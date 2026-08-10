@@ -252,7 +252,7 @@ use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransacti
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
-    SurfacePlacement,
+    SurfacePlacement, SurfaceRenderBackend,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

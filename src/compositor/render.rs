@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::{
     ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
-    SurfaceDamageRect,
+    SurfaceDamageRect, SurfaceRenderBackend,
 };
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
@@ -259,11 +259,7 @@ impl RenderSceneElement {
             kind: RenderSceneElementKind::ClientSurface,
             target,
             visible_target,
-            backing_target: xwayland_visual_backing_target(
-                surface,
-                target,
-                visual_aperture.as_ref(),
-            ),
+            backing_target: xwayland_visual_backing_target(surface, visual_aperture.as_ref()),
             content_uv: content_regions
                 .first()
                 .map_or(SurfaceUvRect::FULL, |plan| plan.content_uv),
@@ -1258,9 +1254,11 @@ impl ServerFrameColor {
 
 pub fn xwayland_visual_backing_target(
     surface: &RenderableSurface,
-    _target: SurfaceTargetRect,
     visual_aperture: Option<&SurfaceVisualAperture>,
 ) -> Option<SurfaceTargetRect> {
+    if surface.render_backend != SurfaceRenderBackend::Xwayland {
+        return None;
+    }
     let placement = surface.render_placement.unwrap_or(surface.placement);
     (surface.placement.parent_surface_id.is_none()
         && placement.root_mode == RootPlacementMode::Absolute)
@@ -1789,15 +1787,7 @@ pub fn server_frame_rects_by_surface(surfaces: &[RenderableSurface]) -> Vec<Vec<
 }
 
 pub fn server_frame_rects_for_surface(surface: &RenderableSurface) -> Vec<ServerFrameRect> {
-    if surface.placement.parent_surface_id.is_none()
-        && surface
-            .render_placement
-            .unwrap_or(surface.placement)
-            .root_mode
-            == RootPlacementMode::Absolute
-        && let Some(aperture) = surface.visual_clip.as_ref()
-    {
-        let bounds = aperture.bounds();
+    if let Some(bounds) = xwayland_visual_backing_target(surface, surface.visual_clip.as_ref()) {
         return vec![ServerFrameRect {
             color: ServerFrameColor::XwaylandBacking,
             x: 0,
@@ -2481,6 +2471,7 @@ mod tests {
             width: 1,
             height: 1,
             placement: SurfacePlacement::absolute_root_at(x, y),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -2549,6 +2540,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -2640,6 +2632,7 @@ mod tests {
             width: 800,
             height: 600,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 1000, 700,
@@ -2672,6 +2665,7 @@ mod tests {
             width: 800,
             height: 600,
             placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_backend: SurfaceRenderBackend::Xwayland,
             render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 100, 100, 1100, 760,
@@ -2714,6 +2708,54 @@ mod tests {
     }
 
     #[test]
+    fn native_absolute_root_preview_does_not_get_xwayland_backing() {
+        let surface = RenderableSurface {
+            surface_id: 11,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                100, 100, 1100, 760,
+            ))),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(800, 600, vec![0x80ff_0000; 800 * 600]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .pop()
+            .expect("native scene element");
+        assert_eq!(element.backing_target(), None);
+        assert!(server_frame_rects_for_surface(&surface).is_empty());
+
+        let mut frame = vec![0; 1300 * 900];
+        draw_wallpaper(&mut frame, 1300, 900);
+        let wallpaper_pixel = frame[100 * 1300 + 100];
+        let transparent_surface = RenderableSurface {
+            buffer: shm_buffer(800, 600, vec![0x0000_0000; 800 * 600]),
+            ..surface
+        };
+        compose_output(
+            &mut frame,
+            1300,
+            900,
+            std::slice::from_ref(&transparent_surface),
+            DesktopVisualState::wallpaper_only(),
+        );
+        assert_eq!(frame[100 * 1300 + 100], wallpaper_pixel);
+    }
+
+    #[test]
     fn non_absolute_root_preview_does_not_get_xwayland_backing() {
         let surface = RenderableSurface {
             surface_id: 8,
@@ -2722,6 +2764,7 @@ mod tests {
             width: 800,
             height: 600,
             placement: SurfacePlacement::root_at(100, 100),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: Some(SurfacePlacement::root_at(100, 100)),
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 100, 100, 1100, 760,
@@ -2752,6 +2795,7 @@ mod tests {
             width: 80,
             height: 60,
             placement: SurfacePlacement::root_at(24, 32),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -2767,6 +2811,7 @@ mod tests {
         let x11 = RenderableSurface {
             surface_id: 10,
             placement: SurfacePlacement::absolute_root_at(48, 40),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             ..xdg.clone()
         };
@@ -2789,6 +2834,7 @@ mod tests {
             width: 100,
             height: 50,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -2826,6 +2872,7 @@ mod tests {
             width: 1000,
             height: 700,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 800, 600,
@@ -2878,6 +2925,7 @@ mod tests {
             width: 300,
             height: 200,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 340, 230,
@@ -2916,6 +2964,7 @@ mod tests {
             width: 120,
             height: 80,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -2962,6 +3011,7 @@ mod tests {
             width: 372,
             height: 272,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: Some(SurfacePlacement::root_at(-16, -10)),
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 340, 230,
@@ -3005,6 +3055,7 @@ mod tests {
             width: 301,
             height: 201,
             placement: SurfacePlacement::root_at(1, 1),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 1, 1, 301, 201,
@@ -3043,6 +3094,7 @@ mod tests {
                 width: 300,
                 height: 200,
                 placement: SurfacePlacement::root(),
+                render_backend: SurfaceRenderBackend::NativeWayland,
                 render_placement: None,
                 visual_clip: Some(SurfaceVisualAperture::logical_only(clip)),
                 render_target_size: None,
@@ -3081,6 +3133,7 @@ mod tests {
             width: 300,
             height: 200,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 320, 220,
@@ -3102,6 +3155,7 @@ mod tests {
             width: 40,
             height: 30,
             placement: SurfacePlacement::subsurface(7, 260, 20),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 280, 220,
@@ -3140,6 +3194,7 @@ mod tests {
             width: 1000,
             height: 700,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 0, 0, 1000, 700,
@@ -3193,6 +3248,7 @@ mod tests {
             width: 800,
             height: 600,
             placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_backend: SurfaceRenderBackend::Xwayland,
             render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
             visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
                 100, 100, 800, 600,
@@ -3252,6 +3308,7 @@ mod tests {
             width: 332,
             height: 242,
             placement: SurfacePlacement::absolute_root_at(84, 70),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: Some(SurfacePlacement::absolute_root_at(84, 70)),
             visual_clip: Some(aperture),
             render_target_size: None,
@@ -3274,14 +3331,32 @@ mod tests {
             assignment.target,
             assignment.visual_clip.as_ref(),
         );
-        let cpu_plans = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+        let cpu_element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
             .into_iter()
             .next()
-            .expect("CPU scene element")
-            .content_regions()
-            .to_vec();
+            .expect("CPU scene element");
+        let cpu_plans = cpu_element.content_regions().to_vec();
 
         assert_eq!(cpu_plans, gles_plans);
+        assert_eq!(
+            cpu_element.backing_target(),
+            xwayland_visual_backing_target(&surface, surface.visual_clip.as_ref())
+        );
+        let mut xwayland_surface = surface.clone();
+        xwayland_surface.render_backend = SurfaceRenderBackend::Xwayland;
+        let xwayland_element =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&xwayland_surface), 1.0)
+                .into_iter()
+                .next()
+                .expect("XWayland CPU scene element");
+        assert_eq!(
+            xwayland_element.backing_target(),
+            xwayland_visual_backing_target(
+                &xwayland_surface,
+                xwayland_surface.visual_clip.as_ref(),
+            )
+        );
+        assert!(xwayland_element.backing_target().is_some());
         assert!(
             cpu_plans
                 .iter()
@@ -3315,6 +3390,7 @@ mod tests {
             width: 332,
             height: 242,
             placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_backend: SurfaceRenderBackend::Xwayland,
             render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
             visual_clip: Some(previous_aperture),
             render_target_size: None,
@@ -3329,6 +3405,7 @@ mod tests {
         };
         let current = RenderableSurface {
             placement: SurfacePlacement::absolute_root_at(500, 400),
+            render_backend: SurfaceRenderBackend::Xwayland,
             render_placement: Some(SurfacePlacement::absolute_root_at(500, 400)),
             visual_clip: Some(current_aperture),
             generation: 2,
@@ -3368,6 +3445,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3445,6 +3523,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3476,6 +3555,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3525,6 +3605,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3560,6 +3641,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3622,6 +3704,7 @@ mod tests {
             width: 4,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: Some(BufferSize::new(6, 3).unwrap()),
@@ -3711,6 +3794,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3781,6 +3865,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3800,6 +3885,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::subsurface(7, 1, 1),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3831,6 +3917,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3874,6 +3961,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -3903,6 +3991,7 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4013,6 +4102,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4055,6 +4145,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4090,6 +4181,7 @@ mod tests {
             width: 12,
             height: 8,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4127,6 +4219,7 @@ mod tests {
             width: 1,
             height: 1,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4170,6 +4263,7 @@ mod tests {
             width: 1,
             height: 1,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4205,6 +4299,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4291,6 +4386,7 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4324,6 +4420,7 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4343,6 +4440,7 @@ mod tests {
             width: 20,
             height: 10,
             placement: SurfacePlacement::subsurface(1, 10, 12),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4370,6 +4468,7 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root_at(5, 6),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
@@ -4389,6 +4488,7 @@ mod tests {
             width: 20,
             height: 10,
             placement: SurfacePlacement::root_at(9, 10),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,

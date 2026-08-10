@@ -1022,7 +1022,6 @@ impl GlesSceneRenderer {
         for (surface, render_assignment) in surfaces.iter().zip(render_assignments) {
             if let Some(bounds) = compositor::xwayland_visual_backing_target(
                 surface,
-                render_assignment.target,
                 render_assignment.visual_clip.as_ref(),
             ) {
                 push_draw_command(
@@ -1513,11 +1512,9 @@ fn push_egl_surface_commands(
     _output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
-    if let Some(bounds) = compositor::xwayland_visual_backing_target(
-        surface,
-        render_assignment.target,
-        render_assignment.visual_clip.as_ref(),
-    ) {
+    if let Some(bounds) =
+        compositor::xwayland_visual_backing_target(surface, render_assignment.visual_clip.as_ref())
+    {
         push_draw_command(
             vertices,
             commands,

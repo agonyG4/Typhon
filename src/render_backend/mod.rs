@@ -232,6 +232,7 @@ pub fn browser_gpu_acceleration_ready(backend: &RenderBackendProfile) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::SurfaceRenderBackend;
     use std::fs::File;
 
     fn test_buffer_identity() -> buffer::BufferIdentity {
@@ -362,6 +363,7 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,

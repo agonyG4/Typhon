@@ -242,7 +242,7 @@ impl CompositorState {
         };
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(surface_id);
-        let Ok(surface) = current.to_renderable_surface(
+        let Ok(mut surface) = current.to_renderable_surface(
             surface_id,
             placement,
             generation,
@@ -250,6 +250,7 @@ impl CompositorState {
         ) else {
             return false;
         };
+        surface.mark_xwayland();
         let buffer_size = surface.buffer_size();
 
         self.renderable_surfaces
@@ -300,7 +301,7 @@ impl CompositorState {
             .map(|(_, serial)| serial.get());
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(root_surface_id);
-        let Ok(surface) = pending.to_renderable_surface(
+        let Ok(mut surface) = pending.to_renderable_surface(
             surface_id,
             placement,
             generation,
@@ -310,6 +311,7 @@ impl CompositorState {
             self.complete_frame_callbacks(frame_callbacks);
             return;
         };
+        surface.mark_xwayland();
         let old_render_placement = self
             .renderable_surfaces
             .iter()
@@ -467,6 +469,7 @@ mod tests {
             width,
             height,
             placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,

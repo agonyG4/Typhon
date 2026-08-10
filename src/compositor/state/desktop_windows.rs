@@ -176,7 +176,10 @@ impl CompositorState {
         SurfacePlacement::absolute_root_at(x, y)
     }
 
-    fn desktop_window_frame(&self, window_id: WindowId) -> Option<(i32, i32, u32, u32)> {
+    pub(in crate::compositor) fn desktop_window_frame(
+        &self,
+        window_id: WindowId,
+    ) -> Option<(i32, i32, u32, u32)> {
         let window = self.window(window_id)?;
         if let Some(geometry) = window.x11_geometry {
             return Some((

@@ -320,8 +320,6 @@ impl CompositorState {
             .surface_window_geometries
             .get(&root_surface_id)
             .copied();
-        let geometry_x = geometry.map_or(0, |geometry| geometry.x);
-        let geometry_y = geometry.map_or(0, |geometry| geometry.y);
         let authoritative = self.surface_placement(root_surface_id);
         let visual = self
             .toplevel_visual_geometries
@@ -365,12 +363,7 @@ impl CompositorState {
         if visual_width == 0 || visual_height == 0 {
             return;
         }
-        let root_render_placement = SurfacePlacement {
-            parent_surface_id: None,
-            local_x: visual_placement.local_x.saturating_sub(geometry_x),
-            local_y: visual_placement.local_y.saturating_sub(geometry_y),
-            root_mode: visual_placement.root_mode,
-        };
+        let root_render_placement = derive_root_render_placement(visual_placement, geometry);
         let clip = render::SurfaceTargetRect::new(
             visual_placement.local_x,
             visual_placement.local_y,
@@ -725,6 +718,21 @@ impl CompositorState {
     }
 }
 
+pub(crate) fn derive_root_render_placement(
+    frame: SurfacePlacement,
+    committed_geometry: Option<XdgWindowGeometry>,
+) -> SurfacePlacement {
+    let Some(committed_geometry) = committed_geometry else {
+        return frame;
+    };
+    SurfacePlacement {
+        parent_surface_id: None,
+        local_x: frame.local_x.saturating_sub(committed_geometry.x),
+        local_y: frame.local_y.saturating_sub(committed_geometry.y),
+        root_mode: frame.root_mode,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowVisualExtents {
     pub(crate) left: u32,
@@ -777,6 +785,40 @@ pub(crate) fn resolve_root_visual_aperture_for_preview(
 #[cfg(test)]
 mod task_3_red_tests {
     use super::*;
+
+    #[test]
+    fn root_render_placement_is_frame_origin_minus_committed_window_geometry() {
+        assert_eq!(
+            derive_root_render_placement(
+                SurfacePlacement::absolute_root_at(100, 100),
+                Some(XdgWindowGeometry::new(16, 10, 1000, 700)),
+            ),
+            SurfacePlacement::absolute_root_at(84, 90),
+        );
+    }
+
+    #[test]
+    fn root_render_placement_stays_stable_across_one_hundred_resize_cycles() {
+        let frame = SurfacePlacement::absolute_root_at(100, 100);
+        let committed_geometry = Some(XdgWindowGeometry::new(16, 10, 1000, 700));
+        let expected = SurfacePlacement::absolute_root_at(84, 90);
+
+        for cycle in 0..100 {
+            assert_eq!(
+                derive_root_render_placement(frame, committed_geometry),
+                expected,
+                "derived root placement changed during cycle {cycle}"
+            );
+        }
+
+        assert_eq!(
+            derive_root_render_placement(
+                SurfacePlacement::absolute_root_at(120, 130),
+                committed_geometry,
+            ),
+            SurfacePlacement::absolute_root_at(104, 120),
+        );
+    }
 
     #[test]
     fn window_visual_extents_use_signed_root_and_xdg_rectangles() {

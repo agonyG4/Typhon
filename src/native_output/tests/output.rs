@@ -795,6 +795,7 @@ pub(super) fn test_renderable_surface(
         width,
         height,
         placement: SurfacePlacement::root(),
+        render_backend: oblivion_one::compositor::SurfaceRenderBackend::Xwayland,
         render_placement: None,
         visual_clip: None,
         render_target_size: None,

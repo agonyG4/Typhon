@@ -128,6 +128,7 @@ impl CompositorState {
             width,
             height,
             placement,
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,

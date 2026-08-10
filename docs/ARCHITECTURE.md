@@ -121,6 +121,30 @@ them permits the next eligible direct re-entry.
 The server initially advertises the safe native protocol set. GPU buffer
 protocols are enabled only after the active native scanout backend is known.
 
+## Surface geometry and decoration ownership
+
+For native XDG toplevels, `surface_placements` and
+`RenderableSurface::placement` own the compositor frame placement. The
+committed `xdg_surface.set_window_geometry` rectangle is retained separately
+as client-content metadata. Rendering derives the root content placement from
+the frame origin minus that committed rectangle, and refreshes the derived
+assignment when the first renderable is published, metadata changes, or the
+authoritative frame placement changes. Resize previews change the visual
+aperture and frame placement; they do not create a second coordinate system.
+
+Client-side decorations remain client-owned. Typhon does not advertise or
+silently substitute server-side decorations. A future SSD implementation must
+introduce explicit ownership for the frame extents, input extents, shadow and
+corner geometry, hit-test regions, configure/state negotiation, and the
+corresponding render and damage primitives before changing that policy.
+
+Synthetic opaque backing is an explicit XWayland compatibility behavior only:
+it is permitted for a confirmed XWayland root with an active visual aperture
+when stale opaque X11 content needs a covered target. Native Wayland surfaces,
+including absolute-root CSD surfaces with transparent pixels, never receive
+that backing. CPU scene composition, GLES command generation, server-frame
+inspection, and damage planning use the same identity-gated predicate.
+
 ## Input and shell launch
 
 Native input translates libinput or raw evdev events into compositor actions.

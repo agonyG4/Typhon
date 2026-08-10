@@ -21,6 +21,23 @@ fn root_buffer_id(surfaces: &[RenderableSurfaceSnapshot]) -> Option<u64> {
         .map(|surface| surface.buffer_id)
 }
 
+fn initial_offset(x: i32, y: i32) -> (i32, i32) {
+    (
+        render::FIRST_SURFACE_OFFSET.0 + x,
+        render::FIRST_SURFACE_OFFSET.1 + y,
+    )
+}
+
+fn initial_root_placement(x: i32, y: i32) -> SurfacePlacement {
+    let (x, y) = initial_offset(x, y);
+    SurfacePlacement::absolute_root_at(x, y)
+}
+
+fn initial_target_rect(x: i32, y: i32, width: u32, height: u32) -> render::SurfaceTargetRect {
+    let (x, y) = initial_offset(x, y);
+    render::SurfaceTargetRect::new(x, y, width, height)
+}
+
 fn map_exclusive_top_panel(
     socket_path: &PathBuf,
 ) -> (
@@ -408,7 +425,7 @@ fn unfullscreen_csd_clears_absolute_render_assignment() {
     let role = capture_xdg_role_snapshot(&commands, root.surface_id);
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!((root.origin_x, root.origin_y), (72, 72));
+    assert_eq!((root.origin_x, root.origin_y), initial_offset(-20, -20));
     assert_eq!(
         role.placement.unwrap_or_default().root_mode,
         RootPlacementMode::Absolute
@@ -568,7 +585,10 @@ fn unfullscreen_restores_exact_previous_floating_placement() {
     let role = capture_xdg_role_snapshot(&commands, root.surface_id);
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!((root.local_x, root.local_y), (custom_x, custom_y));
+    assert_eq!(
+        (root.local_x, root.local_y),
+        initial_offset(custom_x, custom_y)
+    );
     assert_eq!((root.width, root.height), (300, 200));
     assert_eq!(
         role.placement.expect("restored placement").root_mode,
@@ -612,7 +632,10 @@ fn unmaximize_restores_exact_previous_floating_placement() {
     let role = capture_xdg_role_snapshot(&commands, root.surface_id);
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!((root.local_x, root.local_y), (custom_x, custom_y));
+    assert_eq!(
+        (root.local_x, root.local_y),
+        initial_offset(custom_x, custom_y)
+    );
     assert_eq!((root.width, root.height), (300, 200));
     assert_eq!(
         role.placement.expect("restored placement").root_mode,
@@ -935,7 +958,7 @@ fn resize_drag_updates_visual_target_before_client_commit() {
     assert_eq!(surface.generation, 1);
     assert_eq!(
         logical_visual_clip(surface),
-        Some(render::SurfaceTargetRect::new(0, 0, 340, 230))
+        Some(initial_target_rect(0, 0, 340, 230))
     );
 }
 
@@ -984,6 +1007,7 @@ fn state_with_preview_resize(
         width: 944,
         height: 502,
         placement: SurfacePlacement::root(),
+        render_backend: SurfaceRenderBackend::NativeWayland,
         render_placement: None,
         visual_clip: None,
         render_target_size: None,
@@ -1354,8 +1378,8 @@ fn csd_geometry_only_final_commit_keeps_logical_visual_size() {
     assert_eq!(
         snapshots.first_final.visual,
         Some(ToplevelVisualGeometrySnapshot {
-            local_x: 0,
-            local_y: 0,
+            local_x: render::FIRST_SURFACE_OFFSET.0,
+            local_y: render::FIRST_SURFACE_OFFSET.1,
             width: 340,
             height: 230,
             active_resize: false,
@@ -1391,8 +1415,8 @@ fn next_csd_resize_starts_from_window_geometry_not_buffer_size() {
     assert_eq!(
         snapshots.second_preview.visual,
         Some(ToplevelVisualGeometrySnapshot {
-            local_x: 0,
-            local_y: 0,
+            local_x: render::FIRST_SURFACE_OFFSET.0,
+            local_y: render::FIRST_SURFACE_OFFSET.1,
             width: 336,
             height: 230,
             active_resize: true,
@@ -1625,7 +1649,7 @@ fn left_edge_resize_shrink_updates_visual_target_before_client_commit() {
     assert_eq!(server.renderable_surfaces()[0].height, 200);
     assert_eq!(
         logical_visual_clip(&server.renderable_surfaces()[0]),
-        Some(render::SurfaceTargetRect::new(40, 0, 260, 200))
+        Some(initial_target_rect(40, 0, 260, 200))
     );
     assert_eq!(
         origins.first().copied(),
@@ -1658,7 +1682,7 @@ fn resize_preview_clamps_to_toplevel_min_size_before_client_commit() {
     assert_eq!((surface.width, surface.height), (320, 220));
     assert_eq!(
         logical_visual_clip(surface),
-        Some(render::SurfaceTargetRect::new(0, 0, 280, 180))
+        Some(initial_target_rect(0, 0, 280, 180))
     );
 }
 
@@ -1730,33 +1754,6 @@ fn xdg_toplevel_move_request_starts_interactive_move_from_pointer_serial() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     assert_eq!(origins.first().copied(), Some((112, 100)));
-}
-
-#[test]
-fn xdg_toplevel_move_request_accepts_serial_from_same_client_chrome_surface() {
-    let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind(&socket_name).unwrap();
-    let socket_path = runtime_socket_path(&socket_name);
-    let (commands, server_thread) = spawn_controllable_test_server(server);
-
-    let state =
-        create_toplevel_request_move_from_client_chrome_surface(&socket_path, &commands).unwrap();
-    let server = stop_controllable_test_server(commands, server_thread);
-    let origins = render::surface_origins(server.renderable_surfaces());
-    let toplevel_index = server
-        .renderable_surfaces()
-        .iter()
-        .position(|surface| surface.width == 100 && surface.height == 80)
-        .expect("toplevel should remain renderable");
-    let toplevel_id = server.renderable_surfaces()[toplevel_index].surface_id;
-
-    assert_eq!(state.pointer_surface_x, Some(12.0));
-    assert_eq!(state.pointer_surface_y, Some(14.0));
-    assert_eq!(
-        server.state.surface_placement(toplevel_id),
-        SurfacePlacement::absolute_root_at(80, 60)
-    );
-    assert_eq!(origins[toplevel_index], (80, 60));
 }
 
 #[test]

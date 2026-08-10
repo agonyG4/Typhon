@@ -105,6 +105,13 @@ impl SurfaceDamageJournal {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SurfaceRenderBackend {
+    #[default]
+    NativeWayland,
+    Xwayland,
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderableSurface {
     pub surface_id: u32,
@@ -117,6 +124,7 @@ pub struct RenderableSurface {
     // Pointer resize, configure ACK, and visual window changes must not mutate it.
     pub height: u32,
     pub placement: SurfacePlacement,
+    pub render_backend: SurfaceRenderBackend,
     pub render_placement: Option<SurfacePlacement>,
     pub visual_clip: Option<super::render::SurfaceVisualAperture>,
     // Optional compositor-side destination extent. X11 clients can resize their
@@ -134,6 +142,10 @@ pub struct RenderableSurface {
 }
 
 impl RenderableSurface {
+    pub(crate) fn mark_xwayland(&mut self) {
+        self.render_backend = SurfaceRenderBackend::Xwayland;
+    }
+
     pub const fn buffer_id(&self) -> BufferId {
         self.buffer.buffer_id()
     }

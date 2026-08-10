@@ -258,7 +258,13 @@ fn sober_style_toplevel_reassociation_on_same_wl_surface_is_supported() {
     assert!(snapshot.toplevel_registered);
     assert_eq!(snapshot.popup_count, 0);
     assert!(!snapshot.window_geometry_present);
-    assert_eq!(snapshot.placement, None);
+    assert_eq!(
+        snapshot.placement,
+        Some(SurfacePlacement::absolute_root_at(
+            render::FIRST_SURFACE_OFFSET.0,
+            render::FIRST_SURFACE_OFFSET.1,
+        ))
+    );
     assert_eq!(
         snapshot.permanent_role,
         Some(PermanentSurfaceRole::XdgToplevel)

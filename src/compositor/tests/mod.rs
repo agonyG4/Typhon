@@ -124,6 +124,7 @@ mod subsurface;
 mod surface_frames;
 mod toplevel_management;
 mod windows;
+mod windows_geometry;
 mod windows_resize_liveness;
 mod xdg;
 mod xwayland;

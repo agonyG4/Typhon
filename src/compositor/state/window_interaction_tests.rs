@@ -72,6 +72,7 @@ fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> Renderab
         width,
         height,
         placement: SurfacePlacement::root(),
+        render_backend: SurfaceRenderBackend::NativeWayland,
         render_placement: None,
         visual_clip: None,
         render_target_size: None,

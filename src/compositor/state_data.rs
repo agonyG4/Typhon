@@ -163,7 +163,7 @@ pub(in crate::compositor) struct SurfaceViewportCommit {
 
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
-    SurfacePlacement,
+    SurfacePlacement, SurfaceRenderBackend,
     dmabuf::DmabufBufferData,
     explicit_sync::{ExplicitSyncPoint, SyncobjSurfaceState},
     interaction::ResizeCommitSnapshot,
@@ -1233,6 +1233,7 @@ impl PendingSurfaceBuffer {
             width: surface_size.width,
             height: surface_size.height,
             placement,
+            render_backend: SurfaceRenderBackend::NativeWayland,
             render_placement: None,
             visual_clip: None,
             render_target_size: None,
