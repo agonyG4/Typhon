@@ -153,6 +153,114 @@ fn window_stacking_uses_stable_ids() {
 }
 
 #[test]
+fn normal_window_geometry_is_independent_of_stacking_order() {
+    let mut state = CompositorState::new(None);
+    let a = state.allocate_window_id().expect("A window id");
+    let b = state.allocate_window_id().expect("B window id");
+    let c = state.allocate_window_id().expect("C window id");
+    for (window_id, surface_id) in [(a, 401), (b, 402), (c, 403)] {
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .expect("insert XDG window");
+    }
+
+    let placements = [401, 402, 403].map(|surface_id| state.surface_placement(surface_id));
+    assert!(
+        placements
+            .iter()
+            .all(|placement| placement.root_mode == crate::compositor::RootPlacementMode::Absolute)
+    );
+    assert_ne!(placements[0], placements[1]);
+    assert_ne!(placements[1], placements[2]);
+
+    let initial = [a, b, c].map(|id| state.desktop_window_frame(id).expect("frame"));
+    assert!(state.raise_window_id(a));
+    assert_eq!(state.window_stacking, vec![b, c, a]);
+    assert_eq!(
+        initial,
+        [a, b, c].map(|id| state.desktop_window_frame(id).expect("frame"))
+    );
+    assert!(state.raise_window_id(b));
+    assert_eq!(state.window_stacking, vec![c, a, b]);
+    assert_eq!(
+        initial,
+        [a, b, c].map(|id| state.desktop_window_frame(id).expect("frame"))
+    );
+
+    for index in 0..100 {
+        assert!(state.raise_window_id(if index % 2 == 0 { a } else { b }));
+        assert_eq!(
+            initial,
+            [a, b, c].map(|id| state.desktop_window_frame(id).expect("frame"))
+        );
+    }
+}
+
+#[test]
+fn closing_xdg_window_does_not_reflow_survivors_or_new_window_placement() {
+    let mut state = CompositorState::new(None);
+    let a = state.allocate_window_id().expect("A window id");
+    let b = state.allocate_window_id().expect("B window id");
+    let c = state.allocate_window_id().expect("C window id");
+    for (window_id, surface_id) in [(a, 411), (b, 412), (c, 413)] {
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .expect("insert XDG window");
+    }
+
+    let a_before = state.desktop_window_frame(a).expect("A frame");
+    let c_before = state.desktop_window_frame(c).expect("C frame");
+    assert!(state.remove_desktop_window(b).is_some());
+    assert_eq!(state.desktop_window_frame(a), Some(a_before));
+    assert_eq!(state.desktop_window_frame(c), Some(c_before));
+
+    let d = state.allocate_window_id().expect("D window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(d, 414))
+        .expect("insert XDG D");
+    assert_eq!(state.desktop_window_frame(a), Some(a_before));
+    assert_eq!(state.desktop_window_frame(c), Some(c_before));
+    assert_ne!(state.desktop_window_frame(d), Some(a_before));
+    assert_ne!(state.desktop_window_frame(d), Some(c_before));
+}
+
+#[test]
+fn repeated_xdg_creation_reuses_bounded_initial_placement() {
+    let mut state = CompositorState::new(None);
+    let usable = state.usable_output_geometry();
+    let min_x = usable.x as i32;
+    let min_y = usable.y as i32;
+    let max_x = (usable.x + (usable.width - 800.0).max(0.0)) as i32;
+    let max_y = (usable.y + (usable.height - 600.0).max(0.0)) as i32;
+    let mut first_frame = None;
+    let mut maximum_x = min_x;
+    let mut maximum_y = min_y;
+
+    for surface_id in 500..600 {
+        let window_id = state.allocate_window_id().expect("window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .expect("insert XDG window");
+        let frame = state.desktop_window_frame(window_id).expect("frame");
+        assert!(frame.0 >= min_x && frame.0 <= max_x);
+        assert!(frame.1 >= min_y && frame.1 <= max_y);
+        assert!(i64::from(frame.0) + i64::from(frame.2) <= (usable.x + usable.width) as i64);
+        assert!(i64::from(frame.1) + i64::from(frame.3) <= (usable.y + usable.height) as i64);
+        maximum_x = maximum_x.max(frame.0);
+        maximum_y = maximum_y.max(frame.1);
+        if let Some(first_frame) = first_frame {
+            assert_eq!(frame, first_frame, "released placement must be reusable");
+        } else {
+            first_frame = Some(frame);
+        }
+        assert!(state.remove_desktop_window(window_id).is_some());
+    }
+
+    assert!(maximum_x <= max_x);
+    assert!(maximum_y <= max_y);
+}
+
+#[test]
 fn ready_x11_event_creates_one_desktop_window() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

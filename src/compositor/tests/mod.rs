@@ -115,6 +115,7 @@ mod direct_scanout;
 mod input_output;
 mod layer_shell;
 mod lifecycle;
+mod native_geometry;
 mod plan;
 mod protocol_buffers;
 mod protocol_contract;

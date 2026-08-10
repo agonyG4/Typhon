@@ -75,20 +75,23 @@ impl CompositorState {
         {
             return Err(DesktopWindowError::DuplicateRootSurface);
         }
-        let initial_placement = match window.x11_placement_policy {
-            Some(X11PlacementPolicy::CompositorManaged) => {
-                let size = window
-                    .x11_geometry
-                    .map(|geometry| (geometry.frame.width.max(1), geometry.frame.height.max(1)))
-                    .unwrap_or((1, 1));
-                Some(self.allocate_managed_frame(None, size))
-            }
-            Some(
-                X11PlacementPolicy::ClientPositioned
-                | X11PlacementPolicy::ParentRelative
-                | X11PlacementPolicy::OverrideRedirect,
-            ) => window.x11_geometry.map(|geometry| geometry.frame.placement),
-            None => None,
+        let initial_placement = match window.backend {
+            WindowBackend::Xdg(_) => Some(self.allocate_initial_frame(None, (800, 600))),
+            WindowBackend::X11(_) => match window.x11_placement_policy {
+                Some(X11PlacementPolicy::CompositorManaged) => {
+                    let size = window
+                        .x11_geometry
+                        .map(|geometry| (geometry.frame.width.max(1), geometry.frame.height.max(1)))
+                        .unwrap_or((1, 1));
+                    Some(self.allocate_initial_frame(None, size))
+                }
+                Some(
+                    X11PlacementPolicy::ClientPositioned
+                    | X11PlacementPolicy::ParentRelative
+                    | X11PlacementPolicy::OverrideRedirect,
+                ) => window.x11_geometry.map(|geometry| geometry.frame.placement),
+                None => None,
+            },
         };
         if let Some(placement) = initial_placement
             && let Some(geometry) = window.x11_geometry.as_mut()
@@ -120,7 +123,7 @@ impl CompositorState {
         Ok(())
     }
 
-    fn allocate_managed_frame(
+    fn allocate_initial_frame(
         &self,
         excluded: Option<WindowId>,
         (width, height): (u32, u32),
@@ -189,20 +192,23 @@ impl CompositorState {
             .iter()
             .position(|candidate| *candidate == window_id)
             .unwrap_or(0);
-        let geometry = self
-            .current_root_window_geometry(window.root_surface_id)
-            .unwrap_or_else(|| WindowGeometry::new(SurfacePlacement::root(), 800, 600));
+        let geometry = self.current_root_window_geometry(window.root_surface_id);
+        let placement = geometry
+            .map(|geometry| geometry.placement)
+            .unwrap_or_else(|| self.surface_placement(window.root_surface_id));
+        let (width, height) = geometry
+            .map(|geometry| (geometry.width, geometry.height))
+            .unwrap_or((800, 600));
         let (cascade_x, cascade_y) = crate::compositor::render::cascaded_root_position(ordinal);
-        let (x, y) = match geometry.placement.root_mode {
-            crate::compositor::RootPlacementMode::CascadedWindow => (
-                cascade_x + geometry.placement.local_x,
-                cascade_y + geometry.placement.local_y,
-            ),
+        let (x, y) = match placement.root_mode {
+            crate::compositor::RootPlacementMode::CascadedWindow => {
+                (cascade_x + placement.local_x, cascade_y + placement.local_y)
+            }
             crate::compositor::RootPlacementMode::Absolute => {
-                (geometry.placement.local_x, geometry.placement.local_y)
+                (placement.local_x, placement.local_y)
             }
         };
-        Some((x, y, geometry.width.max(1), geometry.height.max(1)))
+        Some((x, y, width.max(1), height.max(1)))
     }
 
     pub(in crate::compositor) fn remove_desktop_window(
@@ -590,13 +596,13 @@ impl CompositorState {
                     current_frame
                         .map(|geometry| geometry.placement)
                         .unwrap_or_else(|| {
-                            self.allocate_managed_frame(
+                            self.allocate_initial_frame(
                                 Some(window_id),
                                 (client.width.max(1), client.height.max(1)),
                             )
                         })
                 } else {
-                    self.allocate_managed_frame(
+                    self.allocate_initial_frame(
                         Some(window_id),
                         (client.width.max(1), client.height.max(1)),
                     )
@@ -890,7 +896,7 @@ impl CompositorState {
         let placement = match placement_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
                 persisted_placement.unwrap_or_else(|| {
-                    self.allocate_managed_frame(
+                    self.allocate_initial_frame(
                         None,
                         (geometry.width.max(1), geometry.height.max(1)),
                     )

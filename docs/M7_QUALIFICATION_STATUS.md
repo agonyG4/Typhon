@@ -56,6 +56,29 @@ native TTY/DRM qualification. `DEFERRED` is not a passing status.
   completion ordering.
 - Native qualification: deferred until the integrated M7 gate.
 
+## M7 Integrated Native Qualification
+
+- Click focus + raise: initial native run `FAIL`.
+- Cause: normal XDG window geometry was coupled to the mutable render/stack
+  ordinal through `CascadedWindow` placement.
+- Deterministic fix: working-tree Typhon patch persists each initial XDG
+  cascade position as authoritative absolute geometry. The closure defect in
+  the first fix was its unbounded allocation ordinal: repeated create/close
+  cycles could consume positions forever even when no old windows remained.
+  The final allocator scans a bounded set of cascade candidates against the
+  current usable output and persistent normal-window frames, chooses the first
+  visible free candidate, and falls back to a visible distinct position when
+  overlap is unavoidable. Released positions are therefore reusable without
+  reflowing survivors or adding a second geometry database.
+- Regression coverage now includes stacking-order and close/new-window
+  immutability, 100 create/close cycles, real renderable-surface origin
+  resolution, a separate ShellActivation regression, and 100 alternating
+  PointerPress activations with deterministic exclusive hit points.
+- Deterministic regression: `NOT RUN — HOST ENVIRONMENT`; the Windows host
+  cannot build the Linux Wayland dependency because `pkg-config` is unavailable
+  and WSL is not installed.
+- Native retest: `PENDING`.
+
 ## M7-C
 
 - Eclipse client, AltTab, Dock, build matrix, tests, and copied XML hash:

@@ -119,6 +119,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     RestoreNextMinimized,
     FocusRootWindow(u32),
     RaiseRootWindow(u32),
+    ActivateRootWindow(u32),
     ToggleMaximizeFocused,
     ToggleFullscreenFocused,
     SetFocusedRootVisualGeometry {
@@ -157,6 +158,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
+    CaptureFocusedWindowId(Sender<Option<WindowId>>),
+    CaptureWindowIdForSurface {
+        surface_id: u32,
+        reply: Sender<Option<WindowId>>,
+    },
     CaptureWindowInteractionDebugSnapshot(Sender<Option<WindowInteractionDebugSnapshot>>),
     CapturePointerOwnershipIsClear(Sender<bool>),
     CaptureWindowInteractionReleaseMetrics(Sender<WindowInteractionReleaseMetrics>),
@@ -352,6 +358,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::RaiseRootWindow(surface_id) => {
                         server.state.raise_root_window(surface_id);
+                    }
+                    ServerCommand::ActivateRootWindow(surface_id) => {
+                        server.activate_window(surface_id);
                     }
                     ServerCommand::ToggleMaximizeFocused => {
                         server.toggle_maximize_focused_window();
@@ -689,6 +698,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(compositor_surface_id),
                         );
                     }
+                    ServerCommand::CaptureFocusedWindowId(reply) => {
+                        let _ = reply.send(server.state.focused_window_id);
+                    }
+                    ServerCommand::CaptureWindowIdForSurface { surface_id, reply } => {
+                        let _ = reply.send(server.state.window_id_for_surface(surface_id));
+                    }
                     ServerCommand::CaptureWindowInteractionDebugSnapshot(reply) => {
                         let _ = reply.send(server.window_interaction_debug_snapshot());
                     }
@@ -981,6 +996,31 @@ pub(in crate::compositor::tests) fn capture_focused_surface_id(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report keyboard focus surface")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_window_id(
+    commands: &Sender<ServerCommand>,
+) -> Option<WindowId> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedWindowId(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report focused window")
+}
+
+pub(in crate::compositor::tests) fn capture_window_id_for_surface(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<WindowId> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWindowIdForSurface { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report window for surface")
 }
 
 pub(in crate::compositor::tests) fn capture_window_interaction_debug_snapshot(

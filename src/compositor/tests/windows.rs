@@ -411,7 +411,7 @@ fn unfullscreen_csd_clears_absolute_render_assignment() {
     assert_eq!((root.origin_x, root.origin_y), (72, 72));
     assert_eq!(
         role.placement.unwrap_or_default().root_mode,
-        RootPlacementMode::CascadedWindow
+        RootPlacementMode::Absolute
     );
 }
 
@@ -572,7 +572,7 @@ fn unfullscreen_restores_exact_previous_floating_placement() {
     assert_eq!((root.width, root.height), (300, 200));
     assert_eq!(
         role.placement.expect("restored placement").root_mode,
-        RootPlacementMode::CascadedWindow
+        RootPlacementMode::Absolute
     );
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
 }
@@ -616,7 +616,7 @@ fn unmaximize_restores_exact_previous_floating_placement() {
     assert_eq!((root.width, root.height), (300, 200));
     assert_eq!(
         role.placement.expect("restored placement").root_mode,
-        RootPlacementMode::CascadedWindow
+        RootPlacementMode::Absolute
     );
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
 }
@@ -1754,9 +1754,9 @@ fn xdg_toplevel_move_request_accepts_serial_from_same_client_chrome_surface() {
     assert_eq!(state.pointer_surface_y, Some(14.0));
     assert_eq!(
         server.state.surface_placement(toplevel_id),
-        SurfacePlacement::root_at(80, 60)
+        SurfacePlacement::absolute_root_at(80, 60)
     );
-    assert_eq!(origins[toplevel_index], (152, 132));
+    assert_eq!(origins[toplevel_index], (80, 60));
 }
 
 #[test]

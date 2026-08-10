@@ -148,7 +148,6 @@ impl CompositorState {
                 wm_capabilities_sent: false,
             },
         );
-        self.set_surface_placement(surface_id, SurfacePlacement::root());
         self.focus_surface(surface);
     }
 

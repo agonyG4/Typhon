@@ -2473,6 +2473,39 @@ mod tests {
         )
     }
 
+    fn absolute_test_surface(surface_id: u32, x: i32, y: i32) -> RenderableSurface {
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            placement: SurfacePlacement::absolute_root_at(x, y),
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1, 1, vec![0xffff_ffff]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        }
+    }
+
+    #[test]
+    fn absolute_root_origins_are_stable_when_renderable_stack_order_changes() {
+        let first = absolute_test_surface(701, 72, 72);
+        let second = absolute_test_surface(702, 104, 104);
+        let initial = surface_origins(&[first.clone(), second.clone()]);
+        let reordered = surface_origins(&[second, first]);
+
+        assert_eq!(initial, vec![(72, 72), (104, 104)]);
+        assert_eq!(reordered, vec![(104, 104), (72, 72)]);
+    }
+
     #[test]
     fn desktop_scene_renderer_reuses_wallpaper_cache_until_size_changes() {
         let mut renderer = DesktopSceneRenderer::default();
