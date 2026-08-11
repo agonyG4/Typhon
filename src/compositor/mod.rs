@@ -234,7 +234,11 @@ pub use render::{
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
-pub use selection::{SelectionOfferRecord, SelectionState};
+pub use selection::{
+    ActiveSelection, DataOfferBinding, SelectionClear, SelectionCommit, SelectionKind,
+    SelectionOfferRecord, SelectionSourceKey, SelectionSourceKind, SelectionSourceRecord,
+    SelectionState,
+};
 pub use server::{OwnCompositorServer, XwaylandClientIdentity};
 pub use server_error::CompositorError;
 use shm::{
