@@ -1,8 +1,12 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use wayland_server::protocol::wl_callback;
 use wayland_server::protocol::wl_output;
 
+use super::state::CapturedSurfacePacing;
 use super::{
     RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
@@ -35,6 +39,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) resize_capture_finalized: bool,
     pub(super) window_geometry: Option<super::XdgWindowGeometry>,
     pub(super) cached_at: Instant,
+    pub(super) pacing: CapturedSurfacePacing,
 }
 
 impl CachedSubsurfaceCommit {
@@ -57,7 +62,11 @@ impl CachedSubsurfaceCommit {
             resize_capture_finalized,
             window_geometry,
             cached_at: _,
+            pacing,
         } = newer;
+        // A pacing value is a commit boundary.  The caller must not merge a
+        // later paced update into an older content update.
+        debug_assert!(!pacing.is_boundary());
         self.commit_id = commit_id;
         self.commit_sequence = commit_sequence;
         let attachment_changed = attachment.is_some();
@@ -153,6 +162,7 @@ mod window_geometry_tests {
             resize_capture_finalized: true,
             window_geometry: Some(window_geometry),
             cached_at: Instant::now(),
+            pacing: CapturedSurfacePacing::default(),
         }
     }
 
@@ -175,7 +185,7 @@ mod window_geometry_tests {
 struct SubsurfaceRoleState {
     parent_id: u32,
     requested_mode: SubsurfaceSyncMode,
-    cached_commit: Option<CachedSubsurfaceCommit>,
+    cached_commits: VecDeque<CachedSubsurfaceCommit>,
     pending_position: Option<(i32, i32)>,
 }
 
@@ -201,17 +211,18 @@ impl SubsurfaceTransactionState {
             SubsurfaceRoleState {
                 parent_id,
                 requested_mode: SubsurfaceSyncMode::Synchronized,
-                cached_commit: None,
+                cached_commits: VecDeque::new(),
                 pending_position: None,
             },
         );
         true
     }
 
-    pub(super) fn remove_role(&mut self, surface_id: u32) -> Option<CachedSubsurfaceCommit> {
+    pub(super) fn remove_role(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
         self.roles
             .remove(&surface_id)
-            .and_then(|role| role.cached_commit)
+            .map(|role| role.cached_commits.into_iter().collect())
+            .unwrap_or_default()
     }
 
     pub(super) fn remove_subtree(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
@@ -223,10 +234,8 @@ impl SubsurfaceTransactionState {
                     .iter()
                     .filter_map(|(child_id, role)| (role.parent_id == id).then_some(*child_id)),
             );
-            if let Some(mut role) = self.roles.remove(&id)
-                && let Some(commit) = role.cached_commit.take()
-            {
-                removed.push(commit);
+            if let Some(role) = self.roles.remove(&id) {
+                removed.extend(role.cached_commits);
             }
         }
         removed
@@ -235,7 +244,7 @@ impl SubsurfaceTransactionState {
     pub(super) fn drain_cached_commits(&mut self) -> Vec<CachedSubsurfaceCommit> {
         self.roles
             .values_mut()
-            .filter_map(|role| role.cached_commit.take())
+            .flat_map(|role| role.cached_commits.drain(..))
             .collect()
     }
 
@@ -278,10 +287,23 @@ impl SubsurfaceTransactionState {
         commit: CachedSubsurfaceCommit,
     ) -> Option<SurfaceBufferRelease> {
         let role = self.roles.get_mut(&surface_id)?;
-        if let Some(cached) = role.cached_commit.as_mut() {
-            cached.merge(commit)
+        if role.cached_commits.is_empty() {
+            role.cached_commits.push_back(commit);
+            return None;
+        }
+        if role.cached_commits.len() == 1
+            && !role
+                .cached_commits
+                .front()
+                .is_some_and(|cached| cached.pacing.is_boundary())
+            && !commit.pacing.is_boundary()
+        {
+            role.cached_commits
+                .front_mut()
+                .expect("cached commit exists")
+                .merge(commit)
         } else {
-            role.cached_commit = Some(commit);
+            role.cached_commits.push_back(commit);
             None
         }
     }
@@ -289,13 +311,13 @@ impl SubsurfaceTransactionState {
     pub(super) fn has_cached_commit(&self, surface_id: u32) -> bool {
         self.roles
             .get(&surface_id)
-            .is_some_and(|role| role.cached_commit.is_some())
+            .is_some_and(|role| !role.cached_commits.is_empty())
     }
 
     pub(super) fn cached_node_count(&self) -> usize {
         self.roles
             .values()
-            .filter(|role| role.cached_commit.is_some())
+            .filter(|role| !role.cached_commits.is_empty())
             .count()
     }
 
@@ -350,15 +372,17 @@ impl SubsurfaceTransactionState {
     ) -> Vec<(u32, CachedSubsurfaceCommit)> {
         let mut surface_ids = Vec::new();
         self.collect_effectively_synchronized_descendants(parent_id, &mut surface_ids);
-        surface_ids
-            .into_iter()
-            .filter_map(|surface_id| {
-                self.roles
-                    .get_mut(&surface_id)
-                    .and_then(|role| role.cached_commit.take())
-                    .map(|commit| (surface_id, commit))
-            })
-            .collect()
+        let mut commits = Vec::new();
+        for surface_id in surface_ids {
+            if let Some(role) = self.roles.get_mut(&surface_id) {
+                commits.extend(
+                    role.cached_commits
+                        .drain(..)
+                        .map(|commit| (surface_id, commit)),
+                );
+            }
+        }
+        commits
     }
 
     pub(super) fn take_desynchronized_subtree_commits(
@@ -371,15 +395,17 @@ impl SubsurfaceTransactionState {
             .into_iter()
             .filter(|surface_id| !self.is_effectively_synchronized(*surface_id))
             .collect::<Vec<_>>();
-        eligible
-            .into_iter()
-            .filter_map(|surface_id| {
-                self.roles
-                    .get_mut(&surface_id)
-                    .and_then(|role| role.cached_commit.take())
-                    .map(|commit| (surface_id, commit))
-            })
-            .collect()
+        let mut commits = Vec::new();
+        for surface_id in eligible {
+            if let Some(role) = self.roles.get_mut(&surface_id) {
+                commits.extend(
+                    role.cached_commits
+                        .drain(..)
+                        .map(|commit| (surface_id, commit)),
+                );
+            }
+        }
+        commits
     }
 
     fn collect_effectively_synchronized_descendants(&self, parent_id: u32, output: &mut Vec<u32>) {
@@ -464,7 +490,7 @@ mod tests {
         let mut state = SubsurfaceTransactionState::default();
         assert!(state.register(2, 1));
         assert!(state.register(3, 2));
-        assert!(state.remove_role(2).is_none());
+        assert!(state.remove_role(2).is_empty());
         assert_eq!(state.parent(2), None);
         assert_eq!(state.parent(3), Some(2));
 
@@ -473,5 +499,28 @@ mod tests {
         assert!(state.remove_subtree(4).is_empty());
         assert_eq!(state.parent(4), None);
         assert_eq!(state.parent(5), None);
+    }
+
+    #[test]
+    fn pacing_boundaries_are_never_merged_or_reordered() {
+        let mut state = SubsurfaceTransactionState::default();
+        assert!(state.register(2, 1));
+
+        let mut first = crate::compositor::state::empty_cached_subsurface_commit();
+        first.pacing = CapturedSurfacePacing {
+            fifo_set_barrier: true,
+            ..CapturedSurfacePacing::default()
+        };
+        let mut second = crate::compositor::state::empty_cached_subsurface_commit();
+        second.pacing = CapturedSurfacePacing {
+            fifo_wait_barrier: true,
+            ..CapturedSurfacePacing::default()
+        };
+
+        assert!(state.cache_commit(2, first).is_none());
+        assert!(state.cache_commit(2, second).is_none());
+        assert_eq!(state.roles[&2].cached_commits.len(), 2);
+        assert!(state.roles[&2].cached_commits[0].pacing.fifo_set_barrier);
+        assert!(state.roles[&2].cached_commits[1].pacing.fifo_wait_barrier);
     }
 }

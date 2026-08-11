@@ -9,9 +9,9 @@ mod native_output;
 use oblivion_one::{
     CompositorAppGpuPreference,
     compositor::{
-        CompositorPlan, InputProtocolCapabilities, OwnCompositorServer,
-        RendererProtocolCapabilities, SelectionProtocolCapabilities,
-        client_protocols_for_capabilities,
+        CompositorPlan, FramePacingProtocolCapabilities, InputProtocolCapabilities,
+        OwnCompositorServer, RendererProtocolCapabilities, SelectionProtocolCapabilities,
+        client_protocols_for_capabilities_with_frame_pacing,
     },
     default_state_dir, discover_tools,
     portal::PortalRuntime,
@@ -165,10 +165,11 @@ fn parse_compositor_args(args: &[String]) -> Result<CompositorCliOptions, io::Er
 }
 
 fn native_protocol_names() -> Vec<&'static str> {
-    client_protocols_for_capabilities(
+    client_protocols_for_capabilities_with_frame_pacing(
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
         RendererProtocolCapabilities::unsupported(),
+        FramePacingProtocolCapabilities::qualified_native(),
     )
     .into_iter()
     .map(|protocol| protocol.name())
@@ -185,7 +186,8 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     // Block process-directed SIGCHLD before constructing the Wayland server or
     // entering any native driver, graphics-library, or worker initialization.
     oblivion_one::process::block_sigchld_for_current_thread()?;
-    let plan = CompositorPlan::new(&options.socket_name);
+    let plan = CompositorPlan::new(&options.socket_name)
+        .with_frame_pacing_capabilities(FramePacingProtocolCapabilities::qualified_native());
     println!("Typhon native compositor");
     println!("socket: {}", plan.socket_name);
     println!("runtime: Native");
@@ -194,12 +196,13 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     println!("protocols: {}", protocol_names.join(", "));
     println!("command: {}", plan.command_preview());
 
-    let server = OwnCompositorServer::bind_with_capabilities(
+    let server = OwnCompositorServer::bind_with_capabilities_and_frame_pacing(
         &options.socket_name,
         false,
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
         RendererProtocolCapabilities::unsupported(),
+        FramePacingProtocolCapabilities::qualified_native(),
     )?;
     println!("Wayland socket bound: {}", server.socket_name());
 

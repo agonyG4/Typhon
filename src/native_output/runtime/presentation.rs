@@ -4,8 +4,10 @@ use super::frame::{
     update_cursor_output_arbitration,
 };
 use super::planner::{
-    NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
-    plan_scheduled_target_for_mode,
+    NativePresentationPath, NativePresentationPlanInput, pending_target_for_scanout,
+    plan_native_presentation_path, plan_visual_target_for_mode,
+    prepare_presentation_target_for_mode, reactive_or_commit_timing_target,
+    take_reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
@@ -216,8 +218,7 @@ impl NativeRuntime {
             *cursor_render_mode,
             cursor_visible,
         );
-        let planned_cursor_delivery =
-            presented_delivery_for_plan(runtime_plane_plan.as_ref(), &effective_cursor);
+        #[rustfmt::skip] let planned_cursor_delivery = presented_delivery_for_plan(runtime_plane_plan.as_ref(), &effective_cursor);
         let cursor_state_changed = atomic_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
@@ -303,34 +304,28 @@ impl NativeRuntime {
         adaptive_buffering.apply_capability(triple_capability);
         let render_ahead_allowed = adaptive_buffering.mode() == AdaptiveBufferingMode::Triple;
         let pacing_mode = adaptive_buffering.pacing_mode();
-        if pacing_mode == NativeOutputPacingMode::ReactiveDouble {
-            *scheduled_presentation_target = None;
-            presentation_deadline.clear_scheduled_target();
-        }
-        if explicit_output
-            && frame_scheduler.visual_work_queued()
-            && scheduled_presentation_target.is_none()
-        {
-            let pending_target = match &**scanout {
-                NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                    explicit.swapchain()?.latest_future_primary_target()
-                }
-                _ => None,
-            };
-            let reason = if *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force {
-                PresentationTargetReason::ForcedValidation
-            } else {
-                PresentationTargetReason::PredictedPressure
-            };
-            *scheduled_presentation_target = plan_scheduled_target_for_mode(
-                presentation_deadline,
-                pacing_mode,
-                pending_target,
-                scheduler_now,
-                Duration::from_nanos(prediction.total_cost_ns),
-                reason,
-            );
-        }
+        *scheduled_presentation_target = prepare_presentation_target_for_mode(
+            pacing_mode,
+            explicit_output,
+            presentation_deadline,
+            server,
+            frame_scheduler,
+            *scheduled_presentation_target,
+            scheduler_now,
+            Duration::from_nanos(prediction.total_cost_ns),
+        );
+        #[rustfmt::skip] let pending_target = if explicit_output && frame_scheduler.visual_work_queued() && scheduled_presentation_target.is_none() { pending_target_for_scanout(scanout)? } else { None };
+        *scheduled_presentation_target = plan_visual_target_for_mode(
+            presentation_deadline,
+            pacing_mode,
+            pending_target,
+            scheduler_now,
+            Duration::from_nanos(prediction.total_cost_ns),
+            explicit_output,
+            frame_scheduler.visual_work_queued(),
+            *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force,
+            *scheduled_presentation_target,
+        );
         let effective_render_target_available = if explicit_output {
             scanout.render_target_available_for(pacing_mode)
         } else {
@@ -659,8 +654,11 @@ impl NativeRuntime {
                 && direct_candidate_changed
             {
                 let direct_target = match pacing_mode {
-                    NativeOutputPacingMode::ReactiveDouble => presentation_deadline
-                        .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                    NativeOutputPacingMode::ReactiveDouble => reactive_or_commit_timing_target(
+                        presentation_deadline,
+                        *scheduled_presentation_target,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    ),
                     NativeOutputPacingMode::PredictiveTriple => scheduled_presentation_target
                         .or_else(|| {
                             presentation_deadline.reactive_target(MonotonicTimestampNs::new(
@@ -939,8 +937,13 @@ impl NativeRuntime {
                 } else {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let frame_target = match pacing_mode {
-                            NativeOutputPacingMode::ReactiveDouble => presentation_deadline
-                                .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                            NativeOutputPacingMode::ReactiveDouble => {
+                                take_reactive_or_commit_timing_target(
+                                    presentation_deadline,
+                                    scheduled_presentation_target,
+                                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                )
+                            }
                             NativeOutputPacingMode::PredictiveTriple => {
                                 scheduled_presentation_target.take().or_else(|| {
                                     presentation_deadline.reactive_target(

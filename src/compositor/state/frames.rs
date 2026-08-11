@@ -76,7 +76,8 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
-        self.pending_interactive_resize_update.is_some()
+        !self.active_fifo_barriers.is_empty()
+            || self.pending_interactive_resize_update.is_some()
             || self.pending_resize_configure_is_flushable()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 !self.external_acquire_readiness
@@ -85,7 +86,9 @@ impl CompositorState {
             || self
                 .pending_surface_tree_transactions
                 .iter()
-                .any(|transaction| !self.external_acquire_readiness || transaction.is_ready())
+                .any(|transaction| {
+                    !self.external_acquire_readiness || self.transaction_is_ready(transaction)
+                })
             || !self.pending_color_info.is_empty()
     }
 
@@ -250,6 +253,12 @@ impl CompositorState {
         }
         let captured_releases =
             shm_buffer_releases.len() + dmabuf_releases_to_complete_on_present.len();
+        let fifo_barrier_claims = self.fifo_claims_for_frame(
+            self.renderable_surfaces
+                .iter()
+                .map(|surface| surface.surface_id)
+                .chain(self.client_cursor_surfaces.keys().copied()),
+        );
         self.buffer_release_metrics.buffer_releases_captured = self
             .buffer_release_metrics
             .buffer_releases_captured
@@ -279,6 +288,7 @@ impl CompositorState {
                 presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
                 shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,
+                fifo_barrier_claims,
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
@@ -410,6 +420,9 @@ impl CompositorState {
         let _ = self
             .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
+        for claim in &batch.fifo_barrier_claims {
+            self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+        }
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         self.clear_legacy_batch_reference(batch_id);
@@ -1297,23 +1310,65 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let prefix_end =
-            ready_explicit_sync_prefix_end_indices(transactions.iter().enumerate().map(
-                |(index, transaction)| (index, transaction.root_surface_id, transaction.is_ready()),
-            ));
+        let readiness = transactions
+            .iter()
+            .map(|transaction| self.transaction_is_ready(transaction))
+            .collect::<Vec<_>>();
+        for transaction in &transactions {
+            for (surface_id, commit) in &transaction.nodes {
+                if commit.pacing.fifo_wait_barrier {
+                    if self
+                        .subsurface_transactions
+                        .is_effectively_synchronized(*surface_id)
+                        || commit.pacing.fifo_wait_ignored_for_synchronized_subsurface
+                    {
+                        self.surface_pacing_metrics
+                            .waits_ignored_for_synchronized_subsurfaces = self
+                            .surface_pacing_metrics
+                            .waits_ignored_for_synchronized_subsurfaces
+                            .saturating_add(1);
+                    } else if self.active_fifo_barriers.contains_key(surface_id) {
+                        self.surface_pacing_metrics.waits_blocked =
+                            self.surface_pacing_metrics.waits_blocked.saturating_add(1);
+                    }
+                }
+                if commit
+                    .pacing
+                    .commit_timing
+                    .is_some_and(|timing| !timing.is_due(self.presentation_clock))
+                {
+                    self.surface_pacing_metrics.transactions_blocked_by_timing = self
+                        .surface_pacing_metrics
+                        .transactions_blocked_by_timing
+                        .saturating_add(1);
+                }
+            }
+        }
+        let prefix_end = ordered_surface_tree_prefix_end_indices(
+            transactions.iter().enumerate().map(|(index, transaction)| {
+                (
+                    index,
+                    transaction.root_surface_id,
+                    readiness[index],
+                    transaction.is_pacing_protected(),
+                )
+            }),
+        );
         let replacements = transactions
             .iter()
             .enumerate()
             .filter_map(|(index, transaction)| {
                 let end = *prefix_end.get(&transaction.root_surface_id)?;
-                (index <= end && !transaction.is_ready()).then(|| {
+                (index <= end && !readiness[index]).then(|| {
                     let replacement = transactions[index + 1..=end]
                         .iter()
-                        .find(|candidate| {
-                            candidate.root_surface_id == transaction.root_surface_id
-                                && candidate.is_ready()
+                        .enumerate()
+                        .find_map(|(offset, candidate)| {
+                            (candidate.root_surface_id == transaction.root_surface_id
+                                && readiness[index + 1 + offset])
+                                .then(|| candidate.nodes.first())
+                                .flatten()
                         })
-                        .and_then(|candidate| candidate.nodes.first())
                         .expect("ready tree prefix guarantees an ordered ready successor")
                         .1
                         .commit_id;
@@ -1332,9 +1387,9 @@ impl CompositorState {
             };
             if index > end_index {
                 waiting.push(transaction);
-            } else if !transaction.is_ready() {
+            } else if !readiness[index] {
                 let root_id = transaction.root_surface_id;
-                let acquire_state = if transaction.is_ready() {
+                let acquire_state = if readiness[index] {
                     PendingAcquireState::Ready
                 } else {
                     PendingAcquireState::RegistrationPending

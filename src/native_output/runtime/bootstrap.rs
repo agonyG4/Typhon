@@ -492,7 +492,10 @@ impl NativeRuntime {
             ),
             earliest_native_deadline(
                 xwayland.next_deadline_ns(),
-                control_server.next_deadline_ns(),
+                earliest_native_deadline(
+                    control_server.next_deadline_ns(),
+                    server.next_surface_pacing_deadline_ns(),
+                ),
             ),
         ))?;
         let last_rendered_scene_generation = server.scene_render_generation();

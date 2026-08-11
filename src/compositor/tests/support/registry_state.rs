@@ -1805,3 +1805,53 @@ impl Dispatch<client_xdg_popup::XdgPopup, ()> for RegistryTestState {
         }
     }
 }
+
+impl Dispatch<client_wp_fifo_manager_v1::WpFifoManagerV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_fifo_manager_v1::WpFifoManagerV1,
+        _event: client_wp_fifo_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_fifo_v1::WpFifoV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_fifo_v1::WpFifoV1,
+        _event: client_wp_fifo_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+        _event: client_wp_commit_timing_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_commit_timer_v1::WpCommitTimerV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_commit_timer_v1::WpCommitTimerV1,
+        _event: client_wp_commit_timer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}

@@ -78,6 +78,11 @@ impl PresentationTimestamp {
     pub const fn nanoseconds(self) -> u32 {
         self.nanoseconds
     }
+
+    pub fn as_nanos(self) -> Option<u64> {
+        let seconds = self.seconds.checked_mul(1_000_000_000)?;
+        seconds.checked_add(self.nanoseconds as u64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

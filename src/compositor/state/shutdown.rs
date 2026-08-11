@@ -43,6 +43,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         resize_capture_finalized: true,
         window_geometry: None,
         cached_at: Instant::now(),
+        pacing: CapturedSurfacePacing::default(),
     }
 }
 
@@ -102,12 +103,24 @@ pub(in crate::compositor) fn ready_explicit_sync_prefix_end_indices(
     prefix_end
 }
 
-pub(in crate::compositor) fn explicit_sync_overflow_unready_index(
-    ready_states: impl IntoIterator<Item = (usize, bool)>,
-) -> Option<usize> {
-    ready_states
-        .into_iter()
-        .find_map(|(index, ready)| (!ready).then_some(index))
+pub(in crate::compositor) fn ordered_surface_tree_prefix_end_indices(
+    commits: impl IntoIterator<Item = (usize, u32, bool, bool)>,
+) -> HashMap<u32, usize> {
+    let mut prefix_end = HashMap::new();
+    let mut blocked = HashMap::<u32, bool>::new();
+    for (index, surface_id, ready, pacing_protected) in commits {
+        if blocked.get(&surface_id).copied().unwrap_or(false) {
+            continue;
+        }
+        if pacing_protected && !ready {
+            blocked.insert(surface_id, true);
+            continue;
+        }
+        if ready {
+            prefix_end.insert(surface_id, index);
+        }
+    }
+    prefix_end
 }
 
 pub(in crate::compositor) fn damage_only_rendered_surface_size(
@@ -184,14 +197,19 @@ mod explicit_sync_commit_accounting_tests {
     }
 
     #[test]
-    fn queue_overflow_retires_oldest_unready_and_never_ready() {
-        assert_eq!(
-            explicit_sync_overflow_unready_index([(4, true), (7, false), (9, false)]),
-            Some(7)
-        );
-        assert_eq!(
-            explicit_sync_overflow_unready_index([(4, true), (7, true), (9, true)]),
-            None
-        );
+    fn pacing_boundary_stops_ordered_prefix_without_superseding_it() {
+        let prefix = ordered_surface_tree_prefix_end_indices([
+            (0, 7, true, false),
+            (1, 7, false, true),
+            (2, 7, true, false),
+        ]);
+        assert_eq!(prefix.get(&7), Some(&0));
+
+        let ready_after_boundary = ordered_surface_tree_prefix_end_indices([
+            (0, 7, true, false),
+            (1, 7, true, true),
+            (2, 7, true, false),
+        ]);
+        assert_eq!(ready_after_boundary.get(&7), Some(&2));
     }
 }

@@ -27,6 +27,7 @@ mod surface_commit_cursor;
 mod surface_commit_placement;
 mod surface_commits;
 mod surface_focus;
+mod surface_pacing;
 mod surface_transactions;
 mod surfaces;
 mod window_actions;
@@ -100,6 +101,12 @@ pub(in crate::compositor) use surface_commit_placement::*;
 pub(in crate::compositor) use surface_commits::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_focus::*;
+pub use surface_pacing::SurfacePacingMetrics;
+#[allow(unused_imports)]
+pub(in crate::compositor) use surface_pacing::{
+    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingConstraint, FifoBarrierClaim,
+    FifoBarrierClearReason, FifoBarrierGeneration, PendingSurfacePacingState,
+};
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::*;
 #[allow(unused_imports)]

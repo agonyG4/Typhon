@@ -168,6 +168,11 @@ impl CompositorState {
         let _ = self
             .settle_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let mut batch = self.take_presented_frame_batch(frame_id, batch_id);
+        for claim in &batch.fifo_barrier_claims {
+            if claim.surface_id == direct_surface_id {
+                self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+            }
+        }
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let callbacks = std::mem::take(&mut batch.callbacks);
         self.complete_frame_callbacks(callbacks);
@@ -189,6 +194,9 @@ impl CompositorState {
             .frame_batches
             .remove(&batch_id)
             .expect("missing compositor frame batch for no-visual-change settlement");
+        for claim in &batch.fifo_barrier_claims {
+            self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::LatchingDeadline);
+        }
         for pending in std::mem::take(&mut batch.presentation_feedbacks) {
             pending.feedback.discarded();
         }

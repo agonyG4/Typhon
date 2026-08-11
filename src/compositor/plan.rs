@@ -13,6 +13,8 @@ pub enum ProtocolGlobal {
     WpPointerConstraints,
     WpIdleInhibit,
     WpPrimarySelection,
+    WpFifo,
+    WpCommitTiming,
     ExtDataControl,
     XdgDecoration,
     LinuxDmabuf,
@@ -39,6 +41,8 @@ impl ProtocolGlobal {
             Self::WpPointerConstraints => "zwp_pointer_constraints_v1",
             Self::WpIdleInhibit => "zwp_idle_inhibit_manager_v1",
             Self::WpPrimarySelection => "zwp_primary_selection_device_manager_v1",
+            Self::WpFifo => "wp_fifo_manager_v1",
+            Self::WpCommitTiming => "wp_commit_timing_manager_v1",
             Self::ExtDataControl => "ext_data_control_manager_v1",
             Self::XdgDecoration => "zxdg_decoration_manager_v1",
             Self::LinuxDmabuf => "zwp_linux_dmabuf_v1",
@@ -112,6 +116,32 @@ pub struct RendererProtocolCapabilities {
     pub color_management: bool,
 }
 
+/// Protocols which are safe to expose only after their complete frame-pacing
+/// path has been qualified.  These are deliberately separate from the base
+/// client protocol list so a partial implementation cannot become a public
+/// global by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePacingProtocolCapabilities {
+    pub fifo: bool,
+    pub commit_timing: bool,
+}
+
+impl FramePacingProtocolCapabilities {
+    pub const fn safe_baseline() -> Self {
+        Self {
+            fifo: false,
+            commit_timing: false,
+        }
+    }
+
+    pub const fn qualified_native() -> Self {
+        Self {
+            fifo: true,
+            commit_timing: true,
+        }
+    }
+}
+
 impl RendererProtocolCapabilities {
     pub const fn unsupported() -> Self {
         Self {
@@ -141,6 +171,20 @@ pub fn client_protocols_for_capabilities(
     selection_capabilities: SelectionProtocolCapabilities,
     renderer_capabilities: RendererProtocolCapabilities,
 ) -> Vec<ProtocolGlobal> {
+    client_protocols_for_capabilities_with_frame_pacing(
+        input_capabilities,
+        selection_capabilities,
+        renderer_capabilities,
+        FramePacingProtocolCapabilities::safe_baseline(),
+    )
+}
+
+pub fn client_protocols_for_capabilities_with_frame_pacing(
+    input_capabilities: InputProtocolCapabilities,
+    selection_capabilities: SelectionProtocolCapabilities,
+    renderer_capabilities: RendererProtocolCapabilities,
+    frame_pacing_capabilities: FramePacingProtocolCapabilities,
+) -> Vec<ProtocolGlobal> {
     let mut protocols = BASE_CLIENT_PROTOCOLS.to_vec();
     let selection_insert_at = protocols
         .iter()
@@ -154,6 +198,13 @@ pub fn client_protocols_for_capabilities(
     }
     if selection_capabilities.clipboard {
         protocols.insert(selection_insert_at, ProtocolGlobal::WlDataDeviceManager);
+    }
+
+    if frame_pacing_capabilities.commit_timing {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WpCommitTiming);
+    }
+    if frame_pacing_capabilities.fifo {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WpFifo);
     }
 
     if renderer_capabilities.color_management {
@@ -247,6 +298,7 @@ impl CompositorArchitecture {
 pub struct CompositorPlan {
     pub socket_name: String,
     pub architecture: CompositorArchitecture,
+    pub frame_pacing_capabilities: FramePacingProtocolCapabilities,
 }
 
 impl CompositorPlan {
@@ -254,7 +306,16 @@ impl CompositorPlan {
         Self {
             socket_name: socket_name.into(),
             architecture: CompositorArchitecture::default(),
+            frame_pacing_capabilities: FramePacingProtocolCapabilities::safe_baseline(),
         }
+    }
+
+    pub fn with_frame_pacing_capabilities(
+        mut self,
+        capabilities: FramePacingProtocolCapabilities,
+    ) -> Self {
+        self.frame_pacing_capabilities = capabilities;
+        self
     }
 
     pub const fn uses_external_compositor(&self) -> bool {
@@ -266,10 +327,11 @@ impl CompositorPlan {
     }
 
     pub fn protocol_names(&self) -> Vec<&'static str> {
-        client_protocols_for_capabilities(
+        client_protocols_for_capabilities_with_frame_pacing(
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
+            self.frame_pacing_capabilities,
         )
         .into_iter()
         .map(ProtocolGlobal::name)

@@ -64,6 +64,8 @@ fn native_registry_advertises_enabled_idle_inhibition() {
 
     let globals = result.unwrap();
     assert!(globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
+    assert!(globals.contains(&"wp_fifo_manager_v1".to_string()));
+    assert!(globals.contains(&"wp_commit_timing_manager_v1".to_string()));
 }
 
 #[test]

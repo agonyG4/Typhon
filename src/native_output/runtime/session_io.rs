@@ -465,7 +465,10 @@ impl NativeSessionIo for NativeRuntime {
                 self.xwayland.next_deadline_ns(),
                 earliest_native_deadline(
                     self.control_server.next_deadline_ns(),
-                    publication_deadline,
+                    earliest_native_deadline(
+                        publication_deadline,
+                        self.server.next_surface_pacing_deadline_ns(),
+                    ),
                 ),
             ),
         ))?;

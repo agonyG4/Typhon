@@ -151,12 +151,37 @@ fn native_libinput_profile_advertises_serviced_input_protocols() {
 }
 
 #[test]
-fn staging_frame_pacing_protocols_are_hidden_until_barriers_are_implemented() {
+fn safe_baseline_hides_frame_pacing_protocols() {
     let plan = CompositorPlan::new("oblivion-one-test");
     let protocols = plan.protocol_names();
 
     assert!(!protocols.contains(&"wp_fifo_manager_v1"));
     assert!(!protocols.contains(&"wp_commit_timing_manager_v1"));
+}
+
+#[test]
+fn qualified_native_frame_pacing_profile_advertises_each_v1_global_once() {
+    let plan = CompositorPlan::new("oblivion-one-test")
+        .with_frame_pacing_capabilities(FramePacingProtocolCapabilities::qualified_native());
+    let protocols = plan.protocol_names();
+
+    for name in ["wp_fifo_manager_v1", "wp_commit_timing_manager_v1"] {
+        assert_eq!(
+            protocols
+                .iter()
+                .filter(|candidate| **candidate == name)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        crate::compositor::protocols::versions::WP_FIFO_MANAGER_V1,
+        1
+    );
+    assert_eq!(
+        crate::compositor::protocols::versions::WP_COMMIT_TIMING_MANAGER_V1,
+        1
+    );
 }
 
 #[test]

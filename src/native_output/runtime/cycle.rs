@@ -58,6 +58,7 @@ impl NativeRuntime {
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
             self.dispatch_suspended_sources(&cycle)?;
+            self.server.progress_surface_pacing(monotonic_now_ns()?);
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
                 return Ok(());
@@ -73,6 +74,7 @@ impl NativeRuntime {
         }
         let wayland_dispatch_started = Instant::now();
         self.dispatch_wayland_and_input(&mut cycle)?;
+        self.server.progress_surface_pacing(monotonic_now_ns()?);
         self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
         self.service_control_events(&cycle.wakeup)?;
         self.service_cursor_io_completions(&cycle.wakeup)?;
@@ -192,7 +194,10 @@ impl NativeRuntime {
                     }
                     self.event_loop.arm_deadline(earliest_native_deadline(
                         Some(monotonic_now_ns()?.saturating_add(50_000_000)),
-                        self.control_server.next_deadline_ns(),
+                        earliest_native_deadline(
+                            self.control_server.next_deadline_ns(),
+                            self.server.next_surface_pacing_deadline_ns(),
+                        ),
                     ))?;
                     return Ok(());
                 }
@@ -207,7 +212,10 @@ impl NativeRuntime {
     fn arm_shutdown_deadline(&mut self) -> NativeResult<()> {
         self.event_loop.arm_deadline(earliest_native_deadline(
             self.shutdown.pageflip_deadline_ns(),
-            self.control_server.next_deadline_ns(),
+            earliest_native_deadline(
+                self.control_server.next_deadline_ns(),
+                self.server.next_surface_pacing_deadline_ns(),
+            ),
         ))?;
         Ok(())
     }
@@ -223,7 +231,10 @@ impl NativeRuntime {
                 self.shutdown.suspended_reactor_deadline_ns(),
                 self.control_server.next_deadline_ns(),
             ),
-            publication_deadline,
+            earliest_native_deadline(
+                publication_deadline,
+                self.server.next_surface_pacing_deadline_ns(),
+            ),
         ))?;
         Ok(())
     }

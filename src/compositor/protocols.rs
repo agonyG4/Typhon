@@ -1,9 +1,11 @@
 mod activation;
 mod advanced;
 mod buffers;
+mod commit_timing;
 mod core;
 mod data_control;
 mod data_device;
+mod fifo;
 mod globals;
 mod idle_inhibit;
 mod input;

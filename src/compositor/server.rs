@@ -57,11 +57,12 @@ use super::{
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
     CoreComplianceMetrics, DirectScanoutFeedbackCapabilities, DirectScanoutSceneBlockers,
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
-    FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime, FramePresentation,
-    FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect, PendingProcessLaunch,
-    PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause,
-    RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
+    FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
+    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
+    PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface,
+    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
+    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, SurfacePacingMetrics,
     WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
     WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
     XwaylandSceneMetricsSnapshot, color,
@@ -181,6 +182,7 @@ impl OwnCompositorServer {
             InputProtocolCapabilities::native_libinput(),
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
+            FramePacingProtocolCapabilities::qualified_native(),
         )
     }
 
@@ -197,6 +199,25 @@ impl OwnCompositorServer {
             input_capabilities,
             selection_capabilities,
             renderer_capabilities,
+            FramePacingProtocolCapabilities::safe_baseline(),
+        )
+    }
+
+    pub fn bind_with_capabilities_and_frame_pacing(
+        socket_name: impl Into<String>,
+        gpu_buffers_enabled: bool,
+        input_capabilities: InputProtocolCapabilities,
+        selection_capabilities: SelectionProtocolCapabilities,
+        renderer_capabilities: RendererProtocolCapabilities,
+        frame_pacing_capabilities: FramePacingProtocolCapabilities,
+    ) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            gpu_buffers_enabled,
+            input_capabilities,
+            selection_capabilities,
+            renderer_capabilities,
+            frame_pacing_capabilities,
         )
     }
 
@@ -211,6 +232,7 @@ impl OwnCompositorServer {
             input_capabilities,
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
+            FramePacingProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -225,6 +247,7 @@ impl OwnCompositorServer {
             InputProtocolCapabilities::desktop_baseline(),
             selection_capabilities,
             RendererProtocolCapabilities::unsupported(),
+            FramePacingProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -239,6 +262,7 @@ impl OwnCompositorServer {
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
+            FramePacingProtocolCapabilities::safe_baseline(),
         )?;
         server.state.clipboard_bridge = Some(clipboard_bridge);
         Ok(server)
@@ -254,6 +278,7 @@ impl OwnCompositorServer {
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
+            FramePacingProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -263,6 +288,7 @@ impl OwnCompositorServer {
         input_capabilities: InputProtocolCapabilities,
         selection_capabilities: SelectionProtocolCapabilities,
         renderer_capabilities: RendererProtocolCapabilities,
+        frame_pacing_capabilities: FramePacingProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
         let astrea_shell_capability = {
@@ -315,6 +341,7 @@ impl OwnCompositorServer {
             input_capabilities,
             selection_capabilities,
             renderer_capabilities,
+            frame_pacing_capabilities,
             xwayland_global_data.clone(),
         );
         let socket = ListeningSocket::bind(&socket_name)
@@ -937,6 +964,10 @@ impl OwnCompositorServer {
         self.state.subsurface_transaction_metrics
     }
 
+    pub const fn surface_pacing_metrics(&self) -> SurfacePacingMetrics {
+        self.state.surface_pacing_metrics
+    }
+
     pub fn fullscreen_render_plan_metrics(&self) -> FullscreenRenderPlanMetrics {
         self.state.fullscreen_render_plan_metrics()
     }
@@ -1411,6 +1442,8 @@ impl OwnCompositorServer {
         self.publish_astrea_toplevel_updates();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
+        self.state
+            .progress_surface_pacing(super::pacing::client_pacing_now_ns());
         self.display.flush_clients()?;
         dispatch_result?;
         Ok(accepted)

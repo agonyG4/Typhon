@@ -111,6 +111,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let buffer_transform_change = data.take_pending_buffer_transform();
                 let input_region_change = data.take_pending_input_region();
                 let opaque_region_change = data.take_pending_opaque_region();
+                let mut pacing = data.take_pending_surface_pacing();
+                pacing.fifo_wait_ignored_for_synchronized_subsurface = pacing.fifo_wait_barrier
+                    && state.is_effectively_synchronized_subsurface(surface_id);
                 let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
                 let mut attachment = data.take_pending();
                 if let Some(PendingSurfaceAttachment::Buffer(buffer)) = attachment.as_mut() {
@@ -231,6 +234,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     resize_capture_finalized: false,
                     window_geometry,
                     cached_at: Instant::now(),
+                    pacing,
                 };
                 state.commit_surface_tree_request(surface_id, commit);
             }

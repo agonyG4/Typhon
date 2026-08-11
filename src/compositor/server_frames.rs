@@ -8,6 +8,30 @@ pub struct PreparedDirectFrameBatch {
 }
 
 impl OwnCompositorServer {
+    /// Earliest monotonic wake at which an ordered surface transaction can
+    /// change pacing readiness.  Native output folds this into its existing
+    /// deadline arbitration.
+    #[doc(hidden)]
+    pub fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
+        self.state.next_surface_pacing_deadline_ns()
+    }
+
+    /// Earliest monotonic Commit Timing lower bound still held by an ordered
+    /// surface transaction.  Native output uses this to select a refresh
+    /// target before the transaction becomes publishable.
+    #[doc(hidden)]
+    pub fn next_commit_timing_deadline_ns(&self) -> Option<u64> {
+        self.state.next_commit_timing_deadline_ns()
+    }
+
+    /// Re-evaluate ordered FIFO/timing constraints after a native wake.  This
+    /// publishes work through the normal surface-tree path; it does not render
+    /// or submit anything itself.
+    #[doc(hidden)]
+    pub fn progress_surface_pacing(&mut self, now_ns: u64) {
+        self.state.progress_surface_pacing(now_ns);
+    }
+
     #[doc(hidden)]
     pub fn has_prepared_frame_batch(&self) -> bool {
         self.state.legacy_prepared_frame_batch.is_some()

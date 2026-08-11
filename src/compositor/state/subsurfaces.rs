@@ -3,6 +3,7 @@
 use super::*;
 
 impl CompositorState {
+    const MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT: usize = 8;
     pub(in crate::compositor) fn register_subsurface_relationship(
         &mut self,
         surface_id: u32,
@@ -214,6 +215,9 @@ impl CompositorState {
         let incoming_has_unready_acquire = !dependencies.is_empty();
         let incoming_has_attachment_change =
             nodes.iter().any(|(_, commit)| commit.attachment.is_some());
+        let incoming_is_pacing_protected =
+            nodes.iter().any(|(_, commit)| commit.pacing.is_boundary());
+        let incoming_is_ready = self.surface_tree_parts_ready(&nodes, &dependencies);
         let matching = self
             .pending_surface_tree_transactions
             .iter()
@@ -223,16 +227,36 @@ impl CompositorState {
             })
             .collect::<Vec<_>>();
         let Some(&target_index) = matching.last() else {
-            if incoming_has_unready_acquire {
+            if incoming_has_unready_acquire || (incoming_is_pacing_protected && !incoming_is_ready)
+            {
                 self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
             } else {
                 self.publish_surface_tree_nodes(root_surface_id, nodes);
             }
             return;
         };
-        if incoming_has_attachment_change
-            && self.pending_surface_tree_transactions[target_index].is_ready()
-        {
+        let target_is_ready =
+            self.transaction_is_ready(&self.pending_surface_tree_transactions[target_index]);
+        let target_is_pacing_protected =
+            self.pending_surface_tree_transactions[target_index].is_pacing_protected();
+        if target_is_pacing_protected || incoming_is_pacing_protected {
+            if target_is_pacing_protected {
+                self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
+                self.commit_ready_surface_tree_transactions();
+                return;
+            }
+            if incoming_has_attachment_change && target_is_ready {
+                self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
+                self.commit_ready_surface_tree_transactions();
+                return;
+            }
+            if incoming_is_pacing_protected {
+                self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
+                self.commit_ready_surface_tree_transactions();
+                return;
+            }
+        }
+        if incoming_has_attachment_change && target_is_ready {
             if incoming_has_unready_acquire {
                 self.subsurface_transaction_metrics
                     .ready_transactions_preserved_from_newer_unready = self
@@ -258,7 +282,7 @@ impl CompositorState {
             nodes,
             dependencies,
         );
-        let ready_after_merge = transaction.is_ready();
+        let ready_after_merge = self.transaction_is_ready(&transaction);
         self.record_surface_tree_merge_metrics(&stats);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
@@ -419,7 +443,7 @@ impl CompositorState {
             .iter()
             .filter(|transaction| transaction.root_surface_id == root_surface_id)
         {
-            if transaction.is_ready() {
+            if self.transaction_is_ready(transaction) {
                 ready = ready.saturating_add(1);
             } else {
                 waiting = waiting.saturating_add(1);
@@ -583,10 +607,11 @@ impl CompositorState {
                 (transaction.root_surface_id == root_surface_id).then_some(index)
             })
             .collect::<Vec<_>>();
-        let at_capacity_with_only_ready = matching.len() >= 3
-            && matching
-                .iter()
-                .all(|index| self.pending_surface_tree_transactions[*index].is_ready());
+        let at_capacity_with_only_ready = matching.len()
+            >= Self::MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT
+            && matching.iter().all(|index| {
+                self.transaction_is_ready(&self.pending_surface_tree_transactions[*index])
+            });
         if at_capacity_with_only_ready {
             self.subsurface_transaction_metrics.all_ready_queue_pressure = self
                 .subsurface_transaction_metrics
@@ -595,23 +620,25 @@ impl CompositorState {
             self.commit_ready_surface_tree_transactions();
             matching.clear();
         }
-        if matching.len() >= 3 {
+        if matching.len() >= Self::MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT {
             self.subsurface_transaction_metrics
                 .explicit_sync_queue_overflow = self
                 .subsurface_transaction_metrics
                 .explicit_sync_queue_overflow
                 .saturating_add(1);
-            let remove_index = explicit_sync_overflow_unready_index(matching.iter().map(|index| {
-                (
-                    *index,
-                    self.pending_surface_tree_transactions[*index].is_ready(),
-                )
-            }));
+            let remove_index = matching.iter().copied().find(|index| {
+                !self.transaction_is_ready(&self.pending_surface_tree_transactions[*index])
+                    && !self.pending_surface_tree_transactions[*index].is_pacing_protected()
+            });
             let Some(remove_index) = remove_index else {
-                debug_assert!(
-                    false,
-                    "ready explicit-sync queue must publish before overflow"
-                );
+                let pacing_protected = nodes.iter().any(|(_, commit)| commit.pacing.is_boundary());
+                if pacing_protected {
+                    self.note_protocol_error_metric();
+                    if let Some(surface) = self.surface_resource_by_id(root_surface_id) {
+                        surface
+                            .post_error(1u32, "surface tree pacing transaction budget exhausted");
+                    }
+                }
                 self.release_unpublished_surface_tree_nodes(nodes);
                 return;
             };
@@ -673,7 +700,7 @@ impl CompositorState {
                 .iter()
                 .filter(|transaction| transaction.root_surface_id == root_surface_id)
                 .count()
-                <= 3
+                <= Self::MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT
         );
         self.update_surface_tree_slot_metrics(root_surface_id);
         let pending_acquires = self.pending_explicit_sync_commits.len().saturating_add(
@@ -1124,9 +1151,8 @@ impl CompositorState {
 
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
         let parent_id = self.subsurface_transactions.parent(surface_id);
-        if let Some(commit) = self.subsurface_transactions.remove_role(surface_id) {
-            self.release_cached_subsurface_commits(vec![commit]);
-        }
+        let cached = self.subsurface_transactions.remove_role(surface_id);
+        self.release_cached_subsurface_commits(cached);
         self.unmap_surface_content(surface_id);
         self.deactivate_role_instance(surface_id);
         self.set_surface_placement(surface_id, SurfacePlacement::root());

@@ -3,7 +3,98 @@ use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget, PresentationTargetReason,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
+use oblivion_one::{compositor::OwnCompositorServer, native::scheduler::NativeFrameScheduler};
+use std::io;
 use std::time::Duration;
+
+pub(super) fn pending_target_for_scanout(
+    scanout: &super::super::scanout::NativeScanoutBackend,
+) -> io::Result<Option<PresentationTarget>> {
+    match scanout {
+        super::super::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
+            Ok(explicit.swapchain()?.latest_future_primary_target())
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(super) fn plan_commit_timing_target(
+    planner: &mut PresentationDeadlinePlanner,
+    server: &OwnCompositorServer,
+    frame_scheduler: &NativeFrameScheduler,
+    scheduled: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+) -> Option<PresentationTarget> {
+    let Some(requested_target) = server.next_commit_timing_deadline_ns() else {
+        return scheduled;
+    };
+    let requested_target = MonotonicTimestampNs::new(requested_target);
+    let needs_commit_timing_target = scheduled
+        .map(|target| {
+            target.reason != PresentationTargetReason::CommitTiming
+                || target.presentation_time < requested_target
+        })
+        .unwrap_or(true);
+    (frame_scheduler.visual_work_queued() && needs_commit_timing_target)
+        .then(|| planner.plan_not_before(now, requested_target, predicted_total_cost))
+        .flatten()
+        .or(scheduled)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_presentation_target_for_mode(
+    pacing_mode: NativeOutputPacingMode,
+    explicit_output: bool,
+    planner: &mut PresentationDeadlinePlanner,
+    server: &OwnCompositorServer,
+    frame_scheduler: &NativeFrameScheduler,
+    scheduled: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+) -> Option<PresentationTarget> {
+    let scheduled = if pacing_mode == NativeOutputPacingMode::ReactiveDouble
+        && scheduled.is_none_or(|target| target.reason != PresentationTargetReason::CommitTiming)
+    {
+        planner.clear_scheduled_target();
+        None
+    } else {
+        scheduled
+    };
+    if explicit_output {
+        plan_commit_timing_target(
+            planner,
+            server,
+            frame_scheduler,
+            scheduled,
+            now,
+            predicted_total_cost,
+        )
+    } else {
+        scheduled
+    }
+}
+
+pub(super) fn reactive_or_commit_timing_target(
+    planner: &PresentationDeadlinePlanner,
+    scheduled: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+) -> Option<PresentationTarget> {
+    scheduled
+        .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
+        .or_else(|| planner.reactive_target(now))
+}
+
+pub(super) fn take_reactive_or_commit_timing_target(
+    planner: &PresentationDeadlinePlanner,
+    scheduled: &mut Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+) -> Option<PresentationTarget> {
+    scheduled
+        .take()
+        .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
+        .or_else(|| planner.reactive_target(now))
+}
 
 pub(super) fn plan_scheduled_target_for_mode(
     planner: &mut PresentationDeadlinePlanner,
@@ -19,13 +110,45 @@ pub(super) fn plan_scheduled_target_for_mode(
     planner.plan_render_ahead(pending_target?, now, predicted_total_cost, reason)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_visual_target_for_mode(
+    planner: &mut PresentationDeadlinePlanner,
+    pacing_mode: NativeOutputPacingMode,
+    pending_target: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    explicit_output: bool,
+    visual_work_queued: bool,
+    force_validation: bool,
+    scheduled: Option<PresentationTarget>,
+) -> Option<PresentationTarget> {
+    if !explicit_output || !visual_work_queued || scheduled.is_some() {
+        return scheduled;
+    }
+    let reason = if force_validation {
+        PresentationTargetReason::ForcedValidation
+    } else {
+        PresentationTargetReason::PredictedPressure
+    };
+    plan_scheduled_target_for_mode(
+        planner,
+        pacing_mode,
+        pending_target,
+        now,
+        predicted_total_cost,
+        reason,
+    )
+}
+
 pub(super) fn visual_target_deadline_for_mode(
     pacing_mode: NativeOutputPacingMode,
     scheduled_target: Option<PresentationTarget>,
 ) -> Option<u64> {
-    (pacing_mode == NativeOutputPacingMode::PredictiveTriple)
-        .then(|| scheduled_target.map(|target| target.render_start_deadline.get()))
-        .flatten()
+    (pacing_mode == NativeOutputPacingMode::PredictiveTriple
+        || scheduled_target
+            .is_some_and(|target| target.reason == PresentationTargetReason::CommitTiming))
+    .then(|| scheduled_target.map(|target| target.render_start_deadline.get()))
+    .flatten()
 }
 
 #[derive(Debug, PartialEq, Eq)]

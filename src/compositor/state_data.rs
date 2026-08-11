@@ -10,6 +10,7 @@ use wayland_server::{
     protocol::{wl_buffer, wl_callback, wl_output, wl_surface},
 };
 
+use crate::compositor::state::PendingSurfacePacingState;
 use crate::compositor::{DragSessionPhase, XdgAssociationReservation};
 use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
@@ -272,6 +273,7 @@ pub(super) struct SurfaceData {
     pending_buffer_damage: Mutex<Vec<PendingBufferDamageRect>>,
     frame_callbacks: Mutex<Vec<wl_callback::WlCallback>>,
     explicit_sync: Mutex<Option<Arc<SyncobjSurfaceState>>>,
+    pub(super) pending_pacing: Mutex<PendingSurfacePacingState>,
     viewport: Mutex<SurfaceViewportState>,
     buffer_scale: Mutex<SurfaceBufferScaleState>,
     buffer_transform: Mutex<SurfaceBufferTransformState>,

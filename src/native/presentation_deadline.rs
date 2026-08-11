@@ -35,6 +35,7 @@ pub enum PresentationTargetReason {
     PredictedPressure,
     ProvenReadinessMiss,
     ForcedValidation,
+    CommitTiming,
 }
 
 #[doc(hidden)]
@@ -130,6 +131,36 @@ impl PresentationDeadlinePlanner {
             false,
             if estimated {
                 MonotonicTimestampNs::new(0)
+            } else {
+                submit_not_before(presentation_time, self.refresh_interval)
+            },
+        );
+        self.scheduled = Some(target);
+        Some(target)
+    }
+
+    /// Select the first refresh target which is both reachable after the
+    /// predicted render cost and not earlier than a surface Commit Timing
+    /// request.  The request is therefore a presentation lower bound, not a
+    /// timer which releases work at the last possible instant.
+    pub fn plan_not_before(
+        &mut self,
+        now: MonotonicTimestampNs,
+        requested_target: MonotonicTimestampNs,
+        predicted_total_cost: Duration,
+    ) -> Option<PresentationTarget> {
+        let ready_at = now.checked_add(predicted_total_cost)?;
+        let eligible_at = MonotonicTimestampNs::new(ready_at.get().max(requested_target.get()));
+        let (sequence, presentation_time, estimated) = self.earliest_reachable(eligible_at)?;
+        let target = self.make_target(
+            sequence,
+            presentation_time,
+            predicted_total_cost,
+            PresentationTargetReason::CommitTiming,
+            estimated,
+            false,
+            if estimated {
+                now
             } else {
                 submit_not_before(presentation_time, self.refresh_interval)
             },
@@ -512,5 +543,84 @@ mod tests {
             presented_at = target.presentation_time;
             assert_eq!(planner.note_presented(presented_at), expected_sequence);
         }
+    }
+
+    #[test]
+    fn commit_timing_chooses_first_refresh_not_before_requested_target() {
+        for refresh in [60, 120, 165] {
+            let interval = Duration::from_nanos(1_000_000_000 / refresh);
+            let mut planner = PresentationDeadlinePlanner::new(interval);
+            planner.note_presented(MonotonicTimestampNs::new(1_000_000_000));
+            let requested =
+                MonotonicTimestampNs::new(1_000_000_000 + interval.as_nanos() as u64 + 1);
+            let target = planner
+                .plan_not_before(
+                    MonotonicTimestampNs::new(1_000_000_000 + 1_000),
+                    requested,
+                    Duration::from_micros(500),
+                )
+                .unwrap();
+            assert!(target.presentation_time.get() >= requested.get());
+            assert_eq!(target.reason, PresentationTargetReason::CommitTiming);
+        }
+    }
+
+    #[test]
+    fn commit_timing_accounts_for_render_cost_without_presenting_early() {
+        let interval = Duration::from_millis(10);
+        let mut planner = PresentationDeadlinePlanner::new(interval);
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        let target = planner
+            .plan_not_before(
+                MonotonicTimestampNs::new(101_000_000),
+                MonotonicTimestampNs::new(105_000_000),
+                Duration::from_millis(7),
+            )
+            .unwrap();
+
+        assert_eq!(target.presentation_time.get(), 110_000_000);
+        assert!(target.render_start_deadline().get() <= 103_000_000);
+    }
+
+    #[test]
+    fn commit_timing_past_target_is_immediately_render_eligible() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_millis(10));
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        let target = planner
+            .plan_not_before(
+                MonotonicTimestampNs::new(121_000_000),
+                MonotonicTimestampNs::new(90_000_000),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(target.presentation_time.get(), 130_000_000);
+    }
+
+    #[test]
+    fn commit_timing_target_is_invalidated_with_the_clock_generation() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_millis(10));
+        let target = planner
+            .plan_not_before(
+                MonotonicTimestampNs::new(1),
+                MonotonicTimestampNs::new(2),
+                Duration::from_nanos(1),
+            )
+            .unwrap();
+        planner.invalidate(Duration::from_millis(10));
+        assert!(!planner.is_current(target));
+    }
+
+    #[test]
+    fn commit_timing_handles_large_timestamp_without_overflow() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(1));
+        planner.note_presented(MonotonicTimestampNs::new(u64::MAX - 100));
+        let target = planner
+            .plan_not_before(
+                MonotonicTimestampNs::new(u64::MAX - 10),
+                MonotonicTimestampNs::new(u64::MAX - 5),
+                Duration::from_nanos(1),
+            )
+            .unwrap();
+        assert!(target.presentation_time.get() >= u64::MAX - 5);
     }
 }

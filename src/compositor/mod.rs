@@ -33,6 +33,8 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
     wp_linux_drm_syncobj_timeline_v1,
 };
 use wayland_protocols::wp::{
+    commit_timing::v1::server::{wp_commit_timer_v1, wp_commit_timing_manager_v1},
+    fifo::v1::server::{wp_fifo_manager_v1, wp_fifo_v1},
     fractional_scale::v1::server::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     idle_inhibit::zv1::server::{zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1},
     pointer_constraints::zv1::server::{
@@ -96,6 +98,7 @@ mod shm;
 mod state_data;
 mod subsurface;
 mod surface;
+mod surface_pacing_data;
 mod toplevel_actions;
 mod toplevel_collection;
 mod toplevel_publication;
@@ -207,9 +210,10 @@ use output::{
 };
 use pacing::*;
 pub use plan::{
-    ArchitectureLayer, CompositorArchitecture, CompositorPlan, InputProtocolCapabilities,
-    ProtocolGlobal, RendererProtocolCapabilities, SelectionProtocolCapabilities,
-    client_protocols_for_capabilities,
+    ArchitectureLayer, CompositorArchitecture, CompositorPlan, FramePacingProtocolCapabilities,
+    InputProtocolCapabilities, ProtocolGlobal, RendererProtocolCapabilities,
+    SelectionProtocolCapabilities, client_protocols_for_capabilities,
+    client_protocols_for_capabilities_with_frame_pacing,
 };
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
@@ -241,7 +245,7 @@ use shm::{
 };
 pub(crate) use state::OverrideRedirectStackSnapshotResult;
 pub use state::{
-    AstreaShortcutPhase, XwaylandSceneBatchError, XwaylandSceneBatchToken,
+    AstreaShortcutPhase, SurfacePacingMetrics, XwaylandSceneBatchError, XwaylandSceneBatchToken,
     XwaylandSceneMetricsSnapshot,
 };
 use state_data::*;
@@ -464,13 +468,11 @@ pub(in crate::compositor) enum SurfaceTeardownReason {
     RoleDestroyed,
     CompositorShutdown,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct SurfaceTeardownResult {
     pub removed_resource: bool,
     pub removed_renderables: usize,
 }
-
 #[derive(Debug, Default)]
 pub struct CompositorState {
     pub accepted_clients: usize,
@@ -481,6 +483,11 @@ pub struct CompositorState {
     next_surface_id: u32,
     buffer_ids: BufferIdAllocator,
     surface_resources: HashMap<u32, wl_surface::WlSurface>,
+    fifo_resources: HashMap<u32, wp_fifo_v1::WpFifoV1>,
+    commit_timer_resources: HashMap<u32, wp_commit_timer_v1::WpCommitTimerV1>,
+    active_fifo_barriers: HashMap<u32, ActiveFifoBarrier>,
+    next_fifo_barrier_generation: u64,
+    surface_pacing_metrics: SurfacePacingMetrics,
     output_resources: Vec<wl_output::WlOutput>,
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
@@ -665,13 +672,11 @@ pub(crate) struct SurfacePresentationKey {
 pub struct SurfaceDamagePresentation {
     sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
 }
-
 #[derive(Debug, Clone)]
 pub struct PendingProcessLaunch {
     pub argv: Vec<String>,
     pub request: astrea_launch_request_v1::AstreaLaunchRequestV1,
 }
-
 #[derive(Debug, Clone)]
 struct AstreaShortcutRegistration {
     resource: astrea_shortcut_v1::AstreaShortcutV1,

@@ -18,6 +18,12 @@ pub(in crate::compositor) struct PendingSurfaceTreeTransaction {
     pub(in crate::compositor) received_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum TransactionOrdering {
+    Coalescible,
+    PacingProtected,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct SurfacePublicationState {
     pub(in crate::compositor) latest_received: SurfaceCommitSequence,
@@ -103,10 +109,20 @@ pub(in crate::compositor) struct BufferlessSurfaceCommitState {
 }
 
 impl PendingSurfaceTreeTransaction {
-    pub(in crate::compositor) fn is_ready(&self) -> bool {
-        self.dependencies
+    pub(in crate::compositor) fn ordering(&self) -> TransactionOrdering {
+        if self
+            .nodes
             .iter()
-            .all(|dependency| dependency.state == PendingAcquireState::Ready)
+            .any(|(_, commit)| commit.pacing.is_boundary())
+        {
+            TransactionOrdering::PacingProtected
+        } else {
+            TransactionOrdering::Coalescible
+        }
+    }
+
+    pub(in crate::compositor) fn is_pacing_protected(&self) -> bool {
+        self.ordering() == TransactionOrdering::PacingProtected
     }
 }
 
@@ -134,7 +150,9 @@ impl CompositorState {
             resize_capture_finalized,
             window_geometry,
             cached_at: _,
+            pacing,
         } = commit;
+        self.apply_captured_surface_pacing(surface_id, commit_sequence, pacing);
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
             return;
         };

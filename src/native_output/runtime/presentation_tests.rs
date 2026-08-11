@@ -1,4 +1,4 @@
-use super::super::planner::visual_target_deadline_for_mode;
+use super::super::planner::{plan_scheduled_target_for_mode, visual_target_deadline_for_mode};
 use super::kms_worker::{
     ValidationBaseInvalidationDisposition, WorkerRejectionKind, direct_rejection_policy,
     validation_base_invalidation_disposition,

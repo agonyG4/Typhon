@@ -251,13 +251,17 @@ impl CompositorState {
                     && commit.attachment.is_some()
             });
             if supersedes {
-                if transaction.is_ready() {
+                if transaction.is_pacing_protected() {
+                    retained_trees.push(transaction);
+                    continue;
+                }
+                if self.transaction_is_ready(&transaction) {
                     retained_trees.push(transaction);
                     continue;
                 }
                 let root_surface_id = transaction.root_surface_id;
                 let replacement = SurfaceCommitId::from_sequence(new_sequence);
-                let acquire_state = if transaction.is_ready() {
+                let acquire_state = if self.transaction_is_ready(&transaction) {
                     PendingAcquireState::Ready
                 } else {
                     PendingAcquireState::RegistrationPending
@@ -747,6 +751,19 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
+        if let Some(active) = self.active_fifo_barriers.get(&surface_id).copied() {
+            self.clear_fifo_barrier_claim(
+                FifoBarrierClaim {
+                    surface_id,
+                    surface_generation: active.surface_generation,
+                    fifo_barrier_generation: active.fifo_barrier_generation,
+                    commit_sequence: active.commit_sequence,
+                },
+                FifoBarrierClearReason::SurfaceTeardown,
+            );
+        }
+        self.fifo_resources.remove(&surface_id);
+        self.commit_timer_resources.remove(&surface_id);
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);
         self.surface_presentation_generations.remove(&surface_id);

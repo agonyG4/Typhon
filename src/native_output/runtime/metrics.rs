@@ -843,9 +843,12 @@ impl NativeRuntime {
                         self.cursor_output_arbitration.deadline_ns(),
                         earliest_native_deadline(
                             self.control_server.next_deadline_ns(),
-                            self.server
-                                .has_pending_astrea_toplevel_publication()
-                                .then_some(now_ns),
+                            earliest_native_deadline(
+                                self.server
+                                    .has_pending_astrea_toplevel_publication()
+                                    .then_some(now_ns),
+                                self.server.next_surface_pacing_deadline_ns(),
+                            ),
                         ),
                     ),
                 ),

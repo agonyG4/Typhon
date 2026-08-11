@@ -61,6 +61,18 @@ Core/XDG request matrix, but they must remain synchronized with
 | `wl_seat` | 7 | Implemented |
 | `xwayland_shell_v1` | 1 | Implemented for the active private XWayland client |
 
+## Qualified frame-pacing extension inventory
+
+These staging protocol globals are intentionally absent from the safe baseline
+and are advertised only by the native qualified profile. Their implementation
+and deterministic evidence are tracked in
+`docs/wayland/FRAME_PACING_V1.md`.
+
+| interface | advertised | status |
+|---|---:|---|
+| `wp_fifo_manager_v1` | 1 | Implemented (qualified native profile only) |
+| `wp_commit_timing_manager_v1` | 1 | Implemented (qualified native profile only) |
+
 The current dispatch audit still finds generated-protocol wildcard arms in
 some extension handlers. Covered Core/XDG requests have explicit dispatch or
 are documented below as validated no-ops; the remaining wildcard inventory is

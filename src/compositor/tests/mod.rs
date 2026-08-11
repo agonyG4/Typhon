@@ -43,6 +43,13 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_offer_v1 as client_ext_data_control_offer_v1,
     ext_data_control_source_v1 as client_ext_data_control_source_v1,
 };
+use wayland_protocols::wp::commit_timing::v1::client::{
+    wp_commit_timer_v1 as client_wp_commit_timer_v1,
+    wp_commit_timing_manager_v1 as client_wp_commit_timing_manager_v1,
+};
+use wayland_protocols::wp::fifo::v1::client::{
+    wp_fifo_manager_v1 as client_wp_fifo_manager_v1, wp_fifo_v1 as client_wp_fifo_v1,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1 as client_wp_fractional_scale_manager_v1,
     wp_fractional_scale_v1 as client_wp_fractional_scale_v1,
@@ -125,6 +132,7 @@ mod astrea_shortcuts;
 mod data_control;
 mod data_device;
 mod direct_scanout;
+mod frame_pacing;
 mod input_output;
 mod layer_shell;
 mod lifecycle;

@@ -1,6 +1,10 @@
 use super::*;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
+use wayland_protocols::wp::{
+    commit_timing::v1::server::wp_commit_timing_manager_v1, fifo::v1::server::wp_fifo_manager_v1,
+};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_minimum_globals(
     display: &DisplayHandle,
     gpu_capabilities: &GpuProtocolCapabilities,
@@ -8,6 +12,7 @@ pub(super) fn register_minimum_globals(
     input_capabilities: InputProtocolCapabilities,
     selection_capabilities: SelectionProtocolCapabilities,
     renderer_capabilities: RendererProtocolCapabilities,
+    frame_pacing_capabilities: FramePacingProtocolCapabilities,
     xwayland_global_data: XwaylandShellGlobalData,
 ) {
     debug_assert!(
@@ -90,6 +95,19 @@ pub(super) fn register_minimum_globals(
             ext_data_control_manager_v1::ExtDataControlManagerV1,
             _,
         >(versions::EXT_DATA_CONTROL_MANAGER_V1, ());
+    }
+    if frame_pacing_capabilities.fifo {
+        display.create_global::<CompositorState, wp_fifo_manager_v1::WpFifoManagerV1, _>(
+            versions::WP_FIFO_MANAGER_V1,
+            (),
+        );
+    }
+    if frame_pacing_capabilities.commit_timing {
+        display.create_global::<
+            CompositorState,
+            wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+            _,
+        >(versions::WP_COMMIT_TIMING_MANAGER_V1, ());
     }
     display
         .create_global::<CompositorState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(

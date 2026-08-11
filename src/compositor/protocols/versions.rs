@@ -533,6 +533,8 @@ pub(crate) const WP_POINTER_WARP_V1: u32 = 1;
 pub(crate) const ZWP_IDLE_INHIBIT_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1: u32 = 1;
 pub(crate) const EXT_DATA_CONTROL_MANAGER_V1: u32 = 1;
+pub(crate) const WP_FIFO_MANAGER_V1: u32 = 1;
+pub(crate) const WP_COMMIT_TIMING_MANAGER_V1: u32 = 1;
 pub(crate) const ZXDG_DECORATION_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_LINUX_DMABUF_V1: u32 = 4;
 pub(crate) const WP_LINUX_DRM_SYNCOBJ_MANAGER_V1: u32 = 1;
@@ -572,6 +574,8 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
         ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1,
     ),
     GlobalAdvertisement::new("ext_data_control_manager_v1", EXT_DATA_CONTROL_MANAGER_V1),
+    GlobalAdvertisement::new("wp_fifo_manager_v1", WP_FIFO_MANAGER_V1),
+    GlobalAdvertisement::new("wp_commit_timing_manager_v1", WP_COMMIT_TIMING_MANAGER_V1),
     GlobalAdvertisement::new("zxdg_decoration_manager_v1", ZXDG_DECORATION_MANAGER_V1),
     GlobalAdvertisement::new("zwp_linux_dmabuf_v1", ZWP_LINUX_DMABUF_V1),
     GlobalAdvertisement::new(
