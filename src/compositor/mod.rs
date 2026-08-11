@@ -593,6 +593,7 @@ pub struct CompositorState {
     last_pointer_press: Option<PointerPress>,
     held_pointer_buttons: Vec<PointerPress>,
     implicit_pointer_grab: Option<ImplicitPointerGrab>,
+    next_input_epoch: u64,
     recent_input_serials: Vec<InputSerial>,
     active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
@@ -631,6 +632,7 @@ pub struct CompositorState {
     syncobj_device: Option<DrmSyncobjDevice>,
     clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
     selection_state: SelectionState,
+    next_selection_source_key: u64,
     data_sources: HashMap<ObjectId, ClipboardDataSource>,
     data_devices: Vec<ClipboardDataDevice>,
     data_offers: HashMap<ObjectId, ClipboardDataOffer>,
@@ -788,6 +790,7 @@ struct DataOfferData {
 #[derive(Debug, Clone)]
 struct ClipboardDataSource {
     source: wl_data_source::WlDataSource,
+    selection_key: SelectionSourceKey,
     client_id: ClientId,
     mime_types: Vec<String>,
     use_state: DataSourceUse,

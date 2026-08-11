@@ -67,6 +67,7 @@ pub(super) enum DragOfferPhase {
 #[derive(Debug, Clone)]
 pub(super) struct ActiveClipboard {
     pub(super) generation: u64,
+    pub(super) source_key: SelectionSourceKey,
     pub(super) source: ClipboardSourceBackend,
     pub(super) mime_types: Vec<String>,
 }

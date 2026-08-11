@@ -548,6 +548,11 @@ impl CompositorState {
         start.elapsed().as_millis() as u32
     }
 
+    pub(in crate::compositor) fn allocate_selection_source_key(&mut self) -> SelectionSourceKey {
+        self.next_selection_source_key = self.next_selection_source_key.wrapping_add(1).max(1);
+        SelectionSourceKey(self.next_selection_source_key)
+    }
+
     pub(in crate::compositor) fn remember_input_serial(
         &mut self,
         serial: u32,
@@ -556,10 +561,12 @@ impl CompositorState {
     ) {
         let client_id = surface.client().map(|client| client.id());
         let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(&surface));
+        self.next_input_epoch = self.next_input_epoch.wrapping_add(1).max(1);
         self.recent_input_serials
             .retain(|input| input.serial != serial);
         self.recent_input_serials.push(InputSerial {
             serial,
+            epoch: self.next_input_epoch,
             surface,
             client_id,
             root_surface_id,
@@ -607,7 +614,7 @@ impl CompositorState {
                 && input.kind == InputSerialKind::PointerEnter
                 && input.surface.id().same_client_as(&surface.id())
                 && same_surface_resource(&input.surface, surface)
-                && input.focus_generation <= self.focus_generation
+                && input.focus_generation == self.focus_generation
         })
     }
 
@@ -627,7 +634,7 @@ impl CompositorState {
                 && matches!(input.kind, InputSerialKind::PointerButtonPress { .. })
                 && input.root_surface_id == expected_root_surface_id
                 && input.client_id == surface.client().map(|client| client.id())
-                && input.focus_generation <= self.focus_generation
+                && input.focus_generation == self.focus_generation
         })
     }
 
@@ -644,17 +651,28 @@ impl CompositorState {
         client_id: &ClientId,
         serial: u32,
     ) -> bool {
-        self.recent_input_serials.iter().any(|input| {
-            input.serial == serial
-                && input.client_id.as_ref() == Some(client_id)
-                && matches!(
-                    input.kind,
-                    InputSerialKind::PointerButtonPress { .. }
-                        | InputSerialKind::KeyboardKeyPress { .. }
-                        | InputSerialKind::TouchDown { .. }
-                )
-                && input.focus_generation <= self.focus_generation
-        })
+        self.selection_input_epoch(client_id, serial).is_some()
+    }
+
+    pub(in crate::compositor) fn selection_input_epoch(
+        &self,
+        client_id: &ClientId,
+        serial: u32,
+    ) -> Option<u64> {
+        self.recent_input_serials
+            .iter()
+            .find(|input| {
+                input.serial == serial
+                    && input.client_id.as_ref() == Some(client_id)
+                    && matches!(
+                        input.kind,
+                        InputSerialKind::PointerButtonPress { .. }
+                            | InputSerialKind::KeyboardKeyPress { .. }
+                            | InputSerialKind::TouchDown { .. }
+                    )
+                    && input.focus_generation == self.focus_generation
+            })
+            .map(|input| input.epoch)
     }
 
     pub(in crate::compositor) fn register_data_source(
@@ -662,11 +680,17 @@ impl CompositorState {
         source: wl_data_source::WlDataSource,
         client_id: ClientId,
     ) {
-        self.selection_state.begin_source(source.id().protocol_id());
+        let selection_key = self.allocate_selection_source_key();
+        self.selection_state.register_source(
+            selection_key,
+            SelectionSourceKind::WaylandClipboard,
+            None,
+        );
         self.data_sources.insert(
             source.id(),
             ClipboardDataSource {
                 source,
+                selection_key,
                 client_id,
                 mime_types: Vec::new(),
                 use_state: DataSourceUse::Unused,
@@ -681,9 +705,7 @@ impl CompositorState {
         source: &wl_data_source::WlDataSource,
         mime_type: String,
     ) {
-        self.selection_state
-            .offer_source_mime_type(source.id().protocol_id(), mime_type.clone());
-        let Some(binding) = self.data_sources.get_mut(&source.id()) else {
+        let Some(binding) = self.data_sources.get(&source.id()) else {
             return;
         };
         if mime_type.is_empty()
@@ -696,7 +718,12 @@ impl CompositorState {
         {
             return;
         }
-        binding.mime_types.push(mime_type);
+        let selection_key = binding.selection_key;
+        self.selection_state
+            .offer_source_mime_type_for_key(selection_key, mime_type.clone());
+        if let Some(binding) = self.data_sources.get_mut(&source.id()) {
+            binding.mime_types.push(mime_type);
+        }
     }
 
     pub(in crate::compositor) fn remove_data_source(
@@ -704,12 +731,17 @@ impl CompositorState {
         source: &wl_data_source::WlDataSource,
     ) {
         self.cancel_drag_for_source(source);
+        let selection_key = self
+            .data_sources
+            .get(&source.id())
+            .map(|binding| binding.selection_key);
         if let Some(binding) = self.data_sources.get_mut(&source.id()) {
             binding.use_state = DataSourceUse::Retired;
         }
         self.data_sources.remove(&source.id());
-        self.selection_state
-            .remove_source(source.id().protocol_id());
+        if let Some(selection_key) = selection_key {
+            self.selection_state.remove_source_key(selection_key);
+        }
         if self
             .active_clipboard
             .as_ref()
@@ -799,8 +831,10 @@ impl CompositorState {
 
         let Some(source) = source else {
             self.active_clipboard = None;
-            self.selection_state.clear_clipboard_selection();
-            self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+            let clear = self
+                .selection_state
+                .clear_selection(SelectionKind::Clipboard);
+            self.next_clipboard_generation = clear.generation;
             if let Some(bridge) = self.clipboard_bridge.as_mut() {
                 let _ = bridge.clear_internal_selection();
             }
@@ -819,6 +853,13 @@ impl CompositorState {
             return false;
         }
 
+        let Some(commit) = self
+            .selection_state
+            .commit_selection(SelectionKind::Clipboard, binding.selection_key)
+        else {
+            return false;
+        };
+
         if let Some(previous) = self.active_clipboard.as_ref()
             && let ClipboardSourceBackend::InternalWayland {
                 source: previous_source,
@@ -830,15 +871,14 @@ impl CompositorState {
             previous_source.cancelled();
         }
 
-        self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
         if let Some(binding) = self.data_sources.get_mut(&source.id()) {
             binding.use_state = DataSourceUse::Selection;
         }
-        let generation = self.next_clipboard_generation;
-        self.selection_state
-            .set_clipboard_selection_from_source(source.id().protocol_id());
+        let generation = commit.generation;
+        self.next_clipboard_generation = generation;
         self.active_clipboard = Some(ActiveClipboard {
             generation,
+            source_key: binding.selection_key,
             source: ClipboardSourceBackend::InternalWayland {
                 source: binding.source,
                 client_id: binding.client_id,
@@ -864,8 +904,25 @@ impl CompositorState {
             return;
         }
         self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+        let source_key = self.allocate_selection_source_key();
+        self.selection_state.register_source(
+            source_key,
+            SelectionSourceKind::HostClipboardBridge,
+            None,
+        );
+        for mime_type in &mime_types {
+            self.selection_state
+                .offer_source_mime_type_for_key(source_key, mime_type.clone());
+        }
+        let generation = self
+            .selection_state
+            .commit_selection(SelectionKind::Clipboard, source_key)
+            .map(|commit| commit.generation)
+            .unwrap_or(self.next_clipboard_generation);
+        self.next_clipboard_generation = generation;
         self.active_clipboard = Some(ActiveClipboard {
-            generation: self.next_clipboard_generation,
+            generation,
+            source_key,
             source: ClipboardSourceBackend::HostBridge { offer_id },
             mime_types,
         });
@@ -878,6 +935,10 @@ impl CompositorState {
         if self.active_clipboard.as_ref().is_some_and(|selection| {
             matches!(selection.source, ClipboardSourceBackend::HostBridge { .. })
         }) {
+            let clear = self
+                .selection_state
+                .clear_selection(SelectionKind::Clipboard);
+            self.next_clipboard_generation = clear.generation;
             self.active_clipboard = None;
             self.data_offers.clear();
             self.publish_clipboard_to_focused_client();

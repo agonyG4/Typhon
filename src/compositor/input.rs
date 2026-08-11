@@ -39,6 +39,7 @@ pub(super) enum InputSerialKind {
 #[derive(Debug, Clone)]
 pub(super) struct InputSerial {
     pub(super) serial: u32,
+    pub(super) epoch: u64,
     pub(super) surface: wl_surface::WlSurface,
     pub(super) client_id: Option<wayland_server::backend::ClientId>,
     pub(super) root_surface_id: u32,
