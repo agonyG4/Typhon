@@ -157,6 +157,21 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_source_dnd_finished_count: usize,
     pub(in crate::compositor::tests) data_source_cancelled_count: usize,
     pub(in crate::compositor::tests) data_source_cancelled: bool,
+    pub(in crate::compositor::tests) primary_selection_events: Vec<bool>,
+    pub(in crate::compositor::tests) primary_selection_offer:
+        Option<client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    pub(in crate::compositor::tests) primary_offer_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) primary_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) primary_source_cancelled_count: usize,
+    pub(in crate::compositor::tests) data_control_selection_events: Vec<bool>,
+    pub(in crate::compositor::tests) data_control_primary_selection_events: Vec<bool>,
+    pub(in crate::compositor::tests) data_control_clipboard_offer:
+        Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    pub(in crate::compositor::tests) data_control_primary_offer:
+        Option<client_ext_data_control_offer_v1::ExtDataControlOfferV1>,
+    pub(in crate::compositor::tests) data_control_offer_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_control_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_control_source_cancelled_count: usize,
     pub(in crate::compositor::tests) activation_token_done: Option<String>,
     pub(in crate::compositor::tests) astrea_shortcut_pressed_count: usize,
     pub(in crate::compositor::tests) astrea_shortcut_pressed_serials: Vec<u32>,
@@ -708,6 +723,180 @@ impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
             }
             client_wl_data_source::Event::DndFinished => {
                 state.data_source_dnd_finished_count += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl
+    Dispatch<client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        _event: client_zwp_primary_selection_device_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        event: client_zwp_primary_selection_device_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_primary_selection_device_v1::Event::DataOffer { offer } => {
+                state.primary_selection_offer = Some(offer);
+            }
+            client_zwp_primary_selection_device_v1::Event::Selection { id } => {
+                state.primary_selection_events.push(id.is_some());
+                state.primary_selection_offer = id;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        [0 => (client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ())]
+    );
+}
+
+impl Dispatch<client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        event: client_zwp_primary_selection_offer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_zwp_primary_selection_offer_v1::Event::Offer { mime_type } = event {
+            state.primary_offer_mime_types.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<client_zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+        event: client_zwp_primary_selection_source_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_primary_selection_source_v1::Event::Send { mime_type, fd } => {
+                state.primary_source_send_mime_types.push(mime_type);
+                let mut file = File::from(fd);
+                let _ = file.write_all(b"primary payload");
+            }
+            client_zwp_primary_selection_source_v1::Event::Cancelled => {
+                state.primary_source_cancelled_count += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_ext_data_control_manager_v1::ExtDataControlManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_ext_data_control_manager_v1::ExtDataControlManagerV1,
+        _event: client_ext_data_control_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_ext_data_control_device_v1::ExtDataControlDeviceV1,
+        event: client_ext_data_control_device_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_ext_data_control_device_v1::Event::DataOffer { id } => {
+                state.data_control_clipboard_offer = Some(id);
+            }
+            client_ext_data_control_device_v1::Event::Selection { id } => {
+                state.data_control_selection_events.push(id.is_some());
+                state.data_control_clipboard_offer = id;
+            }
+            client_ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                state
+                    .data_control_primary_selection_events
+                    .push(id.is_some());
+                state.data_control_primary_offer = id;
+            }
+            client_ext_data_control_device_v1::Event::Finished => {}
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_ext_data_control_device_v1::ExtDataControlDeviceV1,
+        [0 => (client_ext_data_control_offer_v1::ExtDataControlOfferV1, ())]
+    );
+}
+
+impl Dispatch<client_ext_data_control_offer_v1::ExtDataControlOfferV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_ext_data_control_offer_v1::ExtDataControlOfferV1,
+        event: client_ext_data_control_offer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_ext_data_control_offer_v1::Event::Offer { mime_type } = event {
+            state.data_control_offer_mime_types.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<client_ext_data_control_source_v1::ExtDataControlSourceV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_ext_data_control_source_v1::ExtDataControlSourceV1,
+        event: client_ext_data_control_source_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.data_control_source_send_mime_types.push(mime_type);
+                let mut file = File::from(fd);
+                let _ = file.write_all(b"data-control payload");
+            }
+            client_ext_data_control_source_v1::Event::Cancelled => {
+                state.data_control_source_cancelled_count += 1;
             }
             _ => {}
         }

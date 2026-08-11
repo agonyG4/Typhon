@@ -961,10 +961,20 @@ impl CompositorState {
             .iter()
             .map(|surface| surface.surface_id)
             .collect::<Vec<_>>();
+        let current_buffer_ids = self
+            .current_surface_buffers
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         let mut removed_surface_ids = renderable_ids
             .into_iter()
             .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id))
             .collect::<Vec<_>>();
+        removed_surface_ids.extend(
+            current_buffer_ids
+                .into_iter()
+                .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id)),
+        );
         removed_surface_ids.sort_unstable();
         removed_surface_ids.dedup();
         if removed_surface_ids.is_empty() {

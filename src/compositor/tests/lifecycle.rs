@@ -37,7 +37,7 @@ fn cpu_composition_registry_omits_gpu_buffer_globals() {
 }
 
 #[test]
-fn default_registry_advertises_enabled_idle_inhibition() {
+fn desktop_baseline_registry_hides_idle_inhibition() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -49,6 +49,20 @@ fn default_registry_advertises_enabled_idle_inhibition() {
     let globals = result.unwrap();
     assert!(!globals.contains(&"zwp_relative_pointer_manager_v1".to_string()));
     assert!(!globals.contains(&"zwp_pointer_constraints_v1".to_string()));
+    assert!(!globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
+}
+
+#[test]
+fn native_registry_advertises_enabled_idle_inhibition() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
     assert!(globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
 }
 
@@ -67,7 +81,7 @@ fn default_registry_hides_color_management_until_renderer_supports_transforms() 
 }
 
 #[test]
-fn default_registry_advertises_core_clipboard_only() {
+fn default_registry_advertises_core_clipboard_profile() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -78,12 +92,12 @@ fn default_registry_advertises_core_clipboard_only() {
 
     let globals = result.unwrap();
     assert!(globals.contains(&"wl_data_device_manager".to_string()));
-    assert!(!globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
-    assert!(!globals.contains(&"ext_data_control_manager_v1".to_string()));
+    assert!(globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
+    assert!(globals.contains(&"ext_data_control_manager_v1".to_string()));
 }
 
 #[test]
-fn clipboard_ready_registry_advertises_only_core_clipboard_selection() {
+fn clipboard_only_registry_advertises_only_clipboard_selection() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_with_selection_capabilities(
         &socket_name,
@@ -107,7 +121,7 @@ fn clipboard_ready_registry_advertises_only_core_clipboard_selection() {
 }
 
 #[test]
-fn native_and_cpu_base_registries_share_core_clipboard_policy() {
+fn native_and_cpu_base_registries_share_core_clipboard_profile() {
     let cpu_socket_name = unique_socket_name();
     let cpu_server = OwnCompositorServer::bind_cpu_composition(&cpu_socket_name).unwrap();
     let cpu_socket_path = runtime_socket_path(&cpu_socket_name);
@@ -126,8 +140,8 @@ fn native_and_cpu_base_registries_share_core_clipboard_policy() {
 
     for globals in [cpu_result.unwrap(), native_result.unwrap()] {
         assert!(globals.contains(&"wl_data_device_manager".to_string()));
-        assert!(!globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
-        assert!(!globals.contains(&"ext_data_control_manager_v1".to_string()));
+        assert!(globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
+        assert!(globals.contains(&"ext_data_control_manager_v1".to_string()));
     }
 }
 

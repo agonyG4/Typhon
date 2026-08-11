@@ -73,6 +73,10 @@ impl CompositorState {
         self.renderable_surfaces
             .iter()
             .any(|surface| self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
+            || self
+                .current_surface_buffers
+                .keys()
+                .any(|surface_id| self.root_surface_id_for_surface(*surface_id) == root_surface_id)
     }
 
     pub(in crate::compositor) fn add_relative_pointer_resource(

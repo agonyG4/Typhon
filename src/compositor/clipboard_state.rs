@@ -29,7 +29,10 @@ pub(super) struct ClipboardDataDevice {
 pub(super) struct ClipboardDataOffer {
     pub(super) offer: wl_data_offer::WlDataOffer,
     pub(super) target_client_id: ClientId,
+    pub(super) target_id: u32,
     pub(super) source_generation: u64,
+    pub(super) broker_offer_id: Option<u64>,
+    pub(super) source_key: Option<SelectionSourceKey>,
     pub(super) mime_types: Vec<String>,
     pub(super) kind: DataOfferKind,
     pub(super) accepted_mime: Option<String>,
@@ -69,14 +72,6 @@ pub(super) enum DragOfferPhase {
     Dropped,
     Finished,
     Destroyed,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ActiveClipboard {
-    pub(super) generation: u64,
-    pub(super) source_key: SelectionSourceKey,
-    pub(super) source: ClipboardSourceBackend,
-    pub(super) mime_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,19 +145,4 @@ pub(super) struct DataControlOfferBinding {
     pub(super) source_generation: u64,
     pub(super) source_key: SelectionSourceKey,
     pub(super) mime_types: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum ClipboardSourceBackend {
-    InternalWayland {
-        source: wl_data_source::WlDataSource,
-        client_id: ClientId,
-    },
-    DataControl {
-        source: ext_data_control_source_v1::ExtDataControlSourceV1,
-        client_id: ClientId,
-    },
-    HostBridge {
-        offer_id: HostClipboardOfferId,
-    },
 }

@@ -262,7 +262,7 @@ the inventory.
 | `wl_data_offer.set_actions` | `protocols/data_device.rs` | `sourced_wire_drag_ask_resolves_to_copy_before_finished`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_offer.invalid_action_mask`, `invalid_action` | 3 | Implemented | modifier-driven action overrides remain optional policy; duplicate unchanged actions are suppressed |
 | `wl_data_offer.finish` | `protocols/data_device.rs`, `state/data_device.rs` | `sourced_wire_drag_ask_resolves_to_copy_before_finished`, `sourced_wire_drag_target_disconnect_after_drop_cancels_once`, `sourced_wire_drag_offer_destroy_after_drop_cancels_once`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_offer.invalid_finish` | 3 | Implemented | native toolkit coverage remains required; deterministic normal, ASK, destruction, and disconnect paths are covered |
 | `wl_data_device.start_drag` | `protocols/data_device.rs`, `state/data_device.rs` | `sourced_wire_drag_target_disconnect_before_drop_cancels_once`, `sourced_wire_drag_target_disconnect_while_ask_is_unresolved_cancels_once`, `source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role`, `dnd_production_state_seeded_model_runs_100_000_transitions` | `wl_data_device.used_source`, `wl_data_device.role`, `wl_data_source.invalid_source` | 3 | Implemented | source-less, icon, source-use, post-drop cancellation, and teardown transitions are covered; native toolkit validation remains required |
-| `wl_data_device.set_selection` | `protocols/data_device.rs` | `v3_source_set_actions_then_selection_is_a_wire_protocol_error`, clipboard selection tests | `wl_data_device.used_source` | 3 | Partial | focus/serial policy remains shared with clipboard bridge |
+| `wl_data_device.set_selection` | `protocols/data_device.rs` | `v3_source_set_actions_then_selection_is_a_wire_protocol_error`, `clipboard_source_disconnect_clears_focused_target_selection`, `normal_clipboard_source_transfers_to_data_control_target` | `wl_data_device.used_source` | 3 | Partial | focus/serial policy remains shared with clipboard bridge; cross-protocol receive is pipe-qualified |
 | `xdg_wm_base.get_xdg_surface` | `protocols/xdg.rs` | `sober_style_toplevel_reassociation_on_same_wl_surface_is_supported`, `sober_style_popup_reassociation_on_same_wl_surface_is_supported`, `xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work`, `xdg_popup_role_destroy_retires_unpublished_explicit_sync_work`, `duplicate_xdg_association_on_same_wl_surface_is_rejected`, `dormant_xdg_toplevel_reassociation_to_popup_is_rejected`, `dormant_xdg_popup_reassociation_to_toplevel_is_rejected`, `pending_surface_content_rejects_xdg_association_and_preserves_healthy_client`, `committed_surface_content_rejects_xdg_association_and_preserves_healthy_client`, `xdg_role_after_layer_surface_is_rejected`, `xdg_role_after_subsurface_is_rejected_and_healthy_client_survives`, `xdg_role_after_cursor_surface_is_rejected_and_healthy_client_survives`, `source_less_wire_drag_with_icon_reserves_a_permanent_drag_icon_role`, `xdg_buffer_before_initial_configure_is_a_wire_error` | `xdg_wm_base.role`, `xdg_wm_base.invalid_surface_state`, `xdg_surface.already_constructed` | 6 | Implemented | same-role reassociation is a deliberate interoperability extension; association cleanup is shared with client teardown and stale unpublished work is rejected defensively |
 | `xdg_wm_base.destroy` | `protocols/xdg.rs` | `wm_base_destroy_with_live_xdg_surfaces_posts_defunct_surfaces` | `xdg_wm_base.defunct_surfaces` | 6 | Implemented | none |
 | `xdg_positioner` completeness | `popup.rs` / `protocols/xdg.rs` | `incomplete_positioner_is_not_usable_for_reposition` | `xdg_wm_base.invalid_positioner`, `xdg_positioner.invalid_input` | 6 | Implemented | parent serial is policy metadata per XML |
@@ -277,6 +277,35 @@ the inventory.
 advertise a bounds preference, so it does not send this optional event.
 `wm_capabilities` is `Implemented` for v5 and v6 and is version-gated for
 v4 resources.
+
+## Selection qualification evidence
+
+The activated `core_clipboard()` profile advertises normal Clipboard, PRIMARY,
+and ext-data-control together. The default desktop input profile intentionally
+hides Idle Inhibit; the native-base profile advertises it. These capability
+contracts are covered by the lifecycle and plan registry tests rather than by
+the transfer tests below.
+
+| transfer or lifecycle | real-client/deterministic evidence | qualification detail |
+|---|---|---|
+| normal Clipboard → normal `wl_data_device` | `clipboard_ready_wayland_clients_transfer_selection_without_compositor_buffering` | pipe transfer, MIME ordering, requested MIME |
+| normal Clipboard → ext-data-control | `normal_clipboard_source_transfers_to_data_control_target` | immediate current-selection publication and pipe transfer |
+| PRIMARY → PRIMARY | `primary_selection_real_client_pipe_transfer_and_reuse` | multiple MIME offers, pipe transfer, requested MIME, live-source reuse |
+| PRIMARY → ext-data-control | `primary_source_transfers_to_data_control_target` | focus-independent observation and pipe transfer |
+| ext-data-control Clipboard → normal Clipboard | `data_control_real_client_sources_transfer_to_clipboard_and_primary_targets` | normal offer receives Data Control source bytes |
+| ext-data-control PRIMARY → PRIMARY | `data_control_real_client_sources_transfer_to_clipboard_and_primary_targets` | PRIMARY offer receives Data Control source bytes |
+| ext-data-control Clipboard → ext-data-control | `data_control_real_client_sources_transfer_to_clipboard_and_primary_targets` | both channels publish to the observing Data Control device |
+| HostBridge Clipboard → normal Clipboard | `host_bridge_selection_is_offered_to_focused_wayland_client` | bridge request receives the requested MIME over a pipe |
+| HostBridge Clipboard → ext-data-control | `host_clipboard_bridge_transfers_to_data_control_target` | focus-independent bridge publication and pipe transfer |
+| Data Control source reuse | `data_control_source_is_rejected_when_reused` | exact `ext_data_control_device_v1.used_source` protocol error |
+| mutation ordering | `older_mutation_epoch_cannot_replace_newer_channel_state`, `late_wayland_primary_mutation_cannot_replace_newer_data_control_state`, `stale_source_removal_cannot_clear_newer_selection` | shared monotonic epoch, channel-local watermarks, stale-source protection |
+| Idle Inhibit lifecycle | `idle_inhibitor_tracks_unmap_remap_and_destroy_lifecycle` | mapped/unmapped/remapped/destroyed target transitions |
+
+Rejected receives validate target, kind, generation, source key, and MIME
+before the single source-key dispatcher. The dispatcher borrows the supplied
+FD only for the source event; rejected requests drop the owned FD without
+emitting source data. XWayland selection bridging and native toolkit smoke
+coverage remain outside this deterministic matrix.
 
 ## Deterministic model evidence
 
@@ -338,7 +367,8 @@ the initial inventory was written:
   timestamps, and purpose-specific validators;
 - canonical Clipboard and PRIMARY seat channels with stale-generation offer
   rejection, MIME-bounded sources, protocol-specific send adapters, and
-  cross-protocol ext-data-control publication;
+  cross-protocol ext-data-control publication qualified by the pipe matrix
+  above;
 - surface-aware idle inhibition that derives its effective count from live
   rendered content and reconciles on mapping, unmapping, minimization,
   restoration, and client teardown;

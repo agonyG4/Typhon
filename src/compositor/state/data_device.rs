@@ -341,7 +341,10 @@ impl CompositorState {
                 ClipboardDataOffer {
                     offer: offer.clone(),
                     target_client_id: target_client.clone(),
+                    target_id: device.id().protocol_id(),
                     source_generation: 0,
+                    broker_offer_id: None,
+                    source_key: None,
                     mime_types: mime_types.clone(),
                     kind: DataOfferKind::DragAndDrop,
                     accepted_mime: None,

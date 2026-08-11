@@ -535,7 +535,11 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureClipboardState(reply) => {
                         let _ = reply.send(ClipboardStateSnapshot {
-                            active_source: server.state.active_clipboard.is_some(),
+                            active_source: server
+                                .state
+                                .selection_state
+                                .active_selection(SelectionKind::Clipboard)
+                                .is_some(),
                             source_count: server.state.data_sources.len(),
                             offer_count: server.state.data_offers.len(),
                         });

@@ -62,10 +62,11 @@ impl Dispatch<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1, IdleInhibitorData> for 
         _client: &Client,
         resource: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
         request: zwp_idle_inhibitor_v1::Request,
-        _data: &IdleInhibitorData,
+        data: &IdleInhibitorData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        let _ = (&data.client_id, &data.target_surface);
         if let zwp_idle_inhibitor_v1::Request::Destroy = request {
             state.remove_idle_inhibitor(resource);
         }
@@ -75,8 +76,9 @@ impl Dispatch<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1, IdleInhibitorData> for 
         state: &mut Self,
         _client: ClientId,
         resource: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
-        _data: &IdleInhibitorData,
+        data: &IdleInhibitorData,
     ) {
+        let _ = (&data.client_id, &data.target_surface);
         state.remove_idle_inhibitor(resource);
     }
 }

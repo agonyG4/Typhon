@@ -63,6 +63,13 @@ impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDevice
                     SelectionSourceKind::WaylandPrimary,
                     None,
                 );
+                state.selection_state.set_source_backend(
+                    selection_key,
+                    SelectionSourceBackend::WaylandPrimary {
+                        source: source.clone(),
+                        client_id: client.id(),
+                    },
+                );
                 state.primary_sources.insert(
                     source.id(),
                     PrimarySourceBinding {
@@ -127,12 +134,6 @@ impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, Prim
                 else {
                     return;
                 };
-                if state
-                    .last_primary_selection_epoch
-                    .is_some_and(|last_epoch| selection_epoch < last_epoch)
-                {
-                    return;
-                }
                 if let Some(source) = source {
                     let Some(binding) = state.primary_sources.get(&source.id()).cloned() else {
                         return;
@@ -140,17 +141,12 @@ impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, Prim
                     if binding.client_id != data.client_id
                         || !source.is_alive()
                         || binding.mime_types.is_empty()
-                        || state
-                            .selection_state
-                            .source(binding.selection_key)
-                            .is_none_or(|source| source.used)
                     {
                         return;
                     }
                     state.set_primary_selection_from_source(binding.selection_key, selection_epoch);
                 } else {
-                    state.clear_primary_selection();
-                    state.last_primary_selection_epoch = Some(selection_epoch);
+                    state.clear_primary_selection(selection_epoch);
                 }
             }
             zwp_primary_selection_device_v1::Request::Destroy => {
@@ -195,13 +191,6 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, Prim
                     return;
                 };
                 if binding.client_id != data.client_id {
-                    return;
-                }
-                if state
-                    .selection_state
-                    .source(data.selection_key)
-                    .is_none_or(|source| source.used)
-                {
                     return;
                 }
                 if mime_type.is_empty() || mime_type.len() > 4096 {
@@ -286,25 +275,33 @@ impl CompositorState {
     pub(in crate::compositor) fn set_primary_selection_from_source(
         &mut self,
         source_key: SelectionSourceKey,
-        selection_epoch: u64,
+        selection_epoch: SelectionMutationEpoch,
     ) {
-        let Some(commit) = self
-            .selection_state
-            .commit_selection(SelectionKind::Primary, source_key)
-        else {
+        let Some(commit) = self.selection_state.commit_selection(
+            SelectionKind::Primary,
+            source_key,
+            selection_epoch,
+        ) else {
             return;
         };
         if let Some(replaced_source) = commit.replaced_source {
             self.cancel_selection_source(SelectionKind::Primary, replaced_source);
         }
         self.selection_state.mark_source_used(source_key);
-        self.last_primary_selection_epoch = Some(selection_epoch);
         self.publish_primary_to_focused_client();
         self.publish_data_control_selection(SelectionKind::Primary);
     }
 
-    pub(in crate::compositor) fn clear_primary_selection(&mut self) {
-        let clear = self.selection_state.clear_selection(SelectionKind::Primary);
+    pub(in crate::compositor) fn clear_primary_selection(
+        &mut self,
+        mutation_epoch: SelectionMutationEpoch,
+    ) {
+        let Some(clear) = self
+            .selection_state
+            .clear_selection(SelectionKind::Primary, mutation_epoch)
+        else {
+            return;
+        };
         if let Some(source_key) = clear.cleared_source {
             self.cancel_selection_source(SelectionKind::Primary, source_key);
         }
@@ -319,9 +316,10 @@ impl CompositorState {
         let Some(binding) = self.primary_sources.remove(&source.id()) else {
             return;
         };
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
         let cleared = self
             .selection_state
-            .remove_source_key(binding.selection_key);
+            .remove_source_key(binding.selection_key, mutation_epoch);
         if cleared.contains(&SelectionKind::Primary) {
             self.publish_primary_to_focused_client();
             self.publish_data_control_selection(SelectionKind::Primary);
@@ -441,7 +439,7 @@ impl CompositorState {
             .send_event(zwp_primary_selection_device_v1::Event::Selection { id: Some(offer) });
     }
 
-    pub(in crate::compositor) fn receive_primary_offer(
+    fn receive_primary_offer(
         &mut self,
         offer: &zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
         data: &PrimaryOfferData,
@@ -456,42 +454,18 @@ impl CompositorState {
             || binding.broker_offer_id != data.broker_offer_id
             || binding.source_generation != data.source_generation
             || binding.source_key != data.source_key
+            || !binding.mime_types.iter().any(|mime| mime == &mime_type)
             || !self.selection_state.offer_is_current(
                 data.broker_offer_id,
                 SelectionKind::Primary,
                 data.source_generation,
                 data.target_id,
+                data.source_key,
                 &mime_type,
             )
         {
             return;
         }
-        if let Some(source) = self
-            .primary_sources
-            .values()
-            .find(|binding| binding.selection_key == data.source_key)
-            .map(|binding| binding.source.clone())
-        {
-            if !source.is_alive() {
-                return;
-            }
-            let _ = source.send_event(zwp_primary_selection_source_v1::Event::Send {
-                mime_type,
-                fd: fd.as_fd(),
-            });
-        } else if let Some(source) = self
-            .data_control_sources
-            .values()
-            .find(|binding| binding.selection_key == data.source_key)
-            .map(|binding| binding.source.clone())
-        {
-            if !source.is_alive() {
-                return;
-            }
-            let _ = source.send_event(ext_data_control_source_v1::Event::Send {
-                mime_type,
-                fd: fd.as_fd(),
-            });
-        }
+        self.request_selection_data(SelectionKind::Primary, data.source_key, mime_type, fd);
     }
 }

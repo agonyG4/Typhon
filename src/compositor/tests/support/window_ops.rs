@@ -33,6 +33,55 @@ pub(in crate::compositor::tests) fn create_idle_inhibitor_for_surface_and_captur
     Ok(rx.recv_timeout(Duration::from_secs(1))?)
 }
 
+pub(in crate::compositor::tests) fn exercise_idle_inhibitor_surface_lifecycle(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(bool, bool, bool, bool), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let idle_manager: client_zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    let _buffer = attach_test_buffered_surface(&surface, &shm, &qh, 2, 2)?;
+    let inhibitor = idle_manager.create_inhibitor(&surface, &qh, ());
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let capture = || -> Result<bool, Box<dyn std::error::Error>> {
+        wait_for_server_commands(commands);
+        let (reply, rx) = mpsc::channel();
+        commands.send(ServerCommand::CaptureIdleInhibited(reply))?;
+        Ok(rx.recv_timeout(Duration::from_secs(1))?)
+    };
+    let mapped = capture()?;
+
+    surface.attach(None, 0, 0);
+    surface.commit();
+    connection
+        .flush()
+        .map_err(|error| io::Error::other(format!("flush after unmap: {error}")))?;
+    let unmapped = capture()?;
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 2, 2)?;
+    connection
+        .flush()
+        .map_err(|error| io::Error::other(format!("flush after remap: {error}")))?;
+    let remapped = capture()?;
+
+    inhibitor.destroy();
+    connection
+        .flush()
+        .map_err(|error| io::Error::other(format!("flush after destroy: {error}")))?;
+    let destroyed = capture()?;
+    Ok((mapped, unmapped, remapped, destroyed))
+}
+
 pub(in crate::compositor::tests) fn create_client_surface_with_viewport_destination(
     socket_path: &PathBuf,
     buffer_width: u32,

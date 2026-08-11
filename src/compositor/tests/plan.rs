@@ -68,7 +68,7 @@ fn safe_selection_profile_hides_unimplemented_selection_protocols() {
 }
 
 #[test]
-fn clipboard_ready_profile_advertises_only_core_clipboard_selection() {
+fn clipboard_only_profile_advertises_only_clipboard_selection() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::desktop_baseline(),
         SelectionProtocolCapabilities {

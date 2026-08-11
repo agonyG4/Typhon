@@ -20,6 +20,24 @@ fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
 }
 
 #[test]
+fn idle_inhibitor_tracks_unmap_remap_and_destroy_lifecycle() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        idle_inhibit: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let lifecycle = exercise_idle_inhibitor_surface_lifecycle(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(lifecycle, (true, false, true, false));
+}
+
+#[test]
 fn wayland_client_surface_commit_sends_output_enter() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

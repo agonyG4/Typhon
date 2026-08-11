@@ -60,6 +60,13 @@ impl Dispatch<ext_data_control_manager_v1::ExtDataControlManagerV1, ()> for Comp
                     SelectionSourceKind::DataControl,
                     None,
                 );
+                state.selection_state.set_source_backend(
+                    selection_key,
+                    SelectionSourceBackend::DataControl {
+                        source: source.clone(),
+                        client_id: client.id(),
+                    },
+                );
                 state.data_control_sources.insert(
                     source.id(),
                     DataControlSourceBinding {
@@ -273,15 +280,15 @@ impl CompositorState {
             return;
         }
         let Some(source) = source else {
-            let clear = self.selection_state.clear_selection(kind);
+            let mutation_epoch = self.selection_state.allocate_mutation_epoch();
+            let Some(clear) = self.selection_state.clear_selection(kind, mutation_epoch) else {
+                return;
+            };
             if let Some(source_key) = clear.cleared_source {
                 self.cancel_selection_source(kind, source_key);
             }
             self.publish_data_control_selection(kind);
             if kind == SelectionKind::Clipboard {
-                self.active_clipboard = None;
-                self.next_clipboard_generation = clear.generation;
-                self.data_offers.clear();
                 if let Some(bridge) = self.clipboard_bridge.as_mut() {
                     let _ = bridge.clear_internal_selection();
                 }
@@ -309,9 +316,10 @@ impl CompositorState {
         if binding.mime_types.is_empty() {
             return;
         }
-        let Some(commit) = self
-            .selection_state
-            .commit_selection(kind, binding.selection_key)
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
+        let Some(commit) =
+            self.selection_state
+                .commit_selection(kind, binding.selection_key, mutation_epoch)
         else {
             return;
         };
@@ -325,20 +333,10 @@ impl CompositorState {
         self.publish_data_control_selection(kind);
         match kind {
             SelectionKind::Clipboard => {
-                self.next_clipboard_generation = commit.generation;
                 if let Some(bridge) = self.clipboard_bridge.as_mut() {
                     let _ = bridge
                         .publish_internal_selection(commit.generation, binding.mime_types.clone());
                 }
-                self.active_clipboard = Some(ActiveClipboard {
-                    generation: commit.generation,
-                    source_key: binding.selection_key,
-                    source: ClipboardSourceBackend::DataControl {
-                        source: binding.source,
-                        client_id: binding.client_id,
-                    },
-                    mime_types: binding.mime_types,
-                });
                 self.publish_clipboard_to_focused_client();
             }
             SelectionKind::Primary => self.publish_primary_to_focused_client(),
@@ -352,18 +350,15 @@ impl CompositorState {
         let Some(binding) = self.data_control_sources.remove(&source.id()) else {
             return;
         };
+        let mutation_epoch = self.selection_state.allocate_mutation_epoch();
         let cleared = self
             .selection_state
-            .remove_source_key(binding.selection_key);
+            .remove_source_key(binding.selection_key, mutation_epoch);
         for kind in cleared {
             if kind == SelectionKind::Clipboard
-                && self
-                    .active_clipboard
-                    .as_ref()
-                    .is_some_and(|selection| selection.source_key == binding.selection_key)
+                && let Some(bridge) = self.clipboard_bridge.as_mut()
             {
-                self.active_clipboard = None;
-                self.next_clipboard_generation = self.selection_state.current_generation(kind);
+                let _ = bridge.clear_internal_selection();
             }
             self.publish_data_control_selection(kind);
             match kind {
@@ -499,30 +494,18 @@ impl CompositorState {
             || binding.kind != data.kind
             || binding.source_generation != data.source_generation
             || binding.source_key != data.source_key
+            || !binding.mime_types.iter().any(|mime| mime == &mime_type)
             || !self.selection_state.offer_is_current(
                 data.broker_offer_id,
                 data.kind,
                 data.source_generation,
                 data.target_id,
+                data.source_key,
                 &mime_type,
             )
         {
             return;
         }
-        let Some(source) = self
-            .data_control_sources
-            .values()
-            .find(|source| source.selection_key == data.source_key)
-            .map(|source| source.source.clone())
-        else {
-            return;
-        };
-        if !source.is_alive() {
-            return;
-        }
-        let _ = source.send_event(ext_data_control_source_v1::Event::Send {
-            mime_type,
-            fd: fd.as_fd(),
-        });
+        self.request_selection_data(data.kind, data.source_key, mime_type, fd);
     }
 }

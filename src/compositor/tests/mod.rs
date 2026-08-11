@@ -37,6 +37,12 @@ use wayland_client::{
         wl_surface as client_wl_surface, wl_touch as client_wl_touch,
     },
 };
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1 as client_ext_data_control_device_v1,
+    ext_data_control_manager_v1 as client_ext_data_control_manager_v1,
+    ext_data_control_offer_v1 as client_ext_data_control_offer_v1,
+    ext_data_control_source_v1 as client_ext_data_control_source_v1,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1 as client_wp_fractional_scale_manager_v1,
     wp_fractional_scale_v1 as client_wp_fractional_scale_v1,
@@ -64,6 +70,12 @@ use wayland_protocols::wp::pointer_warp::v1::client::wp_pointer_warp_v1 as clien
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation as client_wp_presentation,
     wp_presentation_feedback as client_wp_presentation_feedback,
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1 as client_zwp_primary_selection_device_manager_v1,
+    zwp_primary_selection_device_v1 as client_zwp_primary_selection_device_v1,
+    zwp_primary_selection_offer_v1 as client_zwp_primary_selection_offer_v1,
+    zwp_primary_selection_source_v1 as client_zwp_primary_selection_source_v1,
 };
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1 as client_zwp_relative_pointer_manager_v1,
@@ -110,6 +122,7 @@ use support::window_ops::*;
 mod astrea_shell_auth;
 mod astrea_shell_capability;
 mod astrea_shortcuts;
+mod data_control;
 mod data_device;
 mod direct_scanout;
 mod input_output;
@@ -117,6 +130,7 @@ mod layer_shell;
 mod lifecycle;
 mod native_geometry;
 mod plan;
+mod primary_selection;
 mod protocol_buffers;
 mod protocol_contract;
 mod protocol_error;
