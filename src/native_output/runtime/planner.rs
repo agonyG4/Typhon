@@ -20,26 +20,44 @@ pub(super) fn pending_target_for_scanout(
 
 pub(super) fn plan_commit_timing_target(
     planner: &mut PresentationDeadlinePlanner,
-    server: &OwnCompositorServer,
-    frame_scheduler: &NativeFrameScheduler,
+    server: &mut OwnCompositorServer,
+    _frame_scheduler: &NativeFrameScheduler,
     scheduled: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
-    let Some(requested_target) = server.next_commit_timing_deadline_ns() else {
+    let Some(requested_target_ns) = server.next_commit_timing_requested_ns() else {
         return scheduled;
     };
-    let requested_target = MonotonicTimestampNs::new(requested_target);
+    let requested_target = MonotonicTimestampNs::new(requested_target_ns);
     let needs_commit_timing_target = scheduled
         .map(|target| {
             target.reason != PresentationTargetReason::CommitTiming
                 || target.presentation_time < requested_target
         })
         .unwrap_or(true);
-    (frame_scheduler.visual_work_queued() && needs_commit_timing_target)
-        .then(|| planner.plan_not_before(now, requested_target, predicted_total_cost))
-        .flatten()
-        .or(scheduled)
+    if !needs_commit_timing_target
+        && let Some(target) = scheduled
+        && server.arm_commit_timing_target(
+            requested_target_ns,
+            target.presentation_time.get(),
+            target.render_start_deadline.get(),
+            target.sequence,
+            target.clock_generation,
+        )
+    {
+        return Some(target);
+    }
+    let target = planner.plan_not_before(now, requested_target, predicted_total_cost)?;
+    server
+        .arm_commit_timing_target(
+            requested_target_ns,
+            target.presentation_time.get(),
+            target.render_start_deadline.get(),
+            target.sequence,
+            target.clock_generation,
+        )
+        .then_some(target)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47,7 +65,7 @@ pub(super) fn prepare_presentation_target_for_mode(
     pacing_mode: NativeOutputPacingMode,
     explicit_output: bool,
     planner: &mut PresentationDeadlinePlanner,
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     frame_scheduler: &NativeFrameScheduler,
     scheduled: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
@@ -61,7 +79,7 @@ pub(super) fn prepare_presentation_target_for_mode(
     } else {
         scheduled
     };
-    if explicit_output {
+    let scheduled = if explicit_output {
         plan_commit_timing_target(
             planner,
             server,
@@ -72,7 +90,9 @@ pub(super) fn prepare_presentation_target_for_mode(
         )
     } else {
         scheduled
-    }
+    };
+    server.progress_surface_pacing(now.get());
+    scheduled
 }
 
 pub(super) fn reactive_or_commit_timing_target(

@@ -633,11 +633,7 @@ impl CompositorState {
             let Some(remove_index) = remove_index else {
                 let pacing_protected = nodes.iter().any(|(_, commit)| commit.pacing.is_boundary());
                 if pacing_protected {
-                    self.note_protocol_error_metric();
-                    if let Some(surface) = self.surface_resource_by_id(root_surface_id) {
-                        surface
-                            .post_error(1u32, "surface tree pacing transaction budget exhausted");
-                    }
+                    self.request_client_resource_exhaustion(root_surface_id);
                 }
                 self.release_unpublished_surface_tree_nodes(nodes);
                 return;
@@ -693,6 +689,7 @@ impl CompositorState {
                 root_surface_id,
                 nodes,
                 dependencies,
+                commit_timing_readiness: None,
                 received_at: Instant::now(),
             });
         debug_assert!(

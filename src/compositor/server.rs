@@ -1438,6 +1438,7 @@ impl OwnCompositorServer {
         self.state.begin_client_dispatch_cycle();
         let dispatch_result = self.display.dispatch_clients(&mut self.state);
         self.state.finish_client_dispatch_cycle();
+        self.kill_pending_resource_exhaustion_clients();
         self.teardown_disconnected_clients();
         self.publish_astrea_toplevel_updates();
         self.state.clear_dead_active_clipboard_source();

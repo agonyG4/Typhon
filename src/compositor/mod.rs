@@ -486,6 +486,8 @@ pub struct CompositorState {
     fifo_resources: HashMap<u32, wp_fifo_v1::WpFifoV1>,
     commit_timer_resources: HashMap<u32, wp_commit_timer_v1::WpCommitTimerV1>,
     active_fifo_barriers: HashMap<u32, ActiveFifoBarrier>,
+    active_commit_timing_targets:
+        HashMap<u32, Vec<(u64, SurfaceCommitSequence, CommitTimingReadiness)>>,
     next_fifo_barrier_generation: u64,
     surface_pacing_metrics: SurfacePacingMetrics,
     output_resources: Vec<wl_output::WlOutput>,
@@ -524,6 +526,7 @@ pub struct CompositorState {
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
+    pending_client_resource_exhaustions: Vec<u32>,
     pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
@@ -683,7 +686,6 @@ struct AstreaShortcutRegistration {
     namespace: String,
     name: String,
 }
-
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct ActiveLockedPointerRouting {
     constraint_id: u64,
@@ -703,7 +705,6 @@ pub(in crate::compositor) struct ActiveConfinedPointerRouting {
     surface: wl_surface::WlSurface,
     region: OutputRegion,
 }
-
 #[derive(Debug, Clone)]
 struct PendingLockedPointerReveal {
     backend_id: PointerConstraintBackendId,

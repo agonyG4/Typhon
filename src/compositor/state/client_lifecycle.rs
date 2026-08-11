@@ -8,6 +8,23 @@ pub(in crate::compositor) struct ClientTeardownSummary {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn request_client_resource_exhaustion(&mut self, surface_id: u32) {
+        if !self
+            .pending_client_resource_exhaustions
+            .contains(&surface_id)
+        {
+            self.pending_client_resource_exhaustions.push(surface_id);
+        }
+        self.surface_pacing_metrics.queue_resource_exhaustions = self
+            .surface_pacing_metrics
+            .queue_resource_exhaustions
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn take_client_resource_exhaustions(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_client_resource_exhaustions)
+    }
+
     pub(in crate::compositor) fn note_protocol_error_metric(&mut self) {
         self.compliance_metrics.note_protocol_error();
     }

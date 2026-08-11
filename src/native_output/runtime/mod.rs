@@ -19,6 +19,7 @@ macro_rules! require_validation_base {
 
 mod atomic_commit;
 mod bootstrap;
+mod commit_timing;
 mod cursor_cycle;
 mod cycle;
 mod cycle_dispatch;

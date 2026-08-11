@@ -26,6 +26,98 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn fifo_head_publication_rechecks_next_wait_against_new_barrier() {
+        let mut state = CompositorState::default();
+        let mut first = empty_cached_subsurface_commit();
+        first.pacing.fifo_set_barrier = true;
+        let mut second = empty_cached_subsurface_commit();
+        second.pacing.fifo_wait_barrier = true;
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                root_surface_id: 7,
+                nodes: vec![(7, first)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                root_surface_id: 7,
+                nodes: vec![(7, second)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.active_fifo_barriers.contains_key(&7));
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        assert!(
+            state.pending_surface_tree_transactions[0].nodes[0]
+                .1
+                .pacing
+                .fifo_wait_barrier
+        );
+    }
+
+    #[test]
+    fn timed_head_cannot_be_superseded_by_untimed_work() {
+        let mut state = CompositorState::default();
+        let now = client_pacing_now_ns();
+        let seconds = now / 1_000_000_000 + 60;
+        let mut timed = empty_cached_subsurface_commit();
+        timed.pacing.commit_timing = Some(
+            CommitTimingConstraint::from_protocol(seconds, (now % 1_000_000_000) as u32).unwrap(),
+        );
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                root_surface_id: 8,
+                nodes: vec![(8, timed)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                root_surface_id: 8,
+                nodes: vec![(8, empty_cached_subsurface_commit())],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        state.commit_ready_surface_tree_transactions();
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 2);
+    }
+
+    #[test]
+    fn stale_fifo_generation_cannot_clear_the_current_barrier() {
+        let mut state = CompositorState::default();
+        let current = ActiveFifoBarrier {
+            surface_generation: 3,
+            fifo_barrier_generation: FifoBarrierGeneration::new(2),
+            commit_sequence: SurfaceCommitSequence::initial(),
+            fallback_deadline_ns: u64::MAX,
+        };
+        state.active_fifo_barriers.insert(9, current);
+
+        state.clear_fifo_barrier_claim(
+            FifoBarrierClaim {
+                surface_id: 9,
+                surface_generation: 3,
+                fifo_barrier_generation: FifoBarrierGeneration::new(1),
+                commit_sequence: SurfaceCommitSequence::initial(),
+            },
+            FifoBarrierClearReason::Presented,
+        );
+
+        assert_eq!(state.active_fifo_barriers.get(&9), Some(&current));
+        assert_eq!(state.surface_pacing_metrics.stale_barrier_clear_attempts, 1);
+    }
+
+    #[test]
     fn empty_frame_batch_is_explicit_and_registry_is_bounded_to_two() {
         let mut state = CompositorState::default();
         let first = state.take_frame_batch_for_render(10);

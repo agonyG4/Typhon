@@ -1,3 +1,4 @@
+use super::commit_timing::{refreshed_published_state, reset_after_same_buffer};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
     NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
@@ -31,7 +32,6 @@ use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
-
 impl NativeRuntime {
     #[allow(unused_variables)]
     pub(super) fn render_present_and_update_metrics(
@@ -132,10 +132,7 @@ impl NativeRuntime {
         let input_drain_us = cycle.input_drain_us;
         let raw_input_events = cycle.raw_input_events;
         let coalesced_input_events = cycle.coalesced_input_events;
-        let render_generation = server.render_generation();
-        let scene_generation = server.scene_render_generation();
-        let scene_changed = scene_generation != *last_rendered_scene_generation;
-        let pending_frame_work = server.has_unowned_frame_work();
+        #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         let pacing_now_ns = monotonic_now_ns()?;
         #[rustfmt::skip]
         synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
@@ -314,6 +311,7 @@ impl NativeRuntime {
             scheduler_now,
             Duration::from_nanos(prediction.total_cost_ns),
         );
+        #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         #[rustfmt::skip] let pending_target = if explicit_output && frame_scheduler.visual_work_queued() && scheduled_presentation_target.is_none() { pending_target_for_scanout(scanout)? } else { None };
         *scheduled_presentation_target = plan_visual_target_for_mode(
             presentation_deadline,
@@ -683,8 +681,8 @@ impl NativeRuntime {
                     )? {
                         DirectScanoutAttempt::Unchanged => {
                             direct_suppressed = true;
-                            presentation_deadline.clear_scheduled_target();
-                            *scheduled_presentation_target = None;
+                            #[rustfmt::skip]
+                            reset_after_same_buffer(server, presentation_deadline, scheduled_presentation_target);
                             perf.log("native.direct_scanout", || {
                                 vec![NativePerfField::str("transition", "same_buffer_suppressed")]
                             });

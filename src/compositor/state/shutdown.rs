@@ -103,6 +103,7 @@ pub(in crate::compositor) fn ready_explicit_sync_prefix_end_indices(
     prefix_end
 }
 
+#[cfg(test)]
 pub(in crate::compositor) fn ordered_surface_tree_prefix_end_indices(
     commits: impl IntoIterator<Item = (usize, u32, bool, bool)>,
 ) -> HashMap<u32, usize> {

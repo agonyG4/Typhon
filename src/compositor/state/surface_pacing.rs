@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+const COMMIT_TIMING_REEVALUATION_INTERVAL: Duration = Duration::from_secs(1);
+
 use super::*;
 
 /// The timestamp carried by one `wl_surface.commit`.  It remains in the
@@ -9,6 +11,23 @@ use super::*;
 pub(in crate::compositor) struct CommitTimingConstraint {
     seconds: u64,
     nanoseconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct CommitTimingReadiness {
+    pub(in crate::compositor) requested_not_before: CommitTimingConstraint,
+    pub(in crate::compositor) selected_presentation_time_ns: u64,
+    pub(in crate::compositor) release_for_render_at_ns: u64,
+    pub(in crate::compositor) selected_sequence: u64,
+    pub(in crate::compositor) clock_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct CommitTimingTargetClaim {
+    pub(in crate::compositor) surface_id: u32,
+    pub(in crate::compositor) surface_generation: u64,
+    pub(in crate::compositor) commit_sequence: SurfaceCommitSequence,
+    pub(in crate::compositor) readiness: CommitTimingReadiness,
 }
 
 impl CommitTimingConstraint {
@@ -28,20 +47,32 @@ impl CommitTimingConstraint {
         self.seconds
     }
 
-    pub(in crate::compositor) fn as_nanos(self) -> Option<u64> {
-        let seconds = self.seconds.checked_mul(1_000_000_000)?;
-        seconds.checked_add(self.nanoseconds as u64)
+    pub(in crate::compositor) const fn ordering_key(self) -> (u64, u32) {
+        (self.seconds, self.nanoseconds)
+    }
+
+    pub(in crate::compositor) fn as_nanos(self) -> Option<u128> {
+        Some(
+            u128::from(self.seconds)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u128::from(self.nanoseconds)),
+        )
     }
 
     pub(in crate::compositor) fn is_due(self, clock: PresentationClock) -> bool {
         PresentationTimestamp::from_clock(clock)
             .ok()
-            .and_then(PresentationTimestamp::as_nanos)
-            .is_some_and(|now| self.as_nanos().is_some_and(|target| now >= target))
+            .is_some_and(|now| self.is_due_at(now))
+    }
+
+    fn is_due_at(self, now: PresentationTimestamp) -> bool {
+        let (now_hi, now_lo) = now.protocol_seconds();
+        let (target_hi, target_lo) = ((self.seconds >> 32) as u32, self.seconds as u32);
+        (now_hi, now_lo, now.nanoseconds()) >= (target_hi, target_lo, self.nanoseconds)
     }
 
     pub(in crate::compositor) fn monotonic_deadline_ns(self) -> Option<u64> {
-        self.as_nanos()
+        self.as_nanos().and_then(|nanos| u64::try_from(nanos).ok())
     }
 
     pub(in crate::compositor) fn monotonic_deadline_from_clock_sample(
@@ -49,15 +80,32 @@ impl CommitTimingConstraint {
         monotonic_now: PresentationTimestamp,
         realtime_now: PresentationTimestamp,
     ) -> Option<u64> {
-        let target = self.as_nanos()?;
-        let monotonic_now = monotonic_now.as_nanos()?;
-        let realtime_now = realtime_now.as_nanos()?;
-        Some(if target <= realtime_now {
-            monotonic_now
+        let target = self.as_nanos().expect("commit timing timestamps are u128");
+        let monotonic_now = timestamp_as_nanos_u128(monotonic_now);
+        let realtime_now = timestamp_as_nanos_u128(realtime_now);
+        let monotonic_now_ns = u64::try_from(monotonic_now).unwrap_or(u64::MAX);
+        let deadline = if target <= realtime_now {
+            monotonic_now_ns
         } else {
-            monotonic_now.checked_add(target - realtime_now)?
-        })
+            let delta = target - realtime_now;
+            u64::try_from(monotonic_now.saturating_add(delta)).unwrap_or_else(|_| {
+                monotonic_now_ns.saturating_add(
+                    COMMIT_TIMING_REEVALUATION_INTERVAL
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                )
+            })
+        };
+        Some(deadline)
     }
+}
+
+fn timestamp_as_nanos_u128(timestamp: PresentationTimestamp) -> u128 {
+    let (seconds_hi, seconds_lo) = timestamp.protocol_seconds();
+    let seconds = (u128::from(seconds_hi) << 32) | u128::from(seconds_lo);
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u128::from(timestamp.nanoseconds()))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +121,7 @@ pub(in crate::compositor) struct CapturedSurfacePacing {
     pub(in crate::compositor) fifo_wait_barrier: bool,
     pub(in crate::compositor) fifo_wait_ignored_for_synchronized_subsurface: bool,
     pub(in crate::compositor) commit_timing: Option<CommitTimingConstraint>,
+    pub(in crate::compositor) commit_timing_readiness: Option<CommitTimingReadiness>,
 }
 
 impl CapturedSurfacePacing {
@@ -82,6 +131,7 @@ impl CapturedSurfacePacing {
             fifo_wait_barrier: pending.fifo_wait_barrier,
             fifo_wait_ignored_for_synchronized_subsurface: false,
             commit_timing: pending.commit_timing,
+            commit_timing_readiness: None,
         }
     }
 
@@ -90,6 +140,12 @@ impl CapturedSurfacePacing {
             || (self.fifo_wait_barrier && !self.fifo_wait_ignored_for_synchronized_subsurface)
             || self.commit_timing.is_some()
     }
+}
+
+fn fifo_wait_blocks(pacing: CapturedSurfacePacing, barrier_active: bool) -> bool {
+    pacing.fifo_wait_barrier
+        && !pacing.fifo_wait_ignored_for_synchronized_subsurface
+        && barrier_active
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,7 +160,6 @@ impl FifoBarrierGeneration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum FifoBarrierClearReason {
     Presented,
-    LatchingDeadline,
     ForwardProgressFallback,
     SurfaceTeardown,
 }
@@ -140,6 +195,7 @@ pub struct SurfacePacingMetrics {
     pub past_targets: u64,
     pub future_targets: u64,
     pub timing_protocol_errors: u64,
+    pub queue_resource_exhaustions: u64,
     pub transactions_blocked_by_timing: u64,
     pub released_for_predicted_target: u64,
     pub released_by_conservative_fallback: u64,
@@ -248,7 +304,18 @@ impl CompositorState {
                 .pacing_protected_transactions
                 .saturating_add(1);
         }
+        let surface_generation = self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+            .unwrap_or_default();
         if !pacing.fifo_set_barrier {
+            if let Some(readiness) = pacing.commit_timing_readiness {
+                self.active_commit_timing_targets
+                    .entry(surface_id)
+                    .or_default()
+                    .push((surface_generation, commit_sequence, readiness));
+            }
             return;
         }
         self.next_fifo_barrier_generation = self
@@ -256,11 +323,6 @@ impl CompositorState {
             .checked_add(1)
             .unwrap_or(1);
         let generation = FifoBarrierGeneration::new(self.next_fifo_barrier_generation);
-        let surface_generation = self
-            .surface_presentation_generations
-            .get(&surface_id)
-            .copied()
-            .unwrap_or_default();
         let active = ActiveFifoBarrier {
             surface_generation,
             fifo_barrier_generation: generation,
@@ -275,12 +337,29 @@ impl CompositorState {
             .surface_pacing_metrics
             .barriers_activated
             .saturating_add(1);
+        if let Some(readiness) = pacing.commit_timing_readiness {
+            self.active_commit_timing_targets
+                .entry(surface_id)
+                .or_default()
+                .push((surface_generation, commit_sequence, readiness));
+        }
     }
 
     pub(in crate::compositor) fn transaction_is_ready(
         &self,
         transaction: &PendingSurfaceTreeTransaction,
     ) -> bool {
+        if let Some(requested) = transaction.commit_timing_request()
+            && !transaction
+                .commit_timing_readiness
+                .is_some_and(|readiness| {
+                    readiness.requested_not_before == requested
+                        && client_pacing_now_ns() >= readiness.release_for_render_at_ns
+                })
+            && !requested.is_due(self.presentation_clock)
+        {
+            return false;
+        }
         self.surface_tree_parts_ready(&transaction.nodes, &transaction.dependencies)
     }
 
@@ -296,19 +375,10 @@ impl CompositorState {
             return false;
         }
         for (surface_id, commit) in nodes {
-            let effective_sync = self
-                .subsurface_transactions
-                .is_effectively_synchronized(*surface_id);
-            if commit.pacing.fifo_wait_barrier
-                && !commit.pacing.fifo_wait_ignored_for_synchronized_subsurface
-                && !effective_sync
-                && self.active_fifo_barriers.contains_key(surface_id)
-            {
-                return false;
-            }
-            if let Some(timestamp) = commit.pacing.commit_timing
-                && !timestamp.is_due(self.presentation_clock)
-            {
+            if fifo_wait_blocks(
+                commit.pacing,
+                self.active_fifo_barriers.contains_key(surface_id),
+            ) {
                 return false;
             }
         }
@@ -327,14 +397,22 @@ impl CompositorState {
             .iter()
             .flat_map(|transaction| transaction.nodes.iter())
             .filter_map(|(_, commit)| commit.pacing.commit_timing)
-            .filter_map(|timing| match self.presentation_clock {
-                PresentationClock::Monotonic => timing.monotonic_deadline_ns(),
+            .map(|timing| match self.presentation_clock {
+                PresentationClock::Monotonic => {
+                    timing.monotonic_deadline_ns().unwrap_or_else(|| {
+                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
+                    })
+                }
                 PresentationClock::Realtime => {
-                    let mono =
-                        PresentationTimestamp::from_clock(PresentationClock::Monotonic).ok()?;
-                    let realtime =
-                        PresentationTimestamp::from_clock(PresentationClock::Realtime).ok()?;
-                    timing.monotonic_deadline_from_clock_sample(mono, realtime)
+                    let deadline = PresentationTimestamp::from_clock(PresentationClock::Monotonic)
+                        .ok()
+                        .zip(PresentationTimestamp::from_clock(PresentationClock::Realtime).ok())
+                        .and_then(|(mono, realtime)| {
+                            timing.monotonic_deadline_from_clock_sample(mono, realtime)
+                        });
+                    deadline.unwrap_or_else(|| {
+                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
+                    })
                 }
             })
             .map(|target| target.max(now))
@@ -351,18 +429,141 @@ impl CompositorState {
             .iter()
             .flat_map(|transaction| transaction.nodes.iter())
             .filter_map(|(_, commit)| commit.pacing.commit_timing)
-            .filter_map(|timing| match self.presentation_clock {
-                PresentationClock::Monotonic => timing.monotonic_deadline_ns(),
+            .map(|timing| match self.presentation_clock {
+                PresentationClock::Monotonic => {
+                    timing.monotonic_deadline_ns().unwrap_or_else(|| {
+                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
+                    })
+                }
                 PresentationClock::Realtime => {
-                    let mono =
-                        PresentationTimestamp::from_clock(PresentationClock::Monotonic).ok()?;
-                    let realtime =
-                        PresentationTimestamp::from_clock(PresentationClock::Realtime).ok()?;
-                    timing.monotonic_deadline_from_clock_sample(mono, realtime)
+                    let deadline = PresentationTimestamp::from_clock(PresentationClock::Monotonic)
+                        .ok()
+                        .zip(PresentationTimestamp::from_clock(PresentationClock::Realtime).ok())
+                        .and_then(|(mono, realtime)| {
+                            timing.monotonic_deadline_from_clock_sample(mono, realtime)
+                        });
+                    deadline.unwrap_or_else(|| {
+                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
+                    })
                 }
             })
             .map(|target| target.max(now))
             .min()
+    }
+
+    pub(in crate::compositor) fn next_commit_timing_requested_ns(&self) -> Option<u64> {
+        self.pending_surface_tree_transactions
+            .iter()
+            .find_map(PendingSurfaceTreeTransaction::commit_timing_request)
+            .and_then(|timing| timing.monotonic_deadline_ns())
+    }
+
+    pub(in crate::compositor) fn has_pending_commit_timing(&self) -> bool {
+        self.pending_surface_tree_transactions
+            .iter()
+            .any(|transaction| transaction.commit_timing_request().is_some())
+    }
+
+    pub(in crate::compositor) fn arm_commit_timing_target(
+        &mut self,
+        readiness: CommitTimingReadiness,
+    ) -> bool {
+        let Some(requested_ns) = readiness.requested_not_before.monotonic_deadline_ns() else {
+            return false;
+        };
+        if readiness.selected_presentation_time_ns < requested_ns {
+            return false;
+        }
+        let Some(transaction) =
+            self.pending_surface_tree_transactions
+                .iter_mut()
+                .find(|transaction| {
+                    transaction.commit_timing_request() == Some(readiness.requested_not_before)
+                })
+        else {
+            return false;
+        };
+        transaction.commit_timing_readiness = Some(readiness);
+        true
+    }
+
+    pub(in crate::compositor) fn invalidate_pending_commit_timing_targets(&mut self) {
+        for transaction in &mut self.pending_surface_tree_transactions {
+            transaction.commit_timing_readiness = None;
+        }
+    }
+
+    pub(in crate::compositor) fn commit_timing_claims_for_frame(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<CommitTimingTargetClaim> {
+        surface_ids
+            .into_iter()
+            .flat_map(|surface_id| {
+                self.active_commit_timing_targets
+                    .get(&surface_id)
+                    .into_iter()
+                    .flat_map(|claims| claims.iter())
+                    .map(move |(surface_generation, commit_sequence, readiness)| {
+                        CommitTimingTargetClaim {
+                            surface_id,
+                            surface_generation: *surface_generation,
+                            commit_sequence: *commit_sequence,
+                            readiness: *readiness,
+                        }
+                    })
+            })
+            .collect()
+    }
+
+    pub(in crate::compositor) fn complete_commit_timing_claim(
+        &mut self,
+        claim: CommitTimingTargetClaim,
+        presentation: FramePresentation,
+    ) {
+        let comparable = presentation.clock == self.presentation_clock;
+        if comparable
+            && !claim
+                .readiness
+                .requested_not_before
+                .is_due_at(presentation.timestamp)
+        {
+            self.surface_pacing_metrics.early_presentation_violations = self
+                .surface_pacing_metrics
+                .early_presentation_violations
+                .saturating_add(1);
+            debug_assert!(
+                claim
+                    .readiness
+                    .requested_not_before
+                    .is_due_at(presentation.timestamp),
+                "Commit Timing frame was presented before its requested timestamp"
+            );
+        }
+        self.discard_commit_timing_claim(claim);
+    }
+
+    pub(in crate::compositor) fn discard_commit_timing_claim(
+        &mut self,
+        claim: CommitTimingTargetClaim,
+    ) {
+        let mut remove_surface_entry = false;
+        if let Some(active) = self.active_commit_timing_targets.get_mut(&claim.surface_id)
+            && let Some(index) =
+                active
+                    .iter()
+                    .position(|(surface_generation, commit_sequence, readiness)| {
+                        *surface_generation == claim.surface_generation
+                            && *commit_sequence == claim.commit_sequence
+                            && *readiness == claim.readiness
+                    })
+        {
+            active.remove(index);
+            remove_surface_entry = active.is_empty();
+        }
+        if remove_surface_entry {
+            self.active_commit_timing_targets.remove(&claim.surface_id);
+        }
     }
 
     pub(in crate::compositor) fn progress_surface_pacing(&mut self, now_ns: u64) {
@@ -429,7 +630,7 @@ impl CompositorState {
         }
         self.active_fifo_barriers.remove(&claim.surface_id);
         match reason {
-            FifoBarrierClearReason::Presented | FifoBarrierClearReason::LatchingDeadline => {
+            FifoBarrierClearReason::Presented => {
                 self.surface_pacing_metrics.barriers_cleared_by_presentation = self
                     .surface_pacing_metrics
                     .barriers_cleared_by_presentation
@@ -454,7 +655,68 @@ mod tests {
     fn timestamp_keeps_both_seconds_words_without_truncation() {
         let constraint = CommitTimingConstraint::from_protocol(0x1234_5678_9abc_def0, 7).unwrap();
         assert_eq!(constraint.seconds(), 0x1234_5678_9abc_def0);
-        assert_eq!(constraint.as_nanos(), None);
+        assert!(constraint.as_nanos().is_some());
+    }
+
+    #[test]
+    fn maximum_protocol_timestamp_remains_representable_for_re_evaluation() {
+        let constraint = CommitTimingConstraint::from_protocol(u64::MAX, 999_999_999).unwrap();
+        assert!(constraint.as_nanos().is_some());
+        let monotonic = PresentationTimestamp::from_microseconds(1, 0).unwrap();
+        let realtime = PresentationTimestamp::from_microseconds(0, 0).unwrap();
+        assert!(
+            constraint
+                .monotonic_deadline_from_clock_sample(monotonic, realtime)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn selected_timing_target_releases_before_presentation_time_and_remains_owned() {
+        let mut state = CompositorState::default();
+        let now = client_pacing_now_ns();
+        let seconds = now / 1_000_000_000 + 60;
+        let requested = CommitTimingConstraint::from_protocol(seconds, 0).unwrap();
+        let mut commit = empty_cached_subsurface_commit();
+        commit.pacing.commit_timing = Some(requested);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                root_surface_id: 10,
+                nodes: vec![(10, commit)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        let readiness = CommitTimingReadiness {
+            requested_not_before: requested,
+            selected_presentation_time_ns: now + 61_000_000_000,
+            release_for_render_at_ns: now + 60_000_000_000,
+            selected_sequence: 44,
+            clock_generation: 7,
+        };
+
+        assert!(state.arm_commit_timing_target(readiness));
+        assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        state.arm_commit_timing_target(CommitTimingReadiness {
+            release_for_render_at_ns: 0,
+            ..readiness
+        });
+        assert!(state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+
+        let pacing = CapturedSurfacePacing {
+            commit_timing: Some(requested),
+            commit_timing_readiness: Some(readiness),
+            ..CapturedSurfacePacing::default()
+        };
+        state.apply_captured_surface_pacing(10, SurfaceCommitSequence::initial(), pacing);
+        let claims = state.commit_timing_claims_for_frame([10]);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].readiness.selected_sequence, 44);
+        assert_eq!(
+            claims[0].readiness.selected_presentation_time_ns,
+            now + 61_000_000_000
+        );
     }
 
     #[test]
@@ -477,5 +739,22 @@ mod tests {
     fn fallback_is_refresh_aware_but_finite() {
         assert_eq!(fifo_forward_progress_deadline(10, 60_000_000), 75_000_010);
         assert_eq!(fifo_forward_progress_deadline(10, 6_060_606), 34_000_010);
+    }
+
+    #[test]
+    fn synchronized_wait_capture_remains_authoritative_after_mode_changes() {
+        let ignored_at_commit = CapturedSurfacePacing {
+            fifo_wait_barrier: true,
+            fifo_wait_ignored_for_synchronized_subsurface: true,
+            ..CapturedSurfacePacing::default()
+        };
+        let applied_at_commit = CapturedSurfacePacing {
+            fifo_wait_barrier: true,
+            fifo_wait_ignored_for_synchronized_subsurface: false,
+            ..CapturedSurfacePacing::default()
+        };
+
+        assert!(!fifo_wait_blocks(ignored_at_commit, true));
+        assert!(fifo_wait_blocks(applied_at_commit, true));
     }
 }

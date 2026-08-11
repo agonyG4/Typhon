@@ -15,6 +15,7 @@ pub(in crate::compositor) struct PendingSurfaceTreeTransaction {
     pub(in crate::compositor) root_surface_id: u32,
     pub(in crate::compositor) nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     pub(in crate::compositor) dependencies: Vec<SurfaceTreeAcquireDependency>,
+    pub(in crate::compositor) commit_timing_readiness: Option<CommitTimingReadiness>,
     pub(in crate::compositor) received_at: Instant,
 }
 
@@ -109,6 +110,13 @@ pub(in crate::compositor) struct BufferlessSurfaceCommitState {
 }
 
 impl PendingSurfaceTreeTransaction {
+    pub(in crate::compositor) fn commit_timing_request(&self) -> Option<CommitTimingConstraint> {
+        self.nodes
+            .iter()
+            .filter_map(|(_, commit)| commit.pacing.commit_timing)
+            .max_by(|left, right| left.ordering_key().cmp(&right.ordering_key()))
+    }
+
     pub(in crate::compositor) fn ordering(&self) -> TransactionOrdering {
         if self
             .nodes

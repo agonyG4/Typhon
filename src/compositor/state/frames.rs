@@ -87,7 +87,9 @@ impl CompositorState {
                 .pending_surface_tree_transactions
                 .iter()
                 .any(|transaction| {
-                    !self.external_acquire_readiness || self.transaction_is_ready(transaction)
+                    transaction.commit_timing_request().is_some()
+                        || !self.external_acquire_readiness
+                        || self.transaction_is_ready(transaction)
                 })
             || !self.pending_color_info.is_empty()
     }
@@ -259,6 +261,12 @@ impl CompositorState {
                 .map(|surface| surface.surface_id)
                 .chain(self.client_cursor_surfaces.keys().copied()),
         );
+        let commit_timing_target_claims = self.commit_timing_claims_for_frame(
+            self.renderable_surfaces
+                .iter()
+                .map(|surface| surface.surface_id)
+                .chain(self.client_cursor_surfaces.keys().copied()),
+        );
         self.buffer_release_metrics.buffer_releases_captured = self
             .buffer_release_metrics
             .buffer_releases_captured
@@ -289,6 +297,7 @@ impl CompositorState {
                 shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,
                 fifo_barrier_claims,
+                commit_timing_target_claims,
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
@@ -338,6 +347,9 @@ impl CompositorState {
             .remove(&batch_id)
             .expect("missing compositor frame batch on discard");
         let mut batch = batch;
+        for claim in &batch.commit_timing_target_claims {
+            self.discard_commit_timing_claim(*claim);
+        }
         let callback_count = batch.callbacks.len();
         if callback_count > 0 {
             self.frame_callback_metrics
@@ -385,6 +397,9 @@ impl CompositorState {
             .remove(&batch_id)
             .or_else(|| self.retired_frame_batches.remove(&batch_id))
             .expect("missing compositor frame batch after safe abandonment");
+        for claim in &batch.commit_timing_target_claims {
+            self.discard_commit_timing_claim(*claim);
+        }
         let frame_id = batch.frame_id;
         let callback_count = batch.callbacks.len();
         if callback_count > 0 {
@@ -422,6 +437,9 @@ impl CompositorState {
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
         for claim in &batch.fifo_barrier_claims {
             self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+        }
+        for claim in &batch.commit_timing_target_claims {
+            self.complete_commit_timing_claim(*claim, presentation);
         }
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let batch = self.complete_frame_batch_releases(batch_id, batch);
@@ -631,6 +649,9 @@ impl CompositorState {
                 .frame_batches
                 .remove(&batch_id)
                 .expect("frame batch disappeared during shutdown release");
+            for claim in &batch.commit_timing_target_claims {
+                self.discard_commit_timing_claim(*claim);
+            }
             for pending in std::mem::take(&mut batch.presentation_feedbacks) {
                 pending.feedback.discarded();
             }
@@ -647,6 +668,9 @@ impl CompositorState {
                 .retired_frame_batches
                 .remove(&batch_id)
                 .expect("retired frame batch disappeared during shutdown release");
+            for claim in &batch.commit_timing_target_claims {
+                self.discard_commit_timing_claim(*claim);
+            }
             for pending in std::mem::take(&mut batch.presentation_feedbacks) {
                 pending.feedback.discarded();
             }
@@ -1310,18 +1334,10 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let readiness = transactions
-            .iter()
-            .map(|transaction| self.transaction_is_ready(transaction))
-            .collect::<Vec<_>>();
         for transaction in &transactions {
             for (surface_id, commit) in &transaction.nodes {
                 if commit.pacing.fifo_wait_barrier {
-                    if self
-                        .subsurface_transactions
-                        .is_effectively_synchronized(*surface_id)
-                        || commit.pacing.fifo_wait_ignored_for_synchronized_subsurface
-                    {
+                    if commit.pacing.fifo_wait_ignored_for_synchronized_subsurface {
                         self.surface_pacing_metrics
                             .waits_ignored_for_synchronized_subsurfaces = self
                             .surface_pacing_metrics
@@ -1344,57 +1360,69 @@ impl CompositorState {
                 }
             }
         }
-        let prefix_end = ordered_surface_tree_prefix_end_indices(
-            transactions.iter().enumerate().map(|(index, transaction)| {
-                (
-                    index,
-                    transaction.root_surface_id,
-                    readiness[index],
-                    transaction.is_pacing_protected(),
-                )
-            }),
-        );
-        let replacements = transactions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, transaction)| {
-                let end = *prefix_end.get(&transaction.root_surface_id)?;
-                (index <= end && !readiness[index]).then(|| {
-                    let replacement = transactions[index + 1..=end]
-                        .iter()
-                        .enumerate()
-                        .find_map(|(offset, candidate)| {
-                            (candidate.root_surface_id == transaction.root_surface_id
-                                && readiness[index + 1 + offset])
-                                .then(|| candidate.nodes.first())
-                                .flatten()
-                        })
-                        .expect("ready tree prefix guarantees an ordered ready successor")
-                        .1
-                        .commit_id;
-                    (index, replacement)
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let mut waiting = Vec::new();
-        let mut ready = Vec::new();
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut superseded_resize_commits: HashMap<u32, ResizeCommitSnapshot> = HashMap::new();
-        for (index, transaction) in transactions.into_iter().enumerate() {
-            let Some(&end_index) = prefix_end.get(&transaction.root_surface_id) else {
-                waiting.push(transaction);
-                continue;
-            };
-            if index > end_index {
-                waiting.push(transaction);
-            } else if !readiness[index] {
+        loop {
+            let root_heads = transactions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, transaction)| {
+                    (!transactions[..index]
+                        .iter()
+                        .any(|previous| previous.root_surface_id == transaction.root_surface_id))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let mut selected = None;
+            for index in root_heads {
+                let transaction = &transactions[index];
+                if self.transaction_is_ready(transaction) {
+                    selected = Some((index, false, None));
+                    break;
+                }
+                if transaction.is_pacing_protected() {
+                    continue;
+                }
                 let root_id = transaction.root_surface_id;
-                let acquire_state = if readiness[index] {
+                let mut replacement = None;
+                for candidate in &transactions[index + 1..] {
+                    if candidate.root_surface_id != root_id {
+                        continue;
+                    }
+                    let ready = self.transaction_is_ready(candidate);
+                    if candidate.is_pacing_protected() {
+                        if ready {
+                            replacement =
+                                candidate.nodes.first().map(|(_, commit)| commit.commit_id);
+                        }
+                        break;
+                    }
+                    if ready {
+                        replacement = candidate.nodes.first().map(|(_, commit)| commit.commit_id);
+                        break;
+                    }
+                }
+                if replacement.is_some() {
+                    selected = Some((index, true, replacement));
+                    break;
+                }
+            }
+            let Some((index, supersede, replacement)) = selected else {
+                break;
+            };
+            let transaction = transactions.remove(index);
+            if supersede {
+                let root_id = transaction.root_surface_id;
+                let replacement = replacement.expect("supersession has a replacement");
+                let acquire_state = if transaction
+                    .dependencies
+                    .iter()
+                    .all(|dependency| dependency.state == PendingAcquireState::Ready)
+                {
                     PendingAcquireState::Ready
                 } else {
                     PendingAcquireState::RegistrationPending
                 };
-                let replacement = replacements[&index];
                 for (_, commit) in &transaction.nodes {
                     if commit.attachment.is_some() {
                         self.note_explicit_commit_superseded(
@@ -1424,29 +1452,32 @@ impl CompositorState {
                     .subsurface_transaction_metrics
                     .tree_transactions_superseded
                     .saturating_add(1);
-            } else {
-                let mut transaction = transaction;
-                if let Some((_, root)) = transaction.nodes.first_mut() {
-                    let mut callbacks = superseded_callbacks
-                        .remove(&transaction.root_surface_id)
-                        .unwrap_or_default();
-                    callbacks.append(&mut root.frame_callbacks);
-                    root.frame_callbacks = callbacks;
-                }
-                if let Some(resize_commit) =
-                    superseded_resize_commits.remove(&transaction.root_surface_id)
-                {
-                    self.install_tree_resize_commit(
-                        transaction.root_surface_id,
-                        &mut transaction.nodes,
-                        resize_commit,
-                    );
-                }
-                ready.push(transaction);
+                continue;
             }
-        }
-        self.pending_surface_tree_transactions = waiting;
-        for transaction in ready {
+            let mut transaction = transaction;
+            if let Some(readiness) = transaction.commit_timing_readiness {
+                for (_, commit) in &mut transaction.nodes {
+                    if commit.pacing.commit_timing.is_some() {
+                        commit.pacing.commit_timing_readiness = Some(readiness);
+                    }
+                }
+            }
+            if let Some((_, root)) = transaction.nodes.first_mut() {
+                let mut callbacks = superseded_callbacks
+                    .remove(&transaction.root_surface_id)
+                    .unwrap_or_default();
+                callbacks.append(&mut root.frame_callbacks);
+                root.frame_callbacks = callbacks;
+            }
+            if let Some(resize_commit) =
+                superseded_resize_commits.remove(&transaction.root_surface_id)
+            {
+                self.install_tree_resize_commit(
+                    transaction.root_surface_id,
+                    &mut transaction.nodes,
+                    resize_commit,
+                );
+            }
             let wait_ms =
                 u64::try_from(transaction.received_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.subsurface_transaction_metrics
@@ -1461,6 +1492,7 @@ impl CompositorState {
                 .saturating_add(1);
             self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
         }
+        self.pending_surface_tree_transactions = transactions;
         for (root_surface_id, resize_commit) in superseded_resize_commits {
             self.release_detached_resize_capture(root_surface_id, resize_commit);
         }

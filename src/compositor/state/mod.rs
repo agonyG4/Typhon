@@ -104,8 +104,9 @@ pub(in crate::compositor) use surface_focus::*;
 pub use surface_pacing::SurfacePacingMetrics;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_pacing::{
-    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingConstraint, FifoBarrierClaim,
-    FifoBarrierClearReason, FifoBarrierGeneration, PendingSurfacePacingState,
+    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingConstraint, CommitTimingReadiness,
+    CommitTimingTargetClaim, FifoBarrierClaim, FifoBarrierClearReason, FifoBarrierGeneration,
+    PendingSurfacePacingState,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::*;

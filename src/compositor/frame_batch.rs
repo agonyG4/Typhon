@@ -2,7 +2,9 @@ use std::num::NonZeroU64;
 
 use wayland_server::protocol::{wl_buffer, wl_callback};
 
-use super::{FifoBarrierClaim, PendingPresentationFeedback, SurfaceBufferRelease};
+use super::{
+    CommitTimingTargetClaim, FifoBarrierClaim, PendingPresentationFeedback, SurfaceBufferRelease,
+};
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +65,7 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) shm_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pub(super) dmabuf_releases_to_complete_on_present: Vec<SurfaceBufferRelease>,
     pub(super) fifo_barrier_claims: Vec<FifoBarrierClaim>,
+    pub(super) commit_timing_target_claims: Vec<CommitTimingTargetClaim>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

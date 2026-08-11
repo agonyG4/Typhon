@@ -447,6 +447,7 @@ impl NativeSessionIo for NativeRuntime {
             Duration::from_nanos(1_000_000_000u64 / u64::from(self.refresh_hz.max(1)));
         self.presentation_deadline.invalidate(refresh_interval);
         self.scheduled_presentation_target = None;
+        self.server.invalidate_commit_timing_targets();
         self.render_journal.reset();
         self.adaptive_buffering.reset();
         self.pending_proven_deadline_miss = None;

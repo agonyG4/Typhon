@@ -437,6 +437,7 @@ mod tests {
                 root_surface_id: 7,
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),
+                commit_timing_readiness: None,
                 received_at: Instant::now(),
             });
 
@@ -452,12 +453,14 @@ mod tests {
                 root_surface_id: 7,
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),
+                commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
             PendingSurfaceTreeTransaction {
                 root_surface_id: 8,
                 nodes: vec![(8, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),
+                commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
         ]);

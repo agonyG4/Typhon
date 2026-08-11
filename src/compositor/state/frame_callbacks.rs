@@ -173,6 +173,13 @@ impl CompositorState {
                 self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
             }
         }
+        for claim in &batch.commit_timing_target_claims {
+            if claim.surface_id == direct_surface_id {
+                self.complete_commit_timing_claim(*claim, presentation);
+            } else {
+                self.discard_commit_timing_claim(*claim);
+            }
+        }
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let callbacks = std::mem::take(&mut batch.callbacks);
         self.complete_frame_callbacks(callbacks);
@@ -194,8 +201,12 @@ impl CompositorState {
             .frame_batches
             .remove(&batch_id)
             .expect("missing compositor frame batch for no-visual-change settlement");
-        for claim in &batch.fifo_barrier_claims {
-            self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::LatchingDeadline);
+        // A no-visual-change result is not a content-latching event.  In
+        // particular, a direct same-buffer attempt must not satisfy FIFO
+        // merely because the buffer identity did not change; forward
+        // progress is handled by the barrier's explicit fallback deadline.
+        for claim in &batch.commit_timing_target_claims {
+            self.discard_commit_timing_claim(*claim);
         }
         for pending in std::mem::take(&mut batch.presentation_feedbacks) {
             pending.feedback.discarded();

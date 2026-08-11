@@ -762,6 +762,7 @@ impl CompositorState {
                 FifoBarrierClearReason::SurfaceTeardown,
             );
         }
+        self.active_commit_timing_targets.remove(&surface_id);
         self.fifo_resources.remove(&surface_id);
         self.commit_timer_resources.remove(&surface_id);
         self.surface_damage_journals.remove(&surface_id);
