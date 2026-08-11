@@ -44,16 +44,38 @@ impl SelectionMimeTypes for Vec<String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SelectionSourceKey(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionKind {
     Clipboard,
     Primary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelectionSourceKind {
+    WaylandClipboard,
+    WaylandPrimary,
+    DataControl,
+    HostClipboardBridge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionSourceRecord {
+    pub key: SelectionSourceKey,
+    pub kind: SelectionSourceKind,
+    pub owner: Option<u64>,
+    pub mime_types: Vec<String>,
+    pub used: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveSelection {
     pub generation: u64,
     pub kind: SelectionKind,
+    pub source_key: SelectionSourceKey,
+    pub source_kind: SelectionSourceKind,
     pub source_id: u32,
     pub mime_types: Vec<String>,
 }
@@ -62,21 +84,48 @@ pub struct ActiveSelection {
 pub struct DataOfferBinding {
     pub offer_id: u64,
     pub target_id: u32,
+    pub kind: SelectionKind,
     pub source_generation: u64,
+    pub source_key: SelectionSourceKey,
     pub mime_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionCommit {
+    pub generation: u64,
+    pub replaced_source: Option<SelectionSourceKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionClear {
+    pub generation: u64,
+    pub cleared_source: Option<SelectionSourceKey>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SelectionChannel {
+    generation: u64,
+    active: Option<ActiveSelection>,
+    offers: HashMap<u64, DataOfferBinding>,
+}
+
+impl SelectionChannel {
+    fn advance_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SelectionState {
     max_history: usize,
     clipboard_history: Vec<SelectionOfferRecord>,
     primary_selection: Option<SelectionOfferRecord>,
     data_control_enabled: bool,
-    sources: HashMap<u32, Vec<String>>,
-    clipboard_selection: Option<ActiveSelection>,
-    offers: HashMap<u64, DataOfferBinding>,
+    sources: HashMap<SelectionSourceKey, SelectionSourceRecord>,
+    legacy_source_keys: HashMap<u32, SelectionSourceKey>,
+    channels: [SelectionChannel; 2],
     next_offer_id: u64,
-    next_selection_generation: u64,
 }
 
 impl Default for SelectionState {
@@ -87,10 +136,9 @@ impl Default for SelectionState {
             primary_selection: None,
             data_control_enabled: true,
             sources: HashMap::new(),
-            clipboard_selection: None,
-            offers: HashMap::new(),
+            legacy_source_keys: HashMap::new(),
+            channels: [SelectionChannel::default(), SelectionChannel::default()],
             next_offer_id: 0,
-            next_selection_generation: 0,
         }
     }
 }
@@ -101,6 +149,195 @@ impl SelectionState {
             max_history: max_history.max(1),
             ..Self::default()
         }
+    }
+
+    pub fn register_source(
+        &mut self,
+        key: SelectionSourceKey,
+        kind: SelectionSourceKind,
+        owner: Option<u64>,
+    ) {
+        self.sources.insert(
+            key,
+            SelectionSourceRecord {
+                key,
+                kind,
+                owner,
+                mime_types: Vec::new(),
+                used: false,
+            },
+        );
+    }
+
+    pub fn mark_source_used(&mut self, key: SelectionSourceKey) -> bool {
+        let Some(source) = self.sources.get_mut(&key) else {
+            return false;
+        };
+        if source.used {
+            return false;
+        }
+        source.used = true;
+        true
+    }
+
+    pub fn source(&self, key: SelectionSourceKey) -> Option<&SelectionSourceRecord> {
+        self.sources.get(&key)
+    }
+
+    pub fn offer_source_mime_type_for_key(
+        &mut self,
+        key: SelectionSourceKey,
+        mime_type: impl Into<String>,
+    ) {
+        let mime_type = mime_type.into();
+        if mime_type.is_empty() || mime_type.len() > MAX_MIME_TYPE_LEN {
+            return;
+        }
+        let Some(source) = self.sources.get_mut(&key) else {
+            return;
+        };
+        if source.mime_types.len() >= MAX_SOURCE_MIME_TYPES
+            || source
+                .mime_types
+                .iter()
+                .any(|existing| existing == &mime_type)
+        {
+            return;
+        }
+        source.mime_types.push(mime_type);
+    }
+
+    pub fn source_mime_types_for_key(&self, key: SelectionSourceKey) -> Option<&[String]> {
+        self.sources
+            .get(&key)
+            .map(|source| source.mime_types.as_slice())
+    }
+
+    pub fn commit_selection(
+        &mut self,
+        kind: SelectionKind,
+        key: SelectionSourceKey,
+    ) -> Option<SelectionCommit> {
+        let source = self.sources.get(&key)?.clone();
+        if source.mime_types.is_empty() {
+            return None;
+        }
+        let channel = self.channel_mut(kind);
+        let replaced_source = channel
+            .active
+            .as_ref()
+            .map(|selection| selection.source_key)
+            .filter(|active_key| *active_key != key);
+        let generation = channel.advance_generation();
+        channel.active = Some(ActiveSelection {
+            generation,
+            kind,
+            source_key: key,
+            source_kind: source.kind,
+            source_id: key.0 as u32,
+            mime_types: source.mime_types,
+        });
+        channel.offers.clear();
+        if kind == SelectionKind::Clipboard {
+            self.record_clipboard_offer(
+                channel
+                    .active
+                    .as_ref()
+                    .map(|selection| selection.mime_types.clone())
+                    .unwrap_or_default(),
+                0,
+            );
+        }
+        Some(SelectionCommit {
+            generation,
+            replaced_source,
+        })
+    }
+
+    pub fn clear_selection(&mut self, kind: SelectionKind) -> SelectionClear {
+        let channel = self.channel_mut(kind);
+        let cleared_source = channel.active.take().map(|selection| selection.source_key);
+        let generation = channel.advance_generation();
+        channel.offers.clear();
+        if kind == SelectionKind::Primary {
+            self.primary_selection = None;
+        }
+        SelectionClear {
+            generation,
+            cleared_source,
+        }
+    }
+
+    pub fn active_selection(&self, kind: SelectionKind) -> Option<&ActiveSelection> {
+        self.channel(kind).active.as_ref()
+    }
+
+    pub fn current_generation(&self, kind: SelectionKind) -> u64 {
+        self.channel(kind).generation
+    }
+
+    pub fn register_offer(
+        &mut self,
+        kind: SelectionKind,
+        target_id: u32,
+        source_generation: u64,
+    ) -> Option<u64> {
+        let selection = self.active_selection(kind)?.clone();
+        if selection.generation != source_generation {
+            return None;
+        }
+        self.next_offer_id = self.next_offer_id.wrapping_add(1).max(1);
+        let offer_id = self.next_offer_id;
+        self.channel_mut(kind).offers.insert(
+            offer_id,
+            DataOfferBinding {
+                offer_id,
+                target_id,
+                kind,
+                source_generation,
+                source_key: selection.source_key,
+                mime_types: selection.mime_types,
+            },
+        );
+        Some(offer_id)
+    }
+
+    pub fn offer_is_current(
+        &self,
+        offer_id: u64,
+        kind: SelectionKind,
+        generation: u64,
+        target_id: u32,
+        mime_type: &str,
+    ) -> bool {
+        let Some(offer) = self.channel(kind).offers.get(&offer_id) else {
+            return false;
+        };
+        let Some(selection) = self.active_selection(kind) else {
+            return false;
+        };
+        offer.kind == kind
+            && offer.target_id == target_id
+            && offer.source_generation == generation
+            && offer.source_generation == selection.generation
+            && offer.source_key == selection.source_key
+            && offer.mime_types.iter().any(|mime| mime == mime_type)
+    }
+
+    pub fn remove_source_key(&mut self, key: SelectionSourceKey) -> Vec<SelectionKind> {
+        self.sources.remove(&key);
+        self.legacy_source_keys.retain(|_, value| *value != key);
+        let mut cleared = Vec::new();
+        for kind in [SelectionKind::Clipboard, SelectionKind::Primary] {
+            if self
+                .active_selection(kind)
+                .is_some_and(|selection| selection.source_key == key)
+            {
+                self.clear_selection(kind);
+                cleared.push(kind);
+            }
+        }
+        cleared
     }
 
     pub fn record_clipboard_offer(&mut self, mime_types: impl SelectionMimeTypes, byte_len: usize) {
@@ -129,52 +366,35 @@ impl SelectionState {
     }
 
     pub fn begin_source(&mut self, source_id: u32) {
-        self.sources.entry(source_id).or_default();
+        let key = SelectionSourceKey(u64::from(source_id));
+        self.legacy_source_keys.insert(source_id, key);
+        self.register_source(key, SelectionSourceKind::WaylandClipboard, None);
     }
 
     pub fn offer_source_mime_type(&mut self, source_id: u32, mime_type: impl Into<String>) {
-        let mime_type = mime_type.into();
-        if mime_type.is_empty() || mime_type.len() > MAX_MIME_TYPE_LEN {
+        let Some(key) = self.legacy_source_keys.get(&source_id).copied() else {
             return;
-        }
-        let mime_types = self.sources.entry(source_id).or_default();
-        if mime_types.len() >= MAX_SOURCE_MIME_TYPES
-            || mime_types.iter().any(|existing| existing == &mime_type)
-        {
-            return;
-        }
-        mime_types.push(mime_type);
+        };
+        self.offer_source_mime_type_for_key(key, mime_type);
     }
 
     pub fn source_mime_types(&self, source_id: u32) -> Option<&[String]> {
-        self.sources.get(&source_id).map(Vec::as_slice)
+        let key = self.legacy_source_keys.get(&source_id).copied()?;
+        self.source_mime_types_for_key(key)
     }
 
     pub fn set_clipboard_selection_from_source(&mut self, source_id: u32) -> Option<u64> {
-        let mime_types = self.sources.get(&source_id)?.clone();
-        if mime_types.is_empty() {
-            return None;
-        }
-        self.next_selection_generation = self.next_selection_generation.saturating_add(1);
-        let generation = self.next_selection_generation;
-        self.clipboard_selection = Some(ActiveSelection {
-            generation,
-            kind: SelectionKind::Clipboard,
-            source_id,
-            mime_types,
-        });
-        self.offers.clear();
-        Some(generation)
+        let key = self.legacy_source_keys.get(&source_id).copied()?;
+        self.commit_selection(SelectionKind::Clipboard, key)
+            .map(|commit| commit.generation)
     }
 
     pub fn clear_clipboard_selection(&mut self) {
-        self.next_selection_generation = self.next_selection_generation.saturating_add(1);
-        self.clipboard_selection = None;
-        self.offers.clear();
+        self.clear_selection(SelectionKind::Clipboard);
     }
 
     pub fn active_clipboard_selection(&self) -> Option<&ActiveSelection> {
-        self.clipboard_selection.as_ref()
+        self.active_selection(SelectionKind::Clipboard)
     }
 
     pub fn register_clipboard_offer(
@@ -182,48 +402,33 @@ impl SelectionState {
         target_id: u32,
         source_generation: u64,
     ) -> Option<u64> {
-        let selection = self.clipboard_selection.as_ref()?;
-        if selection.generation != source_generation {
-            return None;
-        }
-        self.next_offer_id = self.next_offer_id.saturating_add(1).max(1);
-        let offer_id = self.next_offer_id;
-        self.offers.insert(
-            offer_id,
-            DataOfferBinding {
-                offer_id,
-                target_id,
-                source_generation,
-                mime_types: selection.mime_types.clone(),
-            },
-        );
-        Some(offer_id)
+        self.register_offer(SelectionKind::Clipboard, target_id, source_generation)
     }
 
     pub fn offer_matches_active_selection(&self, offer_id: u64, mime_type: &str) -> bool {
-        let Some(offer) = self.offers.get(&offer_id) else {
+        let Some(offer) = self.channel(SelectionKind::Clipboard).offers.get(&offer_id) else {
             return false;
         };
-        let Some(selection) = self.clipboard_selection.as_ref() else {
-            return false;
-        };
-        offer.source_generation == selection.generation
-            && offer.mime_types.iter().any(|mime| mime == mime_type)
+        self.offer_is_current(
+            offer_id,
+            SelectionKind::Clipboard,
+            offer.source_generation,
+            offer.target_id,
+            mime_type,
+        )
     }
 
     pub fn remove_source(&mut self, source_id: u32) {
-        self.sources.remove(&source_id);
-        if self
-            .clipboard_selection
-            .as_ref()
-            .is_some_and(|selection| selection.source_id == source_id)
-        {
-            self.clear_clipboard_selection();
+        if let Some(key) = self.legacy_source_keys.get(&source_id).copied() {
+            self.remove_source_key(key);
         }
     }
 
     pub fn commit_source_to_primary_selection(&mut self, source_id: u32, byte_len: usize) -> bool {
-        let Some(mime_types) = self.sources.get(&source_id).cloned() else {
+        let Some(key) = self.legacy_source_keys.get(&source_id).copied() else {
+            return false;
+        };
+        let Some(mime_types) = self.source_mime_types_for_key(key).map(ToOwned::to_owned) else {
             return false;
         };
         self.set_primary_selection(mime_types, byte_len);
@@ -231,7 +436,7 @@ impl SelectionState {
     }
 
     pub fn clear_primary_selection(&mut self) {
-        self.primary_selection = None;
+        self.clear_selection(SelectionKind::Primary);
     }
 
     pub fn set_data_control_enabled(&mut self, enabled: bool) {
@@ -249,18 +454,40 @@ impl SelectionState {
     pub fn primary_selection(&self) -> Option<&SelectionOfferRecord> {
         self.primary_selection.as_ref()
     }
+
+    fn channel(&self, kind: SelectionKind) -> &SelectionChannel {
+        &self.channels[match kind {
+            SelectionKind::Clipboard => 0,
+            SelectionKind::Primary => 1,
+        }]
+    }
+
+    fn channel_mut(&mut self, kind: SelectionKind) -> &mut SelectionChannel {
+        &mut self.channels[match kind {
+            SelectionKind::Clipboard => 0,
+            SelectionKind::Primary => 1,
+        }]
+    }
 }
 
 fn normalize_mime_types(mime_types: impl SelectionMimeTypes) -> Vec<String> {
-    let mime_types: Vec<_> = mime_types
-        .into_mime_types()
-        .into_iter()
-        .filter(|mime_type| !mime_type.is_empty())
-        .collect();
-    if mime_types.is_empty() {
+    let mut normalized = Vec::new();
+    for mime_type in mime_types.into_mime_types() {
+        if mime_type.is_empty()
+            || mime_type.len() > MAX_MIME_TYPE_LEN
+            || normalized.iter().any(|existing| existing == &mime_type)
+        {
+            continue;
+        }
+        normalized.push(mime_type);
+        if normalized.len() == MAX_SOURCE_MIME_TYPES {
+            break;
+        }
+    }
+    if normalized.is_empty() {
         vec!["application/octet-stream".to_string()]
     } else {
-        mime_types
+        normalized
     }
 }
 
@@ -406,5 +633,92 @@ mod tests {
         state.remove_source(7);
 
         assert!(state.active_clipboard_selection().is_none());
+    }
+
+    #[test]
+    fn broker_keeps_clipboard_and_primary_generations_independent() {
+        let mut broker = SelectionState::default();
+        let clipboard_source = SelectionSourceKey(100);
+        let primary_source = SelectionSourceKey(200);
+        let replacement_source = SelectionSourceKey(201);
+        broker.register_source(
+            clipboard_source,
+            SelectionSourceKind::WaylandClipboard,
+            Some(1),
+        );
+        broker.register_source(primary_source, SelectionSourceKind::WaylandPrimary, Some(2));
+        broker.register_source(
+            replacement_source,
+            SelectionSourceKind::DataControl,
+            Some(3),
+        );
+        broker.offer_source_mime_type_for_key(clipboard_source, "text/plain");
+        broker.offer_source_mime_type_for_key(primary_source, "text/plain");
+        broker.offer_source_mime_type_for_key(replacement_source, "text/plain");
+
+        let clipboard_commit = broker
+            .commit_selection(SelectionKind::Clipboard, clipboard_source)
+            .unwrap();
+        let primary_commit = broker
+            .commit_selection(SelectionKind::Primary, primary_source)
+            .unwrap();
+        let clipboard_offer = broker
+            .register_offer(SelectionKind::Clipboard, 7, clipboard_commit.generation)
+            .unwrap();
+        let primary_offer = broker
+            .register_offer(SelectionKind::Primary, 8, primary_commit.generation)
+            .unwrap();
+
+        broker
+            .commit_selection(SelectionKind::Primary, replacement_source)
+            .unwrap();
+
+        assert!(broker.offer_is_current(
+            clipboard_offer,
+            SelectionKind::Clipboard,
+            clipboard_commit.generation,
+            7,
+            "text/plain"
+        ));
+        assert!(!broker.offer_is_current(
+            primary_offer,
+            SelectionKind::Primary,
+            primary_commit.generation,
+            8,
+            "text/plain"
+        ));
+        assert_eq!(
+            broker
+                .active_selection(SelectionKind::Primary)
+                .unwrap()
+                .source_key,
+            replacement_source
+        );
+    }
+
+    #[test]
+    fn stale_source_removal_cannot_clear_newer_selection() {
+        let mut broker = SelectionState::default();
+        let old_source = SelectionSourceKey(1);
+        let new_source = SelectionSourceKey(2);
+        for key in [old_source, new_source] {
+            broker.register_source(key, SelectionSourceKind::DataControl, None);
+            broker.offer_source_mime_type_for_key(key, "text/plain");
+        }
+        broker
+            .commit_selection(SelectionKind::Primary, old_source)
+            .unwrap();
+        broker
+            .commit_selection(SelectionKind::Primary, new_source)
+            .unwrap();
+        broker.remove_source_key(old_source);
+
+        assert_eq!(
+            broker
+                .active_selection(SelectionKind::Primary)
+                .unwrap()
+                .source_key,
+            new_source
+        );
     }
 }

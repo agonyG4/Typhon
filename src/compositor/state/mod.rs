@@ -18,6 +18,7 @@ mod override_redirect_stack;
 mod pointer_constraints;
 mod resize;
 mod roles;
+mod selection_runtime;
 mod shortcuts;
 mod shutdown;
 mod subsurfaces;
@@ -80,6 +81,8 @@ pub(in crate::compositor) use pointer_constraints::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
 pub(in crate::compositor) use roles::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use selection_runtime::*;
 pub use shortcuts::AstreaShortcutPhase;
 #[allow(unused_imports)]
 pub(in crate::compositor) use shortcuts::*;
