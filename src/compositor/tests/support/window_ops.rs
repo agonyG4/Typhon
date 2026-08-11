@@ -16,10 +16,12 @@ pub(in crate::compositor::tests) fn create_idle_inhibitor_for_surface_and_captur
     let qh = queue.handle();
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let idle_manager: client_zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1 =
         globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
     let _inhibitor = idle_manager.create_inhibitor(&surface, &qh, ());
+    let _buffer = attach_test_buffered_surface(&surface, &shm, &qh, 2, 2)?;
     surface.commit();
     connection.flush()?;
 

@@ -726,120 +726,41 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn remove_data_source(
-        &mut self,
-        source: &wl_data_source::WlDataSource,
-    ) {
-        self.cancel_drag_for_source(source);
-        let selection_key = self
-            .data_sources
-            .get(&source.id())
-            .map(|binding| binding.selection_key);
-        if let Some(binding) = self.data_sources.get_mut(&source.id()) {
-            binding.use_state = DataSourceUse::Retired;
-        }
-        self.data_sources.remove(&source.id());
-        if let Some(selection_key) = selection_key {
-            self.selection_state.remove_source_key(selection_key);
-        }
-        if self
-            .active_clipboard
-            .as_ref()
-            .is_some_and(|selection| match &selection.source {
-                ClipboardSourceBackend::InternalWayland {
-                    source: active_source,
-                    ..
-                } => same_wayland_resource(active_source, source),
-                ClipboardSourceBackend::HostBridge { .. } => false,
-            })
-        {
-            self.active_clipboard = None;
-            self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
-            if let Some(bridge) = self.clipboard_bridge.as_mut() {
-                let _ = bridge.clear_internal_selection();
-            }
-            self.data_offers.clear();
-            self.publish_clipboard_clear_to_data_devices();
-        }
-    }
-
-    pub(in crate::compositor) fn clear_dead_active_clipboard_source(&mut self) {
-        let active_source = self.active_clipboard.as_ref().and_then(|selection| {
-            if let ClipboardSourceBackend::InternalWayland { source, .. } = &selection.source {
-                Some(source.clone())
-            } else {
-                None
-            }
-        });
-        let Some(source) = active_source else {
-            return;
-        };
-        if source.is_alive() && source.client().is_some() {
-            return;
-        }
-        self.remove_data_source(&source);
-    }
-
-    pub(in crate::compositor) fn register_data_device(
-        &mut self,
-        device: wl_data_device::WlDataDevice,
-        client_id: ClientId,
-        seat_id: ObjectId,
-    ) {
-        self.data_devices
-            .retain(|binding| binding.device.is_alive());
-        self.data_devices.push(ClipboardDataDevice {
-            device: device.clone(),
-            client_id: client_id.clone(),
-            seat_id,
-        });
-        if self.client_has_focus(&client_id) {
-            self.publish_clipboard_to_data_device(&device);
-        }
-    }
-
-    pub(in crate::compositor) fn remove_data_device(
-        &mut self,
-        device: &wl_data_device::WlDataDevice,
-    ) {
-        if let Some(client_id) = device.client().map(|client| client.id())
-            && self
-                .active_drag
-                .as_ref()
-                .is_some_and(|drag| drag.target_client.as_ref() == Some(&client_id))
-        {
-            self.cancel_drag_session("data_device_destroyed");
-        }
-        self.data_devices
-            .retain(|binding| !same_wayland_resource(&binding.device, device));
-        self.data_offers.retain(|_, offer| {
-            offer.offer.is_alive() && !offer.offer.id().same_client_as(&device.id())
-        });
-    }
-
     pub(in crate::compositor) fn set_clipboard_selection(
         &mut self,
         client_id: &ClientId,
         source: Option<wl_data_source::WlDataSource>,
         serial: u32,
     ) -> bool {
-        if !self.client_has_focus(client_id)
-            || !self.validate_set_selection_serial(client_id, serial)
+        if !self.client_has_focus(client_id) {
+            return false;
+        }
+        let Some(selection_epoch) = self.selection_input_epoch(client_id, serial) else {
+            return false;
+        };
+        if self
+            .last_clipboard_selection_epoch
+            .is_some_and(|last_epoch| selection_epoch < last_epoch)
         {
             return false;
         }
 
         let Some(source) = source else {
-            self.active_clipboard = None;
             let clear = self
                 .selection_state
                 .clear_selection(SelectionKind::Clipboard);
+            if let Some(source_key) = clear.cleared_source {
+                self.cancel_selection_source(SelectionKind::Clipboard, source_key);
+            }
+            self.active_clipboard = None;
             self.next_clipboard_generation = clear.generation;
+            self.last_clipboard_selection_epoch = Some(selection_epoch);
             if let Some(bridge) = self.clipboard_bridge.as_mut() {
                 let _ = bridge.clear_internal_selection();
             }
             self.data_offers.clear();
             self.publish_clipboard_to_focused_client();
+            self.publish_data_control_selection(SelectionKind::Clipboard);
             return true;
         };
 
@@ -860,16 +781,11 @@ impl CompositorState {
             return false;
         };
 
-        if let Some(previous) = self.active_clipboard.as_ref()
-            && let ClipboardSourceBackend::InternalWayland {
-                source: previous_source,
-                ..
-            } = &previous.source
-            && !same_wayland_resource(previous_source, &source)
-            && previous_source.is_alive()
-        {
-            previous_source.cancelled();
+        if let Some(previous_source) = commit.replaced_source {
+            self.cancel_selection_source(SelectionKind::Clipboard, previous_source);
         }
+        self.selection_state.mark_source_used(binding.selection_key);
+        self.last_clipboard_selection_epoch = Some(selection_epoch);
 
         if let Some(binding) = self.data_sources.get_mut(&source.id()) {
             binding.use_state = DataSourceUse::Selection;
@@ -890,6 +806,7 @@ impl CompositorState {
         }
         self.data_offers.clear();
         self.publish_clipboard_to_focused_client();
+        self.publish_data_control_selection(SelectionKind::Clipboard);
         true
     }
 
@@ -914,10 +831,23 @@ impl CompositorState {
             self.selection_state
                 .offer_source_mime_type_for_key(source_key, mime_type.clone());
         }
+        let previous_host_source = self.active_clipboard.as_ref().and_then(|selection| {
+            matches!(selection.source, ClipboardSourceBackend::HostBridge { .. })
+                .then_some(selection.source_key)
+        });
         let generation = self
             .selection_state
             .commit_selection(SelectionKind::Clipboard, source_key)
-            .map(|commit| commit.generation)
+            .map(|commit| {
+                if let Some(previous_source) = commit.replaced_source {
+                    self.cancel_selection_source(SelectionKind::Clipboard, previous_source);
+                }
+                self.selection_state.mark_source_used(source_key);
+                if let Some(previous_host_source) = previous_host_source {
+                    self.selection_state.remove_source_key(previous_host_source);
+                }
+                commit.generation
+            })
             .unwrap_or(self.next_clipboard_generation);
         self.next_clipboard_generation = generation;
         self.active_clipboard = Some(ActiveClipboard {
@@ -928,10 +858,10 @@ impl CompositorState {
         });
         self.data_offers.clear();
         self.publish_clipboard_to_focused_client();
+        self.publish_data_control_selection(SelectionKind::Clipboard);
     }
 
     pub(in crate::compositor) fn clear_host_clipboard_selection(&mut self) {
-        self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
         if self.active_clipboard.as_ref().is_some_and(|selection| {
             matches!(selection.source, ClipboardSourceBackend::HostBridge { .. })
         }) {
@@ -942,6 +872,7 @@ impl CompositorState {
             self.active_clipboard = None;
             self.data_offers.clear();
             self.publish_clipboard_to_focused_client();
+            self.publish_data_control_selection(SelectionKind::Clipboard);
         }
     }
 
@@ -1109,6 +1040,18 @@ impl CompositorState {
                     return;
                 }
                 let _ = source.send_event(wl_data_source::Event::Send {
+                    mime_type,
+                    fd: fd.as_fd(),
+                });
+            }
+            ClipboardSourceBackend::DataControl {
+                source,
+                client_id: _,
+            } => {
+                if !source.is_alive() {
+                    return;
+                }
+                let _ = source.send_event(ext_data_control_source_v1::Event::Send {
                     mime_type,
                     fd: fd.as_fd(),
                 });

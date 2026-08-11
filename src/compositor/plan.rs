@@ -77,7 +77,7 @@ impl InputProtocolCapabilities {
             pointer_constraints: true,
             pointer_warp: true,
             keyboard_shortcuts_inhibit: false,
-            idle_inhibit: false,
+            idle_inhibit: true,
         }
     }
 }
@@ -101,8 +101,8 @@ impl SelectionProtocolCapabilities {
     pub const fn core_clipboard() -> Self {
         Self {
             clipboard: true,
-            primary_selection: false,
-            data_control: false,
+            primary_selection: true,
+            data_control: true,
         }
     }
 }

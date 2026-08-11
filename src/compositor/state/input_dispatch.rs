@@ -1,34 +1,78 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn refresh_input_serial_focus_generation(&mut self, serial: u32) {
+        let focus_generation = self.focus_generation;
+        if let Some(input) = self
+            .recent_input_serials
+            .iter_mut()
+            .find(|input| input.serial == serial)
+        {
+            input.focus_generation = focus_generation;
+        }
+    }
+
     pub(in crate::compositor) fn add_idle_inhibitor(
         &mut self,
         inhibitor: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+        client_id: ClientId,
+        target_surface: wl_surface::WlSurface,
     ) {
-        self.idle_inhibitor_resources.push(inhibitor);
-        self.idle_manager.inhibit();
+        self.idle_inhibitor_resources.push(IdleInhibitorBinding {
+            inhibitor,
+            client_id,
+            target_surface,
+        });
+        self.reconcile_idle_inhibition();
     }
 
     pub(in crate::compositor) fn remove_idle_inhibitor(
         &mut self,
         inhibitor: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
     ) {
-        let before = self.idle_inhibitor_resources.len();
         self.idle_inhibitor_resources
-            .retain(|resource| !same_wayland_resource(resource, inhibitor));
-        if self.idle_inhibitor_resources.len() != before {
-            self.idle_manager.uninhibit();
-        }
+            .retain(|binding| !same_wayland_resource(&binding.inhibitor, inhibitor));
+        self.reconcile_idle_inhibition();
     }
 
     pub fn idle_inhibited(&mut self) -> bool {
-        self.idle_inhibitor_resources.retain(Resource::is_alive);
-        if self.idle_inhibitor_resources.is_empty() {
-            while self.idle_manager.is_inhibited() {
-                self.idle_manager.uninhibit();
-            }
-        }
+        self.reconcile_idle_inhibition();
         self.idle_manager.is_inhibited()
+    }
+
+    pub(in crate::compositor) fn reconcile_idle_inhibition(&mut self) {
+        self.idle_inhibitor_resources
+            .retain(|binding| binding.inhibitor.is_alive() && binding.target_surface.is_alive());
+        let effective_count = self
+            .idle_inhibitor_resources
+            .iter()
+            .filter(|binding| self.idle_inhibitor_is_effective(binding))
+            .count();
+        self.idle_manager.reconcile_inhibited_count(effective_count);
+    }
+
+    fn idle_inhibitor_is_effective(&self, binding: &IdleInhibitorBinding) -> bool {
+        let target_surface_id = compositor_surface_id(&binding.target_surface);
+        if self
+            .surface_client_ids
+            .get(&target_surface_id)
+            .is_none_or(|client_id| *client_id != binding.client_id)
+        {
+            return false;
+        }
+        if !self.surface_resources.contains_key(&target_surface_id) {
+            return false;
+        }
+        let root_surface_id = self.root_surface_id_for_surface(target_surface_id);
+        if self
+            .toplevel_window_state(root_surface_id)
+            .is_some_and(WindowState::is_minimized)
+        {
+            return false;
+        }
+        self.renderable_surfaces
+            .iter()
+            .any(|surface| self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
     }
 
     pub(in crate::compositor) fn add_relative_pointer_resource(
@@ -735,6 +779,7 @@ impl CompositorState {
                 } else if let Some(root_surface) = self.surface_resource_by_id(root_surface_id) {
                     self.focus_surface(root_surface);
                 }
+                self.refresh_input_serial_focus_generation(serial);
                 let press = PointerPress {
                     serial,
                     button,
@@ -861,6 +906,7 @@ impl CompositorState {
             {
                 self.set_desktop_focus(root_surface, WindowFocusReason::PointerPress.label());
             }
+            self.refresh_input_serial_focus_generation(serial);
             let press = PointerPress {
                 serial,
                 button,

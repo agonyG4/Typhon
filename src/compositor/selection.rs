@@ -238,16 +238,6 @@ impl SelectionState {
             mime_types: source.mime_types,
         });
         channel.offers.clear();
-        if kind == SelectionKind::Clipboard {
-            self.record_clipboard_offer(
-                channel
-                    .active
-                    .as_ref()
-                    .map(|selection| selection.mime_types.clone())
-                    .unwrap_or_default(),
-                0,
-            );
-        }
         Some(SelectionCommit {
             generation,
             replaced_source,

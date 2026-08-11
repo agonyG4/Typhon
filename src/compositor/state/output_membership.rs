@@ -182,6 +182,7 @@ impl CompositorState {
         for surface in surfaces {
             self.reconcile_surface_output_membership(&surface);
         }
+        self.reconcile_idle_inhibition();
     }
 
     pub(in crate::compositor) fn scrub_surface_output_membership(&mut self, surface_id: u32) {

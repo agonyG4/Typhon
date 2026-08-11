@@ -157,12 +157,41 @@ impl CompositorState {
             self.remove_data_source(&source);
         }
 
-        let idle_before = self.idle_inhibitor_resources.len();
-        self.idle_inhibitor_resources
-            .retain(|inhibitor| !resource_owned_by_client(inhibitor, client_id));
-        for _ in self.idle_inhibitor_resources.len()..idle_before {
-            self.idle_manager.uninhibit();
+        self.primary_devices
+            .retain(|device| device.client_id != *client_id);
+        self.primary_offers.retain(|_, offer| {
+            offer.target_client_id != *client_id
+                && !resource_owned_by_client(&offer.offer, client_id)
+        });
+        let primary_sources = self
+            .primary_sources
+            .values()
+            .filter(|source| source.client_id == *client_id)
+            .map(|source| source.source.clone())
+            .collect::<Vec<_>>();
+        for source in primary_sources {
+            self.remove_primary_source(&source);
         }
+
+        self.data_control_devices
+            .retain(|device| device.client_id != *client_id);
+        self.data_control_offers.retain(|_, offer| {
+            offer.target_client_id != *client_id
+                && !resource_owned_by_client(&offer.offer, client_id)
+        });
+        let data_control_sources = self
+            .data_control_sources
+            .values()
+            .filter(|source| source.client_id == *client_id)
+            .map(|source| source.source.clone())
+            .collect::<Vec<_>>();
+        for source in data_control_sources {
+            self.remove_data_control_source(&source);
+        }
+
+        self.idle_inhibitor_resources
+            .retain(|inhibitor| inhibitor.client_id != *client_id);
+        self.reconcile_idle_inhibition();
 
         self.recent_input_serials
             .retain(|input| !resource_owned_by_client(&input.surface, client_id));

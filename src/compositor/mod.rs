@@ -135,7 +135,6 @@ pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
 #[allow(unused_imports)]
 pub(in crate::compositor) use toplevel_publication::*;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackDisposition {
     Presented,
@@ -144,7 +143,6 @@ pub enum TerminalCallbackDisposition {
     Superseded,
     Cancelled,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackOwnership {
     None,
@@ -164,7 +162,6 @@ pub enum TerminalCallbackOwnership {
         reason: TerminalCallbackLeakReason,
     },
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackLeakReason {
     MissingBatch,
@@ -234,11 +231,7 @@ pub use render::{
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
-pub use selection::{
-    ActiveSelection, DataOfferBinding, SelectionClear, SelectionCommit, SelectionKind,
-    SelectionOfferRecord, SelectionSourceKey, SelectionSourceKind, SelectionSourceRecord,
-    SelectionState,
-};
+pub use selection::*;
 pub use server::{OwnCompositorServer, XwaylandClientIdentity};
 pub use server_error::CompositorError;
 use shm::{
@@ -258,20 +251,16 @@ pub use surface::{
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
     SurfacePlacement, SurfaceRenderBackend,
 };
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCallbackTime(u32);
-
 impl FrameCallbackTime {
     pub const fn new(milliseconds: u32) -> Self {
         Self(milliseconds)
     }
-
     pub const fn milliseconds(self) -> u32 {
         self.0
     }
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolOnlyCompletion {
     Completed { callback_count: usize },
@@ -286,7 +275,6 @@ pub struct XwaylandSurfaceCommitObserved {
     pub buffer_id: Option<BufferId>,
     pub buffer_size: Option<BufferSize>,
 }
-
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
@@ -434,7 +422,6 @@ pub enum RenderGenerationCause {
     CursorMotion,
     CursorState,
 }
-
 impl RenderGenerationCause {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -460,7 +447,6 @@ impl RenderGenerationCause {
         matches!(self, Self::SurfaceCommit | Self::SurfaceDamage)
     }
 }
-
 #[derive(Debug, Clone, Copy)]
 pub struct ClientCursorRenderState<'a> {
     pub surface: &'a RenderableSurface,
@@ -469,7 +455,6 @@ pub struct ClientCursorRenderState<'a> {
     pub hotspot_x: i32,
     pub hotspot_y: i32,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(in crate::compositor) enum SurfaceTeardownReason {
@@ -501,7 +486,7 @@ pub struct CompositorState {
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
     pointer_resources: Vec<wl_pointer::WlPointer>,
     relative_pointer_resources: Vec<RelativePointerResource>,
-    idle_inhibitor_resources: Vec<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
+    idle_inhibitor_resources: Vec<IdleInhibitorBinding>,
     idle_manager: IdleManager,
     output_size: OutputSize,
     output_scale: OutputScale,
@@ -636,9 +621,17 @@ pub struct CompositorState {
     data_sources: HashMap<ObjectId, ClipboardDataSource>,
     data_devices: Vec<ClipboardDataDevice>,
     data_offers: HashMap<ObjectId, ClipboardDataOffer>,
+    primary_sources: HashMap<ObjectId, PrimarySourceBinding>,
+    primary_devices: Vec<PrimaryDeviceBinding>,
+    primary_offers: HashMap<ObjectId, PrimaryOfferBinding>,
+    data_control_sources: HashMap<ObjectId, DataControlSourceBinding>,
+    data_control_devices: Vec<DataControlDeviceBinding>,
+    data_control_offers: HashMap<ObjectId, DataControlOfferBinding>,
     active_clipboard: Option<ActiveClipboard>,
     active_drag: Option<ActiveDrag>,
     next_clipboard_generation: u64,
+    last_clipboard_selection_epoch: Option<u64>,
+    last_primary_selection_epoch: Option<u64>,
     popup_surfaces: HashMap<u32, PopupSurface>,
     popup_grab_stack: Vec<u32>,
     popup_nodes: HashMap<u32, PopupNode>,

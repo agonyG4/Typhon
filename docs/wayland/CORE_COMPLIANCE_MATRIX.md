@@ -44,9 +44,9 @@ Core/XDG request matrix, but they must remain synchronized with
 | `zwp_relative_pointer_manager_v1` | 1 | Partial |
 | `zwp_pointer_constraints_v1` | 1 | Partial |
 | `wp_pointer_warp_v1` | 1 | Partial |
-| `zwp_idle_inhibit_manager_v1` | 1 | Partial |
-| `zwp_primary_selection_device_manager_v1` | 1 | Partial |
-| `ext_data_control_manager_v1` | 1 | Partial |
+| `zwp_idle_inhibit_manager_v1` | 1 | Implemented |
+| `zwp_primary_selection_device_manager_v1` | 1 | Implemented |
+| `ext_data_control_manager_v1` | 1 | Implemented |
 | `zxdg_decoration_manager_v1` | 1 | Partial |
 | `zwp_linux_dmabuf_v1` | 4 | Partial |
 | `wp_linux_drm_syncobj_manager_v1` | 1 | Partial |
@@ -336,6 +336,12 @@ the initial inventory was written:
   validation;
 - typed input serial records, pressed-key keyboard enter state, monotonic
   timestamps, and purpose-specific validators;
+- canonical Clipboard and PRIMARY seat channels with stale-generation offer
+  rejection, MIME-bounded sources, protocol-specific send adapters, and
+  cross-protocol ext-data-control publication;
+- surface-aware idle inhibition that derives its effective count from live
+  rendered content and reconciles on mapping, unmapping, minimization,
+  restoration, and client teardown;
 - copied/double-buffered input and opaque regions, buffer transform/scale
   validation, and version-gated preferred buffer scale/transform announcements;
 - independent XDG initial-handshake and outstanding-configure state, ordered

@@ -1113,6 +1113,7 @@ impl CompositorState {
         self.renderable_surfaces = visible_surfaces;
 
         if minimized_surfaces.is_empty() {
+            self.reconcile_idle_inhibition();
             return false;
         }
 
@@ -1132,6 +1133,7 @@ impl CompositorState {
         }
         self.queue_backend_state(window_id);
         self.focus_topmost_renderable_toplevel();
+        self.reconcile_idle_inhibition();
         self.advance_render_generation(RenderGenerationCause::WindowMinimize);
         true
     }
@@ -1171,6 +1173,7 @@ impl CompositorState {
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
+        self.reconcile_idle_inhibition();
         self.advance_render_generation(RenderGenerationCause::WindowRestore);
         true
     }

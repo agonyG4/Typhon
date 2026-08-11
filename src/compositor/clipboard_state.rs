@@ -1,6 +1,13 @@
 use super::*;
 
 #[derive(Debug, Clone)]
+pub(super) struct IdleInhibitorBinding {
+    pub(super) inhibitor: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    pub(super) client_id: ClientId,
+    pub(super) target_surface: wl_surface::WlSurface,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct DataSourceData {
     pub(super) client_id: ClientId,
 }
@@ -92,9 +99,67 @@ pub(super) struct ActiveDrag {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct PrimarySourceBinding {
+    pub(super) source: zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+    pub(super) selection_key: SelectionSourceKey,
+    pub(super) client_id: ClientId,
+    pub(super) mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PrimaryDeviceBinding {
+    pub(super) device: zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    pub(super) client_id: ClientId,
+    pub(super) seat_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PrimaryOfferBinding {
+    pub(super) offer: zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+    pub(super) target_client_id: ClientId,
+    pub(super) target_id: u32,
+    pub(super) broker_offer_id: u64,
+    pub(super) source_generation: u64,
+    pub(super) source_key: SelectionSourceKey,
+    pub(super) mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DataControlSourceBinding {
+    pub(super) source: ext_data_control_source_v1::ExtDataControlSourceV1,
+    pub(super) selection_key: SelectionSourceKey,
+    pub(super) client_id: ClientId,
+    pub(super) mime_types: Vec<String>,
+    pub(super) used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DataControlDeviceBinding {
+    pub(super) device: ext_data_control_device_v1::ExtDataControlDeviceV1,
+    pub(super) client_id: ClientId,
+    pub(super) seat_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DataControlOfferBinding {
+    pub(super) offer: ext_data_control_offer_v1::ExtDataControlOfferV1,
+    pub(super) target_client_id: ClientId,
+    pub(super) target_id: u32,
+    pub(super) broker_offer_id: u64,
+    pub(super) kind: SelectionKind,
+    pub(super) source_generation: u64,
+    pub(super) source_key: SelectionSourceKey,
+    pub(super) mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum ClipboardSourceBackend {
     InternalWayland {
         source: wl_data_source::WlDataSource,
+        client_id: ClientId,
+    },
+    DataControl {
+        source: ext_data_control_source_v1::ExtDataControlSourceV1,
         client_id: ClientId,
     },
     HostBridge {

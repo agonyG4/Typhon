@@ -50,7 +50,10 @@ impl CompositorState {
         reason: &'static str,
     ) {
         let old_surface_id = self.focused_surface.as_ref().map(compositor_surface_id);
+        let old_client_id = self.focused_client_id();
         let new_surface_id = compositor_surface_id(&surface);
+        let new_client_id = surface.client().map(|client| client.id());
+        let client_focus_changed = old_client_id != new_client_id;
         let old_window_id = self.focused_window_id;
         let new_window_id =
             self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
@@ -68,6 +71,9 @@ impl CompositorState {
             focus_debug_log(|| {
                 format!("focus_enter reason={reason} old={old_surface_id:?} new={new_surface_id}")
             });
+        }
+        if client_focus_changed && let Some(old_client_id) = old_client_id.as_ref() {
+            self.publish_primary_clear_to_client(old_client_id);
         }
         self.focused_surface = Some(surface.clone());
         self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
@@ -88,6 +94,9 @@ impl CompositorState {
             }
         }
         self.ensure_keyboard_focus(&surface);
+        if client_focus_changed {
+            self.publish_primary_to_focused_client();
+        }
         crate::xwayland::trace::emit("focus_wayland_keyboard", || {
             crate::xwayland::trace::TraceFields::new()
                 .field("source", "compositor")

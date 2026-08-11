@@ -383,6 +383,7 @@ impl CompositorState {
             self.recompute_layer_keyboard_focus();
         }
         self.reorder_renderable_surfaces_by_committed_stack();
+        self.reconcile_idle_inhibition();
         layer_shell_debug_log(|| format!("map surface={surface_id}"));
     }
 
@@ -403,6 +404,7 @@ impl CompositorState {
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         self.recompute_layer_keyboard_focus();
+        self.reconcile_idle_inhibition();
         layer_shell_debug_log(|| format!("unmap surface={surface_id}"));
     }
 

@@ -968,6 +968,7 @@ impl CompositorState {
         removed_surface_ids.sort_unstable();
         removed_surface_ids.dedup();
         if removed_surface_ids.is_empty() {
+            self.reconcile_idle_inhibition();
             return false;
         }
 
@@ -997,6 +998,7 @@ impl CompositorState {
             &removed_surface_ids,
             "surface-destroyed",
         );
+        self.reconcile_idle_inhibition();
         if self
             .pointer_surface
             .as_ref()

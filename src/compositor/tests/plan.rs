@@ -7,6 +7,8 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
         "wl_compositor",
         "wl_subcompositor",
         "wl_data_device_manager",
+        "zwp_primary_selection_device_manager_v1",
+        "ext_data_control_manager_v1",
         "wl_shm",
         "wp_viewporter",
         "wp_fractional_scale_manager_v1",
@@ -84,12 +86,12 @@ fn clipboard_ready_profile_advertises_only_core_clipboard_selection() {
 }
 
 #[test]
-fn default_plan_advertises_core_clipboard_but_not_unimplemented_selection_protocols() {
+fn default_plan_advertises_core_selection_protocols() {
     let protocols = CompositorPlan::new("oblivion-one-test").protocol_names();
 
     assert!(protocols.contains(&"wl_data_device_manager"));
-    assert!(!protocols.contains(&"zwp_primary_selection_device_manager_v1"));
-    assert!(!protocols.contains(&"ext_data_control_manager_v1"));
+    assert!(protocols.contains(&"zwp_primary_selection_device_manager_v1"));
+    assert!(protocols.contains(&"ext_data_control_manager_v1"));
 }
 
 #[test]
@@ -134,7 +136,7 @@ fn unsupported_gaming_protocol_stubs_are_hidden_from_public_plan() {
 }
 
 #[test]
-fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
+fn native_libinput_profile_advertises_serviced_input_protocols() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
@@ -145,7 +147,7 @@ fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
     assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(names.contains(&"zwp_pointer_constraints_v1"));
     assert!(names.contains(&"wp_pointer_warp_v1"));
-    assert!(!names.contains(&"zwp_idle_inhibit_manager_v1"));
+    assert!(names.contains(&"zwp_idle_inhibit_manager_v1"));
 }
 
 #[test]

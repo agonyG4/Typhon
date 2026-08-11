@@ -41,6 +41,10 @@ impl IdleManager {
         self.inhibited_count = self.inhibited_count.saturating_sub(1);
     }
 
+    pub fn reconcile_inhibited_count(&mut self, count: usize) {
+        self.inhibited_count = count;
+    }
+
     pub const fn is_inhibited(&self) -> bool {
         self.inhibited_count > 0
     }
@@ -127,5 +131,18 @@ mod tests {
             manager.state_at(start + Duration::from_secs(20)),
             IdleState::DpmsOff
         );
+    }
+
+    #[test]
+    fn idle_manager_reconciliation_is_idempotent() {
+        let start = Instant::now();
+        let mut manager = IdleManager::new(Duration::from_secs(5), Duration::from_secs(10), start);
+
+        manager.reconcile_inhibited_count(2);
+        manager.reconcile_inhibited_count(2);
+        assert!(manager.is_inhibited());
+
+        manager.reconcile_inhibited_count(0);
+        assert!(!manager.is_inhibited());
     }
 }

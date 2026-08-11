@@ -37,7 +37,7 @@ fn cpu_composition_registry_omits_gpu_buffer_globals() {
 }
 
 #[test]
-fn default_registry_omits_unsupported_gaming_protocol_stubs() {
+fn default_registry_advertises_enabled_idle_inhibition() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -49,7 +49,7 @@ fn default_registry_omits_unsupported_gaming_protocol_stubs() {
     let globals = result.unwrap();
     assert!(!globals.contains(&"zwp_relative_pointer_manager_v1".to_string()));
     assert!(!globals.contains(&"zwp_pointer_constraints_v1".to_string()));
-    assert!(!globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
+    assert!(globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
 }
 
 #[test]
