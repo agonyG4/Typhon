@@ -204,6 +204,7 @@ pub(crate) struct WorkerQueuedOutputFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputFrameIdentitySnapshot {
     pub(crate) frame_id: u64,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) slot: OutputSlotId,
     pub(crate) render_generation: u64,
@@ -215,6 +216,7 @@ impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
     fn from(frame: &RenderedOutputFrame) -> Self {
         Self {
             frame_id: frame.id,
+            protocol_batch_id: frame.protocol_batch_id,
             transaction_id: frame.transaction_id,
             slot: frame.slot,
             render_generation: frame.render_generation,

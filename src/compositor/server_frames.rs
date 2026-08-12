@@ -46,8 +46,8 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn next_commit_timing_planning_candidate(&self) -> Option<CommitTimingPlanningCandidate> {
-        self.state.next_commit_timing_planning_candidate()
+    pub fn commit_timing_planning_candidates(&mut self) -> Vec<CommitTimingPlanningCandidate> {
+        self.state.commit_timing_planning_candidates()
     }
 
     #[doc(hidden)]
@@ -81,17 +81,14 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn active_commit_timing_guard(&self) -> Option<CommitTimingSubmissionGuard> {
-        self.state.active_commit_timing_guard()
-    }
-
-    #[doc(hidden)]
-    pub fn commit_timing_submission_is_safe(
+    pub fn commit_timing_submission_is_safe_for_batch(
         &mut self,
+        batch_id: CompositorFrameBatchId,
         planned_monotonic_presentation_time: MonotonicTimestampNs,
         clock_generation: u64,
     ) -> bool {
-        self.state.active_commit_timing_submission_is_safe(
+        self.state.commit_timing_submission_is_safe_for_batch(
+            batch_id,
             planned_monotonic_presentation_time,
             clock_generation,
         )

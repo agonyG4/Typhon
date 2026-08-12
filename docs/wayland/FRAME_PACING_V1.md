@@ -39,12 +39,25 @@ readiness plan. A target beyond the native `u64` monotonic horizon receives a
 finite re-evaluation wake and is never treated as due.
 
 Realtime plans are revalidated when the compositor re-enters the ready path and
-again immediately before submission. A backward clock jump clears the pending
-readiness and replans from a fresh sample; a forward jump may release a target
-that is already due. If the selected mapping is no longer safe at pre-submit,
-the frame is deferred and the planner is asked to produce a new target. The
-guard is tied to the exact transaction ID and clock generation, so equal
-timestamps on independent roots do not cross-arm or cross-submit.
+again immediately before submission. Each realtime sample reads monotonic time
+before the realtime clock and again after it; the post-sample monotonic value is
+used for the mapping, so the sampling interval can only move a wake later. A
+backward clock jump clears the pending readiness and replans from a fresh
+sample; a forward jump may release a target that is already due.
+
+Global pacing state is used to choose the next event-loop wake, but it is not a
+global output submission lock. The native planner visits every eligible,
+unarmed root-head timed transaction and arms each independent plan, so a
+blocked acquire on one root cannot starve a ready timed root. Submission safety
+instead checks only the exact Commit Timing claims captured by the prepared
+frame batch. A batch with no timed claims therefore does not inherit an
+unrelated surface's timed constraint.
+
+If a selected mapping is no longer safe at pre-submit, the frame is deferred
+and the planner is asked to produce a new target. Claims remain tied to the
+exact transaction ID, surface generation, commit sequence, batch ID, and clock
+generation, so equal timestamps on independent roots do not cross-arm or
+cross-submit.
 
 ## Ordering and bounded resources
 
@@ -73,12 +86,13 @@ is a forward-progress guard, not an independent presentation clock.
 The native loop folds surface pacing deadlines into its existing event-loop
 deadline arbitration during normal operation, output suspension, shutdown, and
 session recovery. A pending timed transaction is itself frame-prepare work;
-planning is not gated on an already-queued visual flag. Commit Timing calls
-`PresentationDeadlinePlanner::plan_not_before`, which chooses the first
+planning is not gated on an already-queued visual flag. Commit Timing visits all
+eligible root-head candidates and calls
+`PresentationDeadlinePlanner::plan_not_before` for each, choosing the first
 refresh target reachable after both the requested timestamp and predicted
-render cost. The selected target is armed on the transaction before release
-and retained in the frame batch/output transaction, including direct-scanout
-target selection.
+render cost. The selected targets are armed on their transactions before
+release and retained in the frame batch/output transaction, including
+direct-scanout target selection.
 
 The same frame-batch claim and completion path is used for composited output,
 direct scanout, no-visual-change settlement, release completion, and

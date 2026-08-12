@@ -247,9 +247,8 @@ pub(crate) use state::OverrideRedirectStackSnapshotResult;
 pub use state::{
     AstreaShortcutPhase, CommitTimingClockMappingMetadata, CommitTimingClockSample,
     CommitTimingConstraint, CommitTimingPlanningCandidate, CommitTimingReadiness,
-    CommitTimingSchedulerDeadline, CommitTimingSubmissionGuard, SurfacePacingMetrics,
-    SurfaceTreeTransactionId, XwaylandSceneBatchError, XwaylandSceneBatchToken,
-    XwaylandSceneMetricsSnapshot,
+    CommitTimingSchedulerDeadline, SurfacePacingMetrics, SurfaceTreeTransactionId,
+    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot,
 };
 use state_data::*;
 use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};

@@ -66,16 +66,17 @@ pub(super) fn submit_ready_frame(
         cursor_epoch,
     );
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
-    let guard_target = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
+    let guard = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
         explicit
             .swapchain()?
             .ready_identity()
-            .map(|identity| identity.target)
+            .map(|identity| (identity.protocol_batch_id, identity.target))
     } else {
-        compatibility_target
+        server.prepared_frame_batch_id().zip(compatibility_target)
     };
-    if let Some(guard_target) = guard_target
-        && !server.commit_timing_submission_is_safe(
+    if let Some((batch_id, guard_target)) = guard
+        && !server.commit_timing_submission_is_safe_for_batch(
+            batch_id,
             guard_target.presentation_time,
             guard_target.clock_generation,
         )

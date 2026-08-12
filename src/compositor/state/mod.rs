@@ -111,7 +111,6 @@ pub(in crate::compositor) use surface_pacing::{
 pub use surface_pacing::{
     CommitTimingClockMappingMetadata, CommitTimingClockSample, CommitTimingConstraint,
     CommitTimingPlanningCandidate, CommitTimingReadiness, CommitTimingSchedulerDeadline,
-    CommitTimingSubmissionGuard,
 };
 pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]

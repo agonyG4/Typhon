@@ -26,41 +26,48 @@ pub(super) fn plan_commit_timing_target(
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
-    let Some(candidate) = server.next_commit_timing_planning_candidate() else {
+    let candidates = server.commit_timing_planning_candidates();
+    if candidates.is_empty() {
+        return scheduled;
+    }
+
+    let mut planned_targets = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !candidate.clock_mapping.is_representable {
+            continue;
+        }
+        let mut candidate_planner = *planner;
+        let Some(target) = candidate_planner.plan_not_before(
+            now,
+            candidate.monotonic_not_before,
+            predicted_total_cost,
+        ) else {
+            continue;
+        };
+        if server.arm_commit_timing_target(
+            candidate,
+            target.presentation_time,
+            target.render_start_deadline,
+            target.sequence,
+            target.clock_generation,
+        ) {
+            planned_targets.push(target);
+        }
+    }
+
+    let Some(earliest) = planned_targets.into_iter().min_by_key(|target| {
+        (
+            target.render_start_deadline,
+            target.presentation_time,
+            target.sequence,
+        )
+    }) else {
         return scheduled;
     };
-    if !candidate.clock_mapping.is_representable {
-        return scheduled;
-    }
-    let requested_target = candidate.monotonic_not_before;
-    let needs_commit_timing_target = scheduled
-        .map(|target| {
-            target.reason != PresentationTargetReason::CommitTiming
-                || target.presentation_time < requested_target
-        })
-        .unwrap_or(true);
-    if !needs_commit_timing_target
-        && let Some(target) = scheduled
-        && server.arm_commit_timing_target(
-            candidate,
-            target.presentation_time,
-            target.render_start_deadline,
-            target.sequence,
-            target.clock_generation,
-        )
-    {
-        return Some(target);
-    }
-    let target = planner.plan_not_before(now, requested_target, predicted_total_cost)?;
-    server
-        .arm_commit_timing_target(
-            candidate,
-            target.presentation_time,
-            target.render_start_deadline,
-            target.sequence,
-            target.clock_generation,
-        )
-        .then_some(target)
+    planner.clear_scheduled_target();
+    planner
+        .plan_not_before(now, earliest.presentation_time, predicted_total_cost)
+        .or(Some(earliest))
 }
 
 #[allow(clippy::too_many_arguments)]
