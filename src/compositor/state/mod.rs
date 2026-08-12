@@ -29,6 +29,7 @@ mod surface_commits;
 mod surface_focus;
 mod surface_pacing;
 mod surface_transactions;
+mod surface_tree_readiness;
 mod surfaces;
 mod window_actions;
 mod window_interaction;
@@ -104,12 +105,22 @@ pub(in crate::compositor) use surface_focus::*;
 pub use surface_pacing::SurfacePacingMetrics;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_pacing::{
-    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingConstraint, CommitTimingReadiness,
-    CommitTimingTargetClaim, FifoBarrierClaim, FifoBarrierClearReason, FifoBarrierGeneration,
-    PendingSurfacePacingState,
+    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingTargetClaim, FifoBarrierClaim,
+    FifoBarrierClearReason, FifoBarrierGeneration, PendingSurfacePacingState,
 };
+pub use surface_pacing::{
+    CommitTimingClockMappingMetadata, CommitTimingClockSample, CommitTimingConstraint,
+    CommitTimingPlanningCandidate, CommitTimingReadiness, CommitTimingSchedulerDeadline,
+    CommitTimingSubmissionGuard,
+};
+pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]
-pub(in crate::compositor) use surface_transactions::*;
+pub(in crate::compositor) use surface_transactions::{
+    BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction, ReleasedSurfaceTreeState,
+    SurfacePublicationContext, SurfacePublicationDecision, SurfacePublicationSource,
+    SurfacePublicationState, SurfaceTreeAcquireDependency, SurfaceTreeMergeStats,
+    TransactionOrdering,
+};
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
 #[allow(unused_imports)]

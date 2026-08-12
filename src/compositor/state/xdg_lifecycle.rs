@@ -434,6 +434,7 @@ mod tests {
         state
             .pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 7,
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),
@@ -450,6 +451,7 @@ mod tests {
         let mut state = CompositorState::default();
         state.pending_surface_tree_transactions.extend([
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(2),
                 root_surface_id: 7,
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),
@@ -457,6 +459,7 @@ mod tests {
                 received_at: Instant::now(),
             },
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(3),
                 root_surface_id: 8,
                 nodes: vec![(8, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),

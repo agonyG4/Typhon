@@ -34,6 +34,7 @@ mod frame_consumption_tests {
         second.pacing.fifo_wait_barrier = true;
         state.pending_surface_tree_transactions.extend([
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 7,
                 nodes: vec![(7, first)],
                 dependencies: Vec::new(),
@@ -41,6 +42,7 @@ mod frame_consumption_tests {
                 received_at: Instant::now(),
             },
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(2),
                 root_surface_id: 7,
                 nodes: vec![(7, second)],
                 dependencies: Vec::new(),
@@ -72,6 +74,7 @@ mod frame_consumption_tests {
         );
         state.pending_surface_tree_transactions.extend([
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(3),
                 root_surface_id: 8,
                 nodes: vec![(8, timed)],
                 dependencies: Vec::new(),
@@ -79,6 +82,7 @@ mod frame_consumption_tests {
                 received_at: Instant::now(),
             },
             PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(4),
                 root_surface_id: 8,
                 nodes: vec![(8, empty_cached_subsurface_commit())],
                 dependencies: Vec::new(),

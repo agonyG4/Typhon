@@ -630,6 +630,8 @@ impl NativeRuntime {
             )? {
                 super::presentation_ready::ReadySubmissionResult::Submitted => {}
                 super::presentation_ready::ReadySubmissionResult::Unavailable => {
+                    presentation_deadline.clear_scheduled_target();
+                    *scheduled_presentation_target = None;
                     *queued_redraw_requested = true;
                     return Ok(());
                 }

@@ -26,10 +26,13 @@ pub(super) fn plan_commit_timing_target(
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
-    let Some(requested_target_ns) = server.next_commit_timing_requested_ns() else {
+    let Some(candidate) = server.next_commit_timing_planning_candidate() else {
         return scheduled;
     };
-    let requested_target = MonotonicTimestampNs::new(requested_target_ns);
+    if !candidate.clock_mapping.is_representable {
+        return scheduled;
+    }
+    let requested_target = candidate.monotonic_not_before;
     let needs_commit_timing_target = scheduled
         .map(|target| {
             target.reason != PresentationTargetReason::CommitTiming
@@ -39,9 +42,9 @@ pub(super) fn plan_commit_timing_target(
     if !needs_commit_timing_target
         && let Some(target) = scheduled
         && server.arm_commit_timing_target(
-            requested_target_ns,
-            target.presentation_time.get(),
-            target.render_start_deadline.get(),
+            candidate,
+            target.presentation_time,
+            target.render_start_deadline,
             target.sequence,
             target.clock_generation,
         )
@@ -51,9 +54,9 @@ pub(super) fn plan_commit_timing_target(
     let target = planner.plan_not_before(now, requested_target, predicted_total_cost)?;
     server
         .arm_commit_timing_target(
-            requested_target_ns,
-            target.presentation_time.get(),
-            target.render_start_deadline.get(),
+            candidate,
+            target.presentation_time,
+            target.render_start_deadline,
             target.sequence,
             target.clock_generation,
         )

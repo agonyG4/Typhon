@@ -1,5 +1,18 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceTreeTransactionId(u64);
+
+impl SurfaceTreeTransactionId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::compositor) struct SurfaceTreeAcquireDependency {
     pub(in crate::compositor) surface_commit_id: SurfaceCommitId,
@@ -12,6 +25,7 @@ pub(in crate::compositor) struct SurfaceTreeAcquireDependency {
 
 #[derive(Debug)]
 pub(in crate::compositor) struct PendingSurfaceTreeTransaction {
+    pub(in crate::compositor) id: SurfaceTreeTransactionId,
     pub(in crate::compositor) root_surface_id: u32,
     pub(in crate::compositor) nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     pub(in crate::compositor) dependencies: Vec<SurfaceTreeAcquireDependency>,
@@ -135,6 +149,16 @@ impl PendingSurfaceTreeTransaction {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn allocate_surface_tree_transaction_id(
+        &mut self,
+    ) -> SurfaceTreeTransactionId {
+        self.next_surface_tree_transaction_id = self
+            .next_surface_tree_transaction_id
+            .checked_add(1)
+            .expect("surface tree transaction ID overflow");
+        SurfaceTreeTransactionId::new(self.next_surface_tree_transaction_id)
+    }
+
     pub(in crate::compositor) fn apply_cached_subsurface_commit(
         &mut self,
         surface_id: u32,

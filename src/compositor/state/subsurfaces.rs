@@ -631,10 +631,12 @@ impl CompositorState {
                     && !self.pending_surface_tree_transactions[*index].is_pacing_protected()
             });
             let Some(remove_index) = remove_index else {
-                let pacing_protected = nodes.iter().any(|(_, commit)| commit.pacing.is_boundary());
-                if pacing_protected {
-                    self.request_client_resource_exhaustion(root_surface_id);
-                }
+                self.request_client_resource_exhaustion(root_surface_id);
+                self.surface_pacing_metrics
+                    .queue_admission_resource_exhaustion = self
+                    .surface_pacing_metrics
+                    .queue_admission_resource_exhaustion
+                    .saturating_add(1);
                 self.release_unpublished_surface_tree_nodes(nodes);
                 return;
             };
@@ -686,6 +688,7 @@ impl CompositorState {
         }
         self.pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
+                id: self.allocate_surface_tree_transaction_id(),
                 root_surface_id,
                 nodes,
                 dependencies,

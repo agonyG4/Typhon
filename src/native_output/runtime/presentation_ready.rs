@@ -66,6 +66,22 @@ pub(super) fn submit_ready_frame(
         cursor_epoch,
     );
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
+    let guard_target = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
+        explicit
+            .swapchain()?
+            .ready_identity()
+            .map(|identity| identity.target)
+    } else {
+        compatibility_target
+    };
+    if let Some(guard_target) = guard_target
+        && !server.commit_timing_submission_is_safe(
+            guard_target.presentation_time,
+            guard_target.clock_generation,
+        )
+    {
+        return Ok(ReadySubmissionResult::Unavailable);
+    }
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
             let transaction_id = explicit

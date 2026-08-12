@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::presentation_deadline::MonotonicTimestampNs;
 use wayland_server::{Resource, backend::protocol::ProtocolError};
 
 #[derive(Debug, Clone, Copy)]
@@ -45,8 +46,8 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn next_commit_timing_requested_ns(&self) -> Option<u64> {
-        self.state.next_commit_timing_requested_ns()
+    pub fn next_commit_timing_planning_candidate(&self) -> Option<CommitTimingPlanningCandidate> {
+        self.state.next_commit_timing_planning_candidate()
     }
 
     #[doc(hidden)]
@@ -57,33 +58,43 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn arm_commit_timing_target(
         &mut self,
-        requested_not_before_ns: u64,
-        selected_presentation_time_ns: u64,
-        release_for_render_at_ns: u64,
+        candidate: CommitTimingPlanningCandidate,
+        selected_monotonic_presentation_time: MonotonicTimestampNs,
+        release_for_render_at: MonotonicTimestampNs,
         selected_sequence: u64,
         clock_generation: u64,
     ) -> bool {
-        let Some(requested_not_before) = self
-            .state
-            .pending_surface_tree_transactions
-            .iter()
-            .filter_map(PendingSurfaceTreeTransaction::commit_timing_request)
-            .find(|timing| timing.monotonic_deadline_ns() == Some(requested_not_before_ns))
-        else {
-            return false;
-        };
         self.state.arm_commit_timing_target(CommitTimingReadiness {
-            requested_not_before,
-            selected_presentation_time_ns,
-            release_for_render_at_ns,
+            transaction_id: candidate.transaction_id,
+            requested_not_before: candidate.requested_not_before,
+            selected_monotonic_presentation_time,
+            release_for_render_at,
             selected_sequence,
             clock_generation,
+            clock_mapping: candidate.clock_mapping,
         })
     }
 
     #[doc(hidden)]
     pub fn invalidate_commit_timing_targets(&mut self) {
         self.state.invalidate_pending_commit_timing_targets();
+    }
+
+    #[doc(hidden)]
+    pub fn active_commit_timing_guard(&self) -> Option<CommitTimingSubmissionGuard> {
+        self.state.active_commit_timing_guard()
+    }
+
+    #[doc(hidden)]
+    pub fn commit_timing_submission_is_safe(
+        &mut self,
+        planned_monotonic_presentation_time: MonotonicTimestampNs,
+        clock_generation: u64,
+    ) -> bool {
+        self.state.active_commit_timing_submission_is_safe(
+            planned_monotonic_presentation_time,
+            clock_generation,
+        )
     }
 
     /// Re-evaluate ordered FIFO/timing constraints after a native wake.  This

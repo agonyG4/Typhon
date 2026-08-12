@@ -33,9 +33,18 @@ generation/sequence claims are ignored and counted.
 Commit Timing timestamps preserve the full 64-bit seconds field and validate
 `tv_nsec < 1_000_000_000`. Comparisons use the seconds/nanoseconds tuple and
 total-nanosecond calculations use `u128`; contemporary monotonic timestamps are
-used directly. Realtime timestamps are converted with a paired
-monotonic/realtime clock sample. A target beyond the native `u64` monotonic
-horizon receives a finite re-evaluation wake and is never treated as due.
+used directly. Realtime timestamps are mapped through a paired
+monotonic/realtime clock sample and retain that mapping metadata with the
+readiness plan. A target beyond the native `u64` monotonic horizon receives a
+finite re-evaluation wake and is never treated as due.
+
+Realtime plans are revalidated when the compositor re-enters the ready path and
+again immediately before submission. A backward clock jump clears the pending
+readiness and replans from a fresh sample; a forward jump may release a target
+that is already due. If the selected mapping is no longer safe at pre-submit,
+the frame is deferred and the planner is asked to produce a new target. The
+guard is tied to the exact transaction ID and clock generation, so equal
+timestamps on independent roots do not cross-arm or cross-submit.
 
 ## Ordering and bounded resources
 
@@ -47,10 +56,13 @@ boundary, as required by the effective synchronization state at that commit.
 
 Each root has at most eight queued surface-tree transactions. Ordinary pressure
 can retire an unready coalescible transaction. If the queue contains only
-pacing-protected work, a new pacing boundary is released and the owning client
-is terminated through the Wayland display no-memory/resource-exhaustion error
+pacing-protected work, admission is rejected and the owning client is
+terminated through the Wayland display no-memory/resource-exhaustion error
 path after dispatch; the boundary is never silently superseded and no
-`wl_surface` semantic error is fabricated.
+`wl_surface` semantic error is fabricated. Every queued transaction has a
+monotonic `SurfaceTreeTransactionId`; readiness, arming, extraction, and
+completion validate that exact ID rather than relying on a timestamp or queue
+position.
 
 An active FIFO barrier is refresh-aware but finite: the fallback is at least
 34 ms and otherwise one and one-quarter output refresh intervals. The fallback
@@ -71,7 +83,10 @@ target selection.
 The same frame-batch claim and completion path is used for composited output,
 direct scanout, no-visual-change settlement, release completion, and
 presentation feedback. Explicit-sync acquire readiness remains a prerequisite;
-FIFO and Commit Timing do not bypass it.
+FIFO and Commit Timing do not bypass it. A Commit Timing target is attached
+before render release and remains attached through the frame batch, including
+direct scanout, so completion can diagnose any early presentation against the
+requested lower bound.
 
 ## Evidence
 
@@ -80,9 +95,10 @@ tests, real socket bindings, exact duplicate/invalid/destroyed protocol errors,
 one-shot timestamp state, FIFO ordering with fresh post-publication barrier
 readiness, stale FIFO generations, timed-head ordering, hidden-surface finite
 progress, refresh-aware fallback, full timestamp storage including the maximum
-seconds value, realtime conversion, selected-target readiness/ownership,
-frame-batch claims, and the Commit Timing planner at 60/120/165 Hz. Run the
-focused checks with:
+seconds value, monotonic and realtime clock mapping, due-time and overflow
+rechecks, independent equal-timestamp transaction IDs, selected-target
+readiness/ownership, frame-batch claims, and the Commit Timing planner at
+60/120/165 Hz. Run the focused checks with:
 
 ```text
 cargo test --locked compositor::tests::frame_pacing -- --nocapture

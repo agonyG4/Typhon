@@ -3,23 +3,64 @@ use std::time::Duration;
 const COMMIT_TIMING_REEVALUATION_INTERVAL: Duration = Duration::from_secs(1);
 
 use super::*;
+use crate::native::presentation_deadline::MonotonicTimestampNs;
 
 /// The timestamp carried by one `wl_surface.commit`.  It remains in the
 /// advertised presentation-clock domain until the native scheduler asks for
 /// a monotonic wake-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compositor) struct CommitTimingConstraint {
-    seconds: u64,
-    nanoseconds: u32,
+pub struct CommitTimingConstraint {
+    pub seconds: u64,
+    pub nanoseconds: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compositor) struct CommitTimingReadiness {
-    pub(in crate::compositor) requested_not_before: CommitTimingConstraint,
-    pub(in crate::compositor) selected_presentation_time_ns: u64,
-    pub(in crate::compositor) release_for_render_at_ns: u64,
-    pub(in crate::compositor) selected_sequence: u64,
-    pub(in crate::compositor) clock_generation: u64,
+pub struct CommitTimingClockSample {
+    pub monotonic_now: PresentationTimestamp,
+    pub presentation_now: PresentationTimestamp,
+    pub presentation_clock: PresentationClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTimingSchedulerDeadline {
+    pub monotonic_not_before: MonotonicTimestampNs,
+    pub recheck_at: MonotonicTimestampNs,
+    pub is_representable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTimingClockMappingMetadata {
+    pub sample: CommitTimingClockSample,
+    pub monotonic_not_before: MonotonicTimestampNs,
+    pub is_representable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTimingReadiness {
+    pub transaction_id: SurfaceTreeTransactionId,
+    pub requested_not_before: CommitTimingConstraint,
+    pub selected_monotonic_presentation_time: MonotonicTimestampNs,
+    pub release_for_render_at: MonotonicTimestampNs,
+    pub selected_sequence: u64,
+    pub clock_generation: u64,
+    pub clock_mapping: CommitTimingClockMappingMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTimingPlanningCandidate {
+    pub transaction_id: SurfaceTreeTransactionId,
+    pub requested_not_before: CommitTimingConstraint,
+    pub monotonic_not_before: MonotonicTimestampNs,
+    pub recheck_at: MonotonicTimestampNs,
+    pub clock_mapping: CommitTimingClockMappingMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitTimingSubmissionGuard {
+    pub transaction_id: SurfaceTreeTransactionId,
+    pub requested_not_before: CommitTimingConstraint,
+    pub selected_monotonic_presentation_time: MonotonicTimestampNs,
+    pub clock_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +92,14 @@ impl CommitTimingConstraint {
         (self.seconds, self.nanoseconds)
     }
 
+    pub const fn protocol_seconds(self) -> (u32, u32) {
+        ((self.seconds >> 32) as u32, self.seconds as u32)
+    }
+
+    pub const fn nanoseconds(self) -> u32 {
+        self.nanoseconds
+    }
+
     pub(in crate::compositor) fn as_nanos(self) -> Option<u128> {
         Some(
             u128::from(self.seconds)
@@ -71,32 +120,39 @@ impl CommitTimingConstraint {
         (now_hi, now_lo, now.nanoseconds()) >= (target_hi, target_lo, self.nanoseconds)
     }
 
-    pub(in crate::compositor) fn monotonic_deadline_ns(self) -> Option<u64> {
-        self.as_nanos().and_then(|nanos| u64::try_from(nanos).ok())
-    }
-
-    pub(in crate::compositor) fn monotonic_deadline_from_clock_sample(
+    pub fn scheduler_deadline(
         self,
-        monotonic_now: PresentationTimestamp,
-        realtime_now: PresentationTimestamp,
-    ) -> Option<u64> {
-        let target = self.as_nanos().expect("commit timing timestamps are u128");
-        let monotonic_now = timestamp_as_nanos_u128(monotonic_now);
-        let realtime_now = timestamp_as_nanos_u128(realtime_now);
-        let monotonic_now_ns = u64::try_from(monotonic_now).unwrap_or(u64::MAX);
-        let deadline = if target <= realtime_now {
-            monotonic_now_ns
-        } else {
-            let delta = target - realtime_now;
-            u64::try_from(monotonic_now.saturating_add(delta)).unwrap_or_else(|_| {
-                monotonic_now_ns.saturating_add(
-                    COMMIT_TIMING_REEVALUATION_INTERVAL
-                        .as_nanos()
-                        .min(u128::from(u64::MAX)) as u64,
-                )
-            })
+        sample: CommitTimingClockSample,
+    ) -> CommitTimingSchedulerDeadline {
+        let monotonic_now = timestamp_as_nanos_u128(sample.monotonic_now);
+        let requested = self.as_nanos().expect("commit timing timestamps are u128");
+        let mapped = match sample.presentation_clock {
+            PresentationClock::Monotonic => requested,
+            PresentationClock::Realtime => {
+                let presentation_now = timestamp_as_nanos_u128(sample.presentation_now);
+                if requested <= presentation_now {
+                    monotonic_now
+                } else {
+                    monotonic_now.saturating_add(requested - presentation_now)
+                }
+            }
         };
-        Some(deadline)
+        let monotonic_now_ns = u64::try_from(monotonic_now).unwrap_or(u64::MAX);
+        let recheck_at = MonotonicTimestampNs::new(
+            monotonic_now_ns.saturating_add(
+                COMMIT_TIMING_REEVALUATION_INTERVAL
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+        );
+        let is_representable = u64::try_from(mapped).is_ok();
+        CommitTimingSchedulerDeadline {
+            monotonic_not_before: MonotonicTimestampNs::new(
+                u64::try_from(mapped).unwrap_or(u64::MAX),
+            ),
+            recheck_at,
+            is_representable,
+        }
     }
 }
 
@@ -200,6 +256,14 @@ pub struct SurfacePacingMetrics {
     pub released_for_predicted_target: u64,
     pub released_by_conservative_fallback: u64,
     pub early_presentation_violations: u64,
+    pub realtime_plans_created: u64,
+    pub realtime_mappings_revalidated: u64,
+    pub realtime_backward_jump_replans: u64,
+    pub realtime_forward_jump_already_due_releases: u64,
+    pub stale_planner_transaction_ids: u64,
+    pub equal_timestamp_independent_plans: u64,
+    pub pre_submit_timing_deferrals: u64,
+    pub queue_admission_resource_exhaustion: u64,
 }
 
 pub(in crate::compositor) const FIFO_FORWARD_PROGRESS_FALLBACK: Duration =
@@ -349,16 +413,26 @@ impl CompositorState {
         &self,
         transaction: &PendingSurfaceTreeTransaction,
     ) -> bool {
-        if let Some(requested) = transaction.commit_timing_request()
-            && !transaction
+        if let Some(requested) = transaction.commit_timing_request() {
+            if transaction
                 .commit_timing_readiness
                 .is_some_and(|readiness| {
-                    readiness.requested_not_before == requested
-                        && client_pacing_now_ns() >= readiness.release_for_render_at_ns
+                    readiness.transaction_id != transaction.id
+                        || readiness.requested_not_before != requested
                 })
-            && !requested.is_due(self.presentation_clock)
-        {
-            return false;
+            {
+                return false;
+            }
+            if !requested.is_due(self.presentation_clock)
+                && !transaction
+                    .commit_timing_readiness
+                    .is_some_and(|readiness| {
+                        client_pacing_now_ns() >= readiness.release_for_render_at.get()
+                            && self.commit_timing_readiness_is_safe(readiness)
+                    })
+            {
+                return false;
+            }
         }
         self.surface_tree_parts_ready(&transaction.nodes, &transaction.dependencies)
     }
@@ -385,6 +459,76 @@ impl CompositorState {
         true
     }
 
+    fn current_commit_timing_clock_sample(&self) -> Option<CommitTimingClockSample> {
+        Some(CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_clock(PresentationClock::Monotonic).ok()?,
+            presentation_now: PresentationTimestamp::from_clock(self.presentation_clock).ok()?,
+            presentation_clock: self.presentation_clock,
+        })
+    }
+
+    fn commit_timing_readiness_is_safe(&self, readiness: CommitTimingReadiness) -> bool {
+        let Some(sample) = self.current_commit_timing_clock_sample() else {
+            return false;
+        };
+        if readiness.clock_mapping.sample.presentation_clock != self.presentation_clock {
+            return false;
+        }
+        if sample.presentation_clock == PresentationClock::Realtime {
+            return matches!(
+                revalidate_commit_timing_readiness(readiness, sample),
+                CommitTimingRevalidation::Keep | CommitTimingRevalidation::AlreadyDue
+            );
+        }
+        let deadline = readiness.requested_not_before.scheduler_deadline(sample);
+        deadline.is_representable
+            && deadline.monotonic_not_before <= readiness.selected_monotonic_presentation_time
+    }
+
+    pub(in crate::compositor) fn revalidate_pending_commit_timing_targets(&mut self) {
+        let Some(sample) = self.current_commit_timing_clock_sample() else {
+            return;
+        };
+        if sample.presentation_clock != PresentationClock::Realtime {
+            return;
+        }
+        let mut backward_jump_replans = 0;
+        let mut mappings_revalidated = 0;
+        let mut forward_jump_releases = 0;
+        for transaction in &mut self.pending_surface_tree_transactions {
+            let Some(readiness) = transaction.commit_timing_readiness else {
+                continue;
+            };
+            if readiness.clock_mapping.sample.presentation_clock != PresentationClock::Realtime {
+                continue;
+            }
+            mappings_revalidated += 1;
+            match revalidate_commit_timing_readiness(readiness, sample) {
+                CommitTimingRevalidation::Replan => {
+                    transaction.commit_timing_readiness = None;
+                    backward_jump_replans += 1;
+                }
+                CommitTimingRevalidation::AlreadyDue => {
+                    forward_jump_releases += 1;
+                }
+                CommitTimingRevalidation::Keep => {}
+            }
+        }
+        self.surface_pacing_metrics.realtime_mappings_revalidated = self
+            .surface_pacing_metrics
+            .realtime_mappings_revalidated
+            .saturating_add(mappings_revalidated);
+        self.surface_pacing_metrics.realtime_backward_jump_replans = self
+            .surface_pacing_metrics
+            .realtime_backward_jump_replans
+            .saturating_add(backward_jump_replans);
+        self.surface_pacing_metrics
+            .realtime_forward_jump_already_due_releases = self
+            .surface_pacing_metrics
+            .realtime_forward_jump_already_due_releases
+            .saturating_add(forward_jump_releases);
+    }
+
     pub(in crate::compositor) fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
         let now = client_pacing_now_ns();
         let mut deadline = self
@@ -392,31 +536,7 @@ impl CompositorState {
             .values()
             .map(|barrier| barrier.fallback_deadline_ns)
             .min();
-        let timing_deadline = self
-            .pending_surface_tree_transactions
-            .iter()
-            .flat_map(|transaction| transaction.nodes.iter())
-            .filter_map(|(_, commit)| commit.pacing.commit_timing)
-            .map(|timing| match self.presentation_clock {
-                PresentationClock::Monotonic => {
-                    timing.monotonic_deadline_ns().unwrap_or_else(|| {
-                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
-                    })
-                }
-                PresentationClock::Realtime => {
-                    let deadline = PresentationTimestamp::from_clock(PresentationClock::Monotonic)
-                        .ok()
-                        .zip(PresentationTimestamp::from_clock(PresentationClock::Realtime).ok())
-                        .and_then(|(mono, realtime)| {
-                            timing.monotonic_deadline_from_clock_sample(mono, realtime)
-                        });
-                    deadline.unwrap_or_else(|| {
-                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
-                    })
-                }
-            })
-            .map(|target| target.max(now))
-            .min();
+        let timing_deadline = self.next_commit_timing_deadline_ns();
         if let Some(target) = timing_deadline {
             deadline = Some(deadline.map_or(target, |current| current.min(target)));
         }
@@ -425,37 +545,70 @@ impl CompositorState {
 
     pub(in crate::compositor) fn next_commit_timing_deadline_ns(&self) -> Option<u64> {
         let now = client_pacing_now_ns();
-        self.pending_surface_tree_transactions
-            .iter()
-            .flat_map(|transaction| transaction.nodes.iter())
-            .filter_map(|(_, commit)| commit.pacing.commit_timing)
-            .map(|timing| match self.presentation_clock {
-                PresentationClock::Monotonic => {
-                    timing.monotonic_deadline_ns().unwrap_or_else(|| {
-                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
-                    })
-                }
-                PresentationClock::Realtime => {
-                    let deadline = PresentationTimestamp::from_clock(PresentationClock::Monotonic)
-                        .ok()
-                        .zip(PresentationTimestamp::from_clock(PresentationClock::Realtime).ok())
-                        .and_then(|(mono, realtime)| {
-                            timing.monotonic_deadline_from_clock_sample(mono, realtime)
-                        });
-                    deadline.unwrap_or_else(|| {
-                        now.saturating_add(COMMIT_TIMING_REEVALUATION_INTERVAL.as_nanos() as u64)
-                    })
-                }
-            })
-            .map(|target| target.max(now))
-            .min()
+        let candidate = self.next_commit_timing_planning_candidate()?;
+        Some(if candidate.clock_mapping.is_representable {
+            candidate.monotonic_not_before.get().max(now)
+        } else {
+            candidate.recheck_at.get().max(now)
+        })
     }
 
-    pub(in crate::compositor) fn next_commit_timing_requested_ns(&self) -> Option<u64> {
+    pub(in crate::compositor) fn next_commit_timing_planning_candidate(
+        &self,
+    ) -> Option<CommitTimingPlanningCandidate> {
+        let sample = self.current_commit_timing_clock_sample()?;
         self.pending_surface_tree_transactions
             .iter()
-            .find_map(PendingSurfaceTreeTransaction::commit_timing_request)
-            .and_then(|timing| timing.monotonic_deadline_ns())
+            .enumerate()
+            .filter(|(index, transaction)| {
+                !self.pending_surface_tree_transactions[..*index]
+                    .iter()
+                    .any(|previous| previous.root_surface_id == transaction.root_surface_id)
+            })
+            .filter_map(|(_, transaction)| {
+                self.commit_timing_planning_candidate_for_id_with_sample(transaction.id, sample)
+            })
+            .min_by_key(|candidate| (candidate.monotonic_not_before, candidate.transaction_id))
+    }
+
+    pub(in crate::compositor) fn commit_timing_planning_candidate_for_id(
+        &self,
+        transaction_id: SurfaceTreeTransactionId,
+    ) -> Option<CommitTimingPlanningCandidate> {
+        let sample = self.current_commit_timing_clock_sample()?;
+        self.commit_timing_planning_candidate_for_id_with_sample(transaction_id, sample)
+    }
+
+    fn commit_timing_planning_candidate_for_id_with_sample(
+        &self,
+        transaction_id: SurfaceTreeTransactionId,
+        sample: CommitTimingClockSample,
+    ) -> Option<CommitTimingPlanningCandidate> {
+        let index = self
+            .pending_surface_tree_transactions
+            .iter()
+            .position(|transaction| transaction.id == transaction_id)?;
+        let transaction = &self.pending_surface_tree_transactions[index];
+        if self.pending_surface_tree_transactions[..index]
+            .iter()
+            .any(|previous| previous.root_surface_id == transaction.root_surface_id)
+        {
+            return None;
+        }
+        let requested_not_before = transaction.commit_timing_request()?;
+        let deadline = requested_not_before.scheduler_deadline(sample);
+        let clock_mapping = CommitTimingClockMappingMetadata {
+            sample,
+            monotonic_not_before: deadline.monotonic_not_before,
+            is_representable: deadline.is_representable,
+        };
+        Some(CommitTimingPlanningCandidate {
+            transaction_id,
+            requested_not_before,
+            monotonic_not_before: deadline.monotonic_not_before,
+            recheck_at: deadline.recheck_at,
+            clock_mapping,
+        })
     }
 
     pub(in crate::compositor) fn has_pending_commit_timing(&self) -> bool {
@@ -468,22 +621,69 @@ impl CompositorState {
         &mut self,
         readiness: CommitTimingReadiness,
     ) -> bool {
-        let Some(requested_ns) = readiness.requested_not_before.monotonic_deadline_ns() else {
-            return false;
-        };
-        if readiness.selected_presentation_time_ns < requested_ns {
+        if readiness.clock_mapping.sample.presentation_clock != self.presentation_clock
+            || (readiness.clock_mapping.is_representable
+                && readiness.selected_monotonic_presentation_time
+                    < readiness.clock_mapping.monotonic_not_before)
+        {
             return false;
         }
-        let Some(transaction) =
-            self.pending_surface_tree_transactions
-                .iter_mut()
-                .find(|transaction| {
-                    transaction.commit_timing_request() == Some(readiness.requested_not_before)
-                })
+        let Some(transaction_index) = self
+            .pending_surface_tree_transactions
+            .iter()
+            .position(|transaction| transaction.id == readiness.transaction_id)
         else {
+            self.surface_pacing_metrics.stale_planner_transaction_ids = self
+                .surface_pacing_metrics
+                .stale_planner_transaction_ids
+                .saturating_add(1);
             return false;
         };
-        transaction.commit_timing_readiness = Some(readiness);
+        let root_surface_id =
+            self.pending_surface_tree_transactions[transaction_index].root_surface_id;
+        if self.pending_surface_tree_transactions[..transaction_index]
+            .iter()
+            .any(|previous| previous.root_surface_id == root_surface_id)
+        {
+            self.surface_pacing_metrics.stale_planner_transaction_ids = self
+                .surface_pacing_metrics
+                .stale_planner_transaction_ids
+                .saturating_add(1);
+            return false;
+        }
+        if self.pending_surface_tree_transactions[transaction_index].commit_timing_request()
+            != Some(readiness.requested_not_before)
+        {
+            self.surface_pacing_metrics.stale_planner_transaction_ids = self
+                .surface_pacing_metrics
+                .stale_planner_transaction_ids
+                .saturating_add(1);
+            return false;
+        }
+        let has_independent_equal_timestamp = self
+            .pending_surface_tree_transactions
+            .iter()
+            .enumerate()
+            .any(|(index, transaction)| {
+                index != transaction_index
+                    && transaction.root_surface_id != root_surface_id
+                    && transaction.commit_timing_request() == Some(readiness.requested_not_before)
+            });
+        if has_independent_equal_timestamp {
+            self.surface_pacing_metrics
+                .equal_timestamp_independent_plans = self
+                .surface_pacing_metrics
+                .equal_timestamp_independent_plans
+                .saturating_add(1);
+        }
+        if readiness.clock_mapping.sample.presentation_clock == PresentationClock::Realtime {
+            self.surface_pacing_metrics.realtime_plans_created = self
+                .surface_pacing_metrics
+                .realtime_plans_created
+                .saturating_add(1);
+        }
+        self.pending_surface_tree_transactions[transaction_index].commit_timing_readiness =
+            Some(readiness);
         true
     }
 
@@ -516,6 +716,65 @@ impl CompositorState {
             .collect()
     }
 
+    pub(in crate::compositor) fn active_commit_timing_guard(
+        &self,
+    ) -> Option<CommitTimingSubmissionGuard> {
+        self.active_commit_timing_targets
+            .values()
+            .flat_map(|claims| claims.iter())
+            .map(|(_, _, readiness)| CommitTimingSubmissionGuard {
+                transaction_id: readiness.transaction_id,
+                requested_not_before: readiness.requested_not_before,
+                selected_monotonic_presentation_time: readiness
+                    .selected_monotonic_presentation_time,
+                clock_generation: readiness.clock_generation,
+            })
+            .max_by_key(|guard| {
+                (
+                    guard.selected_monotonic_presentation_time,
+                    guard.transaction_id,
+                )
+            })
+    }
+
+    pub(in crate::compositor) fn active_commit_timing_submission_is_safe(
+        &mut self,
+        planned_monotonic_presentation_time: MonotonicTimestampNs,
+        clock_generation: u64,
+    ) -> bool {
+        let Some(sample) = self.current_commit_timing_clock_sample() else {
+            return false;
+        };
+        let current_monotonic = MonotonicTimestampNs::new(
+            u64::try_from(timestamp_as_nanos_u128(sample.monotonic_now)).unwrap_or(u64::MAX),
+        );
+        let effective_monotonic_presentation_time =
+            planned_monotonic_presentation_time.max(current_monotonic);
+        let safe = self
+            .active_commit_timing_targets
+            .values()
+            .flat_map(|claims| claims.iter())
+            .all(|(_, _, readiness)| {
+                if readiness.clock_generation != clock_generation
+                    || readiness.clock_mapping.sample.presentation_clock != self.presentation_clock
+                    || effective_monotonic_presentation_time
+                        < readiness.selected_monotonic_presentation_time
+                {
+                    return false;
+                }
+                let deadline = readiness.requested_not_before.scheduler_deadline(sample);
+                deadline.is_representable
+                    && effective_monotonic_presentation_time >= deadline.monotonic_not_before
+            });
+        if !safe && self.active_commit_timing_guard().is_some() {
+            self.surface_pacing_metrics.pre_submit_timing_deferrals = self
+                .surface_pacing_metrics
+                .pre_submit_timing_deferrals
+                .saturating_add(1);
+        }
+        safe
+    }
+
     pub(in crate::compositor) fn complete_commit_timing_claim(
         &mut self,
         claim: CommitTimingTargetClaim,
@@ -532,6 +791,43 @@ impl CompositorState {
                 .surface_pacing_metrics
                 .early_presentation_violations
                 .saturating_add(1);
+            let (actual_seconds_hi, actual_seconds_lo) = presentation.timestamp.protocol_seconds();
+            let (requested_seconds_hi, requested_seconds_lo) =
+                claim.readiness.requested_not_before.protocol_seconds();
+            client_pacing_log(
+                "early_commit_timing_presentation",
+                &[
+                    (
+                        "transaction_id",
+                        claim.readiness.transaction_id.get().to_string(),
+                    ),
+                    ("requested_seconds_hi", requested_seconds_hi.to_string()),
+                    ("requested_seconds_lo", requested_seconds_lo.to_string()),
+                    (
+                        "requested_nanoseconds",
+                        claim.readiness.requested_not_before.nanoseconds.to_string(),
+                    ),
+                    ("presentation_clock", format!("{:?}", presentation.clock)),
+                    (
+                        "selected_monotonic_presentation_time",
+                        claim
+                            .readiness
+                            .selected_monotonic_presentation_time
+                            .get()
+                            .to_string(),
+                    ),
+                    ("actual_seconds_hi", actual_seconds_hi.to_string()),
+                    ("actual_seconds_lo", actual_seconds_lo.to_string()),
+                    (
+                        "actual_nanoseconds",
+                        presentation.timestamp.nanoseconds().to_string(),
+                    ),
+                    (
+                        "clock_generation",
+                        claim.readiness.clock_generation.to_string(),
+                    ),
+                ],
+            );
             debug_assert!(
                 claim
                     .readiness
@@ -647,6 +943,40 @@ impl CompositorState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitTimingRevalidation {
+    Keep,
+    Replan,
+    AlreadyDue,
+}
+
+fn revalidate_commit_timing_readiness(
+    readiness: CommitTimingReadiness,
+    sample: CommitTimingClockSample,
+) -> CommitTimingRevalidation {
+    if sample.presentation_clock != PresentationClock::Realtime
+        || readiness.clock_mapping.sample.presentation_clock != PresentationClock::Realtime
+    {
+        return CommitTimingRevalidation::Keep;
+    }
+    let deadline = readiness.requested_not_before.scheduler_deadline(sample);
+    if !deadline.is_representable
+        || deadline.monotonic_not_before > readiness.selected_monotonic_presentation_time
+    {
+        return CommitTimingRevalidation::Replan;
+    }
+    if readiness
+        .requested_not_before
+        .is_due_at(sample.presentation_now)
+        && !readiness
+            .requested_not_before
+            .is_due_at(readiness.clock_mapping.sample.presentation_now)
+    {
+        return CommitTimingRevalidation::AlreadyDue;
+    }
+    CommitTimingRevalidation::Keep
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,8 +996,12 @@ mod tests {
         let realtime = PresentationTimestamp::from_microseconds(0, 0).unwrap();
         assert!(
             constraint
-                .monotonic_deadline_from_clock_sample(monotonic, realtime)
-                .is_some()
+                .scheduler_deadline(CommitTimingClockSample {
+                    monotonic_now: monotonic,
+                    presentation_now: realtime,
+                    presentation_clock: PresentationClock::Realtime,
+                })
+                .is_representable
         );
     }
 
@@ -682,24 +1016,30 @@ mod tests {
         state
             .pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 10,
                 nodes: vec![(10, commit)],
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             });
+        let candidate = state
+            .next_commit_timing_planning_candidate()
+            .expect("timed transaction should produce a planning candidate");
         let readiness = CommitTimingReadiness {
+            transaction_id: SurfaceTreeTransactionId::new(1),
             requested_not_before: requested,
-            selected_presentation_time_ns: now + 61_000_000_000,
-            release_for_render_at_ns: now + 60_000_000_000,
+            selected_monotonic_presentation_time: MonotonicTimestampNs::new(now + 61_000_000_000),
+            release_for_render_at: MonotonicTimestampNs::new(now + 60_000_000_000),
             selected_sequence: 44,
             clock_generation: 7,
+            clock_mapping: candidate.clock_mapping,
         };
 
         assert!(state.arm_commit_timing_target(readiness));
         assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
         state.arm_commit_timing_target(CommitTimingReadiness {
-            release_for_render_at_ns: 0,
+            release_for_render_at: MonotonicTimestampNs::new(0),
             ..readiness
         });
         assert!(state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
@@ -714,8 +1054,8 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].readiness.selected_sequence, 44);
         assert_eq!(
-            claims[0].readiness.selected_presentation_time_ns,
-            now + 61_000_000_000
+            claims[0].readiness.selected_monotonic_presentation_time,
+            MonotonicTimestampNs::new(now + 61_000_000_000)
         );
     }
 
@@ -730,8 +1070,346 @@ mod tests {
         let monotonic = PresentationTimestamp::from_microseconds(50, 0).unwrap();
         let realtime = PresentationTimestamp::from_microseconds(100, 0).unwrap();
         assert_eq!(
-            constraint.monotonic_deadline_from_clock_sample(monotonic, realtime),
-            Some(51_000_000_000)
+            constraint
+                .scheduler_deadline(CommitTimingClockSample {
+                    monotonic_now: monotonic,
+                    presentation_now: realtime,
+                    presentation_clock: PresentationClock::Realtime,
+                })
+                .monotonic_not_before
+                .get(),
+            51_000_000_000
+        );
+    }
+
+    #[test]
+    fn realtime_clock_sample_maps_future_protocol_time_into_monotonic_scheduler_time() {
+        let constraint = CommitTimingConstraint::from_protocol(1000, 50_000_000).unwrap();
+        let deadline = constraint.scheduler_deadline(CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        });
+
+        assert_eq!(deadline.monotonic_not_before.get(), 100_050_000_000);
+        assert!(deadline.is_representable);
+    }
+
+    #[test]
+    fn realtime_clock_sample_treats_already_due_target_as_immediate() {
+        let constraint = CommitTimingConstraint::from_protocol(999, 999_999_999).unwrap();
+        let deadline = constraint.scheduler_deadline(CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        });
+
+        assert_eq!(deadline.monotonic_not_before.get(), 100_000_000_000);
+    }
+
+    #[test]
+    fn monotonic_clock_sample_keeps_the_protocol_timestamp_in_scheduler_domain() {
+        let constraint = CommitTimingConstraint::from_protocol(101, 50_000_000).unwrap();
+        let deadline = constraint.scheduler_deadline(CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_clock: PresentationClock::Monotonic,
+        });
+
+        assert_eq!(deadline.monotonic_not_before.get(), 101_050_000_000);
+        assert!(deadline.is_representable);
+    }
+
+    #[test]
+    fn realtime_backward_jump_invalidates_an_old_selected_target() {
+        let requested = CommitTimingConstraint::from_protocol(1001, 0).unwrap();
+        let initial_sample = CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        };
+        let initial_deadline = requested.scheduler_deadline(initial_sample);
+        let readiness = CommitTimingReadiness {
+            transaction_id: SurfaceTreeTransactionId::new(1),
+            requested_not_before: requested,
+            selected_monotonic_presentation_time: initial_deadline.monotonic_not_before,
+            release_for_render_at: MonotonicTimestampNs::new(100_500_000_000),
+            selected_sequence: 1,
+            clock_generation: 1,
+            clock_mapping: CommitTimingClockMappingMetadata {
+                sample: initial_sample,
+                monotonic_not_before: initial_deadline.monotonic_not_before,
+                is_representable: initial_deadline.is_representable,
+            },
+        };
+        let backward_sample = CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 500_000).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(999, 500_000).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        };
+
+        assert_eq!(
+            revalidate_commit_timing_readiness(readiness, backward_sample),
+            CommitTimingRevalidation::Replan
+        );
+    }
+
+    #[test]
+    fn realtime_forward_jump_makes_the_original_constraint_already_due() {
+        let requested = CommitTimingConstraint::from_protocol(1001, 0).unwrap();
+        let initial_sample = CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        };
+        let initial_deadline = requested.scheduler_deadline(initial_sample);
+        let readiness = CommitTimingReadiness {
+            transaction_id: SurfaceTreeTransactionId::new(1),
+            requested_not_before: requested,
+            selected_monotonic_presentation_time: initial_deadline.monotonic_not_before,
+            release_for_render_at: MonotonicTimestampNs::new(100_500_000_000),
+            selected_sequence: 1,
+            clock_generation: 1,
+            clock_mapping: CommitTimingClockMappingMetadata {
+                sample: initial_sample,
+                monotonic_not_before: initial_deadline.monotonic_not_before,
+                is_representable: initial_deadline.is_representable,
+            },
+        };
+        let forward_sample = CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 500_000).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1002, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        };
+
+        assert_eq!(
+            revalidate_commit_timing_readiness(readiness, forward_sample),
+            CommitTimingRevalidation::AlreadyDue
+        );
+    }
+
+    #[test]
+    fn repeated_realtime_backward_jumps_replan_with_finite_progress() {
+        let requested = CommitTimingConstraint::from_protocol(1001, 0).unwrap();
+        let initial_sample = CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        };
+        let initial_deadline = requested.scheduler_deadline(initial_sample);
+        let mut readiness = CommitTimingReadiness {
+            transaction_id: SurfaceTreeTransactionId::new(1),
+            requested_not_before: requested,
+            selected_monotonic_presentation_time: initial_deadline.monotonic_not_before,
+            release_for_render_at: MonotonicTimestampNs::new(100_500_000_000),
+            selected_sequence: 1,
+            clock_generation: 1,
+            clock_mapping: CommitTimingClockMappingMetadata {
+                sample: initial_sample,
+                monotonic_not_before: initial_deadline.monotonic_not_before,
+                is_representable: initial_deadline.is_representable,
+            },
+        };
+        for (monotonic_seconds, realtime_seconds) in [(100, 999), (101, 998)] {
+            let sample = CommitTimingClockSample {
+                monotonic_now: PresentationTimestamp::from_microseconds(monotonic_seconds, 0)
+                    .unwrap(),
+                presentation_now: PresentationTimestamp::from_microseconds(realtime_seconds, 0)
+                    .unwrap(),
+                presentation_clock: PresentationClock::Realtime,
+            };
+            assert_eq!(
+                revalidate_commit_timing_readiness(readiness, sample),
+                CommitTimingRevalidation::Replan
+            );
+            let deadline = requested.scheduler_deadline(sample);
+            assert!(deadline.is_representable);
+            readiness.selected_monotonic_presentation_time = deadline.monotonic_not_before;
+            readiness.clock_mapping = CommitTimingClockMappingMetadata {
+                sample,
+                monotonic_not_before: deadline.monotonic_not_before,
+                is_representable: deadline.is_representable,
+            };
+        }
+    }
+
+    #[test]
+    fn maximum_realtime_protocol_target_keeps_a_finite_recheck_deadline() {
+        let constraint = CommitTimingConstraint::from_protocol(u64::MAX, 999_999_999).unwrap();
+        let deadline = constraint.scheduler_deadline(CommitTimingClockSample {
+            monotonic_now: PresentationTimestamp::from_microseconds(100, 0).unwrap(),
+            presentation_now: PresentationTimestamp::from_microseconds(1000, 0).unwrap(),
+            presentation_clock: PresentationClock::Realtime,
+        });
+
+        assert!(!deadline.is_representable);
+        assert!(deadline.recheck_at.get() > 100_000_000_000);
+    }
+
+    #[test]
+    fn equal_timestamps_in_independent_root_heads_arm_only_the_selected_transaction() {
+        let mut state = CompositorState::default();
+        let requested = CommitTimingConstraint::from_protocol(1, 0).unwrap();
+        let mut first = empty_cached_subsurface_commit();
+        first.pacing.commit_timing = Some(requested);
+        let mut second = empty_cached_subsurface_commit();
+        second.pacing.commit_timing = Some(requested);
+        let first_id = state.allocate_surface_tree_transaction_id();
+        let second_id = state.allocate_surface_tree_transaction_id();
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                id: first_id,
+                root_surface_id: 1,
+                nodes: vec![(1, first)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                id: second_id,
+                root_surface_id: 2,
+                nodes: vec![(2, second)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        let first_candidate = state
+            .commit_timing_planning_candidate_for_id(first_id)
+            .unwrap();
+        let second_candidate = state
+            .commit_timing_planning_candidate_for_id(second_id)
+            .unwrap();
+        assert_ne!(
+            first_candidate.transaction_id,
+            second_candidate.transaction_id
+        );
+        assert_eq!(
+            state
+                .next_commit_timing_planning_candidate()
+                .unwrap()
+                .transaction_id,
+            first_id
+        );
+
+        let selected = second_candidate.monotonic_not_before;
+        assert!(state.arm_commit_timing_target(CommitTimingReadiness {
+            transaction_id: second_id,
+            requested_not_before: requested,
+            selected_monotonic_presentation_time: selected,
+            release_for_render_at: MonotonicTimestampNs::new(0),
+            selected_sequence: 1,
+            clock_generation: 1,
+            clock_mapping: second_candidate.clock_mapping,
+        }));
+        assert_eq!(
+            state
+                .surface_pacing_metrics
+                .equal_timestamp_independent_plans,
+            1
+        );
+        assert!(
+            state.pending_surface_tree_transactions[0]
+                .commit_timing_readiness
+                .is_none()
+        );
+        assert_eq!(
+            state.pending_surface_tree_transactions[1]
+                .commit_timing_readiness
+                .unwrap()
+                .transaction_id,
+            second_id
+        );
+    }
+
+    #[test]
+    fn same_root_equal_timestamp_keeps_the_second_transaction_ordered() {
+        let mut state = CompositorState::default();
+        let requested = CommitTimingConstraint::from_protocol(1, 0).unwrap();
+        let mut first = empty_cached_subsurface_commit();
+        first.pacing.commit_timing = Some(requested);
+        let mut second = empty_cached_subsurface_commit();
+        second.pacing.commit_timing = Some(requested);
+        let first_id = state.allocate_surface_tree_transaction_id();
+        let second_id = state.allocate_surface_tree_transaction_id();
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                id: first_id,
+                root_surface_id: 4,
+                nodes: vec![(4, first)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                id: second_id,
+                root_surface_id: 4,
+                nodes: vec![(4, second)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        assert_eq!(
+            state
+                .next_commit_timing_planning_candidate()
+                .unwrap()
+                .transaction_id,
+            first_id
+        );
+        assert!(
+            state
+                .commit_timing_planning_candidate_for_id(second_id)
+                .is_none()
+        );
+        state.pending_surface_tree_transactions.remove(0);
+        assert_eq!(
+            state
+                .next_commit_timing_planning_candidate()
+                .unwrap()
+                .transaction_id,
+            second_id
+        );
+    }
+
+    #[test]
+    fn non_evictable_queue_rejects_an_ordinary_incoming_transaction() {
+        let mut state = CompositorState::default();
+        let requested = CommitTimingConstraint::from_protocol(
+            client_pacing_now_ns() / 1_000_000_000 + 3_600,
+            0,
+        )
+        .unwrap();
+        for index in 0..8 {
+            let mut commit = empty_cached_subsurface_commit();
+            commit.pacing.commit_timing = Some(requested);
+            state
+                .pending_surface_tree_transactions
+                .push(PendingSurfaceTreeTransaction {
+                    id: SurfaceTreeTransactionId::new(index as u64 + 1),
+                    root_surface_id: 9,
+                    nodes: vec![(9, commit)],
+                    dependencies: Vec::new(),
+                    commit_timing_readiness: None,
+                    received_at: Instant::now(),
+                });
+        }
+
+        state.queue_waiting_surface_tree(
+            9,
+            vec![(9, empty_cached_subsurface_commit())],
+            Vec::new(),
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 8);
+        assert_eq!(state.take_client_resource_exhaustions(), vec![9]);
+        assert_eq!(
+            state
+                .surface_pacing_metrics
+                .queue_admission_resource_exhaustion,
+            1
         );
     }
 

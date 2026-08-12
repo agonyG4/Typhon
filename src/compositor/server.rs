@@ -1099,7 +1099,10 @@ impl OwnCompositorServer {
     }
 
     pub fn set_presentation_clock(&mut self, clock: PresentationClock) {
-        self.state.presentation_clock = clock;
+        if self.state.presentation_clock != clock {
+            self.state.presentation_clock = clock;
+            self.state.invalidate_pending_commit_timing_targets();
+        }
     }
 
     pub fn presentation_clock(&self) -> PresentationClock {

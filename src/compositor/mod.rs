@@ -245,7 +245,10 @@ use shm::{
 };
 pub(crate) use state::OverrideRedirectStackSnapshotResult;
 pub use state::{
-    AstreaShortcutPhase, SurfacePacingMetrics, XwaylandSceneBatchError, XwaylandSceneBatchToken,
+    AstreaShortcutPhase, CommitTimingClockMappingMetadata, CommitTimingClockSample,
+    CommitTimingConstraint, CommitTimingPlanningCandidate, CommitTimingReadiness,
+    CommitTimingSchedulerDeadline, CommitTimingSubmissionGuard, SurfacePacingMetrics,
+    SurfaceTreeTransactionId, XwaylandSceneBatchError, XwaylandSceneBatchToken,
     XwaylandSceneMetricsSnapshot,
 };
 use state_data::*;
@@ -578,6 +581,7 @@ pub struct CompositorState {
     window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
+    next_surface_tree_transaction_id: u64,
     commit_debug: CommitDebugState,
     resize_flow_metrics: ResizeFlowMetrics,
     xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,
@@ -696,7 +700,6 @@ pub(in crate::compositor) struct ActiveLockedPointerRouting {
     surface_y: f64,
     activation_anchor: OutputPosition,
 }
-
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct ActiveConfinedPointerRouting {
     constraint_id: u64,
@@ -718,7 +721,6 @@ struct ImplicitPointerGrab {
     surface: wl_surface::WlSurface,
     root_surface_id: u32,
 }
-
 #[derive(Debug, Default)]
 struct RelativeMotionDebugState {
     pending_drop_reason: Option<String>,
@@ -727,13 +729,11 @@ struct RelativeMotionDebugState {
     last_route_snapshot_log: Option<Instant>,
     dispatch_total: u64,
 }
-
 #[derive(Debug, Clone)]
 struct RelativePointerResource {
     resource: zwp_relative_pointer_v1::ZwpRelativePointerV1,
     source_pointer: wl_pointer::WlPointer,
 }
-
 #[derive(Debug, Clone)]
 struct PointerConstraint {
     id: u64,
