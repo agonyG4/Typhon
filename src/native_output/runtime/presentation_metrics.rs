@@ -20,6 +20,13 @@ impl PipelineSchedulingDiagnostics {
     }
 }
 
+pub(super) fn note_same_buffer_suppressed(perf: NativePerfLogger) -> bool {
+    perf.log("native.direct_scanout", || {
+        vec![NativePerfField::str("transition", "same_buffer_suppressed")]
+    });
+    true
+}
+
 pub(super) fn log_output_pipeline_snapshot(
     perf: NativePerfLogger,
     configured_policy: AdaptiveTripleBufferPolicy,

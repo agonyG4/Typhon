@@ -3,6 +3,16 @@ use oblivion_one::native::presentation_deadline::{
     PresentationDeadlinePlanner, PresentationTarget,
 };
 
+pub(super) fn defer_after_timing(
+    presentation_deadline: &mut PresentationDeadlinePlanner,
+    scheduled_presentation_target: &mut Option<PresentationTarget>,
+    queued_redraw_requested: &mut bool,
+) {
+    presentation_deadline.clear_scheduled_target();
+    *scheduled_presentation_target = None;
+    *queued_redraw_requested = true;
+}
+
 pub(super) fn reset_after_same_buffer(
     server: &mut OwnCompositorServer,
     presentation_deadline: &mut PresentationDeadlinePlanner,

@@ -15,7 +15,9 @@ use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
 };
-use super::presentation_metrics::{PipelineSchedulingDiagnostics, log_output_pipeline_snapshot};
+use super::presentation_metrics::{
+    PipelineSchedulingDiagnostics, log_output_pipeline_snapshot, note_same_buffer_suppressed,
+};
 use super::presentation_pipeline::build_output_pipeline_snapshot_with_presented;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
@@ -682,13 +684,11 @@ impl NativeRuntime {
                         kms_commit_worker.as_ref(),
                     )? {
                         DirectScanoutAttempt::Unchanged => {
-                            direct_suppressed = true;
+                            direct_suppressed = note_same_buffer_suppressed(perf);
                             #[rustfmt::skip]
                             reset_after_same_buffer(server, presentation_deadline, scheduled_presentation_target);
-                            perf.log("native.direct_scanout", || {
-                                vec![NativePerfField::str("transition", "same_buffer_suppressed")]
-                            });
                         }
+                        #[rustfmt::skip] DirectScanoutAttempt::TimingDeferred => { super::commit_timing::defer_after_timing(presentation_deadline, scheduled_presentation_target, queued_redraw_requested); return Ok(()); }
                         DirectScanoutAttempt::WorkerQueued {
                             transaction_id,
                             token,

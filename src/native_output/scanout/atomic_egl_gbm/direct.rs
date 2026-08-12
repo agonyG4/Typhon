@@ -16,11 +16,19 @@ fn settle_no_visual_change_transaction(
     cursor_epoch: u64,
     direct_surface_id: u32,
     release: OutputReleasePlan,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(frame_id) = server.prepared_frame_id() else {
-        return Ok(());
+        return Ok(true);
     };
     let frame_batch_id = server.take_frame_batch_for_render(frame_id);
+    if !server.commit_timing_submission_is_safe_for_batch(
+        frame_batch_id,
+        target.presentation_time,
+        target.clock_generation,
+    ) {
+        server.restore_frame_batch_after_render_failure(frame_batch_id);
+        return Ok(false);
+    }
     let created_at = match monotonic_now_ns() {
         Ok(now) => MonotonicTimestampNs::new(now),
         Err(error) => {
@@ -96,7 +104,7 @@ fn settle_no_visual_change_transaction(
             callback_owner_leaks.leaked_callbacks,
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 impl AtomicEglGbmScanout {
@@ -199,7 +207,7 @@ impl AtomicEglGbmScanout {
                 .counters
                 .same_buffer_suppressed
                 .saturating_add(1);
-            settle_no_visual_change_transaction(
+            if !settle_no_visual_change_transaction(
                 self,
                 server,
                 output_transactions,
@@ -212,7 +220,9 @@ impl AtomicEglGbmScanout {
                 cursor_epoch,
                 candidate.surface_id,
                 release,
-            )?;
+            )? {
+                return Ok(DirectScanoutAttempt::TimingDeferred);
+            }
             return Ok(DirectScanoutAttempt::Unchanged);
         }
         if candidate.buffer.planes().is_empty() {
@@ -331,6 +341,15 @@ impl AtomicEglGbmScanout {
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
         let surface_damage =
             server.capture_surface_damage_presentation_for_surface(candidate.surface_id);
+        if !server.commit_timing_submission_is_safe_for_batch(
+            protocol_batch_id,
+            target.presentation_time,
+            target.clock_generation,
+        ) {
+            server.restore_frame_batch_after_render_failure(protocol_batch_id);
+            drop(surface_damage);
+            return Ok(DirectScanoutAttempt::TimingDeferred);
+        }
         let transaction_id = match output_transactions.allocate_id() {
             Ok(transaction_id) => transaction_id,
             Err(error) => {

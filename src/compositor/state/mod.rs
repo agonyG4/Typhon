@@ -1,6 +1,7 @@
 use super::*;
 
 mod client_lifecycle;
+mod commit_timing_runtime;
 mod cursor;
 mod data_device;
 mod desktop_windows;
@@ -52,6 +53,11 @@ pub use xwayland_scene::{
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
+pub(in crate::compositor) use commit_timing_runtime::CommitTimingTargetClaim;
+pub(in crate::compositor) use commit_timing_runtime::{
+    CommitTimingClockMappingMetadata, CommitTimingClockSample, CommitTimingPlanningCandidate,
+    CommitTimingReadiness, CommitTimingSchedulerDeadline,
+};
 #[allow(unused_imports)]
 pub(in crate::compositor) use cursor::*;
 #[allow(unused_imports)]
@@ -102,16 +108,12 @@ pub(in crate::compositor) use surface_commit_placement::*;
 pub(in crate::compositor) use surface_commits::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_focus::*;
-pub use surface_pacing::SurfacePacingMetrics;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_pacing::{
-    ActiveFifoBarrier, CapturedSurfacePacing, CommitTimingTargetClaim, FifoBarrierClaim,
-    FifoBarrierClearReason, FifoBarrierGeneration, PendingSurfacePacingState,
+    ActiveFifoBarrier, CapturedSurfacePacing, FifoBarrierClaim, FifoBarrierClearReason,
+    FifoBarrierGeneration, PendingSurfacePacingState,
 };
-pub use surface_pacing::{
-    CommitTimingClockMappingMetadata, CommitTimingClockSample, CommitTimingConstraint,
-    CommitTimingPlanningCandidate, CommitTimingReadiness, CommitTimingSchedulerDeadline,
-};
+pub use surface_pacing::{CommitTimingConstraint, SurfacePacingMetrics};
 pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::{

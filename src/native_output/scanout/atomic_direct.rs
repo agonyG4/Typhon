@@ -179,6 +179,7 @@ pub(crate) struct DirectPageflipCompletion {
 pub(crate) enum DirectScanoutAttempt {
     Rejected(DirectScanoutSceneRejection),
     Fallback(&'static str),
+    TimingDeferred,
     Unchanged,
     AdmissionRejected {
         transaction_id: OutputTransactionId,
