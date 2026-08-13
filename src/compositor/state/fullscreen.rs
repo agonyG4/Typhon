@@ -6,6 +6,19 @@ use crate::compositor::{SurfaceContentType, SurfacePresentationMetadata};
 use crate::render_backend::buffer::SurfaceBufferSource;
 use std::borrow::Cow;
 
+fn select_fullscreen_root_content_type(
+    owner_root_surface_id: u32,
+    surface_id: u32,
+    candidate: SurfaceContentType,
+    current: SurfaceContentType,
+) -> SurfaceContentType {
+    if surface_id == owner_root_surface_id && candidate != SurfaceContentType::None {
+        candidate
+    } else {
+        current
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn fullscreen_tree_presentation_metadata(
         &self,
@@ -27,11 +40,12 @@ impl CompositorState {
             if surface_metadata.hint.is_async() {
                 metadata.hint = surface_metadata.hint;
             }
-            if metadata.content_type == SurfaceContentType::None
-                && surface_metadata.content_type != SurfaceContentType::None
-            {
-                metadata.content_type = surface_metadata.content_type;
-            }
+            metadata.content_type = select_fullscreen_root_content_type(
+                owner.owner_root_surface_id,
+                surface.surface_id,
+                surface_metadata.content_type,
+                metadata.content_type,
+            );
         }
         Some(metadata)
     }
@@ -510,6 +524,40 @@ impl CompositorState {
                 (role.mapped && role.committed.layer == Layer::Overlay).then_some(*surface_id)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod root_content_type_tests {
+    use super::*;
+
+    fn select(root: SurfaceContentType, child: SurfaceContentType) -> SurfaceContentType {
+        let after_root = select_fullscreen_root_content_type(1, 1, root, SurfaceContentType::None);
+        select_fullscreen_root_content_type(1, 2, child, after_root)
+    }
+
+    #[test]
+    fn child_content_does_not_replace_root_none() {
+        assert_eq!(
+            select(SurfaceContentType::None, SurfaceContentType::Game),
+            SurfaceContentType::None
+        );
+    }
+
+    #[test]
+    fn root_video_wins_over_child_game() {
+        assert_eq!(
+            select(SurfaceContentType::Video, SurfaceContentType::Game),
+            SurfaceContentType::Video
+        );
+    }
+
+    #[test]
+    fn root_game_is_preserved_when_child_is_none() {
+        assert_eq!(
+            select(SurfaceContentType::Game, SurfaceContentType::None),
+            SurfaceContentType::Game
+        );
     }
 }
 

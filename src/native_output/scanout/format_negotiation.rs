@@ -175,7 +175,7 @@ pub(crate) fn select_output_format_modifier_for_presentation(
     gbm: &mut impl GbmAllocationProbe,
 ) -> io::Result<DrmFormatModifierPair> {
     let drm = if presentation_mode.is_async() {
-        async_drm.unwrap_or(normal_drm)
+        async_drm.unwrap_or(&[])
     } else {
         normal_drm
     };

@@ -63,10 +63,11 @@ PAGE_FLIP_ASYNC` and never `ALLOW_MODESET`; modesets never use Async. Legacy
 page flips have explicit VSync and Async submission modes, with Async enabled
 only after the legacy capability is available.
 
-For composited Async, the render fence is waited in userspace and the primary
-`IN_FENCE_FD` is omitted. VSync retains the existing explicit-sync path. Async
-cursor-only or cursor-mutating submissions are rejected, and a visible or
-transitioning cursor blocks Async eligibility.
+For composited Async, render-fence readiness is checked nonblocking from the
+event loop before submission and the primary `IN_FENCE_FD` is omitted. VSync
+retains the existing explicit-sync path. Async cursor-only or cursor-mutating
+submissions are rejected, and a visible or transitioning cursor blocks Async
+eligibility.
 
 The atomic connector Content Type property is optional. Its absence does not
 disable the protocol, but no property programming is emitted. When present,
@@ -82,9 +83,12 @@ adds the existing zero-copy flag. A completed Async presentation does not
 clear a FIFO barrier. A later valid non-tearing latch or surface teardown is
 responsible for retiring that barrier.
 
-Direct Scanout validation includes presentation mode and content type. When
-the driver supplies `IN_FORMATS_ASYNC`, Async validation uses that set; when it
-does not, the normal primary-plane set is used as the explicit fallback.
+Direct Scanout validation includes presentation mode and content type. A
+composited Async candidate must be present in the driver’s `IN_FORMATS_ASYNC`
+set for the selected framebuffer format/modifier; absence of that exact
+qualification keeps the frame on VSync. The TEST_ONLY result is cached only
+for the exact output generation, CRTC, primary plane, format/modifier, acquire
+strategy, cursor state, and content type that were tested.
 
 ## Qualification boundary
 

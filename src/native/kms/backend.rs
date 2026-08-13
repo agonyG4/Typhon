@@ -3,6 +3,8 @@ use std::{
     time::Instant,
 };
 
+use crate::compositor::{DrmContentType, OutputPresentationMode};
+
 use super::{
     AtomicCommitFlags, AtomicCommitSubmitter, AtomicConnectorProperties, AtomicCrtcProperties,
     AtomicCursorPlaneProperties, AtomicCursorPlaneSnapshot, AtomicCursorVisualState,
@@ -54,6 +56,8 @@ pub struct AtomicFlipRequest {
     pub token: PageFlipToken,
     pub in_fence: OwnedFd,
     pub cursor: Option<AtomicCursorVisualState>,
+    pub presentation_mode: OutputPresentationMode,
+    pub content_type: DrmContentType,
 }
 
 #[derive(Debug)]
@@ -220,7 +224,7 @@ impl AtomicDiscovery {
                 }
                 parse_in_formats_blob(&property_blob(fd, blob_id)?)?
             }
-            None => plane_scanout_formats.clone(),
+            None => Vec::new(),
         };
         let cursor_plane = cursor_selected.and_then(|selected_cursor| {
             let entries = plane_property_entries
@@ -880,6 +884,29 @@ impl Drop for DrmAtomicBackend {
         }
     }
 
+    pub fn submit_flip_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+        presentation_mode: OutputPresentationMode,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.submit_flip_with_cursor(framebuffer, token, cursor)
+            }
+            KmsDisplayBackend::Legacy(backend) => backend.submit_flip_with_mode(
+                framebuffer,
+                token,
+                if presentation_mode.is_async() {
+                    crate::native::drm::LegacyPageFlipMode::Async
+                } else {
+                    crate::native::drm::LegacyPageFlipMode::Vsync
+                },
+            ),
+        }
+    }
+
     pub fn submit_flip_with_presentation_mode(
         &self,
         framebuffer: FramebufferId,
@@ -1235,6 +1262,29 @@ impl KmsBackendSelection {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => backend.discovery().optional.async_page_flip,
             KmsDisplayBackend::Legacy(backend) => backend.async_page_flip_capable(),
+        }
+    }
+
+    pub fn resolved_content_type(&self, requested: DrmContentType) -> DrmContentType {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend)
+                if backend
+                    .pipeline
+                    .connector_props
+                    .content_type_value(requested.as_str())
+                    .is_some() =>
+            {
+                requested
+            }
+            KmsDisplayBackend::Atomic(_) => DrmContentType::Graphics,
+            KmsDisplayBackend::Legacy(_) => requested,
+        }
+    }
+
+    pub fn atomic_commit_submitter(&self) -> Option<AtomicCommitSubmitter> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => Some(backend.commit_submitter()),
+            KmsDisplayBackend::Legacy(_) => None,
         }
     }
 

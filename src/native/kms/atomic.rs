@@ -6,6 +6,9 @@ use super::{
     ConnectorPropertyId, CrtcId, CrtcPropertyId, DrmFormatModifierPair, DrmObjectKind,
     FramebufferId, PageFlipToken, PlaneId, PlanePropertyId,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static CONTENT_TYPE_FALLBACK_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 
@@ -339,11 +342,21 @@ impl AtomicRequest {
         let Some(property) = pipeline.connector_props.content_type else {
             return Ok(false);
         };
-        let Some(value) = pipeline.connector_props.content_type_value(content_type) else {
-            return Err(AtomicKmsError::new(
-                AtomicKmsErrorKind::MissingProperty,
-                format!("connector Content Type enum is missing {content_type:?}"),
-            ));
+        let value = pipeline
+            .connector_props
+            .content_type_value(content_type)
+            .or_else(|| {
+                if content_type != "Graphics"
+                    && !CONTENT_TYPE_FALLBACK_DIAGNOSTIC_EMITTED.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "KMS connector Content Type enum {content_type:?} is unavailable; falling back to Graphics"
+                    );
+                }
+                pipeline.connector_props.content_type_value("Graphics")
+            });
+        let Some(value) = value else {
+            return Ok(false);
         };
         self.set_connector(pipeline.connector, property, value)?;
         Ok(true)
@@ -856,6 +869,22 @@ pub struct SerializedAtomicRequest {
 pub struct AtomicCommitFlags(u32);
 
 impl AtomicCommitFlags {
+    pub const fn for_presentation(
+        mode: crate::compositor::OutputPresentationMode,
+        test_only: bool,
+    ) -> Self {
+        match (mode, test_only) {
+            (crate::compositor::OutputPresentationMode::Async, true) => {
+                Self::test_only_async_page_flip()
+            }
+            (crate::compositor::OutputPresentationMode::Async, false) => Self::async_page_flip(),
+            (crate::compositor::OutputPresentationMode::Vsync, true) => {
+                Self::test_only_no_modeset()
+            }
+            (crate::compositor::OutputPresentationMode::Vsync, false) => Self::page_flip(),
+        }
+    }
+
     pub const fn initial_test() -> Self {
         Self::test_only_allow_modeset()
     }
@@ -925,6 +954,19 @@ pub struct AtomicSubmission {
 }
 
 impl AtomicSubmission {
+    pub fn for_presentation(
+        request: AtomicRequest,
+        token: PageFlipToken,
+        mode: crate::compositor::OutputPresentationMode,
+        test_only: bool,
+    ) -> Self {
+        Self {
+            request,
+            flags: AtomicCommitFlags::for_presentation(mode, test_only),
+            user_data: if test_only { 0 } else { token.get() },
+        }
+    }
+
     pub fn page_flip(request: AtomicRequest, token: PageFlipToken) -> Self {
         Self {
             request,

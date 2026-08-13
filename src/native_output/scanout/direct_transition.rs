@@ -169,6 +169,7 @@ impl NativeScanoutBackend {
         cursor_revision: Option<crate::native_output::presentation::plane::CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
+        confirmed_content_type: oblivion_one::compositor::DrmContentType,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
@@ -181,6 +182,7 @@ impl NativeScanoutBackend {
                 cursor_revision,
                 cursor_epoch,
                 pacing_mode,
+                confirmed_content_type,
                 worker,
             ),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(

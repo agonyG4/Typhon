@@ -54,6 +54,34 @@ fn legacy_kms_never_enables_explicit_triple_buffering() {
 }
 
 #[test]
+fn presentation_flag_contract_is_identical_for_test_only_and_real_submissions() {
+    assert_eq!(
+        AtomicCommitFlags::for_presentation(
+            crate::compositor::OutputPresentationMode::Vsync,
+            false,
+        ),
+        AtomicCommitFlags::page_flip()
+    );
+    assert_eq!(
+        AtomicCommitFlags::for_presentation(
+            crate::compositor::OutputPresentationMode::Async,
+            false,
+        ),
+        AtomicCommitFlags::async_page_flip()
+    );
+    assert_eq!(
+        AtomicCommitFlags::for_presentation(crate::compositor::OutputPresentationMode::Vsync, true,),
+        AtomicCommitFlags::test_only_no_modeset()
+    );
+    let async_test =
+        AtomicCommitFlags::for_presentation(crate::compositor::OutputPresentationMode::Async, true);
+    assert!(async_test.contains_test_only());
+    assert!(async_test.contains_pageflip_async());
+    assert!(!async_test.contains_allow_modeset());
+    assert!(!async_test.contains_nonblock());
+}
+
+#[test]
 fn startup_policy_allows_only_pre_takeover_auto_fallback() {
     assert_eq!(
         KmsPolicy::Auto.on_atomic_failure(AtomicFailurePhase::Capability),
@@ -776,6 +804,8 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
             token: PageFlipToken::new(55).unwrap(),
             in_fence: input,
             cursor: None,
+            presentation_mode: crate::compositor::OutputPresentationMode::Vsync,
+            content_type: crate::compositor::DrmContentType::Graphics,
         },
         |submission| {
             let serialized = submission.request.serialize();
@@ -800,6 +830,35 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
 }
 
 #[test]
+fn async_atomic_flip_does_not_program_in_fence_fd() {
+    let pipeline = explicit_fence_pipeline();
+    let input = pipe_read_end();
+    let input_raw = input.as_raw_fd();
+    let fence_property = pipeline.plane_props.in_fence_fd.unwrap().0.get();
+
+    submit_atomic_flip_with(
+        &pipeline,
+        AtomicFlipRequest {
+            framebuffer: FramebufferId::new(81).unwrap(),
+            token: PageFlipToken::new(55).unwrap(),
+            in_fence: input,
+            cursor: None,
+            presentation_mode: crate::compositor::OutputPresentationMode::Async,
+            content_type: crate::compositor::DrmContentType::Graphics,
+        },
+        |submission| {
+            let serialized = submission.request.serialize();
+            assert!(!serialized.properties.contains(&fence_property));
+            assert!(submission.flags.contains_pageflip_async());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(unsafe { libc::fcntl(input_raw, libc::F_GETFD) }, -1);
+}
+
+#[test]
 fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
@@ -817,6 +876,8 @@ fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
             token: PageFlipToken::new(55).unwrap(),
             in_fence: input,
             cursor: None,
+            presentation_mode: crate::compositor::OutputPresentationMode::Vsync,
+            content_type: crate::compositor::DrmContentType::Graphics,
         },
         |submission| {
             let serialized = submission.request.serialize();
@@ -849,6 +910,8 @@ fn explicit_atomic_flip_ignores_negative_out_fence() {
             token: PageFlipToken::new(55).unwrap(),
             in_fence: pipe_read_end(),
             cursor: None,
+            presentation_mode: crate::compositor::OutputPresentationMode::Vsync,
+            content_type: crate::compositor::DrmContentType::Graphics,
         },
         |_| Ok(()),
     )

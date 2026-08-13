@@ -1077,7 +1077,8 @@ impl CompatibilityPresentationHarness {
             None,
             1,
             1,
-            |_| result,
+            None,
+            |_, _| result,
         )
     }
 

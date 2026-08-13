@@ -9,6 +9,7 @@ use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
+use super::async_validation::CompositedAsyncValidationKey;
 use super::plane::{CursorSidecarId, PlaneWriteSet};
 use crate::native_output::scanout::{CursorContentKey, OutputSlotId};
 
@@ -288,6 +289,7 @@ pub(crate) struct OutputTransaction {
     pacing_mode: NativeOutputPacingMode,
     presentation_mode: OutputPresentationMode,
     content_type: DrmContentType,
+    async_validation_key: Option<CompositedAsyncValidationKey>,
     content: OutputTransactionContent,
     planes: OutputPlanePlan,
     synchronization: OutputSynchronizationPlan,
@@ -609,6 +611,7 @@ impl OutputTransaction {
             pacing_mode,
             presentation_mode: OutputPresentationMode::Vsync,
             content_type: DrmContentType::Graphics,
+            async_validation_key: None,
             content,
             planes,
             synchronization,
@@ -655,6 +658,18 @@ impl OutputTransaction {
             self.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
         }
         self
+    }
+
+    pub(crate) fn with_async_validation_key(
+        mut self,
+        key: Option<CompositedAsyncValidationKey>,
+    ) -> Self {
+        self.async_validation_key = key;
+        self
+    }
+
+    pub(crate) const fn async_validation_key(&self) -> Option<CompositedAsyncValidationKey> {
+        self.async_validation_key
     }
 
     pub(crate) const fn content(&self) -> OutputTransactionContent {

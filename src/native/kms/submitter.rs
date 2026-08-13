@@ -239,18 +239,11 @@ impl AtomicCommitSubmitter {
                     )
                 })?,
             )?;
-        } else if test_only {
+        } else if test_only && !presentation_mode.is_async() {
             request.set_test_input_fence_none(&self.pipeline)?;
         }
-        let submission = if test_only && presentation_mode.is_async() {
-            AtomicSubmission::test_only_async_page_flip(request)
-        } else if test_only {
-            AtomicSubmission::test_only(request)
-        } else if presentation_mode.is_async() {
-            AtomicSubmission::async_page_flip(request, token)
-        } else {
-            AtomicSubmission::page_flip(request, token)
-        };
+        let submission =
+            AtomicSubmission::for_presentation(request, token, presentation_mode, test_only);
         // SAFETY: the runtime owns the DRM fd and joins the worker before the
         // fd can be closed, revoked, restored, or replaced.
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };

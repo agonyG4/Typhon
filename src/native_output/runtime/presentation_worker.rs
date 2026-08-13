@@ -465,6 +465,17 @@ pub(super) fn submit_explicit_ready_for_presentation(
             FrozenCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
             FrozenCursorTestPolicy::Skip => KmsTestOnlyPolicy::Skip,
         };
+        let primary_test_only =
+            output_transactions
+                .transaction(transaction_id)
+                .is_some_and(|transaction| {
+                    let descriptor = transaction.descriptor();
+                    descriptor.presentation_mode().is_async()
+                        && descriptor
+                            .async_validation_key()
+                            .map(|key| !explicit.async_validation_is_accepted(key))
+                            .unwrap_or(true)
+                });
         return Ok(queue_explicit_ready_for_presentation(
             worker,
             explicit,
@@ -479,7 +490,14 @@ pub(super) fn submit_explicit_ready_for_presentation(
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
             pacing_frame_id,
-            KmsCommitTestPolicy::from_cursor(test_only),
+            KmsCommitTestPolicy {
+                primary: if primary_test_only {
+                    KmsTestOnlyPolicy::Required
+                } else {
+                    KmsTestOnlyPolicy::Skip
+                },
+                cursor: test_only,
+            },
             ready_submit,
             context.validation_base,
         )?
@@ -507,6 +525,7 @@ fn kms_primary_cursor_presentation(
 pub(super) fn queue_compatibility_for_presentation(
     worker: &KmsCommitWorkerHandle,
     scanout: &mut NativeScanoutBackend,
+    kms_backend: &KmsBackendSelection,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
@@ -532,6 +551,7 @@ pub(super) fn queue_compatibility_for_presentation(
     match super::kms_worker::queue_atomic_compatibility_frame(
         worker,
         scanout,
+        kms_backend,
         server,
         output_transactions,
         atomic_commit_arbiter,

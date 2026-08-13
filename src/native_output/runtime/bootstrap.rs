@@ -271,7 +271,11 @@ impl NativeRuntime {
                     ]);
                     fields
                 });
-                scanout.present(&kms_backend, None)?;
+                scanout.present(
+                    &kms_backend,
+                    None,
+                    oblivion_one::compositor::OutputPresentationMode::Vsync,
+                )?;
                 perf.log("native.cursor", || {
                     vec![
                         NativePerfField::str("backend", cursor_render_mode.as_str()),
@@ -623,6 +627,7 @@ impl NativeRuntime {
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
             confirmed_primary_assignment: None,
+            confirmed_output_presentation: ConfirmedOutputPresentationState::default(),
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,

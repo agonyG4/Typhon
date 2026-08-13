@@ -1,5 +1,5 @@
 use super::*;
-use oblivion_one::compositor::FrameBatchDiscardReason;
+use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
 
 macro_rules! require_validation_base {
     ($context:expr, $redraw:ident) => {
@@ -163,6 +163,23 @@ pub(crate) enum NativeClientCursorPath {
 
 pub(super) type ConfirmedPrimaryAssignment = ConfirmedPrimaryState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConfirmedOutputPresentationState {
+    pub(crate) mode: OutputPresentationMode,
+    pub(crate) content_type: DrmContentType,
+    pub(crate) output_generation: u64,
+}
+
+impl Default for ConfirmedOutputPresentationState {
+    fn default() -> Self {
+        Self {
+            mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
+            output_generation: 0,
+        }
+    }
+}
+
 fn create_native_control_server(
     event_loop: &mut NativeEventLoop,
     server: &OwnCompositorServer,
@@ -287,6 +304,7 @@ pub(crate) struct NativeRuntime {
     output_transactions: OutputTransactionLedger,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     confirmed_primary_assignment: Option<ConfirmedPrimaryAssignment>,
+    confirmed_output_presentation: ConfirmedOutputPresentationState,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     render_journal: AdaptiveRenderJournal,
@@ -490,6 +508,7 @@ impl Drop for NativeRuntime {
             return;
         }
         self.confirmed_primary_assignment = None;
+        self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         if !self.scanout_destroyed
             && let Err(error) = self.scanout.release_direct_for_target_destroyed()
         {

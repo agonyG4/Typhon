@@ -79,6 +79,7 @@ impl NativeRuntime {
             output_transactions,
             presented_planes,
             confirmed_primary_assignment,
+            confirmed_output_presentation,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -672,7 +673,7 @@ impl NativeRuntime {
                     && worker_mode
                     && kms_commit_worker.is_some()
                 {
-                    match scanout.try_direct_scanout(
+                    #[rustfmt::skip] match scanout.try_direct_scanout(
                         kms_backend,
                         server,
                         output_transactions,
@@ -680,7 +681,7 @@ impl NativeRuntime {
                         effective_cursor.as_ref(),
                         frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
-                        pacing_mode,
+                        pacing_mode, confirmed_output_presentation.content_type,
                         kms_commit_worker.as_ref(),
                     )? {
                         DirectScanoutAttempt::Unchanged => {
@@ -964,7 +965,7 @@ impl NativeRuntime {
                                 cursor_epoch,
                                 atomic_cursor.as_ref(),
                             )?;
-                        let render_outcome = explicit.render_frame(
+                        #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
                             output_transactions,
@@ -984,7 +985,7 @@ impl NativeRuntime {
                                 primary_cursor,
                                 runtime_plane_plan.as_ref(),
                             ),
-                            frozen_cursor_plane_owner,
+                            frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued(), confirmed_output_presentation.content_type),
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
@@ -1036,7 +1037,8 @@ impl NativeRuntime {
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
                                     #[rustfmt::skip]
-                                    let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
+                                    if !super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)? { *queued_redraw_requested = true; return Ok(()); }
+                                    #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
                                     let Some((
                                         token,
                                         framebuffer_id,
@@ -1219,6 +1221,7 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
+                            #[rustfmt::skip]
                             let (present_result, compatibility_transaction_id) = if render_ahead {
                                 (NativePresentResult::Noop, None)
                             } else {
@@ -1242,10 +1245,7 @@ impl NativeRuntime {
                                     render_generation,
                                     effective_cursor.as_ref(),
                                     cursor_epoch,
-                                    *frame_index,
-                                    |scanout| {
-                                        scanout.present(kms_backend, effective_cursor.as_ref())
-                                    },
+                                    *frame_index, Some(kms_backend), |s, m| s.present(kms_backend, effective_cursor.as_ref(), m),
                                 )?
                             };
                             #[cfg(test)]

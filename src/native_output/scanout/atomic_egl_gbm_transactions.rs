@@ -10,8 +10,64 @@ impl AtomicEglGbmScanout {
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
     ) -> io::Result<(u64, u32, OutputTransactionId)> {
+        let ready_transaction_id = self
+            .swapchain()?
+            .ready_transaction_id()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        let (mut presentation_mode, content_type, async_validation_key) = {
+            let transaction = output_transactions
+                .transaction(ready_transaction_id)
+                .ok_or_else(|| {
+                    io::Error::other("ready transaction disappeared before presentation lookup")
+                })?
+                .descriptor();
+            (
+                transaction.presentation_mode(),
+                transaction.content_type(),
+                transaction.async_validation_key(),
+            )
+        };
+        if presentation_mode.is_async()
+            && let Some(key) = async_validation_key
+            && !self.async_validation_is_accepted(key)
+        {
+            let ready_slot = self
+                .swapchain()?
+                .ready_slot()
+                .ok_or_else(|| io::Error::other("Async validation has no ready slot"))?;
+            let framebuffer = self.framebuffer(ready_slot)?;
+            let test_token = PageFlipToken::new(allocate_native_page_flip_token())
+                .expect("allocated native pageflip token is nonzero");
+            let test_result = kms
+                .atomic_commit_submitter()
+                .ok_or_else(|| io::Error::other("Async validation requires Atomic KMS"))?
+                .test_primary_without_cursor_with_presentation(
+                    framebuffer,
+                    test_token,
+                    OutputPresentationMode::Async,
+                    content_type,
+                );
+            match test_result {
+                Ok(()) => self.note_composited_async_validation(key, true),
+                Err(error) => {
+                    self.note_composited_async_validation(key, false);
+                    output_transactions
+                        .downgrade_presentation_to_vsync(ready_transaction_id)
+                        .map_err(io::Error::other)?;
+                    presentation_mode = OutputPresentationMode::Vsync;
+                    eprintln!("composited Async TEST_ONLY rejected; using Vsync: {error}");
+                }
+            }
+        }
+        if presentation_mode.is_async() && !self.ready_render_fence_is_signaled()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Async Atomic submission requested before the render fence signaled",
+            ));
+        }
         let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
         let transaction_id = frame.transaction_id;
+        debug_assert_eq!(transaction_id, ready_transaction_id);
         let planned_cursor = match output_transactions
             .transaction(transaction_id)
             .ok_or_else(|| io::Error::other("ready transaction disappeared before submission"))?
@@ -109,6 +165,8 @@ impl AtomicEglGbmScanout {
             token,
             in_fence,
             cursor: planned_cursor,
+            presentation_mode,
+            content_type,
         });
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {
@@ -134,6 +192,11 @@ impl AtomicEglGbmScanout {
                 Ok((token.get(), framebuffer.get(), transaction_id))
             }
             Err(error) => {
+                if presentation_mode.is_async() {
+                    if let Some(key) = async_validation_key {
+                        self.note_async_validation(key, false);
+                    }
+                }
                 let failure =
                     io::Error::other(format!("explicit Atomic output submission failed: {error}"));
                 settle_failed_output_transaction(

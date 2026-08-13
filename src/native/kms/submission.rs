@@ -15,31 +15,43 @@ pub(crate) fn submit_atomic_flip_with(
         .crtc_props
         .out_fence_ptr
         .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
-    let in_fence_property = pipeline.plane_props.in_fence_fd.ok_or_else(|| {
-        AtomicKmsError::new(
-            AtomicKmsErrorKind::MissingProperty,
-            "primary plane is missing required IN_FENCE_FD",
-        )
-    })?;
+    let in_fence_property = if request.presentation_mode.is_async() {
+        None
+    } else {
+        Some(pipeline.plane_props.in_fence_fd.ok_or_else(|| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                "primary plane is missing required IN_FENCE_FD",
+            )
+        })?)
+    };
     let mut atomic_request = AtomicRequest::primary_flip_with_cursor(
         pipeline,
         request.framebuffer,
         request.cursor.as_ref(),
     )?;
-    atomic_request.set_plane(
-        pipeline.plane,
-        in_fence_property,
-        u64::try_from(request.in_fence.as_raw_fd()).map_err(|_| {
-            AtomicKmsError::new(
-                AtomicKmsErrorKind::MissingProperty,
-                "Atomic input fence FD is negative",
-            )
-        })?,
-    )?;
+    atomic_request.set_connector_content_type(pipeline, request.content_type.as_str())?;
+    if let Some(in_fence_property) = in_fence_property {
+        atomic_request.set_plane(
+            pipeline.plane,
+            in_fence_property,
+            u64::try_from(request.in_fence.as_raw_fd()).map_err(|_| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::MissingProperty,
+                    "Atomic input fence FD is negative",
+                )
+            })?,
+        )?;
+    }
     if let (Some(property), Some(pointer)) = (pipeline.crtc_props.out_fence_ptr, out_fence_ptr) {
         atomic_request.set_crtc(pipeline.crtc, property, pointer as u64)?;
     }
-    let submission = AtomicSubmission::page_flip(atomic_request, request.token);
+    let submission = AtomicSubmission::for_presentation(
+        atomic_request,
+        request.token,
+        request.presentation_mode,
+        false,
+    );
     let result = submit(&submission);
     match result {
         Ok(()) => Ok(AtomicFlipSubmission {

@@ -123,6 +123,7 @@ impl AtomicEglGbmScanout {
         cursor_revision: Option<CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
+        confirmed_content_type: DrmContentType,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
@@ -183,22 +184,42 @@ impl AtomicEglGbmScanout {
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
             candidate.presentation,
             AsyncEligibility {
-                solitary_fullscreen: true,
+                solitary_fullscreen: candidate.root_surface_id == candidate.surface_id,
                 async_hint: candidate.presentation.hint.is_async(),
                 backend_capable: kms
                     .atomic()
                     .is_some_and(|atomic| atomic.discovery().optional.async_page_flip),
-                output_generation_qualified: true,
-                explicit_sync_ready: true,
-                commit_timing_safe: true,
-                kms_lane_free: true,
-                async_test_only_accepted: true,
+                async_format_supported: candidate
+                    .buffer
+                    .planes()
+                    .first()
+                    .zip(kms.atomic())
+                    .is_some_and(|(plane, atomic)| {
+                        atomic.discovery().plane_async_scanout_formats.contains(
+                            &oblivion_one::native::kms::DrmFormatModifierPair {
+                                fourcc: candidate.buffer.format().as_fourcc(),
+                                modifier: plane.descriptor().modifier.0,
+                            },
+                        )
+                    }),
+                output_generation_qualified: candidate.generation == self.direct.drm_generation,
+                explicit_sync_ready: matches!(
+                    &sync_readiness,
+                    DirectSyncReadiness::Qualified { .. }
+                ),
+                commit_timing_safe: self.direct.ownership.submitted.is_none(),
+                kms_lane_free: self.direct.ownership.submitted.is_none(),
+                async_test_only_accepted: kms.async_page_flip_capable(),
                 cursor_visible: cursor.is_some_and(|state| state.visible),
+                modeset_required: kms
+                    .resolved_content_type(candidate.presentation.content_type.drm_value())
+                    != confirmed_content_type,
                 ..AsyncEligibility::default()
             },
         );
         let presentation_mode = effective_presentation.mode;
-        let content_type = effective_presentation.content_type.drm_value();
+        let content_type =
+            kms.resolved_content_type(effective_presentation.content_type.drm_value());
         self.direct.counters.candidates_accepted += 1;
         let Some(candidate_key) =
             direct_candidate_key(&candidate, self.direct.drm_generation, cursor)

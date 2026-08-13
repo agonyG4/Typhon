@@ -303,6 +303,7 @@ pub(super) fn queue_explicit_composited_frame(
 pub(super) fn queue_atomic_compatibility_frame(
     worker: &KmsCommitWorkerHandle,
     scanout: &mut NativeScanoutBackend,
+    kms_backend: &KmsBackendSelection,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
@@ -344,6 +345,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         render_generation,
         cursor,
         cursor_epoch,
+        Some(kms_backend),
     )?
     else {
         return Ok(WorkerQueueOutcome::Unavailable(
@@ -846,6 +848,17 @@ impl NativeRuntime {
                     self.quarantine_submitted_ownership(ownership)?;
                     return Err(error);
                 }
+                if matches!(
+                    ownership.job.kind,
+                    AtomicCommitKind::CompositedPrimary { .. }
+                ) && let Some(key) = ownership
+                    .job
+                    .owners
+                    .primary()
+                    .and_then(|owner| owner.transaction.async_validation_key())
+                {
+                    self.scanout.note_composited_async_validation(key, true);
+                }
                 self.submitted_worker_ownership.push(ownership);
                 let ownership = self
                     .submitted_worker_ownership
@@ -1280,6 +1293,15 @@ impl NativeRuntime {
                 }
             }
             KmsWorkerEvent::TestRejected { job, error } => {
+                if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+                    && let Some(key) = job
+                        .owners
+                        .primary()
+                        .and_then(|owner| owner.transaction.async_validation_key())
+                {
+                    self.scanout.note_composited_async_validation(key, false);
+                    self.queued_redraw_requested = true;
+                }
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
                     && let Some(duration_ns) = job.test_only_duration_ns
                 {
@@ -1289,6 +1311,15 @@ impl NativeRuntime {
             }
             KmsWorkerEvent::SubmitRejected { job, error }
             | KmsWorkerEvent::BusyExhausted { job, error } => {
+                if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+                    && let Some(key) = job
+                        .owners
+                        .primary()
+                        .and_then(|owner| owner.transaction.async_validation_key())
+                {
+                    self.scanout.note_composited_async_validation(key, false);
+                    self.queued_redraw_requested = true;
+                }
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
                     if job.test_policy.effective() == KmsTestOnlyPolicy::Required
                         && let Some(duration_ns) = job.test_only_duration_ns

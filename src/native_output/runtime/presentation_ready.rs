@@ -12,6 +12,28 @@ use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;
 
+pub(super) fn ensure_async_render_fence_ready(
+    explicit: &AtomicEglGbmScanout,
+    output_transactions: &OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    output_render_fence_token: &mut Option<ReactorToken>,
+    event_loop: &mut NativeEventLoop,
+) -> NativeResult<bool> {
+    let is_async = output_transactions
+        .transaction(transaction_id)
+        .is_some_and(|transaction| transaction.descriptor().presentation_mode().is_async());
+    if !is_async || explicit.ready_render_fence_is_signaled()? {
+        return Ok(true);
+    }
+    if output_render_fence_token.is_none()
+        && let Some(fd) = explicit.ready_render_fence_fd()
+    {
+        *output_render_fence_token =
+            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
+    }
+    Ok(false)
+}
+
 pub(super) enum ReadySubmissionResult {
     Submitted,
     Unavailable,
@@ -89,6 +111,24 @@ pub(super) fn submit_ready_frame(
                 .swapchain()?
                 .ready_transaction_id()
                 .ok_or_else(|| io::Error::other("ready explicit frame has no transaction ID"))?;
+            let presentation_mode = output_transactions
+                .transaction(transaction_id)
+                .ok_or_else(|| {
+                    io::Error::other("ready transaction disappeared before fence check")
+                })?
+                .descriptor()
+                .presentation_mode();
+            if presentation_mode.is_async()
+                && !ensure_async_render_fence_ready(
+                    explicit,
+                    output_transactions,
+                    transaction_id,
+                    output_render_fence_token,
+                    event_loop,
+                )?
+            {
+                return Ok(ReadySubmissionResult::Unavailable);
+            }
             let Some((token, framebuffer_id, transaction_id, _worker_queued)) =
                 submit_explicit_ready_for_presentation(
                     worker_mode,
@@ -152,6 +192,7 @@ pub(super) fn submit_ready_frame(
             let Some(result) = queue_compatibility_for_presentation(
                 worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?,
                 scanout,
+                kms_backend,
                 server,
                 output_transactions,
                 atomic_commit_arbiter,
@@ -196,7 +237,10 @@ pub(super) fn submit_ready_frame(
                 cursor,
                 cursor_epoch,
                 *frame_index,
-                |scanout| scanout.present(kms_backend, cursor),
+                kms_backend,
+                |scanout, presentation_mode| {
+                    scanout.present(kms_backend, cursor, presentation_mode)
+                },
             )?
         };
     #[cfg(test)]

@@ -320,6 +320,7 @@ impl NativeSessionIo for NativeRuntime {
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
         self.confirmed_primary_assignment = None;
+        self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         self.submitted_worker_ownership.clear();
         self.worker_quarantine.jobs.clear();
         self.worker_quarantine.cursor_sidecars.clear();

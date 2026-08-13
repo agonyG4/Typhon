@@ -1,3 +1,4 @@
+pub(crate) mod async_validation;
 pub(crate) mod ledger;
 pub(crate) mod pipeline;
 pub(crate) mod plane;

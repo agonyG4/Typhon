@@ -76,6 +76,7 @@ pub struct SurfacePresentationMetadata {
 pub struct SurfacePresentationState {
     current: SurfacePresentationMetadata,
     pending: SurfacePresentationMetadata,
+    pending_generation: u64,
 }
 
 impl SurfacePresentationState {
@@ -89,33 +90,50 @@ impl SurfacePresentationState {
 
     pub const fn set_pending_hint(mut self, hint: SurfacePresentationHint) -> Self {
         self.pending.hint = hint;
+        self.pending_generation = self
+            .pending_generation
+            .checked_add(1)
+            .expect("presentation pending generation exhausted");
         self
     }
 
     pub const fn set_pending_content_type(mut self, content_type: SurfaceContentType) -> Self {
         self.pending.content_type = content_type;
+        self.pending_generation = self
+            .pending_generation
+            .checked_add(1)
+            .expect("presentation pending generation exhausted");
         self
     }
 
     pub const fn destroy_tearing_object(mut self) -> Self {
         self.pending.hint = SurfacePresentationHint::Vsync;
+        self.pending_generation = self
+            .pending_generation
+            .checked_add(1)
+            .expect("presentation pending generation exhausted");
         self
     }
 
     pub const fn destroy_content_type_object(mut self) -> Self {
         self.pending.content_type = SurfaceContentType::None;
+        self.pending_generation = self
+            .pending_generation
+            .checked_add(1)
+            .expect("presentation pending generation exhausted");
         self
     }
 
     pub const fn capture_pending_and_reset(self) -> (Self, CapturedSurfacePresentation) {
         let captured = CapturedSurfacePresentation {
             metadata: self.pending,
-            pending_base: self.current,
+            captured_pending_generation: self.pending_generation,
         };
         (
             Self {
                 current: self.current,
                 pending: self.current,
+                pending_generation: self.pending_generation,
             },
             captured,
         )
@@ -126,7 +144,7 @@ impl SurfacePresentationState {
         // A new protocol request may arrive after capture but before the
         // synchronized surface tree latches. Preserve it; otherwise latching
         // an older commit would erase the newer double-buffered request.
-        if self.pending == captured.pending_base {
+        if self.pending_generation == captured.captured_pending_generation {
             self.pending = captured.metadata;
         }
         self
@@ -141,7 +159,7 @@ impl SurfacePresentationState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CapturedSurfacePresentation {
     pub metadata: SurfacePresentationMetadata,
-    pending_base: SurfacePresentationMetadata,
+    captured_pending_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,6 +205,7 @@ pub enum AsyncBlocker {
     CommitTimingNotSafe,
     KmsLaneBusy,
     AsyncTestOnlyRejected,
+    AsyncFormatUnsupported,
     AsyncSubmitRejected,
     ModesetRequired,
 }
@@ -206,6 +225,7 @@ impl AsyncBlocker {
             Self::CommitTimingNotSafe => "commit_timing_not_safe",
             Self::KmsLaneBusy => "kms_lane_busy",
             Self::AsyncTestOnlyRejected => "async_test_only_rejected",
+            Self::AsyncFormatUnsupported => "async_format_unsupported",
             Self::AsyncSubmitRejected => "async_submit_rejected",
             Self::ModesetRequired => "modeset_required",
         }
@@ -225,10 +245,11 @@ pub struct AsyncEligibility {
     pub commit_timing_safe: bool,
     pub kms_lane_free: bool,
     pub async_test_only_accepted: bool,
+    pub async_format_supported: bool,
     pub modeset_required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutputPresentationMode {
     Vsync,
     Async,
@@ -272,6 +293,8 @@ impl EffectivePresentation {
             Some(AsyncBlocker::SurfaceHintMissing)
         } else if !eligibility.backend_capable {
             Some(AsyncBlocker::BackendCapabilityUnavailable)
+        } else if !eligibility.async_format_supported {
+            Some(AsyncBlocker::AsyncFormatUnsupported)
         } else if !eligibility.output_generation_qualified {
             Some(AsyncBlocker::OutputGenerationUnqualified)
         } else if eligibility.cursor_visible {
@@ -329,6 +352,60 @@ mod tests {
     }
 
     #[test]
+    fn same_value_vsync_mutation_after_async_capture_is_not_overwritten() {
+        let state =
+            SurfacePresentationState::default().set_pending_hint(SurfacePresentationHint::Async);
+        let (state, captured) = state.capture_pending_and_reset();
+        let state = state.set_pending_hint(SurfacePresentationHint::Vsync);
+        let state = state.apply_captured(captured);
+
+        assert_eq!(state.current().hint, SurfacePresentationHint::Async);
+        let (state, next) = state.commit();
+        assert_eq!(next.hint, SurfacePresentationHint::Vsync);
+        assert_eq!(state.current().hint, SurfacePresentationHint::Vsync);
+    }
+
+    #[test]
+    fn same_value_none_mutation_after_game_capture_is_not_overwritten() {
+        let state =
+            SurfacePresentationState::default().set_pending_content_type(SurfaceContentType::Game);
+        let (state, captured) = state.capture_pending_and_reset();
+        let state = state.set_pending_content_type(SurfaceContentType::None);
+        let state = state.apply_captured(captured);
+
+        assert_eq!(state.current().content_type, SurfaceContentType::Game);
+        let (state, next) = state.commit();
+        assert_eq!(next.content_type, SurfaceContentType::None);
+        assert_eq!(state.current().content_type, SurfaceContentType::None);
+    }
+
+    #[test]
+    fn reverse_hint_mutation_sequence_keeps_the_newest_request() {
+        let state =
+            SurfacePresentationState::default().set_pending_hint(SurfacePresentationHint::Async);
+        let (state, captured) = state.capture_pending_and_reset();
+        let state = state.set_pending_hint(SurfacePresentationHint::Vsync);
+        let state = state.apply_captured(captured);
+        let state = state.set_pending_hint(SurfacePresentationHint::Async);
+        let (_, next) = state.commit();
+
+        assert_eq!(next.hint, SurfacePresentationHint::Async);
+    }
+
+    #[test]
+    fn reverse_content_mutation_sequence_keeps_the_newest_request() {
+        let state =
+            SurfacePresentationState::default().set_pending_content_type(SurfaceContentType::Game);
+        let (state, captured) = state.capture_pending_and_reset();
+        let state = state.set_pending_content_type(SurfaceContentType::None);
+        let state = state.apply_captured(captured);
+        let state = state.set_pending_content_type(SurfaceContentType::Video);
+        let (_, next) = state.commit();
+
+        assert_eq!(next.content_type, SurfaceContentType::Video);
+    }
+
+    #[test]
     fn tearing_object_destruction_reverts_only_pending_hint() {
         let state = SurfacePresentationState::default()
             .set_pending_hint(SurfacePresentationHint::Async)
@@ -360,6 +437,31 @@ mod tests {
         );
         assert_eq!(result.mode, OutputPresentationMode::Vsync);
         assert_eq!(result.blocker, Some(AsyncBlocker::SurfaceHintMissing));
+    }
+
+    #[test]
+    fn async_format_compatibility_is_an_explicit_blocker() {
+        let result = EffectivePresentation::decide(
+            TearingPolicy::Auto,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::None,
+            },
+            AsyncEligibility {
+                solitary_fullscreen: true,
+                async_hint: true,
+                backend_capable: true,
+                output_generation_qualified: true,
+                explicit_sync_ready: true,
+                commit_timing_safe: true,
+                kms_lane_free: true,
+                async_test_only_accepted: true,
+                async_format_supported: false,
+                ..AsyncEligibility::default()
+            },
+        );
+        assert_eq!(result.mode, OutputPresentationMode::Vsync);
+        assert_eq!(result.blocker, Some(AsyncBlocker::AsyncFormatUnsupported));
     }
 
     #[test]

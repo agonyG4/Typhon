@@ -2,7 +2,7 @@ use super::cursor_cycle::defer_cursor_after_busy;
 use super::*;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::{TerminalCallbackDisposition, TerminalCallbackOwnership};
-use oblivion_one::native::kms::KmsBackendKind;
+use oblivion_one::native::kms::{KmsBackendKind, KmsBackendSelection};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub(crate) struct DirectCallbackLeakMetrics {
 fn effective_output_presentation(
     server: &OwnCompositorServer,
     cursor_visible: bool,
+    kms_backend: Option<&KmsBackendSelection>,
+    output_generation: u64,
+    pacing_mode: NativeOutputPacingMode,
 ) -> (OutputPresentationMode, DrmContentType) {
     let metadata = server
         .fullscreen_tree_presentation_metadata()
@@ -32,19 +35,34 @@ fn effective_output_presentation(
         TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
         metadata,
         AsyncEligibility {
-            solitary_fullscreen: metrics.fullscreen_active,
+            solitary_fullscreen: metrics.solitary_tree_active,
             async_hint: metadata.hint.is_async(),
-            backend_capable: false,
-            output_generation_qualified: true,
-            explicit_sync_ready: true,
-            commit_timing_safe: true,
-            kms_lane_free: true,
-            async_test_only_accepted: true,
+            backend_capable: kms_backend.is_some_and(|kms| {
+                kms.effective_kind() == KmsBackendKind::Legacy && kms.async_page_flip_capable()
+            }),
+            async_format_supported: kms_backend.is_some_and(|kms| {
+                kms.effective_kind() == KmsBackendKind::Legacy && kms.async_page_flip_capable()
+            }),
+            output_generation_qualified: output_generation != 0,
+            explicit_sync_ready: kms_backend
+                .is_some_and(|kms| kms.effective_kind() == KmsBackendKind::Legacy),
+            commit_timing_safe: pacing_mode == NativeOutputPacingMode::ReactiveDouble,
+            kms_lane_free: kms_backend
+                .is_some_and(|kms| kms.effective_kind() == KmsBackendKind::Legacy),
+            async_test_only_accepted: kms_backend.is_some_and(|kms| {
+                kms.effective_kind() == KmsBackendKind::Legacy && kms.async_page_flip_capable()
+            }),
             cursor_visible,
             ..AsyncEligibility::default()
         },
     );
-    (effective.mode, effective.content_type.drm_value())
+    (
+        effective.mode,
+        kms_backend.map_or_else(
+            || effective.content_type.drm_value(),
+            |kms| kms.resolved_content_type(effective.content_type.drm_value()),
+        ),
+    )
 }
 
 pub(crate) fn direct_terminal_callback_owner_leaks(
@@ -489,9 +507,15 @@ pub(super) fn build_compatibility_transaction(
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
+    kms_backend: Option<&KmsBackendSelection>,
 ) -> NativeResult<Option<OutputTransactionId>> {
-    let (presentation_mode, content_type) =
-        effective_output_presentation(server, cursor.is_some_and(|state| state.visible));
+    let (presentation_mode, content_type) = effective_output_presentation(
+        server,
+        cursor.is_some_and(|state| state.visible),
+        kms_backend,
+        output_generation,
+        pacing_mode,
+    );
     let frame_batch_id = server
         .prepared_frame_batch_id()
         .ok_or_else(|| io::Error::other("compatibility pageflip has no prepared frame batch"))?;
@@ -551,7 +575,11 @@ pub(super) fn present_compatibility_frame(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
     frame_index: u64,
-    present: impl FnOnce(&mut NativeScanoutBackend) -> io::Result<NativePresentResult>,
+    kms_backend: Option<&KmsBackendSelection>,
+    present: impl FnOnce(
+        &mut NativeScanoutBackend,
+        OutputPresentationMode,
+    ) -> io::Result<NativePresentResult>,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let transaction_id = build_compatibility_transaction(
         output_transactions,
@@ -563,8 +591,13 @@ pub(super) fn present_compatibility_frame(
         render_generation,
         cursor,
         cursor_epoch,
+        kms_backend,
     )?;
-    let result = present(scanout).map_err(|error| {
+    let presentation_mode = transaction_id
+        .and_then(|transaction_id| output_transactions.transaction(transaction_id))
+        .map(|record| record.descriptor().presentation_mode())
+        .unwrap_or_default();
+    let result = present(scanout, presentation_mode).map_err(|error| {
         native_runtime_error(
             NativeRuntimeStage::Present,
             scanout.kind(),

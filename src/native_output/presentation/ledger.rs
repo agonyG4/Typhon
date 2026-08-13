@@ -2,6 +2,7 @@
 
 use super::transaction::{OutputTransaction, OutputTransactionContent, OutputTransactionId};
 use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::compositor::OutputPresentationMode;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::collections::{HashMap, VecDeque};
@@ -811,6 +812,22 @@ impl OutputTransactionLedger {
 
     pub(crate) fn transaction(&self, id: OutputTransactionId) -> Option<&OutputTransactionRecord> {
         self.active.get(&id)
+    }
+
+    pub(crate) fn downgrade_presentation_to_vsync(
+        &mut self,
+        id: OutputTransactionId,
+    ) -> Result<(), OutputTransactionError> {
+        let record = self
+            .active
+            .get_mut(&id)
+            .ok_or(OutputTransactionError::UnknownTransaction)?;
+        let descriptor = record.descriptor.clone();
+        let content_type = descriptor.content_type();
+        record.descriptor = descriptor
+            .with_presentation_state(OutputPresentationMode::Vsync, content_type)
+            .with_async_validation_key(None);
+        Ok(())
     }
 
     pub(crate) fn transaction_including_terminal(

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs, io, iter,
     os::fd::{AsFd, AsRawFd},
     os::unix::fs::MetadataExt,
@@ -11,7 +12,7 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
-    FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
+    DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
 };
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -35,6 +36,7 @@ use crate::native_output::runtime::{
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
+use crate::native_output::presentation::async_validation::CompositedAsyncValidationKey;
 
 #[cfg(test)]
 mod confirmed_pageflip_tests;
@@ -66,6 +68,35 @@ pub(crate) struct AtomicEglGbmScanout {
     drm_cleanup_armed: bool,
     deadline_hints_enabled: bool,
     counters: ExplicitOutputCounters,
+    async_page_flip_capable: bool,
+    async_format_capable: bool,
+    connector_content_types: HashSet<DrmContentType>,
+    async_crtc_id: u32,
+    async_primary_plane_id: u32,
+    async_output_generation: u64,
+    async_validation_accepted: HashSet<CompositedAsyncValidationKey>,
+    async_validation_rejected: HashSet<CompositedAsyncValidationKey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtomicAsyncPolicyInputs {
+    pub(crate) cursor_transition_pending: bool,
+    pub(crate) kms_lane_free: bool,
+    pub(crate) confirmed_content_type: oblivion_one::compositor::DrmContentType,
+}
+
+impl AtomicAsyncPolicyInputs {
+    pub(crate) const fn new(
+        cursor_transition_pending: bool,
+        kms_lane_free: bool,
+        confirmed_content_type: oblivion_one::compositor::DrmContentType,
+    ) -> Self {
+        Self {
+            cursor_transition_pending,
+            kms_lane_free,
+            confirmed_content_type,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -224,7 +255,60 @@ impl AtomicEglGbmScanout {
         self.direct.identity_viewport_metadata_logged = false;
         self.direct.last_debug_candidate = None;
         self.dmabuf_scanout_capabilities.output_generation = generation;
+        self.async_output_generation = generation;
+        self.async_validation_accepted.clear();
+        self.async_validation_rejected.clear();
         self.scene.invalidate_presented_damage_history();
+    }
+
+    pub(crate) fn composited_async_validation_key(
+        &self,
+        output_generation: u64,
+        cursor_visible: bool,
+        content_type: oblivion_one::compositor::DrmContentType,
+        acquire_strategy: u8,
+    ) -> Option<CompositedAsyncValidationKey> {
+        (self.async_page_flip_capable
+            && self.async_format_capable
+            && self.async_output_generation == output_generation)
+            .then_some(CompositedAsyncValidationKey::new(
+                output_generation,
+                self.async_crtc_id,
+                self.async_primary_plane_id,
+                self.format_modifier,
+                acquire_strategy,
+                cursor_visible,
+                content_type,
+            ))
+    }
+
+    fn resolve_connector_content_type(&self, requested: DrmContentType) -> DrmContentType {
+        self.connector_content_types
+            .contains(&requested)
+            .then_some(requested)
+            .unwrap_or(DrmContentType::Graphics)
+    }
+
+    pub(crate) fn async_validation_is_accepted(&self, key: CompositedAsyncValidationKey) -> bool {
+        self.async_validation_accepted.contains(&key)
+    }
+
+    pub(crate) fn async_validation_is_rejected(&self, key: CompositedAsyncValidationKey) -> bool {
+        self.async_validation_rejected.contains(&key)
+    }
+
+    pub(crate) fn note_composited_async_validation(
+        &mut self,
+        key: CompositedAsyncValidationKey,
+        accepted: bool,
+    ) {
+        if accepted {
+            self.async_validation_rejected.remove(&key);
+            self.async_validation_accepted.insert(key);
+        } else {
+            self.async_validation_accepted.remove(&key);
+            self.async_validation_rejected.insert(key);
+        }
     }
 
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {
@@ -465,6 +549,30 @@ impl AtomicEglGbmScanout {
                 drm_cleanup_armed: true,
                 deadline_hints_enabled: true,
                 counters: ExplicitOutputCounters::default(),
+                async_page_flip_capable: discovery.optional.async_page_flip,
+                async_format_capable: discovery
+                    .plane_async_scanout_formats
+                    .contains(&format_modifier),
+                connector_content_types: [
+                    DrmContentType::Graphics,
+                    DrmContentType::Photo,
+                    DrmContentType::Cinema,
+                    DrmContentType::Game,
+                ]
+                .into_iter()
+                .filter(|content_type| {
+                    discovery
+                        .pipeline
+                        .connector_props
+                        .content_type_value(content_type.as_str())
+                        .is_some()
+                })
+                .collect(),
+                async_crtc_id: discovery.pipeline.crtc.get(),
+                async_primary_plane_id: discovery.pipeline.plane.get(),
+                async_output_generation: pool_generation,
+                async_validation_accepted: HashSet::new(),
+                async_validation_rejected: HashSet::new(),
             }),
             Err(error) => {
                 let _ = egl.make_current(egl_display, None, None, None);
@@ -599,11 +707,18 @@ impl AtomicEglGbmScanout {
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
         frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+        async_policy_inputs: AtomicAsyncPolicyInputs,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let metadata = server
             .fullscreen_tree_presentation_metadata()
             .unwrap_or_default();
         let metrics = server.fullscreen_render_plan_metrics();
+        let resolved_content_type =
+            self.resolve_connector_content_type(metadata.content_type.drm_value());
+        let acquire_strategy = match pacing_mode {
+            NativeOutputPacingMode::ReactiveDouble => 0,
+            NativeOutputPacingMode::PredictiveTriple => 1,
+        };
         let cursor_visible = matches!(
             cursor.as_ref(),
             Some(CursorPlaneAssignment::Atomic {
@@ -615,20 +730,32 @@ impl AtomicEglGbmScanout {
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
             metadata,
             AsyncEligibility {
-                solitary_fullscreen: metrics.fullscreen_active,
+                solitary_fullscreen: metrics.solitary_tree_active,
                 async_hint: metadata.hint.is_async(),
-                backend_capable: self.discovery().optional.async_page_flip,
-                output_generation_qualified: true,
-                explicit_sync_ready: true,
-                commit_timing_safe: true,
-                kms_lane_free: true,
-                async_test_only_accepted: true,
+                backend_capable: self.async_page_flip_capable,
+                async_format_supported: self.async_format_capable,
+                output_generation_qualified: self.async_output_generation == output_generation,
+                explicit_sync_ready: self.swapchain.is_some(),
+                commit_timing_safe: pacing_mode == NativeOutputPacingMode::ReactiveDouble,
+                kms_lane_free: async_policy_inputs.kms_lane_free,
+                async_test_only_accepted: self
+                    .composited_async_validation_key(
+                        output_generation,
+                        cursor_visible,
+                        resolved_content_type,
+                        acquire_strategy,
+                    )
+                    .map(|key| !self.async_validation_is_rejected(key))
+                    .unwrap_or(true),
+                modeset_required: resolved_content_type
+                    != async_policy_inputs.confirmed_content_type,
                 cursor_visible,
+                cursor_transition_pending: async_policy_inputs.cursor_transition_pending,
                 ..AsyncEligibility::default()
             },
         );
         let presentation_mode = effective_presentation.mode;
-        let content_type = effective_presentation.content_type.drm_value();
+        let content_type = resolved_content_type;
         let pacing_mode = if presentation_mode.is_async() {
             NativeOutputPacingMode::ReactiveDouble
         } else {
@@ -656,6 +783,17 @@ impl AtomicEglGbmScanout {
                 return Err(io::Error::other(error));
             }
         };
+        let async_validation_key = presentation_mode.is_async().then(|| {
+            CompositedAsyncValidationKey::new(
+                output_generation,
+                self.async_crtc_id,
+                self.async_primary_plane_id,
+                self.format_modifier,
+                acquire_strategy,
+                cursor_visible,
+                content_type,
+            )
+        });
         let transaction = match OutputTransaction::composited_with_direct_equivalence(
             transaction_id,
             output_generation,
@@ -671,7 +809,9 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             equivalent_direct_key,
         ) {
-            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
+            Ok(transaction) => transaction
+                .with_presentation_state(presentation_mode, content_type)
+                .with_async_validation_key(async_validation_key),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
@@ -868,6 +1008,17 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
         self.swapchain.as_ref()?.pending_timing_fd()
+    }
+
+    pub(crate) fn ready_render_fence_is_signaled(&self) -> io::Result<bool> {
+        self.swapchain
+            .as_ref()
+            .ok_or_else(|| io::Error::other("explicit output swapchain is unavailable"))?
+            .ready_render_fence_is_signaled()
+    }
+
+    pub(crate) fn ready_render_fence_fd(&self) -> Option<RawFd> {
+        self.swapchain.as_ref()?.ready_render_fence_fd()
     }
 
     pub(crate) const fn counters(&self) -> ExplicitOutputCounters {

@@ -1010,6 +1010,22 @@ impl AtomicOutputSwapchain {
         self.pending.as_mut().map(|pending| &mut pending.frame)
     }
 
+    pub(crate) fn ready_render_fence_is_signaled(&self) -> io::Result<bool> {
+        self.ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?
+            .render_fence
+            .is_signaled_nonblocking()
+    }
+
+    pub(crate) fn ready_render_fence_fd(&self) -> Option<RawFd> {
+        self.ready
+            .as_ref()?
+            .render_fence
+            .readiness_fd()
+            .map(AsRawFd::as_raw_fd)
+    }
+
     pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
         self.pending
             .as_ref()?

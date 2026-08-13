@@ -274,6 +274,16 @@ impl NativeScanoutBackend {
             _ => None,
         }
     }
+
+    pub(crate) fn note_composited_async_validation(
+        &mut self,
+        key: crate::native_output::presentation::async_validation::CompositedAsyncValidationKey,
+        accepted: bool,
+    ) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_composited_async_validation(key, accepted);
+        }
+    }
     pub(crate) fn from_atomic_explicit(scanout: AtomicEglGbmScanout) -> Self {
         Self::AtomicEglGbm(Box::new(scanout))
     }
@@ -466,6 +476,7 @@ impl NativeScanoutBackend {
         &mut self,
         kms: &KmsBackendSelection,
         cursor: Option<&AtomicCursorVisualState>,
+        presentation_mode: oblivion_one::compositor::OutputPresentationMode,
     ) -> io::Result<NativePresentResult> {
         let submitted_token = match self {
             Self::AtomicEglGbm(_) => {
@@ -473,8 +484,8 @@ impl NativeScanoutBackend {
                     "explicit Atomic output requires IN_FENCE_FD submission",
                 ));
             }
-            Self::NativeEglGbm(scanout) => scanout.present(kms, cursor)?,
-            Self::Gbm(scanout) => scanout.present(kms, cursor)?,
+            Self::NativeEglGbm(scanout) => scanout.present(kms, cursor, presentation_mode)?,
+            Self::Gbm(scanout) => scanout.present(kms, cursor, presentation_mode)?,
             Self::Dumb(_) => return Ok(NativePresentResult::Immediate),
         };
         match submitted_token {

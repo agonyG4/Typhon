@@ -120,6 +120,31 @@ impl NativeRenderFence {
         self.timing_fd.as_ref()
     }
 
+    pub(crate) fn readiness_fd(&self) -> Option<&OwnedFd> {
+        self.timing_fd.as_ref().or(self.submission_fd.as_ref())
+    }
+
+    pub(crate) fn is_signaled_nonblocking(&self) -> io::Result<bool> {
+        let fd = self
+            .readiness_fd()
+            .ok_or_else(|| io::Error::other("native render fence has no readiness FD"))?;
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pollfd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::other(
+                "native render fence readiness FD is invalid",
+            ));
+        }
+        Ok(ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+    }
+
     pub(crate) fn take_timing_fd(&mut self) -> Option<OwnedFd> {
         self.timing_fd.take()
     }

@@ -80,6 +80,28 @@ fn explicit_output_modifier_intersection_probes_gbm_and_rejects_invalid_modifier
 }
 
 #[test]
+fn async_modifier_intersection_requires_explicit_async_formats() {
+    let xrgb_tiled = DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: 11,
+    };
+    let egl = [EglGlesDmabufFormat::new(
+        DrmFormat::Xrgb8888,
+        DrmModifier(11),
+    )];
+
+    let result = select_output_format_modifier_for_presentation(
+        OutputPresentationMode::Async,
+        &[xrgb_tiled],
+        None,
+        &egl,
+        &mut TestGbmAllocationProbe { rejected: vec![] },
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn explicit_addfb2_metadata_preserves_multiple_planes_and_modifier_flag() {
     let descriptor = ExplicitFramebufferDescriptor::new(
         1920,

@@ -178,6 +178,7 @@ impl NativeRuntime {
             atomic_commit_arbiter,
             output_transactions,
             confirmed_primary_assignment,
+            confirmed_output_presentation,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -570,12 +571,41 @@ impl NativeRuntime {
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
+                let compatibility_transaction_id = output_transactions.submitted_transaction(
+                    PageFlipToken::new(pageflip.user_data)
+                        .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                    *drm_file_generation,
+                );
                 let presentation_mode = match atomic_completion {
                     Some(AtomicCommitCompletion::Completed { kind, .. }) => output_transactions
                         .transaction(kind.transaction_id())
                         .map(|record| record.descriptor().presentation_mode())
                         .unwrap_or(OutputPresentationMode::Vsync),
-                    _ => OutputPresentationMode::Vsync,
+                    _ => compatibility_transaction_id
+                        .and_then(|transaction_id| {
+                            output_transactions
+                                .transaction(transaction_id)
+                                .map(|record| record.descriptor().presentation_mode())
+                        })
+                        .unwrap_or(OutputPresentationMode::Vsync),
+                };
+                let presentation_content_type = match atomic_completion {
+                    Some(AtomicCommitCompletion::Completed { kind, .. }) => output_transactions
+                        .transaction(kind.transaction_id())
+                        .map(|record| record.descriptor().content_type())
+                        .unwrap_or(oblivion_one::compositor::DrmContentType::Graphics),
+                    _ => compatibility_transaction_id
+                        .and_then(|transaction_id| {
+                            output_transactions
+                                .transaction(transaction_id)
+                                .map(|record| record.descriptor().content_type())
+                        })
+                        .unwrap_or(oblivion_one::compositor::DrmContentType::Graphics),
+                };
+                *confirmed_output_presentation = ConfirmedOutputPresentationState {
+                    mode: presentation_mode,
+                    content_type: presentation_content_type,
+                    output_generation: *drm_file_generation,
                 };
                 let presentation = if presentation_mode.is_async() && direct_pending {
                     FramePresentation::tearing_zero_copy(
@@ -908,11 +938,6 @@ impl NativeRuntime {
                         pageflip.user_data,
                         *drm_file_generation,
                     )?;
-                    let compatibility_transaction_id = output_transactions.submitted_transaction(
-                        PageFlipToken::new(pageflip.user_data)
-                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                        *drm_file_generation,
-                    );
                     if let Some(transaction_id) = compatibility_transaction_id {
                         complete_presented_output_transaction(
                             output_transactions,
