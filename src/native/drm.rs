@@ -225,7 +225,8 @@ pub fn submit_legacy_page_flip_with_mode(
         crtc_id,
         fb_id,
         flags: drm_sys::DRM_MODE_PAGE_FLIP_EVENT
-            | matches!(mode, LegacyPageFlipMode::Async) as u32 * drm_sys::DRM_MODE_PAGE_FLIP_ASYNC,
+            | (matches!(mode, LegacyPageFlipMode::Async) as u32
+                * drm_sys::DRM_MODE_PAGE_FLIP_ASYNC),
         reserved: 0,
         user_data: token,
     };

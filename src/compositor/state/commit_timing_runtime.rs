@@ -98,7 +98,7 @@ impl CommitTimingConstraint {
     }
 }
 
-fn timestamp_as_nanos_u128(timestamp: PresentationTimestamp) -> u128 {
+pub(in crate::compositor) fn timestamp_as_nanos_u128(timestamp: PresentationTimestamp) -> u128 {
     let (seconds_hi, seconds_lo) = timestamp.protocol_seconds();
     let seconds = (u128::from(seconds_hi) << 32) | u128::from(seconds_lo);
     seconds
@@ -107,7 +107,7 @@ fn timestamp_as_nanos_u128(timestamp: PresentationTimestamp) -> u128 {
 }
 
 impl CompositorState {
-    fn current_commit_timing_clock_sample(&self) -> Option<CommitTimingClockSample> {
+    pub(super) fn current_commit_timing_clock_sample(&self) -> Option<CommitTimingClockSample> {
         let monotonic_before =
             PresentationTimestamp::from_clock(PresentationClock::Monotonic).ok()?;
         let presentation_now = PresentationTimestamp::from_clock(self.presentation_clock).ok()?;
@@ -124,7 +124,7 @@ impl CompositorState {
         })
     }
 
-    fn commit_timing_readiness_is_safe(&self, readiness: CommitTimingReadiness) -> bool {
+    pub(super) fn commit_timing_readiness_is_safe(&self, readiness: CommitTimingReadiness) -> bool {
         let Some(sample) = self.current_commit_timing_clock_sample() else {
             return false;
         };
@@ -271,6 +271,7 @@ impl CompositorState {
         candidates
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn commit_timing_planning_candidate_for_id(
         &self,
         transaction_id: SurfaceTreeTransactionId,
@@ -589,13 +590,13 @@ impl CompositorState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommitTimingRevalidation {
+pub(in crate::compositor) enum CommitTimingRevalidation {
     Keep,
     Replan,
     AlreadyDue,
 }
 
-fn revalidate_commit_timing_readiness(
+pub(in crate::compositor) fn revalidate_commit_timing_readiness(
     readiness: CommitTimingReadiness,
     sample: CommitTimingClockSample,
 ) -> CommitTimingRevalidation {

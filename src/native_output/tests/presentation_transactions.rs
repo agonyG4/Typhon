@@ -8,6 +8,7 @@ use crate::native_output::presentation::qualification::{DirectReleaseMode, Direc
 use crate::native_output::presentation::trace::{
     PresentationTransactionEvent, PresentationTransactionTraceRing,
 };
+use crate::native_output::{ExplicitOutputCounters, OutputPresentationMode};
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
@@ -246,6 +247,17 @@ fn direct_sync_rejects_unresolved_acquire_and_unproven_buffer() {
         DirectSyncReadiness::from_capabilities(true, true, true, false, true, true),
         DirectSyncReadiness::Unsupported("primary_in_fence_property_missing")
     ));
+}
+
+#[test]
+fn explicit_output_counters_distinguish_atomic_fence_paths() {
+    let mut counters = ExplicitOutputCounters::default();
+    counters.note_atomic_submission(OutputPresentationMode::Vsync);
+    counters.note_atomic_submission(OutputPresentationMode::Async);
+
+    assert_eq!(counters.atomic_submissions, 2);
+    assert_eq!(counters.atomic_in_fence_submissions, 1);
+    assert_eq!(counters.async_userspace_fence_submissions, 1);
 }
 
 #[test]

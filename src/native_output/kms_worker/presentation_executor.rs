@@ -1,4 +1,4 @@
-use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate};
+use super::super::payload::{KmsCursorUpdate, KmsPrimaryUpdate};
 use super::{
     AtomicKmsWorkerExecutor, KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure,
 };

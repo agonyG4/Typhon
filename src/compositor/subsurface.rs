@@ -142,7 +142,10 @@ fn merge_damage(
 #[cfg(test)]
 mod window_geometry_tests {
     use super::*;
-    use crate::compositor::XdgWindowGeometry;
+    use crate::compositor::{
+        SurfaceContentType, SurfacePresentationHint, SurfacePresentationMetadata,
+        SurfacePresentationState, XdgWindowGeometry,
+    };
 
     fn cached_commit_with_window_geometry(
         sequence: u64,
@@ -182,6 +185,39 @@ mod window_geometry_tests {
         assert_eq!(
             cached.window_geometry,
             Some(XdgWindowGeometry::new(8, 9, 320, 220))
+        );
+    }
+
+    fn captured_presentation(
+        hint: SurfacePresentationHint,
+        content_type: SurfaceContentType,
+    ) -> CapturedSurfacePresentation {
+        let state = SurfacePresentationState::default()
+            .set_pending_hint(hint)
+            .set_pending_content_type(content_type);
+        let (_, captured) = state.capture_pending_and_reset();
+        captured
+    }
+
+    #[test]
+    fn cached_commit_merge_keeps_the_newest_presentation_metadata() {
+        let mut cached =
+            cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 300, 200));
+        cached.presentation =
+            captured_presentation(SurfacePresentationHint::Async, SurfaceContentType::None);
+        let mut newer =
+            cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 300, 200));
+        newer.presentation =
+            captured_presentation(SurfacePresentationHint::Async, SurfaceContentType::Video);
+
+        cached.merge(newer);
+
+        assert_eq!(
+            cached.presentation.metadata,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::Video,
+            }
         );
     }
 }

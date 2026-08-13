@@ -104,10 +104,26 @@ pub(crate) struct ExplicitOutputCounters {
     pub(crate) sync_file_deadline_hints_applied: u64,
     pub(crate) sync_file_deadline_hints_unsupported: u64,
     pub(crate) sync_file_deadline_hints_failed: u64,
+    pub(crate) atomic_submissions: u64,
     pub(crate) atomic_in_fence_submissions: u64,
+    pub(crate) async_userspace_fence_submissions: u64,
     pub(crate) atomic_out_fences_received: u64,
     pub(crate) atomic_out_fence_missing: u64,
     pub(crate) render_fence_timing_unavailable: u64,
+}
+
+impl ExplicitOutputCounters {
+    pub(crate) fn note_atomic_submission(
+        &mut self,
+        presentation_mode: oblivion_one::compositor::OutputPresentationMode,
+    ) {
+        self.atomic_submissions += 1;
+        if presentation_mode.is_async() {
+            self.async_userspace_fence_submissions += 1;
+        } else {
+            self.atomic_in_fence_submissions += 1;
+        }
+    }
 }
 
 struct DeviceAllocationProbe<'a> {
@@ -283,10 +299,11 @@ impl AtomicEglGbmScanout {
     }
 
     fn resolve_connector_content_type(&self, requested: DrmContentType) -> DrmContentType {
-        self.connector_content_types
-            .contains(&requested)
-            .then_some(requested)
-            .unwrap_or(DrmContentType::Graphics)
+        if self.connector_content_types.contains(&requested) {
+            requested
+        } else {
+            DrmContentType::Graphics
+        }
     }
 
     pub(crate) fn async_validation_is_accepted(&self, key: CompositedAsyncValidationKey) -> bool {

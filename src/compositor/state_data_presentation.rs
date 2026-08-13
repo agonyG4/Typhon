@@ -50,6 +50,14 @@ impl SurfaceData {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
+    pub(super) fn pending_presentation(&self) -> SurfacePresentationMetadata {
+        self.presentation
+            .lock()
+            .map(|presentation| presentation.pending())
+            .unwrap_or_default()
+    }
+
     pub(super) fn apply_presentation(&self, captured: CapturedSurfacePresentation) {
         if let Ok(mut presentation) = self.presentation.lock() {
             *presentation = std::mem::take(&mut *presentation).apply_captured(captured);

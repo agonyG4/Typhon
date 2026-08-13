@@ -45,7 +45,6 @@ impl AtomicCommitSubmitter {
             framebuffer,
             token,
             cursor,
-            true,
             in_fence,
             request_out_fence,
             test_only,
@@ -54,6 +53,7 @@ impl AtomicCommitSubmitter {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_primary_with_presentation(
         &self,
         framebuffer: FramebufferId,
@@ -99,6 +99,7 @@ impl AtomicCommitSubmitter {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_primary_without_cursor_with_presentation(
         &self,
         framebuffer: FramebufferId,

@@ -492,11 +492,13 @@ impl Drop for NativeRuntime {
                 && let Some(counters) = self.scanout.explicit_output_counters()
             {
                 println!(
-                    "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_in_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={} render_fence_timing_unavailable={}",
+                    "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_submissions={} atomic_in_fence_submissions={} async_userspace_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={} render_fence_timing_unavailable={}",
                     counters.sync_file_deadline_hints_applied,
                     counters.sync_file_deadline_hints_unsupported,
                     counters.sync_file_deadline_hints_failed,
+                    counters.atomic_submissions,
                     counters.atomic_in_fence_submissions,
+                    counters.async_userspace_fence_submissions,
                     counters.atomic_out_fences_received,
                     counters.atomic_out_fence_missing,
                     counters.render_fence_timing_unavailable,

@@ -137,12 +137,10 @@ impl NativeRuntime {
         let coalesced_input_events = cycle.coalesced_input_events;
         #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         let pacing_now_ns = monotonic_now_ns()?;
-        #[rustfmt::skip]
-        synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
+        #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
         let (client_cursor, client_cursor_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
-        #[rustfmt::skip]
-        prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, client_cursor_active, perf)?;
+        #[rustfmt::skip] prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, client_cursor_active, perf)?;
         let (mut runtime_plane_plan, mut client_cursor_hardware_usable) = (None, false);
         if let Some(cursor) = atomic_cursor.as_mut() {
             let cursor_image_ready = prepare_cursor_image(
@@ -541,8 +539,7 @@ impl NativeRuntime {
                 .ok_or_else(|| {
                     io::Error::other("cursor-only Atomic output has no presentation target")
                 })?;
-            #[rustfmt::skip]
-            let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
+            #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,
                 kms_commit_worker.as_ref(),
@@ -673,7 +670,7 @@ impl NativeRuntime {
                     && worker_mode
                     && kms_commit_worker.is_some()
                 {
-                    #[rustfmt::skip] match scanout.try_direct_scanout(
+                    match scanout.try_direct_scanout(
                         kms_backend,
                         server,
                         output_transactions,
@@ -681,13 +678,13 @@ impl NativeRuntime {
                         effective_cursor.as_ref(),
                         frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
-                        pacing_mode, confirmed_output_presentation.content_type,
+                        pacing_mode,
+                        confirmed_output_presentation.content_type,
                         kms_commit_worker.as_ref(),
                     )? {
                         DirectScanoutAttempt::Unchanged => {
                             direct_suppressed = note_same_buffer_suppressed(perf);
-                            #[rustfmt::skip]
-                            reset_after_same_buffer(server, presentation_deadline, scheduled_presentation_target);
+                            #[rustfmt::skip] reset_after_same_buffer(server, presentation_deadline, scheduled_presentation_target);
                         }
                         #[rustfmt::skip] DirectScanoutAttempt::TimingDeferred => { super::commit_timing::defer_after_timing(presentation_deadline, scheduled_presentation_target, queued_redraw_requested); return Ok(()); }
                         DirectScanoutAttempt::WorkerQueued {
@@ -704,8 +701,7 @@ impl NativeRuntime {
                             }) {
                                 test_only = KmsTestOnlyPolicy::Required;
                             }
-                            #[rustfmt::skip]
-                            let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
+                            #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
                             let direct_result = finish_direct_worker_queued(
                                 kms_commit_worker
                                     .as_ref()
@@ -936,6 +932,7 @@ impl NativeRuntime {
                     *queued_redraw_requested = false;
                     *last_software_cursor_damage = current_software_cursor_damage;
                 } else {
+                    #[rustfmt::skip] let atomic_kms_lane_free = !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let frame_target = match pacing_mode {
                             NativeOutputPacingMode::ReactiveDouble => {
@@ -985,7 +982,7 @@ impl NativeRuntime {
                                 primary_cursor,
                                 runtime_plane_plan.as_ref(),
                             ),
-                            frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued(), confirmed_output_presentation.content_type),
+                            frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
@@ -1036,8 +1033,11 @@ impl NativeRuntime {
                                 if waits_for_target {
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
-                                    #[rustfmt::skip]
-                                    if !super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)? { *queued_redraw_requested = true; return Ok(()); }
+                                    #[rustfmt::skip] let async_render_fence_ready = super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)?;
+                                    if !async_render_fence_ready {
+                                        *queued_redraw_requested = true;
+                                        return Ok(());
+                                    }
                                     #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
                                     let Some((
                                         token,
@@ -1221,8 +1221,7 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
-                            #[rustfmt::skip]
-                            let (present_result, compatibility_transaction_id) = if render_ahead {
+                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead {
                                 (NativePresentResult::Noop, None)
                             } else {
                                 let compatibility_target = (*scheduled_presentation_target)

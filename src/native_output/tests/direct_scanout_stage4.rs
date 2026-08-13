@@ -6,7 +6,7 @@ use super::{
     OutputTransactionTerminal, PrimaryPlaneAssignment, classify_direct_content,
     feedback_capabilities_changed,
 };
-use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::compositor::{CompositorFrameBatchId, DrmContentType, OutputPresentationMode};
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,

@@ -360,7 +360,6 @@ impl CompositorState {
 
 impl CompositorState {
     pub(in crate::compositor) fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
-        let now = client_pacing_now_ns();
         let mut deadline = self
             .active_fifo_barriers
             .values()
@@ -459,6 +458,7 @@ impl CompositorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::presentation_deadline::MonotonicTimestampNs;
 
     #[test]
     fn timestamp_keeps_both_seconds_words_without_truncation() {
@@ -468,13 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn maximum_protocol_timestamp_remains_representable_for_re_evaluation() {
+    fn maximum_protocol_timestamp_reports_unrepresentable_scheduler_deadline() {
         let constraint = CommitTimingConstraint::from_protocol(u64::MAX, 999_999_999).unwrap();
         assert!(constraint.as_nanos().is_some());
         let monotonic = PresentationTimestamp::from_microseconds(1, 0).unwrap();
         let realtime = PresentationTimestamp::from_microseconds(0, 0).unwrap();
         assert!(
-            constraint
+            !constraint
                 .scheduler_deadline(CommitTimingClockSample {
                     monotonic_before: monotonic,
                     monotonic_after: monotonic,
@@ -618,7 +618,7 @@ mod tests {
             .unwrap();
 
         assert!(target.presentation_time >= deadline.monotonic_not_before);
-        assert_eq!(target.sequence, 2);
+        assert_eq!(target.sequence, 3);
     }
 
     #[test]
@@ -1122,6 +1122,7 @@ mod tests {
             CommitTimingRevalidation::AlreadyDue
         );
     }
+    #[test]
     fn non_evictable_queue_rejects_an_ordinary_incoming_transaction() {
         let mut state = CompositorState::default();
         let requested = CommitTimingConstraint::from_protocol(

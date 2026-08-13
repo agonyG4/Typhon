@@ -47,6 +47,10 @@ use wayland_protocols::wp::commit_timing::v1::client::{
     wp_commit_timer_v1 as client_wp_commit_timer_v1,
     wp_commit_timing_manager_v1 as client_wp_commit_timing_manager_v1,
 };
+use wayland_protocols::wp::content_type::v1::client::{
+    wp_content_type_manager_v1 as client_wp_content_type_manager_v1,
+    wp_content_type_v1 as client_wp_content_type_v1,
+};
 use wayland_protocols::wp::fifo::v1::client::{
     wp_fifo_manager_v1 as client_wp_fifo_manager_v1, wp_fifo_v1 as client_wp_fifo_v1,
 };
@@ -87,6 +91,10 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1 as client_zwp_relative_pointer_manager_v1,
     zwp_relative_pointer_v1 as client_zwp_relative_pointer_v1,
+};
+use wayland_protocols::wp::tearing_control::v1::client::{
+    wp_tearing_control_manager_v1 as client_wp_tearing_control_manager_v1,
+    wp_tearing_control_v1 as client_wp_tearing_control_v1,
 };
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport as client_wp_viewport, wp_viewporter as client_wp_viewporter,
@@ -138,6 +146,7 @@ mod layer_shell;
 mod lifecycle;
 mod native_geometry;
 mod plan;
+mod presentation_modes;
 mod primary_selection;
 mod protocol_buffers;
 mod protocol_contract;

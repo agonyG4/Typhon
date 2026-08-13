@@ -28,6 +28,13 @@ retires the associated metadata and makes later protocol requests inert.
 and double-buffering rules. The protocol values map to connector Content Type
 values as follows:
 
+Presentation hint and Content Type are persistent committed surface state.
+Capturing a surface commit does not reset the next pending baseline to the
+currently active metadata. Only an explicit protocol mutation changes that
+pending value. A compositor-local pending mutation generation records whether a
+newer explicit request arrived after an older commit was captured, so activating
+that older commit cannot overwrite the newer pending request.
+
 | Wayland value | DRM value |
 | --- | --- |
 | `none` | `Graphics` |

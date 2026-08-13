@@ -54,9 +54,13 @@ pub use xwayland_scene::{
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
 pub(in crate::compositor) use commit_timing_runtime::CommitTimingTargetClaim;
-pub(in crate::compositor) use commit_timing_runtime::{
+pub use commit_timing_runtime::{
     CommitTimingClockMappingMetadata, CommitTimingClockSample, CommitTimingPlanningCandidate,
     CommitTimingReadiness, CommitTimingSchedulerDeadline,
+};
+#[allow(unused_imports)]
+pub(super) use commit_timing_runtime::{
+    CommitTimingRevalidation, revalidate_commit_timing_readiness, timestamp_as_nanos_u128,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use cursor::*;

@@ -2,7 +2,6 @@
 
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
-use crate::compositor::{DrmContentType, OutputPresentationMode};
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
@@ -12,6 +11,7 @@ use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
     PrimaryPlaneAssignment,
 };
+use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
 use oblivion_one::native::{
     kms::{AtomicCursorVisualState, FramebufferId, PageFlipToken},
     presentation_deadline::{MonotonicTimestampNs, PresentationTarget},

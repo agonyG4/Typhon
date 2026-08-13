@@ -126,6 +126,7 @@ pub(crate) struct DirectPlaneValidationKey {
 }
 
 impl DirectPlaneValidationKey {
+    #[allow(dead_code)]
     pub(crate) const fn with_presentation_state(
         mut self,
         presentation_mode: OutputPresentationMode,

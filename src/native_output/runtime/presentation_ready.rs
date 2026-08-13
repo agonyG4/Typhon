@@ -237,7 +237,7 @@ pub(super) fn submit_ready_frame(
                 cursor,
                 cursor_epoch,
                 *frame_index,
-                kms_backend,
+                Some(kms_backend),
                 |scanout, presentation_mode| {
                     scanout.present(kms_backend, cursor, presentation_mode)
                 },

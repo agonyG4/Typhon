@@ -883,7 +883,9 @@ impl Drop for DrmAtomicBackend {
             eprintln!("atomic KMS restore failed: {error}");
         }
     }
+}
 
+impl KmsBackendSelection {
     pub fn submit_flip_with_presentation(
         &self,
         framebuffer: FramebufferId,
@@ -1269,6 +1271,7 @@ impl KmsBackendSelection {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend)
                 if backend
+                    .discovery
                     .pipeline
                     .connector_props
                     .content_type_value(requested.as_str())

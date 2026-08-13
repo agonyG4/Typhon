@@ -90,8 +90,12 @@ impl Dispatch<wp_tearing_control_v1::WpTearingControlV1, TearingControlResourceD
                     return;
                 }
                 let hint = match hint {
-                    0 => SurfacePresentationHint::Vsync,
-                    1 => SurfacePresentationHint::Async,
+                    WEnum::Value(wp_tearing_control_v1::PresentationHint::Vsync) => {
+                        SurfacePresentationHint::Vsync
+                    }
+                    WEnum::Value(wp_tearing_control_v1::PresentationHint::Async) => {
+                        SurfacePresentationHint::Async
+                    }
                     _ => return,
                 };
                 if let Some(surface) = state.surface_resource_by_id(data.surface_id)
@@ -202,10 +206,10 @@ impl Dispatch<wp_content_type_v1::WpContentTypeV1, ContentTypeResourceData> for 
                     return;
                 }
                 let content_type = match content_type {
-                    0 => SurfaceContentType::None,
-                    1 => SurfaceContentType::Photo,
-                    2 => SurfaceContentType::Video,
-                    3 => SurfaceContentType::Game,
+                    WEnum::Value(wp_content_type_v1::Type::None) => SurfaceContentType::None,
+                    WEnum::Value(wp_content_type_v1::Type::Photo) => SurfaceContentType::Photo,
+                    WEnum::Value(wp_content_type_v1::Type::Video) => SurfaceContentType::Video,
+                    WEnum::Value(wp_content_type_v1::Type::Game) => SurfaceContentType::Game,
                     _ => return,
                 };
                 if let Some(surface) = state.surface_resource_by_id(data.surface_id)

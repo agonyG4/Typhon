@@ -137,6 +137,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
+    CaptureSurfacePresentationMetadata {
+        surface_id: u32,
+        reply: Sender<Option<(SurfacePresentationMetadata, SurfacePresentationMetadata)>>,
+    },
     CaptureDirectScanoutCandidate(
         Sender<Result<DirectScanoutCandidateSnapshot, DirectScanoutSceneRejection>>,
     ),
@@ -496,6 +500,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
                         let _ = reply.send(server.state.fullscreen_presentation_eligibility());
+                    }
+                    ServerCommand::CaptureSurfacePresentationMetadata { surface_id, reply } => {
+                        let metadata = server
+                            .state
+                            .surface_resources
+                            .values()
+                            .find(|surface| surface.id().protocol_id() == surface_id)
+                            .and_then(|surface| {
+                                surface.data::<SurfaceData>().map(|data| {
+                                    (data.current_presentation(), data.pending_presentation())
+                                })
+                            });
+                        let _ = reply.send(metadata);
                     }
                     ServerCommand::CaptureDirectScanoutCandidate(reply) => {
                         let candidate = server.direct_scanout_scene_candidate().map(|candidate| {
@@ -880,6 +897,20 @@ pub(in crate::compositor::tests) fn wait_for_server_commands(commands: &Sender<S
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should process command barrier");
+}
+
+pub(in crate::compositor::tests) fn capture_surface_presentation_metadata(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<(SurfacePresentationMetadata, SurfacePresentationMetadata)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfacePresentationMetadata { surface_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should return surface presentation metadata")
 }
 
 pub(in crate::compositor::tests) fn capture_clipboard_state(

@@ -4,6 +4,14 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+use wayland_protocols::wp::content_type::v1::client::{
+    wp_content_type_manager_v1 as client_wp_content_type_manager_v1,
+    wp_content_type_v1 as client_wp_content_type_v1,
+};
+use wayland_protocols::wp::tearing_control::v1::client::{
+    wp_tearing_control_manager_v1 as client_wp_tearing_control_manager_v1,
+    wp_tearing_control_v1 as client_wp_tearing_control_v1,
+};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
 #[derive(Default)]
@@ -1849,6 +1857,56 @@ impl Dispatch<client_wp_commit_timer_v1::WpCommitTimerV1, ()> for RegistryTestSt
         _state: &mut Self,
         _proxy: &client_wp_commit_timer_v1::WpCommitTimerV1,
         _event: client_wp_commit_timer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_tearing_control_manager_v1::WpTearingControlManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_tearing_control_manager_v1::WpTearingControlManagerV1,
+        _event: client_wp_tearing_control_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_tearing_control_v1::WpTearingControlV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_tearing_control_v1::WpTearingControlV1,
+        _event: client_wp_tearing_control_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_content_type_manager_v1::WpContentTypeManagerV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_content_type_manager_v1::WpContentTypeManagerV1,
+        _event: client_wp_content_type_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_content_type_v1::WpContentTypeV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_content_type_v1::WpContentTypeV1,
+        _event: client_wp_content_type_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

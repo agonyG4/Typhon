@@ -171,7 +171,7 @@ impl AtomicEglGbmScanout {
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {
             Ok(submission) => {
-                self.counters.atomic_in_fence_submissions += 1;
+                self.counters.note_atomic_submission(presentation_mode);
                 if submission.out_fence.is_some() {
                     self.counters.atomic_out_fences_received += 1;
                 } else {
@@ -192,10 +192,10 @@ impl AtomicEglGbmScanout {
                 Ok((token.get(), framebuffer.get(), transaction_id))
             }
             Err(error) => {
-                if presentation_mode.is_async() {
-                    if let Some(key) = async_validation_key {
-                        self.note_async_validation(key, false);
-                    }
+                if presentation_mode.is_async()
+                    && let Some(key) = async_validation_key
+                {
+                    self.note_composited_async_validation(key, false);
                 }
                 let failure =
                     io::Error::other(format!("explicit Atomic output submission failed: {error}"));

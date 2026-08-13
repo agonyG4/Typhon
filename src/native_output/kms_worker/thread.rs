@@ -27,7 +27,7 @@ use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::{
     collections::VecDeque,
     io,
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -598,6 +598,7 @@ pub(crate) struct AtomicKmsWorkerExecutor {
     pub(super) submitter: AtomicCommitSubmitter,
 }
 
+#[path = "presentation_executor.rs"]
 mod presentation_executor;
 
 impl Drop for KmsCommitWorkerHandle {

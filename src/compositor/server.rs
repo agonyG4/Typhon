@@ -61,9 +61,9 @@ use super::{
     PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
-    WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
-    XwaylandSceneMetricsSnapshot, color,
+    SurfacePacingMetrics, SurfacePresentationMetadata, WindowFocusOutcome, WindowFocusReason,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
 };
 #[derive(Debug)]

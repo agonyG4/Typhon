@@ -686,9 +686,10 @@ impl CompositorState {
                 self.active_toplevel_resizes.contains_key(&root_surface_id),
             );
         }
+        let transaction_id = self.allocate_surface_tree_transaction_id();
         self.pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
-                id: self.allocate_surface_tree_transaction_id(),
+                id: transaction_id,
                 root_surface_id,
                 nodes,
                 dependencies,

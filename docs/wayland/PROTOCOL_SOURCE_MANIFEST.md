@@ -154,6 +154,8 @@ The target contract is:
 | `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |
 | `wp_fifo_manager_v1` | 1 | qualified native frame-pacing capability |
 | `wp_commit_timing_manager_v1` | 1 | qualified native frame-pacing capability |
+| `wp_tearing_control_manager_v1` | 1 | qualified native presentation-metadata capability |
+| `wp_content_type_manager_v1` | 1 | qualified native presentation-metadata capability |
 | `wp_color_manager_v1` | 1 | color capability |
 | `zwp_relative_pointer_manager_v1` | 1 | relative-pointer capability |
 | `zwp_pointer_constraints_v1` | 1 | pointer-constraints capability |

@@ -132,7 +132,7 @@ impl SurfacePresentationState {
         (
             Self {
                 current: self.current,
-                pending: self.current,
+                pending: self.pending,
                 pending_generation: self.pending_generation,
             },
             captured,
@@ -162,8 +162,9 @@ pub struct CapturedSurfacePresentation {
     captured_pending_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TearingPolicy {
+    #[default]
     Off,
     Auto,
 }
@@ -171,12 +172,6 @@ pub enum TearingPolicy {
 /// Name used by the native output policy. `TearingPolicy` remains the
 /// compositor-facing spelling for callers that do not care about the layer.
 pub type NativeTearingPreference = TearingPolicy;
-
-impl Default for TearingPolicy {
-    fn default() -> Self {
-        Self::Off
-    }
-}
 
 impl TearingPolicy {
     pub fn from_environment(value: Option<&str>) -> Self {
@@ -249,16 +244,11 @@ pub struct AsyncEligibility {
     pub modeset_required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum OutputPresentationMode {
+    #[default]
     Vsync,
     Async,
-}
-
-impl Default for OutputPresentationMode {
-    fn default() -> Self {
-        Self::Vsync
-    }
 }
 
 impl OutputPresentationMode {
@@ -377,6 +367,49 @@ mod tests {
         let (state, next) = state.commit();
         assert_eq!(next.content_type, SurfaceContentType::None);
         assert_eq!(state.current().content_type, SurfaceContentType::None);
+    }
+
+    #[test]
+    fn captured_presentation_is_the_baseline_for_the_next_commit() {
+        let state =
+            SurfacePresentationState::default().set_pending_hint(SurfacePresentationHint::Async);
+        let (state, first) = state.capture_pending_and_reset();
+        let state = state.set_pending_content_type(SurfaceContentType::Video);
+        let (state, second) = state.capture_pending_and_reset();
+        let state = state.apply_captured(first).apply_captured(second);
+
+        assert_eq!(first.metadata.hint, SurfacePresentationHint::Async);
+        assert_eq!(first.metadata.content_type, SurfaceContentType::None);
+        assert_eq!(second.metadata.hint, SurfacePresentationHint::Async);
+        assert_eq!(second.metadata.content_type, SurfaceContentType::Video);
+        assert_eq!(state.current(), second.metadata);
+    }
+
+    #[test]
+    fn captured_content_type_is_the_baseline_for_an_unrelated_hint_change() {
+        let state =
+            SurfacePresentationState::default().set_pending_content_type(SurfaceContentType::Game);
+        let (state, first) = state.capture_pending_and_reset();
+        let state = state.set_pending_hint(SurfacePresentationHint::Async);
+        let (state, second) = state.capture_pending_and_reset();
+        let state = state.apply_captured(first).apply_captured(second);
+
+        assert_eq!(first.metadata.hint, SurfacePresentationHint::Vsync);
+        assert_eq!(first.metadata.content_type, SurfaceContentType::Game);
+        assert_eq!(second.metadata.hint, SurfacePresentationHint::Async);
+        assert_eq!(second.metadata.content_type, SurfaceContentType::Game);
+        assert_eq!(state.current(), second.metadata);
+    }
+
+    #[test]
+    fn buffer_only_capture_inherits_persistent_presentation_metadata() {
+        let state = SurfacePresentationState::default()
+            .set_pending_hint(SurfacePresentationHint::Async)
+            .set_pending_content_type(SurfaceContentType::Photo);
+        let (state, first) = state.capture_pending_and_reset();
+        let (_, second) = state.capture_pending_and_reset();
+
+        assert_eq!(second.metadata, first.metadata);
     }
 
     #[test]
