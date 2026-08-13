@@ -159,6 +159,8 @@ fn new_content_epoch_can_reuse_validation_key_but_still_submits() {
         plane_layout_hash: 9,
         cursor_atomic_key: None,
         synchronization_key: 10,
+        presentation_mode: OutputPresentationMode::Vsync,
+        content_type: DrmContentType::Graphics,
     };
 
     assert_eq!(first.output_generation, second.output_generation);

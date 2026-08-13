@@ -9,6 +9,47 @@ use super::{
     DrmPropertyEnum, ModeBlobIo, PropertyId, SerializedAtomicRequest,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsyncPageFlipCapabilities {
+    pub legacy: bool,
+    pub atomic: bool,
+}
+
+impl AsyncPageFlipCapabilities {
+    pub const fn from_capability_values(legacy: u64, atomic: u64) -> Self {
+        Self {
+            legacy: legacy != 0,
+            atomic: atomic != 0,
+        }
+    }
+}
+
+pub fn query_async_page_flip_capabilities(
+    fd: BorrowedFd<'_>,
+) -> Result<AsyncPageFlipCapabilities, AtomicKmsError> {
+    let legacy = drm_ffi::get_capability(fd, u64::from(drm_sys::DRM_CAP_ASYNC_PAGE_FLIP)).map_err(
+        |error| {
+            classify_io_error(
+                error,
+                AtomicKmsErrorKind::Unsupported,
+                "query legacy async page-flip capability",
+            )
+        },
+    )?;
+    let atomic = drm_ffi::get_capability(fd, u64::from(drm_sys::DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP))
+        .map_err(|error| {
+            classify_io_error(
+                error,
+                AtomicKmsErrorKind::Unsupported,
+                "query atomic async page-flip capability",
+            )
+        })?;
+    Ok(AsyncPageFlipCapabilities::from_capability_values(
+        legacy.value,
+        atomic.value,
+    ))
+}
+
 pub fn enable_atomic_client_capability(fd: BorrowedFd<'_>) -> Result<(), AtomicKmsError> {
     drm_ffi::set_capability(fd, u64::from(drm_sys::DRM_CLIENT_CAP_ATOMIC), true)
         .map(|_| ())

@@ -6,6 +6,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use super::astrea_shell_capability::{AstreaShellCapability, AstreaShellCapabilityVerifier};
+use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
+use super::protocols::versions;
+use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
+use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
+use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
+#[cfg(test)]
+use crate::render_backend::buffer::BufferId;
+use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
+use crate::syncobj::DrmSyncobjDevice;
+use crate::xwayland::trace::{self, TraceFields};
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1;
 use wayland_protocols::wp::{
     fractional_scale::v1::server::wp_fractional_scale_manager_v1,
@@ -29,19 +40,6 @@ use wayland_server::{
         wl_compositor, wl_data_device_manager, wl_output, wl_seat, wl_shm, wl_subcompositor,
     },
 };
-
-use super::astrea_shell_capability::{AstreaShellCapability, AstreaShellCapabilityVerifier};
-use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
-use super::protocols::versions;
-use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
-use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
-use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
-#[cfg(test)]
-use crate::render_backend::buffer::BufferId;
-use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
-use crate::syncobj::DrmSyncobjDevice;
-use crate::xwayland::trace::{self, TraceFields};
-
 #[path = "server_control.rs"]
 mod control_api;
 #[path = "server_xwayland.rs"]
@@ -60,10 +58,10 @@ use super::{
     FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
     FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
-    PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface,
-    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
-    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, SurfacePacingMetrics,
-    WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
+    PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    SurfacePacingMetrics, WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
     WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
     XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
@@ -83,31 +81,26 @@ pub struct OwnCompositorServer {
     gpu_buffer_protocols_enabled: bool,
     shutdown_releases_armed: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
     pub client_id: ClientId,
     pub generation: XwaylandGeneration,
 }
-
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct XwaylandShellGlobalData {
     pub(in crate::compositor) active: Arc<Mutex<Option<XwaylandClientIdentity>>>,
     pub(in crate::compositor) bind_events: Arc<Mutex<Vec<XwaylandClientIdentity>>>,
 }
-
 #[derive(Debug)]
 struct TyphonClientData {
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
 }
-
 #[derive(Debug, Clone)]
 struct DisconnectedClient {
     client_id: ClientId,
     pid: Option<i32>,
 }
-
 impl ClientData for TyphonClientData {
     fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
         let pid = self
@@ -183,6 +176,7 @@ impl OwnCompositorServer {
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
             FramePacingProtocolCapabilities::qualified_native(),
+            PresentationProtocolCapabilities::qualified_native(),
         )
     }
 
@@ -200,6 +194,7 @@ impl OwnCompositorServer {
             selection_capabilities,
             renderer_capabilities,
             FramePacingProtocolCapabilities::safe_baseline(),
+            PresentationProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -218,6 +213,7 @@ impl OwnCompositorServer {
             selection_capabilities,
             renderer_capabilities,
             frame_pacing_capabilities,
+            PresentationProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -233,6 +229,7 @@ impl OwnCompositorServer {
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
             FramePacingProtocolCapabilities::safe_baseline(),
+            PresentationProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -248,6 +245,7 @@ impl OwnCompositorServer {
             selection_capabilities,
             RendererProtocolCapabilities::unsupported(),
             FramePacingProtocolCapabilities::safe_baseline(),
+            PresentationProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -263,6 +261,7 @@ impl OwnCompositorServer {
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
             FramePacingProtocolCapabilities::safe_baseline(),
+            PresentationProtocolCapabilities::safe_baseline(),
         )?;
         server.state.clipboard_bridge = Some(clipboard_bridge);
         Ok(server)
@@ -279,6 +278,7 @@ impl OwnCompositorServer {
             SelectionProtocolCapabilities::core_clipboard(),
             RendererProtocolCapabilities::unsupported(),
             FramePacingProtocolCapabilities::safe_baseline(),
+            PresentationProtocolCapabilities::safe_baseline(),
         )
     }
 
@@ -289,6 +289,7 @@ impl OwnCompositorServer {
         selection_capabilities: SelectionProtocolCapabilities,
         renderer_capabilities: RendererProtocolCapabilities,
         frame_pacing_capabilities: FramePacingProtocolCapabilities,
+        presentation_capabilities: PresentationProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
         let astrea_shell_capability = {
@@ -342,6 +343,7 @@ impl OwnCompositorServer {
             selection_capabilities,
             renderer_capabilities,
             frame_pacing_capabilities,
+            presentation_capabilities,
             xwayland_global_data.clone(),
         );
         let socket = ListeningSocket::bind(&socket_name)
@@ -980,6 +982,10 @@ impl OwnCompositorServer {
 
     pub fn direct_scanout_scene_blockers(&self) -> DirectScanoutSceneBlockers {
         self.state.direct_scanout_scene_blockers()
+    }
+
+    pub fn fullscreen_tree_presentation_metadata(&self) -> Option<SurfacePresentationMetadata> {
+        self.state.fullscreen_tree_presentation_metadata()
     }
 
     /// Returns the immutable publication epoch for the currently published

@@ -8,7 +8,8 @@ use wayland_server::protocol::wl_output;
 
 use super::state::CapturedSurfacePacing;
 use super::{
-    RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, SurfaceInputRegion,
+    CapturedSurfacePresentation, RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence,
+    SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
     state_data::{PendingSurfaceAttachment, PendingViewportChange, SurfaceBufferRelease},
 };
@@ -40,6 +41,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) window_geometry: Option<super::XdgWindowGeometry>,
     pub(super) cached_at: Instant,
     pub(super) pacing: CapturedSurfacePacing,
+    pub(super) presentation: CapturedSurfacePresentation,
 }
 
 impl CachedSubsurfaceCommit {
@@ -63,6 +65,7 @@ impl CachedSubsurfaceCommit {
             window_geometry,
             cached_at: _,
             pacing,
+            presentation,
         } = newer;
         // A pacing value is a commit boundary.  The caller must not merge a
         // later paced update into an older content update.
@@ -102,6 +105,7 @@ impl CachedSubsurfaceCommit {
             self.input_region = input_region;
         }
         self.presentation_feedbacks.extend(presentation_feedbacks);
+        self.presentation = presentation;
         if resize_capture_finalized {
             self.resize_commit = resize_commit;
             self.resize_capture_finalized = true;
@@ -163,6 +167,7 @@ mod window_geometry_tests {
             window_geometry: Some(window_geometry),
             cached_at: Instant::now(),
             pacing: CapturedSurfacePacing::default(),
+            presentation: CapturedSurfacePresentation::default(),
         }
     }
 

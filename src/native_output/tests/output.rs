@@ -15,6 +15,8 @@ fn direct_plane_validation_key_changes_for_modifier_and_generation() {
         plane_layout_hash: 3,
         cursor_atomic_key: None,
         synchronization_key: 4,
+        presentation_mode: OutputPresentationMode::Vsync,
+        content_type: DrmContentType::Graphics,
     };
     let modifier_changed = DirectPlaneValidationKey {
         modifier: 7,

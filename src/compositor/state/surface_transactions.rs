@@ -183,6 +183,7 @@ impl CompositorState {
             window_geometry,
             cached_at: _,
             pacing,
+            presentation,
         } = commit;
         self.apply_captured_surface_pacing(surface_id, commit_sequence, pacing);
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
@@ -191,6 +192,7 @@ impl CompositorState {
         let Some(data) = surface.data::<SurfaceData>() else {
             return;
         };
+        data.apply_presentation(presentation);
         let viewport = data.apply_viewport_change(viewport_destination);
         let surface_size = viewport
             .destination

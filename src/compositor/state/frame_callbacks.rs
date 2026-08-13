@@ -168,9 +168,11 @@ impl CompositorState {
         let _ = self
             .settle_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let mut batch = self.take_presented_frame_batch(frame_id, batch_id);
-        for claim in &batch.fifo_barrier_claims {
-            if claim.surface_id == direct_surface_id {
-                self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+        if !matches!(presentation.kind, PresentationKind::Tearing) {
+            for claim in &batch.fifo_barrier_claims {
+                if claim.surface_id == direct_surface_id {
+                    self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+                }
             }
         }
         for claim in &batch.commit_timing_target_claims {

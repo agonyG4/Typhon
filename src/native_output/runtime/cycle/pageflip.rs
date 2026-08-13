@@ -570,7 +570,28 @@ impl NativeRuntime {
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
-                let presentation = if direct_pending {
+                let presentation_mode = match atomic_completion {
+                    Some(AtomicCommitCompletion::Completed { kind, .. }) => output_transactions
+                        .transaction(kind.transaction_id())
+                        .map(|record| record.descriptor().presentation_mode())
+                        .unwrap_or(OutputPresentationMode::Vsync),
+                    _ => OutputPresentationMode::Vsync,
+                };
+                let presentation = if presentation_mode.is_async() && direct_pending {
+                    FramePresentation::tearing_zero_copy(
+                        *presentation_clock,
+                        pageflip.timestamp.seconds,
+                        pageflip.timestamp.microseconds,
+                        pageflip.sequence,
+                    )?
+                } else if presentation_mode.is_async() {
+                    FramePresentation::tearing(
+                        *presentation_clock,
+                        pageflip.timestamp.seconds,
+                        pageflip.timestamp.microseconds,
+                        pageflip.sequence,
+                    )?
+                } else if direct_pending {
                     FramePresentation::synchronized_zero_copy(
                         *presentation_clock,
                         pageflip.timestamp.seconds,

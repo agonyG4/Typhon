@@ -281,8 +281,10 @@ impl AtomicEglGbmScanout {
                 width,
                 height,
             };
-            let format_modifier = select_output_format_modifier(
+            let format_modifier = select_output_format_modifier_for_presentation(
+                oblivion_one::compositor::OutputPresentationMode::Vsync,
                 &discovery.plane_scanout_formats,
+                Some(&discovery.plane_async_scanout_formats),
                 &egl_formats,
                 &mut probe,
             )?;
@@ -598,6 +600,40 @@ impl AtomicEglGbmScanout {
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
         frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
+        let metadata = server
+            .fullscreen_tree_presentation_metadata()
+            .unwrap_or_default();
+        let metrics = server.fullscreen_render_plan_metrics();
+        let cursor_visible = matches!(
+            cursor.as_ref(),
+            Some(CursorPlaneAssignment::Atomic {
+                state: Some(state),
+                ..
+            }) if state.visible
+        );
+        let effective_presentation = EffectivePresentation::decide(
+            TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+            metadata,
+            AsyncEligibility {
+                solitary_fullscreen: metrics.fullscreen_active,
+                async_hint: metadata.hint.is_async(),
+                backend_capable: self.discovery().optional.async_page_flip,
+                output_generation_qualified: true,
+                explicit_sync_ready: true,
+                commit_timing_safe: true,
+                kms_lane_free: true,
+                async_test_only_accepted: true,
+                cursor_visible,
+                ..AsyncEligibility::default()
+            },
+        );
+        let presentation_mode = effective_presentation.mode;
+        let content_type = effective_presentation.content_type.drm_value();
+        let pacing_mode = if presentation_mode.is_async() {
+            NativeOutputPacingMode::ReactiveDouble
+        } else {
+            pacing_mode
+        };
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
             let slot = swapchain.acquire_render_slot_for(pacing_mode)?;
@@ -635,7 +671,7 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             equivalent_direct_key,
         ) {
-            Ok(transaction) => transaction,
+            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;

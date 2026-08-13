@@ -88,6 +88,7 @@ impl PresentationTimestamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationKind {
     Synchronized,
+    Tearing,
     Software,
 }
 
@@ -123,6 +124,32 @@ impl FramePresentation {
         sequence: u32,
     ) -> io::Result<Self> {
         let mut presentation = Self::synchronized(clock, seconds, microseconds, sequence)?;
+        presentation.zero_copy = true;
+        Ok(presentation)
+    }
+
+    pub fn tearing(
+        clock: PresentationClock,
+        seconds: u32,
+        microseconds: u32,
+        sequence: u32,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            clock,
+            timestamp: PresentationTimestamp::from_microseconds(u64::from(seconds), microseconds)?,
+            sequence: u64::from(sequence),
+            kind: PresentationKind::Tearing,
+            zero_copy: false,
+        })
+    }
+
+    pub fn tearing_zero_copy(
+        clock: PresentationClock,
+        seconds: u32,
+        microseconds: u32,
+        sequence: u32,
+    ) -> io::Result<Self> {
+        let mut presentation = Self::tearing(clock, seconds, microseconds, sequence)?;
         presentation.zero_copy = true;
         Ok(presentation)
     }

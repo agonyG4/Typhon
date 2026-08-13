@@ -5,6 +5,7 @@ use super::{
     AtomicPipelineProperties, AtomicRequest, AtomicSubmission, FramebufferId, PageFlipToken,
     submit_atomic,
 };
+use crate::compositor::{DrmContentType, OutputPresentationMode};
 
 /// Submit-only, cloneable metadata for the normal runtime Atomic path.
 ///
@@ -40,6 +41,30 @@ impl AtomicCommitSubmitter {
         request_out_fence: bool,
         test_only: bool,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+        self.submit_primary_with_presentation(
+            framebuffer,
+            token,
+            cursor,
+            true,
+            in_fence,
+            request_out_fence,
+            test_only,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )
+    }
+
+    pub fn submit_primary_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+        in_fence: Option<BorrowedFd<'_>>,
+        request_out_fence: bool,
+        test_only: bool,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         self.submit_primary_inner(
             framebuffer,
             token,
@@ -48,6 +73,8 @@ impl AtomicCommitSubmitter {
             in_fence,
             request_out_fence,
             test_only,
+            presentation_mode,
+            content_type,
         )
     }
 
@@ -67,6 +94,31 @@ impl AtomicCommitSubmitter {
             in_fence,
             request_out_fence,
             test_only,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )
+    }
+
+    pub fn submit_primary_without_cursor_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        in_fence: Option<BorrowedFd<'_>>,
+        request_out_fence: bool,
+        test_only: bool,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+        self.submit_primary_inner(
+            framebuffer,
+            token,
+            None,
+            false,
+            in_fence,
+            request_out_fence,
+            test_only,
+            presentation_mode,
+            content_type,
         )
     }
 
@@ -76,8 +128,35 @@ impl AtomicCommitSubmitter {
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
     ) -> Result<(), AtomicKmsError> {
-        self.submit_primary_inner(framebuffer, token, cursor, true, None, false, true)
-            .map(|_| ())
+        self.test_primary_with_presentation(
+            framebuffer,
+            token,
+            cursor,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )
+    }
+
+    pub fn test_primary_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        self.submit_primary_inner(
+            framebuffer,
+            token,
+            cursor,
+            true,
+            None,
+            false,
+            true,
+            presentation_mode,
+            content_type,
+        )
+        .map(|_| ())
     }
 
     pub fn test_primary_without_cursor(
@@ -85,8 +164,18 @@ impl AtomicCommitSubmitter {
         framebuffer: FramebufferId,
         token: PageFlipToken,
     ) -> Result<(), AtomicKmsError> {
-        self.submit_primary_inner(framebuffer, token, None, false, None, false, true)
-            .map(|_| ())
+        self.submit_primary_inner(
+            framebuffer,
+            token,
+            None,
+            false,
+            None,
+            false,
+            true,
+            OutputPresentationMode::Vsync,
+            DrmContentType::Graphics,
+        )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -99,6 +188,8 @@ impl AtomicCommitSubmitter {
         in_fence: Option<BorrowedFd<'_>>,
         request_out_fence: bool,
         test_only: bool,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         // This pointer is request-local and remains valid until the ioctl
         // returns. It never crosses the worker boundary in a payload.
@@ -124,6 +215,13 @@ impl AtomicCommitSubmitter {
             }
             request
         };
+        request.set_connector_content_type(&self.pipeline, content_type.as_str())?;
+        if presentation_mode.is_async() && touch_cursor {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "Async pageflip cannot mutate cursor-plane state",
+            ));
+        }
         if let Some(in_fence) = in_fence {
             let property = self.pipeline.plane_props.in_fence_fd.ok_or_else(|| {
                 AtomicKmsError::new(
@@ -144,8 +242,12 @@ impl AtomicCommitSubmitter {
         } else if test_only {
             request.set_test_input_fence_none(&self.pipeline)?;
         }
-        let submission = if test_only {
+        let submission = if test_only && presentation_mode.is_async() {
+            AtomicSubmission::test_only_async_page_flip(request)
+        } else if test_only {
             AtomicSubmission::test_only(request)
+        } else if presentation_mode.is_async() {
+            AtomicSubmission::async_page_flip(request, token)
         } else {
             AtomicSubmission::page_flip(request, token)
         };
@@ -225,6 +327,27 @@ impl AtomicCommitSubmitter {
             AtomicKmsErrorKind::TestOnlyRejected,
             "runtime atomic TEST_ONLY cursor update",
         )
+    }
+
+    pub fn test_primary_without_cursor_with_presentation(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Result<(), AtomicKmsError> {
+        self.submit_primary_inner(
+            framebuffer,
+            token,
+            None,
+            false,
+            None,
+            false,
+            true,
+            presentation_mode,
+            content_type,
+        )
+        .map(|_| ())
     }
 }
 

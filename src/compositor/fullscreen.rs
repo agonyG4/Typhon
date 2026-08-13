@@ -21,6 +21,7 @@ pub struct DirectScanoutSceneCandidate {
     pub buffer_size: BufferSize,
     pub output_size: BufferSize,
     pub viewport_identity_metadata_present: bool,
+    pub presentation: crate::compositor::SurfacePresentationMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

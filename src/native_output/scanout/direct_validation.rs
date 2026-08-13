@@ -119,6 +119,22 @@ pub(crate) struct DirectPlaneValidationKey {
     pub(crate) cursor_atomic_key: Option<CursorAtomicValidationKey>,
     /// Stable input-fence, explicit-sync, and release-fence contract bits.
     pub(crate) synchronization_key: u64,
+    /// Presentation semantics are part of KMS TEST_ONLY validity.
+    pub(crate) presentation_mode: OutputPresentationMode,
+    /// Connector Content Type is part of the frozen output transaction.
+    pub(crate) content_type: DrmContentType,
+}
+
+impl DirectPlaneValidationKey {
+    pub(crate) const fn with_presentation_state(
+        mut self,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Self {
+        self.presentation_mode = presentation_mode;
+        self.content_type = content_type;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +185,8 @@ pub(crate) fn test_validation_key(seed: u64) -> DirectPlaneValidationKey {
         plane_layout_hash: 0x1000,
         cursor_atomic_key: None,
         synchronization_key: 0x2000,
+        presentation_mode: OutputPresentationMode::Vsync,
+        content_type: DrmContentType::Graphics,
     }
 }
 
@@ -226,6 +244,8 @@ mod tests {
             plane_layout_hash: 0x1000,
             cursor_atomic_key: None,
             synchronization_key: 0x2000,
+            presentation_mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
         }
     }
 

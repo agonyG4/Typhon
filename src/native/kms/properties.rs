@@ -211,14 +211,31 @@ pub struct PlanePropertyId(pub PropertyId);
 #[derive(Debug, Clone)]
 pub struct AtomicConnectorProperties {
     pub crtc_id: ConnectorPropertyId,
+    pub content_type: Option<ConnectorPropertyId>,
+    pub content_type_value: Option<u64>,
+    pub content_type_enums: Option<Vec<DrmPropertyEnum>>,
 }
 
 impl AtomicConnectorProperties {
     pub fn discover(properties: &[DrmProperty]) -> Result<Self, AtomicKmsError> {
         let set = PropertySet::new(DrmObjectKind::Connector, properties.to_vec())?;
+        let content_type_property = properties
+            .iter()
+            .find(|property| property.name().eq_ignore_ascii_case("content type"));
         Ok(Self {
             crtc_id: ConnectorPropertyId(set.required("CRTC_ID")?),
+            content_type: content_type_property.map(|property| ConnectorPropertyId(property.id())),
+            content_type_value: content_type_property.map(|property| property.value),
+            content_type_enums: content_type_property.map(|property| property.enums.clone()),
         })
+    }
+
+    pub fn content_type_value(&self, name: &str) -> Option<u64> {
+        let enums = self.content_type_enums.as_ref()?;
+        enums
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            .map(|entry| entry.value)
     }
 }
 
@@ -263,6 +280,7 @@ pub struct AtomicPlaneProperties {
     pub plane_type: PlanePropertyId,
     pub in_fence_fd: Option<PlanePropertyId>,
     pub in_formats: Option<PlanePropertyId>,
+    pub in_formats_async: Option<PlanePropertyId>,
     pub damage_clips: Option<PlanePropertyId>,
     pub rotation: Option<PlanePropertyId>,
     pub alpha: Option<PlanePropertyId>,
@@ -303,6 +321,7 @@ impl AtomicPlaneProperties {
             plane_type: PlanePropertyId(set.required("type")?),
             in_fence_fd: set.optional("IN_FENCE_FD").map(PlanePropertyId),
             in_formats: set.optional("IN_FORMATS").map(PlanePropertyId),
+            in_formats_async: set.optional("IN_FORMATS_ASYNC").map(PlanePropertyId),
             damage_clips: set.optional("FB_DAMAGE_CLIPS").map(PlanePropertyId),
             rotation: set.optional("rotation").map(PlanePropertyId),
             alpha: set.optional("alpha").map(PlanePropertyId),

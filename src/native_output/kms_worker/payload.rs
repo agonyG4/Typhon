@@ -2,6 +2,7 @@
 
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
+use crate::compositor::{DrmContentType, OutputPresentationMode};
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
@@ -205,6 +206,30 @@ pub(crate) enum KmsCommitPayloadError {
 }
 
 impl KmsCommitJob {
+    pub(crate) fn presentation_mode(&self) -> OutputPresentationMode {
+        self.owners
+            .primary()
+            .map(|owner| owner.transaction.presentation_mode())
+            .or_else(|| {
+                self.owners
+                    .cursor()
+                    .map(|owner| owner.transaction.presentation_mode())
+            })
+            .unwrap_or(OutputPresentationMode::Vsync)
+    }
+
+    pub(crate) fn content_type(&self) -> DrmContentType {
+        self.owners
+            .primary()
+            .map(|owner| owner.transaction.content_type())
+            .or_else(|| {
+                self.owners
+                    .cursor()
+                    .map(|owner| owner.transaction.content_type())
+            })
+            .unwrap_or(DrmContentType::Graphics)
+    }
+
     pub(crate) fn identity(&self) -> KmsCommitBundleIdentity {
         KmsCommitBundleIdentity {
             id: self.bundle_id,

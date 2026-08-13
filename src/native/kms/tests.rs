@@ -438,6 +438,7 @@ fn discovery() -> AtomicDiscovery {
         },
         snapshot: AtomicPipelineSnapshot {
             connector_crtc_id: 0,
+            connector_content_type: None,
             crtc_active: 0,
             crtc_mode_id: 0,
             plane_fb_id: 0,
@@ -457,11 +458,13 @@ fn discovery() -> AtomicDiscovery {
             in_fence_fd: true,
             out_fence_ptr: false,
             framebuffer_damage_clips: false,
+            async_page_flip: false,
         },
         framebuffer_format: u32::from_le_bytes(*b"XR24"),
         plane_possible_crtcs: 1,
         plane_formats: vec![u32::from_le_bytes(*b"XR24")],
         plane_scanout_formats: Vec::new(),
+        plane_async_scanout_formats: Vec::new(),
         cursor_plane: None,
         cursor_width: 64,
         cursor_height: 64,
@@ -1025,6 +1028,7 @@ fn restore_and_safe_disable_requests_restore_cursor_plane() {
     };
     let snapshot = AtomicPipelineSnapshot {
         connector_crtc_id: 12,
+        connector_content_type: None,
         crtc_active: 1,
         crtc_mode_id: 44,
         plane_fb_id: 55,

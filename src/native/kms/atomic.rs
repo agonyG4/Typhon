@@ -331,6 +331,24 @@ impl AtomicRequest {
         self.set(AtomicObjectId::Connector(object), property.0.get(), value)
     }
 
+    pub fn set_connector_content_type(
+        &mut self,
+        pipeline: &AtomicPipelineProperties,
+        content_type: &str,
+    ) -> Result<bool, AtomicKmsError> {
+        let Some(property) = pipeline.connector_props.content_type else {
+            return Ok(false);
+        };
+        let Some(value) = pipeline.connector_props.content_type_value(content_type) else {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                format!("connector Content Type enum is missing {content_type:?}"),
+            ));
+        };
+        self.set_connector(pipeline.connector, property, value)?;
+        Ok(true)
+    }
+
     pub fn set_crtc(
         &mut self,
         object: CrtcId,
@@ -654,6 +672,7 @@ pub struct AtomicCursorPlaneSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AtomicPipelineSnapshot {
     pub connector_crtc_id: u64,
+    pub connector_content_type: Option<u64>,
     pub crtc_active: u64,
     pub crtc_mode_id: u64,
     pub plane_fb_id: u64,
@@ -680,6 +699,12 @@ impl AtomicPipelineSnapshot {
             pipeline.connector_props.crtc_id,
             self.connector_crtc_id,
         )?;
+        if let (Some(property), Some(value)) = (
+            pipeline.connector_props.content_type,
+            self.connector_content_type,
+        ) {
+            request.set_connector(pipeline.connector, property, value)?;
+        }
         request.set_crtc(pipeline.crtc, pipeline.crtc_props.active, self.crtc_active)?;
         request.set_crtc(
             pipeline.crtc,
@@ -851,8 +876,20 @@ impl AtomicCommitFlags {
         Self(drm_sys::DRM_MODE_ATOMIC_NONBLOCK | drm_sys::DRM_MODE_PAGE_FLIP_EVENT)
     }
 
+    pub const fn async_page_flip() -> Self {
+        Self(
+            drm_sys::DRM_MODE_ATOMIC_NONBLOCK
+                | drm_sys::DRM_MODE_PAGE_FLIP_EVENT
+                | drm_sys::DRM_MODE_PAGE_FLIP_ASYNC,
+        )
+    }
+
     pub const fn test_only_no_modeset() -> Self {
         Self(drm_sys::DRM_MODE_ATOMIC_TEST_ONLY)
+    }
+
+    pub const fn test_only_async_page_flip() -> Self {
+        Self(drm_sys::DRM_MODE_ATOMIC_TEST_ONLY | drm_sys::DRM_MODE_PAGE_FLIP_ASYNC)
     }
 
     pub const fn bits(self) -> u32 {
@@ -869,6 +906,10 @@ impl AtomicCommitFlags {
 
     pub const fn contains_pageflip_event(self) -> bool {
         self.0 & drm_sys::DRM_MODE_PAGE_FLIP_EVENT != 0
+    }
+
+    pub const fn contains_pageflip_async(self) -> bool {
+        self.0 & drm_sys::DRM_MODE_PAGE_FLIP_ASYNC != 0
     }
 
     pub const fn contains_test_only(self) -> bool {
@@ -892,6 +933,14 @@ impl AtomicSubmission {
         }
     }
 
+    pub fn async_page_flip(request: AtomicRequest, token: PageFlipToken) -> Self {
+        Self {
+            request,
+            flags: AtomicCommitFlags::async_page_flip(),
+            user_data: token.get(),
+        }
+    }
+
     pub fn resume_modeset(request: AtomicRequest) -> Self {
         Self {
             request,
@@ -904,6 +953,14 @@ impl AtomicSubmission {
         Self {
             request,
             flags: AtomicCommitFlags::test_only_no_modeset(),
+            user_data: 0,
+        }
+    }
+
+    pub fn test_only_async_page_flip(request: AtomicRequest) -> Self {
+        Self {
+            request,
+            flags: AtomicCommitFlags::test_only_async_page_flip(),
             user_data: 0,
         }
     }

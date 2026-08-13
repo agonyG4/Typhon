@@ -1,6 +1,7 @@
 use std::io;
 
 use oblivion_one::{
+    compositor::OutputPresentationMode,
     native::kms::DrmFormatModifierPair,
     render_backend::{
         buffer::{DrmFormat, DrmModifier},
@@ -157,6 +158,27 @@ pub(crate) fn select_output_format_modifier(
     egl: &[EglGlesDmabufFormat],
     gbm: &mut impl GbmAllocationProbe,
 ) -> io::Result<DrmFormatModifierPair> {
+    select_output_format_modifier_for_presentation(
+        OutputPresentationMode::Vsync,
+        drm,
+        None,
+        egl,
+        gbm,
+    )
+}
+
+pub(crate) fn select_output_format_modifier_for_presentation(
+    presentation_mode: OutputPresentationMode,
+    normal_drm: &[DrmFormatModifierPair],
+    async_drm: Option<&[DrmFormatModifierPair]>,
+    egl: &[EglGlesDmabufFormat],
+    gbm: &mut impl GbmAllocationProbe,
+) -> io::Result<DrmFormatModifierPair> {
+    let drm = if presentation_mode.is_async() {
+        async_drm.unwrap_or(normal_drm)
+    } else {
+        normal_drm
+    };
     let mut candidates = drm
         .iter()
         .copied()

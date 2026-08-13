@@ -20,6 +20,33 @@ pub(crate) struct DirectCallbackLeakMetrics {
     pub(crate) leaked_callbacks: u64,
 }
 
+fn effective_output_presentation(
+    server: &OwnCompositorServer,
+    cursor_visible: bool,
+) -> (OutputPresentationMode, DrmContentType) {
+    let metadata = server
+        .fullscreen_tree_presentation_metadata()
+        .unwrap_or_default();
+    let metrics = server.fullscreen_render_plan_metrics();
+    let effective = EffectivePresentation::decide(
+        TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+        metadata,
+        AsyncEligibility {
+            solitary_fullscreen: metrics.fullscreen_active,
+            async_hint: metadata.hint.is_async(),
+            backend_capable: false,
+            output_generation_qualified: true,
+            explicit_sync_ready: true,
+            commit_timing_safe: true,
+            kms_lane_free: true,
+            async_test_only_accepted: true,
+            cursor_visible,
+            ..AsyncEligibility::default()
+        },
+    );
+    (effective.mode, effective.content_type.drm_value())
+}
+
 pub(crate) fn direct_terminal_callback_owner_leaks(
     server: &mut OwnCompositorServer,
     transaction_id: OutputTransactionId,
@@ -463,6 +490,8 @@ pub(super) fn build_compatibility_transaction(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
 ) -> NativeResult<Option<OutputTransactionId>> {
+    let (presentation_mode, content_type) =
+        effective_output_presentation(server, cursor.is_some_and(|state| state.visible));
     let frame_batch_id = server
         .prepared_frame_batch_id()
         .ok_or_else(|| io::Error::other("compatibility pageflip has no prepared frame batch"))?;
@@ -501,7 +530,8 @@ pub(super) fn build_compatibility_transaction(
         }
         None => return Ok(None),
     }
-    .map_err(io::Error::other)?;
+    .map_err(io::Error::other)?
+    .with_presentation_state(presentation_mode, content_type);
     output_transactions
         .insert(transaction)
         .map_err(io::Error::other)?;

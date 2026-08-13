@@ -2,10 +2,40 @@ use super::*;
 use crate::compositor::fullscreen::{
     direct_scanout_scene_blockers_for_visibility, direct_scanout_viewport_compatibility,
 };
+use crate::compositor::{SurfaceContentType, SurfacePresentationMetadata};
 use crate::render_backend::buffer::SurfaceBufferSource;
 use std::borrow::Cow;
 
 impl CompositorState {
+    pub(in crate::compositor) fn fullscreen_tree_presentation_metadata(
+        &self,
+    ) -> Option<SurfacePresentationMetadata> {
+        let owner = self.fullscreen_presentation?;
+        let mut metadata = SurfacePresentationMetadata::default();
+        for surface in &self.renderable_surfaces {
+            if self.root_surface_id_for_surface(surface.surface_id) != owner.owner_root_surface_id {
+                continue;
+            }
+            let Some(surface_metadata) = self
+                .surface_resources
+                .get(&surface.surface_id)
+                .and_then(|surface| surface.data::<SurfaceData>())
+                .map(|data| data.current_presentation())
+            else {
+                continue;
+            };
+            if surface_metadata.hint.is_async() {
+                metadata.hint = surface_metadata.hint;
+            }
+            if metadata.content_type == SurfaceContentType::None
+                && surface_metadata.content_type != SurfaceContentType::None
+            {
+                metadata.content_type = surface_metadata.content_type;
+            }
+        }
+        Some(metadata)
+    }
+
     pub(in crate::compositor) fn window_geometry_for_mode(
         &self,
         mode: ToplevelMode,
@@ -279,6 +309,13 @@ impl CompositorState {
             buffer_size: output_size,
             output_size,
             viewport_identity_metadata_present: viewport_compatibility.metadata_present,
+            presentation: self
+                .surface_resources
+                .get(&root.surface_id)
+                .and_then(|surface| surface.data::<SurfaceData>())
+                .map_or(SurfacePresentationMetadata::default(), |data| {
+                    data.current_presentation()
+                }),
         })
     }
 

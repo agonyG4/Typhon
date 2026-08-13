@@ -136,6 +136,7 @@ impl CompositorState {
         let sequence = presentation.sequence;
         let mut flags = match presentation.kind {
             PresentationKind::Synchronized => wp_presentation_feedback::Kind::Vsync,
+            PresentationKind::Tearing => wp_presentation_feedback::Kind::empty(),
             PresentationKind::Software => wp_presentation_feedback::Kind::empty(),
         };
         if presentation.zero_copy {
@@ -435,8 +436,10 @@ impl CompositorState {
         let _ = self
             .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
-        for claim in &batch.fifo_barrier_claims {
-            self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+        if !matches!(presentation.kind, PresentationKind::Tearing) {
+            for claim in &batch.fifo_barrier_claims {
+                self.clear_fifo_barrier_claim(*claim, FifoBarrierClearReason::Presented);
+            }
         }
         for claim in &batch.commit_timing_target_claims {
             self.complete_commit_timing_claim(*claim, presentation);

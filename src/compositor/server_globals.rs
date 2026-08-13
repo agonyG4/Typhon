@@ -1,7 +1,9 @@
 use super::*;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
 use wayland_protocols::wp::{
-    commit_timing::v1::server::wp_commit_timing_manager_v1, fifo::v1::server::wp_fifo_manager_v1,
+    commit_timing::v1::server::wp_commit_timing_manager_v1,
+    content_type::v1::server::wp_content_type_manager_v1, fifo::v1::server::wp_fifo_manager_v1,
+    tearing_control::v1::server::wp_tearing_control_manager_v1,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -13,6 +15,7 @@ pub(super) fn register_minimum_globals(
     selection_capabilities: SelectionProtocolCapabilities,
     renderer_capabilities: RendererProtocolCapabilities,
     frame_pacing_capabilities: FramePacingProtocolCapabilities,
+    presentation_capabilities: PresentationProtocolCapabilities,
     xwayland_global_data: XwaylandShellGlobalData,
 ) {
     debug_assert!(
@@ -108,6 +111,20 @@ pub(super) fn register_minimum_globals(
             wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
             _,
         >(versions::WP_COMMIT_TIMING_MANAGER_V1, ());
+    }
+    if presentation_capabilities.tearing_control {
+        display.create_global::<
+            CompositorState,
+            wp_tearing_control_manager_v1::WpTearingControlManagerV1,
+            _,
+        >(versions::WP_TEARING_CONTROL_MANAGER_V1, ());
+    }
+    if presentation_capabilities.content_type {
+        display.create_global::<
+            CompositorState,
+            wp_content_type_manager_v1::WpContentTypeManagerV1,
+            _,
+        >(versions::WP_CONTENT_TYPE_MANAGER_V1, ());
     }
     display
         .create_global::<CompositorState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(

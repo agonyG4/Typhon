@@ -23,6 +23,14 @@ pub(crate) enum AtomicCommitKind {
 }
 
 impl AtomicCommitKind {
+    pub(crate) const fn transaction_id(self) -> OutputTransactionId {
+        match self {
+            Self::CompositedPrimary { transaction_id, .. }
+            | Self::DirectPrimary { transaction_id, .. }
+            | Self::PlaneDelta { transaction_id, .. } => transaction_id,
+        }
+    }
+
     pub(crate) const fn is_primary(self) -> bool {
         matches!(
             self,

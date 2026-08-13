@@ -16,6 +16,8 @@ fn settle_no_visual_change_transaction(
     cursor_epoch: u64,
     direct_surface_id: u32,
     release: OutputReleasePlan,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
 ) -> io::Result<bool> {
     let Some(frame_id) = server.prepared_frame_id() else {
         return Ok(true);
@@ -59,7 +61,9 @@ fn settle_no_visual_change_transaction(
         frame_batch_id,
         direct_surface_id,
         release,
-    ) {
+    )
+    .map(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
+    {
         Ok(transaction) => transaction,
         Err(error) => {
             server.restore_frame_batch_after_render_failure(frame_batch_id);
@@ -175,6 +179,26 @@ impl AtomicEglGbmScanout {
                 return Ok(DirectScanoutAttempt::Rejected(rejection));
             }
         };
+        let effective_presentation = EffectivePresentation::decide(
+            TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
+            candidate.presentation,
+            AsyncEligibility {
+                solitary_fullscreen: true,
+                async_hint: candidate.presentation.hint.is_async(),
+                backend_capable: kms
+                    .atomic()
+                    .is_some_and(|atomic| atomic.discovery().optional.async_page_flip),
+                output_generation_qualified: true,
+                explicit_sync_ready: true,
+                commit_timing_safe: true,
+                kms_lane_free: true,
+                async_test_only_accepted: true,
+                cursor_visible: cursor.is_some_and(|state| state.visible),
+                ..AsyncEligibility::default()
+            },
+        );
+        let presentation_mode = effective_presentation.mode;
+        let content_type = effective_presentation.content_type.drm_value();
         self.direct.counters.candidates_accepted += 1;
         let Some(candidate_key) =
             direct_candidate_key(&candidate, self.direct.drm_generation, cursor)
@@ -220,6 +244,8 @@ impl AtomicEglGbmScanout {
                 cursor_epoch,
                 candidate.surface_id,
                 release,
+                presentation_mode,
+                content_type,
             )? {
                 return Ok(DirectScanoutAttempt::TimingDeferred);
             }
@@ -289,6 +315,8 @@ impl AtomicEglGbmScanout {
                     DirectReleaseMode::OutFence => DirectValidationReleaseMode::OutFence,
                 },
             ),
+            presentation_mode,
+            content_type,
         };
         let test_only = if self.direct.validation_cache.contains(validation_key) {
             self.direct.counters.validation_cache_hits =
@@ -375,7 +403,7 @@ impl AtomicEglGbmScanout {
             candidate.surface_id,
             release,
         ) {
-            Ok(transaction) => transaction,
+            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 drop(surface_damage);

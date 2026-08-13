@@ -114,6 +114,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let mut pacing = data.take_pending_surface_pacing();
                 pacing.fifo_wait_ignored_for_synchronized_subsurface = pacing.fifo_wait_barrier
                     && state.is_effectively_synchronized_subsurface(surface_id);
+                let presentation = data.take_pending_presentation();
                 let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
                 let mut attachment = data.take_pending();
                 if let Some(PendingSurfaceAttachment::Buffer(buffer)) = attachment.as_mut() {
@@ -235,6 +236,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     window_geometry,
                     cached_at: Instant::now(),
                     pacing,
+                    presentation,
                 };
                 state.commit_surface_tree_request(surface_id, commit);
             }

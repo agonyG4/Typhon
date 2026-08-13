@@ -23,6 +23,7 @@ pub struct AtomicOptionalCapabilities {
     pub in_fence_fd: bool,
     pub out_fence_ptr: bool,
     pub framebuffer_damage_clips: bool,
+    pub async_page_flip: bool,
 }
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ pub struct AtomicDiscovery {
     pub plane_possible_crtcs: u32,
     pub plane_formats: Vec<u32>,
     pub plane_scanout_formats: Vec<DrmFormatModifierPair>,
+    pub plane_async_scanout_formats: Vec<DrmFormatModifierPair>,
     pub cursor_plane: Option<AtomicCursorPlaneProperties>,
     pub cursor_width: u32,
     pub cursor_height: u32,
@@ -202,6 +204,24 @@ impl AtomicDiscovery {
             }
             _ => Vec::new(),
         };
+        let plane_async_scanout_formats = match property_value(&plane_entries, "IN_FORMATS_ASYNC") {
+            Some(blob_id) => {
+                let blob_id = u32::try_from(blob_id).map_err(|_| {
+                    AtomicKmsError::new(
+                        AtomicKmsErrorKind::MalformedPropertyBlob,
+                        "primary-plane IN_FORMATS_ASYNC blob ID exceeds u32",
+                    )
+                })?;
+                if blob_id == 0 {
+                    return Err(AtomicKmsError::new(
+                        AtomicKmsErrorKind::MalformedPropertyBlob,
+                        "primary-plane IN_FORMATS_ASYNC blob ID is zero",
+                    ));
+                }
+                parse_in_formats_blob(&property_blob(fd, blob_id)?)?
+            }
+            None => plane_scanout_formats.clone(),
+        };
         let cursor_plane = cursor_selected.and_then(|selected_cursor| {
             let entries = plane_property_entries
                 .iter()
@@ -283,6 +303,12 @@ impl AtomicDiscovery {
             in_fence_fd: plane_props.in_fence_fd.is_some(),
             out_fence_ptr: crtc_props.out_fence_ptr.is_some(),
             framebuffer_damage_clips: plane_props.damage_clips.is_some(),
+            async_page_flip: drm_ffi::get_capability(
+                fd,
+                u64::from(drm_sys::DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP),
+            )
+            .ok()
+            .is_some_and(|capability| capability.value != 0),
         };
         let snapshot = AtomicPipelineSnapshot {
             connector_crtc_id: required_value(
@@ -290,6 +316,7 @@ impl AtomicDiscovery {
                 "CRTC_ID",
                 DrmObjectKind::Connector,
             )?,
+            connector_content_type: connector_props.content_type_value,
             crtc_active: required_value(&crtc_entries, "ACTIVE", DrmObjectKind::Crtc)?,
             crtc_mode_id: required_value(&crtc_entries, "MODE_ID", DrmObjectKind::Crtc)?,
             plane_fb_id: required_value(&plane_entries, "FB_ID", DrmObjectKind::PrimaryPlane)?,
@@ -320,6 +347,7 @@ impl AtomicDiscovery {
             plane_possible_crtcs: selected_possible_crtcs,
             plane_formats: selected_formats,
             plane_scanout_formats,
+            plane_async_scanout_formats,
             cursor_plane,
             cursor_width,
             cursor_height,
@@ -851,6 +879,23 @@ impl Drop for DrmAtomicBackend {
             eprintln!("atomic KMS restore failed: {error}");
         }
     }
+
+    pub fn submit_flip_with_presentation_mode(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        mode: crate::native::drm::LegacyPageFlipMode,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy presentation mode requested on Atomic KMS",
+            )),
+            KmsDisplayBackend::Legacy(backend) => {
+                backend.submit_flip_with_mode(framebuffer, token, mode)
+            }
+        }
+    }
 }
 
 fn rollback_pipeline(fd: BorrowedFd<'_>, discovery: &AtomicDiscovery) {
@@ -1183,6 +1228,13 @@ impl KmsBackendSelection {
         match self.backend {
             KmsDisplayBackend::Atomic(_) => KmsBackendKind::Atomic,
             KmsDisplayBackend::Legacy(_) => KmsBackendKind::Legacy,
+        }
+    }
+
+    pub const fn async_page_flip_capable(&self) -> bool {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.discovery().optional.async_page_flip,
+            KmsDisplayBackend::Legacy(backend) => backend.async_page_flip_capable(),
         }
     }
 

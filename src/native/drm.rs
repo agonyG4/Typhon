@@ -199,16 +199,33 @@ pub fn sample_clock_microseconds(clock: DrmTimestampClock) -> io::Result<u64> {
         .saturating_add(nanoseconds / 1_000))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyPageFlipMode {
+    Vsync,
+    Async,
+}
+
 pub fn submit_legacy_page_flip(
     fd: BorrowedFd<'_>,
     crtc_id: u32,
     fb_id: u32,
     token: u64,
 ) -> io::Result<()> {
+    submit_legacy_page_flip_with_mode(fd, crtc_id, fb_id, token, LegacyPageFlipMode::Vsync)
+}
+
+pub fn submit_legacy_page_flip_with_mode(
+    fd: BorrowedFd<'_>,
+    crtc_id: u32,
+    fb_id: u32,
+    token: u64,
+    mode: LegacyPageFlipMode,
+) -> io::Result<()> {
     let mut flip = drm_sys::drm_mode_crtc_page_flip {
         crtc_id,
         fb_id,
-        flags: drm_sys::DRM_MODE_PAGE_FLIP_EVENT,
+        flags: drm_sys::DRM_MODE_PAGE_FLIP_EVENT
+            | matches!(mode, LegacyPageFlipMode::Async) as u32 * drm_sys::DRM_MODE_PAGE_FLIP_ASYNC,
         reserved: 0,
         user_data: token,
     };

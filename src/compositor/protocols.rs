@@ -11,6 +11,7 @@ mod idle_inhibit;
 mod input;
 mod layer_shell;
 mod presentation;
+mod presentation_modes;
 mod primary_selection;
 mod shell_auth;
 mod shell_control;

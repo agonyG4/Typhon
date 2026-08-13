@@ -595,83 +595,10 @@ impl Drop for ExecutingDirectCandidateGuard {
 
 #[derive(Debug)]
 pub(crate) struct AtomicKmsWorkerExecutor {
-    submitter: AtomicCommitSubmitter,
+    pub(super) submitter: AtomicCommitSubmitter,
 }
 
-impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
-    fn test_only(&self, job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
-        let touch_cursor = !matches!(&job.cursor, KmsCursorUpdate::Unchanged);
-        let cursor = match &job.cursor {
-            KmsCursorUpdate::Set(state) => Some(state),
-            KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => None,
-        };
-
-        let test = match &job.primary {
-            KmsPrimaryUpdate::Framebuffer { framebuffer, .. } => {
-                if touch_cursor {
-                    self.submitter.test_primary(*framebuffer, job.token, cursor)
-                } else {
-                    self.submitter
-                        .test_primary_without_cursor(*framebuffer, job.token)
-                }
-            }
-            KmsPrimaryUpdate::Unchanged => self.submitter.test_cursor(cursor),
-        };
-        test.map(|_| ())
-            .map_err(|error| KmsWorkerSubmitFailure { error })
-    }
-
-    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
-        let touch_cursor = !matches!(&job.cursor, KmsCursorUpdate::Unchanged);
-        let cursor = match &job.cursor {
-            KmsCursorUpdate::Set(state) => Some(state),
-            KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => None,
-        };
-
-        let input_fence = match &job.primary {
-            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.as_ref().map(|fence| {
-                // SAFETY: the job-owned OwnedFd remains alive through the
-                // complete ioctl and is released only after the executor
-                // returns, including every EBUSY retry.
-                unsafe { BorrowedFd::borrow_raw(fence.as_raw_fd()) }
-            }),
-            KmsPrimaryUpdate::Unchanged => None,
-        };
-        let submission = match &job.primary {
-            KmsPrimaryUpdate::Framebuffer {
-                framebuffer,
-                in_fence: _,
-                request_out_fence,
-                ..
-            } => {
-                if touch_cursor {
-                    self.submitter.submit_primary(
-                        *framebuffer,
-                        job.token,
-                        cursor,
-                        input_fence,
-                        *request_out_fence,
-                        false,
-                    )
-                } else {
-                    self.submitter.submit_primary_without_cursor(
-                        *framebuffer,
-                        job.token,
-                        input_fence,
-                        *request_out_fence,
-                        false,
-                    )
-                }
-            }
-            KmsPrimaryUpdate::Unchanged => self.submitter.submit_cursor(cursor, job.token, false),
-        };
-        submission
-            .map(|submission| KmsWorkerSubmission {
-                out_fence: submission.out_fence,
-            })
-            .map_err(|error| KmsWorkerSubmitFailure { error })
-    }
-}
+mod presentation_executor;
 
 impl Drop for KmsCommitWorkerHandle {
     fn drop(&mut self) {

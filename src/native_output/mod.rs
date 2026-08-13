@@ -30,14 +30,15 @@ use khronos_egl as egl;
 #[cfg(test)]
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
-    AcquireWatchChange, AstreaShortcutPhase, DesktopComposeRequest, DesktopFrameCopyKind,
-    DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState, FramePresentation,
-    FullscreenPresentationRejection, OutputPosition as CompositorOutputPosition, OutputRegion,
+    AcquireWatchChange, AstreaShortcutPhase, AsyncEligibility, DesktopComposeRequest,
+    DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
+    DrmContentType, EffectivePresentation, FramePresentation, FullscreenPresentationRejection,
+    OutputPosition as CompositorOutputPosition, OutputPresentationMode, OutputRegion,
     OwnCompositorServer, PointerAxisComponent, PointerAxisFrame, PointerAxisSource,
     PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
     PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
-    RenderSceneElement, RenderSceneElementId, RenderableSurface,
+    RenderSceneElement, RenderSceneElementId, RenderableSurface, TearingPolicy,
     render_scene_elements_for_surfaces, resize_debug_log,
 };
 use oblivion_one::native::kms::{

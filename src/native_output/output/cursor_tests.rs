@@ -78,6 +78,7 @@ fn test_cursor() -> NativeAtomicCursor {
                 plane_type: property(20),
                 in_fence_fd: None,
                 in_formats: None,
+                in_formats_async: None,
                 damage_clips: None,
                 rotation: None,
                 alpha: None,

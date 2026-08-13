@@ -11,7 +11,7 @@ use wayland_server::{
 };
 
 use crate::compositor::state::PendingSurfacePacingState;
-use crate::compositor::{DragSessionPhase, XdgAssociationReservation};
+use crate::compositor::{DragSessionPhase, SurfacePresentationState, XdgAssociationReservation};
 use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
 };
@@ -274,6 +274,7 @@ pub(super) struct SurfaceData {
     frame_callbacks: Mutex<Vec<wl_callback::WlCallback>>,
     explicit_sync: Mutex<Option<Arc<SyncobjSurfaceState>>>,
     pub(super) pending_pacing: Mutex<PendingSurfacePacingState>,
+    pub(super) presentation: Mutex<SurfacePresentationState>,
     viewport: Mutex<SurfaceViewportState>,
     buffer_scale: Mutex<SurfaceBufferScaleState>,
     buffer_transform: Mutex<SurfaceBufferTransformState>,

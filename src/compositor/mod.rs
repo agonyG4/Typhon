@@ -34,6 +34,7 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
 };
 use wayland_protocols::wp::{
     commit_timing::v1::server::{wp_commit_timer_v1, wp_commit_timing_manager_v1},
+    content_type::v1::server::{wp_content_type_manager_v1, wp_content_type_v1},
     fifo::v1::server::{wp_fifo_manager_v1, wp_fifo_v1},
     fractional_scale::v1::server::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     idle_inhibit::zv1::server::{zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1},
@@ -47,6 +48,7 @@ use wayland_protocols::wp::{
         zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
     },
     relative_pointer::zv1::server::{zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1},
+    tearing_control::v1::server::{wp_tearing_control_manager_v1, wp_tearing_control_v1},
     viewporter::server::{wp_viewport, wp_viewporter},
 };
 use wayland_protocols::xdg::{
@@ -83,6 +85,7 @@ mod pacing;
 mod plan;
 mod popup;
 mod presentation;
+mod presentation_modes;
 mod protocols;
 mod render;
 mod runtime_files;
@@ -96,6 +99,7 @@ mod server_toplevel;
 mod server_xwayland_events;
 mod shm;
 mod state_data;
+mod state_data_presentation;
 mod subsurface;
 mod surface;
 mod surface_pacing_data;
@@ -209,12 +213,7 @@ use output::{
     send_output_done_if_supported, send_output_mode, send_output_scale,
 };
 use pacing::*;
-pub use plan::{
-    ArchitectureLayer, CompositorArchitecture, CompositorPlan, FramePacingProtocolCapabilities,
-    InputProtocolCapabilities, ProtocolGlobal, RendererProtocolCapabilities,
-    SelectionProtocolCapabilities, client_protocols_for_capabilities,
-    client_protocols_for_capabilities_with_frame_pacing,
-};
+pub use plan::*;
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
     XdgWindowGeometry,
@@ -222,6 +221,7 @@ use popup::{
 pub use presentation::{
     FramePresentation, PresentationClock, PresentationKind, PresentationTimestamp,
 };
+pub use presentation_modes::*;
 pub use render::{
     BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
     DesktopSceneRenderer, DesktopVisualState, OUTPUT_BACKGROUND, RenderSceneElement,
@@ -448,7 +448,6 @@ impl RenderGenerationCause {
             Self::CursorState => "cursor_state",
         }
     }
-
     pub const fn uses_surface_damage(self) -> bool {
         matches!(self, Self::SurfaceCommit | Self::SurfaceDamage)
     }
@@ -487,6 +486,8 @@ pub struct CompositorState {
     surface_resources: HashMap<u32, wl_surface::WlSurface>,
     fifo_resources: HashMap<u32, wp_fifo_v1::WpFifoV1>,
     commit_timer_resources: HashMap<u32, wp_commit_timer_v1::WpCommitTimerV1>,
+    tearing_control_resources: HashMap<u32, wp_tearing_control_v1::WpTearingControlV1>,
+    content_type_resources: HashMap<u32, wp_content_type_v1::WpContentTypeV1>,
     active_fifo_barriers: HashMap<u32, ActiveFifoBarrier>,
     active_commit_timing_targets:
         HashMap<u32, Vec<(u64, SurfaceCommitSequence, CommitTimingReadiness)>>,

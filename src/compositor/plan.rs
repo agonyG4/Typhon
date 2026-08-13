@@ -15,6 +15,8 @@ pub enum ProtocolGlobal {
     WpPrimarySelection,
     WpFifo,
     WpCommitTiming,
+    WpTearingControl,
+    WpContentType,
     ExtDataControl,
     XdgDecoration,
     LinuxDmabuf,
@@ -43,6 +45,8 @@ impl ProtocolGlobal {
             Self::WpPrimarySelection => "zwp_primary_selection_device_manager_v1",
             Self::WpFifo => "wp_fifo_manager_v1",
             Self::WpCommitTiming => "wp_commit_timing_manager_v1",
+            Self::WpTearingControl => "wp_tearing_control_manager_v1",
+            Self::WpContentType => "wp_content_type_manager_v1",
             Self::ExtDataControl => "ext_data_control_manager_v1",
             Self::XdgDecoration => "zxdg_decoration_manager_v1",
             Self::LinuxDmabuf => "zwp_linux_dmabuf_v1",
@@ -142,6 +146,28 @@ impl FramePacingProtocolCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationProtocolCapabilities {
+    pub tearing_control: bool,
+    pub content_type: bool,
+}
+
+impl PresentationProtocolCapabilities {
+    pub const fn safe_baseline() -> Self {
+        Self {
+            tearing_control: false,
+            content_type: false,
+        }
+    }
+
+    pub const fn qualified_native() -> Self {
+        Self {
+            tearing_control: true,
+            content_type: true,
+        }
+    }
+}
+
 impl RendererProtocolCapabilities {
     pub const fn unsupported() -> Self {
         Self {
@@ -185,6 +211,22 @@ pub fn client_protocols_for_capabilities_with_frame_pacing(
     renderer_capabilities: RendererProtocolCapabilities,
     frame_pacing_capabilities: FramePacingProtocolCapabilities,
 ) -> Vec<ProtocolGlobal> {
+    client_protocols_for_capabilities_with_presentation(
+        input_capabilities,
+        selection_capabilities,
+        renderer_capabilities,
+        frame_pacing_capabilities,
+        PresentationProtocolCapabilities::safe_baseline(),
+    )
+}
+
+pub fn client_protocols_for_capabilities_with_presentation(
+    input_capabilities: InputProtocolCapabilities,
+    selection_capabilities: SelectionProtocolCapabilities,
+    renderer_capabilities: RendererProtocolCapabilities,
+    frame_pacing_capabilities: FramePacingProtocolCapabilities,
+    presentation_capabilities: PresentationProtocolCapabilities,
+) -> Vec<ProtocolGlobal> {
     let mut protocols = BASE_CLIENT_PROTOCOLS.to_vec();
     let selection_insert_at = protocols
         .iter()
@@ -205,6 +247,12 @@ pub fn client_protocols_for_capabilities_with_frame_pacing(
     }
     if frame_pacing_capabilities.fifo {
         protocols.insert(selection_insert_at, ProtocolGlobal::WpFifo);
+    }
+    if presentation_capabilities.content_type {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WpContentType);
+    }
+    if presentation_capabilities.tearing_control {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WpTearingControl);
     }
 
     if renderer_capabilities.color_management {

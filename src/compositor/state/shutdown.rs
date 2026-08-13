@@ -44,6 +44,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         window_geometry: None,
         cached_at: Instant::now(),
         pacing: CapturedSurfacePacing::default(),
+        presentation: CapturedSurfacePresentation::default(),
     }
 }
 

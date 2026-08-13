@@ -13,6 +13,7 @@ pub struct LegacyKmsBackend {
     original: Option<drm_sys::drm_mode_crtc>,
     restored: bool,
     restore_on_drop: bool,
+    async_page_flip: bool,
 }
 
 impl LegacyKmsBackend {
@@ -48,6 +49,12 @@ impl LegacyKmsBackend {
             original,
             restored: false,
             restore_on_drop: true,
+            async_page_flip: drm_ffi::get_capability(
+                fd,
+                u64::from(drm_sys::DRM_CAP_ASYNC_PAGE_FLIP),
+            )
+            .ok()
+            .is_some_and(|capability| capability.value != 0),
         })
     }
 
@@ -56,19 +63,55 @@ impl LegacyKmsBackend {
         framebuffer: FramebufferId,
         token: PageFlipToken,
     ) -> Result<(), AtomicKmsError> {
+        self.submit_flip_with_mode(
+            framebuffer,
+            token,
+            crate::native::drm::LegacyPageFlipMode::Vsync,
+        )
+    }
+
+    pub fn submit_flip_with_mode(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        mode: crate::native::drm::LegacyPageFlipMode,
+    ) -> Result<(), AtomicKmsError> {
+        if matches!(mode, crate::native::drm::LegacyPageFlipMode::Async) && !self.async_page_flip {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy async pageflip capability is unavailable",
+            ));
+        }
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        crate::native::drm::submit_legacy_page_flip(
+        crate::native::drm::submit_legacy_page_flip_with_mode(
             fd,
             self.crtc.get(),
             framebuffer.get(),
             token.get(),
+            mode,
         )
         .map_err(|error| {
             AtomicKmsError::new(
                 AtomicKmsErrorKind::FlipRejected,
-                format!("legacy pageflip failed: {error}"),
+                format!("legacy pageflip ({mode:?}) failed: {error}"),
             )
         })
+    }
+
+    pub const fn async_page_flip_capable(&self) -> bool {
+        self.async_page_flip
+    }
+
+    pub fn submit_flip_async(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+    ) -> Result<(), AtomicKmsError> {
+        self.submit_flip_with_mode(
+            framebuffer,
+            token,
+            crate::native::drm::LegacyPageFlipMode::Async,
+        )
     }
 
     pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {

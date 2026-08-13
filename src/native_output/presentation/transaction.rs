@@ -2,7 +2,9 @@
 
 use std::{collections::HashMap, fmt, num::NonZeroU64};
 
-use oblivion_one::compositor::{CompositorFrameBatchId, DirectScanoutSceneCandidate};
+use oblivion_one::compositor::{
+    CompositorFrameBatchId, DirectScanoutSceneCandidate, DrmContentType, OutputPresentationMode,
+};
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
@@ -284,6 +286,8 @@ pub(crate) struct OutputTransaction {
     created_at: MonotonicTimestampNs,
     target: PresentationTarget,
     pacing_mode: NativeOutputPacingMode,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
     content: OutputTransactionContent,
     planes: OutputPlanePlan,
     synchronization: OutputSynchronizationPlan,
@@ -603,6 +607,8 @@ impl OutputTransaction {
             created_at,
             target,
             pacing_mode,
+            presentation_mode: OutputPresentationMode::Vsync,
+            content_type: DrmContentType::Graphics,
             content,
             planes,
             synchronization,
@@ -628,6 +634,27 @@ impl OutputTransaction {
 
     pub(crate) const fn pacing_mode(&self) -> NativeOutputPacingMode {
         self.pacing_mode
+    }
+
+    pub(crate) const fn presentation_mode(&self) -> OutputPresentationMode {
+        self.presentation_mode
+    }
+
+    pub(crate) const fn content_type(&self) -> DrmContentType {
+        self.content_type
+    }
+
+    pub(crate) fn with_presentation_state(
+        mut self,
+        presentation_mode: OutputPresentationMode,
+        content_type: DrmContentType,
+    ) -> Self {
+        self.presentation_mode = presentation_mode;
+        self.content_type = content_type;
+        if presentation_mode.is_async() {
+            self.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+        }
+        self
     }
 
     pub(crate) const fn content(&self) -> OutputTransactionContent {
