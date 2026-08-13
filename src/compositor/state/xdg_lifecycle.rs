@@ -295,6 +295,13 @@ impl CompositorState {
             self.assign_focus_serial_if_needed(window_id);
             self.mark_astrea_toplevel_structure_dirty();
         }
+        if !was_mapped
+            && self
+                .xdg_surface_lifecycle(surface_id)
+                .is_some_and(|lifecycle| lifecycle.currently_mapped)
+        {
+            self.refresh_keyboard_shortcut_inhibition();
+        }
     }
 
     pub(in crate::compositor) fn begin_xdg_empty_or_unmap_commit(&mut self, surface_id: u32) {
@@ -310,6 +317,7 @@ impl CompositorState {
                 .is_some_and(|lifecycle| lifecycle.currently_mapped)
         {
             self.mark_astrea_toplevel_structure_dirty();
+            self.refresh_keyboard_shortcut_inhibition();
         }
     }
 }

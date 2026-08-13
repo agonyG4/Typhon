@@ -37,6 +37,9 @@ use wayland_protocols::xwayland::shell::v1::client::{
     xwayland_surface_v1 as client_xwayland_surface_v1,
 };
 
+#[path = "input_shortcut_inhibition.rs"]
+mod input_shortcut_inhibition;
+
 #[test]
 fn raw_evdev_events_discarded_during_suspend_do_not_replay() {
     let mut pipe = [0; 2];
@@ -1245,38 +1248,6 @@ fn native_input_astrea_keyboard_shortcuts_map_to_actions_and_events() {
         fullscreen.window_actions,
         vec![NativeWindowAction::ToggleFullscreen]
     );
-}
-
-#[test]
-fn native_input_shortcut_inhibition_forwards_window_shortcuts_to_client() {
-    let mut input = NativeInputState::new(320, 200);
-    input.set_keyboard_shortcuts_inhibited(true);
-
-    let alt = input.handle_key_event(KEY_LEFTALT, 1);
-    let fullscreen = input.handle_key_event(KEY_F11, 1);
-
-    assert_eq!(
-        alt.keyboard_events,
-        vec![NativeKeyboardEvent::new(KEY_LEFTALT, true)]
-    );
-    assert!(alt.window_actions.is_empty());
-    assert_eq!(
-        fullscreen.keyboard_events,
-        vec![NativeKeyboardEvent::new(KEY_F11, true)]
-    );
-    assert!(fullscreen.window_actions.is_empty());
-}
-
-#[test]
-fn native_input_shortcut_inhibition_keeps_emergency_exit_shortcut() {
-    let mut input = NativeInputState::new(320, 200);
-    input.set_keyboard_shortcuts_inhibited(true);
-    input.handle_key_event(KEY_LEFTALT, 1);
-
-    let effect = input.handle_key_event(KEY_P, 1);
-
-    assert!(effect.exit_requested);
-    assert!(effect.keyboard_events.is_empty());
 }
 
 #[test]

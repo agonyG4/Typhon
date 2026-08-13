@@ -50,6 +50,8 @@ use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGenerat
 mod server_globals;
 #[path = "server_gpu_globals.rs"]
 mod server_gpu_globals;
+#[path = "server_shortcut_inhibition.rs"]
+mod server_shortcut_inhibition;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
@@ -113,7 +115,6 @@ impl ClientData for TyphonClientData {
         }
     }
 }
-
 impl Drop for OwnCompositorServer {
     fn drop(&mut self) {
         if self.shutdown_releases_armed {
@@ -121,7 +122,6 @@ impl Drop for OwnCompositorServer {
         }
     }
 }
-
 impl OwnCompositorServer {
     pub(crate) fn focused_x11_window_xid(&self) -> Option<u32> {
         let window_id = self.state.focused_window_id?;

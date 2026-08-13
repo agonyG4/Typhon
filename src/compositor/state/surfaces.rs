@@ -751,6 +751,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
+        self.remove_keyboard_shortcut_inhibitors_for_surface(surface_id);
         if let Some(active) = self.active_fifo_barriers.get(&surface_id).copied() {
             self.clear_fifo_barrier_claim(
                 FifoBarrierClaim {

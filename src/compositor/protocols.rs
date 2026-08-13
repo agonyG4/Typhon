@@ -9,6 +9,7 @@ mod fifo;
 mod globals;
 mod idle_inhibit;
 mod input;
+mod keyboard_shortcuts_inhibit;
 mod layer_shell;
 mod presentation;
 mod presentation_modes;

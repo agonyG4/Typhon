@@ -161,6 +161,7 @@ The target contract is:
 | `zwp_pointer_constraints_v1` | 1 | pointer-constraints capability |
 | `wp_pointer_warp_v1` | 1 | pointer-warp capability |
 | `zwp_idle_inhibit_manager_v1` | 1 | idle-inhibit capability |
+| `zwp_keyboard_shortcuts_inhibit_manager_v1` | 1 | keyboard-shortcuts-inhibit capability |
 | `zwp_primary_selection_device_manager_v1` | 1 | primary-selection capability |
 | `ext_data_control_manager_v1` | 1 | data-control capability |
 | `zwp_linux_dmabuf_v1` | 4 | GPU-buffer capability |

@@ -38,6 +38,119 @@ fn idle_inhibitor_tracks_unmap_remap_and_destroy_lifecycle() {
 }
 
 #[test]
+fn keyboard_shortcuts_inhibit_focused_mapped_surface_emits_active_once() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        keyboard_shortcuts_inhibit: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _inhibitor = manager.inhibit_shortcuts(&surface, &seat, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.shortcut_inhibitor_active_count, 1);
+    assert_eq!(state.shortcut_inhibitor_inactive_count, 0);
+    let surface_id = capture_focused_surface_id(&commands).expect("keyboard focus surface");
+    commands
+        .send(ServerCommand::SetShortcutInhibitorPolicy {
+            surface_id,
+            enabled: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.shortcut_inhibitor_inactive_count, 1);
+    commands
+        .send(ServerCommand::SetShortcutInhibitorPolicy {
+            surface_id,
+            enabled: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.shortcut_inhibitor_active_count, 2);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn keyboard_shortcuts_inhibit_unmapped_surface_waits_for_focus_and_mapping() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        keyboard_shortcuts_inhibit: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let _inhibitor = manager.inhibit_shortcuts(&surface, &seat, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.shortcut_inhibitor_active_count, 0);
+    assert_eq!(state.shortcut_inhibitor_inactive_count, 0);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.shortcut_inhibitor_active_count, 1);
+    assert_eq!(state.shortcut_inhibitor_inactive_count, 0);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn wayland_client_surface_commit_sends_output_enter() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

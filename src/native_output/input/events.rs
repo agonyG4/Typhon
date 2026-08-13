@@ -321,6 +321,39 @@ impl NativePointerConstraintState {
 }
 
 impl NativeInputEffect {
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.redraw_requested |= other.redraw_requested;
+        self.visual_redraw_requested |= other.visual_redraw_requested;
+        self.exit_requested |= other.exit_requested;
+        self.cursor_moved |= other.cursor_moved;
+        if other.cursor_position.is_some() {
+            self.cursor_position = other.cursor_position;
+        }
+        self.keyboard_events.append(&mut other.keyboard_events);
+        if other.pointer_motion.is_some() {
+            self.pointer_motion = other.pointer_motion;
+        }
+        if other.pointer_motion_usec.is_some() {
+            self.pointer_motion_usec = other.pointer_motion_usec;
+        }
+        if other.relative_motion.is_some() {
+            self.relative_motion = other.relative_motion;
+        }
+        self.pointer_buttons.append(&mut other.pointer_buttons);
+        if other.pointer_axis.is_some() {
+            self.pointer_axis = other.pointer_axis;
+        }
+        self.window_actions.append(&mut other.window_actions);
+        self.shortcut_events.append(&mut other.shortcut_events);
+        if other.launch_command.is_some() {
+            self.launch_command = other.launch_command;
+            self.launch_source = other.launch_source;
+        }
+        if other.vt_switch.is_some() {
+            self.vt_switch = other.vt_switch;
+        }
+    }
+
     pub(crate) fn request_redraw(&mut self) {
         self.redraw_requested = true;
     }

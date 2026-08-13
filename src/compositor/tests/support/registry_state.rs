@@ -74,6 +74,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) keyboard_enter_count: usize,
     pub(in crate::compositor::tests) keyboard_leave_count: usize,
     pub(in crate::compositor::tests) keyboard_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) shortcut_inhibitor_active_count: usize,
+    pub(in crate::compositor::tests) shortcut_inhibitor_inactive_count: usize,
     pub(in crate::compositor::tests) surface_enter_count: usize,
     pub(in crate::compositor::tests) surface_leave_count: usize,
     pub(in crate::compositor::tests) preferred_buffer_scales: Vec<i32>,
@@ -1029,6 +1031,52 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
             }
             client_wl_keyboard::Event::RepeatInfo { .. } => {
                 state.keyboard_repeat_info = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl
+    Dispatch<
+        client_zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        (),
+    > for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        _event: client_zwp_keyboard_shortcuts_inhibit_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        [0 => (client_zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1, ())]
+    );
+}
+
+impl Dispatch<client_zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+        event: client_zwp_keyboard_shortcuts_inhibitor_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {
+                state.shortcut_inhibitor_active_count += 1;
+            }
+            client_zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
+                state.shortcut_inhibitor_inactive_count += 1;
             }
             _ => {}
         }

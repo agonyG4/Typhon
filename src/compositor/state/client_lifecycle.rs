@@ -117,6 +117,7 @@ impl CompositorState {
     }
 
     fn teardown_non_surface_resources_for_client(&mut self, client_id: &ClientId) {
+        self.remove_keyboard_shortcut_inhibitors_for_client(client_id);
         self.remove_astrea_toplevel_client(client_id);
         if self.active_drag.as_ref().is_some_and(|drag| {
             drag.target_client.as_ref() == Some(client_id)

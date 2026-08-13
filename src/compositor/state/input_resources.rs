@@ -313,6 +313,7 @@ impl CompositorState {
         ));
         self.keyboard_surface = Some(surface.clone());
         self.publish_clipboard_to_focused_client();
+        self.refresh_keyboard_shortcut_inhibition();
     }
 
     pub(in crate::compositor) fn send_keyboard_modifiers(
@@ -348,6 +349,7 @@ impl CompositorState {
             .cloned()
             .collect::<Vec<_>>();
         if keyboards.is_empty() {
+            self.refresh_keyboard_shortcut_inhibition();
             return;
         }
 
@@ -363,6 +365,7 @@ impl CompositorState {
             compositor_surface_id(&surface),
             wayland_resource_client_label(&surface)
         ));
+        self.refresh_keyboard_shortcut_inhibition();
     }
 
     pub(in crate::compositor) fn send_pointer_motion(&mut self, x: f64, y: f64) {

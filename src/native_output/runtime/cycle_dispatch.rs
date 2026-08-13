@@ -741,7 +741,10 @@ impl NativeRuntime {
         let coalesced_input_events = coalesced_events.len();
         for (event_index, event) in coalesced_events.into_iter().enumerate() {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
-            let effect = input_state.handle_hardware_input_event(event);
+            let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
+                server.keyboard_shortcut_inhibition_snapshot(),
+            );
+            effect.append(input_state.handle_hardware_input_event(event));
             let effect_requested_redraw = effect.redraw_requested;
             let cursor_visible = !server.client_cursor_explicitly_hidden()
                 && (server.client_cursor_render_state().is_some()

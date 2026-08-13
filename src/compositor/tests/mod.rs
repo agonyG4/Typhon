@@ -62,6 +62,10 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1 as client_zwp_idle_inhibit_manager_v1,
     zwp_idle_inhibitor_v1 as client_zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1 as client_zwp_keyboard_shortcuts_inhibit_manager_v1,
+    zwp_keyboard_shortcuts_inhibitor_v1 as client_zwp_keyboard_shortcuts_inhibitor_v1,
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1 as client_zwp_linux_buffer_params_v1,
     zwp_linux_dmabuf_feedback_v1 as client_zwp_linux_dmabuf_feedback_v1,

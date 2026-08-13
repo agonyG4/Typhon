@@ -12,6 +12,7 @@ pub enum ProtocolGlobal {
     WpRelativePointer,
     WpPointerConstraints,
     WpIdleInhibit,
+    WpKeyboardShortcutsInhibit,
     WpPrimarySelection,
     WpFifo,
     WpCommitTiming,
@@ -42,6 +43,7 @@ impl ProtocolGlobal {
             Self::WpRelativePointer => "zwp_relative_pointer_manager_v1",
             Self::WpPointerConstraints => "zwp_pointer_constraints_v1",
             Self::WpIdleInhibit => "zwp_idle_inhibit_manager_v1",
+            Self::WpKeyboardShortcutsInhibit => "zwp_keyboard_shortcuts_inhibit_manager_v1",
             Self::WpPrimarySelection => "zwp_primary_selection_device_manager_v1",
             Self::WpFifo => "wp_fifo_manager_v1",
             Self::WpCommitTiming => "wp_commit_timing_manager_v1",
@@ -84,10 +86,38 @@ impl InputProtocolCapabilities {
             relative_pointer: true,
             pointer_constraints: true,
             pointer_warp: true,
-            keyboard_shortcuts_inhibit: false,
+            keyboard_shortcuts_inhibit: true,
             idle_inhibit: true,
         }
     }
+}
+
+/// Compositor-owned keyboard shortcut routing state consumed by native input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardShortcutInhibitionSnapshot {
+    pub effective: bool,
+    pub generation: u64,
+}
+
+impl KeyboardShortcutInhibitionSnapshot {
+    pub const fn new(effective: bool, generation: u64) -> Self {
+        Self {
+            effective,
+            generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyboardShortcutInhibitionMetrics {
+    pub created: u64,
+    pub destroyed: u64,
+    pub duplicate_requests: u64,
+    pub effective_activations: u64,
+    pub relevance_deactivations: u64,
+    pub policy_deactivations: u64,
+    pub policy_reactivations: u64,
+    pub stale_cleanup: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +308,9 @@ pub fn client_protocols_for_capabilities_with_presentation(
     }
     if input_capabilities.idle_inhibit {
         protocols.insert(insert_at, ProtocolGlobal::WpIdleInhibit);
+    }
+    if input_capabilities.keyboard_shortcuts_inhibit {
+        protocols.insert(insert_at, ProtocolGlobal::WpKeyboardShortcutsInhibit);
     }
     protocols
 }

@@ -57,6 +57,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         key: u32,
         pressed: bool,
     },
+    SetShortcutInhibitorPolicy {
+        surface_id: u32,
+        enabled: bool,
+    },
     PointerMotion {
         x: f64,
         y: f64,
@@ -268,6 +272,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                 match command {
                     ServerCommand::KeyboardKey { key, pressed } => {
                         server.send_keyboard_key(key, pressed);
+                    }
+                    ServerCommand::SetShortcutInhibitorPolicy {
+                        surface_id,
+                        enabled,
+                    } => {
+                        server
+                            .state
+                            .set_shortcut_inhibitor_policy_enabled_for_surface(surface_id, enabled);
                     }
                     ServerCommand::PointerMotion { x, y } => {
                         server.send_pointer_motion(x, y);

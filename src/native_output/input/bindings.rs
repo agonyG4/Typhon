@@ -181,6 +181,14 @@ impl AstreaBindingManager {
         AstreaBindingMatch::Pass
     }
 
+    pub(crate) fn cancel_shortcut_sequences_for_inhibition(&mut self) {
+        // Inhibition transfers ownership of subsequent keyboard input to the
+        // focused client.  Cancel stateful compositor sequences without
+        // emitting their completion action; physical modifier truth remains
+        // owned by NativeInputState.
+        self.active_sequences.alt_tab_active = false;
+    }
+
     fn match_binding(
         &self,
         modifiers: ModifierMask,

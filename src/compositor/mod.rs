@@ -508,6 +508,7 @@ pub struct CompositorState {
     focused_window_id: Option<WindowId>,
     focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
+    shortcut_inhibition: ShortcutInhibitionRegistry,
     keyboard_modifiers: KeyboardModifierState,
     pressed_keys: HashSet<u32>,
     pointer_surface: Option<wl_surface::WlSurface>,
@@ -752,7 +753,6 @@ struct PointerConstraint {
     pending_cursor_position_hint: Option<(f64, f64)>,
     committed_cursor_position_hint: Option<(f64, f64)>,
 }
-
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct PointerConstraintRegistration {
     id: u64,
@@ -764,7 +764,6 @@ pub(in crate::compositor) struct PointerConstraintRegistration {
     confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
     region: SurfaceInputRegion,
 }
-
 impl PointerConstraint {
     fn backend_id(&self) -> PointerConstraintBackendId {
         PointerConstraintBackendId {

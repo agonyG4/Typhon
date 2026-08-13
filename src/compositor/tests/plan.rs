@@ -148,6 +148,7 @@ fn native_libinput_profile_advertises_serviced_input_protocols() {
     assert!(names.contains(&"zwp_pointer_constraints_v1"));
     assert!(names.contains(&"wp_pointer_warp_v1"));
     assert!(names.contains(&"zwp_idle_inhibit_manager_v1"));
+    assert!(names.contains(&"zwp_keyboard_shortcuts_inhibit_manager_v1"));
 }
 
 #[test]

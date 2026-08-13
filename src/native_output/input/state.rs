@@ -11,10 +11,12 @@ pub(crate) struct NativeInputState {
     pub(crate) super_pressed: bool,
     pub(crate) shift_pressed: bool,
     pub(crate) keyboard_shortcuts_inhibited: bool,
+    keyboard_shortcut_inhibition_generation: u64,
     pub(crate) pointer_constraint: NativePointerConstraintState,
     pub(crate) binding_manager: AstreaBindingManager,
     pub(crate) cursor_visible: bool,
     pub(crate) forwarded_control_keys: Vec<u16>,
+    pub(crate) forwarded_client_keys: Vec<u16>,
     pub(crate) pressed_deferred_modifier_keys: Vec<u16>,
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
@@ -33,10 +35,12 @@ impl NativeInputState {
             super_pressed: false,
             shift_pressed: false,
             keyboard_shortcuts_inhibited: false,
+            keyboard_shortcut_inhibition_generation: 0,
             pointer_constraint: NativePointerConstraintState::None,
             binding_manager: AstreaBindingManager::default(),
             cursor_visible: true,
             forwarded_control_keys: Vec::new(),
+            forwarded_client_keys: Vec::new(),
             pressed_deferred_modifier_keys: Vec::new(),
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
@@ -44,9 +48,28 @@ impl NativeInputState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_keyboard_shortcuts_inhibited(&mut self, inhibited: bool) {
-        self.keyboard_shortcuts_inhibited = inhibited;
+    pub(crate) fn reconcile_keyboard_shortcut_inhibition(
+        &mut self,
+        snapshot: KeyboardShortcutInhibitionSnapshot,
+    ) -> NativeInputEffect {
+        if snapshot.generation == self.keyboard_shortcut_inhibition_generation {
+            return NativeInputEffect::default();
+        }
+
+        self.keyboard_shortcut_inhibition_generation = snapshot.generation;
+        if self.keyboard_shortcuts_inhibited == snapshot.effective {
+            return NativeInputEffect::default();
+        }
+
+        let was_inhibited = self.keyboard_shortcuts_inhibited;
+        self.keyboard_shortcuts_inhibited = snapshot.effective;
+        let mut effect = NativeInputEffect::default();
+        if !was_inhibited && snapshot.effective {
+            self.binding_manager
+                .cancel_shortcut_sequences_for_inhibition();
+            self.replay_deferred_modifiers(&mut effect);
+        }
+        effect
     }
 
     pub(crate) fn cursor_position(&self) -> (i32, i32) {
@@ -151,10 +174,7 @@ impl NativeInputState {
                 self.apply_binding_action(action, phase, None, &mut effect);
             }
             if !repeated {
-                effect
-                    .keyboard_events
-                    .push(NativeKeyboardEvent::new(code, pressed));
-                effect.request_redraw();
+                self.forward_client_key(code, pressed, &mut effect);
             }
             return effect;
         }
@@ -257,10 +277,7 @@ impl NativeInputState {
         if self.keyboard_shortcuts_inhibited {
             if !repeated {
                 self.replay_deferred_modifiers(&mut effect);
-                effect
-                    .keyboard_events
-                    .push(NativeKeyboardEvent::new(code, pressed));
-                effect.request_redraw();
+                self.forward_client_key(code, pressed, &mut effect);
             }
             return effect;
         }
@@ -269,10 +286,7 @@ impl NativeInputState {
             if pressed {
                 self.replay_deferred_modifiers(&mut effect);
             }
-            effect
-                .keyboard_events
-                .push(NativeKeyboardEvent::new(code, pressed));
-            effect.request_redraw();
+            self.forward_client_key(code, pressed, &mut effect);
         }
         effect
     }
@@ -462,6 +476,31 @@ impl NativeInputState {
         effect.request_redraw();
     }
 
+    fn forward_client_key(&mut self, code: u16, pressed: bool, effect: &mut NativeInputEffect) {
+        if pressed {
+            if !self.forwarded_client_keys.contains(&code) {
+                self.forwarded_client_keys.push(code);
+            }
+            effect
+                .keyboard_events
+                .push(NativeKeyboardEvent::new(code, true));
+            effect.request_redraw();
+            return;
+        }
+        let Some(index) = self
+            .forwarded_client_keys
+            .iter()
+            .position(|forwarded| *forwarded == code)
+        else {
+            return;
+        };
+        self.forwarded_client_keys.swap_remove(index);
+        effect
+            .keyboard_events
+            .push(NativeKeyboardEvent::new(code, false));
+        effect.request_redraw();
+    }
+
     fn set_deferred_modifier_pressed(&mut self, code: u16, pressed: bool) {
         if pressed {
             if !self.pressed_deferred_modifier_keys.contains(&code) {
@@ -596,6 +635,7 @@ impl NativeInputState {
         self.super_pressed = false;
         self.shift_pressed = false;
         self.forwarded_control_keys.clear();
+        self.forwarded_client_keys.clear();
         self.pressed_deferred_modifier_keys.clear();
         self.forwarded_deferred_modifier_keys.clear();
         self.clear_pressed_pointer_buttons();
