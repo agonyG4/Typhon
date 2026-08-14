@@ -153,6 +153,45 @@ pub(super) struct PendingLayerConfigure {
     pub(super) serial: u32,
     pub(super) committed_state: LayerSurfaceCommitState,
     pub(super) geometry: LayerGeometry,
+    pub(super) origin: LayerConfigureOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LayerConfigureOrigin {
+    Initial,
+    ClientSurfaceCommit { initiator_surface_id: u32 },
+    CompositorLayout,
+}
+
+impl LayerConfigureOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ClientSurfaceCommit { .. } => "client-commit",
+            Self::CompositorLayout => "compositor-layout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerArrangeCause {
+    ClientSurfaceCommit { surface_id: u32 },
+    CompositorLayout,
+}
+
+impl LayerArrangeCause {
+    fn configure_origin(self, target_surface_id: u32) -> LayerConfigureOrigin {
+        match self {
+            Self::ClientSurfaceCommit { surface_id } if surface_id == target_surface_id => {
+                LayerConfigureOrigin::ClientSurfaceCommit {
+                    initiator_surface_id: surface_id,
+                }
+            }
+            Self::ClientSurfaceCommit { .. } | Self::CompositorLayout => {
+                LayerConfigureOrigin::CompositorLayout
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +323,10 @@ impl CompositorState {
             }
         };
         if committed_change {
-            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+                previous_usable,
+                LayerArrangeCause::ClientSurfaceCommit { surface_id },
+            );
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         if self
@@ -305,6 +347,10 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
+        let pending_configures_before_commit = self
+            .layer_surfaces
+            .get(&surface_id)
+            .map_or(0, |role| role.pending_configures.len());
         let previous_usable = self.reserved_usable_geometry();
         if self
             .commit_pending_layer_surface_state(surface_id)
@@ -317,7 +363,10 @@ impl CompositorState {
             .get(&surface_id)
             .is_some_and(|role| role.mapped)
         {
-            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+                previous_usable,
+                LayerArrangeCause::ClientSurfaceCommit { surface_id },
+            );
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         let Some(role) = self.layer_surfaces.get(&surface_id) else {
@@ -326,13 +375,23 @@ impl CompositorState {
         let requires_initial_ack = !role.mapped && role.acked_configure.is_none();
         if !role.initial_configure_sent || requires_initial_ack {
             let resource = role.resource.clone();
+            let pending_configure = role
+                .pending_configures
+                .back()
+                .map(|configure| (configure.serial, configure.origin));
             self.note_protocol_error_metric();
             resource.post_error(
                 zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                 "layer surface buffer committed before configure was acknowledged".to_string(),
             );
-            layer_shell_debug_log(|| {
-                format!("commit surface={surface_id} rejected=buffer-before-configure-ack")
+            layer_shell_debug_log(|| match pending_configure {
+                Some((configure_serial, configure_origin)) => format!(
+                    "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial={configure_serial} configure_origin={}",
+                    configure_origin.label()
+                ),
+                None => format!(
+                    "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial=none configure_origin=none"
+                ),
             });
             return false;
         }
@@ -341,11 +400,16 @@ impl CompositorState {
             && !role.pending_configures.is_empty()
             && let Some(pending) = pending_surface_size
         {
-            let commits_unacked_configure_size = role.pending_configures.iter().any(|configure| {
-                let size = configure.geometry.size();
-                pending.width == size.0 && pending.height == size.1
-            });
-            if commits_unacked_configure_size {
+            let matching_configure = role
+                .pending_configures
+                .iter()
+                .take(pending_configures_before_commit)
+                .find(|configure| {
+                    let size = configure.geometry.size();
+                    pending.width == size.0 && pending.height == size.1
+                })
+                .map(|configure| (configure.serial, configure.origin));
+            if let Some((configure_serial, configure_origin)) = matching_configure {
                 let resource = role.resource.clone();
                 self.note_protocol_error_metric();
                 resource.post_error(
@@ -353,7 +417,11 @@ impl CompositorState {
                     "layer surface buffer committed before configure was acknowledged".to_string(),
                 );
                 layer_shell_debug_log(|| {
-                    format!("commit surface={surface_id} rejected=buffer-before-configure-ack")
+                    format!(
+                        "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial={} configure_origin={}",
+                        configure_serial,
+                        configure_origin.label()
+                    )
                 });
                 return false;
             }
@@ -378,7 +446,10 @@ impl CompositorState {
             role.mapped = true;
             role.order = activation_order;
         }
-        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
+        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+            previous_usable,
+            LayerArrangeCause::CompositorLayout,
+        );
         if should_focus {
             self.recompute_layer_keyboard_focus();
         }
@@ -400,7 +471,10 @@ impl CompositorState {
         role.initial_configure_sent = false;
         if was_mapped {
             self.unregister_layer_surface_popups(surface_id);
-            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+                previous_usable,
+                LayerArrangeCause::CompositorLayout,
+            );
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         self.recompute_layer_keyboard_focus();
@@ -465,7 +539,10 @@ impl CompositorState {
         self.layer_surfaces.remove(&surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::LayerSurface);
         self.unmap_surface_content(surface_id);
-        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
+        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+            previous_usable,
+            LayerArrangeCause::CompositorLayout,
+        );
         self.reorder_renderable_surfaces_by_committed_stack();
         self.recompute_layer_keyboard_focus();
     }
@@ -601,10 +678,15 @@ impl CompositorState {
         let Some(geometry) = self.arranged_layer_geometry_for_surface(surface_id) else {
             return;
         };
-        self.send_layer_surface_configure(surface_id, geometry);
+        self.send_layer_surface_configure(surface_id, geometry, LayerConfigureOrigin::Initial);
     }
 
-    fn send_layer_surface_configure(&mut self, surface_id: u32, geometry: LayerGeometry) {
+    fn send_layer_surface_configure(
+        &mut self,
+        surface_id: u32,
+        geometry: LayerGeometry,
+        origin: LayerConfigureOrigin,
+    ) {
         let serial = self.next_configure_serial();
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
             return;
@@ -613,6 +695,7 @@ impl CompositorState {
             serial,
             committed_state: role.committed,
             geometry,
+            origin,
         };
         role.initial_configure_sent = true;
         role.geometry = Some(geometry);
@@ -622,20 +705,21 @@ impl CompositorState {
             .configure(serial, geometry.width, geometry.height);
         layer_shell_debug_log(|| {
             format!(
-                "configure surface={surface_id} wl_surface={} namespace={} layer={:?} output={:?} version={} serial={serial} size={}x{}",
+                "configure surface={surface_id} wl_surface={} namespace={} layer={:?} output={:?} version={} serial={serial} size={}x{} origin={}",
                 role.surface.id().protocol_id(),
                 role.namespace,
                 role.committed.layer,
                 role.output_id,
                 role.version,
                 geometry.width,
-                geometry.height
+                geometry.height,
+                origin.label()
             )
         });
     }
 
     pub(in crate::compositor) fn reconfigure_layer_surfaces_for_output_change(&mut self) {
-        self.arrange_layer_surfaces();
+        self.arrange_layer_surfaces(LayerArrangeCause::CompositorLayout);
     }
 
     pub(in crate::compositor) fn usable_output_geometry(&self) -> OutputRect {
@@ -725,7 +809,7 @@ impl CompositorState {
         geometries
     }
 
-    fn arrange_layer_surfaces(&mut self) {
+    fn arrange_layer_surfaces(&mut self, cause: LayerArrangeCause) {
         let mut geometries = self
             .arranged_layer_geometries(None)
             .into_iter()
@@ -740,7 +824,11 @@ impl CompositorState {
                 SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
             );
             if self.layer_surface_needs_size_configure(surface_id, geometry) {
-                self.send_layer_surface_configure(surface_id, geometry);
+                self.send_layer_surface_configure(
+                    surface_id,
+                    geometry,
+                    cause.configure_origin(surface_id),
+                );
             }
             layer_shell_debug_log(|| {
                 format!(
@@ -761,8 +849,9 @@ impl CompositorState {
     fn arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
         &mut self,
         previous_usable: LayerLayoutRect,
+        cause: LayerArrangeCause,
     ) {
-        self.arrange_layer_surfaces();
+        self.arrange_layer_surfaces(cause);
         if self.reserved_usable_geometry() != previous_usable {
             self.reconfigure_stateful_windows_for_output_size();
         }

@@ -1513,6 +1513,144 @@ fn mapped_layer_surface_can_commit_old_buffer_while_new_configure_is_pending() {
 }
 
 #[test]
+fn mapped_layer_surface_can_commit_client_requested_resize_before_same_commit_configure_ack() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "client-resize-before-same-commit-ack",
+    );
+    layer_surface.set_anchor(client_zwlr_layer_surface_v1::Anchor::Bottom);
+    layer_surface.set_exclusive_zone(68);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    layer_surface.set_size(300, 68);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.layer_surface_configure_count, 1);
+    commit_test_buffered_surface(&surface, &shm, &qh, 300, 68).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    layer_surface.set_size(360, 68);
+    commit_test_buffered_surface(&surface, &shm, &qh, 360, 68).unwrap();
+    connection.flush().unwrap();
+
+    // The compositor may send the resize configure while processing this same
+    // commit, but the client could not acknowledge it until after the commit.
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+    assert_eq!(
+        (state.layer_surface_width, state.layer_surface_height),
+        (360, 68)
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn mapped_layer_surface_can_commit_one_hundred_client_requested_resizes() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "client-resize-stress",
+    );
+    layer_surface.set_anchor(client_zwlr_layer_surface_v1::Anchor::Bottom);
+    layer_surface.set_exclusive_zone(68);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    layer_surface.set_size(300, 68);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 300, 68).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    for step in 0..100 {
+        let width = 304 + step * 4;
+        layer_surface.set_size(width, 68);
+        commit_test_buffered_surface(&surface, &shm, &qh, width as usize, 68).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+    }
+
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    assert_eq!((surfaces[0].width, surfaces[0].height), (700, 68));
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn mapped_layer_surface_state_only_resize_emits_configure_without_new_buffer() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "client-state-only-resize",
+    );
+    layer_surface.set_anchor(client_zwlr_layer_surface_v1::Anchor::Bottom);
+    layer_surface.set_exclusive_zone(68);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    layer_surface.set_size(300, 68);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 300, 68).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    layer_surface.set_size(360, 68);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.layer_surface_configure_count, 2);
+    assert_eq!(
+        (state.layer_surface_width, state.layer_surface_height),
+        (360, 68)
+    );
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn acking_latest_configure_maps_and_repaints_without_stale_configure_error() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);
