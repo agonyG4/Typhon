@@ -60,10 +60,18 @@ grants access.
 
 For read-only publication and v1 compatibility, the compositor-launched shell
 path may continue to admit the currently supervised Astrea shell component and
-its verified descendants. That admission is not sufficient for v2 mutation:
-activate, minimize, restore, and close require the exact ClientId to have
-completed capability authentication. Application IDs, titles, environment
-variables and claimed client metadata are never authorization inputs.
+its verified descendants. The authorization roots belong to the active
+supervised critical shell process: Typhon revokes the exited root and
+authorizes a replacement root when the supervisor restarts it. A suppressed
+restart leaves no authorization for the dead root. That admission is not
+sufficient for v2 mutation: activate, minimize, restore, and close require the
+exact ClientId to have completed capability authentication. Application IDs,
+titles, environment variables and claimed client metadata are never
+authorization inputs.
+
+The transfer is performed while reaping supervised children, before the native
+runtime dispatches the next Wayland client request, so a replacement shell can
+authenticate immediately without reopening a stale authorization window.
 
 The current Wayland backend does not provide a state-aware global filter to the
 compositor's publication model, so the global may remain visible to registry

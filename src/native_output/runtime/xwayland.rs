@@ -18,6 +18,22 @@ fn coalesce_client_list_sync(commands: Vec<XwmCommand>) -> Vec<XwmCommand> {
     normalized
 }
 
+fn transfer_astrea_shell_authorization(
+    server: &mut OwnCompositorServer,
+    kind: ProcessKind,
+    pid: u32,
+    restarted_pid: Option<u32>,
+) -> Option<u32> {
+    if kind != ProcessKind::ShellSessionCritical {
+        return None;
+    }
+    server.revoke_astrea_shell_pid(pid);
+    if let Some(restarted_pid) = restarted_pid {
+        server.authorize_astrea_shell_pid(restarted_pid);
+    }
+    restarted_pid
+}
+
 #[derive(Debug, Default)]
 struct DestroyedCommandNormalization {
     commands: Vec<XwmCommand>,
@@ -328,6 +344,25 @@ impl NativeRuntime {
             if xwayland_exit {
                 self.revoke_xwayland_private_client();
             }
+            if exit.kind == ProcessKind::ShellSessionCritical {
+                let transferred_pid = transfer_astrea_shell_authorization(
+                    &mut self.server,
+                    exit.kind,
+                    exit.pid,
+                    exit.restarted_pid,
+                );
+                if let Some(restarted_pid) = transferred_pid {
+                    eprintln!(
+                        "oblivion-one shell authorization: revoked_pid={} authorized_pid={restarted_pid}",
+                        exit.pid,
+                    );
+                } else {
+                    eprintln!(
+                        "oblivion-one shell authorization: revoked_pid={} replacement=none",
+                        exit.pid,
+                    );
+                }
+            }
             let finished_status = astrea_launch_finished_status(exit.status);
             self.perf.log("process.exit", || {
                 vec![
@@ -435,6 +470,62 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn critical_shell_restart_transfers_authorization_to_replacement() {
+        let socket_name = format!("typhon-shell-auth-transfer-{}", std::process::id());
+        let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+        let old_pid = 41;
+        let replacement_pid = 42;
+        server.authorize_astrea_shell_pid(old_pid);
+
+        assert_eq!(
+            transfer_astrea_shell_authorization(
+                &mut server,
+                ProcessKind::ShellSessionCritical,
+                old_pid,
+                Some(replacement_pid),
+            ),
+            Some(replacement_pid)
+        );
+    }
+
+    #[test]
+    fn suppressed_critical_restart_revokes_old_pid_and_pid_reuse_stays_unauthorized() {
+        let socket_name = format!("typhon-shell-auth-suppressed-{}", std::process::id());
+        let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+        let old_pid = 51;
+        server.authorize_astrea_shell_pid(old_pid);
+
+        assert_eq!(
+            transfer_astrea_shell_authorization(
+                &mut server,
+                ProcessKind::ShellSessionCritical,
+                old_pid,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn noncritical_process_exit_does_not_change_shell_authorization() {
+        let socket_name = format!("typhon-shell-auth-noncritical-{}", std::process::id());
+        let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+        let old_pid = 61;
+        let replacement_pid = 62;
+        server.authorize_astrea_shell_pid(old_pid);
+
+        assert_eq!(
+            transfer_astrea_shell_authorization(
+                &mut server,
+                ProcessKind::Application,
+                old_pid,
+                Some(replacement_pid),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn coalesce_client_list_sync_keeps_only_final_snapshot_after_other_commands() {

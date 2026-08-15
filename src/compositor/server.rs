@@ -1285,6 +1285,10 @@ impl OwnCompositorServer {
         self.state.authorize_astrea_shell_pid(pid);
     }
 
+    pub fn revoke_astrea_shell_pid(&mut self, pid: u32) {
+        self.state.revoke_astrea_shell_pid(pid);
+    }
+
     #[cfg(test)]
     pub(crate) fn clear_astrea_shell_authorization(&mut self) {
         self.state.clear_astrea_shell_authorization();

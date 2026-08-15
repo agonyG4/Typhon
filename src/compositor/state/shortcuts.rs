@@ -143,6 +143,10 @@ impl CompositorState {
         self.astrea_shell_client_pids.insert(pid);
     }
 
+    pub(in crate::compositor) fn revoke_astrea_shell_pid(&mut self, pid: u32) {
+        self.astrea_shell_client_pids.remove(&pid);
+    }
+
     #[cfg(test)]
     pub(in crate::compositor) fn clear_astrea_shell_authorization(&mut self) {
         self.astrea_shell_authenticated_clients.clear();

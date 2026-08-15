@@ -556,6 +556,71 @@ fn astrea_shell_shortcuts_require_authorized_client_pid() {
 }
 
 #[test]
+fn astrea_shell_pid_revoke_blocks_a_new_client() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    server.revoke_astrea_shell_pid(std::process::id());
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let _shortcut = manager.register_shortcut(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Revoked Spotlight".to_string(),
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.astrea_shortcut_cancelled_count, 1);
+    assert_ne!(state.astrea_shortcut_cancelled_serials[0], 0);
+}
+
+#[test]
+fn astrea_shell_pid_restart_transfer_authorizes_only_the_replacement() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let old_pid = std::process::id().saturating_add(1);
+    server.authorize_astrea_shell_pid(old_pid);
+    server.revoke_astrea_shell_pid(old_pid);
+    server.authorize_astrea_shell_pid(std::process::id());
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let _shortcut = manager.register_shortcut(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Restarted Spotlight".to_string(),
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.astrea_shortcut_cancelled_count, 0);
+}
+
+#[test]
 fn astrea_shell_shortcuts_allow_authorized_shell_descendant_pid() {
     let mut authorized = HashSet::new();
     authorized.insert(10);
