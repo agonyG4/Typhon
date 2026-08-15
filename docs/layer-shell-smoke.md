@@ -19,8 +19,9 @@ is tracked separately from client-committed layer state and buffer geometry.
 With debugging enabled, configure and rejection messages include the client PID,
 internal surface ID, Wayland surface and layer-surface resource IDs, namespace,
 layer, mapping state, configure serial history, acknowledgement state, requested
-client size, buffer size, and current compositor geometry. The pending serial
-history is bounded.
+client size, buffer size, and current compositor geometry. The current configure
+serial and origin, plus bounded pending serial/origin history, are included in
+the diagnostic line.
 
 ## Eclipse-style overlay
 

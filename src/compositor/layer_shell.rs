@@ -170,6 +170,16 @@ impl LayerConfigureOrigin {
             Self::CompositorLayout => "compositor-layout",
         }
     }
+
+    fn debug_label(self) -> String {
+        match self {
+            Self::Initial => self.label().to_string(),
+            Self::ClientSurfaceCommit {
+                initiator_surface_id,
+            } => format!("{}({initiator_surface_id})", self.label()),
+            Self::CompositorLayout => self.label().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +265,7 @@ pub(super) struct LayerSurfaceRole {
 }
 
 impl LayerSurfaceRole {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         surface: wl_surface::WlSurface,
         resource: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -300,7 +311,7 @@ fn layer_surface_debug_details(
         .pending_configures
         .iter()
         .take(8)
-        .map(|configure| configure.serial.to_string())
+        .map(|configure| format!("{}:{}", configure.serial, configure.origin.debug_label()))
         .collect::<Vec<_>>()
         .join(",");
     let pending_serials = if role.pending_configures.len() > 8 {
@@ -318,10 +329,7 @@ fn layer_surface_debug_details(
     let last_ack = role
         .last_acknowledged_serial
         .map_or_else(|| "none".to_string(), |serial| serial.to_string());
-    let requested_size = format!(
-        "{}x{}",
-        role.committed.size.width, role.committed.size.height
-    );
+    let requested_size = format!("{}x{}", role.pending.size.width, role.pending.size.height);
     let buffer_size = pending_surface_size.map_or_else(
         || "none".to_string(),
         |size| format!("{}x{}", size.width, size.height),
@@ -335,8 +343,16 @@ fn layer_surface_debug_details(
             )
         },
     );
+    let configure_serial = role.pending_configures.back().map_or_else(
+        || "none".to_string(),
+        |configure| configure.serial.to_string(),
+    );
+    let configure_origin = role.pending_configures.back().map_or_else(
+        || "none".to_string(),
+        |configure| configure.origin.debug_label(),
+    );
     format!(
-        "pid={} surface={} wl_surface={} layer_surface={} namespace={} layer={:?} mapped={} initial_configure_sent={} initial_configure_acknowledged={} pending={} pending_ack={} last_ack={} requested={} buffer={} geometry={} output={:?} version={}",
+        "pid={} surface={} wl_surface={} layer_surface={} namespace={} layer={:?} mapped={} initial_configure_sent={} initial_configure_acknowledged={} configure_serial={} configure_origin={} pending={} pending_ack={} last_ack={} requested={} buffer={} geometry={} output={:?} version={}",
         role.client_pid
             .map_or_else(|| "none".to_string(), |pid| pid.to_string()),
         surface_id,
@@ -347,6 +363,8 @@ fn layer_surface_debug_details(
         role.mapped,
         role.initial_configure_sent,
         role.initial_configure_acknowledged,
+        configure_serial,
+        configure_origin,
         pending_serials,
         pending_ack,
         last_ack,
