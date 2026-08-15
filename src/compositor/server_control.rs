@@ -7,6 +7,10 @@ use crate::control_snapshots::{
 };
 
 impl OwnCompositorServer {
+    pub fn revoke_astrea_shell_pid(&mut self, pid: u32) {
+        self.state.revoke_astrea_shell_pid(pid);
+    }
+
     pub fn control_window_snapshot(&self, id: WindowId) -> Option<WindowSnapshot> {
         let window = self.state.window(id)?;
         let (kind, x11) = match window.backend {
