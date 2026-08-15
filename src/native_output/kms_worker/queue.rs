@@ -281,6 +281,26 @@ pub(crate) struct WorkerInFlight {
     pub(crate) output_generation: u64,
     pub(crate) kind: crate::native_output::runtime::AtomicCommitKind,
     pub(crate) direct_content_key: Option<DirectScanoutCandidateKey>,
+    pub(crate) submit_returned_at_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerPresentationFeedback {
+    pub(crate) output_generation: u64,
+    pub(crate) target_sequence: u64,
+    pub(crate) presented_sequence: u64,
+    pub(crate) submit_returned_at_ns: u64,
+    pub(crate) target_presentation_ns: u64,
+    pub(crate) refresh_interval_ns: u64,
+}
+
+pub(super) fn take_presentation_feedback_for_generation(
+    feedback: &mut Option<WorkerPresentationFeedback>,
+    output_generation: u64,
+) -> Option<WorkerPresentationFeedback> {
+    feedback
+        .take()
+        .filter(|feedback| feedback.output_generation == output_generation)
 }
 
 #[derive(Debug)]
@@ -404,6 +424,7 @@ pub(crate) struct WorkerState {
     pub(crate) executing_bundle_identity: Option<KmsCommitBundleIdentity>,
     pub(crate) executing_primary: Option<AttachablePrimary>,
     pub(crate) inflight: Option<WorkerInFlight>,
+    pub(crate) presentation_feedback: Option<WorkerPresentationFeedback>,
     pub(crate) phase: KmsWorkerPhase,
     pub(crate) cursor_sidecar: CursorSidecarMailbox,
     pub(crate) established_base: Option<EstablishedKmsBase>,
@@ -505,6 +526,7 @@ impl WorkerShared {
                 executing_bundle_identity: None,
                 executing_primary: None,
                 inflight: None,
+                presentation_feedback: None,
                 phase: KmsWorkerPhase::Idle,
                 cursor_sidecar: CursorSidecarMailbox::default(),
                 established_base: None,

@@ -235,6 +235,8 @@ fn worker_timing_snapshot(snapshot: WorkerTimingSnapshot) -> WorkerTimingPerform
         submit_return_earliness: worker_signed_timing_summary_snapshot(
             snapshot.submit_return_earliness,
         ),
+        submit_ack_delay: worker_timing_summary_snapshot(snapshot.submit_ack_delay),
+        pageflip_ack_delay: worker_timing_summary_snapshot(snapshot.pageflip_ack_delay),
         test_only_duration: worker_timing_summary_snapshot(snapshot.test_only_duration),
         current_safety_margin_us: snapshot.current_safety_margin_ns / 1_000,
         target_hit_same_refresh: snapshot.target_same_refresh,

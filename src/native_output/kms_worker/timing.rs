@@ -8,6 +8,7 @@ const MIN_SAFETY_MARGIN_NS: u64 = 100_000;
 const INITIAL_SAFETY_MARGIN_NS: u64 = 1_000_000;
 const MAX_SAFETY_MARGIN_NS: u64 = 3_000_000;
 const SAMPLE_CAPACITY: usize = 120;
+const PRESENTATION_FLOOR_DECAY_SAMPLES: u8 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KmsTimingDecision {
@@ -27,6 +28,8 @@ pub(crate) struct KmsSubmissionBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KmsCommitTimingModel {
     safety_margin_ns: u64,
+    presentation_margin_floor_ns: u64,
+    presentation_floor_early_samples: u8,
     refresh_interval_ns: u64,
     submit_wake_lateness_ns: VecDeque<u64>,
     ioctl_duration_ns: VecDeque<u64>,
@@ -39,6 +42,8 @@ impl KmsCommitTimingModel {
             .max(1);
         let mut model = Self {
             safety_margin_ns: INITIAL_SAFETY_MARGIN_NS,
+            presentation_margin_floor_ns: 0,
+            presentation_floor_early_samples: 0,
             refresh_interval_ns,
             submit_wake_lateness_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             ioctl_duration_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
@@ -62,6 +67,12 @@ impl KmsCommitTimingModel {
         self.submit_wake_lateness_ns.clear();
         self.ioctl_duration_ns.clear();
         self.safety_margin_ns = self.clamp_margin(self.safety_margin_ns);
+        self.presentation_margin_floor_ns = if self.presentation_margin_floor_ns == 0 {
+            0
+        } else {
+            self.clamp_margin(self.presentation_margin_floor_ns)
+        };
+        self.presentation_floor_early_samples = 0;
     }
 
     pub(crate) fn submission_budget(&self) -> KmsSubmissionBudget {
@@ -94,7 +105,13 @@ impl KmsCommitTimingModel {
     pub(crate) fn observe_submit_delta_ns(&mut self, delta_ns: i64) {
         if delta_ns > 0 {
             let late_ns = u64::try_from(delta_ns).unwrap_or(u64::MAX);
-            self.safety_margin_ns = self.clamp_margin(late_ns.saturating_add(MIN_SAFETY_MARGIN_NS));
+            let required_margin_ns =
+                self.clamp_margin(late_ns.saturating_add(MIN_SAFETY_MARGIN_NS));
+            self.presentation_floor_early_samples = 0;
+            self.safety_margin_ns = self
+                .safety_margin_ns
+                .max(self.presentation_margin_floor_ns)
+                .max(required_margin_ns);
             return;
         }
         let difference = self.safety_margin_ns.saturating_sub(MIN_SAFETY_MARGIN_NS);
@@ -102,6 +119,21 @@ impl KmsCommitTimingModel {
             .safety_margin_ns
             .saturating_sub(difference / 16)
             .max(MIN_SAFETY_MARGIN_NS);
+        if self.presentation_margin_floor_ns > MIN_SAFETY_MARGIN_NS {
+            self.presentation_floor_early_samples =
+                self.presentation_floor_early_samples.saturating_add(1);
+            if self.presentation_floor_early_samples >= PRESENTATION_FLOOR_DECAY_SAMPLES {
+                let difference = self
+                    .presentation_margin_floor_ns
+                    .saturating_sub(MIN_SAFETY_MARGIN_NS);
+                self.presentation_margin_floor_ns = self
+                    .presentation_margin_floor_ns
+                    .saturating_sub(difference / 16)
+                    .max(MIN_SAFETY_MARGIN_NS);
+                self.presentation_floor_early_samples = 0;
+            }
+            self.safety_margin_ns = self.safety_margin_ns.max(self.presentation_margin_floor_ns);
+        }
     }
 
     pub(crate) fn observe_submit_result(
@@ -117,6 +149,24 @@ impl KmsCommitTimingModel {
         self.observe_submit_delta_ns(delta_ns);
     }
 
+    pub(crate) fn observe_missed_target(
+        &mut self,
+        submit_returned_ns: u64,
+        target_presentation_ns: u64,
+    ) {
+        let observed_headroom_ns = target_presentation_ns.saturating_sub(submit_returned_ns);
+        let required_margin_ns = observed_headroom_ns.saturating_add(MIN_SAFETY_MARGIN_NS);
+        self.presentation_margin_floor_ns = self
+            .presentation_margin_floor_ns
+            .max(self.clamp_margin(required_margin_ns));
+        self.presentation_floor_early_samples = 0;
+        if required_margin_ns > self.safety_margin_ns {
+            self.safety_margin_ns = self
+                .safety_margin_ns
+                .max(self.clamp_margin(required_margin_ns));
+        }
+    }
+
     pub(crate) fn observe_submission(
         &mut self,
         submit_wake_lateness_ns: u64,
@@ -127,7 +177,9 @@ impl KmsCommitTimingModel {
         let budget = nearest_rank(&self.submit_wake_lateness_ns, 95)
             .saturating_add(nearest_rank(&self.ioctl_duration_ns, 95))
             .saturating_add(MIN_SAFETY_MARGIN_NS);
-        self.safety_margin_ns = self.clamp_margin(budget);
+        self.safety_margin_ns = self
+            .clamp_margin(budget)
+            .max(self.presentation_margin_floor_ns);
     }
 
     fn clamp_margin(&self, value: u64) -> u64 {

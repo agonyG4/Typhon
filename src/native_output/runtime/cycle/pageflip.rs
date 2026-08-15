@@ -669,8 +669,13 @@ impl NativeRuntime {
                             .find(|ownership| ownership.job.token == pageflip_token)
                     {
                         worker.record_worker_target_result(
+                            ownership.job.output_generation,
                             ownership.job.target.sequence,
                             actual_logical_sequence,
+                            ownership.submit_returned_at.get(),
+                            ownership.job.target.presentation_time.get(),
+                            u64::try_from(ownership.job.target.refresh_interval.as_nanos())
+                                .unwrap_or(u64::MAX),
                         );
                     }
                     cycle_direct::settle_direct_pageflip(
@@ -742,8 +747,13 @@ impl NativeRuntime {
                         && let Some(worker) = kms_commit_worker.as_ref()
                     {
                         worker.record_worker_target_result(
+                            *drm_file_generation,
                             frame.target.sequence,
                             actual_logical_sequence,
+                            frame.submit_returned_at.get(),
+                            frame.target.presentation_time.get(),
+                            u64::try_from(frame.target.refresh_interval.as_nanos())
+                                .unwrap_or(u64::MAX),
                         );
                     }
                     let prepared_logical = prepare_presented_output_transaction(

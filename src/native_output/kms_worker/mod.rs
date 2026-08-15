@@ -44,6 +44,8 @@ mod signal_tests;
 mod task4_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;
 pub(crate) use bundle::KmsCursorOwner;
 #[cfg(test)]
 pub(crate) use bundle::KmsPrimaryOwner;

@@ -848,6 +848,11 @@ impl NativeRuntime {
                     self.quarantine_submitted_ownership(ownership)?;
                     return Err(error);
                 }
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_submit_ack_delay(
+                        monotonic_now_ns()?.saturating_sub(ownership.submit_returned_at.get()),
+                    );
+                }
                 if matches!(
                     ownership.job.kind,
                     AtomicCommitKind::CompositedPrimary { .. }

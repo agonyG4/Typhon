@@ -232,6 +232,8 @@ pub(crate) struct WorkerTimingMetrics {
     queue_residency: AtomicTimingSummary,
     submit_earliness: AtomicSignedTimingSummary,
     submit_return_earliness: AtomicSignedTimingSummary,
+    submit_ack_delay: AtomicTimingSummary,
+    pageflip_ack_delay: AtomicTimingSummary,
     test_only_duration: AtomicTimingSummary,
     current_safety_margin_ns: AtomicU64,
     target_same_refresh: AtomicU64,
@@ -250,6 +252,8 @@ pub(crate) struct WorkerTimingSnapshot {
     pub(crate) queue_residency: TimingSummarySnapshot,
     pub(crate) submit_earliness: SignedTimingSummarySnapshot,
     pub(crate) submit_return_earliness: SignedTimingSummarySnapshot,
+    pub(crate) submit_ack_delay: TimingSummarySnapshot,
+    pub(crate) pageflip_ack_delay: TimingSummarySnapshot,
     pub(crate) test_only_duration: TimingSummarySnapshot,
     pub(crate) current_safety_margin_ns: u64,
     pub(crate) target_same_refresh: u64,
@@ -283,6 +287,7 @@ impl WorkerTargetResult {
 }
 
 impl WorkerTimingMetrics {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_submission(
         &self,
         submit_deadline_ns: u64,
@@ -310,6 +315,14 @@ impl WorkerTimingMetrics {
         if submit_return_earliness_ns < 0 {
             self.late_after_ioctl.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn record_pageflip_ack_delay(&self, delay_ns: u64) {
+        self.pageflip_ack_delay.record(delay_ns);
+    }
+
+    pub(crate) fn record_submit_ack_delay(&self, delay_ns: u64) {
+        self.submit_ack_delay.record(delay_ns);
     }
 
     pub(crate) fn record_test_only(&self, duration_ns: u64) {
@@ -342,6 +355,8 @@ impl WorkerTimingMetrics {
             queue_residency: self.queue_residency.snapshot(),
             submit_earliness: self.submit_earliness.snapshot(),
             submit_return_earliness: self.submit_return_earliness.snapshot(),
+            submit_ack_delay: self.submit_ack_delay.snapshot(),
+            pageflip_ack_delay: self.pageflip_ack_delay.snapshot(),
             test_only_duration: self.test_only_duration.snapshot(),
             current_safety_margin_ns: self.current_safety_margin_ns.load(Ordering::Relaxed),
             target_same_refresh: self.target_same_refresh.load(Ordering::Relaxed),

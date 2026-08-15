@@ -196,6 +196,9 @@ impl KmsCommitWorkerHandle {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::CrtcMismatch);
         }
+        self.shared.metrics.timing.record_pageflip_ack_delay(
+            monotonic_now_ns().saturating_sub(inflight.submit_returned_at_ns),
+        );
         if matches!(inflight.kind, AtomicCommitKind::PlaneDelta { .. }) {
             self.shared
                 .metrics

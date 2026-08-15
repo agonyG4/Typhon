@@ -9,8 +9,8 @@ use super::queue::DequeuePause;
 use super::queue::{
     AttachablePrimary, AttachablePrimaryPhase, KmsWorkerFatalJob, KmsWorkerForcedShutdown,
     KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerShutdownSnapshot, RESULT_EVENT_CAPACITY,
-    WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd,
-    notify_eventfd,
+    WorkerInFlight, WorkerMetricsSnapshot, WorkerPresentationFeedback, WorkerShared,
+    create_eventfd, drain_eventfd, notify_eventfd, take_presentation_feedback_for_generation,
 };
 use super::{
     CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
@@ -340,11 +340,41 @@ impl KmsCommitWorkerHandle {
         self.shared.metrics.snapshot()
     }
 
-    pub(crate) fn record_worker_target_result(&self, target: u64, presented: u64) {
+    pub(crate) fn record_worker_target_result(
+        &self,
+        output_generation: u64,
+        target: u64,
+        presented: u64,
+        submit_returned_at_ns: u64,
+        target_presentation_ns: u64,
+        refresh_interval_ns: u64,
+    ) {
         self.shared
             .metrics
             .timing
             .record_target_result(target, presented);
+        if presented <= target {
+            return;
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.presentation_feedback = Some(WorkerPresentationFeedback {
+            output_generation,
+            target_sequence: target,
+            presented_sequence: presented,
+            submit_returned_at_ns,
+            target_presentation_ns,
+            refresh_interval_ns,
+        });
+        drop(state);
+        self.shared.work_wakeup.notify_all();
+    }
+
+    pub(crate) fn record_submit_ack_delay(&self, delay_ns: u64) {
+        self.shared.metrics.timing.record_submit_ack_delay(delay_ns);
     }
 
     pub(crate) fn record_cursor_sidecar_promoted(&self) {
@@ -555,7 +585,7 @@ impl ExecutingDirectCandidateGuard {
         }
     }
 
-    fn transfer_to_inflight(&mut self, job: &KmsCommitJob) {
+    fn transfer_to_inflight(&mut self, job: &KmsCommitJob, submit_returned_at_ns: u64) {
         let mut state = self
             .shared
             .state
@@ -568,6 +598,7 @@ impl ExecutingDirectCandidateGuard {
             output_generation: job.output_generation,
             kind: job.kind,
             direct_content_key: self.candidate,
+            submit_returned_at_ns,
         });
         state.established_base = Some(EstablishedKmsBase::Pending(job.identity()));
         state.executing = false;
@@ -920,13 +951,13 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             };
             match submission {
                 Ok(Ok(submission)) => {
-                    executing.transfer_to_inflight(&job);
+                    let submit_returned_at = monotonic_now_ns();
+                    executing.transfer_to_inflight(&job, submit_returned_at);
                     if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
                         // The ioctl has consumed the input-fence contract. The
                         // fence must not remain owned while waiting for the pageflip.
                         let _ = in_fence.take();
                     }
-                    let submit_returned_at = monotonic_now_ns();
                     let submit_duration_ns = submit_returned_at.saturating_sub(submit_started_at);
                     shared
                         .metrics
@@ -943,6 +974,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
                     let submit_wake_lateness_ns =
                         submit_started_at.saturating_sub(decision.submit_deadline_ns);
+                    let job_output_generation = job.output_generation;
                     let model = timing.as_mut().expect("timing model initialized");
                     model.observe_submission(submit_wake_lateness_ns, submit_duration_ns);
                     model.observe_submit_result(submit_returned_at, decision.submit_deadline_ns);
@@ -982,6 +1014,28 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     }
                     if !wait_for_pageflip_or_quiesce(&shared, transaction_id, token) {
                         return;
+                    }
+                    let feedback = {
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        take_presentation_feedback_for_generation(
+                            &mut state.presentation_feedback,
+                            job_output_generation,
+                        )
+                    };
+                    if let Some(feedback) = feedback
+                        && feedback.presented_sequence > feedback.target_sequence
+                    {
+                        let model = timing.as_mut().expect("timing model initialized");
+                        model.reconfigure_refresh_interval(Duration::from_nanos(
+                            feedback.refresh_interval_ns.max(1),
+                        ));
+                        model.observe_missed_target(
+                            feedback.submit_returned_at_ns,
+                            feedback.target_presentation_ns,
+                        );
                     }
                     break;
                 }

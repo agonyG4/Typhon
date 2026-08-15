@@ -432,6 +432,16 @@ fn worker_pre_admits_ready_primary_before_its_submit_not_before_deadline() {
 }
 
 #[test]
+fn reactive_double_does_not_pre_admit_behind_kernel_primary() {
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    snapshot.prepared = ready(2, 2, 2);
+
+    assert!(!snapshot.can_pre_admit_primary());
+}
+
+#[test]
 fn two_future_primaries_coalesce_new_visual_work_without_rendering_farther_ahead() {
     let mut scheduler = NativeFrameScheduler::new(60, 0);
     scheduler.queue_visual_work();

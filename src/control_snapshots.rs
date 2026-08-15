@@ -466,6 +466,8 @@ pub struct WorkerTimingPerformanceSnapshot {
     pub queue_residency: TimingSummarySnapshot,
     pub submit_earliness: SignedTimingSummarySnapshot,
     pub submit_return_earliness: SignedTimingSummarySnapshot,
+    pub submit_ack_delay: TimingSummarySnapshot,
+    pub pageflip_ack_delay: TimingSummarySnapshot,
     pub test_only_duration: TimingSummarySnapshot,
     pub current_safety_margin_us: u64,
     pub target_hit_same_refresh: u64,

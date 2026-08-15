@@ -217,26 +217,6 @@ fn submission_budget_is_bounded_by_half_the_refresh_interval() {
     assert_eq!(model.submission_budget().submission_budget_ns, 2_000_000);
 }
 
-#[test]
-fn worker_target_feedback_classifies_refresh_distance() {
-    assert_eq!(
-        WorkerTargetResult::from_sequences(42, 42),
-        WorkerTargetResult::SameRefresh
-    );
-    assert_eq!(
-        WorkerTargetResult::from_sequences(42, 43),
-        WorkerTargetResult::MissedOneRefresh
-    );
-    assert_eq!(
-        WorkerTargetResult::from_sequences(42, 44),
-        WorkerTargetResult::MissedTwoOrMoreRefreshes
-    );
-    assert_eq!(
-        WorkerTargetResult::from_sequences(42, 41),
-        WorkerTargetResult::StaleOrOutOfOrder
-    );
-}
-
 pub(super) fn test_job(token: u64) -> KmsCommitJob {
     let transaction_id = OutputTransactionId::new(
         std::num::NonZeroU64::new(token).expect("test transaction ID is nonzero"),

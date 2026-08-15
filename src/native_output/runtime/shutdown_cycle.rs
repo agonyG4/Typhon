@@ -33,6 +33,7 @@ impl NativeRuntime {
                         output_generation: ownership.job.output_generation,
                         kind: ownership.job.kind,
                         direct_content_key: None,
+                        submit_returned_at_ns: ownership.submit_returned_at.get(),
                     })
             });
         }

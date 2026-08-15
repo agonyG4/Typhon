@@ -280,6 +280,8 @@ impl OutputPipelineSnapshot {
         matches!(self.prepared, PreparedCompositedState::Ready { .. })
             && self.worker_queued_next.is_none()
             && self.future_primary_depth() <= 2
+            && (self.pacing_mode == NativeOutputPacingMode::PredictiveTriple
+                || self.kernel_submitted.is_none())
             && !self.kernel_plane_delta()
     }
 
