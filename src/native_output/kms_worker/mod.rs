@@ -2,12 +2,18 @@
 
 mod bundle;
 mod cursor_sidecar;
+mod metrics;
 mod payload;
 mod policy;
 mod queue;
 mod thread;
 mod timing;
 
+#[cfg(test)]
+pub(crate) use metrics::WorkerTargetResult;
+pub(crate) use metrics::{
+    SignedTimingSummarySnapshot, TimingSummarySnapshot, WorkerTimingMetrics, WorkerTimingSnapshot,
+};
 #[cfg(test)]
 pub(crate) use payload::KmsCommitPayloadError;
 pub(crate) use payload::{

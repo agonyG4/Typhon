@@ -413,6 +413,21 @@ pub struct TimingSummarySnapshot {
     pub max_us: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct SignedTimingSummarySnapshot {
+    pub count: u64,
+    pub total_us: i64,
+    pub last_us: i64,
+    pub mean_us: i64,
+    pub p50_us: i64,
+    pub p95_us: i64,
+    pub p99_us: i64,
+    pub min_us: i64,
+    pub max_us: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -445,6 +460,26 @@ pub struct BufferingPerformanceSnapshot {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct WorkerTimingPerformanceSnapshot {
+    pub submit_wake_lateness: SignedTimingSummarySnapshot,
+    pub ioctl_duration: TimingSummarySnapshot,
+    pub queue_residency: TimingSummarySnapshot,
+    pub submit_earliness: SignedTimingSummarySnapshot,
+    pub submit_return_earliness: SignedTimingSummarySnapshot,
+    pub test_only_duration: TimingSummarySnapshot,
+    pub current_safety_margin_us: u64,
+    pub target_hit_same_refresh: u64,
+    pub target_miss_one_refresh: u64,
+    pub target_miss_two_or_more_refreshes: u64,
+    pub target_stale_or_out_of_order: u64,
+    pub late_before_ioctl: u64,
+    pub late_after_ioctl: u64,
+    pub test_only_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct KmsPerformanceSnapshot {
     pub worker_jobs_enqueued: u64,
     pub worker_jobs_submitted: u64,
@@ -453,12 +488,13 @@ pub struct KmsPerformanceSnapshot {
     pub worker_submit_duration_max_us: u64,
     pub worker_queue_residency_max_us: u64,
     pub worker_queue_depth_max: u64,
-    pub wake_lateness_p50_us: u64,
-    pub wake_lateness_p95_us: u64,
-    pub wake_lateness_p99_us: u64,
-    pub target_slip_p50_us: u64,
-    pub target_slip_p95_us: u64,
-    pub target_slip_p99_us: u64,
+    pub worker_timing: WorkerTimingPerformanceSnapshot,
+    pub main_loop_wake_lateness_p50_us: u64,
+    pub main_loop_wake_lateness_p95_us: u64,
+    pub main_loop_wake_lateness_p99_us: u64,
+    pub main_loop_target_slip_p50_us: u64,
+    pub main_loop_target_slip_p95_us: u64,
+    pub main_loop_target_slip_p99_us: u64,
     pub pageflip_interval_p50_us: u64,
     pub pageflip_interval_p95_us: u64,
     pub pageflip_interval_p99_us: u64,

@@ -2,7 +2,8 @@
 
 use super::{
     CursorSidecar, CursorSidecarMailbox, EstablishedKmsBase, KmsCommitBundleIdentity, KmsCommitJob,
-    KmsValidationBase, KmsWorkerEvent, ValidationBaseDisposition, validation_base_ready,
+    KmsValidationBase, KmsWorkerEvent, ValidationBaseDisposition, WorkerTimingMetrics,
+    WorkerTimingSnapshot, validation_base_ready,
 };
 use crate::native_output::DirectScanoutCandidateKey;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
@@ -21,6 +22,7 @@ pub(crate) const RESULT_EVENT_CAPACITY: usize = 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct WorkerMetrics {
+    pub(crate) timing: WorkerTimingMetrics,
     pub(crate) jobs_enqueued: AtomicU64,
     pub(crate) jobs_submitted: AtomicU64,
     pub(crate) jobs_rejected: AtomicU64,
@@ -76,6 +78,7 @@ pub(crate) struct WorkerMetrics {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WorkerMetricsSnapshot {
+    pub(crate) timing: WorkerTimingSnapshot,
     pub(crate) jobs_enqueued: u64,
     pub(crate) jobs_submitted: u64,
     pub(crate) jobs_rejected: u64,
@@ -137,6 +140,7 @@ impl WorkerMetrics {
             };
         }
         WorkerMetricsSnapshot {
+            timing: self.timing.snapshot(),
             jobs_enqueued: read!(jobs_enqueued),
             jobs_submitted: read!(jobs_submitted),
             jobs_rejected: read!(jobs_rejected),

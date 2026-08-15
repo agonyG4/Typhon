@@ -2,11 +2,14 @@ use super::planner::visual_target_deadline_for_mode;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
 use crate::native_output::{
-    KmsTarget, kms_worker::WorkerMetricsSnapshot, scanout::NativePaintStats,
+    KmsTarget,
+    kms_worker::{WorkerMetricsSnapshot, WorkerTimingSnapshot},
+    scanout::NativePaintStats,
 };
 use oblivion_one::control_snapshots::{
     BufferingPerformanceSnapshot, KmsPerformanceSnapshot, PerformanceSnapshot,
-    RepaintPerformanceSnapshot, TimingSummarySnapshot,
+    RepaintPerformanceSnapshot, SignedTimingSummarySnapshot, TimingSummarySnapshot,
+    WorkerTimingPerformanceSnapshot,
 };
 use std::collections::BTreeMap;
 
@@ -192,6 +195,58 @@ fn timing_summary_snapshot(summary: TimingSummary) -> TimingSummarySnapshot {
     }
 }
 
+fn worker_timing_summary_snapshot(
+    summary: crate::native_output::kms_worker::TimingSummarySnapshot,
+) -> TimingSummarySnapshot {
+    TimingSummarySnapshot {
+        count: summary.count,
+        total_us: summary.total_ns / 1_000,
+        last_us: summary.last_ns / 1_000,
+        mean_us: summary.mean_ns / 1_000,
+        p50_us: summary.p50_ns / 1_000,
+        p95_us: summary.p95_ns / 1_000,
+        p99_us: summary.p99_ns / 1_000,
+        max_us: summary.max_ns / 1_000,
+    }
+}
+
+fn worker_signed_timing_summary_snapshot(
+    summary: crate::native_output::kms_worker::SignedTimingSummarySnapshot,
+) -> SignedTimingSummarySnapshot {
+    SignedTimingSummarySnapshot {
+        count: summary.count,
+        total_us: summary.total_ns / 1_000,
+        last_us: summary.last_ns / 1_000,
+        mean_us: summary.mean_ns / 1_000,
+        p50_us: summary.p50_ns / 1_000,
+        p95_us: summary.p95_ns / 1_000,
+        p99_us: summary.p99_ns / 1_000,
+        min_us: summary.min_ns / 1_000,
+        max_us: summary.max_ns / 1_000,
+    }
+}
+
+fn worker_timing_snapshot(snapshot: WorkerTimingSnapshot) -> WorkerTimingPerformanceSnapshot {
+    WorkerTimingPerformanceSnapshot {
+        submit_wake_lateness: worker_signed_timing_summary_snapshot(snapshot.submit_wake_lateness),
+        ioctl_duration: worker_timing_summary_snapshot(snapshot.ioctl_duration),
+        queue_residency: worker_timing_summary_snapshot(snapshot.queue_residency),
+        submit_earliness: worker_signed_timing_summary_snapshot(snapshot.submit_earliness),
+        submit_return_earliness: worker_signed_timing_summary_snapshot(
+            snapshot.submit_return_earliness,
+        ),
+        test_only_duration: worker_timing_summary_snapshot(snapshot.test_only_duration),
+        current_safety_margin_us: snapshot.current_safety_margin_ns / 1_000,
+        target_hit_same_refresh: snapshot.target_same_refresh,
+        target_miss_one_refresh: snapshot.target_miss_one_refresh,
+        target_miss_two_or_more_refreshes: snapshot.target_miss_two_or_more,
+        target_stale_or_out_of_order: snapshot.target_stale_or_out_of_order,
+        late_before_ioctl: snapshot.late_before_ioctl,
+        late_after_ioctl: snapshot.late_after_ioctl,
+        test_only_count: snapshot.test_only_count,
+    }
+}
+
 impl NativeRuntime {
     pub(super) fn performance_snapshot(&self) -> PerformanceSnapshot {
         let buffering = self.frame_pacing.buffering_metrics();
@@ -231,12 +286,13 @@ impl NativeRuntime {
                 worker_submit_duration_max_us: worker.submit_duration_ns_max / 1_000,
                 worker_queue_residency_max_us: worker.queue_wait_ns_max / 1_000,
                 worker_queue_depth_max: worker.runtime_queue_depth_max,
-                wake_lateness_p50_us: pacing.wake_lateness.0,
-                wake_lateness_p95_us: pacing.wake_lateness.1,
-                wake_lateness_p99_us: pacing.wake_lateness.2,
-                target_slip_p50_us: pacing.target_error.0,
-                target_slip_p95_us: pacing.target_error.1,
-                target_slip_p99_us: pacing.target_error.2,
+                worker_timing: worker_timing_snapshot(worker.timing),
+                main_loop_wake_lateness_p50_us: pacing.wake_lateness.0,
+                main_loop_wake_lateness_p95_us: pacing.wake_lateness.1,
+                main_loop_wake_lateness_p99_us: pacing.wake_lateness.2,
+                main_loop_target_slip_p50_us: pacing.target_error.0,
+                main_loop_target_slip_p95_us: pacing.target_error.1,
+                main_loop_target_slip_p99_us: pacing.target_error.2,
                 pageflip_interval_p50_us: pacing.pageflip_interval.0,
                 pageflip_interval_p95_us: pacing.pageflip_interval.1,
                 pageflip_interval_p99_us: pacing.pageflip_interval.2,

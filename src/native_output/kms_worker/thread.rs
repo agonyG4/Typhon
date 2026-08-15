@@ -340,6 +340,13 @@ impl KmsCommitWorkerHandle {
         self.shared.metrics.snapshot()
     }
 
+    pub(crate) fn record_worker_target_result(&self, target: u64, presented: u64) {
+        self.shared
+            .metrics
+            .timing
+            .record_target_result(target, presented);
+    }
+
     pub(crate) fn record_cursor_sidecar_promoted(&self) {
         self.shared
             .metrics
@@ -764,6 +771,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         if timing.is_none() {
             timing = Some(KmsCommitTimingModel::new(job.target.refresh_interval));
+        } else if let Some(model) = timing.as_mut() {
+            model.reconfigure_refresh_interval(job.target.refresh_interval);
         }
         let model = timing.as_ref().expect("timing model initialized");
         let now_ns = monotonic_now_ns();
@@ -840,7 +849,9 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 quiesce_with_jobs(&shared, vec![job]);
                 return;
             };
-            match test {
+            let (test_result, test_duration_ns) = test;
+            shared.metrics.timing.record_test_only(test_duration_ns);
+            match (test_result, test_duration_ns) {
                 (Ok(Ok(())), duration_ns) => {
                     job.test_only_duration_ns = Some(duration_ns);
                 }
@@ -934,7 +945,17 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         submit_started_at.saturating_sub(decision.submit_deadline_ns);
                     let model = timing.as_mut().expect("timing model initialized");
                     model.observe_submission(submit_wake_lateness_ns, submit_duration_ns);
+                    model.observe_submit_result(submit_returned_at, decision.submit_deadline_ns);
                     let submission_budget_ns = model.submission_budget().submission_budget_ns;
+                    shared.metrics.timing.record_submission(
+                        decision.submit_deadline_ns,
+                        job.target.presentation_time.get(),
+                        submit_started_at,
+                        submit_returned_at,
+                        queue_wait_ns,
+                        submit_duration_ns,
+                        submission_budget_ns,
+                    );
                     shared
                         .metrics
                         .queue_wait_ns_total

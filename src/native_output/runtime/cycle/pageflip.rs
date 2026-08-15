@@ -661,6 +661,18 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("direct pageflip token is zero"))?;
+                    if *kms_commit_worker_transport
+                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                        && let Some(worker) = kms_commit_worker.as_ref()
+                        && let Some(ownership) = submitted_worker_ownership
+                            .iter()
+                            .find(|ownership| ownership.job.token == pageflip_token)
+                    {
+                        worker.record_worker_target_result(
+                            ownership.job.target.sequence,
+                            actual_logical_sequence,
+                        );
+                    }
                     cycle_direct::settle_direct_pageflip(
                         scanout,
                         server,
@@ -725,6 +737,15 @@ impl NativeRuntime {
                         protocol_batch_id,
                         surface_damage,
                     } = explicit.complete_pageflip(pageflip_token)?;
+                    if *kms_commit_worker_transport
+                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                        && let Some(worker) = kms_commit_worker.as_ref()
+                    {
+                        worker.record_worker_target_result(
+                            frame.target.sequence,
+                            actual_logical_sequence,
+                        );
+                    }
                     let prepared_logical = prepare_presented_output_transaction(
                         output_transactions,
                         transaction_id,

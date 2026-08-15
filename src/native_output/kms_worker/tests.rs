@@ -156,6 +156,14 @@ fn late_sample_increases_margin_immediately() {
 }
 
 #[test]
+fn submit_return_feedback_increases_margin_from_real_boundary() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
+    model.observe_submit_result(12_000_000, 10_000_000);
+    assert_eq!(model.safety_margin_ns(), 2_100_000);
+}
+
+#[test]
 fn early_samples_decay_margin_gradually() {
     use std::time::Duration;
     let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
@@ -172,6 +180,18 @@ fn margin_is_bounded_by_half_refresh() {
     let mut model = KmsCommitTimingModel::new(Duration::from_micros(100));
     model.observe_submit_delta_ns(10_000_000);
     assert_eq!(model.safety_margin_ns(), 50_000);
+}
+
+#[test]
+fn timing_model_requalifies_after_refresh_interval_change() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
+    model.observe_submit_delta_ns(10_000_000);
+    assert_eq!(model.safety_margin_ns(), 3_000_000);
+
+    model.reconfigure_refresh_interval(Duration::from_millis(4));
+
+    assert_eq!(model.safety_margin_ns(), 2_000_000);
 }
 
 #[test]
@@ -195,6 +215,26 @@ fn submission_budget_is_bounded_by_half_the_refresh_interval() {
     model.observe_submission(10_000_000, 10_000_000);
 
     assert_eq!(model.submission_budget().submission_budget_ns, 2_000_000);
+}
+
+#[test]
+fn worker_target_feedback_classifies_refresh_distance() {
+    assert_eq!(
+        WorkerTargetResult::from_sequences(42, 42),
+        WorkerTargetResult::SameRefresh
+    );
+    assert_eq!(
+        WorkerTargetResult::from_sequences(42, 43),
+        WorkerTargetResult::MissedOneRefresh
+    );
+    assert_eq!(
+        WorkerTargetResult::from_sequences(42, 44),
+        WorkerTargetResult::MissedTwoOrMoreRefreshes
+    );
+    assert_eq!(
+        WorkerTargetResult::from_sequences(42, 41),
+        WorkerTargetResult::StaleOrOutOfOrder
+    );
 }
 
 pub(super) fn test_job(token: u64) -> KmsCommitJob {

@@ -51,6 +51,19 @@ impl KmsCommitTimingModel {
         self.safety_margin_ns
     }
 
+    pub(crate) fn reconfigure_refresh_interval(&mut self, refresh_interval: Duration) {
+        let refresh_interval_ns = u64::try_from(refresh_interval.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        if refresh_interval_ns == self.refresh_interval_ns {
+            return;
+        }
+        self.refresh_interval_ns = refresh_interval_ns;
+        self.submit_wake_lateness_ns.clear();
+        self.ioctl_duration_ns.clear();
+        self.safety_margin_ns = self.clamp_margin(self.safety_margin_ns);
+    }
+
     pub(crate) fn submission_budget(&self) -> KmsSubmissionBudget {
         KmsSubmissionBudget {
             submit_wake_lateness_ns: nearest_rank(&self.submit_wake_lateness_ns, 95),
@@ -89,6 +102,19 @@ impl KmsCommitTimingModel {
             .safety_margin_ns
             .saturating_sub(difference / 16)
             .max(MIN_SAFETY_MARGIN_NS);
+    }
+
+    pub(crate) fn observe_submit_result(
+        &mut self,
+        submit_returned_ns: u64,
+        submit_deadline_ns: u64,
+    ) {
+        let delta_ns = if submit_returned_ns >= submit_deadline_ns {
+            i64::try_from(submit_returned_ns - submit_deadline_ns).unwrap_or(i64::MAX)
+        } else {
+            -i64::try_from(submit_deadline_ns - submit_returned_ns).unwrap_or(i64::MAX)
+        };
+        self.observe_submit_delta_ns(delta_ns);
     }
 
     pub(crate) fn observe_submission(
