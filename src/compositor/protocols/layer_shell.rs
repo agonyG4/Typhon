@@ -84,7 +84,18 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                         surface: surface.clone(),
                     },
                 );
-                state.register_layer_surface(surface, layer_surface, output, namespace, layer);
+                state.register_layer_surface(
+                    surface,
+                    layer_surface,
+                    client
+                        .get_credentials(_dhandle)
+                        .ok()
+                        .and_then(|credentials| u32::try_from(credentials.pid).ok())
+                        .filter(|pid| *pid != 0),
+                    output,
+                    namespace,
+                    layer,
+                );
                 state.adopt_current_surface_content_for_role(surface_id);
             }
             zwlr_layer_shell_v1::Request::Destroy => {}
@@ -182,7 +193,14 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
                 }
             }
             zwlr_layer_surface_v1::Request::AckConfigure { serial } => {
-                state.ack_layer_surface_configure(surface_id, serial);
+                if !state.ack_layer_surface_configure(surface_id, serial) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        zwlr_layer_surface_v1::Error::InvalidSurfaceState,
+                        format!("unknown layer-surface configure serial {serial}"),
+                    );
+                }
             }
             zwlr_layer_surface_v1::Request::Destroy => {
                 state.destroy_layer_surface_role(surface_id);

@@ -866,19 +866,19 @@ fn buffer_commit_before_configure_ack_is_rejected() {
 }
 
 #[test]
-fn stale_ack_after_reconfigure_cannot_authorize_mapping() {
+fn unknown_layer_surface_ack_configure_serial_is_protocol_error() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);
     let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
-    let (commands, server_thread) = spawn_controllable_test_server(server);
-    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+    let (running, server_thread) = spawn_test_server(server);
+    let (connection, mut queue, qh, compositor, _shm, layer_shell) =
         connect_layer_client(&socket_path);
     let (surface, layer_surface) = create_layer_surface(
         &compositor,
         &layer_shell,
         &qh,
         client_zwlr_layer_shell_v1::Layer::Top,
-        "stale-ack",
+        "unknown-ack",
     );
     layer_surface.set_anchor(
         client_zwlr_layer_surface_v1::Anchor::Top
@@ -894,28 +894,12 @@ fn stale_ack_after_reconfigure_cannot_authorize_mapping() {
         ..RegistryTestState::default()
     };
     queue.roundtrip(&mut state).unwrap();
-    let stale_serial = state.layer_surface_configure_serials[0];
-    layer_surface.ack_configure(stale_serial);
-    commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
-    connection.flush().unwrap();
-    queue.roundtrip(&mut state).unwrap();
-    assert_eq!(capture_renderable_surface_count(&commands), 1);
-
-    commands
-        .send(ServerCommand::SetOutputSize {
-            width: 1600,
-            height: 900,
-        })
-        .unwrap();
-    queue.roundtrip(&mut state).unwrap();
-    assert_eq!(state.layer_surface_configure_count, 2);
-    layer_surface.ack_configure(stale_serial);
-    commit_test_buffered_surface(&surface, &shm, &qh, 1600, 32).unwrap();
+    let serial = state.layer_surface_configure_serials[0];
+    layer_surface.ack_configure(serial.wrapping_add(1));
     connection.flush().unwrap();
 
     assert!(queue.roundtrip(&mut state).is_err());
-    commands.send(ServerCommand::Stop).unwrap();
-    let _server = server_thread.join().unwrap();
+    stop_test_server(running, server_thread);
 }
 
 #[test]
@@ -1507,6 +1491,154 @@ fn mapped_layer_surface_can_commit_old_buffer_while_new_configure_is_pending() {
     queue.roundtrip(&mut state).unwrap();
 
     assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn mapped_layer_surface_buffer_matching_pending_configure_does_not_imply_response() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (surface, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "matching-pending-configure",
+        1280,
+        32,
+    );
+
+    state.suppress_layer_surface_ack = true;
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 900,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.layer_surface_configures[1].1, 900);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 900, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn mapped_layer_surface_multiple_pending_configures_do_not_reject_matching_buffers() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (surface, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "multiple-pending-configures",
+        1280,
+        32,
+    );
+
+    state.suppress_layer_surface_ack = true;
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 1100,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 900,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.layer_surface_configures[1].1, 1100);
+    assert_eq!(state.layer_surface_configures[2].1, 900);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 1100, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 900, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn multiple_valid_layer_surface_acks_before_one_commit_use_latest_ack() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut state = RegistryTestState::default();
+    let (surface, layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "multiple-valid-acks",
+        1280,
+        32,
+    );
+
+    state.suppress_layer_surface_ack = true;
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 1100,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 900,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let serial_a = state.layer_surface_configure_serials[1];
+    let serial_b = state.layer_surface_configure_serials[2];
+
+    layer_surface.ack_configure(serial_a);
+    layer_surface.ack_configure(serial_b);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
 
     commands.send(ServerCommand::Stop).unwrap();
     let _server = server_thread.join().unwrap();

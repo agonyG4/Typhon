@@ -9,6 +9,19 @@ OBLIVION_ONE_LAYER_SHELL_DEBUG=1
 The expected log transitions are `create`, `configure`, `ack`, `map`, `arrange`,
 `focus_take`, `focus_restore`, `layer_change`, `unmap`, and `destroy`.
 
+Layer-shell mapping has a strict initial and remap handshake: the client must
+send a bufferless commit, receive a configure, acknowledge a valid configure
+serial, and only then attach its first buffer. After the surface is mapped,
+pending configure events do not authorize or reject buffer commits based on
+buffer dimensions. Configure width and height are hints; serial acknowledgement
+is tracked separately from client-committed layer state and buffer geometry.
+
+With debugging enabled, configure and rejection messages include the client PID,
+internal surface ID, Wayland surface and layer-surface resource IDs, namespace,
+layer, mapping state, configure serial history, acknowledgement state, requested
+client size, buffer size, and current compositor geometry. The pending serial
+history is bounded.
+
 ## Eclipse-style overlay
 
 Use an Eclipse build that links LayerShellQt and run the Spotlight or AltTab
@@ -79,5 +92,6 @@ focus_restore after unmap
 ```
 
 Report any `zwlr_layer_surface_v1` protocol error instead of retrying with an
-XDG fallback; that means the smoke client submitted an invalid layer-shell
-state.
+XDG fallback. An error before initial or remap acknowledgement indicates an
+invalid layer-shell state; a mapped commit that merely matches a pending
+configure's hinted dimensions is not by itself invalid.

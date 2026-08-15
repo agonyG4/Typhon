@@ -151,7 +151,6 @@ impl LayerGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingLayerConfigure {
     pub(super) serial: u32,
-    pub(super) committed_state: LayerSurfaceCommitState,
     pub(super) geometry: LayerGeometry,
     pub(super) origin: LayerConfigureOrigin,
 }
@@ -238,13 +237,16 @@ impl LayerLayoutRect {
 pub(super) struct LayerSurfaceRole {
     pub(super) surface: wl_surface::WlSurface,
     pub(super) resource: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    pub(super) client_pid: Option<u32>,
     pub(super) output_id: Option<u32>,
     pub(super) namespace: String,
     pub(super) pending: LayerSurfaceCommitState,
     pub(super) committed: LayerSurfaceCommitState,
     pub(super) initial_configure_sent: bool,
+    pub(super) initial_configure_acknowledged: bool,
     pub(super) pending_configures: VecDeque<PendingLayerConfigure>,
-    pub(super) acked_configure: Option<PendingLayerConfigure>,
+    pub(super) pending_ack_for_next_surface_commit: Option<PendingLayerConfigure>,
+    pub(super) last_acknowledged_serial: Option<u32>,
     pub(super) last_configure_size: Option<(u32, u32)>,
     pub(super) mapped: bool,
     pub(super) geometry: Option<LayerGeometry>,
@@ -256,6 +258,7 @@ impl LayerSurfaceRole {
     pub(super) fn new(
         surface: wl_surface::WlSurface,
         resource: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        client_pid: Option<u32>,
         output_id: Option<u32>,
         namespace: String,
         layer: Layer,
@@ -269,13 +272,16 @@ impl LayerSurfaceRole {
         Self {
             surface,
             resource,
+            client_pid,
             output_id,
             namespace,
             pending: state,
             committed: state,
             initial_configure_sent: false,
+            initial_configure_acknowledged: false,
             pending_configures: VecDeque::new(),
-            acked_configure: None,
+            pending_ack_for_next_surface_commit: None,
+            last_acknowledged_serial: None,
             last_configure_size: None,
             mapped: false,
             geometry: None,
@@ -285,11 +291,79 @@ impl LayerSurfaceRole {
     }
 }
 
+fn layer_surface_debug_details(
+    surface_id: u32,
+    role: &LayerSurfaceRole,
+    pending_surface_size: Option<BufferSize>,
+) -> String {
+    let pending_serials = role
+        .pending_configures
+        .iter()
+        .take(8)
+        .map(|configure| configure.serial.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let pending_serials = if role.pending_configures.len() > 8 {
+        format!("[{pending_serials},...]")
+    } else {
+        format!("[{pending_serials}]")
+    };
+    let pending_ack = role
+        .pending_ack_for_next_surface_commit
+        .as_ref()
+        .map_or_else(
+            || "none".to_string(),
+            |configure| configure.serial.to_string(),
+        );
+    let last_ack = role
+        .last_acknowledged_serial
+        .map_or_else(|| "none".to_string(), |serial| serial.to_string());
+    let requested_size = format!(
+        "{}x{}",
+        role.committed.size.width, role.committed.size.height
+    );
+    let buffer_size = pending_surface_size.map_or_else(
+        || "none".to_string(),
+        |size| format!("{}x{}", size.width, size.height),
+    );
+    let geometry = role.geometry.map_or_else(
+        || "none".to_string(),
+        |geometry| {
+            format!(
+                "{},{} {}x{}",
+                geometry.x, geometry.y, geometry.width, geometry.height
+            )
+        },
+    );
+    format!(
+        "pid={} surface={} wl_surface={} layer_surface={} namespace={} layer={:?} mapped={} initial_configure_sent={} initial_configure_acknowledged={} pending={} pending_ack={} last_ack={} requested={} buffer={} geometry={} output={:?} version={}",
+        role.client_pid
+            .map_or_else(|| "none".to_string(), |pid| pid.to_string()),
+        surface_id,
+        role.surface.id().protocol_id(),
+        role.resource.id().protocol_id(),
+        role.namespace,
+        role.committed.layer,
+        role.mapped,
+        role.initial_configure_sent,
+        role.initial_configure_acknowledged,
+        pending_serials,
+        pending_ack,
+        last_ack,
+        requested_size,
+        buffer_size,
+        geometry,
+        role.output_id,
+        role.version,
+    )
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn register_layer_surface(
         &mut self,
         surface: wl_surface::WlSurface,
         resource: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        client_pid: Option<u32>,
         output: Option<wl_output::WlOutput>,
         namespace: String,
         layer: Layer,
@@ -300,6 +374,7 @@ impl CompositorState {
         let role = LayerSurfaceRole::new(
             surface,
             resource.clone(),
+            client_pid,
             output_id,
             namespace,
             layer,
@@ -336,6 +411,7 @@ impl CompositorState {
         {
             self.configure_layer_surface(surface_id);
         }
+        self.consume_pending_ack_for_surface_commit(surface_id);
         true
     }
 
@@ -347,10 +423,6 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
-        let pending_configures_before_commit = self
-            .layer_surfaces
-            .get(&surface_id)
-            .map_or(0, |role| role.pending_configures.len());
         let previous_usable = self.reserved_usable_geometry();
         if self
             .commit_pending_layer_surface_state(surface_id)
@@ -372,63 +444,21 @@ impl CompositorState {
         let Some(role) = self.layer_surfaces.get(&surface_id) else {
             return false;
         };
-        let requires_initial_ack = !role.mapped && role.acked_configure.is_none();
+        let requires_initial_ack = !role.mapped && !role.initial_configure_acknowledged;
         if !role.initial_configure_sent || requires_initial_ack {
             let resource = role.resource.clone();
-            let pending_configure = role
-                .pending_configures
-                .back()
-                .map(|configure| (configure.serial, configure.origin));
+            let debug_details = layer_surface_debug_details(surface_id, role, pending_surface_size);
             self.note_protocol_error_metric();
             resource.post_error(
                 zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                 "layer surface buffer committed before configure was acknowledged".to_string(),
             );
-            layer_shell_debug_log(|| match pending_configure {
-                Some((configure_serial, configure_origin)) => format!(
-                    "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial={configure_serial} configure_origin={}",
-                    configure_origin.label()
-                ),
-                None => format!(
-                    "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial=none configure_origin=none"
-                ),
+            layer_shell_debug_log(|| {
+                format!("commit {debug_details} rejected=buffer-before-configure-ack")
             });
             return false;
         }
-        if role.mapped
-            && role.acked_configure.is_none()
-            && !role.pending_configures.is_empty()
-            && let Some(pending) = pending_surface_size
-        {
-            let matching_configure = role
-                .pending_configures
-                .iter()
-                .take(pending_configures_before_commit)
-                .find(|configure| {
-                    let size = configure.geometry.size();
-                    pending.width == size.0 && pending.height == size.1
-                })
-                .map(|configure| (configure.serial, configure.origin));
-            if let Some((configure_serial, configure_origin)) = matching_configure {
-                let resource = role.resource.clone();
-                self.note_protocol_error_metric();
-                resource.post_error(
-                    zwlr_layer_surface_v1::Error::InvalidSurfaceState,
-                    "layer surface buffer committed before configure was acknowledged".to_string(),
-                );
-                layer_shell_debug_log(|| {
-                    format!(
-                        "commit surface={surface_id} rejected=buffer-before-configure-ack configure_serial={} configure_origin={}",
-                        configure_serial,
-                        configure_origin.label()
-                    )
-                });
-                return false;
-            }
-        }
-        if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
-            role.acked_configure = None;
-        }
+        self.consume_pending_ack_for_surface_commit(surface_id);
         true
     }
 
@@ -465,7 +495,9 @@ impl CompositorState {
         };
         let was_mapped = role.mapped;
         role.mapped = false;
-        role.acked_configure = None;
+        role.initial_configure_acknowledged = false;
+        role.pending_ack_for_next_surface_commit = None;
+        role.last_acknowledged_serial = None;
         role.pending_configures.clear();
         role.last_configure_size = None;
         role.initial_configure_sent = false;
@@ -531,7 +563,9 @@ impl CompositorState {
         self.unregister_layer_surface_popups(surface_id);
         if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
             role.mapped = false;
-            role.acked_configure = None;
+            role.initial_configure_acknowledged = false;
+            role.pending_ack_for_next_surface_commit = None;
+            role.last_acknowledged_serial = None;
             role.pending_configures.clear();
             role.last_configure_size = None;
             role.initial_configure_sent = false;
@@ -551,9 +585,9 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         serial: u32,
-    ) {
+    ) -> bool {
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
-            return;
+            return false;
         };
         let Some(position) = role
             .pending_configures
@@ -561,19 +595,29 @@ impl CompositorState {
             .position(|configure| configure.serial == serial)
         else {
             layer_shell_debug_log(|| format!("ack surface={surface_id} serial={serial} unknown"));
-            return;
+            return false;
         };
         let configure = {
             let mut acknowledged = role.pending_configures.drain(..=position);
             let Some(configure) = acknowledged.next_back() else {
-                return;
+                return false;
             };
             configure
         };
-        role.acked_configure = Some(configure);
-        role.committed = configure.committed_state;
-        role.geometry = Some(configure.geometry);
-        layer_shell_debug_log(|| format!("ack surface={surface_id} serial={serial}"));
+        if !role.mapped {
+            role.initial_configure_acknowledged = true;
+        }
+        role.last_acknowledged_serial = Some(serial);
+        role.pending_ack_for_next_surface_commit = Some(configure);
+        let debug_details = layer_surface_debug_details(surface_id, role, None);
+        layer_shell_debug_log(|| format!("ack {debug_details}"));
+        true
+    }
+
+    fn consume_pending_ack_for_surface_commit(&mut self, surface_id: u32) {
+        if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
+            role.pending_ack_for_next_surface_commit = None;
+        }
     }
 
     pub(in crate::compositor) fn set_layer_surface_pending_layer(
@@ -693,7 +737,6 @@ impl CompositorState {
         };
         let configure = PendingLayerConfigure {
             serial,
-            committed_state: role.committed,
             geometry,
             origin,
         };
@@ -705,12 +748,8 @@ impl CompositorState {
             .configure(serial, geometry.width, geometry.height);
         layer_shell_debug_log(|| {
             format!(
-                "configure surface={surface_id} wl_surface={} namespace={} layer={:?} output={:?} version={} serial={serial} size={}x{} origin={}",
-                role.surface.id().protocol_id(),
-                role.namespace,
-                role.committed.layer,
-                role.output_id,
-                role.version,
+                "configure {} serial={serial} size={}x{} origin={}",
+                layer_surface_debug_details(surface_id, role, None),
                 geometry.width,
                 geometry.height,
                 origin.label()
