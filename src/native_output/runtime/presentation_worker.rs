@@ -460,7 +460,8 @@ pub(super) fn submit_explicit_ready_for_presentation(
         let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
         let pacing_frame_id = context
             .frame_pacing
-            .worker_submission_frame_id(ready_submit);
+            .reserve_worker_submission(ready_submit)
+            .map_err(io::Error::other)?;
         let test_only = match frozen_cursor_plan.cursor_test_policy {
             FrozenCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
             FrozenCursorTestPolicy::Skip => KmsTestOnlyPolicy::Skip,
@@ -476,7 +477,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
                             .map(|key| !explicit.async_validation_is_accepted(key))
                             .unwrap_or(true)
                 });
-        return Ok(queue_explicit_ready_for_presentation(
+        let result = match queue_explicit_ready_for_presentation(
             worker,
             explicit,
             server,
@@ -500,10 +501,36 @@ pub(super) fn submit_explicit_ready_for_presentation(
             },
             ready_submit,
             context.validation_base,
-        )?
-        .map(|(token, framebuffer_id, transaction_id)| {
-            (token, framebuffer_id, transaction_id, true)
-        }));
+        ) {
+            Ok(result) => result.map(|(token, framebuffer_id, transaction_id)| {
+                (token, framebuffer_id, transaction_id, true)
+            }),
+            Err(error) => {
+                if pacing_frame_id.is_some()
+                    && !context
+                        .frame_pacing
+                        .cancel_worker_submission(pacing_frame_id, ready_submit)
+                {
+                    return Err(io::Error::other(
+                        "failed explicit worker submission pacing identity mismatch",
+                    )
+                    .into());
+                }
+                return Err(error);
+            }
+        };
+        if result.is_none()
+            && pacing_frame_id.is_some()
+            && !context
+                .frame_pacing
+                .cancel_worker_submission(pacing_frame_id, ready_submit)
+        {
+            return Err(io::Error::other(
+                "unavailable explicit worker submission pacing identity mismatch",
+            )
+            .into());
+        }
+        return Ok(result);
     }
     let (token, framebuffer_id, transaction_id) =
         explicit.submit_ready_frame(kms_backend, server, output_transactions)?;
@@ -649,7 +676,7 @@ pub(super) fn finish_direct_worker_queued(
             .frame_batch_id()
             .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?
     };
-    let job = KmsCommitJob {
+    let mut job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
                 commit_token,
@@ -713,6 +740,11 @@ pub(super) fn finish_direct_worker_queued(
         drop(job);
         return Err(io::Error::other(format!("invalid direct worker payload: {error:?}")).into());
     }
+    let pacing_frame_id = context
+        .frame_pacing
+        .reserve_worker_submission(false)
+        .map_err(io::Error::other)?;
+    job.pacing_frame_id = pacing_frame_id;
     let mut guard = DirectWorkerAdmissionGuard::new(
         transaction_id,
         commit_token,

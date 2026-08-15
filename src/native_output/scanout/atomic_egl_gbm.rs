@@ -418,7 +418,7 @@ impl AtomicEglGbmScanout {
                 width,
                 height,
                 Some(image_target),
-                detect_partial_repaint_capabilities(&egl, egl_display, false),
+                detect_partial_repaint_capabilities(&egl, egl_display, true, true, false),
                 oblivion_one::cursor_theme::shared_compositor_cursor_image(),
             )
             .map_err(native_egl_io_error)?;
@@ -643,17 +643,11 @@ impl AtomicEglGbmScanout {
             .map_err(native_egl_io_error)?;
         let (framebuffer, buffer_age) = {
             let slot = self.slot(slot)?;
-            let (presentation_serial, presentation_pending) =
-                self.swapchain.as_ref().map_or((0, false), |swapchain| {
-                    (
-                        swapchain.presentation_serial(),
-                        swapchain.pending_slot().is_some(),
-                    )
-                });
-            (
-                slot.gl_framebuffer,
-                slot.buffer_age(presentation_serial, presentation_pending),
-            )
+            let presentation_serial = self
+                .swapchain
+                .as_ref()
+                .map_or(0, AtomicOutputSwapchain::presentation_serial);
+            (slot.gl_framebuffer, slot.buffer_age(presentation_serial))
         };
         let request = renderer.egl_scene_draw_request(
             self.width,
@@ -912,6 +906,8 @@ impl AtomicEglGbmScanout {
                 return Err(error);
             }
         };
+        let render_us = parts.render_us;
+        let repaint_stats = parts.stats;
         let rendered_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let frame = RenderedOutputFrame {
             id: frame_id,
@@ -941,6 +937,8 @@ impl AtomicEglGbmScanout {
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,
                     transaction_id,
+                    render_us,
+                    repaint_stats,
                 })
             }
             Err(error) => {
@@ -1169,6 +1167,8 @@ pub(crate) enum AtomicFrameRenderOutcome {
     Rendered {
         frame_id: u64,
         transaction_id: OutputTransactionId,
+        render_us: u64,
+        repaint_stats: GlesSceneFrameStats,
     },
     Skipped {
         reason: FrameSkipReason,

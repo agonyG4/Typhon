@@ -53,6 +53,8 @@ mod xwayland_reactor;
 #[cfg(test)]
 mod xwayland_reactor_tests;
 
+use metrics::NativeRenderTelemetry;
+
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{
     AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind, AtomicCommitPhase,
@@ -341,6 +343,7 @@ pub(crate) struct NativeRuntime {
     presentation_trace: PresentationTransactionTraceRing,
     presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
+    render_telemetry: NativeRenderTelemetry,
 }
 
 impl NativeRuntime {
@@ -445,7 +448,7 @@ impl Drop for NativeRuntime {
         } else {
             let _ = oblivion_one::xwayland::trace::take_recent_lifecycle_trace();
         }
-        if self.frame_pacing.enabled() {
+        if self.frame_pacing.summary_enabled() {
             println!(
                 "{}",
                 self.frame_pacing

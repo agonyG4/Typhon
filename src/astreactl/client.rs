@@ -15,7 +15,7 @@ use crate::control::{
 };
 use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DoctorSnapshot, OutputListSnapshot,
-    StatusSnapshot, VersionSnapshot, WindowListSnapshot,
+    PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -71,6 +71,8 @@ fn decode_command_result(
     let decoded = match command {
         "version" => serde_json::from_value::<VersionSnapshot>(value).map(AstreactlResult::Version),
         "status" => serde_json::from_value::<StatusSnapshot>(value).map(AstreactlResult::Status),
+        "performance" => serde_json::from_value::<PerformanceSnapshot>(value)
+            .map(|snapshot| AstreactlResult::Performance(Box::new(snapshot))),
         "doctor" => serde_json::from_value::<DoctorSnapshot>(value).map(AstreactlResult::Doctor),
         "outputs" => {
             serde_json::from_value::<OutputListSnapshot>(value).map(AstreactlResult::Outputs)

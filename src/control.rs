@@ -47,6 +47,7 @@ pub enum ControlCommand {
     Outputs,
     Windows,
     ActiveWindow,
+    Performance,
     CursorGet,
     CursorSetTheme,
     CursorSetSize,
@@ -67,6 +68,7 @@ impl ControlCommand {
             Self::Outputs => "outputs",
             Self::Windows => "windows",
             Self::ActiveWindow => "active-window",
+            Self::Performance => "performance",
             Self::CursorGet => "cursor.get",
             Self::CursorSetTheme => "cursor.set-theme",
             Self::CursorSetSize => "cursor.set-size",
@@ -87,6 +89,7 @@ impl ControlCommand {
             "outputs" => Self::Outputs,
             "windows" => Self::Windows,
             "active-window" => Self::ActiveWindow,
+            "performance" => Self::Performance,
             "cursor.get" => Self::CursorGet,
             "cursor.set-theme" => Self::CursorSetTheme,
             "cursor.set-size" => Self::CursorSetSize,
@@ -307,4 +310,18 @@ fn validate_response(response: &ControlResponse) -> Result<(), ControlCodecError
     valid_payload
         .then_some(())
         .ok_or(ControlCodecError::InvalidResponse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlCommand;
+
+    #[test]
+    fn performance_command_is_part_of_the_bounded_control_codec() {
+        assert_eq!(
+            ControlCommand::parse("performance"),
+            Some(ControlCommand::Performance)
+        );
+        assert_eq!(ControlCommand::Performance.as_str(), "performance");
+    }
 }

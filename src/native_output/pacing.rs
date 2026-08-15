@@ -125,19 +125,137 @@ mod tests {
     }
 
     #[test]
+    fn worker_submit_settles_reserved_frame_after_active_becomes_ready() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let reserved = pacing
+            .reserve_worker_submission(false)
+            .expect("worker reservation should be available");
+
+        pacing.note_ready_frame(2, true);
+        assert_eq!(pacing.worker_submission_frame_id(true), reserved);
+
+        pacing
+            .note_worker_submit_exact(
+                reserved,
+                41,
+                3,
+                false,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
+            .expect("the immutable worker reservation should settle once");
+        assert!(pacing.ready.is_none());
+        assert_eq!(pacing.pending.map(NativeOutputFrameId::get), reserved);
+    }
+
+    #[test]
+    fn worker_cancel_settles_reserved_frame_after_active_becomes_ready() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let reserved = pacing
+            .reserve_worker_submission(false)
+            .expect("worker reservation should be available");
+
+        pacing.note_ready_frame(2, false);
+        assert!(pacing.cancel_worker_submission(reserved, false));
+        assert!(pacing.active.is_none());
+        assert!(pacing.ready.is_none());
+        assert!(pacing.ready_waiting_started_ns.is_none());
+    }
+
+    #[test]
+    fn stale_worker_reservation_cannot_settle_or_remove_newer_frame() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let stale = pacing
+            .reserve_worker_submission(false)
+            .expect("worker reservation should be available");
+        assert!(pacing.cancel_worker_submission(stale, false));
+
+        pacing.queue_visual(2, 2);
+        let current = pacing.worker_submission_frame_id(false);
+        assert_ne!(stale, current);
+        assert!(
+            pacing
+                .note_worker_submit_exact(
+                    stale,
+                    41,
+                    3,
+                    false,
+                    NativeOutputPacingMode::ReactiveDouble,
+                )
+                .is_err()
+        );
+        assert_eq!(pacing.worker_submission_frame_id(false), current);
+        assert!(pacing.pending.is_none());
+    }
+
+    #[test]
+    fn worker_reservation_settles_exactly_once() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let reserved = pacing
+            .reserve_worker_submission(false)
+            .expect("worker reservation should be available");
+        pacing
+            .note_worker_submit_exact(
+                reserved,
+                41,
+                2,
+                false,
+                NativeOutputPacingMode::ReactiveDouble,
+            )
+            .unwrap();
+
+        assert!(
+            pacing
+                .note_worker_submit_exact(
+                    reserved,
+                    42,
+                    3,
+                    false,
+                    NativeOutputPacingMode::ReactiveDouble,
+                )
+                .is_err()
+        );
+        assert_eq!(pacing.pending.map(NativeOutputFrameId::get), reserved);
+    }
+
+    #[test]
+    fn unreserved_worker_submission_does_not_disturb_active_pacing() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let active = pacing.worker_submission_frame_id(false);
+
+        assert!(pacing.cancel_worker_submission(None, true));
+        pacing
+            .note_worker_submit_exact(None, 41, 2, true, NativeOutputPacingMode::ReactiveDouble)
+            .expect("a compatibility job without a pacing reservation is valid");
+
+        assert_eq!(pacing.worker_submission_frame_id(false), active);
+        assert!(pacing.ready.is_none());
+        assert!(pacing.pending.is_none());
+    }
+
+    #[test]
     fn rejected_worker_submission_clears_active_identity_and_ready_timing() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
         pacing.queue_visual(1, 1);
-        let active = pacing.worker_submission_frame_id(false).unwrap();
-        assert!(pacing.cancel_worker_submission(Some(active), false));
+        let active = pacing.reserve_worker_submission(false).unwrap();
+        assert!(pacing.cancel_worker_submission(active, false));
         assert!(pacing.active.is_none());
         assert!(pacing.active_queued_ns.is_none());
 
         pacing.queue_visual(2, 2);
         pacing.note_ready_frame(3, false);
-        let ready = pacing.worker_submission_frame_id(true).unwrap();
-        assert!(pacing.cancel_worker_submission(Some(ready), true));
+        let ready = pacing.reserve_worker_submission(true).unwrap();
+        assert!(pacing.cancel_worker_submission(ready, true));
         assert!(pacing.ready.is_none());
         assert!(pacing.ready_waiting_started_ns.is_none());
     }
@@ -151,6 +269,28 @@ mod tests {
         assert!(pacing.pending.is_some());
         assert!(pacing.abandon_pending_submission(41));
         assert!(pacing.pending.is_none());
+    }
+
+    #[test]
+    fn ready_worker_submit_records_wait_duration_before_clearing_timing() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.note_ready_frame(1_000, false);
+        let reserved = pacing.reserve_worker_submission(true).unwrap();
+
+        pacing
+            .note_worker_submit_exact(
+                reserved,
+                41,
+                51_000,
+                true,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
+            .unwrap();
+
+        assert_eq!(pacing.ready_waiting_for_target.percentiles(), (50, 50, 50));
+        assert!(pacing.ready_waiting_started_ns.is_none());
     }
 
     #[test]
@@ -469,6 +609,11 @@ const PACING_SAMPLE_CAPACITY: usize = 4096;
 const TARGET_TIMESTAMP_TOLERANCE_NS: u64 = 100_000;
 const TRACE_QUEUE_CAPACITY: usize = 2_048;
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerPacingReservation {
+    frame_id: NativeOutputFrameId,
+}
+
 #[derive(Debug)]
 struct NativeTraceSink {
     sender: SyncSender<String>,
@@ -505,13 +650,17 @@ impl NativeTraceSink {
 #[derive(Debug)]
 pub(crate) struct NativeFramePacing {
     enabled: bool,
+    summary_enabled: bool,
     trace: Option<NativeTraceSink>,
     ids: NativeOutputFrameIdSequence,
     pub(crate) active: Option<NativeOutputFrameId>,
     pub(crate) active_queued_ns: Option<u64>,
+    active_queued_frame_id: Option<NativeOutputFrameId>,
     pub(crate) pending: Option<NativeOutputFrameId>,
     pending_token: Option<u64>,
     pub(crate) ready: Option<NativeOutputFrameId>,
+    ready_waiting_frame_id: Option<NativeOutputFrameId>,
+    worker_reservation: Option<WorkerPacingReservation>,
     pub(crate) render_ahead_attempts: u64,
     pub(crate) render_ahead_successes: u64,
     pub(crate) wait_for_buffer_count: u64,
@@ -519,6 +668,7 @@ pub(crate) struct NativeFramePacing {
     pub(crate) reactive_double_frames: u64,
     pub(crate) reactive_double_immediate_submits: u64,
     pub(crate) reactive_double_actual_misses: u64,
+    pub(crate) predictive_triple_frames: u64,
     pub(crate) predictive_render_ahead_attempts: u64,
     pub(crate) predictive_render_ahead_ready: u64,
     pub(crate) predictive_ready_submits: u64,
@@ -568,23 +718,52 @@ pub(crate) struct ExplicitPresentationObservation {
     pub(crate) reactive_double: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeBufferingMetrics {
+    pub(crate) reactive_double_frames: u64,
+    pub(crate) predictive_triple_frames: u64,
+    pub(crate) render_ahead_attempts: u64,
+    pub(crate) render_ahead_ready: u64,
+    pub(crate) ready_submits: u64,
+    pub(crate) triple_entries_predicted: u64,
+    pub(crate) triple_entries_render_miss: u64,
+    pub(crate) triple_entries_submit_miss: u64,
+    pub(crate) triple_entries_presentation_miss: u64,
+    pub(crate) triple_exits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativePacingTimingMetrics {
+    pub(crate) wake_lateness: (u64, u64, u64),
+    pub(crate) target_error: (u64, u64, u64),
+    pub(crate) pageflip_interval: (u64, u64, u64),
+    pub(crate) commit_to_present: (u64, u64, u64),
+    pub(crate) missed_refresh_1x: u64,
+    pub(crate) missed_refresh_2x: u64,
+    pub(crate) missed_refresh_3x_or_more: u64,
+}
+
 impl NativeFramePacing {
     pub(crate) fn from_env() -> Self {
-        let enabled = std::env::var("TYPHON_FRAME_PACING_DEBUG")
+        let summary_enabled = std::env::var("TYPHON_FRAME_PACING_DEBUG")
             .ok()
             .is_some_and(|value| super::perf::native_perf_log_value_enabled(&value));
         let trace_enabled = std::env::var("TYPHON_FRAME_PACING_TRACE")
             .ok()
             .is_some_and(|value| super::perf::native_perf_log_value_enabled(&value));
         Self {
-            enabled: enabled || trace_enabled,
+            enabled: true,
+            summary_enabled: summary_enabled || trace_enabled,
             trace: trace_enabled.then(NativeTraceSink::new),
             ids: NativeOutputFrameIdSequence::new(1),
             active: None,
             active_queued_ns: None,
+            active_queued_frame_id: None,
             pending: None,
             pending_token: None,
             ready: None,
+            ready_waiting_frame_id: None,
+            worker_reservation: None,
             render_ahead_attempts: 0,
             render_ahead_successes: 0,
             wait_for_buffer_count: 0,
@@ -592,6 +771,7 @@ impl NativeFramePacing {
             reactive_double_frames: 0,
             reactive_double_immediate_submits: 0,
             reactive_double_actual_misses: 0,
+            predictive_triple_frames: 0,
             predictive_render_ahead_attempts: 0,
             predictive_render_ahead_ready: 0,
             predictive_ready_submits: 0,
@@ -629,8 +809,8 @@ impl NativeFramePacing {
         }
     }
 
-    pub(crate) const fn enabled(&self) -> bool {
-        self.enabled
+    pub(crate) const fn summary_enabled(&self) -> bool {
+        self.summary_enabled
     }
     pub(crate) fn queue_visual(&mut self, now_ns: u64, render_generation: u64) {
         if !self.enabled {
@@ -642,6 +822,7 @@ impl NativeFramePacing {
         let id = self.ids.next();
         self.active = Some(id);
         self.active_queued_ns = Some(now_ns);
+        self.active_queued_frame_id = Some(id);
         self.log(
             "visual_queued",
             vec![
@@ -668,13 +849,16 @@ impl NativeFramePacing {
                 self.reactive_double_frames += 1;
             }
             (NativeOutputPacingMode::PredictiveTriple, true) => {
+                self.predictive_triple_frames += 1;
                 self.render_ahead_attempts += 1;
                 self.predictive_render_ahead_attempts += 1;
             }
             (NativeOutputPacingMode::ReactiveDouble, true) => {
                 self.multiple_deadline_owner_violation_count += 1;
             }
-            (NativeOutputPacingMode::PredictiveTriple, false) => {}
+            (NativeOutputPacingMode::PredictiveTriple, false) => {
+                self.predictive_triple_frames += 1;
+            }
         }
     }
     pub(crate) fn note_submit(
@@ -692,15 +876,32 @@ impl NativeFramePacing {
         } else {
             self.active.take()
         };
+        if !ready_submit {
+            self.clear_active_worker_timing(id);
+        }
+        self.note_submit_frame(id, token, now_ns, ready_submit, pacing_mode);
+    }
+
+    fn note_submit_frame(
+        &mut self,
+        id: Option<NativeOutputFrameId>,
+        token: u64,
+        now_ns: u64,
+        ready_submit: bool,
+        pacing_mode: NativeOutputPacingMode,
+    ) {
         if ready_submit {
             self.ready_submit_count += 1;
             match pacing_mode {
                 NativeOutputPacingMode::PredictiveTriple => self.predictive_ready_submits += 1,
                 NativeOutputPacingMode::ReactiveDouble => self.normal_ready_wait_count += 1,
             }
-            if let Some(started_at) = self.ready_waiting_started_ns.take() {
-                self.ready_waiting_for_target
-                    .record(now_ns.saturating_sub(started_at) / 1_000);
+            if self.ready_waiting_frame_id == id {
+                if let Some(started_at) = self.ready_waiting_started_ns.take() {
+                    self.ready_waiting_for_target
+                        .record(now_ns.saturating_sub(started_at) / 1_000);
+                }
+                self.ready_waiting_frame_id = None;
             }
         }
         if pacing_mode == NativeOutputPacingMode::ReactiveDouble && !ready_submit {
@@ -708,7 +909,10 @@ impl NativeFramePacing {
         }
         self.pending = id;
         self.pending_token = id.map(|_| token);
-        self.active_queued_ns = None;
+        if !ready_submit && self.active_queued_frame_id == id {
+            self.active_queued_ns = None;
+            self.active_queued_frame_id = None;
+        }
         self.log(
             "submit",
             vec![
@@ -736,12 +940,68 @@ impl NativeFramePacing {
             .map(|id| id.get())
     }
 
+    pub(crate) fn reserve_worker_submission(
+        &mut self,
+        ready_submit: bool,
+    ) -> Result<Option<u64>, &'static str> {
+        if !self.enabled {
+            return Ok(self.worker_submission_frame_id(ready_submit));
+        }
+        if self.worker_reservation.is_some() {
+            return Err("worker pacing reservation is already queued");
+        }
+        let Some(frame_id) = self.worker_submission_frame(ready_submit) else {
+            return Ok(None);
+        };
+        self.worker_reservation = Some(WorkerPacingReservation { frame_id });
+        Ok(Some(frame_id.get()))
+    }
+
     fn worker_submission_frame(&self, ready_submit: bool) -> Option<NativeOutputFrameId> {
         if ready_submit {
             self.ready
         } else {
             self.active
         }
+    }
+
+    fn clear_active_worker_timing(&mut self, frame_id: Option<NativeOutputFrameId>) {
+        if self.active_queued_frame_id == frame_id {
+            self.active_queued_frame_id = None;
+            self.active_queued_ns = None;
+        }
+    }
+
+    fn clear_ready_waiting_timing(&mut self, frame_id: Option<NativeOutputFrameId>) {
+        if self.ready_waiting_frame_id == frame_id {
+            self.ready_waiting_frame_id = None;
+            self.ready_waiting_started_ns = None;
+        }
+    }
+
+    fn take_worker_submission_frame(
+        &mut self,
+        expected: Option<u64>,
+    ) -> Result<Option<NativeOutputFrameId>, &'static str> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+
+        let Some(reservation) = self.worker_reservation else {
+            return Err("worker pacing frame identity does not match queued state");
+        };
+        if reservation.frame_id.get() == expected {
+            self.worker_reservation = None;
+            if self.active == Some(reservation.frame_id) {
+                self.active = None;
+            }
+            if self.ready == Some(reservation.frame_id) {
+                self.ready = None;
+            }
+            self.clear_active_worker_timing(Some(reservation.frame_id));
+            return Ok(Some(reservation.frame_id));
+        }
+        Err("worker pacing frame identity does not match queued state")
     }
 
     pub(crate) fn cancel_worker_submission(
@@ -752,17 +1012,17 @@ impl NativeFramePacing {
         if !self.enabled {
             return true;
         }
-        let current = self.worker_submission_frame(ready_submit);
-        if current.map(|id| id.get()) != expected {
+        if expected.is_none() {
+            return true;
+        }
+        let current = match self.take_worker_submission_frame(expected) {
+            Ok(current) => current,
+            Err(_) => return false,
+        };
+        if current.is_none() {
             return false;
         }
-        if ready_submit {
-            self.ready = None;
-            self.ready_waiting_started_ns = None;
-        } else {
-            self.active = None;
-            self.active_queued_ns = None;
-        }
+        self.clear_ready_waiting_timing(current);
         self.log(
             "worker_submit_cancelled",
             vec![
@@ -784,10 +1044,11 @@ impl NativeFramePacing {
         if !self.enabled {
             return Ok(());
         }
-        if self.worker_submission_frame_id(ready_submit) != expected {
-            return Err("worker pacing frame identity does not match queued state");
+        if expected.is_none() {
+            return Ok(());
         }
-        self.note_submit(token, now_ns, ready_submit, pacing_mode);
+        let id = self.take_worker_submission_frame(expected)?;
+        self.note_submit_frame(id, token, now_ns, ready_submit, pacing_mode);
         Ok(())
     }
 
@@ -810,15 +1071,20 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
+        let ready = self.active.take();
         if waits_for_target {
             self.render_ahead_successes += 1;
             self.predictive_render_ahead_ready += 1;
+            self.ready_waiting_started_ns = None;
+            self.ready_waiting_frame_id = None;
         } else {
             self.normal_ready_wait_count += 1;
             self.ready_waiting_for_target_count += 1;
             self.ready_waiting_started_ns = Some(now_ns);
+            self.ready_waiting_frame_id = ready;
         }
-        self.ready = self.active.take();
+        self.ready = ready;
+        self.active_queued_frame_id = None;
         self.active_queued_ns = None;
         self.log(
             "ready_queued",
@@ -1010,6 +1276,33 @@ impl NativeFramePacing {
             PipelineWaitReason::TripleCapabilityUnavailable => 9,
         };
         self.pipeline_waits[index] = self.pipeline_waits[index].saturating_add(1);
+    }
+
+    pub(crate) const fn buffering_metrics(&self) -> NativeBufferingMetrics {
+        NativeBufferingMetrics {
+            reactive_double_frames: self.reactive_double_frames,
+            predictive_triple_frames: self.predictive_triple_frames,
+            render_ahead_attempts: self.render_ahead_attempts,
+            render_ahead_ready: self.predictive_render_ahead_ready,
+            ready_submits: self.ready_submit_count,
+            triple_entries_predicted: self.adaptive_triple_entries_predicted,
+            triple_entries_render_miss: self.adaptive_triple_entries_proven_render_miss,
+            triple_entries_submit_miss: self.adaptive_triple_entries_proven_submit_miss,
+            triple_entries_presentation_miss: self.adaptive_triple_entries_proven_presentation_miss,
+            triple_exits: self.adaptive_triple_exits,
+        }
+    }
+
+    pub(crate) fn timing_metrics(&self) -> NativePacingTimingMetrics {
+        NativePacingTimingMetrics {
+            wake_lateness: self.wake_lateness.percentiles(),
+            target_error: self.target_error.percentiles(),
+            pageflip_interval: self.pageflip_intervals.percentiles(),
+            commit_to_present: self.commit_to_present.percentiles(),
+            missed_refresh_1x: self.misses.missed_1x,
+            missed_refresh_2x: self.misses.missed_2x,
+            missed_refresh_3x_or_more: self.misses.missed_3x_or_more,
+        }
     }
     pub(crate) fn note_fence_timestamp_quality(&mut self, quality: FenceTimestampQuality) {
         if !self.enabled {

@@ -108,6 +108,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            render_telemetry,
             seat_session: _,
             process_supervisor: _,
             shutdown: _,
@@ -986,6 +987,7 @@ impl NativeRuntime {
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
+                                render_telemetry.record_skipped(render_us);
                                 frame_scheduler.note_immediate_completion();
                                 presentation_deadline.clear_scheduled_target();
                                 *scheduled_presentation_target = None;
@@ -1005,10 +1007,9 @@ impl NativeRuntime {
                                     ]
                                 });
                             }
-                            AtomicFrameRenderOutcome::Rendered {
-                                frame_id,
-                                transaction_id,
-                            } => {
+                            #[rustfmt::skip]
+                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, render_us, repaint_stats } => {
+                                render_telemetry.record_atomic(render_us, repaint_stats, *target);
                                 frame_scheduler.consume_visual_work();
                                 frame_rendered = true;
                                 let trace_timestamp_ns = monotonic_now_ns()?;
@@ -1171,6 +1172,7 @@ impl NativeRuntime {
                             }
                         };
                         let paint_stats = paint_outcome.stats();
+                        render_telemetry.record_native_paint(paint_stats);
                         frame_pacing.log(
                             "render_complete",
                             vec![
@@ -1495,5 +1497,4 @@ impl NativeRuntime {
     }
 }
 #[cfg(test)]
-#[path = "presentation_tests.rs"]
 mod pacing_mode_tests;

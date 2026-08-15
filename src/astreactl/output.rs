@@ -15,6 +15,17 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.mapped_window_count,
             snapshot.minimized_window_count
         ),
+        AstreactlResult::Performance(snapshot) => format!(
+            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}",
+            snapshot.compositor_cpu_render.p50_us,
+            snapshot.compositor_cpu_render.p95_us,
+            snapshot.compositor_cpu_render.p99_us,
+            snapshot.repaint.skip_frames,
+            snapshot.repaint.partial_frames,
+            snapshot.repaint.full_frames,
+            snapshot.buffering.render_ahead_attempts,
+            snapshot.buffering.render_ahead_ready,
+        ),
         AstreactlResult::Doctor(snapshot) => snapshot
             .checks
             .iter()

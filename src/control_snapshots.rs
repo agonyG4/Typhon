@@ -399,6 +399,88 @@ pub struct CursorSnapshot {
     pub asset_source: CursorAssetSource,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TimingSummarySnapshot {
+    pub count: u64,
+    pub total_us: u64,
+    pub last_us: u64,
+    pub mean_us: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct RepaintPerformanceSnapshot {
+    pub skip_frames: u64,
+    pub partial_frames: u64,
+    pub full_frames: u64,
+    pub buffer_age_buckets: std::collections::BTreeMap<String, u64>,
+    pub partial_repair_pixels: u64,
+    pub full_output_pixels: u64,
+    pub full_repaint_reasons: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct BufferingPerformanceSnapshot {
+    pub reactive_double_frames: u64,
+    pub predictive_triple_frames: u64,
+    pub render_ahead_attempts: u64,
+    pub render_ahead_ready: u64,
+    pub ready_submits: u64,
+    pub triple_entries_predicted: u64,
+    pub triple_entries_render_miss: u64,
+    pub triple_entries_submit_miss: u64,
+    pub triple_entries_presentation_miss: u64,
+    pub triple_exits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KmsPerformanceSnapshot {
+    pub worker_jobs_enqueued: u64,
+    pub worker_jobs_submitted: u64,
+    pub worker_jobs_rejected: u64,
+    pub worker_late_wakeups: u64,
+    pub worker_submit_duration_max_us: u64,
+    pub worker_queue_residency_max_us: u64,
+    pub worker_queue_depth_max: u64,
+    pub wake_lateness_p50_us: u64,
+    pub wake_lateness_p95_us: u64,
+    pub wake_lateness_p99_us: u64,
+    pub target_slip_p50_us: u64,
+    pub target_slip_p95_us: u64,
+    pub target_slip_p99_us: u64,
+    pub pageflip_interval_p50_us: u64,
+    pub pageflip_interval_p95_us: u64,
+    pub pageflip_interval_p99_us: u64,
+    pub commit_to_present_p50_us: u64,
+    pub commit_to_present_p95_us: u64,
+    pub commit_to_present_p99_us: u64,
+    pub missed_refresh_1x: u64,
+    pub missed_refresh_2x: u64,
+    pub missed_refresh_3x_or_more: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceSnapshot {
+    pub compositor_cpu_render: TimingSummarySnapshot,
+    pub repaint: RepaintPerformanceSnapshot,
+    pub buffering: BufferingPerformanceSnapshot,
+    pub kms: KmsPerformanceSnapshot,
+    pub timing_scopes: std::collections::BTreeMap<String, TimingSummarySnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AstreactlResult {
@@ -409,6 +491,7 @@ pub enum AstreactlResult {
     Windows(WindowListSnapshot),
     ActiveWindow(ActiveWindowSnapshot),
     Cursor(CursorSnapshot),
+    Performance(Box<PerformanceSnapshot>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

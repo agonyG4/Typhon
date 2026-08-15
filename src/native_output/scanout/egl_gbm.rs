@@ -440,6 +440,8 @@ impl NativeEglGbmScanout {
             detect_partial_repaint_capabilities(
                 &egl,
                 egl_display,
+                false,
+                swap_buffers_with_damage.is_some(),
                 swap_buffers_with_damage.is_some(),
             ),
             oblivion_one::cursor_theme::shared_compositor_cursor_image(),

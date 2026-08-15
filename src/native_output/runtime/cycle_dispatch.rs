@@ -208,6 +208,7 @@ impl NativeRuntime {
                     },
                 })
             }
+            ControlCommand::Performance => serde_json::to_value(self.performance_snapshot()),
             ControlCommand::Doctor => {
                 let output_available = !self.scanout_destroyed;
                 let session_severity = self.session.doctor_severity();

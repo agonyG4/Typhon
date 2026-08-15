@@ -1,5 +1,256 @@
 use super::planner::visual_target_deadline_for_mode;
 use super::*;
+use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
+use crate::native_output::{
+    KmsTarget, kms_worker::WorkerMetricsSnapshot, scanout::NativePaintStats,
+};
+use oblivion_one::control_snapshots::{
+    BufferingPerformanceSnapshot, KmsPerformanceSnapshot, PerformanceSnapshot,
+    RepaintPerformanceSnapshot, TimingSummarySnapshot,
+};
+use std::collections::BTreeMap;
+
+const RENDER_REPAINT_REASON_COUNT: usize = 12;
+const RENDER_BUFFER_AGE_BUCKET_COUNT: usize = 6;
+
+#[derive(Debug, Default)]
+pub(super) struct NativeRenderTelemetry {
+    compositor_cpu_render: TimingSummary,
+    skip_frames: u64,
+    partial_frames: u64,
+    full_frames: u64,
+    buffer_age_buckets: [u64; RENDER_BUFFER_AGE_BUCKET_COUNT],
+    partial_repair_pixels: u64,
+    full_output_pixels: u64,
+    full_repaint_reasons: [u64; RENDER_REPAINT_REASON_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct NativeRenderTelemetrySnapshot {
+    pub(super) compositor_cpu_render: TimingSummary,
+    pub(super) skip_frames: u64,
+    pub(super) partial_frames: u64,
+    pub(super) full_frames: u64,
+    pub(super) buffer_age_buckets: [u64; RENDER_BUFFER_AGE_BUCKET_COUNT],
+    pub(super) partial_repair_pixels: u64,
+    pub(super) full_output_pixels: u64,
+    pub(super) full_repaint_reasons: [u64; RENDER_REPAINT_REASON_COUNT],
+}
+
+impl NativeRenderTelemetry {
+    pub(super) fn record_skipped(&mut self, render_us: u64) {
+        self.record_render_us(render_us);
+        self.record_repaint(RepaintMode::Skip, None, 0, 0, None);
+    }
+
+    pub(super) fn record_render_us(&mut self, render_us: u64) {
+        self.compositor_cpu_render
+            .record(render_us.saturating_mul(1_000));
+    }
+
+    pub(super) fn record_rendered(
+        &mut self,
+        render_us: u64,
+        stats: GlesSceneFrameStats,
+        output_width: u32,
+        output_height: u32,
+    ) {
+        self.record_render_us(render_us);
+        self.record_repaint(
+            stats.repaint_mode,
+            stats.buffer_age,
+            u64::from(output_width).saturating_mul(u64::from(output_height)),
+            stats.repair_damage_pixels,
+            stats.fallback_reason,
+        );
+    }
+
+    pub(super) fn record_atomic(
+        &mut self,
+        render_us: u64,
+        stats: GlesSceneFrameStats,
+        target: KmsTarget,
+    ) {
+        self.record_rendered(render_us, stats, target.width, target.height);
+    }
+
+    pub(super) fn record_native_paint(&mut self, stats: NativePaintStats) {
+        self.record_render_us(stats.render_us);
+        if let Some(repaint) = stats.gles_repaint {
+            self.record_repaint(
+                repaint.repaint_mode,
+                repaint.buffer_age,
+                u64::from(stats.width).saturating_mul(u64::from(stats.height)),
+                repaint.repair_damage_pixels,
+                repaint.fallback_reason,
+            );
+        }
+    }
+
+    pub(super) fn record_repaint(
+        &mut self,
+        mode: RepaintMode,
+        buffer_age: Option<u32>,
+        output_pixels: u64,
+        repair_pixels: u64,
+        fallback_reason: Option<FullRepaintReason>,
+    ) {
+        match mode {
+            RepaintMode::Skip => self.skip_frames = self.skip_frames.saturating_add(1),
+            RepaintMode::Partial => {
+                self.partial_frames = self.partial_frames.saturating_add(1);
+                self.partial_repair_pixels =
+                    self.partial_repair_pixels.saturating_add(repair_pixels);
+            }
+            RepaintMode::Full => {
+                self.full_frames = self.full_frames.saturating_add(1);
+                self.full_output_pixels = self.full_output_pixels.saturating_add(output_pixels);
+            }
+        }
+        let age_bucket = match buffer_age {
+            Some(0) => 0,
+            Some(1) => 1,
+            Some(2) => 2,
+            Some(3) => 3,
+            Some(_) => 4,
+            None => 5,
+        };
+        self.buffer_age_buckets[age_bucket] = self.buffer_age_buckets[age_bucket].saturating_add(1);
+        if let Some(reason) = fallback_reason {
+            self.full_repaint_reasons[reason.histogram_index()] =
+                self.full_repaint_reasons[reason.histogram_index()].saturating_add(1);
+        }
+    }
+
+    pub(super) const fn snapshot(&self) -> NativeRenderTelemetrySnapshot {
+        NativeRenderTelemetrySnapshot {
+            compositor_cpu_render: self.compositor_cpu_render,
+            skip_frames: self.skip_frames,
+            partial_frames: self.partial_frames,
+            full_frames: self.full_frames,
+            buffer_age_buckets: self.buffer_age_buckets,
+            partial_repair_pixels: self.partial_repair_pixels,
+            full_output_pixels: self.full_output_pixels,
+            full_repaint_reasons: self.full_repaint_reasons,
+        }
+    }
+
+    fn control_snapshot(&self) -> RepaintPerformanceSnapshot {
+        let snapshot = self.snapshot();
+        let age_names = ["0", "1", "2", "3", "4_plus", "unknown"];
+        let buffer_age_buckets = age_names
+            .into_iter()
+            .zip(snapshot.buffer_age_buckets)
+            .map(|(name, count)| (name.to_string(), count))
+            .collect();
+        let reasons = [
+            FullRepaintReason::CurrentDamageFull,
+            FullRepaintReason::FirstFrameOrInvalidated,
+            FullRepaintReason::BufferAgeUnsupported,
+            FullRepaintReason::PartialRenderRepairUnsupported,
+            FullRepaintReason::BufferAgeZero,
+            FullRepaintReason::BufferAgeInvalid,
+            FullRepaintReason::BufferAgeQueryFailed,
+            FullRepaintReason::InsufficientHistory,
+            FullRepaintReason::TooManyRectangles,
+            FullRepaintReason::DamageAreaThreshold,
+            FullRepaintReason::ForcedFull,
+            FullRepaintReason::PartialRepaintDisabled,
+        ];
+        let full_repaint_reasons = reasons
+            .into_iter()
+            .zip(snapshot.full_repaint_reasons)
+            .map(|(reason, count)| (reason.as_str().to_string(), count))
+            .collect();
+        RepaintPerformanceSnapshot {
+            skip_frames: snapshot.skip_frames,
+            partial_frames: snapshot.partial_frames,
+            full_frames: snapshot.full_frames,
+            buffer_age_buckets,
+            partial_repair_pixels: snapshot.partial_repair_pixels,
+            full_output_pixels: snapshot.full_output_pixels,
+            full_repaint_reasons,
+        }
+    }
+}
+
+fn timing_summary_snapshot(summary: TimingSummary) -> TimingSummarySnapshot {
+    let total_us = summary.total_ns / 1_000;
+    TimingSummarySnapshot {
+        count: summary.count,
+        total_us,
+        last_us: summary.last_ns / 1_000,
+        mean_us: if summary.count == 0 {
+            0
+        } else {
+            total_us / summary.count
+        },
+        p50_us: summary.percentile_ns(50) / 1_000,
+        p95_us: summary.percentile_ns(95) / 1_000,
+        p99_us: summary.percentile_ns(99) / 1_000,
+        max_us: summary.max_ns / 1_000,
+    }
+}
+
+impl NativeRuntime {
+    pub(super) fn performance_snapshot(&self) -> PerformanceSnapshot {
+        let buffering = self.frame_pacing.buffering_metrics();
+        let pacing = self.frame_pacing.timing_metrics();
+        let worker = self
+            .kms_commit_worker
+            .as_ref()
+            .map_or_else(WorkerMetricsSnapshot::default, |worker| {
+                worker.metrics_snapshot()
+            });
+        let compositor_cpu_render =
+            timing_summary_snapshot(self.render_telemetry.snapshot().compositor_cpu_render);
+        let mut timing_scopes = BTreeMap::new();
+        for (name, summary) in &self.timing_scopes {
+            timing_scopes.insert((*name).to_string(), timing_summary_snapshot(*summary));
+        }
+        PerformanceSnapshot {
+            compositor_cpu_render,
+            repaint: self.render_telemetry.control_snapshot(),
+            buffering: BufferingPerformanceSnapshot {
+                reactive_double_frames: buffering.reactive_double_frames,
+                predictive_triple_frames: buffering.predictive_triple_frames,
+                render_ahead_attempts: buffering.render_ahead_attempts,
+                render_ahead_ready: buffering.render_ahead_ready,
+                ready_submits: buffering.ready_submits,
+                triple_entries_predicted: buffering.triple_entries_predicted,
+                triple_entries_render_miss: buffering.triple_entries_render_miss,
+                triple_entries_submit_miss: buffering.triple_entries_submit_miss,
+                triple_entries_presentation_miss: buffering.triple_entries_presentation_miss,
+                triple_exits: buffering.triple_exits,
+            },
+            kms: KmsPerformanceSnapshot {
+                worker_jobs_enqueued: worker.jobs_enqueued,
+                worker_jobs_submitted: worker.jobs_submitted,
+                worker_jobs_rejected: worker.jobs_rejected,
+                worker_late_wakeups: worker.late_wakeups,
+                worker_submit_duration_max_us: worker.submit_duration_ns_max / 1_000,
+                worker_queue_residency_max_us: worker.queue_wait_ns_max / 1_000,
+                worker_queue_depth_max: worker.runtime_queue_depth_max,
+                wake_lateness_p50_us: pacing.wake_lateness.0,
+                wake_lateness_p95_us: pacing.wake_lateness.1,
+                wake_lateness_p99_us: pacing.wake_lateness.2,
+                target_slip_p50_us: pacing.target_error.0,
+                target_slip_p95_us: pacing.target_error.1,
+                target_slip_p99_us: pacing.target_error.2,
+                pageflip_interval_p50_us: pacing.pageflip_interval.0,
+                pageflip_interval_p95_us: pacing.pageflip_interval.1,
+                pageflip_interval_p99_us: pacing.pageflip_interval.2,
+                commit_to_present_p50_us: pacing.commit_to_present.0,
+                commit_to_present_p95_us: pacing.commit_to_present.1,
+                commit_to_present_p99_us: pacing.commit_to_present.2,
+                missed_refresh_1x: pacing.missed_refresh_1x,
+                missed_refresh_2x: pacing.missed_refresh_2x,
+                missed_refresh_3x_or_more: pacing.missed_refresh_3x_or_more,
+            },
+            timing_scopes,
+        }
+    }
+}
 
 fn xwayland_scene_metric_fields(
     metrics: oblivion_one::compositor::XwaylandSceneMetricsSnapshot,
@@ -902,5 +1153,35 @@ mod tests {
             2
         );
         assert_ne!(fields[3].value, fields[4].value);
+    }
+
+    #[test]
+    fn render_telemetry_keeps_bounded_timing_repaint_and_age_aggregates() {
+        use crate::egl_renderer::{FullRepaintReason, RepaintMode};
+
+        let mut telemetry = NativeRenderTelemetry::default();
+        telemetry.record_render_us(1_500);
+        telemetry.record_render_us(2_500);
+        telemetry.record_repaint(RepaintMode::Partial, Some(2), 100, 20, None);
+        telemetry.record_repaint(
+            RepaintMode::Full,
+            Some(0),
+            100,
+            100,
+            Some(FullRepaintReason::BufferAgeZero),
+        );
+        telemetry.record_repaint(RepaintMode::Skip, None, 100, 0, None);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.compositor_cpu_render.count, 2);
+        assert_eq!(snapshot.partial_frames, 1);
+        assert_eq!(snapshot.full_frames, 1);
+        assert_eq!(snapshot.skip_frames, 1);
+        assert_eq!(snapshot.buffer_age_buckets[2], 1);
+        assert_eq!(snapshot.buffer_age_buckets[0], 1);
+        assert_eq!(snapshot.buffer_age_buckets[5], 1);
+        assert_eq!(snapshot.partial_repair_pixels, 20);
+        assert_eq!(snapshot.full_output_pixels, 100);
+        assert_eq!(snapshot.full_repaint_reasons[4], 1);
     }
 }

@@ -85,7 +85,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|outputs|windows|activewindow|cursor ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...>"
                 );
                 return Ok(0);
             }
@@ -148,7 +148,9 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         }
         let wire_command = match command.as_str() {
             "activewindow" => "active-window",
-            "version" | "status" | "doctor" | "outputs" | "windows" => command.as_str(),
+            "version" | "status" | "doctor" | "performance" | "outputs" | "windows" => {
+                command.as_str()
+            }
             _ => return Err(AstreactlError::Usage(format!("unknown command {command}"))),
         };
         (command.as_str(), wire_command, serde_json::json!({}))

@@ -177,7 +177,9 @@ pub(super) fn submit_ready_frame(
                 }
                 _ => None,
             };
-            let pacing_frame_id = frame_pacing.worker_submission_frame_id(true);
+            let pacing_frame_id = frame_pacing
+                .reserve_worker_submission(true)
+                .map_err(io::Error::other)?;
             let test_only = atomic_cursor.as_ref().map_or(
                 crate::native_output::kms_worker::KmsTestOnlyPolicy::Skip,
                 |cursor| match cursor.scheduled_test_policy() {
@@ -189,7 +191,7 @@ pub(super) fn submit_ready_frame(
                     }
                 },
             );
-            let Some(result) = queue_compatibility_for_presentation(
+            let result = match queue_compatibility_for_presentation(
                 worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?,
                 scanout,
                 kms_backend,
@@ -216,8 +218,29 @@ pub(super) fn submit_ready_frame(
                 crate::native_output::kms_worker::KmsCommitTestPolicy::from_cursor(test_only),
                 cursor_epoch,
                 validation_base,
-            )?
-            else {
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if pacing_frame_id.is_some()
+                        && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
+                    {
+                        return Err(io::Error::other(
+                            "failed compatibility worker pacing identity mismatch",
+                        )
+                        .into());
+                    }
+                    return Err(error);
+                }
+            };
+            let Some(result) = result else {
+                if pacing_frame_id.is_some()
+                    && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
+                {
+                    return Err(io::Error::other(
+                        "unavailable compatibility worker pacing identity mismatch",
+                    )
+                    .into());
+                }
                 return Ok(ReadySubmissionResult::Unavailable);
             };
             result

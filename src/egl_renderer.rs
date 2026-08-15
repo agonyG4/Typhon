@@ -18,12 +18,12 @@ pub(crate) mod native_fence;
 mod program;
 
 pub(crate) use damage::{
-    BufferAge, OutputDamage, OutputRect, RepaintMode, render_target_buffer_age,
+    BufferAge, FullRepaintReason, OutputDamage, OutputRect, RepaintMode, render_target_buffer_age,
 };
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
-    EglPartialRepaintCapabilities, EglPresentedDamageState, FullRepaintReason,
-    PartialRepaintPlanner, RenderExecution, RepaintPlan,
+    EglPartialRepaintCapabilities, EglPresentedDamageState, PartialRepaintPlanner, RenderExecution,
+    RepaintPlan,
 };
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
@@ -2195,6 +2195,8 @@ pub(crate) fn load_swap_buffers_with_damage(
 pub(crate) fn detect_partial_repaint_capabilities(
     egl: &EglInstance,
     display: egl::Display,
+    target_lineage_available: bool,
+    partial_render_repair: bool,
     swap_buffers_with_damage: bool,
 ) -> EglPartialRepaintCapabilities {
     let extensions = egl
@@ -2202,10 +2204,12 @@ pub(crate) fn detect_partial_repaint_capabilities(
         .map(|extensions| extensions.to_string_lossy().into_owned())
         .unwrap_or_default();
     EglPartialRepaintCapabilities {
-        buffer_age: extensions
-            .split_ascii_whitespace()
-            .any(|extension| extension == "EGL_EXT_buffer_age")
-            && !buffer_age_disabled(),
+        buffer_age: !buffer_age_disabled()
+            && (target_lineage_available
+                || extensions
+                    .split_ascii_whitespace()
+                    .any(|extension| extension == "EGL_EXT_buffer_age")),
+        partial_render_repair,
         swap_buffers_with_damage,
     }
 }

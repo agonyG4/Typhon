@@ -36,16 +36,8 @@ pub(crate) struct AtomicOutputSlot {
 }
 
 impl AtomicOutputSlot {
-    pub(crate) fn buffer_age(
-        &self,
-        presentation_serial: u64,
-        presentation_pending: bool,
-    ) -> BufferAge {
-        render_target_buffer_age(
-            presentation_serial,
-            self.last_presented_serial,
-            presentation_pending,
-        )
+    pub(crate) fn buffer_age(&self, presentation_serial: u64) -> BufferAge {
+        render_target_buffer_age(presentation_serial, self.last_presented_serial)
     }
 
     #[allow(clippy::too_many_arguments)]

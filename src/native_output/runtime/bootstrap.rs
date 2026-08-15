@@ -665,6 +665,7 @@ impl NativeRuntime {
             presentation_trace_path: std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
                 .map(std::path::PathBuf::from),
             timing_scopes: std::collections::BTreeMap::new(),
+            render_telemetry: NativeRenderTelemetry::default(),
         };
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
