@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::decoration::render_plan::{DecorationRenderPlan, DecorationRenderPrimitive};
+use super::decoration::types::DecorationRect;
 use super::{
     ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceDamageRect, SurfaceRenderBackend,
@@ -70,6 +72,23 @@ pub struct DesktopComposeRequest<'a> {
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub client_cursor: Option<ClientCursorRenderState<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecorationRenderInstance {
+    pub(crate) plan: DecorationRenderPlan,
+    pub(crate) origin_x: i32,
+    pub(crate) origin_y: i32,
+}
+
+impl DecorationRenderInstance {
+    pub fn primitives(&self) -> &[DecorationRenderPrimitive] {
+        &self.plan.primitives
+    }
+
+    pub fn origin(&self) -> (i32, i32) {
+        (self.origin_x, self.origin_y)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -356,6 +375,7 @@ pub struct DesktopSceneRenderer {
     last_damage_debug_stats: DamageDebugStats,
     reusable_frame_key: Option<ReusableFrameKey>,
     reusable_frame_had_client_cursor: bool,
+    decoration_instances: Vec<DecorationRenderInstance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,11 +407,21 @@ impl DesktopSceneRenderer {
             last_damage_debug_stats: DamageDebugStats::default(),
             reusable_frame_key: None,
             reusable_frame_had_client_cursor: false,
+            decoration_instances: Vec::new(),
         }
     }
 
     pub fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
         self.cursor_image = cursor_image;
+        self.reusable_frame_key = None;
+    }
+
+    pub fn set_decoration_instances(&mut self, instances: &[DecorationRenderInstance]) {
+        if self.decoration_instances == instances {
+            return;
+        }
+        self.decoration_instances.clear();
+        self.decoration_instances.extend_from_slice(instances);
         self.reusable_frame_key = None;
     }
 
@@ -537,6 +567,13 @@ impl DesktopSceneRenderer {
         } else {
             self.copy_scene_to_frame(frame, frame_width, frame_height);
         }
+        draw_decoration_instances(
+            frame,
+            frame_width,
+            frame_height,
+            &self.decoration_instances,
+            output_scale,
+        );
         if !overlay_surfaces.is_empty() {
             draw_client_surfaces_scaled(
                 frame,
@@ -612,6 +649,7 @@ impl DesktopSceneRenderer {
         let elements = render_scene_elements_for_surfaces(surfaces, output_scale);
         let snapshots = scene_surface_snapshots_from_elements(&elements);
         if scene_ready
+            && self.decoration_instances.is_empty()
             && self.rebuild_scene_from_age(
                 frame_width,
                 frame_height,
@@ -835,6 +873,296 @@ fn draw_client_cursor(
         target,
         None,
     );
+}
+
+fn draw_decoration_instances(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    instances: &[DecorationRenderInstance],
+    output_scale: f64,
+) {
+    for instance in instances {
+        for primitive in &instance.plan.primitives {
+            match primitive {
+                DecorationRenderPrimitive::SolidRect { rect, color } => {
+                    fill_decoration_rect(
+                        frame,
+                        frame_width,
+                        frame_height,
+                        decoration_output_rect(instance, *rect, output_scale),
+                        *color,
+                    );
+                }
+                DecorationRenderPrimitive::Image { rect, asset } => {
+                    draw_decoration_icon(
+                        frame,
+                        frame_width,
+                        frame_height,
+                        decoration_output_rect(instance, *rect, output_scale),
+                        asset,
+                    );
+                }
+                DecorationRenderPrimitive::Text {
+                    rect,
+                    clip,
+                    text,
+                    color,
+                } => draw_decoration_text(
+                    frame,
+                    frame_width,
+                    frame_height,
+                    decoration_output_rect(instance, *rect, output_scale),
+                    decoration_output_rect(instance, *clip, output_scale),
+                    text,
+                    *color,
+                    output_scale,
+                ),
+            }
+        }
+    }
+}
+
+fn decoration_output_rect(
+    instance: &DecorationRenderInstance,
+    rect: DecorationRect,
+    output_scale: f64,
+) -> ServerFrameRect {
+    ServerFrameRect {
+        color: ServerFrameColor::Border,
+        x: scale_logical_coordinate(instance.origin_x.saturating_add(rect.x), output_scale),
+        y: scale_logical_coordinate(instance.origin_y.saturating_add(rect.y), output_scale),
+        width: scale_logical_extent(rect.width, output_scale),
+        height: scale_logical_extent(rect.height, output_scale),
+    }
+}
+
+fn fill_decoration_rect(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    rect: ServerFrameRect,
+    color: [u8; 4],
+) {
+    let start_x = i64::from(rect.x).max(0);
+    let start_y = i64::from(rect.y).max(0);
+    let end_x = i64::from(rect.x)
+        .saturating_add(i64::from(rect.width))
+        .min(i64::from(frame_width));
+    let end_y = i64::from(rect.y)
+        .saturating_add(i64::from(rect.height))
+        .min(i64::from(frame_height));
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
+    let pixel = rgba_to_pixel(color);
+    let frame_width = frame_width as usize;
+    for target_y in start_y..end_y {
+        let row_start = target_y as usize * frame_width + start_x as usize;
+        let row_end = row_start + (end_x - start_x) as usize;
+        if let Some(row) = frame.get_mut(row_start..row_end) {
+            row.fill(pixel);
+        }
+    }
+}
+
+fn draw_decoration_icon(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    rect: ServerFrameRect,
+    asset: &str,
+) {
+    let color = if asset.contains("close") {
+        [255, 255, 255, 255]
+    } else if asset.contains("minimize") {
+        [72, 43, 18, 255]
+    } else {
+        [24, 49, 28, 255]
+    };
+    let inset = (rect.width.min(rect.height) / 3).max(2);
+    let left = rect.x.saturating_add(inset as i32);
+    let top = rect.y.saturating_add(inset as i32);
+    let right = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .saturating_sub(inset as i32);
+    let bottom = rect
+        .y
+        .saturating_add(rect.height as i32)
+        .saturating_sub(inset as i32);
+    if asset.contains("close") {
+        let length = right.saturating_sub(left).min(bottom.saturating_sub(top));
+        for offset in 0..length {
+            fill_decoration_rect(
+                frame,
+                frame_width,
+                frame_height,
+                ServerFrameRect {
+                    color: ServerFrameColor::Border,
+                    x: left.saturating_add(offset),
+                    y: top.saturating_add(offset),
+                    width: 2,
+                    height: 2,
+                },
+                color,
+            );
+            fill_decoration_rect(
+                frame,
+                frame_width,
+                frame_height,
+                ServerFrameRect {
+                    color: ServerFrameColor::Border,
+                    x: right.saturating_sub(offset),
+                    y: top.saturating_add(offset),
+                    width: 2,
+                    height: 2,
+                },
+                color,
+            );
+        }
+    } else if asset.contains("minimize") {
+        fill_decoration_rect(
+            frame,
+            frame_width,
+            frame_height,
+            ServerFrameRect {
+                color: ServerFrameColor::Border,
+                x: left,
+                y: bottom.saturating_sub(1),
+                width: right.saturating_sub(left).max(2) as u32,
+                height: 2,
+            },
+            color,
+        );
+    } else {
+        let width = right.saturating_sub(left).max(2) as u32;
+        let height = bottom.saturating_sub(top).max(2) as u32;
+        fill_decoration_rect(
+            frame,
+            frame_width,
+            frame_height,
+            ServerFrameRect {
+                color: ServerFrameColor::Border,
+                x: left,
+                y: top,
+                width,
+                height: 2,
+            },
+            color,
+        );
+        fill_decoration_rect(
+            frame,
+            frame_width,
+            frame_height,
+            ServerFrameRect {
+                color: ServerFrameColor::Border,
+                x: left,
+                y: bottom.saturating_sub(1),
+                width,
+                height: 2,
+            },
+            color,
+        );
+        fill_decoration_rect(
+            frame,
+            frame_width,
+            frame_height,
+            ServerFrameRect {
+                color: ServerFrameColor::Border,
+                x: left,
+                y: top,
+                width: 2,
+                height,
+            },
+            color,
+        );
+        fill_decoration_rect(
+            frame,
+            frame_width,
+            frame_height,
+            ServerFrameRect {
+                color: ServerFrameColor::Border,
+                x: right.saturating_sub(1),
+                y: top,
+                width: 2,
+                height,
+            },
+            color,
+        );
+    }
+}
+
+fn draw_decoration_text(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    rect: ServerFrameRect,
+    clip: ServerFrameRect,
+    text: &str,
+    color: [u8; 4],
+    output_scale: f64,
+) {
+    let scale = output_scale.max(1.0).round() as i32;
+    let glyph_width = 6 * scale;
+    let glyph_height = 7 * scale;
+    let mut x = rect.x;
+    let max_x = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .min(clip.x.saturating_add(clip.width as i32));
+    let y = rect
+        .y
+        .saturating_add(((rect.height as i32) - glyph_height).max(0) / 2);
+    for character in text.chars() {
+        if x.saturating_add(glyph_width) > max_x {
+            break;
+        }
+        let pattern = decoration_glyph(character);
+        for (row, bits) in pattern.into_iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                fill_decoration_rect(
+                    frame,
+                    frame_width,
+                    frame_height,
+                    ServerFrameRect {
+                        color: ServerFrameColor::Border,
+                        x: x.saturating_add(column * scale),
+                        y: y.saturating_add(row as i32 * scale),
+                        width: scale.max(1) as u32,
+                        height: scale.max(1) as u32,
+                    },
+                    color,
+                );
+            }
+        }
+        x = x.saturating_add(glyph_width);
+    }
+}
+
+fn decoration_glyph(character: char) -> [u8; 7] {
+    match character.to_ascii_uppercase() {
+        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
+        'H' => [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'N' => [0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11],
+        'O' => [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
+        'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'Y' => [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
+        ' ' => [0; 7],
+        _ => [0x1f, 0x11, 0x15, 0x11, 0x15, 0x11, 0x1f],
+    }
+}
+
+fn rgba_to_pixel(color: [u8; 4]) -> u32 {
+    (u32::from(color[3]) << 24)
+        | (u32::from(color[0]) << 16)
+        | (u32::from(color[1]) << 8)
+        | u32::from(color[2])
 }
 
 fn split_external_overlay_surfaces(

@@ -643,6 +643,8 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
     ) -> NativeRenderedFrame<'_> {
         let surfaces = server.native_frame_renderable_surfaces();
+        let decorations = server.native_decoration_render_instances(surfaces.as_ref());
+        self.scene_renderer.set_decoration_instances(&decorations);
         self.render_frame(NativeFrameRequest {
             width,
             height,
@@ -711,6 +713,7 @@ impl NativeFrameRenderer {
             content_generation: native_scene_content_generation(server.scene_render_generation()),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
+            decoration_instances: server.native_decoration_render_instances(surfaces.as_ref()),
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())

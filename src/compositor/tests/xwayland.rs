@@ -584,9 +584,11 @@ fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
         XwmCommand::ConfigureFrame {
             window,
             geometry,
+            frame_extents,
             ..
         } if *window == snapshot.handle
             && geometry == &frame
+            && *frame_extents == [1, 1, 33, 1]
     )));
 }
 
@@ -1395,7 +1397,11 @@ fn late_kind_change_removes_normal_membership_without_focus_flash() {
     );
     assert!(metadata_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::ConfigureFrame { window, geometry }
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            ..
+        }
             if *window == handle && *geometry == handle_geometry(&fixture.server, handle)
     )));
 

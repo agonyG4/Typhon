@@ -745,6 +745,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+        if self.handle_decoration_button(button, pressed) {
+            return;
+        }
         if let Some(locked_surface) = self.locked_pointer_input_surface() {
             crate::xwayland::trace::emit("focus_pointer_button", || {
                 crate::xwayland::trace::TraceFields::new()

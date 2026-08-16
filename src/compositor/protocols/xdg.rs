@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::compositor::decoration::types::{DecorationMode, DecorationPreference};
 
 fn xdg_surface_role_error(error: SurfaceRoleError) -> xdg_surface::Error {
     match error {
@@ -188,13 +189,29 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Compo
                 let Some(data) = toplevel.data::<XdgToplevelData>() else {
                     return;
                 };
+                let surface_id = compositor_surface_id(&data.surface);
+                if state.xdg_decoration_resources.contains_key(&surface_id) {
+                    state.post_protocol_error(
+                        _client,
+                        resource,
+                        zxdg_toplevel_decoration_v1::Error::AlreadyConstructed,
+                        "xdg_toplevel already has a decoration object".to_string(),
+                    );
+                    return;
+                }
                 let decoration = data_init.init(
                     id,
                     XdgToplevelData {
                         surface: data.surface.clone(),
                     },
                 );
-                send_client_side_decoration_configure(&decoration);
+                state
+                    .xdg_decoration_states
+                    .insert(surface_id, WindowDecorationState::new());
+                state
+                    .xdg_decoration_resources
+                    .insert(surface_id, decoration.clone());
+                send_decoration_configure(&decoration, DecorationMode::ServerSide);
             }
             zxdg_decoration_manager_v1::Request::Destroy => {}
             other => {
@@ -214,19 +231,76 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
 {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
         request: zxdg_toplevel_decoration_v1::Request,
-        _data: &XdgToplevelData,
+        data: &XdgToplevelData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            zxdg_toplevel_decoration_v1::Request::SetMode { .. }
-            | zxdg_toplevel_decoration_v1::Request::UnsetMode => {
-                send_client_side_decoration_configure(resource);
+            zxdg_toplevel_decoration_v1::Request::SetMode { mode } => {
+                let preference = match mode {
+                    WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ClientSide) => {
+                        DecorationPreference::ClientSide
+                    }
+                    WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide) => {
+                        DecorationPreference::ServerSide
+                    }
+                    WEnum::Value(_) => {
+                        state.post_protocol_error(
+                            client,
+                            resource,
+                            zxdg_toplevel_decoration_v1::Error::InvalidMode,
+                            "invalid xdg decoration mode".to_string(),
+                        );
+                        return;
+                    }
+                    WEnum::Unknown(_) => {
+                        state.post_protocol_error(
+                            client,
+                            resource,
+                            zxdg_toplevel_decoration_v1::Error::InvalidMode,
+                            "invalid xdg decoration mode".to_string(),
+                        );
+                        return;
+                    }
+                };
+                let surface_id = compositor_surface_id(&data.surface);
+                let Some(mode) = state
+                    .xdg_decoration_states
+                    .get_mut(&surface_id)
+                    .map(|state| {
+                        state.set_preference(preference);
+                        state.effective_mode(false)
+                    })
+                else {
+                    return;
+                };
+                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
+                send_decoration_configure(resource, mode);
             }
-            zxdg_toplevel_decoration_v1::Request::Destroy => {}
+            zxdg_toplevel_decoration_v1::Request::UnsetMode => {
+                let surface_id = compositor_surface_id(&data.surface);
+                let Some(mode) = state
+                    .xdg_decoration_states
+                    .get_mut(&surface_id)
+                    .map(|state| {
+                        state.set_preference(DecorationPreference::Unset);
+                        state.effective_mode(false)
+                    })
+                else {
+                    return;
+                };
+                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
+                send_decoration_configure(resource, mode);
+            }
+            zxdg_toplevel_decoration_v1::Request::Destroy => {
+                let surface_id = compositor_surface_id(&data.surface);
+                state.xdg_decoration_states.remove(&surface_id);
+                state.xdg_decoration_resources.remove(&surface_id);
+                state.advance_render_generation(RenderGenerationCause::WindowDecoration);
+            }
             other => {
                 let _ = other;
                 state.compliance_metrics.note_unhandled_request(
@@ -239,11 +313,17 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevel
     }
 }
 
-fn send_client_side_decoration_configure(
+fn send_decoration_configure(
     decoration: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+    mode: DecorationMode,
 ) {
     let _ = decoration.send_event(zxdg_toplevel_decoration_v1::Event::Configure {
-        mode: WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+        mode: WEnum::Value(match mode {
+            DecorationMode::ServerSide => zxdg_toplevel_decoration_v1::Mode::ServerSide,
+            DecorationMode::ClientSide | DecorationMode::None => {
+                zxdg_toplevel_decoration_v1::Mode::ClientSide
+            }
+        }),
     });
 }
 

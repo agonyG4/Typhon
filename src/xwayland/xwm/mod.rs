@@ -200,6 +200,7 @@ pub enum XwmCommand {
     ConfigureFrame {
         window: X11WindowHandle,
         geometry: X11Geometry,
+        frame_extents: [u32; 4],
     },
     ConfigureNotify {
         window: X11WindowHandle,
@@ -236,6 +237,7 @@ pub enum XwmCommand {
     SetState {
         window: X11WindowHandle,
         state: X11PublishedState,
+        frame_extents: [u32; 4],
     },
     SyncClientLists {
         client_list: Vec<X11WindowHandle>,

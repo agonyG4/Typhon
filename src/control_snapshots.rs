@@ -399,6 +399,26 @@ pub struct CursorSnapshot {
     pub asset_source: CursorAssetSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DecorationThemeSnapshot {
+    pub selected_theme: String,
+    pub active_theme: String,
+    pub schema_version: u32,
+    pub generation: u64,
+    pub source: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct DecorationThemeListSnapshot {
+    pub themes: Vec<String>,
+    pub selected_theme: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -530,6 +550,8 @@ pub enum AstreactlResult {
     ActiveWindow(ActiveWindowSnapshot),
     Cursor(CursorSnapshot),
     Performance(Box<PerformanceSnapshot>),
+    DecorationTheme(DecorationThemeSnapshot),
+    DecorationThemes(DecorationThemeListSnapshot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

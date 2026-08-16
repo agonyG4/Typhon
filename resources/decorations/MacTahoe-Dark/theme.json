@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "MacTahoe-Dark",
+  "metrics": {
+    "titlebar_height": 32,
+    "button_visual_size": 16,
+    "button_spacing": 9,
+    "right_padding": 12,
+    "horizontal_padding": 12,
+    "border_width": 1
+  },
+  "colors": {
+    "active_background": "#18202aff",
+    "inactive_background": "#101419ff",
+    "border": "#0a0d12ff",
+    "title": "#ffffffff",
+    "inactive_title": "#8a929eff"
+  },
+  "title": {
+    "font_family": "Sans",
+    "font_style": "Regular",
+    "font_size": 13,
+    "alignment": "center"
+  },
+  "buttons": {
+    "minimize": { "active": { "normal": "assets/minimize.svg" } },
+    "maximize": { "active": { "normal": "assets/maximize.svg" } },
+    "restore": { "active": { "normal": "assets/restore.svg" } },
+    "close": { "active": { "normal": "assets/close.svg" } }
+  }
+}

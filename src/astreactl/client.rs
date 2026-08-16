@@ -14,8 +14,9 @@ use crate::control::{
     decode_response, encode_request,
 };
 use crate::control_snapshots::{
-    ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DoctorSnapshot, OutputListSnapshot,
-    PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
+    ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
+    DecorationThemeSnapshot, DoctorSnapshot, OutputListSnapshot, PerformanceSnapshot,
+    StatusSnapshot, VersionSnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -94,6 +95,12 @@ fn decode_command_result(
                 })
                 .map(AstreactlResult::Cursor)
         }
+        "decoration.status" | "decoration.set-theme" | "decoration.reload" => {
+            serde_json::from_value::<DecorationThemeSnapshot>(value)
+                .map(AstreactlResult::DecorationTheme)
+        }
+        "decoration.list" => serde_json::from_value::<DecorationThemeListSnapshot>(value)
+            .map(AstreactlResult::DecorationThemes),
         _ => return Err(AstreactlError::Usage("unknown control command".to_string())),
     };
     decoded.map_err(|_| AstreactlError::MalformedResponse)

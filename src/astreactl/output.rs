@@ -82,6 +82,21 @@ pub fn human(result: &AstreactlResult) -> String {
             })
             .unwrap_or_else(|| "No active window".to_string()),
         AstreactlResult::Cursor(snapshot) => format_cursor(snapshot),
+        AstreactlResult::DecorationTheme(snapshot) => format!(
+            "Selected: {}\nActive: {}\nSchema: {}\nGeneration: {}\nSource: {}\nError: {}",
+            sanitize_terminal_text(&snapshot.selected_theme),
+            sanitize_terminal_text(&snapshot.active_theme),
+            snapshot.schema_version,
+            snapshot.generation,
+            sanitize_terminal_text(&snapshot.source),
+            sanitize_optional_text(snapshot.last_error.as_deref()),
+        ),
+        AstreactlResult::DecorationThemes(snapshot) => snapshot
+            .themes
+            .iter()
+            .map(|theme| sanitize_terminal_text(theme))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 

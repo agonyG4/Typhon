@@ -20,11 +20,15 @@ pub enum X11WindowType {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct X11WindowTypes {
     pub atoms: Vec<X11WindowType>,
+    pub no_decorations: bool,
 }
 
 impl X11WindowTypes {
     pub fn new(atoms: Vec<X11WindowType>) -> Self {
-        Self { atoms }
+        Self {
+            atoms,
+            no_decorations: false,
+        }
     }
 
     pub fn preferred_supported_type(&self) -> Option<X11WindowType> {

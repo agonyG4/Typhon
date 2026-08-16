@@ -48,7 +48,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `zwp_keyboard_shortcuts_inhibit_manager_v1` | 1 | Implemented |
 | `zwp_primary_selection_device_manager_v1` | 1 | Implemented |
 | `ext_data_control_manager_v1` | 1 | Implemented |
-| `zxdg_decoration_manager_v1` | 1 | Partial |
+| `zxdg_decoration_manager_v1` | 1 | Implemented |
 | `zwp_linux_dmabuf_v1` | 4 | Partial |
 | `wp_linux_drm_syncobj_manager_v1` | 1 | Partial |
 | `wl_drm` | 2 | Partial |

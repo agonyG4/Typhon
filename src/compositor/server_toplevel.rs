@@ -156,6 +156,26 @@ impl OwnCompositorServer {
         changed
     }
 
+    pub fn decoration_theme_status(&self) -> (String, String, u32, u64, String, Option<String>) {
+        self.state.decoration_theme_status()
+    }
+
+    pub fn decoration_theme_list(&self) -> Vec<String> {
+        self.state.available_decoration_themes()
+    }
+
+    pub fn set_decoration_theme(&mut self, name: &str) -> Result<(), String> {
+        let result = self.state.set_decoration_theme(name);
+        let _ = self.display.flush_clients();
+        result
+    }
+
+    pub fn reload_decoration_theme(&mut self) -> Result<(), String> {
+        let result = self.state.reload_decoration_theme();
+        let _ = self.display.flush_clients();
+        result
+    }
+
     pub fn toggle_fullscreen_focused_window(&mut self) -> bool {
         let changed = self.state.toggle_fullscreen_focused_window();
         self.publish_astrea_toplevel_updates();

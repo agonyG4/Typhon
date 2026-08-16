@@ -1294,6 +1294,7 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
                 3 => XwmCommand::ConfigureFrame {
                     window: handle,
                     geometry: X11Geometry::default(),
+                    frame_extents: [0; 4],
                 },
                 4 => XwmCommand::ConfigureNotify {
                     window: handle,
@@ -1308,6 +1309,7 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
                 8 => XwmCommand::SetState {
                     window: handle,
                     state: Default::default(),
+                    frame_extents: [0; 4],
                 },
                 9 => XwmCommand::BeginResizeSync {
                     window: handle,

@@ -85,7 +85,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...|decoration status|decoration list|decoration set-theme NAME|decoration reload>"
                 );
                 return Ok(0);
             }
@@ -140,6 +140,13 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         .ok_or_else(|| AstreactlError::Usage("missing command".to_string()))?;
     let (display_command, wire_command, request_args) = if command == "cursor" {
         parse_cursor_command(&positionals[1..], cursor_theme, cursor_size)?
+    } else if command == "decoration" {
+        if cursor_theme.is_some() || cursor_size.is_some() {
+            return Err(AstreactlError::Usage(
+                "decoration command does not accept cursor options".to_string(),
+            ));
+        }
+        parse_decoration_command(&positionals[1..])?
     } else {
         if positionals.len() != 1 || cursor_theme.is_some() || cursor_size.is_some() {
             return Err(AstreactlError::Usage(
@@ -171,6 +178,44 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(7);
     }
     Ok(0)
+}
+
+fn parse_decoration_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    let subcommand = positionals
+        .first()
+        .ok_or_else(|| AstreactlError::Usage("missing decoration subcommand".to_string()))?;
+    match subcommand.as_str() {
+        "status" | "reload" | "list" => {
+            if positionals.len() != 1 {
+                return Err(AstreactlError::Usage(
+                    "decoration command takes no extra arguments".to_string(),
+                ));
+            }
+            let wire = match subcommand.as_str() {
+                "status" => "decoration.status",
+                "reload" => "decoration.reload",
+                _ => "decoration.list",
+            };
+            Ok(("decoration", wire, serde_json::json!({})))
+        }
+        "set-theme" => {
+            if positionals.len() != 2 {
+                return Err(AstreactlError::Usage(
+                    "decoration set-theme requires exactly one theme".to_string(),
+                ));
+            }
+            Ok((
+                "decoration",
+                "decoration.set-theme",
+                serde_json::json!({"theme": positionals[1]}),
+            ))
+        }
+        _ => Err(AstreactlError::Usage(format!(
+            "unknown decoration command {subcommand}"
+        ))),
+    }
 }
 
 fn parse_cursor_command(

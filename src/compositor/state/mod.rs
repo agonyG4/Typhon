@@ -34,6 +34,7 @@ mod surface_transactions;
 mod surface_tree_readiness;
 mod surfaces;
 mod window_actions;
+mod window_decoration;
 mod window_interaction;
 mod window_resize;
 mod windows;
@@ -132,6 +133,8 @@ pub(in crate::compositor) use surface_transactions::{
 pub(in crate::compositor) use surfaces::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use window_actions::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use window_decoration::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use window_interaction::*;
 #[allow(unused_imports)]

@@ -54,10 +54,11 @@ pub(crate) enum PropertyKind {
     NetWmState,
     WmClientLeader,
     NetWmUserTimeWindow,
+    MotifWmHints,
 }
 
 impl PropertyKind {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::NetWmName,
         Self::WmName,
         Self::WmClass,
@@ -74,9 +75,10 @@ impl PropertyKind {
         Self::NetWmState,
         Self::WmClientLeader,
         Self::NetWmUserTimeWindow,
+        Self::MotifWmHints,
     ];
 
-    const fn bit(self) -> u16 {
+    const fn bit(self) -> u32 {
         match self {
             Self::NetWmName => 1 << 0,
             Self::WmName => 1 << 1,
@@ -94,6 +96,7 @@ impl PropertyKind {
             Self::NetWmState => 1 << 13,
             Self::WmClientLeader => 1 << 14,
             Self::NetWmUserTimeWindow => 1 << 15,
+            Self::MotifWmHints => 1u32 << 16,
         }
     }
 
@@ -115,6 +118,7 @@ impl PropertyKind {
             Self::NetWmState => XwmAtomName::NetWmState,
             Self::WmClientLeader => XwmAtomName::WmClientLeader,
             Self::NetWmUserTimeWindow => XwmAtomName::NetWmUserTimeWindow,
+            Self::MotifWmHints => XwmAtomName::MotifWmHints,
         })
     }
 
@@ -156,6 +160,7 @@ enum ParsedProperty {
         accepts_input: Option<bool>,
         urgency: bool,
     },
+    MotifNoDecorations(bool),
 }
 
 pub(crate) fn begin_initial(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -797,6 +802,10 @@ fn commit_property(
         PropertyKind::NetWmUserTimeWindow => {
             record.properties.user_time_window = record.staging_properties.user_time_window;
         }
+        PropertyKind::MotifWmHints => {
+            record.properties.window_types.no_decorations =
+                record.staging_properties.window_types.no_decorations;
+        }
     }
     let was_admitted = record.snapshot.is_some();
     update_snapshot(record);
@@ -901,6 +910,9 @@ fn apply_parsed(
             properties.accepts_input = accepts_input;
             properties.urgency = urgency;
         }
+        ParsedProperty::MotifNoDecorations(value) => {
+            properties.window_types.no_decorations = value;
+        }
     }
     if matches!(kind, PropertyKind::NetWmName | PropertyKind::WmName) {
         properties.title = properties
@@ -933,6 +945,7 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         },
         PropertyKind::NetWmSyncRequestCounter => ParsedProperty::SyncCounter(None),
         PropertyKind::NetWmState => ParsedProperty::State(Default::default()),
+        PropertyKind::MotifWmHints => ParsedProperty::MotifNoDecorations(false),
     }
 }
 
@@ -982,6 +995,7 @@ fn parse(
             (values.len() == 1).then(|| ParsedProperty::SyncCounter(Some(u64::from(values[0]))))
         }),
         PropertyKind::NetWmState => parse_state(reply, xwm),
+        PropertyKind::MotifWmHints => parse_motif_hints(reply),
     }
 }
 
@@ -1004,7 +1018,17 @@ fn expected_type(kind: PropertyKind, xwm: &Xwm) -> Option<u32> {
         | PropertyKind::NetWmUserTimeWindow => u32::from(xproto::AtomEnum::WINDOW),
         PropertyKind::WmNormalHints => u32::from(xproto::AtomEnum::WM_SIZE_HINTS),
         PropertyKind::WmHints => u32::from(xproto::AtomEnum::WM_HINTS),
+        PropertyKind::MotifWmHints => return None,
     })
+}
+
+fn parse_motif_hints(reply: &xproto::GetPropertyReply) -> Option<ParsedProperty> {
+    let values = parse_u32s(reply)?;
+    let flags = *values.first()?;
+    let decorations = values.get(2).copied().unwrap_or_default();
+    Some(ParsedProperty::MotifNoDecorations(
+        flags & (1 << 1) != 0 && decorations == 0,
+    ))
 }
 
 fn parse_window_type(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProperty> {
@@ -1158,7 +1182,7 @@ fn parse_state(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProp
     }))
 }
 
-fn all_mask() -> u16 {
+fn all_mask() -> u32 {
     PropertyKind::ALL
         .iter()
         .fold(0, |mask, kind| mask | kind.bit())

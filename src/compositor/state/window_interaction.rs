@@ -1,3 +1,4 @@
+use super::super::decoration::types::DecorationHit;
 use super::*;
 
 const MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS: usize = 64;
@@ -42,14 +43,7 @@ impl BeginWindowInteraction {
 
 impl CompositorState {
     pub(in crate::compositor) fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
-        self.begin_window_interaction_at(
-            x,
-            y,
-            WindowInteractionKind::Move,
-            WindowInteractionSource::NativeBinding,
-            None,
-            None,
-        )
+        self.begin_window_move_at_with_trigger(x, y, 0)
     }
 
     pub(in crate::compositor) fn begin_window_move_at_with_trigger(
@@ -58,6 +52,22 @@ impl CompositorState {
         y: f64,
         trigger_button: u32,
     ) -> bool {
+        if self.surface_id_at(x, y).is_none()
+            && let Some((window_id, root_surface_id, DecorationHit::Titlebar)) =
+                self.decoration_hit_at(x, y)
+        {
+            return self.begin_window_interaction_for_root(BeginWindowInteraction {
+                window_id: Some(window_id),
+                root_surface_id,
+                x,
+                y,
+                kind: WindowInteractionKind::Move,
+                source: WindowInteractionSource::NativeBinding,
+                trigger_button: (trigger_button != 0).then_some(trigger_button),
+                trigger_serial: None,
+                pointer_motion_surface_id: None,
+            });
+        }
         self.begin_window_interaction_at(
             x,
             y,
@@ -79,6 +89,21 @@ impl CompositorState {
         trigger_button: u32,
     ) -> bool {
         let Some(surface_id) = self.surface_id_at(x, y) else {
+            if let Some((window_id, root_surface_id, DecorationHit::Resize(edge))) =
+                self.decoration_hit_at(x, y)
+            {
+                return self.begin_window_interaction_for_root(BeginWindowInteraction {
+                    window_id: Some(window_id),
+                    root_surface_id,
+                    x,
+                    y,
+                    kind: WindowInteractionKind::Resize(resize_edges_for_decoration_edge(edge)),
+                    source: WindowInteractionSource::NativeBinding,
+                    trigger_button: (trigger_button != 0).then_some(trigger_button),
+                    trigger_serial: None,
+                    pointer_motion_surface_id: None,
+                });
+            }
             log_begin_rejection_without_target(
                 "no_surface_at_pointer",
                 x,
@@ -752,6 +777,20 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<WindowFrameHit> {
+        if let Some((window_id, root_surface_id, hit)) = self.decoration_hit_at(x, y) {
+            let kind = match hit {
+                DecorationHit::Resize(edge) => {
+                    WindowInteractionKind::Resize(resize_edges_for_decoration_edge(edge))
+                }
+                DecorationHit::Titlebar => WindowInteractionKind::Move,
+                DecorationHit::Button(_) => return None,
+            };
+            return Some(WindowFrameHit {
+                window_id,
+                root_surface_id,
+                kind,
+            });
+        }
         if let Some(hit) = self.root_surface_hit_at(x, y) {
             if self
                 .window(hit.window_id)

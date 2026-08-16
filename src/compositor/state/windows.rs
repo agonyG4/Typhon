@@ -296,6 +296,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
+        let window_id = self.window_id_for_surface(surface_id);
         self.destroy_popup_children_for_parent(surface_id);
 
         self.unregister_toplevel_surface(surface_id);
@@ -311,6 +312,32 @@ impl CompositorState {
         self.xdg_surface_resources.remove(&surface_id);
         self.xdg_surface_wm_bases.remove(&surface_id);
         self.xdg_surface_lifecycles.remove(&surface_id);
+        self.xdg_decoration_states.remove(&surface_id);
+        self.xdg_decoration_resources.remove(&surface_id);
+        if self
+            .decoration_button_capture
+            .is_some_and(|capture| capture.root_surface_id == surface_id)
+        {
+            self.decoration_button_capture = None;
+        }
+        if self
+            .decoration_button_hover
+            .is_some_and(|(hover_window_id, _)| Some(hover_window_id) == window_id)
+        {
+            self.decoration_button_hover = None;
+        }
+        if self
+            .decoration_titlebar_click_capture
+            .is_some_and(|(captured_window_id, _)| Some(captured_window_id) == window_id)
+        {
+            self.decoration_titlebar_click_capture = None;
+        }
+        if self
+            .decoration_last_titlebar_click
+            .is_some_and(|(clicked_window_id, _)| Some(clicked_window_id) == window_id)
+        {
+            self.decoration_last_titlebar_click = None;
+        }
         self.destroy_xdg_association(surface_id);
     }
 
@@ -1056,6 +1083,16 @@ impl CompositorState {
 
     pub(in crate::compositor) fn toggle_maximize_focused_window(&mut self) -> bool {
         let Some(surface_id) = self.focused_root_surface_id() else {
+            return false;
+        };
+        self.toggle_root_window_mode(surface_id, ToplevelMode::Maximized)
+    }
+
+    pub(in crate::compositor) fn toggle_maximize_desktop_window(
+        &mut self,
+        window_id: WindowId,
+    ) -> bool {
+        let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id) else {
             return false;
         };
         self.toggle_root_window_mode(surface_id, ToplevelMode::Maximized)

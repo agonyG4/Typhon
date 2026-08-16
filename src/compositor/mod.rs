@@ -70,6 +70,7 @@ mod astrea_shell_capability;
 mod clipboard_bridge;
 mod color;
 mod commit_debug;
+mod decoration;
 mod desktop_window;
 mod dmabuf;
 mod explicit_sync;
@@ -176,6 +177,10 @@ pub enum TerminalCallbackLeakReason {
     UnresolvedAtTerminal,
     MissingTransferTarget,
 }
+pub use decoration::render_plan::DecorationRenderPrimitive;
+use decoration::theme::DecorationThemeSnapshot;
+use decoration::types::DecorationButtonKind;
+pub use decoration::types::DecorationRect;
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
@@ -223,15 +228,16 @@ pub use presentation::{
 };
 pub use presentation_modes::*;
 pub use render::{
-    BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
-    DesktopSceneRenderer, DesktopVisualState, OUTPUT_BACKGROUND, RenderSceneElement,
-    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceRenderPlan,
-    SurfaceRenderSpaceAssignment, SurfaceTargetRect, SurfaceVisualAperture, compose_output,
-    cursor_damage_rect, draw_wallpaper, output_scale_key, render_scene_elements_for_surfaces,
-    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
-    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
-    surface_render_plan, surface_render_plan_with_clip, surface_render_plans_with_aperture,
-    surface_render_space_assignments, xwayland_visual_backing_target,
+    BufferAge, DecorationRenderInstance, DesktopComposeRequest, DesktopFrameCopyKind,
+    DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState, OUTPUT_BACKGROUND,
+    RenderSceneElement, RenderSceneElementId, RenderSceneElementKind, ServerFrameColor,
+    SurfaceRenderPlan, SurfaceRenderSpaceAssignment, SurfaceTargetRect, SurfaceVisualAperture,
+    compose_output, cursor_damage_rect, draw_wallpaper, output_scale_key,
+    render_scene_elements_for_surfaces, scale_desktop_visual_state, scale_logical_coordinate,
+    scale_logical_extent, server_frame_rects_by_surface, server_frame_rects_for_surface,
+    surface_origin, surface_origins, surface_render_plan, surface_render_plan_with_clip,
+    surface_render_plans_with_aperture, surface_render_space_assignments,
+    xwayland_visual_backing_target,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
@@ -427,6 +433,7 @@ pub enum RenderGenerationCause {
     CursorCommit,
     CursorMotion,
     CursorState,
+    WindowDecoration,
 }
 impl RenderGenerationCause {
     pub const fn as_str(self) -> &'static str {
@@ -446,6 +453,7 @@ impl RenderGenerationCause {
             Self::CursorCommit => "cursor_commit",
             Self::CursorMotion => "cursor_motion",
             Self::CursorState => "cursor_state",
+            Self::WindowDecoration => "window_decoration",
         }
     }
     pub const fn uses_surface_damage(self) -> bool {
@@ -561,6 +569,14 @@ pub struct CompositorState {
     xdg_surface_resources: HashMap<u32, xdg_surface::XdgSurface>,
     xdg_surface_wm_bases: HashMap<u32, xdg_wm_base::XdgWmBase>,
     xdg_surface_lifecycles: HashMap<u32, XdgSurfaceLifecycle>,
+    xdg_decoration_states: HashMap<u32, WindowDecorationState>,
+    xdg_decoration_resources: HashMap<u32, zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    decoration_button_capture: Option<DecorationButtonCapture>,
+    decoration_button_hover: Option<(WindowId, DecorationButtonKind)>,
+    decoration_titlebar_click_capture: Option<(WindowId, u32)>,
+    decoration_last_titlebar_click: Option<(WindowId, Instant)>,
+    decoration_theme: DecorationThemeSnapshot,
+    decoration_theme_error: Option<String>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     layer_surfaces: HashMap<u32, LayerSurfaceRole>,
     layer_surface_order: u64,

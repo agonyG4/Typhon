@@ -54,6 +54,7 @@ impl EglUvRect {
 pub(super) enum EglDrawLayer {
     Wallpaper,
     Solid(ServerFrameColor),
+    SolidRgba(u32),
     Surface(u32),
     Cursor,
 }

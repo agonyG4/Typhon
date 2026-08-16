@@ -64,6 +64,7 @@ impl OwnCompositorServer {
                     commands.push(XwmCommand::ConfigureFrame {
                         window: handle,
                         geometry,
+                        frame_extents: self.state.x11_decoration_frame_extents(handle),
                     });
                 }
                 if !self.state.defer_client_list_sync() {

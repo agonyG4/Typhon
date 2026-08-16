@@ -304,7 +304,20 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
             }
         }
-        XwmCommand::ConfigureFrame { window, geometry } => {
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        } => {
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    window.xid(),
+                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
+                    AtomEnum::CARDINAL,
+                    &frame_extents,
+                )
+                .map_err(XwmError::Connection)?;
             let cookie = xwm
                 .connection
                 .configure_window(
@@ -460,7 +473,20 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     .map_err(XwmError::Connection)?;
             }
         }
-        XwmCommand::SetState { window, state } => {
+        XwmCommand::SetState {
+            window,
+            state,
+            frame_extents,
+        } => {
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    window.xid(),
+                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
+                    AtomEnum::CARDINAL,
+                    &frame_extents,
+                )
+                .map_err(XwmError::Connection)?;
             publish_state(xwm, window, state)?;
         }
         XwmCommand::SyncClientLists {

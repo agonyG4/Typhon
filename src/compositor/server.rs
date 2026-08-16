@@ -55,9 +55,9 @@ mod server_shortcut_inhibition;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
-    CoreComplianceMetrics, DirectScanoutFeedbackCapabilities, DirectScanoutSceneBlockers,
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
-    FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
+    CoreComplianceMetrics, DecorationRenderInstance, DirectScanoutFeedbackCapabilities,
+    DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
+    ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
     FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
@@ -350,6 +350,7 @@ impl OwnCompositorServer {
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
 
         let mut state = CompositorState::new(syncobj_device);
+        state.load_persisted_decoration_theme();
         state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
         let verifier: AstreaShellCapabilityVerifier = astrea_shell_capability.verifier();
         state.set_astrea_shell_capability_verifier(verifier);
@@ -550,7 +551,11 @@ impl OwnCompositorServer {
                 if old_policy != new_policy
                     && let Some(geometry) = self.state.x11_authoritative_geometry(window)
                 {
-                    commands.push(XwmCommand::ConfigureFrame { window, geometry });
+                    commands.push(XwmCommand::ConfigureFrame {
+                        window,
+                        geometry,
+                        frame_extents: self.state.x11_decoration_frame_extents(window),
+                    });
                 }
                 if prior_focused
                     && prior_id.is_some_and(|id| {
@@ -881,6 +886,13 @@ impl OwnCompositorServer {
 
     pub fn native_frame_renderable_surfaces(&self) -> Cow<'_, [RenderableSurface]> {
         self.state.native_frame_renderable_surfaces()
+    }
+
+    pub fn native_decoration_render_instances(
+        &self,
+        surfaces: &[RenderableSurface],
+    ) -> Vec<DecorationRenderInstance> {
+        self.state.native_decoration_render_instances(surfaces)
     }
 
     pub fn external_overlay_surface_ids(&self) -> Vec<u32> {

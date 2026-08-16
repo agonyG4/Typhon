@@ -5,9 +5,10 @@ use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
 };
 use oblivion_one::control_snapshots::{
-    ActiveWindowSnapshot, ControlStatusSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot,
-    FeatureState, FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot,
-    PositionSnapshot, StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
+    ActiveWindowSnapshot, ControlStatusSnapshot, DecorationThemeListSnapshot,
+    DecorationThemeSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot, FeatureState,
+    FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot, PositionSnapshot,
+    StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
@@ -36,6 +37,12 @@ struct CursorSizeArgs {
 struct CursorSetArgs {
     theme: String,
     size_px: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecorationThemeArgs {
+    theme: String,
 }
 
 impl NativeRuntime {
@@ -460,6 +467,82 @@ impl NativeRuntime {
                         job_id: CursorJobId(0),
                     },
                 );
+            }
+            ControlCommand::DecorationStatus => {
+                let (selected_theme, active_theme, schema_version, generation, source, last_error) =
+                    self.server.decoration_theme_status();
+                serde_json::to_value(DecorationThemeSnapshot {
+                    selected_theme,
+                    active_theme,
+                    schema_version,
+                    generation,
+                    source,
+                    last_error,
+                })
+            }
+            ControlCommand::DecorationList => {
+                let (selected_theme, ..) = self.server.decoration_theme_status();
+                serde_json::to_value(DecorationThemeListSnapshot {
+                    themes: self.server.decoration_theme_list(),
+                    selected_theme,
+                })
+            }
+            ControlCommand::DecorationSetTheme => {
+                let args = match serde_json::from_value::<DecorationThemeArgs>(request.args) {
+                    Ok(args) => args,
+                    Err(_) => {
+                        return Some(ControlResponse::failure(
+                            request.id,
+                            ControlError::new(
+                                ControlErrorCode::InvalidArgument,
+                                "decoration set-theme requires a theme",
+                            ),
+                        ));
+                    }
+                };
+                if let Err(error) = self.server.set_decoration_theme(&args.theme) {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(ControlErrorCode::InvalidArgument, error),
+                    ));
+                }
+                let (selected_theme, active_theme, schema_version, generation, source, last_error) =
+                    self.server.decoration_theme_status();
+                serde_json::to_value(DecorationThemeSnapshot {
+                    selected_theme,
+                    active_theme,
+                    schema_version,
+                    generation,
+                    source,
+                    last_error,
+                })
+            }
+            ControlCommand::DecorationReload => {
+                if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "decoration reload takes no arguments",
+                        ),
+                    ));
+                }
+                if let Err(error) = self.server.reload_decoration_theme() {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(ControlErrorCode::Internal, error),
+                    ));
+                }
+                let (selected_theme, active_theme, schema_version, generation, source, last_error) =
+                    self.server.decoration_theme_status();
+                serde_json::to_value(DecorationThemeSnapshot {
+                    selected_theme,
+                    active_theme,
+                    schema_version,
+                    generation,
+                    source,
+                    last_error,
+                })
             }
             _ => {
                 return Some(ControlResponse::failure(

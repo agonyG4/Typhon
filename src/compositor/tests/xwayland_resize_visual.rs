@@ -468,7 +468,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
     )));
     assert!(backend_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::SetState { window, state }
+        XwmCommand::SetState { window, state, .. }
             if *window == handle && state.fullscreen && !state.maximized
     )));
     assert_eq!(
@@ -579,7 +579,7 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
     )));
     assert!(enter_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::SetState { window, state }
+        XwmCommand::SetState { window, state, .. }
             if *window == handle && state.fullscreen && !state.maximized
     )));
     assert_eq!(
@@ -606,7 +606,7 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
     )));
     assert!(exit_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::SetState { window, state }
+        XwmCommand::SetState { window, state, .. }
             if *window == handle && !state.fullscreen && !state.maximized
     )));
     assert_eq!(

@@ -257,6 +257,7 @@ impl OwnCompositorServer {
                             hidden: minimized,
                             activated,
                         },
+                        frame_extents: self.state.x11_decoration_frame_extents(handle),
                     })
                 }
             })

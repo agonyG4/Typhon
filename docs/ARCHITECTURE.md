@@ -132,11 +132,24 @@ assignment when the first renderable is published, metadata changes, or the
 authoritative frame placement changes. Resize previews change the visual
 aperture and frame placement; they do not create a second coordinate system.
 
-Client-side decorations remain client-owned. Typhon does not advertise or
-silently substitute server-side decorations. A future SSD implementation must
-introduce explicit ownership for the frame extents, input extents, shadow and
-corner geometry, hit-test regions, configure/state negotiation, and the
-corresponding render and damage primitives before changing that policy.
+Decoration ownership is negotiated per XDG toplevel through
+`zxdg_decoration_manager_v1`. Explicit client-side mode leaves the client
+pixels untouched; explicit server-side mode and an unset mode with a live
+decoration object use the compositor-owned MacTahoe-Dark frame. A toplevel
+without a decoration object remains client-side. Fullscreen suppresses the
+visible server frame, while maximized windows retain the titlebar and drop the
+floating border.
+
+The geometry, input, CPU scene compositor, GLES command builder, and XWayland
+`_NET_FRAME_EXTENTS` publisher consume the same `DecorationLayout`. Titlebar
+buttons capture the exact `WindowId`, titlebar double-click toggles maximize,
+and resize hit regions are interaction-only extents around the visible frame.
+Themes are declarative, bounded JSON packages searched below
+`$XDG_DATA_HOME/astrea/typhon/decorations/<name>` (with config and system
+fallbacks), with selection persisted in
+`$XDG_CONFIG_HOME/AstreaOS/typhon/decoration.json`. The built-in first theme is
+`MacTahoe-Dark`; `astreactl decoration status|list|set-theme|reload` controls
+the active snapshot and render generation.
 
 Synthetic opaque backing is an explicit XWayland compatibility behavior only:
 it is permitted for a confirmed XWayland root with an active visual aperture
