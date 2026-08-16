@@ -157,4 +157,6 @@ mod frame_tests;
 #[cfg(test)]
 mod task_05_8_tests;
 #[cfg(test)]
+mod window_decoration_tests;
+#[cfg(test)]
 mod window_interaction_tests;

@@ -304,10 +304,12 @@ impl super::super::CompositorState {
         surfaces: &[RenderableSurface],
     ) -> Vec<DecorationRenderInstance> {
         let metrics = self.decoration_theme.metrics();
+        let origins = render::surface_origins(surfaces);
         surfaces
             .iter()
-            .filter(|surface| surface.placement.parent_surface_id.is_none())
-            .filter_map(|surface| {
+            .enumerate()
+            .filter(|(_, surface)| surface.placement.parent_surface_id.is_none())
+            .filter_map(|(index, surface)| {
                 let window_id = self.window_id_for_surface(surface.surface_id)?;
                 let window = self.window(window_id)?;
                 let mode = window.state.mode();
@@ -330,6 +332,9 @@ impl super::super::CompositorState {
                 } else {
                     return None;
                 };
+                if decoration_mode != DecorationMode::ServerSide {
+                    return None;
+                }
                 let layout = DecorationLayout::for_window(
                     surface.width,
                     surface.height,
@@ -355,9 +360,10 @@ impl super::super::CompositorState {
                             .map(|capture| capture.kind),
                     },
                 );
+                let (root_origin_x, root_origin_y) = origins.get(index).copied()?;
                 Some(DecorationRenderInstance {
-                    origin_x: surface.x.saturating_sub(layout.client.x),
-                    origin_y: surface.y.saturating_sub(layout.client.y),
+                    origin_x: root_origin_x.saturating_sub(layout.client.x),
+                    origin_y: root_origin_y.saturating_sub(layout.client.y),
                     plan,
                 })
             })
