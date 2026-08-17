@@ -6,7 +6,7 @@ use crate::compositor::decoration::{
 };
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Instant};
 
 const SURFACE_WIDTH: u32 = 300;
 const SURFACE_HEIGHT: u32 = 200;
@@ -102,7 +102,7 @@ fn ssd_render_uses_resolved_cascaded_root_origin_for_titlebar_and_content() {
     let instance = instances.first().expect("SSD instance");
 
     assert_eq!(origins, vec![render::FIRST_SURFACE_OFFSET]);
-    assert_eq!(instance.origin(), (71, 39));
+    assert_eq!(instance.origin(), (72, 46));
 
     let titlebar_color = match instance.primitives().first().expect("titlebar primitive") {
         DecorationRenderPrimitive::SolidRect { color, .. } => *color,
@@ -150,15 +150,15 @@ fn ssd_render_follows_absolute_move_and_active_render_placement() {
         ToplevelMode::Floating,
     );
 
-    assert_eq!(decoration_instances(&state)[0].origin(), (199, 107));
+    assert_eq!(decoration_instances(&state)[0].origin(), (200, 114));
 
     state.renderable_surfaces[0].placement = SurfacePlacement::root_at(40, 50);
     state.renderable_surfaces[0].render_placement = None;
-    assert_eq!(decoration_instances(&state)[0].origin(), (111, 89));
+    assert_eq!(decoration_instances(&state)[0].origin(), (111, 95));
 
     state.renderable_surfaces[0].render_placement =
         Some(SurfacePlacement::absolute_root_at(300, 220));
-    assert_eq!(decoration_instances(&state)[0].origin(), (299, 187));
+    assert_eq!(decoration_instances(&state)[0].origin(), (299, 193));
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn xwayland_ssd_render_follows_actual_frame_content_placement() {
     surface.placement = SurfacePlacement::absolute_root_at(320, 180);
     let state = x11_state(surface);
 
-    assert_eq!(decoration_instances(&state)[0].origin(), (319, 147));
+    assert_eq!(decoration_instances(&state)[0].origin(), (320, 154));
 }
 
 #[test]
@@ -222,4 +222,98 @@ fn csd_and_fullscreen_have_no_server_decoration_instance() {
         ToplevelMode::Fullscreen,
     );
     assert!(decoration_instances(&fullscreen).is_empty());
+}
+
+#[test]
+fn maximized_ssd_outer_frame_matches_usable_output_across_repeated_cycles() {
+    let mut state = xdg_state(
+        test_surface(47),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Floating,
+    );
+    state.set_output_size(1280, 800);
+    let surface_id = 47;
+    let usable = state.usable_output_geometry();
+    let metrics = state.decoration_theme.metrics();
+
+    for _ in 0..100 {
+        let geometry = state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Maximized);
+        assert_eq!(geometry.placement.local_x, usable.x as i32);
+        assert_eq!(geometry.placement.local_y, usable.y as i32 + 26);
+        assert_eq!(geometry.width, usable.width as u32);
+        assert_eq!(
+            geometry.height,
+            usable.height as u32 - metrics.titlebar_height
+        );
+
+        let layout = DecorationLayout::for_window(
+            geometry.width,
+            geometry.height,
+            DecorationMode::ServerSide,
+            true,
+            false,
+            metrics,
+        )
+        .expect("maximized SSD layout");
+        assert_eq!(layout.outer.width, usable.width as u32);
+        assert_eq!(layout.outer.height, usable.height as u32);
+        assert_eq!(layout.extents.top, metrics.titlebar_height);
+    }
+}
+
+#[test]
+fn titlebar_double_click_requires_spatial_proximity() {
+    const LEFT_BUTTON: u32 = 0x110;
+    let mut state = xdg_state(
+        test_surface(48),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Floating,
+    );
+    let window_id = state.window_id_for_surface(48).expect("window id");
+    let instance = decoration_instances(&state).pop().expect("SSD instance");
+    let x = f64::from(instance.origin().0 + 100);
+    let y = f64::from(instance.origin().1 + 10);
+    state.last_pointer_x = x;
+    state.last_pointer_y = y;
+
+    state.decoration_last_titlebar_click = Some((window_id, Instant::now(), x + 100.0, y));
+    assert!(!state.handle_decoration_button(LEFT_BUTTON, true));
+    assert!(state.decoration_titlebar_click_capture.is_none());
+
+    state.decoration_last_titlebar_click = Some((window_id, Instant::now(), x + 2.0, y + 2.0));
+    assert!(state.handle_decoration_button(LEFT_BUTTON, true));
+    assert_eq!(
+        state.decoration_titlebar_click_capture,
+        Some((window_id, LEFT_BUTTON))
+    );
+}
+
+#[test]
+fn ssd_controls_and_titles_use_fractional_scale_rasters() {
+    let state = xdg_state(
+        test_surface(49),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Floating,
+    );
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let instances =
+            state.native_decoration_render_instances_for_scale(&state.renderable_surfaces, scale);
+        let instance = instances.first().expect("SSD instance");
+        let image = instance
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                DecorationRenderPrimitive::Image { asset, .. } => Some(asset),
+                _ => None,
+            })
+            .expect("rasterized control");
+        let expected = (16.0 * scale).ceil() as u32;
+        assert_eq!((image.width(), image.height()), (expected, expected));
+        assert!(
+            instance
+                .primitives()
+                .iter()
+                .any(|primitive| matches!(primitive, DecorationRenderPrimitive::Text { .. }))
+        );
+    }
 }

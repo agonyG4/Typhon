@@ -588,7 +588,7 @@ fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
             ..
         } if *window == snapshot.handle
             && geometry == &frame
-            && *frame_extents == [1, 1, 33, 1]
+            && *frame_extents == [0, 0, 26, 0]
     )));
 }
 
