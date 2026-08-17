@@ -14,7 +14,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::WL_DATA_DEVICE_MANAGER, 3);
     assert_eq!(versions::XDG_WM_BASE, 6);
     assert_eq!(versions::WL_OUTPUT, 4);
-    assert_eq!(versions::WL_SEAT, 7);
+    assert_eq!(versions::WL_SEAT, 8);
     assert_eq!(versions::XWAYLAND_SHELL_V1, 1);
     assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 2);
     assert_eq!(versions::ASTREA_SHELL_AUTH_MANAGER_V1, 1);
@@ -26,7 +26,7 @@ fn advertised_global_versions_are_centralized() {
     assert!(globals.contains(&GlobalAdvertisement::new("wl_data_device_manager", 3)));
     assert!(globals.contains(&GlobalAdvertisement::new("xdg_wm_base", 6)));
     assert!(globals.contains(&GlobalAdvertisement::new("wl_output", 4)));
-    assert!(globals.contains(&GlobalAdvertisement::new("wl_seat", 7)));
+    assert!(globals.contains(&GlobalAdvertisement::new("wl_seat", 8)));
     assert!(globals.contains(&GlobalAdvertisement::new("xwayland_shell_v1", 1)));
     assert!(globals.contains(&GlobalAdvertisement::new("astrea_toplevel_manager_v1", 2)));
     assert!(globals.contains(&GlobalAdvertisement::new("astrea_shell_auth_manager_v1", 1)));

@@ -14,6 +14,18 @@ use wayland_protocols::wp::tearing_control::v1::client::{
 };
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) enum TestWaylandEvent {
+    DataOffer,
+    DataOfferMime(String),
+    SelectionSome,
+    SelectionNone,
+    KeyboardEnter { surface_id: u32 },
+    KeyboardLeave { surface_id: u32 },
+    KeyboardModifiers,
+}
+
 #[derive(Default)]
 pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) frame_done: bool,
@@ -44,6 +56,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) pointer_vertical_axis: Option<f64>,
     pub(in crate::compositor::tests) pointer_horizontal_axis: Option<f64>,
     pub(in crate::compositor::tests) pointer_axis_sources: Vec<u32>,
+    pub(in crate::compositor::tests) pointer_axis_value120: Vec<(u32, i32)>,
     pub(in crate::compositor::tests) pointer_axis_discrete: Vec<(u32, i32)>,
     pub(in crate::compositor::tests) pointer_axis_stops: Vec<(u32, u32)>,
     pub(in crate::compositor::tests) pointer_axis_times: Vec<u32>,
@@ -74,6 +87,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) keyboard_enter_count: usize,
     pub(in crate::compositor::tests) keyboard_leave_count: usize,
     pub(in crate::compositor::tests) keyboard_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) event_timeline: Vec<TestWaylandEvent>,
     pub(in crate::compositor::tests) shortcut_inhibitor_active_count: usize,
     pub(in crate::compositor::tests) shortcut_inhibitor_inactive_count: usize,
     pub(in crate::compositor::tests) surface_enter_count: usize,
@@ -625,7 +639,9 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            client_wl_data_device::Event::DataOffer { .. } => {}
+            client_wl_data_device::Event::DataOffer { .. } => {
+                state.event_timeline.push(TestWaylandEvent::DataOffer);
+            }
             client_wl_data_device::Event::Enter { serial, id, .. } => {
                 state.data_device_enter_count += 1;
                 state.data_device_enter_serial = Some(serial);
@@ -643,6 +659,13 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
             client_wl_data_device::Event::Selection { id } => {
                 state.data_device_selection_events.push(id.is_some());
                 state.data_device_selection_offer = id;
+                state
+                    .event_timeline
+                    .push(if state.data_device_selection_offer.is_some() {
+                        TestWaylandEvent::SelectionSome
+                    } else {
+                        TestWaylandEvent::SelectionNone
+                    });
             }
             _ => {}
         }
@@ -666,7 +689,10 @@ impl Dispatch<client_wl_data_offer::WlDataOffer, ()> for RegistryTestState {
     ) {
         match event {
             client_wl_data_offer::Event::Offer { mime_type } => {
-                state.data_offer_mime_types.push(mime_type);
+                state.data_offer_mime_types.push(mime_type.clone());
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::DataOfferMime(mime_type));
             }
             client_wl_data_offer::Event::SourceActions { source_actions } => {
                 let actions = match source_actions {
@@ -1003,13 +1029,20 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
     ) {
         match event {
             client_wl_keyboard::Event::Enter { surface, .. } => {
-                state.keyboard_enter_surface_id = Some(surface.id().protocol_id());
+                let surface_id = surface.id().protocol_id();
+                state.keyboard_enter_surface_id = Some(surface_id);
                 state.keyboard_enter_count += 1;
                 state.keyboard_event_log.push("keyboard_enter");
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::KeyboardEnter { surface_id });
             }
-            client_wl_keyboard::Event::Leave { .. } => {
+            client_wl_keyboard::Event::Leave { surface, .. } => {
                 state.keyboard_leave_count += 1;
                 state.keyboard_event_log.push("keyboard_leave");
+                state.event_timeline.push(TestWaylandEvent::KeyboardLeave {
+                    surface_id: surface.id().protocol_id(),
+                });
             }
             client_wl_keyboard::Event::Keymap { fd, size, .. } => {
                 state.keyboard_keymap = true;
@@ -1028,6 +1061,9 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
             client_wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 state.keyboard_mods_depressed.push(mods_depressed);
                 state.keyboard_event_log.push("keyboard_modifiers");
+                state
+                    .event_timeline
+                    .push(TestWaylandEvent::KeyboardModifiers);
             }
             client_wl_keyboard::Event::RepeatInfo { .. } => {
                 state.keyboard_repeat_info = true;
@@ -1180,6 +1216,16 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 };
                 state.pointer_axis_discrete.push((axis, discrete));
                 state.pointer_event_log.push("axis_discrete");
+            }
+            client_wl_pointer::Event::AxisValue120 { axis, value120 } => {
+                let axis = match axis {
+                    WEnum::Value(client_wl_pointer::Axis::VerticalScroll) => 0,
+                    WEnum::Value(client_wl_pointer::Axis::HorizontalScroll) => 1,
+                    WEnum::Value(_) => u32::MAX,
+                    WEnum::Unknown(axis) => axis,
+                };
+                state.pointer_axis_value120.push((axis, value120));
+                state.pointer_event_log.push("axis_value120");
             }
             client_wl_pointer::Event::AxisStop { time, axis } => {
                 let axis = match axis {

@@ -5,6 +5,7 @@ pub(crate) enum WindowFocusReason {
     PointerEnter,
     PointerPress,
     ShellActivation,
+    InitialMap,
     #[expect(
         dead_code,
         reason = "keyboard navigation has no caller in the current input policy"
@@ -19,6 +20,7 @@ impl WindowFocusReason {
             Self::PointerEnter => "pointer-enter",
             Self::PointerPress => "pointer-press",
             Self::ShellActivation => "shell-activation",
+            Self::InitialMap => "initial-map",
             Self::KeyboardNavigation => "keyboard-navigation",
             Self::Restore => "restore",
         }

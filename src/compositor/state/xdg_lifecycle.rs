@@ -286,20 +286,24 @@ impl CompositorState {
         if let Some(lifecycle) = self.xdg_surface_lifecycle_mut(surface_id) {
             lifecycle.mark_buffer_commit();
         }
+        let currently_mapped = self
+            .xdg_surface_lifecycle(surface_id)
+            .is_some_and(|lifecycle| lifecycle.currently_mapped);
         if !was_mapped
-            && self
-                .xdg_surface_lifecycle(surface_id)
-                .is_some_and(|lifecycle| lifecycle.currently_mapped)
+            && currently_mapped
+            && self.toplevel_surfaces.contains_key(&surface_id)
+            && let Some(window_id) = self.window_id_for_surface(surface_id)
+        {
+            self.focus_desktop_window(window_id, WindowFocusReason::InitialMap);
+        }
+        if !was_mapped
+            && currently_mapped
             && let Some(window_id) = self.window_id_for_surface(surface_id)
         {
             self.assign_focus_serial_if_needed(window_id);
             self.mark_astrea_toplevel_structure_dirty();
         }
-        if !was_mapped
-            && self
-                .xdg_surface_lifecycle(surface_id)
-                .is_some_and(|lifecycle| lifecycle.currently_mapped)
-        {
+        if !was_mapped && currently_mapped {
             self.refresh_keyboard_shortcut_inhibition();
         }
     }

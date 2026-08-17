@@ -130,12 +130,12 @@ pub(crate) struct DecorationMetrics {
 impl DecorationMetrics {
     pub(crate) const fn mac_tahoe() -> Self {
         Self {
-            titlebar_height: 32,
+            titlebar_height: 26,
             button_visual_size: 16,
             button_spacing: 9,
             right_padding: 12,
             horizontal_padding: 12,
-            border_width: 1,
+            border_width: 0,
             resize_hit_width: 6,
             minimum_button_hit_width: 24,
         }

@@ -604,6 +604,15 @@ fn native_input_alt_tab_sequence_emits_astrea_shortcuts() {
     let mut input = NativeInputState::new(320, 200);
 
     input.handle_key_event(KEY_LEFTALT, 1);
+    let forwarded_alt = input.handle_key_event(KEY_Z, 1);
+    input.handle_key_event(KEY_Z, 0);
+    assert_eq!(
+        forwarded_alt.keyboard_events,
+        vec![
+            NativeKeyboardEvent::new(KEY_LEFTALT, true),
+            NativeKeyboardEvent::new(KEY_Z, true),
+        ]
+    );
     let next = input.handle_key_event(KEY_TAB, 1);
     let commit = input.handle_key_event(KEY_LEFTALT, 0);
 
@@ -619,6 +628,12 @@ fn native_input_alt_tab_sequence_emits_astrea_shortcuts() {
             "alt_tab_commit"
         )]
     );
+    assert_eq!(
+        commit.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_LEFTALT, false)],
+        "a consumed Alt release must reconcile the client-visible Alt press"
+    );
+    assert!(input.forwarded_key_ledger_is_empty());
 }
 
 #[test]
@@ -1954,11 +1969,13 @@ fn libinput_v120_conversion_keeps_devices_and_axes_independent() {
 fn libinput_v120_conversion_does_not_create_discrete_finger_or_continuous_steps() {
     let finger = PointerAxisComponent {
         continuous: Some(30.0),
+        value120: None,
         discrete: None,
         stopped: false,
     };
     let continuous = PointerAxisComponent {
         continuous: Some(30.0),
+        value120: None,
         discrete: None,
         stopped: false,
     };

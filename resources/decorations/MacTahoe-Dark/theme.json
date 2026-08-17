@@ -2,30 +2,64 @@
   "schema_version": 1,
   "name": "MacTahoe-Dark",
   "metrics": {
-    "titlebar_height": 32,
+    "titlebar_height": 26,
     "button_visual_size": 16,
     "button_spacing": 9,
     "right_padding": 12,
     "horizontal_padding": 12,
-    "border_width": 1
+    "border_width": 0
   },
   "colors": {
-    "active_background": "#18202aff",
-    "inactive_background": "#101419ff",
-    "border": "#0a0d12ff",
+    "active_background": "#333333ff",
+    "inactive_background": "#242424ff",
+    "border": "#010101ff",
+    "active_border": "#010101ff",
+    "inactive_border": "#2c2c2cff",
     "title": "#ffffffff",
-    "inactive_title": "#8a929eff"
+    "inactive_title": "#ffffff99"
   },
   "title": {
-    "font_family": "Sans",
+    "font_family": "SF Pro Text,Inter,Noto Sans,Sans",
     "font_style": "Regular",
     "font_size": 13,
     "alignment": "center"
   },
   "buttons": {
-    "minimize": { "active": { "normal": "assets/minimize.svg" } },
-    "maximize": { "active": { "normal": "assets/maximize.svg" } },
-    "restore": { "active": { "normal": "assets/restore.svg" } },
-    "close": { "active": { "normal": "assets/close.svg" } }
+    "minimize": {
+      "active": {
+        "normal": "assets/minimize-active.svg",
+        "hover": "assets/minimize-hover-active.svg"
+      },
+      "inactive": {
+        "normal": "assets/minimize-inactive.svg",
+        "hover": "assets/minimize-hover-inactive.svg"
+      }
+    },
+    "maximize": {
+      "active": {
+        "normal": "assets/maximize-active.svg",
+        "hover": "assets/maximize-hover-active.svg"
+      },
+      "inactive": {
+        "normal": "assets/maximize-inactive.svg",
+        "hover": "assets/maximize-hover-inactive.svg"
+      }
+    },
+    "restore": {
+      "active": {
+        "normal": "assets/restore-active.svg",
+        "hover": "assets/restore-hover-active.svg"
+      }
+    },
+    "close": {
+      "active": {
+        "normal": "assets/close-active.svg",
+        "hover": "assets/close-hover-active.svg"
+      },
+      "inactive": {
+        "normal": "assets/close-inactive.svg",
+        "hover": "assets/close-hover-inactive.svg"
+      }
+    }
   }
 }

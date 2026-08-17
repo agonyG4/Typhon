@@ -549,7 +549,7 @@ pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 2;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
-pub(crate) const WL_SEAT: u32 = 7;
+pub(crate) const WL_SEAT: u32 = 8;
 pub(crate) const XWAYLAND_SHELL_V1: u32 = crate::xwayland::XWAYLAND_SHELL_V1_VERSION;
 
 pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[

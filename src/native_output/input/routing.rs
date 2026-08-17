@@ -589,11 +589,13 @@ pub(crate) fn hardware_input_event_from_libinput(
                 source: PointerAxisSource::Unknown,
                 horizontal: PointerAxisComponent {
                     continuous: (event.has_axis(Axis::Horizontal)).then_some(horizontal),
+                    value120: None,
                     discrete: None,
                     stopped: event.has_axis(Axis::Horizontal) && horizontal == 0.0,
                 },
                 vertical: PointerAxisComponent {
                     continuous: (event.has_axis(Axis::Vertical)).then_some(vertical),
+                    value120: None,
                     discrete: None,
                     stopped: event.has_axis(Axis::Vertical) && vertical == 0.0,
                 },
@@ -692,6 +694,7 @@ where
 fn continuous_axis_component(has_axis: bool, value: f64) -> PointerAxisComponent {
     PointerAxisComponent {
         continuous: has_axis.then_some(value),
+        value120: None,
         discrete: None,
         stopped: has_axis && value == 0.0,
     }
@@ -707,13 +710,22 @@ fn wheel_axis_component<F>(
 where
     F: FnOnce() -> f64,
 {
+    let raw_value120 = has_axis.then(|| read_v120());
     PointerAxisComponent {
         continuous: has_axis.then_some(value),
+        value120: raw_value120.and_then(scroll_v120_i32),
         discrete: has_axis
-            .then(|| remainder.take_steps(horizontal, read_v120()))
+            .then(|| remainder.take_steps(horizontal, raw_value120.unwrap_or_default()))
             .flatten(),
         stopped: has_axis && value == 0.0,
     }
+}
+
+fn scroll_v120_i32(value: f64) -> Option<i32> {
+    if !value.is_finite() {
+        return None;
+    }
+    i32::try_from(value.round() as i64).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1396,5 +1408,19 @@ mod scroll_event_tests {
         assert!(should_forward_libinput_scroll_event(
             LibinputScrollEventKind::Continuous,
         ));
+    }
+
+    #[test]
+    fn wheel_axis_preserves_raw_v120_and_accumulates_legacy_steps() {
+        let mut remainder = ScrollV120Remainder::default();
+        let component = wheel_axis_component(true, 2.5, || 30.0, &mut remainder, false);
+
+        assert_eq!(component.continuous, Some(2.5));
+        assert_eq!(component.value120, Some(30));
+        assert_eq!(component.discrete, None);
+
+        let component = wheel_axis_component(true, 2.5, || 90.0, &mut remainder, false);
+        assert_eq!(component.value120, Some(90));
+        assert_eq!(component.discrete, Some(1));
     }
 }

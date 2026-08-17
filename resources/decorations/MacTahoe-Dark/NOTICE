@@ -1,0 +1,6 @@
+MacTahoe-Dark control artwork is sourced from the local Labwc theme package
+/home/agony/.themes/MacTahoe-Dark/labwc supplied for this Typhon integration.
+
+The source theme directory is not modified by Typhon. The bundled copies are
+used as immutable, locally validated SVG inputs for the compositor theme
+loader.

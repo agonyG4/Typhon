@@ -10,8 +10,8 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::{
     compositor::{
-        self, DecorationRenderInstance, DecorationRenderPrimitive, DesktopVisualState,
-        RenderableSurface, SurfaceDamageRect,
+        self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
+        DesktopVisualState, RenderableSurface, SurfaceDamageRect,
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
@@ -155,6 +155,7 @@ impl EglSceneFrameCommit {
                 content_generation: 0,
                 output_scale_key: 0,
                 surface_signature_hash: 0,
+                decoration_signature_hash: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
         }
@@ -198,7 +199,7 @@ pub(crate) struct GlesSceneRenderer {
     active_surface_ids: Vec<u32>,
     failed_surface_generations: HashMap<u32, u64>,
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
-    decoration_resources: HashMap<u32, EglImageResource>,
+    decoration_resources: HashMap<DecorationResourceKey, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
@@ -421,12 +422,13 @@ impl GlesSceneRenderer {
             base_surfaces.as_slice()
         };
         let surface_signatures = egl_scene_surface_signatures(surfaces);
-        let candidate_scene_key = EglSceneCacheKey::new(
+        let candidate_scene_key = EglSceneCacheKey::new_with_decorations(
             width,
             height,
             content_generation,
             output_scale_key,
             &surface_signatures,
+            &decoration_instances,
             framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
@@ -436,6 +438,7 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
+            &decoration_instances,
             framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
@@ -672,15 +675,17 @@ impl GlesSceneRenderer {
         instances: &[DecorationRenderInstance],
     ) -> RendererResult<()> {
         let mut required = HashSet::new();
+        let mut required_assets = HashMap::new();
         for instance in instances {
             for primitive in instance.primitives() {
                 match primitive {
                     DecorationRenderPrimitive::SolidRect { color, .. }
                     | DecorationRenderPrimitive::Text { color, .. } => {
-                        required.insert(rgba_to_pixel(*color));
+                        required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
                     }
-                    DecorationRenderPrimitive::Image { .. } => {
-                        required.insert(0xffff_ffff);
+                    DecorationRenderPrimitive::Image { asset, .. } => {
+                        required.insert(DecorationResourceKey::Asset(asset.asset_id()));
+                        required_assets.insert(asset.asset_id(), asset);
                     }
                 }
             }
@@ -690,28 +695,47 @@ impl GlesSceneRenderer {
             .decoration_resources
             .keys()
             .copied()
-            .filter(|color| !required.contains(color))
+            .filter(|key| !required.contains(key))
             .collect::<Vec<_>>();
-        for color in stale {
-            if let Some(resource) = self.decoration_resources.remove(&color) {
+        for key in stale {
+            if let Some(resource) = self.decoration_resources.remove(&key) {
                 destroy_image_resource(&self.gl, egl, egl_display, resource);
             }
         }
 
-        for color in required {
-            if self.decoration_resources.contains_key(&color) {
+        for key in required {
+            if self.decoration_resources.contains_key(&key) {
                 continue;
             }
-            let mut resource = create_uploaded_resource(&self.gl, 1, 1)?;
-            write_argb_pixels_to_resource(
-                &self.gl,
-                &resource,
-                SurfaceDamageRect::full(1, 1),
-                &[color],
-                &mut self.texture_upload_rgba,
-            );
+            let mut resource = match key {
+                DecorationResourceKey::Solid(color) => {
+                    let resource = create_uploaded_resource(&self.gl, 1, 1)?;
+                    write_argb_pixels_to_resource(
+                        &self.gl,
+                        &resource,
+                        SurfaceDamageRect::full(1, 1),
+                        &[color],
+                        &mut self.texture_upload_rgba,
+                    );
+                    resource
+                }
+                DecorationResourceKey::Asset(asset_id) => {
+                    let asset = required_assets
+                        .get(&asset_id)
+                        .expect("required decoration asset was collected");
+                    let resource =
+                        create_uploaded_resource(&self.gl, asset.width(), asset.height())?;
+                    write_rgba_bytes_to_resource(
+                        &self.gl,
+                        &resource,
+                        SurfaceDamageRect::full(asset.width(), asset.height()),
+                        asset.rgba_premultiplied(),
+                    );
+                    resource
+                }
+            };
             resource.generation = 1;
-            self.decoration_resources.insert(color, resource);
+            self.decoration_resources.insert(key, resource);
         }
         Ok(())
     }
@@ -1039,15 +1063,17 @@ impl GlesSceneRenderer {
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        decoration_instances: &[DecorationRenderInstance],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.scene_cache_key.is_some_and(|key| {
-            key.is_current(
+            key.is_current_with_decorations(
                 width,
                 height,
                 content_generation,
                 output_scale_key,
                 surface_signatures,
+                decoration_instances,
                 framebuffer_origin,
             )
         })
@@ -1086,58 +1112,46 @@ impl GlesSceneRenderer {
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
-        for (surface, render_assignment) in surfaces.iter().zip(render_assignments) {
-            if let Some(bounds) = compositor::xwayland_visual_backing_target(
-                surface,
-                render_assignment.visual_clip.as_ref(),
-            ) {
-                push_draw_command(
-                    &mut self.vertices,
-                    &mut self.commands,
-                    EglDrawLayer::Solid(compositor::ServerFrameColor::XwaylandBacking),
-                    EglRect::new(
-                        bounds.x() as f32,
-                        bounds.y() as f32,
-                        bounds.width() as f32,
-                        bounds.height() as f32,
-                    ),
-                    width,
-                    height,
-                    framebuffer_origin,
-                );
-            }
-            for render_plan in compositor::surface_render_plans_with_aperture(
-                surface,
-                render_assignment.target,
-                render_assignment.visual_clip.as_ref(),
-            ) {
-                push_egl_render_plan(
+        for group in compositor::window_visual_stack_order(surfaces, decoration_instances) {
+            for &surface_index in group.surface_indices() {
+                let Some((surface, render_assignment)) = surfaces
+                    .get(surface_index)
+                    .zip(render_assignments.get(surface_index).cloned())
+                else {
+                    continue;
+                };
+                push_egl_surface_commands(
                     &mut self.vertices,
                     &mut self.commands,
                     width,
                     height,
                     surface,
-                    render_plan,
+                    render_assignment,
+                    framebuffer_origin,
+                );
+            }
+            if let Some(decoration_index) = group.decoration_index()
+                && let Some(instance) = decoration_instances.get(decoration_index)
+            {
+                push_egl_decoration_instance(
+                    &mut self.vertices,
+                    &mut self.commands,
+                    width,
+                    height,
+                    instance,
+                    output_scale,
                     framebuffer_origin,
                 );
             }
         }
-        push_egl_decoration_commands(
-            &mut self.vertices,
-            &mut self.commands,
-            width,
-            height,
-            decoration_instances,
-            output_scale,
-            framebuffer_origin,
-        );
 
-        self.scene_cache_key = Some(EglSceneCacheKey::new(
+        self.scene_cache_key = Some(EglSceneCacheKey::new_with_decorations(
             width,
             height,
             content_generation,
             output_scale_key,
             surface_signatures,
+            decoration_instances,
             framebuffer_origin,
         ));
     }
@@ -1159,22 +1173,16 @@ impl GlesSceneRenderer {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
 
-        let origins = compositor::surface_origins(overlay_surfaces);
         let render_assignments =
             compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
-        for ((surface, (origin_x, origin_y)), render_assignment) in
-            overlay_surfaces.iter().zip(origins).zip(render_assignments)
-        {
+        for (surface, render_assignment) in overlay_surfaces.iter().zip(render_assignments) {
             push_egl_surface_commands(
                 &mut self.cursor_vertices,
                 &mut self.cursor_commands,
                 width,
                 height,
                 surface,
-                origin_x,
-                origin_y,
                 render_assignment,
-                output_scale,
                 framebuffer_origin,
             );
         }
@@ -1385,7 +1393,11 @@ impl GlesSceneRenderer {
                 .map(|resource| resource.texture),
             EglDrawLayer::SolidRgba(color) => self
                 .decoration_resources
-                .get(&color)
+                .get(&DecorationResourceKey::Solid(color))
+                .map(|resource| resource.texture),
+            EglDrawLayer::DecorationAsset(asset_id) => self
+                .decoration_resources
+                .get(&DecorationResourceKey::Asset(asset_id))
                 .map(|resource| resource.texture),
             EglDrawLayer::Surface(surface_id) => self
                 .surface_resources
@@ -1426,63 +1438,57 @@ impl GlesSceneRenderer {
     }
 }
 
-fn push_egl_decoration_commands(
+fn push_egl_decoration_instance(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,
     output_width: u32,
     output_height: u32,
-    instances: &[DecorationRenderInstance],
+    instance: &DecorationRenderInstance,
     output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
-    for instance in instances {
-        for primitive in instance.primitives() {
-            match primitive {
-                DecorationRenderPrimitive::SolidRect { rect, color } => {
-                    push_egl_decoration_rect(
-                        vertices,
-                        commands,
-                        output_width,
-                        output_height,
-                        EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
-                        instance,
-                        *rect,
-                        output_scale,
-                        framebuffer_origin,
-                    );
-                }
-                DecorationRenderPrimitive::Image { rect, asset } => {
-                    push_egl_decoration_icon(
-                        vertices,
-                        commands,
-                        output_width,
-                        output_height,
-                        instance,
-                        *rect,
-                        asset,
-                        output_scale,
-                        framebuffer_origin,
-                    );
-                }
-                DecorationRenderPrimitive::Text {
-                    rect,
-                    clip,
-                    text,
-                    color,
-                } => push_egl_decoration_text(
+    for primitive in instance.primitives() {
+        match primitive {
+            DecorationRenderPrimitive::SolidRect { rect, color } => {
+                push_egl_decoration_rect(
                     vertices,
                     commands,
                     output_width,
                     output_height,
+                    EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
                     instance,
                     *rect,
-                    *clip,
-                    text,
-                    *color,
                     output_scale,
                     framebuffer_origin,
-                ),
+                );
             }
+            DecorationRenderPrimitive::Image { rect, asset } => {
+                push_egl_decoration_rect(
+                    vertices,
+                    commands,
+                    output_width,
+                    output_height,
+                    EglDrawLayer::DecorationAsset(asset.asset_id()),
+                    instance,
+                    *rect,
+                    output_scale,
+                    framebuffer_origin,
+                );
+            }
+            DecorationRenderPrimitive::Text {
+                rect, clip, asset, ..
+            } => push_egl_decoration_text(
+                vertices,
+                commands,
+                output_width,
+                output_height,
+                instance,
+                *rect,
+                *clip,
+                asset,
+                output_scale,
+                framebuffer_origin,
+            ),
         }
     }
 }
@@ -1515,60 +1521,6 @@ fn push_egl_decoration_rect(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_egl_decoration_icon(
-    vertices: &mut Vec<EglTexturedVertex>,
-    commands: &mut Vec<EglDrawCommand>,
-    output_width: u32,
-    output_height: u32,
-    instance: &DecorationRenderInstance,
-    rect: oblivion_one::compositor::DecorationRect,
-    asset: &str,
-    output_scale: f64,
-    framebuffer_origin: OutputFramebufferOrigin,
-) {
-    let scale = output_scale.max(1.0) as f32;
-    let (origin_x, origin_y) = instance.origin();
-    let x = (origin_x.saturating_add(rect.x) as f32) * scale;
-    let y = (origin_y.saturating_add(rect.y) as f32) * scale;
-    let width = rect.width as f32 * scale;
-    let height = rect.height as f32 * scale;
-    let stroke = scale.max(1.0);
-    let layer = EglDrawLayer::SolidRgba(0xffff_ffff);
-    let mut line = |line_x: f32, line_y: f32, line_width: f32, line_height: f32| {
-        push_draw_command(
-            vertices,
-            commands,
-            layer,
-            EglRect::new(line_x, line_y, line_width, line_height),
-            output_width,
-            output_height,
-            framebuffer_origin,
-        );
-    };
-
-    let name = asset.to_ascii_lowercase();
-    if name.contains("close") {
-        for offset in 3..13 {
-            let offset = offset as f32 * width / 16.0;
-            line(x + offset, y + offset, stroke, stroke);
-            line(x + width - offset - stroke, y + offset, stroke, stroke);
-        }
-    } else if name.contains("minimize") {
-        line(x + width * 0.25, y + height * 0.60, width * 0.5, stroke);
-    } else {
-        let inset = width * 0.22;
-        line(x + inset, y + inset, width * 0.56, stroke);
-        line(x + inset, y + height - inset - stroke, width * 0.56, stroke);
-        line(x + inset, y + inset, stroke, height * 0.56);
-        line(x + width - inset - stroke, y + inset, stroke, height * 0.56);
-        if name.contains("restore") {
-            let offset = width * 0.12;
-            line(x + offset, y + height * 0.34, width * 0.56, stroke);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn push_egl_decoration_text(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,
@@ -1577,73 +1529,47 @@ fn push_egl_decoration_text(
     instance: &DecorationRenderInstance,
     rect: oblivion_one::compositor::DecorationRect,
     clip: oblivion_one::compositor::DecorationRect,
-    text: &str,
-    color: [u8; 4],
+    asset: &oblivion_one::compositor::DecorationRasterAsset,
     output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
     let scale = output_scale.max(1.0) as f32;
-    let (origin_x_value, origin_y_value) = instance.origin();
-    let origin_x = origin_x_value as f32 * scale;
-    let origin_y = origin_y_value as f32 * scale;
-    let rect_x = origin_x + rect.x as f32 * scale;
-    let rect_y = origin_y + rect.y as f32 * scale;
-    let clip_left = origin_x + clip.x as f32 * scale;
-    let clip_right = clip_left + clip.width as f32 * scale;
-    let clip_top = origin_y + clip.y as f32 * scale;
-    let clip_bottom = clip_top + clip.height as f32 * scale;
-    let glyph_width = 6.0 * scale;
-    let glyph_height = 7.0 * scale;
-    let mut x = rect_x;
-    let y = rect_y + ((rect.height as f32 * scale - glyph_height).max(0.0) / 2.0);
-    let layer = EglDrawLayer::SolidRgba(rgba_to_pixel(color));
-    for character in text.chars() {
-        if x + glyph_width > clip_right || x + glyph_width <= clip_left {
-            break;
-        }
-        let pattern = egl_decoration_glyph(character);
-        for (row, bits) in pattern.into_iter().enumerate() {
-            for column in 0..5 {
-                if bits & (1 << (4 - column)) == 0 {
-                    continue;
-                }
-                let cell_x = x + column as f32 * scale;
-                let cell_y = y + row as f32 * scale;
-                if cell_x < clip_left
-                    || cell_y < clip_top
-                    || cell_x + scale > clip_right
-                    || cell_y + scale > clip_bottom
-                {
-                    continue;
-                }
-                push_draw_command(
-                    vertices,
-                    commands,
-                    layer,
-                    EglRect::new(cell_x, cell_y, scale, scale),
-                    output_width,
-                    output_height,
-                    framebuffer_origin,
-                );
-            }
-        }
-        x += glyph_width;
+    let (origin_x, origin_y) = instance.origin();
+    let left = rect.x.max(clip.x);
+    let top = rect.y.max(clip.y);
+    let right = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .min(clip.x.saturating_add(clip.width as i32));
+    let bottom = rect
+        .y
+        .saturating_add(rect.height as i32)
+        .min(clip.y.saturating_add(clip.height as i32));
+    if left >= right || top >= bottom || rect.width == 0 || rect.height == 0 {
+        return;
     }
-}
-
-fn egl_decoration_glyph(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
-        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-        'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
-        'H' => [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-        'N' => [0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11],
-        'O' => [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
-        'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
-        'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        'Y' => [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
-        ' ' => [0; 7],
-        _ => [0x1f, 0x11, 0x15, 0x11, 0x15, 0x11, 0x1f],
-    }
+    let uv = EglUvRect::new(
+        (left - rect.x) as f32 / rect.width as f32,
+        (top - rect.y) as f32 / rect.height as f32,
+        (right - rect.x) as f32 / rect.width as f32,
+        (bottom - rect.y) as f32 / rect.height as f32,
+    );
+    push_draw_command_with_uv(
+        vertices,
+        commands,
+        EglDrawLayer::DecorationAsset(asset.asset_id()),
+        EglRect::new(
+            (origin_x.saturating_add(left) as f32) * scale,
+            (origin_y.saturating_add(top) as f32) * scale,
+            (right - left) as f32 * scale,
+            (bottom - top) as f32 * scale,
+        ),
+        uv,
+        SurfaceSampling::ScaledLinear,
+        output_width,
+        output_height,
+        framebuffer_origin,
+    );
 }
 
 fn rgba_to_pixel(color: [u8; 4]) -> u32 {
@@ -1651,6 +1577,12 @@ fn rgba_to_pixel(color: [u8; 4]) -> u32 {
         | (u32::from(color[0]) << 16)
         | (u32::from(color[1]) << 8)
         | u32::from(color[2])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DecorationResourceKey {
+    Solid(u32),
+    Asset(u64),
 }
 
 struct EglImageResource {
@@ -1735,6 +1667,7 @@ struct EglSceneCacheKey {
     content_generation: u64,
     output_scale_key: u32,
     surface_signature_hash: u64,
+    decoration_signature_hash: u64,
     framebuffer_origin: OutputFramebufferOrigin,
 }
 
@@ -1753,10 +1686,56 @@ impl EglSceneCacheKey {
             content_generation,
             output_scale_key,
             surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
+            decoration_signature_hash: egl_decoration_signature_hash(&[]),
             framebuffer_origin,
         }
     }
 
+    fn new_with_decorations(
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        decoration_instances: &[DecorationRenderInstance],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        let mut key = Self::new(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            surface_signatures,
+            framebuffer_origin,
+        );
+        key.decoration_signature_hash = egl_decoration_signature_hash(decoration_instances);
+        key
+    }
+
+    #[cfg(test)]
+    fn new_with_decoration_snapshots(
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        decoration_snapshots: &[DecorationSceneSnapshot],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        let mut key = Self::new(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            surface_signatures,
+            framebuffer_origin,
+        );
+        key.decoration_signature_hash =
+            egl_decoration_snapshot_signature_hash(decoration_snapshots);
+        key
+    }
+
+    #[cfg(test)]
     fn is_current(
         self,
         width: u32,
@@ -1766,11 +1745,54 @@ impl EglSceneCacheKey {
         surface_signatures: &[EglSceneSurfaceSignature],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
+        self.is_current_with_decorations(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            surface_signatures,
+            &[],
+            framebuffer_origin,
+        )
+    }
+
+    fn is_current_with_decorations(
+        self,
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        decoration_instances: &[DecorationRenderInstance],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> bool {
         self.width == width
             && self.height == height
             && self.content_generation == content_generation
             && self.output_scale_key == output_scale_key
             && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
+            && self.decoration_signature_hash == egl_decoration_signature_hash(decoration_instances)
+            && self.framebuffer_origin == framebuffer_origin
+    }
+
+    #[cfg(test)]
+    fn is_current_with_decoration_snapshots(
+        self,
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        decoration_snapshots: &[DecorationSceneSnapshot],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> bool {
+        self.width == width
+            && self.height == height
+            && self.content_generation == content_generation
+            && self.output_scale_key == output_scale_key
+            && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
+            && self.decoration_signature_hash
+                == egl_decoration_snapshot_signature_hash(decoration_snapshots)
             && self.framebuffer_origin == framebuffer_origin
     }
 }
@@ -1816,10 +1838,7 @@ fn push_egl_surface_commands(
     width: u32,
     height: u32,
     surface: &RenderableSurface,
-    _origin_x: i32,
-    _origin_y: i32,
     render_assignment: compositor::SurfaceRenderSpaceAssignment,
-    _output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
     if let Some(bounds) =
@@ -1942,6 +1961,34 @@ fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> 
         hash = fnv1a_u64(hash, u64::from(signature.clip_width));
         hash = fnv1a_u64(hash, u64::from(signature.clip_height));
         hash = fnv1a_u64(hash, signature.generation);
+    }
+    hash
+}
+
+fn egl_decoration_signature_hash(instances: &[DecorationRenderInstance]) -> u64 {
+    let snapshots = instances
+        .iter()
+        .map(DecorationRenderInstance::scene_snapshot)
+        .collect::<Vec<_>>();
+    egl_decoration_snapshot_signature_hash(&snapshots)
+}
+
+fn egl_decoration_snapshot_signature_hash(snapshots: &[DecorationSceneSnapshot]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for snapshot in snapshots {
+        let (window_id, root_surface_id) = snapshot.identity();
+        let (x, y, width, height) = snapshot.bounds();
+        for value in [
+            window_id.get(),
+            u64::from(root_surface_id),
+            x as u64,
+            y as u64,
+            u64::from(width),
+            u64::from(height),
+            snapshot.visual_signature(),
+        ] {
+            hash = fnv1a_u64(hash, value);
+        }
     }
     hash
 }
@@ -3086,6 +3133,41 @@ mod tests {
             9,
             120,
             &[cropped_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_decoration_scene_changes() {
+        let window_id = oblivion_one::compositor::WindowId::from_raw(21).expect("window id");
+        let initial = DecorationSceneSnapshot::from_bounds(window_id, 7, 100, 80, 302, 227, 1);
+        let changed = DecorationSceneSnapshot::from_bounds(window_id, 7, 100, 80, 302, 227, 2);
+        let key = EglSceneCacheKey::new_with_decoration_snapshots(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            std::slice::from_ref(&initial),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(key.is_current_with_decoration_snapshots(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            std::slice::from_ref(&initial),
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(!key.is_current_with_decoration_snapshots(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            std::slice::from_ref(&changed),
             OutputFramebufferOrigin::BottomLeft,
         ));
     }

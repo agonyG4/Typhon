@@ -985,11 +985,15 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_axis_frame(&mut self, frame: PointerAxisFrame) {
-        if frame.horizontal.continuous == Some(0.0)
-            && frame.vertical.continuous == Some(0.0)
-            && !frame.horizontal.stopped
-            && !frame.vertical.stopped
-        {
+        let horizontal_empty = frame.horizontal.continuous == Some(0.0)
+            && frame.horizontal.value120.is_none()
+            && frame.horizontal.discrete.is_none()
+            && !frame.horizontal.stopped;
+        let vertical_empty = frame.vertical.continuous == Some(0.0)
+            && frame.vertical.value120.is_none()
+            && frame.vertical.discrete.is_none()
+            && !frame.vertical.stopped;
+        if horizontal_empty && vertical_empty {
             return;
         }
         self.compliance_metrics.pointer_axis_frames = self
@@ -1068,7 +1072,14 @@ fn send_pointer_axis_frame_to_resource(pointer: &wl_pointer::WlPointer, frame: P
         (wl_pointer::Axis::VerticalScroll, frame.vertical),
     ];
     for (axis, component) in axes {
-        if pointer.version() >= 5
+        if pointer.version() >= 8 {
+            if let Some(value120) = component.value120 {
+                let _ = pointer.send_event(wl_pointer::Event::AxisValue120 {
+                    axis: WEnum::Value(axis),
+                    value120,
+                });
+            }
+        } else if pointer.version() >= 5
             && let Some(discrete) = component.discrete
         {
             let _ = pointer.send_event(wl_pointer::Event::AxisDiscrete {

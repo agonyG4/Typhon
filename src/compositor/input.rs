@@ -497,6 +497,7 @@ pub(super) fn wayland_event_time_from_usec(timestamp_usec: u64) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerAxisComponent {
     pub continuous: Option<f64>,
+    pub value120: Option<i32>,
     pub discrete: Option<i32>,
     pub stopped: bool,
 }
@@ -505,6 +506,7 @@ impl PointerAxisComponent {
     pub const fn continuous(value: f64) -> Self {
         Self {
             continuous: Some(value),
+            value120: None,
             discrete: None,
             stopped: false,
         }
@@ -513,6 +515,7 @@ impl PointerAxisComponent {
     pub const fn absent() -> Self {
         Self {
             continuous: None,
+            value120: None,
             discrete: None,
             stopped: false,
         }

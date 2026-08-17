@@ -1,10 +1,13 @@
-use super::types::{DecorationButtonVisualState, DecorationMetrics};
+use super::{
+    raster::{DecorationRasterAsset, rasterize_svg},
+    types::{DecorationButtonVisualState, DecorationMetrics},
+};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fmt, fs,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 pub(crate) const MAX_THEME_JSON_BYTES: usize = 64 * 1024;
@@ -21,6 +24,7 @@ pub(crate) enum DecorationThemeError {
     AssetTooLarge(String),
     AssetIo(String),
     ExternalResource(String),
+    Raster(String),
     Persistence(String),
 }
 
@@ -40,6 +44,7 @@ impl fmt::Display for DecorationThemeError {
                     "theme asset references an external resource: {path}"
                 )
             }
+            Self::Raster(reason) => write!(formatter, "theme asset rasterization failed: {reason}"),
             Self::Persistence(reason) => {
                 write!(formatter, "theme selection persistence failed: {reason}")
             }
@@ -96,6 +101,10 @@ pub(crate) struct ThemeColorsDefinition {
     pub active_background: String,
     pub inactive_background: String,
     pub border: String,
+    #[serde(default)]
+    pub active_border: Option<String>,
+    #[serde(default)]
+    pub inactive_border: Option<String>,
     pub title: String,
     pub inactive_title: String,
 }
@@ -105,6 +114,8 @@ pub(crate) struct ThemeColors {
     pub active_background: [u8; 4],
     pub inactive_background: [u8; 4],
     pub border: [u8; 4],
+    pub active_border: [u8; 4],
+    pub inactive_border: [u8; 4],
     pub title: [u8; 4],
     pub inactive_title: [u8; 4],
 }
@@ -115,6 +126,14 @@ impl ThemeColorsDefinition {
             active_background: parse_color("active_background", &self.active_background)?,
             inactive_background: parse_color("inactive_background", &self.inactive_background)?,
             border: parse_color("border", &self.border)?,
+            active_border: parse_color(
+                "active_border",
+                self.active_border.as_deref().unwrap_or(&self.border),
+            )?,
+            inactive_border: parse_color(
+                "inactive_border",
+                self.inactive_border.as_deref().unwrap_or(&self.border),
+            )?,
             title: parse_color("title", &self.title)?,
             inactive_title: parse_color("inactive_title", &self.inactive_title)?,
         })
@@ -176,11 +195,14 @@ pub(crate) struct DecorationThemeSnapshot {
     title: ThemeTitleDefinition,
     asset_paths: BTreeMap<String, String>,
     asset_bytes: BTreeMap<String, Arc<[u8]>>,
+    raster_assets: BTreeMap<String, DecorationRasterAsset>,
+    font_bytes: Option<Arc<[u8]>>,
+    text_cache: Arc<Mutex<BTreeMap<String, super::text::RasterizedTitle>>>,
 }
 
 impl Default for DecorationThemeSnapshot {
     fn default() -> Self {
-        Self::builtin_mac_tahoe(1)
+        load_theme_by_name("MacTahoe-Dark", 1).unwrap_or_else(|_| Self::builtin_mac_tahoe(1))
     }
 }
 
@@ -188,11 +210,13 @@ impl DecorationThemeSnapshot {
     pub(crate) fn builtin_mac_tahoe(generation: u64) -> Self {
         let metrics = DecorationMetrics::mac_tahoe();
         let colors = ThemeColors {
-            active_background: [24, 32, 42, 255],
-            inactive_background: [16, 20, 25, 255],
-            border: [10, 13, 18, 255],
+            active_background: [51, 51, 51, 255],
+            inactive_background: [36, 36, 36, 255],
+            border: [1, 1, 1, 255],
+            active_border: [1, 1, 1, 255],
+            inactive_border: [44, 44, 44, 255],
             title: [255, 255, 255, 255],
-            inactive_title: [138, 146, 158, 255],
+            inactive_title: [255, 255, 255, 153],
         };
         let title = ThemeTitleDefinition {
             font_family: "Sans".into(),
@@ -218,15 +242,18 @@ impl DecorationThemeSnapshot {
             }
         }
         Self {
-            name: "MacTahoe-Dark".into(),
+            name: "Emergency-Fallback".into(),
             schema_version: 1,
-            source: "builtin".into(),
+            source: "emergency-fallback".into(),
             generation,
             metrics,
             colors,
             title,
             asset_paths,
             asset_bytes: BTreeMap::new(),
+            raster_assets: BTreeMap::new(),
+            font_bytes: None,
+            text_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -302,6 +329,51 @@ impl DecorationThemeSnapshot {
     pub(crate) fn asset_bytes(&self, path: &str) -> Option<&[u8]> {
         self.asset_bytes.get(path).map(AsRef::as_ref)
     }
+
+    pub(crate) fn raster_asset(&self, path: &str, scale: f64) -> Option<&DecorationRasterAsset> {
+        self.raster_assets.get(&raster_asset_key(path, scale))
+    }
+
+    pub(crate) fn rasterize_title(
+        &self,
+        title: &str,
+        title_rect: super::types::DecorationRect,
+        color: [u8; 4],
+        output_scale: f64,
+    ) -> Option<super::text::RasterizedTitle> {
+        let font_bytes = self.font_bytes.as_deref()?;
+        let key = format!(
+            "{title}\0{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            title_rect.width,
+            title_rect.height,
+            color[0],
+            color[1],
+            color[2],
+            color[3],
+            self.title.font_size,
+            self.title.alignment as u8,
+            output_scale.to_bits(),
+        );
+        if let Ok(cache) = self.text_cache.lock()
+            && let Some(raster) = cache.get(&key)
+        {
+            return Some(raster.clone());
+        }
+        let raster = super::text::rasterize_title(
+            font_bytes,
+            title,
+            title_rect,
+            color,
+            self.title.font_size,
+            self.title.alignment,
+            output_scale,
+        )
+        .ok()?;
+        if let Ok(mut cache) = self.text_cache.lock() {
+            cache.insert(key, raster.clone());
+        }
+        Some(raster)
+    }
 }
 
 pub(crate) fn parse_theme_json(
@@ -322,6 +394,7 @@ pub(crate) fn snapshot_from_definition(
 ) -> Result<DecorationThemeSnapshot, DecorationThemeError> {
     let metrics = definition.metrics.into_metrics()?;
     let colors = definition.colors.parse()?;
+    let font_bytes = select_font_bytes(&definition.title)?;
     let mut asset_paths = BTreeMap::new();
     insert_button_paths(
         &mut asset_paths,
@@ -352,6 +425,9 @@ pub(crate) fn snapshot_from_definition(
         title: definition.title,
         asset_paths,
         asset_bytes: BTreeMap::new(),
+        raster_assets: BTreeMap::new(),
+        font_bytes: Some(font_bytes),
+        text_cache: Arc::new(Mutex::new(BTreeMap::new())),
     })
 }
 
@@ -380,6 +456,14 @@ pub(crate) fn load_theme_package(
         asset_bytes.insert(path.clone(), Arc::<[u8]>::from(data));
     }
     snapshot.asset_bytes = asset_bytes;
+    for (path, bytes) in &snapshot.asset_bytes {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let raster = rasterize_svg(path, bytes, scale).map_err(DecorationThemeError::Raster)?;
+            snapshot
+                .raster_assets
+                .insert(raster_asset_key(path, scale), raster);
+        }
+    }
     Ok(snapshot)
 }
 
@@ -388,9 +472,6 @@ pub(crate) fn load_theme_by_name(
     generation: u64,
 ) -> Result<DecorationThemeSnapshot, DecorationThemeError> {
     validate_theme_name(name)?;
-    if name == "MacTahoe-Dark" {
-        return Ok(DecorationThemeSnapshot::builtin_mac_tahoe(generation));
-    }
     for root in theme_search_roots(name) {
         if root.is_dir() {
             let theme = load_theme_package(&root, generation)?;
@@ -422,23 +503,30 @@ fn validate_theme_name(name: &str) -> Result<(), DecorationThemeError> {
 }
 
 fn theme_search_roots(name: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+    let mut roots = vec![
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/decorations")
+            .join(name),
+    ];
+    let mut standard_roots = Vec::new();
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        roots.push(PathBuf::from(data_home));
+        standard_roots.push(PathBuf::from(data_home));
     } else if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".local/share"));
+        standard_roots.push(PathBuf::from(home).join(".local/share"));
     }
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        roots.push(PathBuf::from(config_home));
+        standard_roots.push(PathBuf::from(config_home));
     }
-    roots.extend([
+    standard_roots.extend([
         PathBuf::from("/usr/local/share"),
         PathBuf::from("/usr/share"),
     ]);
+    roots.extend(
+        standard_roots
+            .into_iter()
+            .map(|root| root.join("astrea/typhon/decorations").join(name)),
+    );
     roots
-        .into_iter()
-        .map(|root| root.join("astrea/typhon/decorations").join(name))
-        .collect()
 }
 
 pub(crate) fn available_theme_names() -> Vec<String> {
@@ -661,12 +749,54 @@ fn resolve_asset_path(root: &Path, path: &str) -> Result<PathBuf, DecorationThem
     Ok(resolved)
 }
 
+fn raster_asset_key(path: &str, scale: f64) -> String {
+    format!("{path}@{}", (scale * 100.0).round() as u32)
+}
+
+fn select_font_bytes(title: &ThemeTitleDefinition) -> Result<Arc<[u8]>, DecorationThemeError> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let mut families = title
+        .font_family
+        .split(',')
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(fontdb::Family::Name)
+        .collect::<Vec<_>>();
+    families.push(fontdb::Family::Name("Inter"));
+    families.push(fontdb::Family::Name("Noto Sans"));
+    families.push(fontdb::Family::SansSerif);
+    let id = database
+        .query(&fontdb::Query {
+            families: &families,
+            ..fontdb::Query::default()
+        })
+        .or_else(|| {
+            database
+                .faces()
+                .find(|face| {
+                    face.families
+                        .iter()
+                        .any(|(family, _)| family.contains("Sans") || family.contains("Adwaita"))
+                })
+                .map(|face| face.id)
+        })
+        .ok_or_else(|| DecorationThemeError::Raster("no usable title font was found".into()))?;
+    database
+        .with_face_data(id, |data, _| Arc::<[u8]>::from(data.to_vec()))
+        .ok_or_else(|| {
+            DecorationThemeError::Raster("selected title font bytes are unavailable".into())
+        })
+}
+
 fn validate_asset_bytes(path: &str, bytes: &[u8]) -> Result<(), DecorationThemeError> {
     if path.ends_with(".svg") {
         let text = String::from_utf8_lossy(bytes);
         let lower = text
             .to_ascii_lowercase()
-            .replace("http://www.w3.org/2000/svg", "");
+            .lines()
+            .filter(|line| !line.contains("xmlns"))
+            .collect::<String>();
         if lower.contains("http://")
             || lower.contains("https://")
             || lower.contains("file:")
@@ -683,8 +813,8 @@ fn validate_asset_bytes(path: &str, bytes: &[u8]) -> Result<(), DecorationThemeE
 #[cfg(test)]
 mod tests {
     use super::{
-        DecorationThemeError, DecorationThemeSnapshot, load_theme_package, parse_theme_json,
-        snapshot_from_definition,
+        DecorationThemeError, DecorationThemeSnapshot, load_theme_by_name, load_theme_package,
+        parse_theme_json, snapshot_from_definition,
     };
 
     fn valid_theme() -> serde_json::Value {
@@ -791,6 +921,20 @@ mod tests {
         let snapshot = load_theme_package(&root, 9).expect("bundled theme package");
         assert_eq!(snapshot.name(), "MacTahoe-Dark");
         assert_eq!(snapshot.source(), "package");
-        assert!(snapshot.asset_bytes("assets/close.svg").is_some());
+        assert_eq!(snapshot.metrics().titlebar_height, 26);
+        assert!(snapshot.asset_bytes("assets/close-active.svg").is_some());
+        assert!(
+            snapshot
+                .raster_asset("assets/close-active.svg", 1.25)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mactahoe_name_uses_the_bundled_package_loader() {
+        let snapshot = load_theme_by_name("MacTahoe-Dark", 12).expect("bundled MacTahoe");
+        assert_eq!(snapshot.source(), "package");
+        assert_eq!(snapshot.generation(), 12);
+        assert!(snapshot.asset_bytes("assets/minimize-active.svg").is_some());
     }
 }

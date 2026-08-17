@@ -14,6 +14,9 @@ impl CompositorState {
         window_id: WindowId,
         reason: WindowFocusReason,
     ) -> WindowFocusOutcome {
+        if matches!(reason, WindowFocusReason::InitialMap) && !self.map_focus_allowed() {
+            return WindowFocusOutcome::Unavailable;
+        }
         let Some(window) = self.window(window_id) else {
             return WindowFocusOutcome::Unavailable;
         };
@@ -41,6 +44,17 @@ impl CompositorState {
         } else {
             WindowFocusOutcome::NoChange
         }
+    }
+
+    pub(in crate::compositor) fn map_focus_allowed(&self) -> bool {
+        !self.window_interaction_active()
+            && self.held_pointer_buttons.is_empty()
+            && self.implicit_pointer_grab.is_none()
+            && self.topmost_popup_grab_surface_id().is_none()
+            && self.active_locked_pointer_binding().is_none()
+            && self.active_confined_pointer_binding().is_none()
+            && self.active_drag.is_none()
+            && self.active_exclusive_layer_surface_id().is_none()
     }
 
     pub(in crate::compositor) fn activate_desktop_window(

@@ -15,6 +15,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_key(
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -24,6 +25,10 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_key(
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,
@@ -44,6 +49,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_without_keypress(
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -53,6 +59,10 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_without_keypress(
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -70,6 +80,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_then_press_tab(
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -79,6 +90,10 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_then_press_tab(
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -102,6 +117,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_two_keys
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -111,6 +127,10 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_two_keys
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,
@@ -138,6 +158,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_ctrl_mod
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -147,6 +168,10 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_ctrl_mod
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 29,
@@ -182,6 +207,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, seat_version..=seat_version, ())?;
     let _pointer = seat.get_pointer(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -192,7 +218,14 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     queue.roundtrip(&mut state)?;
     Ok(state)
 }
@@ -209,6 +242,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_relative
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -223,7 +257,14 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_relative
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     state.pointer_motion = false;
@@ -248,6 +289,7 @@ pub(in crate::compositor::tests) fn create_locked_focused_toplevel_and_receive_p
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -262,7 +304,14 @@ pub(in crate::compositor::tests) fn create_locked_focused_toplevel_and_receive_p
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -304,6 +353,7 @@ pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_mo
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -320,7 +370,14 @@ pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_mo
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -370,6 +427,7 @@ pub(in crate::compositor::tests) fn create_late_pointer_after_focus(
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let _pointer_a = seat.get_pointer(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -380,7 +438,14 @@ pub(in crate::compositor::tests) fn create_late_pointer_after_focus(
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     assert_eq!(state.pointer_enter_count, 1);
@@ -405,6 +470,7 @@ pub(in crate::compositor::tests) fn late_pointer_lock_activate_and_receive_relat
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let _pointer_a = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -420,7 +486,14 @@ pub(in crate::compositor::tests) fn late_pointer_lock_activate_and_receive_relat
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     assert_eq!(state.pointer_enter_count, 1);
@@ -474,6 +547,7 @@ pub(in crate::compositor::tests) fn lock_activation_repairs_missing_source_point
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let _pointer_a = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -488,7 +562,14 @@ pub(in crate::compositor::tests) fn lock_activation_repairs_missing_source_point
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -545,6 +626,7 @@ pub(in crate::compositor::tests) fn relative_motion_for_focused_client_is_not_br
         focused_globals.bind(&focused_qh, 1..=6, ())?;
     let focused_wm_base: client_xdg_wm_base::XdgWmBase =
         focused_globals.bind(&focused_qh, 1..=6, ())?;
+    let focused_shm: client_wl_shm::WlShm = focused_globals.bind(&focused_qh, 1..=1, ())?;
     let focused_seat: client_wl_seat::WlSeat = focused_globals.bind(&focused_qh, 5..=5, ())?;
     let _focused_pointer = focused_seat.get_pointer(&focused_qh, ());
     let focused_surface = focused_compositor.create_surface(&focused_qh, ());
@@ -555,7 +637,14 @@ pub(in crate::compositor::tests) fn relative_motion_for_focused_client_is_not_br
 
     let mut focused_state = RegistryTestState::default();
     focused_queue.roundtrip(&mut focused_state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&focused_surface, &focused_shm, &focused_qh, 32, 32)?;
+    focused_connection.flush()?;
+    wait_for_server_commands(commands);
+    focused_queue.roundtrip(&mut focused_state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     focused_queue.roundtrip(&mut focused_state)?;
     assert_eq!(focused_state.pointer_enter_count, 1);
@@ -602,6 +691,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let _pointer = seat.get_pointer(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -612,7 +702,14 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
@@ -621,6 +718,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
         horizontal: PointerAxisComponent::absent(),
         vertical: PointerAxisComponent {
             continuous: Some(15.0),
+            value120: None,
             discrete: Some(1),
             stopped: false,
         },
@@ -642,6 +740,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, pointer_version..=pointer_version, ())?;
     let _pointer = seat.get_pointer(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -652,14 +751,26 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
         timestamp_usec: 123_456_000,
         source: PointerAxisSource::Wheel,
         horizontal: PointerAxisComponent::absent(),
-        vertical: PointerAxisComponent::continuous(15.0),
+        vertical: PointerAxisComponent {
+            continuous: Some(15.0),
+            value120: Some(30),
+            discrete: Some(1),
+            stopped: false,
+        },
     }))?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;

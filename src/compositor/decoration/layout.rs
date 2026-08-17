@@ -17,7 +17,7 @@ mod tests {
         )
         .expect("valid floating layout");
 
-        assert_eq!(layout.titlebar.height, 32);
+        assert_eq!(layout.titlebar.height, 26);
         assert_eq!(
             layout
                 .buttons
@@ -36,6 +36,28 @@ mod tests {
             layout.outer.width as i32 - layout.buttons[2].visual.right(),
             12
         );
+    }
+
+    #[test]
+    fn mac_tahoe_is_borderless_but_keeps_resize_hit_area() {
+        let layout = DecorationLayout::for_window(
+            640,
+            480,
+            DecorationMode::ServerSide,
+            false,
+            false,
+            DecorationMetrics::mac_tahoe(),
+        )
+        .expect("valid floating layout");
+
+        assert_eq!(layout.extents.left, 0);
+        assert_eq!(layout.extents.right, 0);
+        assert_eq!(layout.extents.bottom, 0);
+        assert_eq!(layout.extents.top, 26);
+        assert!(matches!(
+            layout.hit_test(2.0, 2.0),
+            Some(DecorationHit::Resize(_))
+        ));
     }
 
     #[test]
@@ -114,6 +136,28 @@ mod tests {
             Some(DecorationHit::Button(DecorationButtonKind::Close))
         );
     }
+
+    #[test]
+    fn button_input_wins_over_overlapping_top_resize_region() {
+        let layout = DecorationLayout::for_window(
+            640,
+            480,
+            DecorationMode::ServerSide,
+            false,
+            false,
+            DecorationMetrics::mac_tahoe(),
+        )
+        .expect("valid layout");
+        let button = layout.buttons.first().expect("minimize button");
+
+        assert_eq!(
+            layout.hit_test(
+                f64::from(button.input.x + button.input.width as i32 / 2),
+                1.0,
+            ),
+            Some(DecorationHit::Button(button.kind))
+        );
+    }
 }
 use super::types::{
     DecorationButtonKind, DecorationExtents, DecorationHit, DecorationMetrics, DecorationMode,
@@ -158,7 +202,7 @@ impl DecorationLayout {
         } else {
             0
         };
-        let titlebar_height = visible.then_some(metrics.titlebar_height).unwrap_or(0);
+        let titlebar_height = if visible { metrics.titlebar_height } else { 0 };
         let extents = DecorationExtents {
             top: titlebar_height.checked_add(border)?,
             right: border,
@@ -284,22 +328,15 @@ impl DecorationLayout {
         if self.titlebar.height == 0 {
             return None;
         }
-        if let Some(edge) = self.resize_edge_at(x, y) {
-            return Some(DecorationHit::Resize(edge));
-        }
-        if self
+        if let Some(button) = self
             .buttons
             .iter()
             .find(|button| button.input.contains(x, y))
-            .map(|button| button.kind)
-            .map(DecorationHit::Button)
-            .is_some()
         {
-            return self
-                .buttons
-                .iter()
-                .find(|button| button.input.contains(x, y))
-                .map(|button| DecorationHit::Button(button.kind));
+            return Some(DecorationHit::Button(button.kind));
+        }
+        if let Some(edge) = self.resize_edge_at(x, y) {
+            return Some(DecorationHit::Resize(edge));
         }
         self.titlebar
             .contains(x, y)

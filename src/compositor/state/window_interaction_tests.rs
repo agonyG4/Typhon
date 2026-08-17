@@ -1,6 +1,46 @@
 use super::*;
 use std::num::NonZeroU64;
 
+#[test]
+fn fullscreen_window_interaction_eligibility_rejects_move_and_all_resize_edges() {
+    assert!(!window_interaction_allowed_for_mode(
+        ToplevelMode::Fullscreen,
+        WindowInteractionKind::Move,
+    ));
+    for edges in [
+        ResizeEdges::new(true, false, false, false),
+        ResizeEdges::new(false, false, false, true),
+        ResizeEdges::new(false, true, false, false),
+        ResizeEdges::new(false, false, true, false),
+        ResizeEdges::new(true, false, true, false),
+        ResizeEdges::new(true, false, false, true),
+        ResizeEdges::new(false, true, true, false),
+        ResizeEdges::BOTTOM_RIGHT,
+    ] {
+        assert!(!window_interaction_allowed_for_mode(
+            ToplevelMode::Fullscreen,
+            WindowInteractionKind::Resize(edges),
+        ));
+    }
+    assert!(window_interaction_allowed_for_mode(
+        ToplevelMode::Floating,
+        WindowInteractionKind::Move,
+    ));
+}
+
+#[test]
+fn initial_map_focus_does_not_override_client_owned_pointer_activity() {
+    let mut state = CompositorState::new(None);
+    assert!(state.map_focus_allowed());
+
+    state.window_interaction = Some(test_window_interaction(
+        1,
+        WindowInteractionKind::Move,
+        None,
+    ));
+    assert!(!state.map_focus_allowed());
+}
+
 fn test_window_interaction(
     id: u64,
     kind: WindowInteractionKind,

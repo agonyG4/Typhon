@@ -89,6 +89,81 @@ impl DecorationRenderInstance {
     pub fn origin(&self) -> (i32, i32) {
         (self.origin_x, self.origin_y)
     }
+
+    pub fn scene_snapshot(&self) -> DecorationSceneSnapshot {
+        DecorationSceneSnapshot::from_bounds(
+            self.window_id,
+            self.root_surface_id,
+            self.origin_x.saturating_add(self.plan.layout.outer.x),
+            self.origin_y.saturating_add(self.plan.layout.outer.y),
+            self.plan.layout.outer.width,
+            self.plan.layout.outer.height,
+            self.plan.visual_signature(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowVisualGroup {
+    root_surface_id: u32,
+    surface_indices: Vec<usize>,
+    decoration_index: Option<usize>,
+}
+
+impl WindowVisualGroup {
+    pub fn root_surface_id(&self) -> u32 {
+        self.root_surface_id
+    }
+
+    pub fn surface_indices(&self) -> &[usize] {
+        &self.surface_indices
+    }
+
+    pub fn decoration_index(&self) -> Option<usize> {
+        self.decoration_index
+    }
+}
+
+/// Return the authoritative back-to-front normal-window visual order.
+///
+/// A group owns its root and every descendant surface, plus the optional SSD
+/// for that root.  Renderers may choose a different command representation,
+/// but they must consume this ownership order rather than appending all SSD
+/// primitives after unrelated windows.
+pub fn window_visual_stack_order(
+    surfaces: &[RenderableSurface],
+    decorations: &[DecorationRenderInstance],
+) -> Vec<WindowVisualGroup> {
+    let root_indices = surface_root_indices(surfaces);
+    let mut groups: Vec<WindowVisualGroup> = surfaces
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| root_indices.get(*index) == Some(index))
+        .map(|(root_index, root)| WindowVisualGroup {
+            root_surface_id: root.surface_id,
+            surface_indices: root_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(index, root)| (*root == root_index).then_some(index))
+                .collect(),
+            decoration_index: decorations
+                .iter()
+                .position(|decoration| decoration.root_surface_id == root.surface_id),
+        })
+        .collect();
+    for (decoration_index, decoration) in decorations.iter().enumerate() {
+        if !groups
+            .iter()
+            .any(|group| group.root_surface_id == decoration.root_surface_id)
+        {
+            groups.push(WindowVisualGroup {
+                root_surface_id: decoration.root_surface_id,
+                surface_indices: Vec::new(),
+                decoration_index: Some(decoration_index),
+            });
+        }
+    }
+    groups
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -376,6 +451,7 @@ pub struct DesktopSceneRenderer {
     reusable_frame_key: Option<ReusableFrameKey>,
     reusable_frame_had_client_cursor: bool,
     decoration_instances: Vec<DecorationRenderInstance>,
+    decoration_damage_rects: Vec<DecorationRect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +484,7 @@ impl DesktopSceneRenderer {
             reusable_frame_key: None,
             reusable_frame_had_client_cursor: false,
             decoration_instances: Vec::new(),
+            decoration_damage_rects: Vec::new(),
         }
     }
 
@@ -420,9 +497,25 @@ impl DesktopSceneRenderer {
         if self.decoration_instances == instances {
             return;
         }
+        let previous = self
+            .decoration_instances
+            .iter()
+            .map(DecorationRenderInstance::scene_snapshot)
+            .collect::<Vec<_>>();
+        let current = instances
+            .iter()
+            .map(DecorationRenderInstance::scene_snapshot)
+            .collect::<Vec<_>>();
+        self.decoration_damage_rects = previous
+            .into_iter()
+            .chain(current)
+            .map(|snapshot| {
+                let (x, y, width, height) = snapshot.bounds();
+                DecorationRect::new(x, y, width, height)
+            })
+            .collect();
         self.decoration_instances.clear();
         self.decoration_instances.extend_from_slice(instances);
-        self.reusable_frame_key = None;
     }
 
     pub fn compose(
@@ -442,6 +535,7 @@ impl DesktopSceneRenderer {
             BufferAge::Age(1),
         );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
+        self.decoration_damage_rects.clear();
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
             draw_cursor(
                 frame,
@@ -472,6 +566,7 @@ impl DesktopSceneRenderer {
             BufferAge::Age(1),
         );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
+        self.decoration_damage_rects.clear();
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
             draw_cursor(
                 frame,
@@ -545,13 +640,15 @@ impl DesktopSceneRenderer {
             output_scale_key,
             visual_state: scaled_visual_state,
         };
+        let has_partial_damage =
+            !self.last_rebuild_damage_rects.is_empty() || !self.decoration_damage_rects.is_empty();
         let partial_frame_copy = reuse_frame
             && self.reusable_frame_key == Some(frame_key)
             && scaled_visual_state.cursor.is_none()
             && client_cursor.is_none()
             && !self.reusable_frame_had_client_cursor
-            && self.last_rebuild_kind == DesktopSceneRebuildKind::Partial
-            && !self.last_rebuild_damage_rects.is_empty()
+            && self.last_rebuild_kind != DesktopSceneRebuildKind::Full
+            && has_partial_damage
             && frame.len() == self.scene.len();
         let no_frame_copy = reuse_frame
             && self.reusable_frame_key == Some(frame_key)
@@ -561,19 +658,12 @@ impl DesktopSceneRenderer {
             && self.last_rebuild_kind == DesktopSceneRebuildKind::None
             && frame.len() == self.scene.len();
         if partial_frame_copy {
-            self.copy_scene_damage_to_frame(frame, frame_width, frame_height);
+            self.copy_scene_damage_to_frame(frame, frame_width, frame_height, output_scale);
         } else if no_frame_copy {
             self.last_frame_copy_kind = DesktopFrameCopyKind::None;
         } else {
             self.copy_scene_to_frame(frame, frame_width, frame_height);
         }
-        draw_decoration_instances(
-            frame,
-            frame_width,
-            frame_height,
-            &self.decoration_instances,
-            output_scale,
-        );
         if !overlay_surfaces.is_empty() {
             draw_client_surfaces_scaled(
                 frame,
@@ -598,6 +688,7 @@ impl DesktopSceneRenderer {
         if let Some(cursor) = client_cursor {
             draw_client_cursor(frame, frame_width, frame_height, cursor, output_scale);
         }
+        self.decoration_damage_rects.clear();
         self.reusable_frame_key = reuse_frame.then_some(frame_key);
         self.reusable_frame_had_client_cursor = reuse_frame && client_cursor.is_some();
     }
@@ -639,7 +730,8 @@ impl DesktopSceneRenderer {
             && self.scene_height == frame_height
             && self.scene_output_scale_key == output_scale_key
             && self.scene.len() == pixel_count;
-        if scene_ready && self.scene_content_generation == content_generation {
+        let decoration_dirty = !self.decoration_damage_rects.is_empty();
+        if scene_ready && self.scene_content_generation == content_generation && !decoration_dirty {
             self.last_rebuild_damage_rects.clear();
             self.last_rebuild_kind = DesktopSceneRebuildKind::None;
             self.last_damage_debug_stats = DamageDebugStats::partial(frame_width, frame_height, []);
@@ -649,7 +741,6 @@ impl DesktopSceneRenderer {
         let elements = render_scene_elements_for_surfaces(surfaces, output_scale);
         let snapshots = scene_surface_snapshots_from_elements(&elements);
         if scene_ready
-            && self.decoration_instances.is_empty()
             && self.rebuild_scene_from_age(
                 frame_width,
                 frame_height,
@@ -689,7 +780,7 @@ impl DesktopSceneRenderer {
         elements: &[RenderSceneElement],
         snapshots: &[SceneSurfaceSnapshot],
     ) -> bool {
-        let Some(damage_rects) = partial_scene_damage_rects(
+        let Some(mut damage_rects) = partial_scene_damage_rects(
             &self.scene_surface_snapshots,
             elements,
             snapshots,
@@ -698,6 +789,10 @@ impl DesktopSceneRenderer {
         ) else {
             return false;
         };
+        damage_rects.extend(self.decoration_damage_rects.iter().filter_map(|rect| {
+            decoration_damage_output_rect(*rect, output_scale, frame_width, frame_height)
+        }));
+        damage_rects = coalesce_output_rects(damage_rects);
 
         if damage_rects.is_empty() {
             self.scene_content_generation = content_generation;
@@ -715,13 +810,14 @@ impl DesktopSceneRenderer {
                 frame_width,
                 damage_rect,
             );
-            draw_client_surfaces_scaled_with_snapshots(
+            draw_window_visual_groups(
                 &mut self.scene,
                 frame_width,
                 frame_height,
                 surfaces,
                 snapshots,
                 output_scale,
+                &self.decoration_instances,
                 Some(damage_rect),
             );
         }
@@ -790,12 +886,16 @@ impl DesktopSceneRenderer {
             draw_wallpaper(&mut self.scene, frame_width, frame_height);
         }
 
-        draw_client_surfaces_scaled(
+        let snapshots = snapshots;
+        draw_window_visual_groups(
             &mut self.scene,
             frame_width,
             frame_height,
             surfaces,
+            &snapshots,
             output_scale,
+            &self.decoration_instances,
+            None,
         );
         self.scene_surface_snapshots = snapshots;
         self.last_rebuild_damage_rects.clear();
@@ -818,6 +918,7 @@ impl DesktopSceneRenderer {
         frame: &mut [u32],
         frame_width: u32,
         frame_height: u32,
+        _output_scale: f64,
     ) {
         if frame.len() != self.scene.len() {
             self.copy_scene_to_frame(frame, frame_width, frame_height);
@@ -875,52 +976,128 @@ fn draw_client_cursor(
     );
 }
 
-fn draw_decoration_instances(
+fn draw_decoration_instance(
     frame: &mut [u32],
     frame_width: u32,
     frame_height: u32,
-    instances: &[DecorationRenderInstance],
+    instance: &DecorationRenderInstance,
     output_scale: f64,
+    clip: Option<OutputRect>,
 ) {
-    for instance in instances {
-        for primitive in &instance.plan.primitives {
-            match primitive {
-                DecorationRenderPrimitive::SolidRect { rect, color } => {
-                    fill_decoration_rect(
+    let output_clip = clip.map(|clip| ServerFrameRect {
+        color: ServerFrameColor::Border,
+        x: clip.x,
+        y: clip.y,
+        width: clip.width,
+        height: clip.height,
+    });
+    for primitive in &instance.plan.primitives {
+        match primitive {
+            DecorationRenderPrimitive::SolidRect { rect, color } => {
+                let output_rect = decoration_output_rect(instance, *rect, output_scale);
+                if let Some(clip) = clip {
+                    fill_decoration_rect_clipped(
                         frame,
                         frame_width,
                         frame_height,
-                        decoration_output_rect(instance, *rect, output_scale),
+                        output_rect,
                         *color,
+                        clip,
                     );
+                } else {
+                    fill_decoration_rect(frame, frame_width, frame_height, output_rect, *color);
                 }
-                DecorationRenderPrimitive::Image { rect, asset } => {
-                    draw_decoration_icon(
-                        frame,
-                        frame_width,
-                        frame_height,
-                        decoration_output_rect(instance, *rect, output_scale),
-                        asset,
-                    );
-                }
-                DecorationRenderPrimitive::Text {
-                    rect,
-                    clip,
-                    text,
-                    color,
-                } => draw_decoration_text(
+            }
+            DecorationRenderPrimitive::Image { rect, asset } => {
+                draw_decoration_raster_asset(
                     frame,
                     frame_width,
                     frame_height,
                     decoration_output_rect(instance, *rect, output_scale),
-                    decoration_output_rect(instance, *clip, output_scale),
-                    text,
-                    *color,
+                    asset,
+                    output_clip,
+                );
+            }
+            DecorationRenderPrimitive::Text {
+                rect, clip, asset, ..
+            } => {
+                let primitive_clip = decoration_output_rect(instance, *clip, output_scale);
+                let Some(effective_clip) = (match output_clip {
+                    Some(scene_clip) => intersect_server_frame_rect(primitive_clip, scene_clip),
+                    None => Some(primitive_clip),
+                }) else {
+                    continue;
+                };
+                draw_decoration_text(
+                    frame,
+                    frame_width,
+                    frame_height,
+                    decoration_output_rect(instance, *rect, output_scale),
+                    effective_clip,
+                    asset,
                     output_scale,
-                ),
+                );
             }
         }
     }
+}
+
+fn fill_decoration_rect_clipped(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    rect: ServerFrameRect,
+    color: [u8; 4],
+    clip: OutputRect,
+) {
+    let Some(clipped) = (OutputRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    })
+    .intersection(clip)
+    .and_then(|rect| rect.clipped_to_output(frame_width, frame_height)) else {
+        return;
+    };
+    fill_decoration_rect(
+        frame,
+        frame_width,
+        frame_height,
+        ServerFrameRect {
+            color: ServerFrameColor::Border,
+            x: clipped.x,
+            y: clipped.y,
+            width: clipped.width,
+            height: clipped.height,
+        },
+        color,
+    );
+}
+
+fn intersect_server_frame_rect(
+    left: ServerFrameRect,
+    right: ServerFrameRect,
+) -> Option<ServerFrameRect> {
+    let intersection = (OutputRect {
+        x: left.x,
+        y: left.y,
+        width: left.width,
+        height: left.height,
+    })
+    .intersection(OutputRect {
+        x: right.x,
+        y: right.y,
+        width: right.width,
+        height: right.height,
+    })?;
+    Some(ServerFrameRect {
+        color: left.color,
+        x: intersection.x,
+        y: intersection.y,
+        width: intersection.width,
+        height: intersection.height,
+    })
 }
 
 fn decoration_output_rect(
@@ -966,131 +1143,83 @@ fn fill_decoration_rect(
     }
 }
 
-fn draw_decoration_icon(
+fn draw_decoration_raster_asset(
     frame: &mut [u32],
     frame_width: u32,
     frame_height: u32,
     rect: ServerFrameRect,
-    asset: &str,
+    asset: &super::decoration::raster::DecorationRasterAsset,
+    clip: Option<ServerFrameRect>,
 ) {
-    let color = if asset.contains("close") {
-        [255, 255, 255, 255]
-    } else if asset.contains("minimize") {
-        [72, 43, 18, 255]
-    } else {
-        [24, 49, 28, 255]
-    };
-    let inset = (rect.width.min(rect.height) / 3).max(2);
-    let left = rect.x.saturating_add(inset as i32);
-    let top = rect.y.saturating_add(inset as i32);
-    let right = rect
-        .x
-        .saturating_add(rect.width as i32)
-        .saturating_sub(inset as i32);
-    let bottom = rect
-        .y
-        .saturating_add(rect.height as i32)
-        .saturating_sub(inset as i32);
-    if asset.contains("close") {
-        let length = right.saturating_sub(left).min(bottom.saturating_sub(top));
-        for offset in 0..length {
-            fill_decoration_rect(
-                frame,
-                frame_width,
-                frame_height,
-                ServerFrameRect {
-                    color: ServerFrameColor::Border,
-                    x: left.saturating_add(offset),
-                    y: top.saturating_add(offset),
-                    width: 2,
-                    height: 2,
-                },
-                color,
-            );
-            fill_decoration_rect(
-                frame,
-                frame_width,
-                frame_height,
-                ServerFrameRect {
-                    color: ServerFrameColor::Border,
-                    x: right.saturating_sub(offset),
-                    y: top.saturating_add(offset),
-                    width: 2,
-                    height: 2,
-                },
-                color,
-            );
-        }
-    } else if asset.contains("minimize") {
-        fill_decoration_rect(
-            frame,
-            frame_width,
-            frame_height,
-            ServerFrameRect {
-                color: ServerFrameColor::Border,
-                x: left,
-                y: bottom.saturating_sub(1),
-                width: right.saturating_sub(left).max(2) as u32,
-                height: 2,
-            },
-            color,
-        );
-    } else {
-        let width = right.saturating_sub(left).max(2) as u32;
-        let height = bottom.saturating_sub(top).max(2) as u32;
-        fill_decoration_rect(
-            frame,
-            frame_width,
-            frame_height,
-            ServerFrameRect {
-                color: ServerFrameColor::Border,
-                x: left,
-                y: top,
-                width,
-                height: 2,
-            },
-            color,
-        );
-        fill_decoration_rect(
-            frame,
-            frame_width,
-            frame_height,
-            ServerFrameRect {
-                color: ServerFrameColor::Border,
-                x: left,
-                y: bottom.saturating_sub(1),
-                width,
-                height: 2,
-            },
-            color,
-        );
-        fill_decoration_rect(
-            frame,
-            frame_width,
-            frame_height,
-            ServerFrameRect {
-                color: ServerFrameColor::Border,
-                x: left,
-                y: top,
-                width: 2,
-                height,
-            },
-            color,
-        );
-        fill_decoration_rect(
-            frame,
-            frame_width,
-            frame_height,
-            ServerFrameRect {
-                color: ServerFrameColor::Border,
-                x: right.saturating_sub(1),
-                y: top,
-                width: 2,
-                height,
-            },
-            color,
-        );
+    let clip_left = clip.map_or(rect.x, |clip| clip.x).max(rect.x).max(0);
+    let clip_top = clip.map_or(rect.y, |clip| clip.y).max(rect.y).max(0);
+    let clip_right = clip.map_or_else(
+        || rect.x.saturating_add(rect.width as i32),
+        |clip| clip.x.saturating_add(clip.width as i32),
+    );
+    let clip_bottom = clip.map_or_else(
+        || rect.y.saturating_add(rect.height as i32),
+        |clip| clip.y.saturating_add(clip.height as i32),
+    );
+    let start_x = i64::from(clip_left);
+    let start_y = i64::from(clip_top);
+    let end_x = i64::from(rect.x)
+        .saturating_add(i64::from(rect.width))
+        .min(i64::from(frame_width))
+        .min(i64::from(clip_right));
+    let end_y = i64::from(rect.y)
+        .saturating_add(i64::from(rect.height))
+        .min(i64::from(frame_height))
+        .min(i64::from(clip_bottom));
+    if start_x >= end_x || start_y >= end_y || rect.width == 0 || rect.height == 0 {
+        return;
     }
+    let pixels = asset.rgba_premultiplied();
+    let asset_width = asset.width() as usize;
+    for target_y in start_y..end_y {
+        let local_y = target_y.saturating_sub(i64::from(rect.y)) as u32;
+        let source_y = (u64::from(local_y) * u64::from(asset.height()) / u64::from(rect.height))
+            .min(u64::from(asset.height().saturating_sub(1))) as usize;
+        for target_x in start_x..end_x {
+            let local_x = target_x.saturating_sub(i64::from(rect.x)) as u32;
+            let source_x = (u64::from(local_x) * u64::from(asset.width()) / u64::from(rect.width))
+                .min(u64::from(asset.width().saturating_sub(1)))
+                as usize;
+            let source_index = (source_y * asset_width + source_x) * 4;
+            let Some(source) = pixels.get(source_index..source_index + 4) else {
+                continue;
+            };
+            if source[3] == 0 {
+                continue;
+            }
+            let index = target_y as usize * frame_width as usize + target_x as usize;
+            let Some(destination) = frame.get_mut(index) else {
+                continue;
+            };
+            *destination = blend_premultiplied_rgba(*destination, source);
+        }
+    }
+}
+
+fn blend_premultiplied_rgba(destination: u32, source: &[u8]) -> u32 {
+    let source_alpha = u32::from(source[3]);
+    let inverse_alpha = 255 - source_alpha;
+    let destination_alpha = destination >> 24;
+    let output_alpha =
+        source_alpha.saturating_add(destination_alpha.saturating_mul(inverse_alpha) / 255);
+    let destination_red = (destination >> 16) & 0xff;
+    let destination_green = (destination >> 8) & 0xff;
+    let destination_blue = destination & 0xff;
+    let red = u32::from(source[0])
+        .saturating_add(destination_red.saturating_mul(inverse_alpha) / 255)
+        .min(255);
+    let green = u32::from(source[1])
+        .saturating_add(destination_green.saturating_mul(inverse_alpha) / 255)
+        .min(255);
+    let blue = u32::from(source[2])
+        .saturating_add(destination_blue.saturating_mul(inverse_alpha) / 255)
+        .min(255);
+    (output_alpha << 24) | (red << 16) | (green << 8) | blue
 }
 
 fn draw_decoration_text(
@@ -1099,63 +1228,10 @@ fn draw_decoration_text(
     frame_height: u32,
     rect: ServerFrameRect,
     clip: ServerFrameRect,
-    text: &str,
-    color: [u8; 4],
-    output_scale: f64,
+    asset: &super::decoration::raster::DecorationRasterAsset,
+    _output_scale: f64,
 ) {
-    let scale = output_scale.max(1.0).round() as i32;
-    let glyph_width = 6 * scale;
-    let glyph_height = 7 * scale;
-    let mut x = rect.x;
-    let max_x = rect
-        .x
-        .saturating_add(rect.width as i32)
-        .min(clip.x.saturating_add(clip.width as i32));
-    let y = rect
-        .y
-        .saturating_add(((rect.height as i32) - glyph_height).max(0) / 2);
-    for character in text.chars() {
-        if x.saturating_add(glyph_width) > max_x {
-            break;
-        }
-        let pattern = decoration_glyph(character);
-        for (row, bits) in pattern.into_iter().enumerate() {
-            for column in 0..5 {
-                if bits & (1 << (4 - column)) == 0 {
-                    continue;
-                }
-                fill_decoration_rect(
-                    frame,
-                    frame_width,
-                    frame_height,
-                    ServerFrameRect {
-                        color: ServerFrameColor::Border,
-                        x: x.saturating_add(column * scale),
-                        y: y.saturating_add(row as i32 * scale),
-                        width: scale.max(1) as u32,
-                        height: scale.max(1) as u32,
-                    },
-                    color,
-                );
-            }
-        }
-        x = x.saturating_add(glyph_width);
-    }
-}
-
-fn decoration_glyph(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
-        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-        'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
-        'H' => [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
-        'N' => [0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11],
-        'O' => [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
-        'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
-        'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        'Y' => [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
-        ' ' => [0; 7],
-        _ => [0x1f, 0x11, 0x15, 0x11, 0x15, 0x11, 0x1f],
-    }
+    draw_decoration_raster_asset(frame, frame_width, frame_height, rect, asset, Some(clip));
 }
 
 fn rgba_to_pixel(color: [u8; 4]) -> u32 {
@@ -1195,6 +1271,21 @@ fn copy_scene_rect_to_frame(scene: &[u32], frame: &mut [u32], frame_width: u32, 
         };
         target_row.copy_from_slice(source_row);
     }
+}
+
+fn decoration_damage_output_rect(
+    rect: DecorationRect,
+    output_scale: f64,
+    frame_width: u32,
+    frame_height: u32,
+) -> Option<OutputRect> {
+    OutputRect {
+        x: scale_logical_coordinate(rect.x, output_scale),
+        y: scale_logical_coordinate(rect.y, output_scale),
+        width: scale_logical_extent(rect.width, output_scale),
+        height: scale_logical_extent(rect.height, output_scale),
+    }
+    .clipped_to_output(frame_width, frame_height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,26 +1369,86 @@ fn draw_client_surfaces_scaled_with_snapshots(
     clip: Option<OutputRect>,
 ) {
     for (surface, snapshot) in surfaces.iter().zip(snapshots) {
-        if let Some(backing) = snapshot.backing_target {
-            let rect = ServerFrameRect {
-                color: ServerFrameColor::XwaylandBacking,
-                x: backing.x(),
-                y: backing.y(),
-                width: backing.width(),
-                height: backing.height(),
-            };
-            match clip {
-                Some(clip) => fill_rect_clipped(frame, frame_width, frame_height, rect, clip),
-                None => fill_rect(frame, frame_width, frame_height, rect),
-            }
-        }
+        draw_client_surface_with_snapshot(
+            frame,
+            frame_width,
+            frame_height,
+            surface,
+            snapshot,
+            clip,
+        );
+    }
+}
 
-        for plan in &snapshot.content_regions {
-            if clip.is_some_and(|clip| !plan.content_target.output_rect().intersects(clip)) {
+fn draw_window_visual_groups(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    surfaces: &[RenderableSurface],
+    snapshots: &[SceneSurfaceSnapshot],
+    output_scale: f64,
+    decorations: &[DecorationRenderInstance],
+    clip: Option<OutputRect>,
+) {
+    for group in window_visual_stack_order(surfaces, decorations) {
+        for &surface_index in group.surface_indices() {
+            let Some((surface, snapshot)) = surfaces
+                .get(surface_index)
+                .zip(snapshots.get(surface_index))
+            else {
                 continue;
-            }
-            blit_surface_with_plan(frame, frame_width, frame_height, surface, *plan, clip);
+            };
+            draw_client_surface_with_snapshot(
+                frame,
+                frame_width,
+                frame_height,
+                surface,
+                snapshot,
+                clip,
+            );
         }
+        if let Some(decoration_index) = group.decoration_index()
+            && let Some(decoration) = decorations.get(decoration_index)
+        {
+            draw_decoration_instance(
+                frame,
+                frame_width,
+                frame_height,
+                decoration,
+                output_scale,
+                clip,
+            );
+        }
+    }
+}
+
+fn draw_client_surface_with_snapshot(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    surface: &RenderableSurface,
+    snapshot: &SceneSurfaceSnapshot,
+    clip: Option<OutputRect>,
+) {
+    if let Some(backing) = snapshot.backing_target {
+        let rect = ServerFrameRect {
+            color: ServerFrameColor::XwaylandBacking,
+            x: backing.x(),
+            y: backing.y(),
+            width: backing.width(),
+            height: backing.height(),
+        };
+        match clip {
+            Some(clip) => fill_rect_clipped(frame, frame_width, frame_height, rect, clip),
+            None => fill_rect(frame, frame_width, frame_height, rect),
+        }
+    }
+
+    for plan in &snapshot.content_regions {
+        if clip.is_some_and(|clip| !plan.content_target.output_rect().intersects(clip)) {
+            continue;
+        }
+        blit_surface_with_plan(frame, frame_width, frame_height, surface, *plan, clip);
     }
 }
 
@@ -2814,6 +2965,70 @@ mod tests {
         }
     }
 
+    fn solid_test_surface(
+        surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixel: u32,
+    ) -> RenderableSurface {
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement: SurfacePlacement::absolute_root_at(x, y),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(width, height, vec![pixel; (width * height) as usize]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        }
+    }
+
+    fn solid_test_decoration(
+        window_id: WindowId,
+        root_surface_id: u32,
+        width: u32,
+        height: u32,
+        pixel: [u8; 4],
+    ) -> DecorationRenderInstance {
+        let outer = DecorationRect::new(0, 0, width, height);
+        let layout = super::super::decoration::layout::DecorationLayout {
+            outer,
+            client: outer,
+            titlebar: DecorationRect::new(0, 0, width, height),
+            title_safe: outer,
+            resize_input: outer,
+            visible_border: Vec::new(),
+            buttons: Vec::new(),
+            extents: Default::default(),
+        };
+        DecorationRenderInstance {
+            plan: DecorationRenderPlan {
+                layout,
+                primitives: vec![DecorationRenderPrimitive::SolidRect {
+                    rect: outer,
+                    color: pixel,
+                }],
+                theme_generation: 1,
+            },
+            origin_x: 0,
+            origin_y: 0,
+            window_id,
+            root_surface_id,
+        }
+    }
+
     #[test]
     fn absolute_root_origins_are_stable_when_renderable_stack_order_changes() {
         let first = absolute_test_surface(701, 72, 72);
@@ -2823,6 +3038,45 @@ mod tests {
 
         assert_eq!(initial, vec![(72, 72), (104, 104)]);
         assert_eq!(reordered, vec![(104, 104), (72, 72)]);
+    }
+
+    #[test]
+    fn window_visual_stack_order_keeps_each_decoration_with_its_window() {
+        let surfaces = vec![
+            solid_test_surface(701, 0, 0, 2, 2, 0xff00_0000),
+            solid_test_surface(702, 2, 0, 2, 2, 0xff00_ff00),
+            solid_test_surface(703, 4, 0, 2, 2, 0xff00_00ff),
+        ];
+        let decorations = vec![
+            solid_test_decoration(
+                WindowId::from_raw(1).expect("window id"),
+                701,
+                2,
+                1,
+                [0xff, 0x00, 0x00, 0xff],
+            ),
+            solid_test_decoration(
+                WindowId::from_raw(3).expect("window id"),
+                703,
+                2,
+                1,
+                [0x00, 0x00, 0xff, 0xff],
+            ),
+        ];
+
+        let groups = window_visual_stack_order(&surfaces, &decorations);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(WindowVisualGroup::root_surface_id)
+                .collect::<Vec<_>>(),
+            vec![701, 702, 703]
+        );
+        assert_eq!(groups[0].surface_indices(), &[0]);
+        assert_eq!(groups[0].decoration_index(), Some(0));
+        assert_eq!(groups[1].decoration_index(), None);
+        assert_eq!(groups[2].decoration_index(), Some(1));
     }
 
     #[test]
@@ -2857,6 +3111,39 @@ mod tests {
             DesktopVisualState::wallpaper_only(),
         );
         assert_eq!(renderer.wallpaper_generation(), first_generation + 1);
+    }
+
+    #[test]
+    fn lower_window_decoration_cannot_cover_higher_window_client_content() {
+        let lower = solid_test_surface(701, 0, 0, 4, 4, 0xffff_0000);
+        let higher = solid_test_surface(702, 0, 0, 4, 4, 0xff00_00ff);
+        let lower_id = WindowId::from_raw(1).expect("lower window id");
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_decoration_instances(&[solid_test_decoration(
+            lower_id,
+            lower.surface_id,
+            4,
+            2,
+            [0xff, 0x00, 0xff, 0xff],
+        )]);
+        let mut frame = vec![0; 8 * 8];
+
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 8,
+            frame_height: 8,
+            output_scale: 1.0,
+            surfaces: &[lower, higher],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(
+            frame[0], 0xff00_00ff,
+            "the higher client must win where it overlaps the lower titlebar"
+        );
     }
 
     #[test]
@@ -4014,6 +4301,80 @@ mod tests {
         assert_eq!(frame[72 * 96 + 72], 0xffff_0000);
     }
 
+    fn test_decoration_instance(origin_x: i32, origin_y: i32) -> DecorationRenderInstance {
+        let layout = crate::compositor::decoration::layout::DecorationLayout::for_window(
+            20,
+            20,
+            crate::compositor::decoration::types::DecorationMode::ServerSide,
+            false,
+            false,
+            crate::compositor::decoration::types::DecorationMetrics::mac_tahoe(),
+        )
+        .expect("test decoration layout");
+        let plan = crate::compositor::decoration::render_plan::DecorationRenderPlan {
+            layout: layout.clone(),
+            primitives: vec![DecorationRenderPrimitive::SolidRect {
+                rect: layout.titlebar,
+                color: [51, 51, 51, 255],
+            }],
+            theme_generation: 1,
+        };
+        DecorationRenderInstance {
+            plan,
+            origin_x,
+            origin_y,
+            window_id: WindowId::from_raw(1).expect("test window id"),
+            root_surface_id: 1,
+        }
+    }
+
+    #[test]
+    fn decoration_move_reuses_cpu_frame_with_bounded_old_and_new_copy_damage() {
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 96 * 96];
+        let old = test_decoration_instance(20, 20);
+        renderer.set_decoration_instances(std::slice::from_ref(&old));
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 96,
+            frame_height: 96,
+            output_scale: 1.0,
+            surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        let titlebar_pixel = 0xff33_3333;
+        assert_eq!(frame[21 * 96 + 21], titlebar_pixel);
+
+        let new = test_decoration_instance(50, 20);
+        renderer.set_decoration_instances(std::slice::from_ref(&new));
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 96,
+            frame_height: 96,
+            output_scale: 1.0,
+            surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(
+            renderer.last_rebuild_kind(),
+            DesktopSceneRebuildKind::Partial,
+            "decoration movement is part of the complete scene damage"
+        );
+        assert_eq!(
+            renderer.last_frame_copy_kind(),
+            DesktopFrameCopyKind::Partial
+        );
+        assert_ne!(frame[21 * 96 + 21], titlebar_pixel);
+        assert_eq!(frame[21 * 96 + 51], titlebar_pixel);
+    }
+
     #[test]
     fn buffer_age_zero_normalizes_to_reset() {
         assert_eq!(BufferAge::Age(0).normalized(), BufferAge::Reset);
@@ -4616,6 +4977,14 @@ mod tests {
 
         let origin = (72 * 96 + 72) as usize;
         assert_eq!(frame[origin], 0xff80_007f);
+    }
+
+    #[test]
+    fn decoration_raster_blend_preserves_premultiplied_alpha_composition() {
+        let destination = 0xff20_4060;
+        let source = [0x80, 0x00, 0x00, 0x80];
+
+        assert_eq!(blend_premultiplied_rgba(destination, &source), 0xff8f_1f2f);
     }
 
     #[test]

@@ -483,6 +483,13 @@ impl CompositorState {
         };
         if self
             .window(window_id)
+            .is_some_and(|window| !window_interaction_allowed_for_mode(window.state.mode(), kind))
+        {
+            log_begin_rejection(self, begin, "fullscreen_interaction_forbidden");
+            return false;
+        }
+        if self
+            .window(window_id)
             .is_some_and(|window| !window.is_normal_x11_role())
         {
             return false;
@@ -1224,6 +1231,17 @@ const fn x11_button_to_evdev(button: u32) -> Option<u32> {
         3 => Some(0x111),
         _ => Some(u32::MAX),
     }
+}
+
+pub(in crate::compositor) fn window_interaction_allowed_for_mode(
+    mode: ToplevelMode,
+    kind: WindowInteractionKind,
+) -> bool {
+    mode != ToplevelMode::Fullscreen
+        || !matches!(
+            kind,
+            WindowInteractionKind::Move | WindowInteractionKind::Resize(_)
+        )
 }
 
 fn log_begin_rejection(state: &CompositorState, begin: BeginWindowInteraction, reason: &str) {

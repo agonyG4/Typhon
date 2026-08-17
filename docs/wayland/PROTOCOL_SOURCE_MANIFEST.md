@@ -50,9 +50,10 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 - The audit uses `PointerEvent::ScrollWheel`, `ScrollFinger`, and
   `ScrollContinuous`, including `time_usec`, `scroll_value`, and
   `scroll_value_v120`; the deprecated `Axis` event is retained as unknown
-  source compatibility. Wheel v120 values are accumulated independently by
-  libinput device and horizontal/vertical axis before conversion to
-  `wl_pointer.axis_discrete` steps (120 units equals one step).
+  source compatibility. Wheel v120 values are preserved for
+  `wl_pointer.axis_value120` clients and accumulated independently by
+  libinput device and horizontal/vertical axis for legacy
+  `wl_pointer.axis_discrete` clients (120 units equals one step).
 
 ### Stable and already-advertised extension XML
 
@@ -150,7 +151,7 @@ The target contract is:
 | `astrea_toplevel_manager_v1` | 2 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
-| `wl_seat` | 7 | always |
+| `wl_seat` | 8 | always |
 | `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |
 | `wp_fifo_manager_v1` | 1 | qualified native frame-pacing capability |
 | `wp_commit_timing_manager_v1` | 1 | qualified native frame-pacing capability |
