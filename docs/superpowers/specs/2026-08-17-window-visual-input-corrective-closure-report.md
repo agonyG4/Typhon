@@ -83,5 +83,10 @@ launcher/session tools are available.
 
 ## Commit scope
 
-Focused closure commits are recorded in the final handoff after staging. The
-pre-existing dirty worktree remains intentionally unmerged into those commits.
+Focused closure commits:
+
+- `c05c406` — `docs: plan Typhon corrective closure`
+- `84a4e62` — `fix: close WindowVisual input and scroll ownership gaps`
+
+The pre-existing dirty worktree remains intentionally unmerged into those
+commits.
