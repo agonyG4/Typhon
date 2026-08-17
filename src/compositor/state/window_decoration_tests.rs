@@ -82,6 +82,33 @@ fn decoration_instances(state: &CompositorState) -> Vec<DecorationRenderInstance
     state.native_decoration_render_instances(&state.renderable_surfaces)
 }
 
+#[test]
+fn renderable_surface_order_follows_authoritative_window_stacking() {
+    let mut state = CompositorState::new(None);
+    let first_surface = test_surface(41);
+    let second_surface = test_surface(42);
+    let first_id = state.allocate_window_id().expect("first window id");
+    let second_id = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first_id, first_surface.surface_id))
+        .expect("first window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second_id, second_surface.surface_id))
+        .expect("second window");
+    state.renderable_surfaces = vec![first_surface, second_surface];
+    state.window_stacking = vec![second_id, first_id];
+
+    assert!(state.normalize_window_stacking());
+    assert_eq!(
+        state
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![42, 41]
+    );
+}
+
 fn rgba_to_pixel(color: [u8; 4]) -> u32 {
     (u32::from(color[3]) << 24)
         | (u32::from(color[0]) << 16)

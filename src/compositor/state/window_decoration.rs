@@ -303,6 +303,14 @@ impl super::super::CompositorState {
         &self,
         surfaces: &[RenderableSurface],
     ) -> Vec<DecorationRenderInstance> {
+        self.native_decoration_render_instances_for_scale(surfaces, 1.0)
+    }
+
+    pub(in crate::compositor) fn native_decoration_render_instances_for_scale(
+        &self,
+        surfaces: &[RenderableSurface],
+        output_scale: f64,
+    ) -> Vec<DecorationRenderInstance> {
         let metrics = self.decoration_theme.metrics();
         let origins = render::surface_origins(surfaces);
         surfaces
@@ -359,12 +367,15 @@ impl super::super::CompositorState {
                             .filter(|capture| capture.window_id == window_id)
                             .map(|capture| capture.kind),
                     },
+                    output_scale,
                 );
                 let (root_origin_x, root_origin_y) = origins.get(index).copied()?;
                 Some(DecorationRenderInstance {
                     origin_x: root_origin_x.saturating_sub(layout.client.x),
                     origin_y: root_origin_y.saturating_sub(layout.client.y),
                     plan,
+                    window_id,
+                    root_surface_id: surface.surface_id,
                 })
             })
             .collect()

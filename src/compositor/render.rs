@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use super::WindowId;
 use super::decoration::render_plan::{DecorationRenderPlan, DecorationRenderPrimitive};
 use super::decoration::types::DecorationRect;
 use super::{
@@ -75,10 +76,56 @@ pub struct DesktopComposeRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecorationSceneSnapshot {
+    window_id: WindowId,
+    root_surface_id: u32,
+    bounds: DecorationRect,
+    visual_signature: u64,
+}
+
+impl DecorationSceneSnapshot {
+    pub fn from_bounds(
+        window_id: WindowId,
+        root_surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        visual_signature: u64,
+    ) -> Self {
+        Self {
+            window_id,
+            root_surface_id,
+            bounds: DecorationRect::new(x, y, width, height),
+            visual_signature,
+        }
+    }
+
+    pub fn identity(&self) -> (WindowId, u32) {
+        (self.window_id, self.root_surface_id)
+    }
+
+    pub fn bounds(&self) -> (i32, i32, u32, u32) {
+        (
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width,
+            self.bounds.height,
+        )
+    }
+
+    pub fn visual_signature(&self) -> u64 {
+        self.visual_signature
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationRenderInstance {
     pub(crate) plan: DecorationRenderPlan,
     pub(crate) origin_x: i32,
     pub(crate) origin_y: i32,
+    pub(crate) window_id: WindowId,
+    pub(crate) root_surface_id: u32,
 }
 
 impl DecorationRenderInstance {
@@ -122,6 +169,31 @@ impl WindowVisualGroup {
     pub fn decoration_index(&self) -> Option<usize> {
         self.decoration_index
     }
+    pub fn orphan_decoration_count(
+        surfaces: &[RenderableSurface],
+        decorations: &[DecorationRenderInstance],
+    ) -> u32 {
+        let root_indices = surface_root_indices(surfaces);
+        let mut orphan_decoration_count = 0u32;
+        for decoration in decorations {
+            let has_live_root = surfaces.iter().enumerate().any(|(index, surface)| {
+                root_indices.get(index) == Some(&index)
+                    && surface.surface_id == decoration.root_surface_id
+            });
+            if !has_live_root {
+                orphan_decoration_count = orphan_decoration_count.saturating_add(1);
+            }
+        }
+        orphan_decoration_count
+    }
+
+    pub fn stack_order_with_popups(
+        surfaces: &[RenderableSurface],
+        decorations: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
+    ) -> Vec<Self> {
+        window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids)
+    }
 }
 
 /// Return the authoritative back-to-front normal-window visual order.
@@ -134,36 +206,96 @@ pub fn window_visual_stack_order(
     surfaces: &[RenderableSurface],
     decorations: &[DecorationRenderInstance],
 ) -> Vec<WindowVisualGroup> {
+    window_visual_stack_order_with_popups(surfaces, decorations, &[])
+}
+
+/// Return visual ownership order while keeping XDG popups above their parent
+/// window's server-side decoration. Ordinary client subsurfaces remain in
+/// their normal window group.
+fn window_visual_stack_order_with_popups(
+    surfaces: &[RenderableSurface],
+    decorations: &[DecorationRenderInstance],
+    popup_surface_ids: &[u32],
+) -> Vec<WindowVisualGroup> {
     let root_indices = surface_root_indices(surfaces);
-    let mut groups: Vec<WindowVisualGroup> = surfaces
+    let popup_surface_ids = popup_surface_ids.iter().copied().collect::<HashSet<_>>();
+    let index_by_id = surfaces
         .iter()
         .enumerate()
-        .filter(|(index, _)| root_indices.get(*index) == Some(index))
-        .map(|(root_index, root)| WindowVisualGroup {
-            root_surface_id: root.surface_id,
-            surface_indices: root_indices
-                .iter()
-                .enumerate()
-                .filter_map(|(index, root)| (*root == root_index).then_some(index))
-                .collect(),
-            decoration_index: decorations
-                .iter()
-                .position(|decoration| decoration.root_surface_id == root.surface_id),
+        .map(|(index, surface)| (surface.surface_id, index))
+        .collect::<HashMap<_, _>>();
+    let visual_roots = surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            visual_group_root_index(
+                index,
+                surfaces,
+                &index_by_id,
+                &root_indices,
+                &popup_surface_ids,
+            )
         })
-        .collect();
-    for (decoration_index, decoration) in decorations.iter().enumerate() {
-        if !groups
-            .iter()
-            .any(|group| group.root_surface_id == decoration.root_surface_id)
-        {
-            groups.push(WindowVisualGroup {
-                root_surface_id: decoration.root_surface_id,
-                surface_indices: Vec::new(),
-                decoration_index: Some(decoration_index),
-            });
+        .collect::<Vec<_>>();
+    let mut group_roots = Vec::new();
+    let mut seen_group_roots = HashSet::new();
+    for root_index in visual_roots.iter().copied() {
+        if seen_group_roots.insert(root_index) {
+            group_roots.push(root_index);
         }
     }
-    groups
+    group_roots
+        .into_iter()
+        .map(|root_index| {
+            let root = &surfaces[root_index];
+            WindowVisualGroup {
+                root_surface_id: root.surface_id,
+                surface_indices: visual_roots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, root)| (*root == root_index).then_some(index))
+                    .collect(),
+                decoration_index: (!popup_surface_ids.contains(&root.surface_id))
+                    .then(|| {
+                        decorations
+                            .iter()
+                            .position(|decoration| decoration.root_surface_id == root.surface_id)
+                    })
+                    .flatten(),
+            }
+        })
+        .collect()
+}
+
+fn visual_group_root_index(
+    index: usize,
+    surfaces: &[RenderableSurface],
+    index_by_id: &HashMap<u32, usize>,
+    root_indices: &[usize],
+    popup_surface_ids: &HashSet<u32>,
+) -> usize {
+    let mut current = index;
+    let mut visited = HashSet::new();
+    loop {
+        if popup_surface_ids.contains(&surfaces[current].surface_id) {
+            return current;
+        }
+        if !visited.insert(current) {
+            break;
+        }
+        let placement = surfaces[current]
+            .render_placement
+            .unwrap_or(surfaces[current].placement);
+        let Some(parent_index) = placement
+            .parent_surface_id
+            .and_then(|parent_id| index_by_id.get(&parent_id).copied())
+            .filter(|parent_index| *parent_index != current)
+        else {
+            break;
+        };
+        current = parent_index;
+    }
+    root_indices.get(index).copied().unwrap_or(index)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -444,14 +576,17 @@ pub struct DesktopSceneRenderer {
     scene_content_generation: u64,
     scene_generation: u64,
     scene_surface_snapshots: Vec<SceneSurfaceSnapshot>,
+    scene_popup_surface_ids: Vec<u32>,
     last_rebuild_damage_rects: Vec<OutputRect>,
     last_rebuild_kind: DesktopSceneRebuildKind,
     last_frame_copy_kind: DesktopFrameCopyKind,
     last_damage_debug_stats: DamageDebugStats,
+    last_orphan_decoration_count: u32,
     reusable_frame_key: Option<ReusableFrameKey>,
     reusable_frame_had_client_cursor: bool,
     decoration_instances: Vec<DecorationRenderInstance>,
     decoration_damage_rects: Vec<DecorationRect>,
+    popup_surface_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,14 +612,17 @@ impl DesktopSceneRenderer {
             scene_content_generation: 0,
             scene_generation: 0,
             scene_surface_snapshots: Vec::new(),
+            scene_popup_surface_ids: Vec::new(),
             last_rebuild_damage_rects: Vec::new(),
             last_rebuild_kind: DesktopSceneRebuildKind::default(),
             last_frame_copy_kind: DesktopFrameCopyKind::default(),
             last_damage_debug_stats: DamageDebugStats::default(),
+            last_orphan_decoration_count: 0,
             reusable_frame_key: None,
             reusable_frame_had_client_cursor: false,
             decoration_instances: Vec::new(),
             decoration_damage_rects: Vec::new(),
+            popup_surface_ids: Vec::new(),
         }
     }
 
@@ -516,6 +654,17 @@ impl DesktopSceneRenderer {
             .collect();
         self.decoration_instances.clear();
         self.decoration_instances.extend_from_slice(instances);
+    }
+
+    pub fn set_popup_surface_ids(&mut self, popup_surface_ids: &[u32]) {
+        let mut normalized = popup_surface_ids.to_vec();
+        normalized.sort_unstable();
+        normalized.dedup();
+        if self.popup_surface_ids == normalized {
+            return;
+        }
+        self.popup_surface_ids = normalized;
+        self.reusable_frame_key = None;
     }
 
     pub fn compose(
@@ -713,6 +862,10 @@ impl DesktopSceneRenderer {
         self.last_damage_debug_stats
     }
 
+    pub fn last_orphan_decoration_count(&self) -> u32 {
+        self.last_orphan_decoration_count
+    }
+
     fn rebuild_scene(
         &mut self,
         frame_width: u32,
@@ -722,6 +875,8 @@ impl DesktopSceneRenderer {
         output_scale: f64,
         buffer_age: BufferAge,
     ) {
+        self.last_orphan_decoration_count =
+            WindowVisualGroup::orphan_decoration_count(surfaces, &self.decoration_instances);
         self.ensure_wallpaper(frame_width, frame_height);
         let output_scale_key = output_scale_key(output_scale);
 
@@ -729,7 +884,8 @@ impl DesktopSceneRenderer {
         let scene_ready = self.scene_width == frame_width
             && self.scene_height == frame_height
             && self.scene_output_scale_key == output_scale_key
-            && self.scene.len() == pixel_count;
+            && self.scene.len() == pixel_count
+            && self.scene_popup_surface_ids == self.popup_surface_ids;
         let decoration_dirty = !self.decoration_damage_rects.is_empty();
         if scene_ready && self.scene_content_generation == content_generation && !decoration_dirty {
             self.last_rebuild_damage_rects.clear();
@@ -810,20 +966,22 @@ impl DesktopSceneRenderer {
                 frame_width,
                 damage_rect,
             );
-            draw_window_visual_groups(
-                &mut self.scene,
+            draw_window_visual_groups(WindowVisualDrawRequest {
+                frame: &mut self.scene,
                 frame_width,
                 frame_height,
                 surfaces,
                 snapshots,
                 output_scale,
-                &self.decoration_instances,
-                Some(damage_rect),
-            );
+                decorations: &self.decoration_instances,
+                popup_surface_ids: &self.popup_surface_ids,
+                clip: Some(damage_rect),
+            });
         }
 
         self.scene_content_generation = content_generation;
         self.scene_surface_snapshots = snapshots.to_vec();
+        self.scene_popup_surface_ids = self.popup_surface_ids.clone();
         self.last_rebuild_damage_rects = damage_rects;
         self.scene_generation = self.scene_generation.saturating_add(1);
         self.last_rebuild_kind = DesktopSceneRebuildKind::Partial;
@@ -886,18 +1044,19 @@ impl DesktopSceneRenderer {
             draw_wallpaper(&mut self.scene, frame_width, frame_height);
         }
 
-        let snapshots = snapshots;
-        draw_window_visual_groups(
-            &mut self.scene,
+        draw_window_visual_groups(WindowVisualDrawRequest {
+            frame: &mut self.scene,
             frame_width,
             frame_height,
             surfaces,
-            &snapshots,
+            snapshots: &snapshots,
             output_scale,
-            &self.decoration_instances,
-            None,
-        );
+            decorations: &self.decoration_instances,
+            popup_surface_ids: &self.popup_surface_ids,
+            clip: None,
+        });
         self.scene_surface_snapshots = snapshots;
+        self.scene_popup_surface_ids = self.popup_surface_ids.clone();
         self.last_rebuild_damage_rects.clear();
         self.scene_generation = self.scene_generation.saturating_add(1);
         self.last_rebuild_kind = DesktopSceneRebuildKind::Full;
@@ -1380,17 +1539,31 @@ fn draw_client_surfaces_scaled_with_snapshots(
     }
 }
 
-fn draw_window_visual_groups(
-    frame: &mut [u32],
+struct WindowVisualDrawRequest<'a> {
+    frame: &'a mut [u32],
     frame_width: u32,
     frame_height: u32,
-    surfaces: &[RenderableSurface],
-    snapshots: &[SceneSurfaceSnapshot],
+    surfaces: &'a [RenderableSurface],
+    snapshots: &'a [SceneSurfaceSnapshot],
     output_scale: f64,
-    decorations: &[DecorationRenderInstance],
+    decorations: &'a [DecorationRenderInstance],
+    popup_surface_ids: &'a [u32],
     clip: Option<OutputRect>,
-) {
-    for group in window_visual_stack_order(surfaces, decorations) {
+}
+
+fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
+    let WindowVisualDrawRequest {
+        frame,
+        frame_width,
+        frame_height,
+        surfaces,
+        snapshots,
+        output_scale,
+        decorations,
+        popup_surface_ids,
+        clip,
+    } = request;
+    for group in window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids) {
         for &surface_index in group.surface_indices() {
             let Some((surface, snapshot)) = surfaces
                 .get(surface_index)
@@ -3077,6 +3250,105 @@ mod tests {
         assert_eq!(groups[0].decoration_index(), Some(0));
         assert_eq!(groups[1].decoration_index(), None);
         assert_eq!(groups[2].decoration_index(), Some(1));
+    }
+
+    #[test]
+    fn window_visual_stack_order_discards_orphan_decorations_and_counts_them() {
+        let surfaces = vec![solid_test_surface(701, 0, 0, 4, 4, 0xffff_0000)];
+        let decorations = vec![solid_test_decoration(
+            WindowId::from_raw(99).expect("orphan window id"),
+            999,
+            4,
+            4,
+            [0x00, 0xff, 0x00, 0xff],
+        )];
+
+        let groups = window_visual_stack_order(&surfaces, &decorations);
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(WindowVisualGroup::root_surface_id)
+                .collect::<Vec<_>>(),
+            vec![701]
+        );
+        assert_eq!(
+            WindowVisualGroup::orphan_decoration_count(&surfaces, &decorations),
+            1
+        );
+
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_decoration_instances(&decorations);
+        let mut frame = vec![0; 8 * 8];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 8,
+            frame_height: 8,
+            output_scale: 1.0,
+            surfaces: &surfaces,
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(frame[0], 0xffff_0000);
+        assert_eq!(renderer.last_orphan_decoration_count(), 1);
+    }
+
+    #[test]
+    fn popup_surfaces_paint_above_ssd_but_ordinary_subsurfaces_stay_with_the_window() {
+        let root = solid_test_surface(701, 0, 0, 4, 4, 0xffff_0000);
+        let mut ordinary_subsurface = solid_test_surface(702, 0, 0, 2, 2, 0xff00_00ff);
+        ordinary_subsurface.placement = SurfacePlacement::subsurface(701, 0, 0);
+        let mut popup = ordinary_subsurface.clone();
+        popup.surface_id = 703;
+
+        let decorations = vec![solid_test_decoration(
+            WindowId::from_raw(99).expect("window id"),
+            701,
+            4,
+            4,
+            [0x00, 0xff, 0x00, 0xff],
+        )];
+
+        let ordinary_groups =
+            window_visual_stack_order(&[root.clone(), ordinary_subsurface], &decorations);
+        assert_eq!(ordinary_groups.len(), 1);
+        assert_eq!(ordinary_groups[0].surface_indices(), &[0, 1]);
+        assert_eq!(ordinary_groups[0].decoration_index(), Some(0));
+
+        let popup_surfaces = vec![root, popup];
+        let popup_groups =
+            window_visual_stack_order_with_popups(&popup_surfaces, &decorations, &[703]);
+        assert_eq!(
+            popup_groups
+                .iter()
+                .map(WindowVisualGroup::root_surface_id)
+                .collect::<Vec<_>>(),
+            vec![701, 703]
+        );
+        assert_eq!(popup_groups[0].surface_indices(), &[0]);
+        assert_eq!(popup_groups[0].decoration_index(), Some(0));
+        assert_eq!(popup_groups[1].surface_indices(), &[1]);
+        assert_eq!(popup_groups[1].decoration_index(), None);
+
+        let mut renderer = DesktopSceneRenderer::default();
+        renderer.set_decoration_instances(&decorations);
+        renderer.set_popup_surface_ids(&[703]);
+        let mut frame = vec![0; 4 * 4];
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 4,
+            frame_height: 4,
+            output_scale: 1.0,
+            surfaces: &popup_surfaces,
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        assert_eq!(frame[0], 0xff00_00ff);
     }
 
     #[test]

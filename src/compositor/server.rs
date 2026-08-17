@@ -895,6 +895,15 @@ impl OwnCompositorServer {
         self.state.native_decoration_render_instances(surfaces)
     }
 
+    pub fn native_decoration_render_instances_for_scale(
+        &self,
+        surfaces: &[RenderableSurface],
+        output_scale: f64,
+    ) -> Vec<DecorationRenderInstance> {
+        self.state
+            .native_decoration_render_instances_for_scale(surfaces, output_scale)
+    }
+
     pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.state.external_overlay_surface_ids()
     }

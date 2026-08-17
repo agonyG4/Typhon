@@ -91,6 +91,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub fallback_reason: Option<FullRepaintReason>,
     pub partial_repaint_enabled: bool,
     pub contradictory_empty_damage: bool,
+    pub orphan_decoration_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +157,7 @@ impl EglSceneFrameCommit {
                 output_scale_key: 0,
                 surface_signature_hash: 0,
                 decoration_signature_hash: 0,
+                popup_surface_signature_hash: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
         }
@@ -167,6 +169,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub height: u32,
     pub surfaces: &'a [RenderableSurface],
     pub external_overlay_surface_ids: Vec<u32>,
+    pub popup_surface_ids: Vec<u32>,
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
@@ -388,6 +391,7 @@ impl GlesSceneRenderer {
             visual_state,
             output_scale,
             decoration_instances,
+            popup_surface_ids,
             client_cursor,
             current_damage,
         } = request;
@@ -429,6 +433,7 @@ impl GlesSceneRenderer {
             output_scale_key,
             &surface_signatures,
             &decoration_instances,
+            &popup_surface_ids,
             framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
@@ -439,6 +444,7 @@ impl GlesSceneRenderer {
             output_scale_key,
             &surface_signatures,
             &decoration_instances,
+            &popup_surface_ids,
             framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
@@ -485,6 +491,7 @@ impl GlesSceneRenderer {
                 height,
                 scene_surfaces,
                 &decoration_instances,
+                &popup_surface_ids,
                 content_generation,
                 output_scale,
                 output_scale_key,
@@ -1064,6 +1071,7 @@ impl GlesSceneRenderer {
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.scene_cache_key.is_some_and(|key| {
@@ -1074,6 +1082,7 @@ impl GlesSceneRenderer {
                 output_scale_key,
                 surface_signatures,
                 decoration_instances,
+                popup_surface_ids,
                 framebuffer_origin,
             )
         })
@@ -1089,12 +1098,15 @@ impl GlesSceneRenderer {
         height: u32,
         surfaces: &[RenderableSurface],
         decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
         content_generation: u64,
         output_scale: f64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
+        self.frame_stats.orphan_decoration_count =
+            compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
         self.vertices.clear();
         self.commands.clear();
         self.vertices.reserve((1 + surfaces.len()) * 6);
@@ -1112,7 +1124,11 @@ impl GlesSceneRenderer {
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
-        for group in compositor::window_visual_stack_order(surfaces, decoration_instances) {
+        for group in compositor::WindowVisualGroup::stack_order_with_popups(
+            surfaces,
+            decoration_instances,
+            popup_surface_ids,
+        ) {
             for &surface_index in group.surface_indices() {
                 let Some((surface, render_assignment)) = surfaces
                     .get(surface_index)
@@ -1152,6 +1168,7 @@ impl GlesSceneRenderer {
             output_scale_key,
             surface_signatures,
             decoration_instances,
+            popup_surface_ids,
             framebuffer_origin,
         ));
     }
@@ -1668,6 +1685,7 @@ struct EglSceneCacheKey {
     output_scale_key: u32,
     surface_signature_hash: u64,
     decoration_signature_hash: u64,
+    popup_surface_signature_hash: u64,
     framebuffer_origin: OutputFramebufferOrigin,
 }
 
@@ -1687,6 +1705,7 @@ impl EglSceneCacheKey {
             output_scale_key,
             surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
             decoration_signature_hash: egl_decoration_signature_hash(&[]),
+            popup_surface_signature_hash: 0,
             framebuffer_origin,
         }
     }
@@ -1698,6 +1717,7 @@ impl EglSceneCacheKey {
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
         let mut key = Self::new(
@@ -1709,6 +1729,7 @@ impl EglSceneCacheKey {
             framebuffer_origin,
         );
         key.decoration_signature_hash = egl_decoration_signature_hash(decoration_instances);
+        key.popup_surface_signature_hash = egl_popup_surface_signature_hash(popup_surface_ids);
         key
     }
 
@@ -1752,6 +1773,7 @@ impl EglSceneCacheKey {
             output_scale_key,
             surface_signatures,
             &[],
+            &[],
             framebuffer_origin,
         )
     }
@@ -1764,6 +1786,7 @@ impl EglSceneCacheKey {
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.width == width
@@ -1772,6 +1795,8 @@ impl EglSceneCacheKey {
             && self.output_scale_key == output_scale_key
             && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
             && self.decoration_signature_hash == egl_decoration_signature_hash(decoration_instances)
+            && self.popup_surface_signature_hash
+                == egl_popup_surface_signature_hash(popup_surface_ids)
             && self.framebuffer_origin == framebuffer_origin
     }
 
@@ -1795,6 +1820,14 @@ impl EglSceneCacheKey {
                 == egl_decoration_snapshot_signature_hash(decoration_snapshots)
             && self.framebuffer_origin == framebuffer_origin
     }
+}
+
+fn egl_popup_surface_signature_hash(popup_surface_ids: &[u32]) -> u64 {
+    popup_surface_ids
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, id| {
+            (hash ^ u64::from(*id)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

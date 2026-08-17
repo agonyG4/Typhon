@@ -10,6 +10,17 @@ pub struct PreparedDirectFrameBatch {
 }
 
 impl OwnCompositorServer {
+    pub fn popup_surface_ids(&self) -> Vec<u32> {
+        let mut popup_surface_ids = self
+            .state
+            .popup_surfaces
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        popup_surface_ids.sort_unstable();
+        popup_surface_ids
+    }
+
     pub(super) fn kill_pending_resource_exhaustion_clients(&mut self) {
         for surface_id in self.state.take_client_resource_exhaustions() {
             let handle = self.display.handle();

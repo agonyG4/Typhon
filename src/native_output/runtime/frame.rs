@@ -643,8 +643,12 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
     ) -> NativeRenderedFrame<'_> {
         let surfaces = server.native_frame_renderable_surfaces();
-        let decorations = server.native_decoration_render_instances(surfaces.as_ref());
+        let decorations =
+            server.native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0);
         self.scene_renderer.set_decoration_instances(&decorations);
+        let popup_surface_ids = server.popup_surface_ids();
+        self.scene_renderer
+            .set_popup_surface_ids(&popup_surface_ids);
         self.render_frame(NativeFrameRequest {
             width,
             height,
@@ -710,10 +714,12 @@ impl NativeFrameRenderer {
             height,
             surfaces: &self.frame_surfaces,
             external_overlay_surface_ids: server.external_overlay_surface_ids(),
+            popup_surface_ids: server.popup_surface_ids(),
             content_generation: native_scene_content_generation(server.scene_render_generation()),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
-            decoration_instances: server.native_decoration_render_instances(surfaces.as_ref()),
+            decoration_instances: server
+                .native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0),
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())
