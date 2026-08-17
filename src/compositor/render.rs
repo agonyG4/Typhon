@@ -4604,6 +4604,7 @@ mod tests {
     fn decoration_move_reuses_cpu_frame_with_bounded_old_and_new_copy_damage() {
         let mut renderer = DesktopSceneRenderer::default();
         let mut frame = vec![0; 96 * 96];
+        let root = absolute_test_surface(1, 80, 80);
         let old = test_decoration_instance(20, 20);
         renderer.set_decoration_instances(std::slice::from_ref(&old));
         renderer.compose_reusing_frame(DesktopComposeRequest {
@@ -4611,7 +4612,7 @@ mod tests {
             frame_width: 96,
             frame_height: 96,
             output_scale: 1.0,
-            surfaces: &[],
+            surfaces: std::slice::from_ref(&root),
             external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
@@ -4627,7 +4628,7 @@ mod tests {
             frame_width: 96,
             frame_height: 96,
             output_scale: 1.0,
-            surfaces: &[],
+            surfaces: std::slice::from_ref(&root),
             external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
