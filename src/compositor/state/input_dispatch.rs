@@ -1073,7 +1073,7 @@ fn send_pointer_axis_frame_to_resource(pointer: &wl_pointer::WlPointer, frame: P
     ];
     for (axis, component) in axes {
         if pointer.version() >= 8 {
-            if let Some(value120) = component.value120 {
+            if let Some(value120) = component.value120.filter(|value120| *value120 != 0) {
                 let _ = pointer.send_event(wl_pointer::Event::AxisValue120 {
                     axis: WEnum::Value(axis),
                     value120,

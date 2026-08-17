@@ -563,8 +563,12 @@ fn wl_pointer_v4_receives_only_legacy_axis_events() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state =
-        create_focused_toplevel_and_receive_pointer_axis_at_version(&socket_path, &commands, 4);
+    let state = create_focused_toplevel_and_receive_pointer_axis_at_version(
+        &socket_path,
+        &commands,
+        4,
+        Some(30),
+    );
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
@@ -581,13 +585,36 @@ fn wl_pointer_v8_receives_v120_without_duplicate_legacy_discrete_event() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state =
-        create_focused_toplevel_and_receive_pointer_axis_at_version(&socket_path, &commands, 8);
+    let state = create_focused_toplevel_and_receive_pointer_axis_at_version(
+        &socket_path,
+        &commands,
+        8,
+        Some(30),
+    );
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
     assert_eq!(state.pointer_axis_value120, vec![(0, 30)]);
     assert!(state.pointer_axis_discrete.is_empty());
+}
+
+#[test]
+fn wl_pointer_v8_does_not_receive_zero_v120() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_focused_toplevel_and_receive_pointer_axis_at_version(
+        &socket_path,
+        &commands,
+        8,
+        Some(0),
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.pointer_axis_value120.is_empty());
 }
 
 #[test]

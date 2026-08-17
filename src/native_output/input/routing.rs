@@ -725,7 +725,11 @@ fn scroll_v120_i32(value: f64) -> Option<i32> {
     if !value.is_finite() {
         return None;
     }
-    i32::try_from(value.round() as i64).ok()
+    let rounded = value.round();
+    if rounded == 0.0 {
+        return None;
+    }
+    i32::try_from(rounded as i64).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1422,5 +1426,41 @@ mod scroll_event_tests {
         let component = wheel_axis_component(true, 2.5, || 90.0, &mut remainder, false);
         assert_eq!(component.value120, Some(90));
         assert_eq!(component.discrete, Some(1));
+    }
+
+    #[test]
+    fn zero_raw_v120_is_not_a_protocol_step() {
+        let mut remainder = ScrollV120Remainder::default();
+        let component = wheel_axis_component(true, 0.0, || 0.0, &mut remainder, false);
+
+        assert_eq!(component.value120, None);
+        assert_eq!(component.discrete, None);
+    }
+
+    #[test]
+    fn wheel_remainders_are_independent_per_axis_and_zero_continuous_motion_stops() {
+        let mut remainder = ScrollV120Remainder::default();
+        assert_eq!(
+            wheel_axis_component(true, 1.0, || 60.0, &mut remainder, true).discrete,
+            None
+        );
+        assert_eq!(
+            wheel_axis_component(true, 1.0, || 60.0, &mut remainder, true).discrete,
+            Some(1)
+        );
+        assert_eq!(
+            wheel_axis_component(true, 1.0, || 120.0, &mut remainder, false).discrete,
+            Some(1)
+        );
+
+        let finger_stop = continuous_axis_component(true, 0.0);
+        assert_eq!(finger_stop.continuous, Some(0.0));
+        assert!(finger_stop.stopped);
+        assert_eq!(finger_stop.value120, None);
+        assert_eq!(finger_stop.discrete, None);
+
+        let absent_axis = continuous_axis_component(false, 0.0);
+        assert_eq!(absent_axis.continuous, None);
+        assert!(!absent_axis.stopped);
     }
 }

@@ -732,6 +732,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     pointer_version: u32,
+    value120: Option<i32>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
@@ -767,7 +768,7 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
         horizontal: PointerAxisComponent::absent(),
         vertical: PointerAxisComponent {
             continuous: Some(15.0),
-            value120: Some(30),
+            value120,
             discrete: Some(1),
             stopped: false,
         },
