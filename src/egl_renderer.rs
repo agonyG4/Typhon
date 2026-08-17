@@ -1823,6 +1823,9 @@ impl EglSceneCacheKey {
 }
 
 fn egl_popup_surface_signature_hash(popup_surface_ids: &[u32]) -> u64 {
+    if popup_surface_ids.is_empty() {
+        return 0;
+    }
     popup_surface_ids
         .iter()
         .fold(0xcbf2_9ce4_8422_2325, |hash, id| {
