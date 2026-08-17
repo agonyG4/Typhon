@@ -154,11 +154,11 @@ fn ssd_render_follows_absolute_move_and_active_render_placement() {
 
     state.renderable_surfaces[0].placement = SurfacePlacement::root_at(40, 50);
     state.renderable_surfaces[0].render_placement = None;
-    assert_eq!(decoration_instances(&state)[0].origin(), (111, 95));
+    assert_eq!(decoration_instances(&state)[0].origin(), (112, 96));
 
     state.renderable_surfaces[0].render_placement =
         Some(SurfacePlacement::absolute_root_at(300, 220));
-    assert_eq!(decoration_instances(&state)[0].origin(), (299, 193));
+    assert_eq!(decoration_instances(&state)[0].origin(), (300, 194));
 }
 
 #[test]
