@@ -22,12 +22,14 @@ fn test_buffer_identity() -> BufferIdentity {
 mod binding_launch;
 mod direct_scanout_stage4;
 mod frame;
+mod fullscreen_frame_scene;
 mod fullscreen_cadence;
 mod input;
 mod input_interaction_liveness;
 mod input_protocol;
 mod input_xwayland_client;
 mod output;
+mod output_retry;
 mod plane_scheduling_model;
 mod presentation_transactions;
 mod scanout;
