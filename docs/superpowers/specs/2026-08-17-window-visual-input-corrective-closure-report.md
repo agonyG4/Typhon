@@ -50,7 +50,7 @@ visual-diff path.
 
 All commands were run through RTK.
 
-- `TMPDIR=/tmp/t rtk cargo test --locked --lib` — **1678 passed, 2 ignored**.
+- `TMPDIR=/tmp/t rtk cargo test --locked --lib -- --test-threads=1` — **1678 passed, 2 ignored**.
 - `rtk cargo test --locked --bin oblivion-one` — **892 passed**.
 - `rtk cargo check --locked --all-targets` — passed.
 - `rtk cargo fmt --check` — passed after final formatting.
@@ -87,6 +87,8 @@ Focused closure commits:
 
 - `c05c406` — `docs: plan Typhon corrective closure`
 - `84a4e62` — `fix: close WindowVisual input and scroll ownership gaps`
+- `d9326a7` — `test: align borderless MacTahoe extents`
+- `13baca1` — `test: align moved MacTahoe decoration coordinates`
 
 The pre-existing dirty worktree remains intentionally unmerged into those
 commits.
