@@ -821,7 +821,7 @@ fn window_resize_drag_sends_configure_for_root_surface() {
 }
 
 #[test]
-fn resize_drag_coalesces_pointer_updates_behind_in_flight_configure() {
+fn resize_drag_sends_latest_geometry_without_serializing_pointer_updates() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -832,15 +832,17 @@ fn resize_drag_coalesces_pointer_updates_behind_in_flight_configure() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 2);
+    assert!(state.toplevel_configure_count >= 2);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
-    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
     let metrics = server.resize_flow_metrics();
+    assert!(metrics.max_in_flight_configures <= 3);
+    assert!(metrics.maximum_retained_configures <= 4);
     assert_eq!(metrics.raw_pointer_resize_updates, 3);
-    assert_eq!(metrics.pending_resize_updates_replaced, 2);
-    assert_eq!(metrics.resize_updates_applied, 1);
+    assert_eq!(metrics.pending_resize_updates_replaced, 0);
+    assert_eq!(metrics.resize_updates_applied, 3);
 }
 
 #[test]
@@ -858,7 +860,7 @@ fn resize_drag_configure_reports_resizing_state_while_active() {
 }
 
 #[test]
-fn resize_drag_does_not_send_next_configure_without_client_progress() {
+fn resize_drag_keeps_configures_bounded_without_client_progress() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -868,14 +870,17 @@ fn resize_drag_does_not_send_next_configure_without_client_progress() {
         &socket_path,
         &commands,
     );
-    let _server = stop_controllable_test_server(commands, server_thread);
+    let server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 2);
+    assert!(state.toplevel_configure_count >= 2);
+    let metrics = server.resize_flow_metrics();
+    assert!(metrics.max_in_flight_configures <= 3);
+    assert!(metrics.maximum_retained_configures <= 4);
 }
 
 #[test]
-fn queued_resize_configure_reports_pending_frame_work() {
+fn resize_update_flushes_configure_before_pending_frame_work_query() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -889,7 +894,7 @@ fn queued_resize_configure_reports_pending_frame_work() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(pending);
+    assert!(!pending);
 }
 
 #[test]
@@ -922,7 +927,7 @@ fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(before_prepare);
+    assert!(!before_prepare);
     assert!(!after_prepare);
 }
 
@@ -1132,7 +1137,8 @@ fn sequential_successful_resize_commits_do_not_stall_runtime_flow() {
                     .resize_configure_flows
                     .get(&surface_id)
                     .map_or(0, ResizeConfigureFlow::in_flight_configure_count),
-                1
+                0,
+                "captured commits no longer consume the protocol-pressure window"
             );
         }
     }

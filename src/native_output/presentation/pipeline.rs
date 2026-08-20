@@ -11,7 +11,7 @@ use oblivion_one::native::scheduler::{
     NativeOutputPacingMode, PresentationPipelineView, SchedulerPreparedPrimary,
 };
 
-use super::plane::PresentedPlaneSnapshot;
+use super::plane::{PlanePageflipIdentity, PresentedPlaneSnapshot};
 use crate::native_output::{DirectScanoutCandidateKey, OutputSlotId, OutputTransactionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,24 +58,43 @@ pub(crate) const fn derive_triple_capability(inputs: TripleCapabilityInputs) -> 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConfirmedPrimaryState {
+pub(crate) enum PresentedPrimaryState {
     Composed {
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
+        pageflip: PlanePageflipIdentity,
         slot: OutputSlotId,
+        framebuffer_id: u32,
+        pool_generation: u64,
+        presentation_serial: u64,
     },
     Direct {
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
+        pageflip: PlanePageflipIdentity,
         surface_id: u32,
         key: DirectScanoutCandidateKey,
         framebuffer_id: u32,
     },
 }
 
-impl ConfirmedPrimaryState {
+impl PresentedPrimaryState {
+    pub(crate) const fn transaction_id(self) -> OutputTransactionId {
+        match self {
+            Self::Composed { transaction_id, .. } | Self::Direct { transaction_id, .. } => {
+                transaction_id
+            }
+        }
+    }
+
     pub(crate) const fn is_direct(self) -> bool {
         matches!(self, Self::Direct { .. })
+    }
+
+    pub(crate) const fn pageflip_identity(self) -> PlanePageflipIdentity {
+        match self {
+            Self::Composed { pageflip, .. } | Self::Direct { pageflip, .. } => pageflip,
+        }
     }
 }
 
@@ -175,10 +194,9 @@ impl PreparedCompositedState {
 pub(crate) struct OutputPipelineSnapshot {
     pub(crate) output_generation: u64,
     pub(crate) pacing_mode: NativeOutputPacingMode,
-    /// Transitional authoritative plane view. `current_primary` remains as a
-    /// compatibility mirror until all pageflip consumers migrate.
+    /// Canonical immutable identity of the planes most recently promoted by a
+    /// matching pageflip.
     pub(crate) presented_planes: PresentedPlaneSnapshot,
-    pub(crate) current_primary: Option<ConfirmedPrimaryState>,
     pub(crate) kernel_submitted: Option<QueuedCommitSnapshot>,
     pub(crate) worker_queued_next: Option<QueuedCommitSnapshot>,
     pub(crate) prepared: PreparedCompositedState,
@@ -219,7 +237,6 @@ pub(crate) enum PipelineValidationError {
     PreparedCapacityExceeded {
         count: u8,
     },
-    PresentedPrimaryMismatch,
 }
 
 pub(crate) fn validate_pipeline_owner_counts(
@@ -264,8 +281,8 @@ impl OutputPipelineSnapshot {
 
     pub(crate) const fn direct_active(&self) -> bool {
         matches!(
-            self.current_primary,
-            Some(ConfirmedPrimaryState::Direct { .. })
+            self.presented_planes.primary,
+            Some(PresentedPrimaryState::Direct { .. })
         )
     }
 
@@ -294,9 +311,6 @@ impl OutputPipelineSnapshot {
         if self.output_generation == 0 {
             return Err(PipelineValidationError::ZeroOutputGeneration);
         }
-        if self.presented_planes.primary != self.current_primary {
-            return Err(PipelineValidationError::PresentedPrimaryMismatch);
-        }
         for commit in [self.kernel_submitted, self.worker_queued_next]
             .into_iter()
             .flatten()
@@ -318,7 +332,7 @@ impl OutputPipelineSnapshot {
         }
 
         let mut occupied = Vec::with_capacity(4);
-        if let Some(ConfirmedPrimaryState::Composed { slot, .. }) = self.current_primary {
+        if let Some(PresentedPrimaryState::Composed { slot, .. }) = self.presented_planes.primary {
             occupied.push(slot);
         }
         occupied.extend(

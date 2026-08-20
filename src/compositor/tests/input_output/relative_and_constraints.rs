@@ -572,6 +572,7 @@ fn locked_relative_motion_ignores_destroyed_same_client_relative_pointer() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ()).unwrap();
     let pointer_a = seat.get_pointer(&qh, ());
     let pointer_b = seat.get_pointer(&qh, ());
@@ -587,8 +588,15 @@ fn locked_relative_motion_ignores_destroyed_same_client_relative_pointer() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -857,6 +865,7 @@ fn locked_pointer_button_transitions_do_not_clear_relative_motion_route() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -872,8 +881,15 @@ fn locked_pointer_button_transitions_do_not_clear_relative_motion_route() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -956,6 +972,7 @@ fn locked_relative_motion_does_not_wait_for_button_frame() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -971,8 +988,15 @@ fn locked_relative_motion_does_not_wait_for_button_frame() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1111,6 +1135,7 @@ fn locked_pointer_destroy_clears_active_routing() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -1125,6 +1150,10 @@ fn locked_pointer_destroy_clears_active_routing() {
     connection.flush().unwrap();
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     commands
         .send(ServerCommand::PointerMotion {
@@ -1159,7 +1188,10 @@ fn locked_pointer_destroy_clears_active_routing() {
     commands
         .send(ServerCommand::PointerMotionSample(PointerMotionSample {
             timestamp_usec: 404,
-            absolute: Some(OutputPosition { x: 55.0, y: 66.0 }),
+            absolute: Some(OutputPosition {
+                x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+                y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+            }),
             relative: Some(RelativePointerMotion {
                 dx: 1.0,
                 dy: 1.0,
@@ -1196,6 +1228,7 @@ fn same_surface_lock_from_different_pointer_resource_is_rejected() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer_a = seat.get_pointer(&qh, ());
     let pointer_b = seat.get_pointer(&qh, ());
@@ -1208,6 +1241,10 @@ fn same_surface_lock_from_different_pointer_resource_is_rejected() {
     connection.flush().unwrap();
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     commands
         .send(ServerCommand::PointerMotion {

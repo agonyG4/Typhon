@@ -17,7 +17,6 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
                 let surface = data_init.init(id, SurfaceData::new(surface_id));
                 state.register_surface_resource(surface_id, surface.clone());
                 state.register_surface_client(surface_id, client.id());
-                state.focused_surface.get_or_insert_with(|| surface.clone());
             }
             wl_compositor::Request::CreateRegion { id } => {
                 data_init.init(id, RegionData::default());

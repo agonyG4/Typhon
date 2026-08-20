@@ -201,6 +201,9 @@ impl CompositorState {
         let _committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
         let _opaque_region_changed = data.apply_opaque_region_change(opaque_region);
         let input_region_changed = data.apply_input_region_change(input_region);
+        if input_region_changed {
+            self.advance_pointer_hit_generation();
+        }
         let damage = damage.or(window_geometry
             .is_some()
             .then_some(RenderableSurfaceDamage::Full));
@@ -281,7 +284,7 @@ impl CompositorState {
                     .iter()
                     .any(|surface| surface.surface_id == surface_id)
                 {
-                    self.pending_frame_callbacks.extend(frame_callbacks);
+                    self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
                 } else {
                     self.complete_frame_callbacks(frame_callbacks);
                 }
@@ -290,7 +293,6 @@ impl CompositorState {
         if input_region_changed {
             self.refresh_pointer_focus_at_last_position();
         }
-        self.pending_presentation_feedbacks
-            .extend(presentation_feedbacks);
+        self.queue_pending_presentation_feedbacks(presentation_feedbacks);
     }
 }

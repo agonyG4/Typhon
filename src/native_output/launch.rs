@@ -135,14 +135,16 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
             let cursor = cursor.clone();
             supervisor.spawn_restartable(
                 move || {
-                    compositor_app_command_with_policy_and_xwayland_and_cursor(
+                    let mut command = compositor_app_command_with_policy_and_xwayland_and_cursor(
                         &socket_name,
                         &argv,
                         gpu_policy,
                         xwayland.as_ref(),
                         cursor.as_ref(),
                     )?
-                    .ok_or_else(|| io::Error::other("native shell command is empty"))
+                    .ok_or_else(|| io::Error::other("native shell command is empty"))?;
+                    configure_astrea_shell_runtime(&mut command);
+                    Ok(command)
                 },
                 process_options,
             )

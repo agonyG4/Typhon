@@ -55,9 +55,11 @@ that channel, so stale destruction cannot mutate newer state.
 
 Publication always follows the protocol order: create the offer, send every
 MIME offer event, then send the selection event. Focused normal devices receive
-clipboard and PRIMARY according to Typhon's existing desktop/keyboard-focus
-policy. Ext-data-control devices receive both channels independent of focus and
-receive current state immediately on registration. Every receive path checks
+clipboard and PRIMARY according to Typhon's keyboard protocol focus
+(`keyboard_surface`), while desktop/window-management focus (`focused_surface`)
+remains a separate intent. Ext-data-control devices receive both channels
+independent of keyboard focus and receive current state immediately on
+registration. Every receive path checks
 client, channel, generation, active source, and MIME membership before forwarding
 the owned FD. Rejected FDs are dropped deterministically.
 
@@ -137,4 +139,3 @@ clippy, unit/integration test, source-layout, and diff checks. Linux-only
 Wayland-session smoke checks (`wayland-info`, PRIMARY clients,
 ext-data-control clipboard manager, and idle-inhibit visibility transitions)
 will be reported as pending for execution on the user's Linux environment.
-

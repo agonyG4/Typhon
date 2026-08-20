@@ -52,9 +52,9 @@ impl EglUvRect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EglDrawLayer {
-    Wallpaper,
     Solid(ServerFrameColor),
     SolidRgba(u32),
+    DecorationAsset(u64),
     Surface(u32),
     Cursor,
 }

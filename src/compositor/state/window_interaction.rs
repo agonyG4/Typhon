@@ -52,11 +52,13 @@ impl CompositorState {
         y: f64,
         trigger_button: u32,
     ) -> bool {
-        if self.surface_id_at(x, y).is_none()
-            && let Some((window_id, root_surface_id, DecorationHit::Titlebar)) =
-                self.decoration_hit_at(x, y)
-        {
-            return self.begin_window_interaction_for_root(BeginWindowInteraction {
+        let hit = self.pointer_scene_hit_at(x, y);
+        match hit {
+            PointerSceneHit::Decoration {
+                window_id,
+                root_surface_id,
+                hit: DecorationHit::Titlebar,
+            } => self.begin_window_interaction_for_root(BeginWindowInteraction {
                 window_id: Some(window_id),
                 root_surface_id,
                 x,
@@ -66,16 +68,18 @@ impl CompositorState {
                 trigger_button: (trigger_button != 0).then_some(trigger_button),
                 trigger_serial: None,
                 pointer_motion_surface_id: None,
-            });
+            }),
+            PointerSceneHit::Client { .. } => self.begin_window_interaction_from_scene_hit(
+                x,
+                y,
+                WindowInteractionKind::Move,
+                WindowInteractionSource::NativeBinding,
+                Some(trigger_button),
+                None,
+                &hit,
+            ),
+            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => false,
         }
-        self.begin_window_interaction_at(
-            x,
-            y,
-            WindowInteractionKind::Move,
-            WindowInteractionSource::NativeBinding,
-            Some(trigger_button),
-            None,
-        )
     }
 
     pub(in crate::compositor) fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
@@ -88,60 +92,58 @@ impl CompositorState {
         y: f64,
         trigger_button: u32,
     ) -> bool {
-        let Some(surface_id) = self.surface_id_at(x, y) else {
-            if let Some((window_id, root_surface_id, DecorationHit::Resize(edge))) =
-                self.decoration_hit_at(x, y)
-            {
-                return self.begin_window_interaction_for_root(BeginWindowInteraction {
-                    window_id: Some(window_id),
-                    root_surface_id,
-                    x,
-                    y,
-                    kind: WindowInteractionKind::Resize(resize_edges_for_decoration_edge(edge)),
-                    source: WindowInteractionSource::NativeBinding,
-                    trigger_button: (trigger_button != 0).then_some(trigger_button),
-                    trigger_serial: None,
-                    pointer_motion_surface_id: None,
-                });
-            }
-            log_begin_rejection_without_target(
-                "no_surface_at_pointer",
-                x,
-                y,
-                WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
-                WindowInteractionSource::NativeBinding,
-                trigger_button,
-            );
-            return false;
-        };
-        let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        let Some((local_x, local_y, width, height)) =
-            self.root_window_local_point_at(root_surface_id, x, y)
-        else {
-            return self.begin_window_interaction_for_root(BeginWindowInteraction {
-                window_id: self.window_id_for_surface(root_surface_id),
+        let hit = self.pointer_scene_hit_at(x, y);
+        match hit {
+            PointerSceneHit::Decoration {
+                window_id,
+                root_surface_id,
+                hit: DecorationHit::Resize(edge),
+            } => self.begin_window_interaction_for_root(BeginWindowInteraction {
+                window_id: Some(window_id),
                 root_surface_id,
                 x,
                 y,
-                kind: WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+                kind: WindowInteractionKind::Resize(resize_edges_for_decoration_edge(edge)),
                 source: WindowInteractionSource::NativeBinding,
                 trigger_button: (trigger_button != 0).then_some(trigger_button),
                 trigger_serial: None,
-                pointer_motion_surface_id: Some(surface_id),
-            });
-        };
-        let edges = resize_edges_for_window_point(local_x, local_y, width, height);
-        self.begin_window_interaction_for_root(BeginWindowInteraction {
-            window_id: self.window_id_for_surface(root_surface_id),
-            root_surface_id,
-            x,
-            y,
-            kind: WindowInteractionKind::Resize(edges),
-            source: WindowInteractionSource::NativeBinding,
-            trigger_button: (trigger_button != 0).then_some(trigger_button),
-            trigger_serial: None,
-            pointer_motion_surface_id: Some(surface_id),
-        })
+                pointer_motion_surface_id: None,
+            }),
+            PointerSceneHit::Client { target } => {
+                let surface_id = compositor_surface_id(&target.surface);
+                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                let kind = self
+                    .root_window_local_point_at(root_surface_id, x, y)
+                    .map(|(local_x, local_y, width, height)| {
+                        WindowInteractionKind::Resize(resize_edges_for_window_point(
+                            local_x, local_y, width, height,
+                        ))
+                    })
+                    .unwrap_or(WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT));
+                self.begin_window_interaction_for_root(BeginWindowInteraction {
+                    window_id: self.window_id_for_surface(root_surface_id),
+                    root_surface_id,
+                    x,
+                    y,
+                    kind,
+                    source: WindowInteractionSource::NativeBinding,
+                    trigger_button: (trigger_button != 0).then_some(trigger_button),
+                    trigger_serial: None,
+                    pointer_motion_surface_id: Some(surface_id),
+                })
+            }
+            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => {
+                log_begin_rejection_without_target(
+                    "no_surface_at_pointer",
+                    x,
+                    y,
+                    WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+                    WindowInteractionSource::NativeBinding,
+                    trigger_button,
+                );
+                false
+            }
+        }
     }
 
     pub(in crate::compositor) fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
@@ -169,6 +171,7 @@ impl CompositorState {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn begin_window_interaction_at(
         &mut self,
         x: f64,
@@ -178,7 +181,33 @@ impl CompositorState {
         trigger_button: Option<u32>,
         trigger_serial: Option<u32>,
     ) -> bool {
-        let Some(surface_id) = self.surface_id_at(x, y) else {
+        let hit = self.pointer_scene_hit_at(x, y);
+        self.begin_window_interaction_from_scene_hit(
+            x,
+            y,
+            kind,
+            source,
+            trigger_button,
+            trigger_serial,
+            &hit,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "interaction start keeps the resolved scene hit and protocol trigger metadata together"
+    )]
+    fn begin_window_interaction_from_scene_hit(
+        &mut self,
+        x: f64,
+        y: f64,
+        kind: WindowInteractionKind,
+        source: WindowInteractionSource,
+        trigger_button: Option<u32>,
+        trigger_serial: Option<u32>,
+        hit: &PointerSceneHit,
+    ) -> bool {
+        let PointerSceneHit::Client { target } = hit else {
             log_begin_rejection_without_target(
                 "no_surface_at_pointer",
                 x,
@@ -189,6 +218,7 @@ impl CompositorState {
             );
             return false;
         };
+        let surface_id = compositor_surface_id(&target.surface);
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         self.begin_window_interaction_for_root(BeginWindowInteraction {
             window_id: self.window_id_for_surface(root_surface_id),
@@ -721,7 +751,9 @@ impl CompositorState {
         let had_interaction = self.window_interaction.take().is_some();
         let had_cursor_override = self.interaction_cursor_override.take().is_some();
         if had_cursor_override {
-            self.advance_render_generation(RenderGenerationCause::CursorState);
+            if !matches!(reason, WindowInteractionEndReason::WorkspaceSwitch) {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
             self.sync_cursor_visibility_request();
             self.resume_pending_pointer_constraint_activation();
         }
@@ -873,7 +905,7 @@ impl CompositorState {
                         ),
                         self.window(interaction.window_id)
                             .map(|window| window.state.mode())
-                            .unwrap_or(ToplevelMode::Floating),
+                            .unwrap_or(ToplevelMode::Normal),
                         false,
                     );
                 }
@@ -887,56 +919,71 @@ impl CompositorState {
                 self.window_interaction = Some(interaction);
 
                 let resize = interactive_resize_geometry(interaction, edges, dx, dy);
-                let update = PendingInteractiveResizeUpdate {
-                    root_surface_id: interaction.root_surface_id,
-                    width: resize.width,
-                    height: resize.height,
-                    placement: SurfacePlacement {
-                        local_x: resize.x,
-                        local_y: resize.y,
-                        ..interaction.start_placement
-                    },
-                    edges,
-                    interaction_id: interaction
-                        .resize_interaction_id
-                        .expect("resize interaction has an ID"),
+                let placement = SurfacePlacement {
+                    local_x: resize.x,
+                    local_y: resize.y,
+                    ..interaction.start_placement
                 };
+                let interaction_id = interaction
+                    .resize_interaction_id
+                    .expect("resize interaction has an ID");
+                let target = self.clamp_resize_geometry(
+                    interaction.root_surface_id,
+                    WindowGeometry::new(placement, resize.width, resize.height),
+                    edges,
+                );
                 self.resize_flow_metrics.raw_pointer_resize_updates = self
                     .resize_flow_metrics
                     .raw_pointer_resize_updates
                     .saturating_add(1);
-                if self.pending_interactive_resize_update == Some(update) {
+                if self.current_visual_root_window_geometry(interaction.root_surface_id)
+                    == Some(target)
+                {
                     self.resize_flow_metrics.resize_updates_skipped_unchanged = self
                         .resize_flow_metrics
                         .resize_updates_skipped_unchanged
                         .saturating_add(1);
                     return false;
                 }
-                let pending_update_replaced = self
-                    .pending_interactive_resize_update
-                    .replace(update)
-                    .is_some();
-                if pending_update_replaced {
-                    self.resize_flow_metrics.pending_resize_updates_replaced = self
+                let applied = self.queue_resize_root_window_to(
+                    interaction.root_surface_id,
+                    target.width,
+                    target.height,
+                    target.placement,
+                    edges,
+                    interaction_id,
+                );
+                if applied {
+                    self.resize_flow_metrics.resize_updates_applied = self
                         .resize_flow_metrics
-                        .pending_resize_updates_replaced
+                        .resize_updates_applied
+                        .saturating_add(1);
+                    self.flush_pending_resize_configure();
+                } else {
+                    self.resize_flow_metrics.resize_updates_skipped_unchanged = self
+                        .resize_flow_metrics
+                        .resize_updates_skipped_unchanged
                         .saturating_add(1);
                 }
                 resize_debug_log(|| {
+                    let timestamp_ns =
+                        crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
                     format!(
-                        "event=update interaction_id={} root={} pointer=({x},{y}) delta=({dx},{dy}) drag_committed={} pending_update_replaced={} target_geometry=({},{},{},{},{:?})",
+                        "timestamp_ns={timestamp_ns} input_hardware_timestamp_usec={} event=update interaction_id={} root={} pointer=({x},{y}) delta=({dx},{dy}) drag_committed={} visual_applied={} target_geometry=({},{},{},{},{:?})",
+                        self.last_pointer_motion_usec
+                            .map_or_else(|| "none".to_string(), |timestamp| timestamp.to_string()),
                         interaction.id.get(),
                         interaction.root_surface_id,
                         interaction.drag_committed,
-                        pending_update_replaced,
-                        update.placement.local_x,
-                        update.placement.local_y,
-                        update.width,
-                        update.height,
-                        update.placement.root_mode,
+                        applied,
+                        target.placement.local_x,
+                        target.placement.local_y,
+                        target.width,
+                        target.height,
+                        target.placement.root_mode,
                     )
                 });
-                true
+                applied
             }
         }
     }
@@ -957,6 +1004,9 @@ impl CompositorState {
     ) -> bool {
         if self.window_interaction.is_none() && self.interaction_cursor_override.is_none() {
             return false;
+        }
+        if let Some(interaction) = self.window_interaction {
+            return self.end_window_interaction_by_id_with_reason(interaction.id, reason);
         }
         let visual_root_surface_id = self
             .window_interaction
@@ -993,7 +1043,6 @@ impl CompositorState {
             && interaction.drag_committed
             && let WindowInteractionKind::Resize(edges) = interaction.kind
         {
-            self.apply_pending_interactive_resize_update();
             if let Some(final_visual) =
                 self.current_visual_root_window_geometry(interaction.root_surface_id)
             {
@@ -1149,32 +1198,6 @@ impl CompositorState {
             .iter()
             .copied()
             .collect()
-    }
-
-    pub(in crate::compositor) fn apply_pending_interactive_resize_update(&mut self) -> bool {
-        let Some(update) = self.pending_interactive_resize_update.take() else {
-            return false;
-        };
-        let applied = self.queue_resize_root_window_to(
-            update.root_surface_id,
-            update.width,
-            update.height,
-            update.placement,
-            update.edges,
-            update.interaction_id,
-        );
-        if applied {
-            self.resize_flow_metrics.resize_updates_applied = self
-                .resize_flow_metrics
-                .resize_updates_applied
-                .saturating_add(1);
-        } else {
-            self.resize_flow_metrics.resize_updates_skipped_unchanged = self
-                .resize_flow_metrics
-                .resize_updates_skipped_unchanged
-                .saturating_add(1);
-        }
-        applied
     }
 
     pub(in crate::compositor) fn window_interaction_active(&self) -> bool {

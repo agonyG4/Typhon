@@ -108,6 +108,7 @@ impl CompositorState {
         if let WindowBackend::X11(handle) = window.backend {
             self.window_by_x11_handle.insert(handle, window.id);
         }
+        window.refresh_workspace_membership(self.workspace_manager.active_workspace());
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
         self.mark_astrea_toplevel_structure_dirty();
@@ -119,6 +120,7 @@ impl CompositorState {
             );
         }
         self.rebuild_x11_transient_relationships();
+        self.reconcile_workspace_inheritance();
         self.normalize_window_stacking();
         Ok(())
     }
@@ -133,7 +135,11 @@ impl CompositorState {
         let occupied = self
             .desktop_windows
             .values()
-            .filter(|window| Some(window.id) != excluded && !window.state.is_minimized())
+            .filter(|window| {
+                Some(window.id) != excluded
+                    && !window.state.is_minimized()
+                    && self.window_is_visible_in_active_workspace(window.id)
+            })
             .filter_map(|window| self.desktop_window_frame(window.id))
             .collect::<Vec<_>>();
 
@@ -219,6 +225,14 @@ impl CompositorState {
         id: WindowId,
     ) -> Option<DesktopWindow> {
         let window = self.desktop_windows.remove(&id)?;
+        for child in self.desktop_windows.values_mut() {
+            if child.relationships.parent == Some(id) {
+                child.relationships.parent = None;
+            }
+            if child.relationships.transient_for == Some(id) {
+                child.relationships.transient_for = None;
+            }
+        }
         if self.window_by_root_surface.get(&window.root_surface_id) == Some(&id) {
             self.window_by_root_surface.remove(&window.root_surface_id);
         }
@@ -228,6 +242,7 @@ impl CompositorState {
         self.window_stacking.retain(|window_id| *window_id != id);
         self.mark_astrea_toplevel_removed(id);
         self.rebuild_x11_transient_relationships();
+        self.reconcile_workspace_inheritance();
         Some(window)
     }
 
@@ -432,9 +447,9 @@ impl CompositorState {
         } else if state.maximized {
             ToplevelMode::Maximized
         } else {
-            ToplevelMode::Floating
+            ToplevelMode::Normal
         };
-        if mode == ToplevelMode::Floating {
+        if mode == ToplevelMode::Normal {
             if let Some(window) = self.window_mut(window_id) {
                 window.state.set_mode(mode);
             }
@@ -491,6 +506,9 @@ impl CompositorState {
         let old_policy = self
             .window(window_id)
             .and_then(|window| window.x11_placement_policy);
+        let old_scene_visibility = self.window(window_id).is_some_and(|window| {
+            self.surface_is_visible_in_active_workspace(window.root_surface_id)
+        });
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -561,7 +579,22 @@ impl CompositorState {
             }
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
+        let active_workspace = self.workspace_manager.active_workspace();
+        if let Some(window) = self.window_mut(window_id) {
+            window.refresh_workspace_membership(active_workspace);
+        }
         self.rebuild_x11_transient_relationships();
+        self.reconcile_workspace_inheritance();
+        let new_scene_visibility = self.window(window_id).is_some_and(|window| {
+            self.surface_is_visible_in_active_workspace(window.root_surface_id)
+        });
+        if old_scene_visibility != new_scene_visibility {
+            self.rebuild_active_scene_view();
+            self.reconcile_idle_inhibition();
+            self.refresh_pointer_focus_at_last_position();
+            self.mark_astrea_toplevel_structure_dirty();
+            self.advance_render_generation(RenderGenerationCause::WindowMode);
+        }
         self.mark_astrea_toplevel_dirty(window_id);
         if structure_dirty {
             self.mark_astrea_toplevel_structure_dirty();
@@ -1023,7 +1056,7 @@ impl CompositorState {
         } else if state.maximized {
             ToplevelMode::Maximized
         } else {
-            ToplevelMode::Floating
+            ToplevelMode::Normal
         };
         self.transition_x11_window_mode(window_id, mode, state.hidden);
         true

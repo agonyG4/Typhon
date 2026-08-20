@@ -55,16 +55,115 @@ mod tests {
     }
 
     #[test]
-    fn window_manager_moves_and_resizes_floating_windows() {
-        let mut wm = wm::WindowManager::new((1280, 720));
-        let id = wm.add_window("kitty", Rect::new(100, 100, 640, 420));
+    fn canonical_window_id_rejects_zero_and_round_trips_raw_values() {
+        assert!(core::WindowId::from_raw(0).is_none());
+        let id = core::WindowId::from_raw(42).expect("non-zero id");
+        let compositor_id: compositor::WindowId = id;
 
-        wm.focus(id);
-        wm.move_focused_by(32, 16);
-        wm.resize_focused_by(80, -40);
+        assert_eq!(id.get(), 42);
+        assert_eq!(compositor_id.get(), 42);
+        assert_eq!(id, compositor_id);
+    }
 
-        let window = wm.window(id).unwrap();
-        assert_eq!(window.rect, Rect::new(132, 116, 720, 380));
+    #[test]
+    fn workspace_ids_are_nonzero_and_extensible() {
+        assert!(wm::WorkspaceId::new(0).is_none());
+        assert_eq!(wm::WorkspaceId::new(1).unwrap().get(), 1);
+        assert_eq!(wm::WorkspaceId::new(42).unwrap().to_string(), "42");
+    }
+
+    #[test]
+    fn workspace_manager_has_deterministic_default_state() {
+        let manager = wm::WorkspaceManager::default();
+
+        assert_eq!(manager.active_workspace(), wm::WorkspaceId::new(1).unwrap());
+        assert_eq!(manager.workspaces().count(), 10);
+        assert!(manager.contains(wm::WorkspaceId::new(10).unwrap()));
+        assert!(!manager.contains(wm::WorkspaceId::new(99).unwrap()));
+        assert!(wm::WorkspaceId::new(0).is_none());
+        assert!(wm::WorkspaceManager::new(0).is_none());
+    }
+
+    #[test]
+    fn workspace_manager_switches_known_workspace_once() {
+        let mut manager = wm::WorkspaceManager::default();
+        let workspace_two = wm::WorkspaceId::new(2).unwrap();
+
+        assert_eq!(
+            manager.activate(workspace_two),
+            wm::WorkspaceSwitchOutcome::Changed {
+                previous: wm::WorkspaceId::new(1).unwrap(),
+                current: workspace_two,
+            }
+        );
+        assert_eq!(manager.active_workspace(), workspace_two);
+        assert_eq!(
+            manager.activate(workspace_two),
+            wm::WorkspaceSwitchOutcome::NoChange
+        );
+        assert_eq!(
+            manager.activate(wm::WorkspaceId::new(99).unwrap()),
+            wm::WorkspaceSwitchOutcome::UnknownWorkspace
+        );
+        assert_eq!(manager.active_workspace(), workspace_two);
+    }
+
+    #[test]
+    fn ewmh_workspace_conversion_is_extensible_beyond_the_default_policy() {
+        assert_eq!(wm::WorkspaceId::from_ewmh(0), wm::WorkspaceId::new(1));
+        assert_eq!(wm::WorkspaceId::from_ewmh(9), wm::WorkspaceId::new(10));
+        assert_eq!(wm::WorkspaceId::from_ewmh(10), wm::WorkspaceId::new(11));
+        assert_eq!(wm::WorkspaceId::from_ewmh(u32::MAX), None);
+    }
+
+    #[test]
+    fn workspace_manager_reports_its_configured_workspace_count() {
+        let manager = wm::WorkspaceManager::new(12).expect("workspace manager");
+
+        assert_eq!(manager.workspace_count(), 12);
+        assert!(manager.contains(wm::WorkspaceId::new(11).unwrap()));
+    }
+
+    #[test]
+    fn window_management_state_defaults_to_active_floating_membership() {
+        let workspace = wm::WorkspaceId::new(3).unwrap();
+        let state = wm::WindowManagementState::new(workspace);
+
+        assert_eq!(state.workspace(), workspace);
+        assert_eq!(state.layout(), wm::LayoutMembership::Floating);
+        assert_eq!(
+            state.with_layout(wm::LayoutMembership::Tiled).layout(),
+            wm::LayoutMembership::Tiled
+        );
+    }
+
+    #[test]
+    fn moving_window_management_state_preserves_layout_membership() {
+        let first = wm::WorkspaceId::new(1).unwrap();
+        let second = wm::WorkspaceId::new(5).unwrap();
+
+        let floating = wm::WindowManagementState::new(first).with_workspace(second);
+        assert_eq!(floating.workspace(), second);
+        assert_eq!(floating.layout(), wm::LayoutMembership::Floating);
+
+        let tiled = wm::WindowManagementState::new(first)
+            .with_layout(wm::LayoutMembership::Tiled)
+            .with_workspace(second);
+        assert_eq!(tiled.workspace(), second);
+        assert_eq!(tiled.layout(), wm::LayoutMembership::Tiled);
+    }
+
+    #[test]
+    fn workspace_ids_round_trip_ewmh_indices_and_reject_reserved_values() {
+        for (ewmh, workspace) in (0..10).zip(1..=10) {
+            let id = wm::WorkspaceId::from_ewmh(ewmh).expect("valid EWMH workspace");
+            assert_eq!(id.get(), workspace);
+            assert_eq!(id.to_ewmh(), ewmh);
+        }
+        let extensible = wm::WorkspaceId::from_ewmh(10).expect("identity conversion is extensible");
+        assert_eq!(extensible.get(), 11);
+        assert_eq!(extensible.to_ewmh(), 10);
+        assert_eq!(wm::WorkspaceId::from_ewmh(u32::MAX), None);
     }
 
     #[test]

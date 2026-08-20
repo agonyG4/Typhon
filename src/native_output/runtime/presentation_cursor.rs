@@ -219,7 +219,7 @@ pub(super) struct CursorPolicyContext<'a> {
     pub(super) output_height: u32,
     pub(super) cursor_preference: NativeCursorPreference,
     pub(super) cursor_scheduling_policy: NativeCursorSchedulingPolicy,
-    pub(super) confirmed_primary_assignment: Option<ConfirmedPrimaryAssignment>,
+    pub(super) presented_primary: Option<PresentedPrimaryAssignment>,
     pub(super) predictive_triple_active: bool,
     pub(super) client_cursor_active: bool,
     pub(super) cursor_render_mode: &'a mut NativeCursorRenderMode,
@@ -651,7 +651,7 @@ pub(super) fn apply_cursor_policy(
         output_height,
         cursor_preference,
         cursor_scheduling_policy,
-        confirmed_primary_assignment,
+        presented_primary,
         predictive_triple_active,
         client_cursor_active,
         cursor_render_mode,
@@ -666,12 +666,11 @@ pub(super) fn apply_cursor_policy(
             NativeCursorPreference::Software => CursorPreference::Software,
         }
     };
-    let primary_mode =
-        if confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()) {
-            PlanePrimaryMode::Direct
-        } else {
-            PlanePrimaryMode::Composed
-        };
+    let primary_mode = if presented_primary.is_some_and(|assignment| assignment.is_direct()) {
+        PlanePrimaryMode::Direct
+    } else {
+        PlanePrimaryMode::Composed
+    };
     let prospective = AtomicCursorVisualState {
         visible: cursor_visible && cursor_image_ready,
         ..cursor.desired().clone()

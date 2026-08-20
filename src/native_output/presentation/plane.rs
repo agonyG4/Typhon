@@ -8,7 +8,7 @@ use std::{
 
 use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
 
-use super::pipeline::ConfirmedPrimaryState;
+use super::pipeline::PresentedPrimaryState;
 
 macro_rules! plane_identity {
     ($name:ident) => {
@@ -302,7 +302,7 @@ impl PresentedCursorState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PresentedPlaneSnapshot {
     pub(crate) revision: PlaneStateRevision,
-    pub(crate) primary: Option<ConfirmedPrimaryState>,
+    pub(crate) primary: Option<PresentedPrimaryState>,
     pub(crate) cursor: PresentedCursorState,
 }
 
@@ -315,7 +315,7 @@ impl PresentedPlaneSnapshot {
         }
     }
 
-    pub(crate) const fn legacy(primary: Option<ConfirmedPrimaryState>) -> Self {
+    pub(crate) const fn legacy(primary: Option<PresentedPrimaryState>) -> Self {
         Self {
             revision: PlaneStateRevision::new(NonZeroU64::MIN),
             primary,
@@ -343,10 +343,13 @@ impl PresentedPlaneSnapshot {
         &mut self,
         identity: PlanePageflipIdentity,
         pageflip: PlanePageflipIdentity,
-        primary: Option<ConfirmedPrimaryState>,
+        primary: Option<PresentedPrimaryState>,
         cursor: Option<PresentedCursorState>,
     ) -> bool {
-        if identity != pageflip || (primary.is_none() && cursor.is_none()) {
+        if identity != pageflip
+            || primary.is_some_and(|primary| primary.pageflip_identity() != pageflip)
+            || (primary.is_none() && cursor.is_none())
+        {
             return false;
         }
         if let Some(primary) = primary {
@@ -366,6 +369,21 @@ pub(crate) struct PlanePageflipIdentity {
     pub(crate) token: PageFlipToken,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
+}
+
+impl PlanePageflipIdentity {
+    pub(crate) const fn from_pageflip(
+        token: PageFlipToken,
+        output_generation: u64,
+        crtc_id: u32,
+    ) -> Self {
+        Self {
+            bundle_id: KmsCommitBundleId::from_pageflip_token(token),
+            token,
+            output_generation,
+            crtc_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

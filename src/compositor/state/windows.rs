@@ -1,4 +1,6 @@
+use super::hit_testing::PointerSceneHit;
 use super::*;
+use crate::wm::WorkspaceSwitchOutcome;
 
 impl CompositorState {
     pub(in crate::compositor) fn x11_window_wants_initial_focus(
@@ -23,6 +25,7 @@ impl CompositorState {
         if window.kind != DesktopWindowKind::Managed
             || window.state.is_minimized()
             || !window.is_normal_x11_role()
+            || !self.window_is_visible_in_active_workspace(window_id)
         {
             return WindowFocusOutcome::Unavailable;
         }
@@ -62,6 +65,20 @@ impl CompositorState {
         window_id: WindowId,
         reason: WindowFocusReason,
     ) -> WindowActivationOutcome {
+        let Some(target_workspace) = self
+            .window(window_id)
+            .and_then(|window| window.management.map(|management| management.workspace()))
+        else {
+            return WindowActivationOutcome::Unavailable;
+        };
+        if target_workspace != self.active_workspace()
+            && matches!(
+                self.activate_workspace(target_workspace),
+                WorkspaceSwitchOutcome::UnknownWorkspace
+            )
+        {
+            return WindowActivationOutcome::Unavailable;
+        }
         let Some(window) = self.window(window_id) else {
             return WindowActivationOutcome::Unavailable;
         };
@@ -94,6 +111,18 @@ impl CompositorState {
         &mut self,
         target: &PointerTarget,
     ) -> WindowFocusOutcome {
+        self.focus_desktop_window_at_pointer_scene_hit(&PointerSceneHit::Client {
+            target: target.clone(),
+        })
+    }
+
+    pub(in crate::compositor) fn focus_desktop_window_at_pointer_scene_hit(
+        &mut self,
+        hit: &PointerSceneHit,
+    ) -> WindowFocusOutcome {
+        if self.pointer_hit_instrumentation_enabled {
+            self.pointer_hit_metrics.desktop_focus_pipeline_invocations += 1;
+        }
         if self.window_interaction_active()
             || !self.held_pointer_buttons.is_empty()
             || self.implicit_pointer_grab.is_some()
@@ -105,11 +134,29 @@ impl CompositorState {
         {
             return WindowFocusOutcome::Unavailable;
         }
-        let root_surface_id =
-            self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
-        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-            return WindowFocusOutcome::Unavailable;
+        let window_id = match hit {
+            PointerSceneHit::Client { target } => {
+                let root_surface_id =
+                    self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
+                let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+                    return WindowFocusOutcome::Unavailable;
+                };
+                window_id
+            }
+            PointerSceneHit::Decoration { window_id, .. } => *window_id,
+            PointerSceneHit::None => return WindowFocusOutcome::Unavailable,
         };
+        let focused_surface_window_id = self.focused_surface.as_ref().and_then(|surface| {
+            let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(surface));
+            self.window_id_for_surface(root_surface_id)
+        });
+        if self.focused_window_id == Some(window_id) && focused_surface_window_id == Some(window_id)
+        {
+            if self.pointer_hit_instrumentation_enabled {
+                self.pointer_hit_metrics.desktop_focus_same_window_noops += 1;
+            }
+            return WindowFocusOutcome::NoChange;
+        }
         self.focus_desktop_window(window_id, WindowFocusReason::PointerEnter)
     }
 
@@ -162,7 +209,6 @@ impl CompositorState {
                 wm_capabilities_sent: false,
             },
         );
-        self.focus_surface(surface);
     }
 
     pub(in crate::compositor) fn register_popup_surface(
@@ -306,6 +352,7 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.relationships.parent = parent;
         }
+        self.reconcile_workspace_inheritance();
         Ok(())
     }
 
@@ -348,7 +395,7 @@ impl CompositorState {
         }
         if self
             .decoration_last_titlebar_click
-            .is_some_and(|(clicked_window_id, _)| Some(clicked_window_id) == window_id)
+            .is_some_and(|(clicked_window_id, _, _, _)| Some(clicked_window_id) == window_id)
         {
             self.decoration_last_titlebar_click = None;
         }
@@ -477,6 +524,8 @@ impl CompositorState {
         self.popup_surfaces.remove(&surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgPopup);
         self.detach_popup_node(surface_id, PopupLifecycle::Destroyed);
+        self.refresh_active_scene_popup_view();
+        self.refresh_active_scene_surface_order();
         self.surface_placements.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
@@ -579,6 +628,18 @@ impl CompositorState {
         self.surface_is_descendant_of(target_surface_id, popup_surface_id)
     }
 
+    pub(in crate::compositor) fn pointer_scene_hit_allowed_by_popup_grab(
+        &self,
+        hit: &PointerSceneHit,
+    ) -> bool {
+        match hit {
+            PointerSceneHit::Client { target } => self.pointer_target_allowed_by_popup_grab(target),
+            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => {
+                self.topmost_popup_grab_surface_id().is_none()
+            }
+        }
+    }
+
     pub(in crate::compositor) fn topmost_popup_grab_surface_id(&self) -> Option<u32> {
         self.popup_grab
             .as_ref()
@@ -667,6 +728,7 @@ impl CompositorState {
         let parent = node.parent;
         self.popup_nodes.insert(surface_id, node);
         self.link_popup_to_parent(surface_id, parent);
+        self.refresh_active_scene_popup_view();
     }
 
     pub(in crate::compositor) fn relink_popup_node(
@@ -694,6 +756,7 @@ impl CompositorState {
             node.owner_root_id = owner_root_id;
         }
         self.link_popup_to_parent(surface_id, parent);
+        self.refresh_active_scene_popup_view();
         popup_debug_log(|| {
             format!(
                 "popup_associate popup={surface_id} owner_root={owner_root_id} parent={parent:?}"
@@ -1137,6 +1200,7 @@ impl CompositorState {
         else {
             return false;
         };
+        let scene_effect = self.window_is_visible_in_active_workspace(window_id);
         if self
             .window(window_id)
             .is_some_and(|window| window.state.is_minimized())
@@ -1171,6 +1235,7 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
         }
+        self.refresh_active_scene_surface_order();
         self.mark_astrea_toplevel_dirty(window_id);
         if self.focused_root_surface_id() == Some(root_surface_id) {
             self.focused_surface = None;
@@ -1185,7 +1250,10 @@ impl CompositorState {
         self.queue_backend_state(window_id);
         self.focus_topmost_renderable_toplevel();
         self.reconcile_idle_inhibition();
-        self.advance_render_generation(RenderGenerationCause::WindowMinimize);
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::WindowMinimize,
+            scene_effect,
+        );
         true
     }
 
@@ -1219,13 +1287,18 @@ impl CompositorState {
         };
 
         self.renderable_surfaces.extend(minimized_surfaces);
+        self.refresh_active_scene_surface_order();
         if let Some(surface_id) = x11_surface_id {
             let _ = self.adopt_current_xwayland_surface_content(surface_id);
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
         self.reconcile_idle_inhibition();
-        self.advance_render_generation(RenderGenerationCause::WindowRestore);
+        let scene_effect = self.window_is_visible_in_active_workspace(window_id);
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::WindowRestore,
+            scene_effect,
+        );
         true
     }
 
@@ -1252,14 +1325,14 @@ impl CompositorState {
             Some(WindowBackend::X11(_))
         ) {
             return if current_mode == mode {
-                self.restore_floating_root_window(surface_id)
+                self.restore_normal_root_window(surface_id)
             } else {
                 self.set_root_window_mode(surface_id, mode)
             };
         }
 
         if current_mode == mode {
-            self.restore_floating_root_window(surface_id)
+            self.restore_normal_root_window(surface_id)
         } else {
             self.set_root_window_mode(surface_id, mode)
         }
@@ -1315,7 +1388,7 @@ impl CompositorState {
             self.mark_astrea_toplevel_dirty(window_id);
         }
 
-        let geometry = self.window_geometry_for_mode(mode);
+        let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
         let states = mode.xdg_states();
         let configured = self
             .send_configure_root_window_to(surface_id, geometry.width, geometry.height, states)
@@ -1330,17 +1403,18 @@ impl CompositorState {
             geometry.placement,
             RenderGenerationCause::WindowMode,
         );
+        self.install_toplevel_visual_geometry(surface_id, geometry);
         configured
     }
 
-    pub(in crate::compositor) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn restore_normal_root_window(&mut self, surface_id: u32) -> bool {
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && matches!(
                 self.window(window_id).map(|window| window.backend),
                 Some(WindowBackend::X11(_))
             )
         {
-            return self.transition_x11_window_mode(window_id, ToplevelMode::Floating, false);
+            return self.transition_x11_window_mode(window_id, ToplevelMode::Normal, false);
         }
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
@@ -1352,7 +1426,7 @@ impl CompositorState {
             let Some(window) = self.toplevel_window_state_mut(surface_id) else {
                 return false;
             };
-            window.set_mode(ToplevelMode::Floating);
+            window.set_mode(ToplevelMode::Normal);
             window.take_restore_geometry()
         };
         if let Some(window_id) = window_id {
@@ -1375,6 +1449,7 @@ impl CompositorState {
             restore_geometry.placement,
             RenderGenerationCause::WindowMode,
         );
+        self.install_toplevel_visual_geometry(surface_id, restore_geometry);
         configured
     }
 
@@ -1445,19 +1520,26 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
-        let Some(surface_id) = self.window_stacking.iter().rev().find_map(|window_id| {
-            if !self
-                .window(*window_id)
-                .is_some_and(DesktopWindow::is_normal_x11_role)
-            {
-                return None;
-            }
-            let root_surface_id = self.window(*window_id)?.root_surface_id;
-            self.renderable_surfaces
-                .iter()
-                .any(|surface| surface.surface_id == root_surface_id)
-                .then_some(root_surface_id)
-        }) else {
+        let Some((_, surface_id)) = self
+            .window_stacking
+            .iter()
+            .enumerate()
+            .filter_map(|(stack_index, window_id)| {
+                let window = self.window(*window_id)?;
+                if !window.is_workspace_managed()
+                    || !self.window_is_visible_in_active_workspace(*window_id)
+                {
+                    return None;
+                }
+                let root_surface_id = window.root_surface_id;
+                self.renderable_surfaces
+                    .iter()
+                    .any(|surface| surface.surface_id == root_surface_id)
+                    .then_some((stack_index, root_surface_id, window.last_focus_serial))
+            })
+            .max_by_key(|(stack_index, _, focus_serial)| (*focus_serial, *stack_index))
+            .map(|(stack_index, root_surface_id, _)| (stack_index, root_surface_id))
+        else {
             return false;
         };
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
@@ -1478,6 +1560,7 @@ impl CompositorState {
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
             let _ = self.raise_window_id(window_id);
         }
+        let scene_effect = self.surface_is_visible_in_active_workspace(surface_id);
         let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
@@ -1496,7 +1579,11 @@ impl CompositorState {
         }
         lower_surfaces.extend(raised_surfaces);
         self.renderable_surfaces = lower_surfaces;
-        self.advance_render_generation(RenderGenerationCause::WindowStack);
+        self.refresh_active_scene_surface_order();
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::WindowStack,
+            scene_effect,
+        );
         true
     }
 

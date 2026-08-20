@@ -117,6 +117,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_targets_exact_sou
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let pointer_a = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -132,7 +133,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_targets_exact_sou
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -173,6 +181,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_falls_back_to_sam
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let pointer_a = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -188,7 +197,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_falls_back_to_sam
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -231,6 +247,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_fallback_does_not
         locked_globals.bind(&locked_qh, 1..=6, ())?;
     let locked_wm_base: client_xdg_wm_base::XdgWmBase =
         locked_globals.bind(&locked_qh, 1..=6, ())?;
+    let locked_shm: client_wl_shm::WlShm = locked_globals.bind(&locked_qh, 1..=1, ())?;
     let locked_seat: client_wl_seat::WlSeat = locked_globals.bind(&locked_qh, 5..=5, ())?;
     let locked_pointer = locked_seat.get_pointer(&locked_qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
@@ -244,7 +261,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_fallback_does_not
 
     let mut locked_state = RegistryTestState::default();
     locked_queue.roundtrip(&mut locked_state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&locked_surface, &locked_shm, &locked_qh, 32, 32)?;
+    locked_connection.flush()?;
+    wait_for_server_commands(commands);
+    locked_queue.roundtrip(&mut locked_state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     locked_queue.roundtrip(&mut locked_state)?;
 
@@ -304,6 +328,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_dispatches_to_all
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let pointer_a = seat.get_pointer(&qh, ());
     let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
@@ -319,7 +344,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_dispatches_to_all
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -382,6 +414,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_shared_source_poi
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let pointer = seat.get_pointer(&qh, ());
     let pointer_id = pointer.id().protocol_id();
@@ -398,7 +431,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_shared_source_poi
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -450,6 +490,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_different_source_
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
     let pointer_a = seat.get_pointer(&qh, ());
     let pointer_b = seat.get_pointer(&qh, ());
@@ -467,7 +508,14 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_different_source_
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 

@@ -7,7 +7,7 @@ use std::{
 use std::num::NonZeroU64;
 
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
-use oblivion_one::native::kms::PageFlipToken;
+use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 #[cfg(test)]
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -162,6 +162,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) id: u64,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) slot: OutputSlotId,
+    pub(crate) framebuffer_id: FramebufferId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
     pub(crate) target: PresentationTarget,
@@ -207,6 +208,7 @@ pub(crate) struct OutputFrameIdentitySnapshot {
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) slot: OutputSlotId,
+    pub(crate) framebuffer_id: FramebufferId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
     pub(crate) target: PresentationTarget,
@@ -219,6 +221,7 @@ impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
             protocol_batch_id: frame.protocol_batch_id,
             transaction_id: frame.transaction_id,
             slot: frame.slot,
+            framebuffer_id: frame.framebuffer_id,
             render_generation: frame.render_generation,
             pool_generation: frame.pool_generation,
             target: frame.target,
@@ -254,6 +257,7 @@ pub(crate) struct AtomicOutputSwapchain {
     quarantine: Option<QuarantinedOutputSlot>,
     next_frame_id: u64,
     presentation_serial: u64,
+    current_framebuffer_id: Option<FramebufferId>,
 }
 
 impl AtomicOutputSwapchain {
@@ -274,6 +278,7 @@ impl AtomicOutputSwapchain {
             quarantine: None,
             next_frame_id: 1,
             presentation_serial: 0,
+            current_framebuffer_id: None,
         })
     }
 
@@ -385,6 +390,7 @@ impl AtomicOutputSwapchain {
                 NonZeroU64::new(self.next_frame_id).expect("test transaction ID is nonzero"),
             ),
             slot,
+            framebuffer_id: FramebufferId::new(42).expect("test framebuffer ID is nonzero"),
             render_generation,
             pool_generation: self.pool_generation,
             target,
@@ -470,6 +476,7 @@ impl AtomicOutputSwapchain {
                 std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),
             ),
             slot,
+            framebuffer_id: FramebufferId::new(42).expect("test framebuffer ID is nonzero"),
             render_generation: 1,
             pool_generation: self.pool_generation,
             target: PresentationTarget {
@@ -935,6 +942,7 @@ impl AtomicOutputSwapchain {
         let pending = self.pending.take().expect("pending was checked above");
         let old_current = self.current;
         self.current = pending.frame.slot;
+        self.current_framebuffer_id = Some(pending.frame.framebuffer_id);
         self.presentation_serial = self
             .presentation_serial
             .checked_add(1)
@@ -955,6 +963,14 @@ impl AtomicOutputSwapchain {
 
     pub(crate) const fn presentation_serial(&self) -> u64 {
         self.presentation_serial
+    }
+
+    pub(crate) const fn current_framebuffer_id(&self) -> Option<FramebufferId> {
+        self.current_framebuffer_id
+    }
+
+    pub(crate) fn set_current_framebuffer_id(&mut self, framebuffer_id: FramebufferId) {
+        self.current_framebuffer_id = Some(framebuffer_id);
     }
 
     pub(crate) fn pending_slot(&self) -> Option<OutputSlotId> {

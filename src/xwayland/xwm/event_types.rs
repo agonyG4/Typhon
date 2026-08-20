@@ -1,4 +1,5 @@
 use super::*;
+use crate::wm::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XwmDrain {
@@ -63,6 +64,11 @@ pub enum XwmEvent {
         timestamp: u32,
         current_time: u32,
         user_time: Option<u32>,
+    },
+    CurrentDesktopRequested(WorkspaceId),
+    WindowWorkspaceRequested {
+        window: X11WindowHandle,
+        workspace: WorkspaceId,
     },
     CloseRequestedByClient(X11WindowHandle),
     ResizeSyncAckObserved {

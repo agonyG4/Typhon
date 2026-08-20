@@ -12,6 +12,10 @@ use wayland_protocols::wp::tearing_control::v1::client::{
     wp_tearing_control_manager_v1 as client_wp_tearing_control_manager_v1,
     wp_tearing_control_v1 as client_wp_tearing_control_v1,
 };
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1 as client_zxdg_decoration_manager_v1,
+    zxdg_toplevel_decoration_v1 as client_zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
 
@@ -1763,6 +1767,34 @@ impl Dispatch<client_xdg_popup::XdgPopup, ()> for RegistryTestState {
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        _event: client_zxdg_decoration_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        _event: client_zxdg_toplevel_decoration_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 

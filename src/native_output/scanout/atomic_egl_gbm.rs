@@ -14,7 +14,7 @@ use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
     DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
 };
-use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
+use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},
@@ -25,8 +25,8 @@ use crate::egl_renderer::dmabuf::{query_egl_main_device, query_egl_renderable_dm
 use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
     EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, FrameSkipReason,
-    GlesSceneRenderer, OutputFramebufferOrigin, choose_surfaceless_egl_config, create_gles_context,
-    detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
+    GlesSceneRenderer, OutputDamage, OutputFramebufferOrigin, choose_surfaceless_egl_config,
+    create_gles_context, detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
 use crate::native_output::runtime::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
@@ -632,6 +632,7 @@ impl AtomicEglGbmScanout {
         &mut self,
         slot: OutputSlotId,
         renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
@@ -652,6 +653,7 @@ impl AtomicEglGbmScanout {
         let request = renderer.egl_scene_draw_request(
             self.width,
             self.height,
+            resolved_scene,
             server,
             input_state,
             cursor_mode,
@@ -710,6 +712,7 @@ impl AtomicEglGbmScanout {
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
+        expected_scene_signature: u64,
         render_generation: u64,
         output_generation: u64,
         target: PresentationTarget,
@@ -839,15 +842,61 @@ impl AtomicEglGbmScanout {
         // scene encoding, fence export, and GPU work owned by this output frame.
         let composite_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let mut gpu_sampling_started = false;
-        let parts = match self.render_to_slot(
-            slot,
-            renderer,
-            server,
-            input_state,
-            cursor_mode,
-            damage,
-            &mut gpu_sampling_started,
-        ) {
+        let (
+            render_outcome,
+            resolved_snapshot,
+            resolved_scene_signature,
+            resolved_render_generation,
+        ) = {
+            let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
+            let resolved_snapshot = resolved_scene.snapshot();
+            let resolved_scene_signature = resolved_scene.scene_identity_signature();
+            if resolved_scene_signature != expected_scene_signature {
+                eprintln!(
+                    "NATIVE P0: rejecting atomic render because the resolved scene changed between damage and render: expected={expected_scene_signature:#018x} actual={resolved_scene_signature:#018x}"
+                );
+                let error = io::Error::other(
+                    "resolved native frame scene changed between damage and atomic render",
+                );
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::RenderPreparation,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("scene mismatch transaction has no frame batch")
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                return Err(error);
+            }
+            debug_assert_eq!(
+                resolved_scene_signature, expected_scene_signature,
+                "atomic damage and render must consume the same resolved native frame scene"
+            );
+            let outcome = self.render_to_slot(
+                slot,
+                renderer,
+                &resolved_scene,
+                &*server,
+                input_state,
+                cursor_mode,
+                damage,
+                &mut gpu_sampling_started,
+            );
+            (
+                outcome,
+                resolved_snapshot,
+                resolved_scene_signature,
+                resolved_scene.render_generation,
+            )
+        };
+        let parts = match render_outcome {
             Ok(AtomicSlotRenderOutcome::Rendered(parts)) => *parts,
             Ok(AtomicSlotRenderOutcome::Skipped {
                 slot,
@@ -908,11 +957,23 @@ impl AtomicEglGbmScanout {
         };
         let render_us = parts.render_us;
         let repaint_stats = parts.stats;
+        let render_damage_signature = parts
+            .scene_commit
+            .repaint_plan()
+            .render_damage
+            .identity_signature();
+        let repair_damage_signature = parts
+            .scene_commit
+            .repaint_plan()
+            .repair_damage
+            .identity_signature();
         let rendered_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let frame = RenderedOutputFrame {
             id: frame_id,
             transaction_id,
             slot,
+            framebuffer_id: FramebufferId::new(framebuffer_id)
+                .ok_or_else(|| io::Error::other("atomic output framebuffer ID is zero"))?,
             render_generation,
             pool_generation,
             target,
@@ -928,6 +989,7 @@ impl AtomicEglGbmScanout {
             frozen_cursor_plan,
             frozen_cursor_plane_owner,
         };
+        let framebuffer_slot = frame.slot.get();
         match self.swapchain_mut()?.finish_render_owned(frame) {
             Ok(frame_id) => {
                 output_transactions
@@ -939,6 +1001,12 @@ impl AtomicEglGbmScanout {
                     transaction_id,
                     render_us,
                     repaint_stats,
+                    resolved_snapshot,
+                    resolved_scene_signature,
+                    render_damage_signature,
+                    repair_damage_signature,
+                    resolved_render_generation,
+                    framebuffer_slot,
                 })
             }
             Err(error) => {
@@ -967,6 +1035,10 @@ impl AtomicEglGbmScanout {
     pub(crate) fn complete_pageflip(
         &mut self,
         token: PageFlipToken,
+        // Explicit slot age is indexed by confirmed presentation serial, so
+        // this transition must be prepared from actual pageflip predecessor
+        // snapshots rather than the frame's render-time repair damage.
+        presented_transition_damage: OutputDamage,
     ) -> io::Result<CompositedPageflipCompletion> {
         let generation = self.swapchain()?.pool_generation();
         let completed = self.swapchain_mut()?.complete_pageflip(token, generation)?;
@@ -992,7 +1064,8 @@ impl AtomicEglGbmScanout {
                 sample.map(|(timestamp, quality)| (MonotonicTimestampNs::new(timestamp), quality))
             }),
             || {
-                self.scene.commit_presented(scene_commit);
+                self.scene
+                    .commit_presented(scene_commit, presented_transition_damage);
                 if let Some(pool) = self.pool.as_mut() {
                     pool.slots[usize::from(completed.new_current.get())].last_presented_serial =
                         Some(completed.presentation_serial);
@@ -1083,13 +1156,14 @@ impl AtomicEglGbmScanout {
             OutputSlotId::new(1).unwrap(),
             OutputSlotId::new(2).unwrap(),
         ])?;
-        self.swapchain = Some(AtomicOutputSwapchain::from_presented_slots(
-            slots,
-            slot,
-            pool.pool_generation,
-        )?);
+        let framebuffer_id = pool.slots[usize::from(slot.get())].framebuffer;
+        let mut swapchain =
+            AtomicOutputSwapchain::from_presented_slots(slots, slot, pool.pool_generation)?;
+        swapchain.set_current_framebuffer_id(framebuffer_id);
+        self.swapchain = Some(swapchain);
         pool.slots[usize::from(slot.get())].last_presented_serial = Some(0);
-        self.scene.commit_presented(scene_commit);
+        self.scene
+            .commit_presented(scene_commit, OutputDamage::Full);
         self.direct.inhibit_until_composited_present = false;
         Ok(())
     }
@@ -1104,6 +1178,10 @@ impl AtomicEglGbmScanout {
         self.swapchain
             .as_mut()
             .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
+    }
+
+    pub(crate) fn presented_direct_ownership(&self) -> &DirectPrimaryOwnership {
+        &self.direct.ownership
     }
 
     pub(crate) fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
@@ -1169,6 +1247,12 @@ pub(crate) enum AtomicFrameRenderOutcome {
         transaction_id: OutputTransactionId,
         render_us: u64,
         repaint_stats: GlesSceneFrameStats,
+        resolved_snapshot: NativeSceneSnapshot,
+        resolved_scene_signature: u64,
+        render_damage_signature: u64,
+        repair_damage_signature: u64,
+        resolved_render_generation: u64,
+        framebuffer_slot: u8,
     },
     Skipped {
         reason: FrameSkipReason,

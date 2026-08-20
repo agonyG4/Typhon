@@ -131,8 +131,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
         width: u32,
         height: u32,
     },
+    SetPointerHitInstrumentationEnabled(bool),
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
+    CaptureFocusGeneration(Sender<u64>),
+    CapturePointerInputMetrics(Sender<PointerInputMetrics>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureSurfaceResourceCount(Sender<usize>),
@@ -166,6 +169,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
+    CaptureKeyboardFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedWindowId(Sender<Option<WindowId>>),
     CaptureWindowIdForSurface {
         surface_id: u32,
@@ -424,11 +428,20 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .update_toplevel_visual_render_assignment(surface_id);
                         }
                     }
+                    ServerCommand::SetPointerHitInstrumentationEnabled(enabled) => {
+                        server.state.pointer_hit_instrumentation_enabled = enabled;
+                    }
                     ServerCommand::CaptureRenderGeneration(reply) => {
                         let _ = reply.send(server.render_generation());
                     }
                     ServerCommand::CaptureSceneRenderGeneration(reply) => {
                         let _ = reply.send(server.scene_render_generation());
+                    }
+                    ServerCommand::CaptureFocusGeneration(reply) => {
+                        let _ = reply.send(server.state.focus_generation);
+                    }
+                    ServerCommand::CapturePointerInputMetrics(reply) => {
+                        let _ = reply.send(server.state.pointer_hit_metrics);
                     }
                     ServerCommand::CaptureRenderGenerationCause(reply) => {
                         let _ = reply.send(server.render_generation_cause());
@@ -731,6 +744,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(compositor_surface_id),
                         );
                     }
+                    ServerCommand::CaptureKeyboardFocusSurfaceId(reply) => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .keyboard_surface
+                                .as_ref()
+                                .map(compositor_surface_id),
+                        );
+                    }
                     ServerCommand::CaptureFocusedWindowId(reply) => {
                         let _ = reply.send(server.state.focused_window_id);
                     }
@@ -961,6 +983,40 @@ pub(in crate::compositor::tests) fn capture_scene_render_generation(
         .expect("server should report scene render generation")
 }
 
+pub(in crate::compositor::tests) fn capture_focus_generation(
+    commands: &Sender<ServerCommand>,
+) -> u64 {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusGeneration(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report focus generation")
+}
+
+pub(in crate::compositor::tests) fn set_pointer_hit_instrumentation_enabled(
+    commands: &Sender<ServerCommand>,
+    enabled: bool,
+) {
+    commands
+        .send(ServerCommand::SetPointerHitInstrumentationEnabled(enabled))
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn capture_pointer_input_metrics(
+    commands: &Sender<ServerCommand>,
+) -> PointerInputMetrics {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerInputMetrics(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pointer input metrics")
+}
+
 pub(in crate::compositor::tests) fn capture_pointer_focus_surface_id(
     commands: &Sender<ServerCommand>,
 ) -> Option<u32> {
@@ -1043,6 +1099,18 @@ pub(in crate::compositor::tests) fn capture_focused_surface_id(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report keyboard focus surface")
+}
+
+pub(in crate::compositor::tests) fn capture_keyboard_focus_surface_id(
+    commands: &Sender<ServerCommand>,
+) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureKeyboardFocusSurfaceId(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report keyboard protocol focus surface")
 }
 
 pub(in crate::compositor::tests) fn capture_focused_window_id(

@@ -243,25 +243,6 @@ fn rapid_resize_visual_box_tracks_latest_pointer_while_content_is_throttled() {
                 .state
                 .update_window_interaction(pointer_x, 0.0)
         );
-        let applied = fixture
-            .server
-            .state
-            .apply_pending_interactive_resize_update();
-        assert!(
-            applied,
-            "pointer sample was not applied: visual={:?} pending={:?} active={:?}",
-            fixture
-                .server
-                .state
-                .current_visual_root_window_geometry(fixture.surface_id),
-            fixture.server.state.pending_interactive_resize_update,
-            fixture
-                .server
-                .state
-                .active_toplevel_resizes
-                .get(&fixture.surface_id),
-        );
-
         let expected_width = (i64::from(root.width) - pointer_x as i64)
             .max(160)
             .try_into()
@@ -849,12 +830,6 @@ fn move_after_resize_release_cannot_be_overwritten_by_late_presentation() {
         )
     );
     assert!(fixture.server.state.update_window_interaction(20.0, 0.0));
-    assert!(
-        fixture
-            .server
-            .state
-            .apply_pending_interactive_resize_update()
-    );
     fixture.server.state.end_window_interaction();
 
     let sealed = fixture

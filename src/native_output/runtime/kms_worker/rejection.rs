@@ -254,6 +254,7 @@ impl NativeRuntime {
         error: AtomicKmsError,
         rejection_kind: WorkerRejectionKind,
     ) -> NativeResult<()> {
+        self.scene_history.discard_submission(job.token.get());
         if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
             return self.reject_direct_worker_job(job, error, rejection_kind);
         }
@@ -404,6 +405,7 @@ impl NativeRuntime {
         job: KmsCommitJob,
         drop_reason: OutputTransactionDropReason,
     ) -> NativeResult<()> {
+        self.scene_history.discard_submission(job.token.get());
         let sidecar_transaction_id = job
             .owners
             .cursor()

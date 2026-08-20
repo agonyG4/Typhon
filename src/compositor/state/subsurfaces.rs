@@ -997,7 +997,10 @@ impl CompositorState {
         }
         changed |= self.apply_pending_subsurface_stack_for_parent(parent_id);
         if changed {
-            self.advance_render_generation(RenderGenerationCause::SurfaceCommit);
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::SurfaceCommit,
+                self.surface_is_visible_in_active_workspace(parent_id),
+            );
         }
         changed
     }
@@ -1293,6 +1296,7 @@ impl CompositorState {
             .ne(original_order);
         if changed {
             self.invalidate_surface_origin_cache();
+            self.refresh_active_scene_surface_order();
         }
         changed
     }
@@ -1374,9 +1378,16 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn reorder_renderable_surfaces_by_window_stack(&mut self) -> bool {
+        let scene_effect = self
+            .renderable_surfaces
+            .iter()
+            .any(|surface| self.surface_is_visible_in_active_workspace(surface.surface_id));
         let changed = self.reorder_renderable_surfaces_by_committed_stack();
         if changed {
-            self.advance_render_generation(RenderGenerationCause::WindowStack);
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::WindowStack,
+                scene_effect,
+            );
         }
         changed
     }
@@ -1404,6 +1415,7 @@ impl CompositorState {
         }
 
         self.store_surface_placement(surface_id, placement);
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
             visual.placement = placement;
         }
@@ -1414,7 +1426,6 @@ impl CompositorState {
             .find(|surface| surface.surface_id == surface_id)
         {
             surface.placement = placement;
-            let root_surface_id = self.root_surface_id_for_surface(surface_id);
             if self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
@@ -1422,7 +1433,11 @@ impl CompositorState {
             {
                 self.update_toplevel_visual_render_assignment(root_surface_id);
             }
-            self.advance_render_generation(cause);
+            self.refresh_active_scene_surface_tree(root_surface_id);
+            self.advance_render_generation_with_scene_effect(
+                cause,
+                self.surface_is_visible_in_active_workspace(root_surface_id),
+            );
             return true;
         }
 
@@ -1440,6 +1455,8 @@ impl CompositorState {
 
     pub(in crate::compositor) fn invalidate_surface_origin_cache(&mut self) {
         self.surface_origin_cache_generation = None;
+        self.visual_stack_groups_cache_generation = None;
+        self.advance_pointer_hit_generation();
     }
 
     pub(in crate::compositor) fn raise_renderable_surface_tree(&mut self, surface_id: u32) -> bool {
@@ -1475,6 +1492,7 @@ impl CompositorState {
         self.renderable_surfaces = lower;
         if changed {
             self.invalidate_surface_origin_cache();
+            self.refresh_active_scene_surface_order();
         }
         changed
     }

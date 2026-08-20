@@ -64,6 +64,11 @@ impl CompositorState {
             return false;
         }
         let root_surface_id = self.root_surface_id_for_surface(target_surface_id);
+        if !self.surface_is_visible_in_active_workspace(root_surface_id)
+            && !self.layer_surfaces.contains_key(&root_surface_id)
+        {
+            return false;
+        }
         if self
             .toplevel_window_state(root_surface_id)
             .is_some_and(WindowState::is_minimized)
@@ -676,29 +681,7 @@ impl CompositorState {
             .renderable_surfaces
             .iter()
             .position(|renderable| renderable.surface_id == surface_id)?;
-        let mut origin = self.surface_origin_cache.get(index).copied()?;
-        if let Some(interaction) = self.window_interaction
-            && let Some(pending) = self.pending_interactive_resize_update
-            && pending.root_surface_id == interaction.root_surface_id
-            && self.root_surface_id_for_surface(surface_id) == interaction.root_surface_id
-        {
-            let current_placement = self
-                .current_visual_root_window_geometry(interaction.root_surface_id)
-                .map(|geometry| geometry.placement)
-                .unwrap_or_else(|| self.surface_placement(interaction.root_surface_id));
-            origin.0 = origin.0.saturating_add(
-                pending
-                    .placement
-                    .local_x
-                    .saturating_sub(current_placement.local_x),
-            );
-            origin.1 = origin.1.saturating_add(
-                pending
-                    .placement
-                    .local_y
-                    .saturating_sub(current_placement.local_y),
-            );
-        }
+        let origin = self.surface_origin_cache.get(index).copied()?;
         Some(PointerTarget {
             surface: surface.clone(),
             surface_x: x - f64::from(origin.0),
@@ -745,7 +728,16 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
-        if self.handle_decoration_button(button, pressed) {
+        let ordinary_scene_input = self.locked_pointer_input_surface().is_none()
+            && self
+                .implicit_pointer_grab_surface("surface-destroyed")
+                .is_none()
+            && self.topmost_popup_grab_surface_id().is_none();
+        let scene_hit = ordinary_scene_input
+            .then(|| self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y));
+        if ordinary_scene_input
+            && self.handle_decoration_button_with_hit(scene_hit.as_ref(), button, pressed)
+        {
             return;
         }
         if let Some(locked_surface) = self.locked_pointer_input_surface() {
@@ -832,7 +824,14 @@ impl CompositorState {
 
         let grabbed_surface = self.implicit_pointer_grab_surface("surface-destroyed");
         let target = if grabbed_surface.is_none() {
-            self.pointer_target_at(self.last_pointer_x, self.last_pointer_y)
+            match scene_hit.as_ref() {
+                Some(hit) => self.pointer_target_from_scene_hit(
+                    hit,
+                    self.last_pointer_x,
+                    self.last_pointer_y,
+                ),
+                None => self.pointer_target_at(self.last_pointer_x, self.last_pointer_y),
+            }
         } else {
             None
         };

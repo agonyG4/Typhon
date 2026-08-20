@@ -504,6 +504,7 @@ pub(in crate::compositor::tests) fn create_decoy_keyboard_then_focused_toplevel_
     let compositor: client_wl_compositor::WlCompositor =
         focused_globals.bind(&focused_qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = focused_globals.bind(&focused_qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = focused_globals.bind(&focused_qh, 1..=1, ())?;
     let seat: client_wl_seat::WlSeat = focused_globals.bind(&focused_qh, 1..=7, ())?;
     let _keyboard = seat.get_keyboard(&focused_qh, ());
     let surface = compositor.create_surface(&focused_qh, ());
@@ -513,6 +514,10 @@ pub(in crate::compositor::tests) fn create_decoy_keyboard_then_focused_toplevel_
     focused_connection.flush()?;
 
     let mut focused_state = RegistryTestState::default();
+    focused_queue.roundtrip(&mut focused_state)?;
+    commit_test_buffered_surface(&surface, &shm, &focused_qh, 32, 32)?;
+    focused_connection.flush()?;
+    wait_for_server_commands(commands);
     focused_queue.roundtrip(&mut focused_state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,

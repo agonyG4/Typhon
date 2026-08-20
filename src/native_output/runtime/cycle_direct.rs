@@ -31,11 +31,13 @@ pub(super) fn fail_composited_transition(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn settle_direct_pageflip(
     scanout: &mut NativeScanoutBackend,
+    scene_history: &mut NativeSceneHistory,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     atomic_cursor: &mut Option<NativeAtomicCursor>,
     drm_file_generation: u64,
+    pageflip_identity: crate::native_output::presentation::plane::PlanePageflipIdentity,
     transaction_id: OutputTransactionId,
     pageflip_token: PageFlipToken,
     pageflip_user_data: u64,
@@ -44,7 +46,7 @@ pub(super) fn settle_direct_pageflip(
     presented_at_ns: u64,
     actual_logical_sequence: u64,
     presentation: FramePresentation,
-    confirmed_primary_assignment: &mut Option<ConfirmedPrimaryAssignment>,
+    presented_primary: &mut Option<PresentedPrimaryAssignment>,
     render_journal: &mut AdaptiveRenderJournal,
     frame_pacing: &mut NativeFramePacing,
     scheduled_presentation_target: &mut Option<PresentationTarget>,
@@ -103,16 +105,18 @@ pub(super) fn settle_direct_pageflip(
     scanout.note_direct_presentation();
     debug_assert_eq!(completion.transaction_id, transaction_id);
     debug_assert_eq!(completion.token, pageflip_token);
-    let previous_assignment = *confirmed_primary_assignment;
+    let previous_assignment = *presented_primary;
     if previous_assignment.is_some_and(|assignment| assignment.is_direct()) {
         scanout.note_direct_replacement();
     } else {
         scanout.note_direct_entry();
         scanout.invalidate_presented_damage_history();
+        scene_history.invalidate_presented_damage_history();
     }
-    *confirmed_primary_assignment = Some(ConfirmedPrimaryAssignment::Direct {
+    *presented_primary = Some(PresentedPrimaryAssignment::Direct {
         transaction_id,
         token: pageflip_token,
+        pageflip: pageflip_identity,
         surface_id: completion.surface_id,
         key: completion.candidate_key,
         framebuffer_id: completion.framebuffer_id,

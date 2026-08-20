@@ -25,7 +25,7 @@ impl CompositorState {
     ) -> Option<SurfacePresentationMetadata> {
         let owner = self.fullscreen_presentation?;
         let mut metadata = SurfacePresentationMetadata::default();
-        for surface in &self.renderable_surfaces {
+        for surface in self.active_scene_surfaces() {
             if self.root_surface_id_for_surface(surface.surface_id) != owner.owner_root_surface_id {
                 continue;
             }
@@ -55,7 +55,7 @@ impl CompositorState {
         mode: ToplevelMode,
     ) -> WindowGeometry {
         match mode {
-            ToplevelMode::Floating => WindowGeometry::new(
+            ToplevelMode::Normal => WindowGeometry::new(
                 SurfacePlacement::root(),
                 self.output_size.width,
                 self.output_size.height,
@@ -63,6 +63,29 @@ impl CompositorState {
             ToplevelMode::Maximized => self.maximized_window_geometry(),
             ToplevelMode::Fullscreen => self.fullscreen_window_geometry(),
         }
+    }
+
+    pub(in crate::compositor) fn window_geometry_for_surface_mode(
+        &self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> WindowGeometry {
+        if mode == ToplevelMode::Maximized
+            && self.surface_uses_server_side_decorations(surface_id, mode)
+        {
+            let usable = self.usable_output_geometry();
+            let titlebar = self.decoration_theme.metrics().titlebar_height as f64;
+            let titlebar = titlebar.min(usable.height).max(0.0) as u32;
+            return WindowGeometry::new(
+                SurfacePlacement::absolute_root_at(
+                    usable.x as i32,
+                    (usable.y + f64::from(titlebar)) as i32,
+                ),
+                usable.width as u32,
+                (usable.height as u32).saturating_sub(titlebar),
+            );
+        }
+        self.window_geometry_for_mode(mode)
     }
 
     pub(in crate::compositor) fn maximized_window_geometry(&self) -> WindowGeometry {
@@ -133,6 +156,17 @@ impl CompositorState {
                 software_cursor_visible: false,
             };
         };
+        if !self.surface_is_visible_in_active_workspace(owner.owner_root_surface_id) {
+            return FullscreenPresentationEligibility {
+                owner: Some(owner),
+                eligible: false,
+                rejection: Some(FullscreenPresentationRejection::OwnerMinimized),
+                fully_opaque: false,
+                exactly_covers_output: false,
+                overlays_visible: false,
+                software_cursor_visible: false,
+            };
+        }
         if self
             .toplevel_window_state(owner.owner_root_surface_id)
             .is_some_and(WindowState::is_minimized)
@@ -157,7 +191,7 @@ impl CompositorState {
             && geometry.placement.local_y == 0;
         let overlays_visible = self.visible_fullscreen_overlay_count() > 0;
         let root = self
-            .renderable_surfaces
+            .active_scene_surfaces()
             .iter()
             .find(|surface| surface.surface_id == owner.owner_root_surface_id);
         let viewport_compatibility = root.and_then(|surface| {
@@ -185,7 +219,9 @@ impl CompositorState {
             })
             && root.is_some_and(|surface| {
                 surface.visual_clip.is_none()
-                    && surface.render_placement.is_none()
+                    && surface
+                        .render_placement
+                        .is_none_or(|placement| placement == surface.placement)
                     && surface.placement == SurfacePlacement::absolute_root_at(0, 0)
             })
             && transform_or_scale_compatible;
@@ -224,6 +260,9 @@ impl CompositorState {
             .toplevel_surfaces
             .get(&owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerMissing)?;
+        if !self.surface_is_visible_in_active_workspace(owner.owner_root_surface_id) {
+            return Err(DirectScanoutSceneRejection::OwnerMinimized);
+        }
         if self
             .toplevel_window_state(owner.owner_root_surface_id)
             .is_some_and(WindowState::is_minimized)
@@ -231,10 +270,7 @@ impl CompositorState {
             return Err(DirectScanoutSceneRejection::OwnerMinimized);
         }
 
-        let popup_visible = self
-            .popup_nodes
-            .values()
-            .any(|node| node.lifecycle == PopupLifecycle::Alive && node.mapped);
+        let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
         if let Some(rejection) = direct_scanout_scene_rejection_for_flags(
             self.visible_layer_surface_above_content_count() > 0,
             popup_visible,
@@ -251,13 +287,13 @@ impl CompositorState {
             return Err(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput);
         }
 
-        let owner_index = self
-            .renderable_surfaces
+        let active_surfaces = self.active_scene_surfaces();
+        let owner_index = active_surfaces
             .iter()
             .position(|surface| surface.surface_id == owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerRootBufferMissing)?;
-        let root = &self.renderable_surfaces[owner_index];
-        if self.renderable_surfaces.iter().any(|surface| {
+        let root = &active_surfaces[owner_index];
+        if active_surfaces.iter().any(|surface| {
             surface.surface_id != owner.owner_root_surface_id
                 && self.root_surface_id_for_surface(surface.surface_id)
                     == owner.owner_root_surface_id
@@ -293,7 +329,9 @@ impl CompositorState {
         if self
             .active_toplevel_resizes
             .contains_key(&owner.owner_root_surface_id)
-            || root.render_placement.is_some()
+            || root
+                .render_placement
+                .is_some_and(|placement| placement != root.placement)
             || root.render_target_size.is_some()
         {
             return Err(DirectScanoutSceneRejection::ResizePreviewActive);
@@ -355,10 +393,7 @@ impl CompositorState {
             blockers.push(DirectScanoutSceneRejection::OwnerMinimized);
         }
 
-        let popup_visible = self
-            .popup_nodes
-            .values()
-            .any(|node| node.lifecycle == PopupLifecycle::Alive && node.mapped);
+        let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
         let resize_preview_active = self
             .active_toplevel_resizes
             .contains_key(&owner.owner_root_surface_id);
@@ -382,7 +417,7 @@ impl CompositorState {
         }
 
         let Some(root) = self
-            .renderable_surfaces
+            .active_scene_surfaces()
             .iter()
             .find(|surface| surface.surface_id == owner.owner_root_surface_id)
         else {
@@ -393,7 +428,7 @@ impl CompositorState {
             return blockers;
         };
 
-        if self.renderable_surfaces.iter().any(|surface| {
+        if self.active_scene_surfaces().iter().any(|surface| {
             surface.surface_id != owner.owner_root_surface_id
                 && self.root_surface_id_for_surface(surface.surface_id)
                     == owner.owner_root_surface_id
@@ -432,7 +467,9 @@ impl CompositorState {
             blockers.push(DirectScanoutSceneRejection::VisualClipPresent);
         }
         if resize_preview_active
-            || root.render_placement.is_some()
+            || root
+                .render_placement
+                .is_some_and(|placement| placement != root.placement)
             || root.render_target_size.is_some()
         {
             blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
@@ -458,10 +495,24 @@ impl CompositorState {
         let eligibility = self.fullscreen_presentation_eligibility();
         let owner_root_surface_id = eligibility.owner.map(|owner| owner.owner_root_surface_id);
         let visible_overlay_count = self.visible_fullscreen_overlay_count();
-        let solitary_tree_active = self.direct_scanout_scene_candidate().is_ok();
+        let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
+        // This is the composited visibility policy, not Direct Scanout
+        // admission.  A fullscreen owner with a non-scanout buffer still
+        // owns the fullscreen composition tree; only visible popups make the
+        // solitary tree invalid for the current native frame.
+        let owner_not_minimized = owner_root_surface_id.is_some_and(|owner| {
+            self.surface_is_visible_in_active_workspace(owner)
+                && !self
+                    .toplevel_window_state(owner)
+                    .is_some_and(WindowState::is_minimized)
+        });
+        let solitary_tree_active = owner_root_surface_id.is_some()
+            && eligibility.exactly_covers_output
+            && owner_not_minimized
+            && !popup_visible;
         let culled_surface_count = owner_root_surface_id
             .map(|owner| {
-                self.renderable_surfaces
+                self.active_scene_surfaces()
                     .iter()
                     .filter(|surface| self.root_surface_id_for_surface(surface.surface_id) != owner)
                     .count()
@@ -482,16 +533,17 @@ impl CompositorState {
     pub(in crate::compositor) fn native_frame_renderable_surfaces(
         &self,
     ) -> Cow<'_, [RenderableSurface]> {
+        let surfaces: Cow<'_, [RenderableSurface]> = Cow::Borrowed(self.active_scene_surfaces());
         let metrics = self.fullscreen_render_plan_metrics();
         if !metrics.solitary_tree_active {
-            return Cow::Borrowed(&self.renderable_surfaces);
+            return surfaces;
         }
         let Some(owner_root_surface_id) = metrics.owner_root_surface_id else {
-            return Cow::Borrowed(&self.renderable_surfaces);
+            return surfaces;
         };
         let overlay_tree_root_ids = self.fullscreen_overlay_tree_root_ids();
         Cow::Owned(
-            self.renderable_surfaces
+            surfaces
                 .iter()
                 .filter(|surface| {
                     let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);

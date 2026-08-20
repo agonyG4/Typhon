@@ -419,6 +419,46 @@ pub struct DecorationThemeListSnapshot {
     pub selected_theme: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WallpaperDescriptorSnapshot {
+    pub kind: String,
+    pub source_kind: String,
+    #[serde(default)]
+    pub origin: String,
+    pub fit: String,
+    pub scope: String,
+    pub logical_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub resolved_source: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WallpaperSnapshot {
+    pub configured: Option<WallpaperDescriptorSnapshot>,
+    pub factory_default: WallpaperDescriptorSnapshot,
+    pub effective: WallpaperDescriptorSnapshot,
+    pub state: String,
+    pub fallback: String,
+    pub generation: u64,
+    pub error_code: String,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct WallpaperListSnapshot {
+    pub wallpapers: Vec<WallpaperDescriptorSnapshot>,
+    pub snapshot: WallpaperSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -552,6 +592,8 @@ pub enum AstreactlResult {
     Performance(Box<PerformanceSnapshot>),
     DecorationTheme(DecorationThemeSnapshot),
     DecorationThemes(DecorationThemeListSnapshot),
+    Wallpaper(WallpaperSnapshot),
+    WallpaperList(WallpaperListSnapshot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

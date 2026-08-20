@@ -1,5 +1,6 @@
 use super::*;
-
+#[rustfmt::skip]
+use crate::egl_renderer::{BufferAge, EglPartialRepaintCapabilities, PartialRepaintPlanner, RepaintMode};
 #[test]
 fn direct_plane_validation_key_changes_for_modifier_and_generation() {
     let first = DirectPlaneValidationKey {
@@ -29,7 +30,6 @@ fn direct_plane_validation_key_changes_for_modifier_and_generation() {
     };
     assert_ne!(first, generation_changed);
 }
-
 #[test]
 fn connected_connector_for_card_prefers_connected_matching_card_output() {
     let root = std::env::current_dir()
@@ -518,6 +518,1189 @@ fn native_output_damage_for_window_move_covers_old_and_new_surface_bounds() {
             },
         ]
     );
+}
+
+#[test]
+fn native_decoration_damage_covers_old_new_state_change_and_disappearance() {
+    let window_id = WindowId::from_raw(41).expect("non-zero test window id");
+    let previous = DecorationSceneSnapshot::from_bounds(window_id, 7, 100, 80, 302, 227, 10);
+    let moved = DecorationSceneSnapshot::from_bounds(window_id, 7, 220, 140, 302, 227, 10);
+    let damage = NativeDamageAccumulator::from_decoration_bounds_changes(
+        640,
+        480,
+        std::slice::from_ref(&previous),
+        std::slice::from_ref(&moved),
+    )
+    .into_output_damage();
+
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 100, 80))
+    );
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 220, 140))
+    );
+
+    let state_changed = DecorationSceneSnapshot::from_bounds(window_id, 7, 220, 140, 302, 227, 11);
+    let state_damage = NativeDamageAccumulator::from_decoration_bounds_changes(
+        640,
+        480,
+        std::slice::from_ref(&moved),
+        std::slice::from_ref(&state_changed),
+    )
+    .into_output_damage();
+    assert!(!state_damage.is_empty());
+    assert!(state_damage.pixels < 640 * 480);
+
+    let disappearance = NativeDamageAccumulator::from_decoration_bounds_changes(
+        640,
+        480,
+        std::slice::from_ref(&state_changed),
+        &[],
+    )
+    .into_output_damage();
+    assert!(disappearance.rects.contains(&NativeDamageRect {
+        x: 220,
+        y: 140,
+        width: 302,
+        height: 227,
+    }));
+}
+
+#[test]
+fn native_output_damage_reproduces_ssd_trailing_titlebar_on_reused_buffer() {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    const BACKGROUND: u32 = 0xff12_151c;
+    const TITLEBAR: u32 = 0xff33_3333;
+    const CLIENT: u32 = 0xff65_7890;
+
+    let mut previous_position = (72, 72);
+    let mut previous_surface = test_renderable_surface(
+        77,
+        previous_position.0,
+        previous_position.1,
+        300,
+        200,
+        RenderableSurfaceDamage::Full,
+    );
+    let window_id = WindowId::from_raw(77).expect("non-zero test window id");
+    let mut previous_decoration = DecorationSceneSnapshot::from_bounds(
+        window_id,
+        77,
+        previous_position.0 - FRAME_BORDER,
+        previous_position.1 - TITLEBAR_HEIGHT,
+        302,
+        227,
+        1,
+    );
+    let mut retained = vec![BACKGROUND; (WIDTH * HEIGHT) as usize];
+    paint_ssd_scene(
+        &mut retained,
+        WIDTH,
+        HEIGHT,
+        previous_position,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        TITLEBAR,
+        CLIENT,
+        None,
+    );
+
+    for step in 1..=30 {
+        let current_position = (72 + step * 7, 72 + step * 3);
+        let current_surface = test_renderable_surface(
+            77,
+            current_position.0,
+            current_position.1,
+            300,
+            200,
+            RenderableSurfaceDamage::Full,
+        );
+        let current_decoration = DecorationSceneSnapshot::from_bounds(
+            window_id,
+            77,
+            current_position.0 - FRAME_BORDER,
+            current_position.1 - TITLEBAR_HEIGHT,
+            302,
+            227,
+            1,
+        );
+        let damage = native_output_damage_for_scene_and_cursor_with_decorations(
+            WIDTH,
+            HEIGHT,
+            std::slice::from_ref(&previous_surface),
+            std::slice::from_ref(&current_surface),
+            std::slice::from_ref(&previous_decoration),
+            std::slice::from_ref(&current_decoration),
+            true,
+            NativeCursorDamageBounds::default(),
+        );
+        assert!(
+            damage.rects.iter().any(|rect| native_damage_rect_contains(
+                *rect,
+                previous_position.0 + 10,
+                previous_position.1 - TITLEBAR_HEIGHT / 2,
+            )),
+            "step {step} must repair the old titlebar-only pixel"
+        );
+
+        paint_ssd_scene(
+            &mut retained,
+            WIDTH,
+            HEIGHT,
+            current_position,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            TITLEBAR,
+            CLIENT,
+            Some(&damage.rects),
+        );
+
+        let mut reference = vec![BACKGROUND; (WIDTH * HEIGHT) as usize];
+        paint_ssd_scene(
+            &mut reference,
+            WIDTH,
+            HEIGHT,
+            current_position,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            TITLEBAR,
+            CLIENT,
+            None,
+        );
+
+        assert_eq!(
+            retained, reference,
+            "partial SSD repaint diverged from the full reference at movement step {step}; old titlebar pixels were not repaired"
+        );
+
+        previous_surface = current_surface;
+        previous_decoration = current_decoration;
+        previous_position = current_position;
+    }
+}
+
+#[test]
+fn render_ahead_oversized_ssd_repair_matches_full_reference() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    const ROOT_X: i32 = -200;
+    const ROOT_Y: i32 = 120;
+    const PRESENTED_A_WIDTH: u32 = 2100;
+    const RENDERED_B_WIDTH: u32 = 1950;
+    const CURRENT_C_WIDTH: u32 = 1750;
+
+    let presented_a = test_renderable_surface(
+        88,
+        ROOT_X - 72,
+        ROOT_Y - 72,
+        PRESENTED_A_WIDTH,
+        420,
+        RenderableSurfaceDamage::Full,
+    );
+    let rendered_b = test_renderable_surface(
+        88,
+        ROOT_X - 72,
+        ROOT_Y - 72,
+        RENDERED_B_WIDTH,
+        420,
+        RenderableSurfaceDamage::Full,
+    );
+    let current_c = test_renderable_surface(
+        88,
+        ROOT_X - 72,
+        ROOT_Y - 72,
+        CURRENT_C_WIDTH,
+        420,
+        RenderableSurfaceDamage::Full,
+    );
+    assert!(presented_a.width > rendered_b.width);
+    assert!(rendered_b.width > current_c.width);
+    let window_id = WindowId::from_raw(88).expect("non-zero test window id");
+    let decoration = |width: u32| {
+        DecorationSceneSnapshot::from_bounds(
+            window_id,
+            88,
+            ROOT_X - FRAME_BORDER,
+            ROOT_Y - TITLEBAR_HEIGHT,
+            width.saturating_add((FRAME_BORDER * 2) as u32),
+            420 + TITLEBAR_HEIGHT as u32 + (FRAME_BORDER * 2) as u32,
+            1,
+        )
+    };
+    assert_eq!(
+        surface_origins(std::slice::from_ref(&rendered_b)),
+        vec![(ROOT_X, ROOT_Y)]
+    );
+
+    let presented_a_scene = NativeSceneSnapshot::from_surfaces(
+        std::slice::from_ref(&presented_a),
+        vec![decoration(PRESENTED_A_WIDTH)],
+    );
+    let rendered_b_scene = NativeSceneSnapshot::from_surfaces(
+        std::slice::from_ref(&rendered_b),
+        vec![decoration(RENDERED_B_WIDTH)],
+    );
+    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        frame_id: 1,
+        render_generation: 1,
+        scene: presented_a_scene,
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 2,
+        render_generation: 2,
+        scene: rendered_b_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    assert!(history.queue_submission(2));
+    assert_eq!(history.presented_scene().surfaces[0].surface_id, 88);
+
+    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_oversized_ssd_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        PRESENTED_A_WIDTH,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        None,
+    );
+
+    let current_scene = NativeSceneSnapshot::from_surfaces(
+        std::slice::from_ref(&current_c),
+        vec![decoration(CURRENT_C_WIDTH)],
+    );
+    let b_to_c_damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        &rendered_b_scene,
+        &current_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    assert!(
+        !b_to_c_damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(
+                *rect,
+                ROOT_X + PRESENTED_A_WIDTH as i32 - 70,
+                ROOT_Y - TITLEBAR_HEIGHT / 2,
+            )),
+        "B-to-C damage unexpectedly covers the A-only button sample: {:?}",
+        b_to_c_damage.rects
+    );
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        history.presented_scene(),
+        &current_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    assert!(damage.rects.iter().any(|rect| {
+        native_damage_rect_contains(
+            *rect,
+            ROOT_X + PRESENTED_A_WIDTH as i32 - 70,
+            ROOT_Y - TITLEBAR_HEIGHT / 2,
+        )
+    }));
+    paint_oversized_ssd_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        CURRENT_C_WIDTH,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        Some(&damage.rects),
+    );
+
+    let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_oversized_ssd_scene(
+        &mut reference,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        CURRENT_C_WIDTH,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        None,
+    );
+
+    let stale_button_x = ROOT_X + PRESENTED_A_WIDTH as i32 - 70;
+    let stale_edge_x = ROOT_X + PRESENTED_A_WIDTH as i32 - FRAME_BORDER - 1;
+    let sample_y = ROOT_Y - TITLEBAR_HEIGHT / 2;
+    assert_eq!(
+        partial[(sample_y * WIDTH as i32 + stale_button_x) as usize],
+        reference[(sample_y * WIDTH as i32 + stale_button_x) as usize],
+        "the A-only button region must be repaired from presented-scene history"
+    );
+    assert_eq!(
+        partial[(sample_y * WIDTH as i32 + stale_edge_x) as usize],
+        reference[(sample_y * WIDTH as i32 + stale_edge_x) as usize],
+        "the A-only titlebar edge must be repaired from presented-scene history"
+    );
+    let mismatches = partial
+        .iter()
+        .zip(&reference)
+        .filter(|(partial, reference)| partial != reference)
+        .count();
+    assert_eq!(
+        mismatches, 0,
+        "partial A-backed repaint must equal the clean C reference"
+    );
+}
+
+#[test]
+fn rejected_oversized_ssd_retry_matches_full_reference() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const ROOT_X: i32 = -200;
+    const ROOT_Y: i32 = 160;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    let window_id = WindowId::from_raw(92).expect("non-zero test window id");
+    let decoration = |width: u32| {
+        DecorationSceneSnapshot::from_bounds(
+            window_id,
+            92,
+            ROOT_X - FRAME_BORDER,
+            ROOT_Y - TITLEBAR_HEIGHT,
+            width.saturating_add((FRAME_BORDER * 2) as u32),
+            420 + TITLEBAR_HEIGHT as u32 + (FRAME_BORDER * 2) as u32,
+            1,
+        )
+    };
+    let surface = |width: u32, generation: u64| {
+        let mut surface = test_renderable_surface(
+            92,
+            ROOT_X - 72,
+            ROOT_Y - 72,
+            width,
+            420,
+            RenderableSurfaceDamage::Empty,
+        );
+        surface.generation = generation;
+        surface
+    };
+    let presented_surface = surface(2200, 30);
+    let retry_surface = surface(1400, 31);
+    let presented_scene = NativeSceneSnapshot::from_surfaces(
+        std::slice::from_ref(&presented_surface),
+        vec![decoration(2200)],
+    );
+    let retry_scene = NativeSceneSnapshot::from_surfaces(
+        std::slice::from_ref(&retry_surface),
+        vec![decoration(1400)],
+    );
+    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        frame_id: 1,
+        render_generation: 1,
+        scene: presented_scene,
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 2,
+        render_generation: 44,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    assert!(history.queue_submission(220));
+    assert!(history.discard_submission(220));
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 3,
+        render_generation: 44,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        history.presented_scene(),
+        &retry_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_oversized_ssd_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        2200,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        None,
+    );
+    paint_oversized_ssd_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        1400,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        Some(&damage.rects),
+    );
+    let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_oversized_ssd_scene(
+        &mut reference,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        1400,
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        None,
+    );
+    let stale_button_sample =
+        ((ROOT_Y - TITLEBAR_HEIGHT + 13) * WIDTH as i32 + ROOT_X + 2200 - 150) as usize;
+    assert_eq!(
+        partial[stale_button_sample], reference[stale_button_sample],
+        "the old traffic-light cluster must be repaired after the SSD shrink"
+    );
+    let stale_titlebar_edge_sample =
+        ((ROOT_Y - TITLEBAR_HEIGHT + 13) * WIDTH as i32 + WIDTH as i32 - 1) as usize;
+    assert_eq!(
+        partial[stale_titlebar_edge_sample], reference[stale_titlebar_edge_sample],
+        "the old visible titlebar right edge must be repaired after the SSD shrink"
+    );
+    assert_eq!(partial, reference);
+}
+
+#[test]
+fn rejected_oversized_csd_retry_matches_full_reference() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const ROOT_X: i32 = -200;
+    const ROOT_Y: i32 = 160;
+    let surface = |width: u32, generation: u64| {
+        let mut surface = test_renderable_surface(
+            93,
+            ROOT_X - 72,
+            ROOT_Y - 72,
+            width,
+            420,
+            RenderableSurfaceDamage::Empty,
+        );
+        surface.generation = generation;
+        surface
+    };
+    let presented_surface = surface(2200, 50);
+    let retry_surface = surface(1400, 51);
+    let presented_scene =
+        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&presented_surface), Vec::new());
+    let retry_scene =
+        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&retry_surface), Vec::new());
+    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        frame_id: 1,
+        render_generation: 1,
+        scene: presented_scene,
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 2,
+        render_generation: 45,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    assert!(history.queue_submission(230));
+    assert!(history.discard_submission(230));
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 3,
+        render_generation: 45,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        history.presented_scene(),
+        &retry_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_client_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        2200,
+        420,
+        0xff4c_7890,
+        None,
+    );
+    paint_client_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        1400,
+        420,
+        0xff78_90a4,
+        Some(&damage.rects),
+    );
+    let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_client_scene(
+        &mut reference,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        1400,
+        420,
+        0xff78_90a4,
+        None,
+    );
+    assert_eq!(partial, reference);
+}
+
+#[test]
+fn rejected_content_only_retry_repaints_same_geometry() {
+    const WIDTH: u32 = 960;
+    const HEIGHT: u32 = 640;
+    const ROOT_X: i32 = 180;
+    const ROOT_Y: i32 = 100;
+    let mut presented_surface = test_renderable_surface(
+        94,
+        ROOT_X - 72,
+        ROOT_Y - 72,
+        500,
+        300,
+        RenderableSurfaceDamage::Empty,
+    );
+    presented_surface.generation = 60;
+    let mut retry_surface = presented_surface.clone();
+    retry_surface.generation = 61;
+    let presented_scene =
+        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&presented_surface), Vec::new());
+    let retry_scene =
+        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&retry_surface), Vec::new());
+    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        frame_id: 1,
+        render_generation: 1,
+        scene: presented_scene,
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 2,
+        render_generation: 46,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    assert!(history.queue_submission(240));
+    assert!(history.discard_submission(240));
+    history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id: 3,
+        render_generation: 46,
+        scene: retry_scene.clone(),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        history.presented_scene(),
+        &retry_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_client_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        500,
+        300,
+        0xff4c_7890,
+        None,
+    );
+    paint_client_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        500,
+        300,
+        0xffc0_7850,
+        Some(&damage.rects),
+    );
+    let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_client_scene(
+        &mut reference,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        500,
+        300,
+        0xffc0_7850,
+        None,
+    );
+    assert_eq!(partial, reference);
+}
+
+#[test]
+fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_three() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const ROOT_X: i32 = -200;
+    const ROOT_Y: i32 = 160;
+    const CLIENT_HEIGHT: u32 = 220;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    let window_id = WindowId::from_raw(96).expect("non-zero test window id");
+    let scene = |width: u32, generation: u64| {
+        let mut surface = test_renderable_surface(
+            96,
+            ROOT_X - 72,
+            ROOT_Y - 72,
+            width,
+            CLIENT_HEIGHT,
+            RenderableSurfaceDamage::Empty,
+        );
+        surface.generation = generation;
+        NativeSceneSnapshot::from_surfaces(
+            std::slice::from_ref(&surface),
+            vec![DecorationSceneSnapshot::from_bounds(
+                window_id,
+                96,
+                ROOT_X - FRAME_BORDER,
+                ROOT_Y - TITLEBAR_HEIGHT,
+                width.saturating_add((FRAME_BORDER * 2) as u32),
+                CLIENT_HEIGHT + TITLEBAR_HEIGHT as u32 + (FRAME_BORDER * 2) as u32,
+                1,
+            )],
+        )
+    };
+
+    for age in 1..=3_u32 {
+        let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+            frame_id: 1,
+            render_generation: 1,
+            scene: scene(2200, 100),
+            cursor_damage: NativeCursorDamageBounds::default(),
+        });
+        let mut planner = PartialRepaintPlanner::new(
+            (WIDTH, HEIGHT),
+            EglPartialRepaintCapabilities {
+                buffer_age: true,
+                partial_render_repair: true,
+                swap_buffers_with_damage: true,
+            },
+        );
+        let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+        planner.commit_presented_transition(first.render_damage.clone());
+
+        let intermediate_widths: &[u32] = match age {
+            1 => &[],
+            2 => &[2050],
+            3 => &[2050, 1900],
+            _ => unreachable!(),
+        };
+        for (index, width) in intermediate_widths.iter().copied().enumerate() {
+            let current_scene = scene(width, 101 + index as u64);
+            let current_damage = native_output_damage_for_scene_snapshots(
+                WIDTH,
+                HEIGHT,
+                history.presented_scene(),
+                &current_scene,
+                NativeCursorDamageBounds::default(),
+            )
+            .as_renderer_damage(WIDTH, HEIGHT);
+            let plan = planner.plan(current_damage, BufferAge::Value(1));
+            assert_eq!(
+                plan.mode,
+                RepaintMode::Partial,
+                "intermediate age history must remain partial at width {width}"
+            );
+            planner.commit_presented_transition(plan.render_damage.clone());
+            let frame_id = 2 + index as u64;
+            history.replace_ready(NativeFrameSceneSnapshot {
+                frame_id,
+                render_generation: frame_id,
+                scene: current_scene,
+                cursor_damage: NativeCursorDamageBounds::default(),
+            });
+            let token = 960 + frame_id;
+            assert!(history.queue_submission(token));
+            assert!(history.promote_pageflip(token));
+        }
+
+        let retry_scene = scene(1400, 110);
+        let rejected_frame_id = 10 + age as u64;
+        history.replace_ready(NativeFrameSceneSnapshot {
+            frame_id: rejected_frame_id,
+            render_generation: 900,
+            scene: retry_scene.clone(),
+            cursor_damage: NativeCursorDamageBounds::default(),
+        });
+        let rejected_token = 1000 + age as u64;
+        assert!(history.queue_submission(rejected_token));
+        assert!(history.discard_submission(rejected_token));
+        history.replace_ready(NativeFrameSceneSnapshot {
+            frame_id: rejected_frame_id + 1,
+            render_generation: 900,
+            scene: retry_scene.clone(),
+            cursor_damage: NativeCursorDamageBounds::default(),
+        });
+
+        let current_damage = native_output_damage_for_scene_snapshots(
+            WIDTH,
+            HEIGHT,
+            history.presented_scene(),
+            &retry_scene,
+            NativeCursorDamageBounds::default(),
+        );
+        let plan = planner.plan(
+            current_damage.as_renderer_damage(WIDTH, HEIGHT),
+            BufferAge::Value(age as i32),
+        );
+        assert_eq!(
+            plan.mode,
+            RepaintMode::Partial,
+            "age {age} retry must use bounded partial repair"
+        );
+        let repair_rects = plan
+            .repair_damage
+            .rects_slice()
+            .iter()
+            .map(|rect| NativeDamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+            .collect::<Vec<_>>();
+        let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+        paint_ssd_scene_with_height(
+            &mut partial,
+            WIDTH,
+            HEIGHT,
+            ROOT_X,
+            ROOT_Y,
+            2200,
+            CLIENT_HEIGHT,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            None,
+        );
+        paint_ssd_scene_with_height(
+            &mut partial,
+            WIDTH,
+            HEIGHT,
+            ROOT_X,
+            ROOT_Y,
+            1400,
+            CLIENT_HEIGHT,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            Some(&repair_rects),
+        );
+        let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+        paint_ssd_scene_with_height(
+            &mut reference,
+            WIDTH,
+            HEIGHT,
+            ROOT_X,
+            ROOT_Y,
+            1400,
+            CLIENT_HEIGHT,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            None,
+        );
+        let mismatches = partial
+            .iter()
+            .zip(&reference)
+            .filter(|(partial, reference)| partial != reference)
+            .count();
+        let first_mismatch = partial
+            .iter()
+            .zip(&reference)
+            .position(|(partial, reference)| partial != reference)
+            .map(|index| (index % WIDTH as usize, index / WIDTH as usize));
+        assert_eq!(
+            mismatches, 0,
+            "age {age} retry differs from full B at {first_mismatch:?}; repair={repair_rects:?}"
+        );
+    }
+}
+
+#[test]
+fn presented_scene_history_repairs_oversized_shrink_sequence() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    const ROOT_X: i32 = -200;
+    const ROOT_Y: i32 = 120;
+    let widths: Vec<u32> = (0..=30).map(|step| 2200 - (step * 1400 / 30)).collect();
+    let window_id = WindowId::from_raw(89).expect("non-zero test window id");
+    let decoration = |width: u32| {
+        DecorationSceneSnapshot::from_bounds(
+            window_id,
+            89,
+            ROOT_X - FRAME_BORDER,
+            ROOT_Y - TITLEBAR_HEIGHT,
+            width.saturating_add((FRAME_BORDER * 2) as u32),
+            420 + TITLEBAR_HEIGHT as u32 + (FRAME_BORDER * 2) as u32,
+            1,
+        )
+    };
+    let surface = |width: u32| {
+        test_renderable_surface(
+            89,
+            ROOT_X - 72,
+            ROOT_Y - 72,
+            width,
+            420,
+            RenderableSurfaceDamage::Full,
+        )
+    };
+    let scene = |surface: &RenderableSurface, width: u32| {
+        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(surface), vec![decoration(width)])
+    };
+
+    assert_eq!(widths.first(), Some(&2200));
+    assert_eq!(widths.last(), Some(&800));
+    let first_surface = surface(widths[0]);
+    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        frame_id: 0,
+        render_generation: 0,
+        scene: scene(&first_surface, widths[0]),
+        cursor_damage: NativeCursorDamageBounds::default(),
+    });
+    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+    paint_oversized_ssd_scene(
+        &mut partial,
+        WIDTH,
+        HEIGHT,
+        ROOT_X,
+        ROOT_Y,
+        widths[0],
+        TITLEBAR_HEIGHT,
+        FRAME_BORDER,
+        None,
+    );
+
+    for (step, width) in widths.iter().copied().enumerate().skip(1) {
+        let current_surface = surface(width);
+        let current_scene = scene(&current_surface, width);
+        let damage = native_output_damage_for_scene_snapshots(
+            WIDTH,
+            HEIGHT,
+            history.presented_scene(),
+            &current_scene,
+            NativeCursorDamageBounds::default(),
+        );
+        paint_oversized_ssd_scene(
+            &mut partial,
+            WIDTH,
+            HEIGHT,
+            ROOT_X,
+            ROOT_Y,
+            width,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            Some(&damage.rects),
+        );
+        let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
+        paint_oversized_ssd_scene(
+            &mut reference,
+            WIDTH,
+            HEIGHT,
+            ROOT_X,
+            ROOT_Y,
+            width,
+            TITLEBAR_HEIGHT,
+            FRAME_BORDER,
+            None,
+        );
+        let mismatches = partial
+            .iter()
+            .zip(&reference)
+            .filter(|(partial, reference)| partial != reference)
+            .count();
+        assert_eq!(mismatches, 0, "shrink step {step} at width {width}");
+
+        history.replace_ready(NativeFrameSceneSnapshot {
+            frame_id: step as u64,
+            render_generation: step as u64,
+            scene: current_scene,
+            cursor_damage: NativeCursorDamageBounds::default(),
+        });
+        let token = 100 + step as u64;
+        assert!(history.queue_submission(token));
+        assert!(history.promote_pageflip(token));
+    }
+}
+
+#[test]
+fn presented_scene_damage_repairs_all_resize_edges() {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const TITLEBAR_HEIGHT: i32 = 26;
+    const FRAME_BORDER: i32 = 1;
+    let window_id = WindowId::from_raw(90).expect("non-zero test window id");
+    let cases = [
+        ("left", (100, 160, 1600, 800), (300, 160, 1400, 800)),
+        ("right", (100, 160, 1600, 800), (100, 160, 1400, 800)),
+        ("top", (100, 160, 1600, 800), (100, 280, 1600, 680)),
+        ("bottom", (100, 160, 1600, 800), (100, 160, 1600, 680)),
+        ("top-left", (100, 160, 1600, 800), (300, 280, 1400, 680)),
+        ("top-right", (100, 160, 1600, 800), (100, 280, 1400, 680)),
+        ("bottom-left", (100, 160, 1600, 800), (300, 160, 1400, 680)),
+        ("bottom-right", (100, 160, 1600, 800), (100, 160, 1400, 680)),
+    ];
+
+    for (name, previous, current) in cases {
+        let surface = |geometry: (i32, i32, u32, u32)| {
+            test_renderable_surface(
+                90,
+                geometry.0 - 72,
+                geometry.1 - 72,
+                geometry.2,
+                geometry.3,
+                RenderableSurfaceDamage::Full,
+            )
+        };
+        let decoration = |geometry: (i32, i32, u32, u32)| {
+            DecorationSceneSnapshot::from_bounds(
+                window_id,
+                90,
+                geometry.0 - FRAME_BORDER,
+                geometry.1 - TITLEBAR_HEIGHT,
+                geometry.2 + (FRAME_BORDER * 2) as u32,
+                geometry.3 + TITLEBAR_HEIGHT as u32 + (FRAME_BORDER * 2) as u32,
+                1,
+            )
+        };
+        let previous_surface = surface(previous);
+        let current_surface = surface(current);
+        let previous_scene = NativeSceneSnapshot::from_surfaces(
+            std::slice::from_ref(&previous_surface),
+            vec![decoration(previous)],
+        );
+        let current_scene = NativeSceneSnapshot::from_surfaces(
+            std::slice::from_ref(&current_surface),
+            vec![decoration(current)],
+        );
+        let damage = native_output_damage_for_scene_snapshots(
+            WIDTH,
+            HEIGHT,
+            &previous_scene,
+            &current_scene,
+            NativeCursorDamageBounds::default(),
+        );
+
+        assert!(
+            damage
+                .rects
+                .iter()
+                .any(|rect| native_damage_rect_contains(*rect, previous.0, previous.1)),
+            "{name} resize must repair the previous visual bounds"
+        );
+        assert!(
+            damage
+                .rects
+                .iter()
+                .any(|rect| native_damage_rect_contains(*rect, current.0, current.1)),
+            "{name} resize must repaint the current visual bounds"
+        );
+    }
+}
+
+fn paint_oversized_ssd_scene(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    root_x: i32,
+    root_y: i32,
+    client_width: u32,
+    titlebar_height: i32,
+    frame_border: i32,
+    damage: Option<&[NativeDamageRect]>,
+) {
+    paint_ssd_scene_with_height(
+        frame,
+        width,
+        height,
+        root_x,
+        root_y,
+        client_width,
+        420,
+        titlebar_height,
+        frame_border,
+        damage,
+    );
+}
+
+fn paint_ssd_scene_with_height(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    root_x: i32,
+    root_y: i32,
+    client_width: u32,
+    client_height: u32,
+    titlebar_height: i32,
+    frame_border: i32,
+    damage: Option<&[NativeDamageRect]>,
+) {
+    const BACKGROUND: u32 = 0xff12_151c;
+    const TITLEBAR: u32 = 0xff33_3333;
+    const CLIENT: u32 = 0xff65_7890;
+    const BUTTON: u32 = 0xffd0_5040;
+    let outer = NativeDamageRect {
+        x: root_x - frame_border,
+        y: root_y - titlebar_height,
+        width: client_width.saturating_add((frame_border * 2) as u32),
+        height: client_height + titlebar_height as u32 + (frame_border * 2) as u32,
+    };
+    let client = NativeDamageRect {
+        x: root_x,
+        y: root_y,
+        width: client_width,
+        height: client_height,
+    };
+    let buttons = NativeDamageRect {
+        x: root_x + client_width as i32 - 180,
+        y: root_y - titlebar_height + 8,
+        width: 120,
+        height: 10,
+    };
+
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if damage.is_some_and(|rects| {
+                !rects
+                    .iter()
+                    .any(|rect| native_damage_rect_contains(*rect, x, y))
+            }) {
+                continue;
+            }
+            let index = (y * width as i32 + x) as usize;
+            frame[index] = if native_damage_rect_contains(buttons, x, y) {
+                BUTTON
+            } else if native_damage_rect_contains(client, x, y) {
+                CLIENT
+            } else if native_damage_rect_contains(outer, x, y) {
+                TITLEBAR
+            } else {
+                BACKGROUND
+            };
+        }
+    }
+}
+
+fn paint_client_scene(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    root_x: i32,
+    root_y: i32,
+    client_width: u32,
+    client_height: u32,
+    client_color: u32,
+    damage: Option<&[NativeDamageRect]>,
+) {
+    let client = NativeDamageRect {
+        x: root_x,
+        y: root_y,
+        width: client_width,
+        height: client_height,
+    };
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if damage.is_some_and(|rects| {
+                !rects
+                    .iter()
+                    .any(|rect| native_damage_rect_contains(*rect, x, y))
+            }) {
+                continue;
+            }
+            let index = (y * width as i32 + x) as usize;
+            frame[index] = if native_damage_rect_contains(client, x, y) {
+                client_color
+            } else {
+                0xff12_151c
+            };
+        }
+    }
+}
+
+fn paint_ssd_scene(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    position: (i32, i32),
+    titlebar_height: i32,
+    frame_border: i32,
+    titlebar: u32,
+    client: u32,
+    damage: Option<&[NativeDamageRect]>,
+) {
+    let outer = NativeDamageRect {
+        x: position.0 - frame_border,
+        y: position.1 - titlebar_height,
+        width: 300 + (frame_border * 2) as u32,
+        height: 200 + titlebar_height as u32 + (frame_border * 2) as u32,
+    };
+    let client_rect = NativeDamageRect {
+        x: position.0,
+        y: position.1,
+        width: 300,
+        height: 200,
+    };
+
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if damage.is_some_and(|rects| {
+                !rects
+                    .iter()
+                    .any(|rect| native_damage_rect_contains(*rect, x, y))
+            }) {
+                continue;
+            }
+            let index = (y * width as i32 + x) as usize;
+            frame[index] = if native_damage_rect_contains(client_rect, x, y) {
+                client
+            } else if native_damage_rect_contains(outer, x, y) {
+                titlebar
+            } else {
+                0xff12_151c
+            };
+        }
+    }
+}
+
+fn native_damage_rect_contains(rect: NativeDamageRect, x: i32, y: i32) -> bool {
+    x >= rect.x
+        && y >= rect.y
+        && x < rect.x.saturating_add(rect.width as i32)
+        && y < rect.y.saturating_add(rect.height as i32)
 }
 
 #[test]

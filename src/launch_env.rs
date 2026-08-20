@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    env, fs, io,
+    env,
+    ffi::{OsStr, OsString},
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -444,6 +446,128 @@ fn command_available(program: &str) -> bool {
         return false;
     };
     env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
+}
+
+const ASTREA_LAYER_SHELL_QT_LIBDIR: &str = "ASTREA_LAYER_SHELL_QT_LIBDIR";
+const ASTREA_LAYER_SHELL_QT_INTERFACE: &str = "libLayerShellQtInterface.so.6";
+
+/// Add the installed Astrea LayerShellQt runtime to an external shell command.
+///
+/// Eclipse builds can be relocatable and therefore cannot rely on a build-time
+/// RUNPATH. Keep this scoped to the shell process and preserve any library
+/// paths supplied by the user or inherited from the session.
+pub fn configure_astrea_shell_runtime(command: &mut Command) {
+    let Some(library_dir) = astrea_layer_shell_qt_library_dir() else {
+        return;
+    };
+
+    let command_library_path = command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("LD_LIBRARY_PATH"))
+        .map(|(_, value)| value.map(OsStr::to_os_string));
+    let existing_library_path =
+        command_library_path.unwrap_or_else(|| env::var_os("LD_LIBRARY_PATH"));
+
+    if let Ok(library_path) = prepend_library_path(&library_dir, existing_library_path.as_deref()) {
+        command.env("LD_LIBRARY_PATH", library_path);
+    }
+}
+
+fn astrea_layer_shell_qt_library_dir() -> Option<PathBuf> {
+    if let Some(library_dir) = env::var_os(ASTREA_LAYER_SHELL_QT_LIBDIR)
+        .map(PathBuf::from)
+        .filter(|path| path.join(ASTREA_LAYER_SHELL_QT_INTERFACE).is_file())
+    {
+        return Some(library_dir);
+    }
+
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| astrea_layer_shell_qt_library_dir_from_home(&home))
+}
+
+fn astrea_layer_shell_qt_library_dir_from_home(home: &Path) -> Option<PathBuf> {
+    let opt_dir = home.join(".local").join("opt");
+    let mut prefixes = fs::read_dir(opt_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let name = entry.file_name();
+            name.to_str()
+                .filter(|name| name.starts_with("astrea-layer-shell-qt-"))
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    prefixes.sort_unstable_by(|left, right| right.cmp(left));
+
+    prefixes
+        .into_iter()
+        .find_map(|prefix| astrea_layer_shell_qt_library_dir_from_prefix(&prefix))
+}
+
+fn astrea_layer_shell_qt_library_dir_from_prefix(prefix: &Path) -> Option<PathBuf> {
+    [
+        prefix.join("usr/lib"),
+        prefix.join("usr/lib64"),
+        prefix.join("lib"),
+    ]
+    .into_iter()
+    .find(|library_dir| library_dir.join(ASTREA_LAYER_SHELL_QT_INTERFACE).is_file())
+}
+
+fn prepend_library_path(library_dir: &Path, existing: Option<&OsStr>) -> io::Result<OsString> {
+    let mut paths = vec![library_dir.to_owned()];
+    if let Some(existing) = existing {
+        paths.extend(env::split_paths(existing).filter(|path| path != library_dir));
+    }
+    env::join_paths(paths).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn astrea_layer_shell_qt_runtime_finds_installed_usr_lib() {
+        let root = env::temp_dir().join(format!(
+            "oblivion-one-layer-shell-test-{}",
+            std::process::id()
+        ));
+        let library_dir = root
+            .join(".local")
+            .join("opt")
+            .join("astrea-layer-shell-qt-test")
+            .join("usr")
+            .join("lib");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::write(
+            library_dir.join("libLayerShellQtInterface.so.6"),
+            b"test library",
+        )
+        .unwrap();
+
+        assert_eq!(
+            astrea_layer_shell_qt_library_dir_from_home(&root),
+            Some(library_dir.clone())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn astrea_layer_shell_qt_runtime_prepends_without_dropping_existing_paths() {
+        let library_dir = Path::new("/home/agony/.local/opt/astrea-layer-shell-qt/usr/lib");
+
+        assert_eq!(
+            prepend_library_path(library_dir, Some(OsStr::new("/one:/two"))).unwrap(),
+            OsStr::new("/home/agony/.local/opt/astrea-layer-shell-qt/usr/lib:/one:/two")
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

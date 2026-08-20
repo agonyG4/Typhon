@@ -1,3 +1,4 @@
 pub mod client;
 pub mod discovery;
 pub mod output;
+pub mod wallpaper;

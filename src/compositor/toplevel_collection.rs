@@ -72,7 +72,7 @@ impl CompositorState {
                 states = states.union(AstreaToplevelStates::MINIMIZED);
             }
             match window.state.mode() {
-                super::window_state::ToplevelMode::Floating => {}
+                super::window_state::ToplevelMode::Normal => {}
                 super::window_state::ToplevelMode::Maximized => {
                     states = states.union(AstreaToplevelStates::MAXIMIZED);
                 }

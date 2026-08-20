@@ -815,7 +815,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 );
             }
             xdg_toplevel::Request::UnsetMaximized => {
-                state.restore_floating_root_window(compositor_surface_id(&data.surface));
+                state.restore_normal_root_window(compositor_surface_id(&data.surface));
             }
             xdg_toplevel::Request::SetFullscreen { .. } => {
                 state.set_root_window_mode(
@@ -824,7 +824,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 );
             }
             xdg_toplevel::Request::UnsetFullscreen => {
-                state.restore_floating_root_window(compositor_surface_id(&data.surface));
+                state.restore_normal_root_window(compositor_surface_id(&data.surface));
             }
             xdg_toplevel::Request::SetMinimized => {
                 state.minimize_root_window(compositor_surface_id(&data.surface));

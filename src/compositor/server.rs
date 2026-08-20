@@ -44,6 +44,7 @@ use wayland_server::{
 mod control_api;
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
+use crate::wm::{WorkspaceId, WorkspaceSwitchOutcome};
 use crate::xwayland::xwm::{ConfigureSource, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_globals.rs"]
@@ -63,9 +64,9 @@ use super::{
     PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, SurfacePresentationMetadata, WindowFocusOutcome, WindowFocusReason,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
-    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    SurfacePacingMetrics, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
+    WindowFocusReason, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
+    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
 };
 #[derive(Debug)]
@@ -761,11 +762,11 @@ impl OwnCompositorServer {
                     .window_id_for_x11_handle(window)
                     .is_some_and(|window_id| {
                         !matches!(
-                            self.state.focus_desktop_window(
+                            self.state.activate_desktop_window(
                                 window_id,
                                 WindowFocusReason::ShellActivation
                             ),
-                            WindowFocusOutcome::Unavailable
+                            WindowActivationOutcome::Unavailable
                         )
                     })
                 {
@@ -779,6 +780,18 @@ impl OwnCompositorServer {
                 } else {
                     Vec::new()
                 }
+            }
+            XwmEvent::CurrentDesktopRequested(workspace) => {
+                let _ = self.state.activate_workspace(workspace);
+                Vec::new()
+            }
+            XwmEvent::WindowWorkspaceRequested { window, workspace } => {
+                let Some(window_id) = self.state.window_id_for_x11_handle(window) else {
+                    return Vec::new();
+                };
+                self.state
+                    .move_window_family_to_workspace(window_id, workspace);
+                Vec::new()
             }
             XwmEvent::ResizeSyncAckObserved {
                 window,
@@ -906,6 +919,18 @@ impl OwnCompositorServer {
 
     pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.state.external_overlay_surface_ids()
+    }
+
+    pub fn active_workspace(&self) -> WorkspaceId {
+        self.state.active_workspace()
+    }
+
+    pub fn activate_workspace(&mut self, workspace: WorkspaceId) -> WorkspaceSwitchOutcome {
+        self.state.activate_workspace(workspace)
+    }
+
+    pub fn move_focused_window_to_workspace(&mut self, workspace: WorkspaceId) -> bool {
+        self.state.move_focused_window_to_workspace(workspace)
     }
 
     pub fn mark_render_damage_presented(&mut self) {
@@ -1319,7 +1344,6 @@ impl OwnCompositorServer {
     pub fn prepare_frame(&mut self) {
         self.state.commit_ready_explicit_sync_buffers();
         color::flush_pending_color_info(&mut self.state);
-        self.state.apply_pending_interactive_resize_update();
         self.state.flush_pending_resize_configure();
         let _ = self.display.flush_clients();
     }

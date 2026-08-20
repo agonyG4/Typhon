@@ -41,7 +41,10 @@ pub(super) fn log_output_pipeline_snapshot(
             NativePerfField::str("configured_policy", configured_policy.as_str()),
             NativePerfField::str("effective_mode", pacing_mode.as_str()),
             NativePerfField::str("capability", pipeline.triple_capability.as_str()),
-            NativePerfField::str("current_primary", format!("{:?}", pipeline.current_primary)),
+            NativePerfField::str(
+                "current_primary",
+                format!("{:?}", pipeline.presented_planes.primary),
+            ),
             NativePerfField::str(
                 "kernel_submitted",
                 format!("{:?}", pipeline.kernel_submitted),

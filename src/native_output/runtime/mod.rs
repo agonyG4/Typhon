@@ -44,6 +44,7 @@ mod presentation_protocol;
 mod presentation_ready;
 mod presentation_transactions;
 mod presentation_worker;
+mod scene_history;
 mod session;
 mod session_io;
 mod shutdown;
@@ -54,6 +55,7 @@ mod xwayland_reactor;
 mod xwayland_reactor_tests;
 
 use metrics::NativeRenderTelemetry;
+pub(crate) use scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{
@@ -72,7 +74,8 @@ pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
-    earliest_native_deadline, native_pointer_debug_log, normalize_refresh_hz,
+    ResolvedNativeFrameScene, earliest_native_deadline, native_pointer_debug_log,
+    normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{
@@ -163,7 +166,7 @@ pub(crate) enum NativeClientCursorPath {
     Software,
 }
 
-pub(super) type ConfirmedPrimaryAssignment = ConfirmedPrimaryState;
+pub(super) type PresentedPrimaryAssignment = PresentedPrimaryState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmedOutputPresentationState {
@@ -305,7 +308,6 @@ pub(crate) struct NativeRuntime {
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
-    confirmed_primary_assignment: Option<ConfirmedPrimaryAssignment>,
     confirmed_output_presentation: ConfirmedOutputPresentationState,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
@@ -322,7 +324,7 @@ pub(crate) struct NativeRuntime {
     last_refresh_sequence: u64,
     last_submitted_cursor_epoch: u64,
     last_primary_presented_at_ns: Option<u64>,
-    last_renderable_surfaces: Vec<RenderableSurface>,
+    scene_history: NativeSceneHistory,
     last_client_cursor_damage: Option<NativeClientCursorDamageState>,
     last_software_cursor_damage: Option<NativeDamageRect>,
     last_client_cursor_path: Option<NativeClientCursorPath>,
@@ -512,7 +514,7 @@ impl Drop for NativeRuntime {
             self.retain_unproven_teardown_ownership();
             return;
         }
-        self.confirmed_primary_assignment = None;
+        self.presented_planes.primary = None;
         self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         if !self.scanout_destroyed
             && let Err(error) = self.scanout.release_direct_for_target_destroyed()

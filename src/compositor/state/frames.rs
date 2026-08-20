@@ -76,20 +76,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
-        !self.active_fifo_barriers.is_empty()
-            || self.pending_interactive_resize_update.is_some()
+        self.active_fifo_barriers
+            .keys()
+            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id))
             || self.pending_resize_configure_is_flushable()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
-                !self.external_acquire_readiness
-                    || commit.acquire_state == PendingAcquireState::Ready
+                self.surface_is_visible_in_active_workspace(commit.surface_id)
+                    && (!self.external_acquire_readiness
+                        || commit.acquire_state == PendingAcquireState::Ready)
             })
             || self
                 .pending_surface_tree_transactions
                 .iter()
                 .any(|transaction| {
-                    transaction.commit_timing_request().is_some()
-                        || !self.external_acquire_readiness
-                        || self.transaction_is_ready(transaction)
+                    self.surface_is_visible_in_active_workspace(transaction.root_surface_id)
+                        && (transaction.commit_timing_request().is_some()
+                            || !self.external_acquire_readiness
+                            || self.transaction_is_ready(transaction))
                 })
             || !self.pending_color_info.is_empty()
     }
@@ -102,7 +105,7 @@ impl CompositorState {
     pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
         self.has_pending_frame_prepare_work()
             || self.has_unowned_frame_callbacks()
-            || !self.pending_presentation_feedbacks.is_empty()
+            || self.has_visible_pending_presentation_feedbacks()
     }
 
     pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
@@ -228,7 +231,7 @@ impl CompositorState {
         let shm_buffer_releases = std::mem::take(&mut self.pending_buffer_releases);
         let dmabuf_releases_to_complete_on_present =
             std::mem::take(&mut self.pending_dmabuf_buffer_releases);
-        let callbacks = std::mem::take(&mut self.pending_frame_callbacks);
+        let callbacks = self.take_visible_pending_frame_callbacks();
         let callback_count = callbacks.len();
         let callback_commit_ns = (callback_count > 0).then_some(
             self.frame_callback_metrics
@@ -256,18 +259,17 @@ impl CompositorState {
         }
         let captured_releases =
             shm_buffer_releases.len() + dmabuf_releases_to_complete_on_present.len();
-        let fifo_barrier_claims = self.fifo_claims_for_frame(
-            self.renderable_surfaces
-                .iter()
-                .map(|surface| surface.surface_id)
-                .chain(self.client_cursor_surfaces.keys().copied()),
-        );
-        let commit_timing_target_claims = self.commit_timing_claims_for_frame(
-            self.renderable_surfaces
-                .iter()
-                .map(|surface| surface.surface_id)
-                .chain(self.client_cursor_surfaces.keys().copied()),
-        );
+        let active_scene_surface_ids = self
+            .active_scene_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .chain(self.client_cursor_surfaces.keys().copied())
+            .collect::<Vec<_>>();
+        let fifo_barrier_claims =
+            self.fifo_claims_for_frame(active_scene_surface_ids.iter().copied());
+        let commit_timing_target_claims =
+            self.commit_timing_claims_for_frame(active_scene_surface_ids.iter().copied());
+        let presentation_feedbacks = self.take_visible_pending_presentation_feedbacks();
         self.buffer_release_metrics.buffer_releases_captured = self
             .buffer_release_metrics
             .buffer_releases_captured
@@ -294,7 +296,7 @@ impl CompositorState {
                 callback_render_completed_ns: None,
                 callback_settlement: FrameCallbackSettlement::new(callback_count),
                 callback_terminal_ownership_checked: false,
-                presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
+                presentation_feedbacks,
                 shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,
                 fifo_barrier_claims,
@@ -322,6 +324,7 @@ impl CompositorState {
             .presentation_feedbacks
             .append(&mut self.pending_presentation_feedbacks);
         self.pending_presentation_feedbacks = batch.presentation_feedbacks;
+        self.refresh_frame_work_visibility();
         let restored_shm = batch.shm_buffer_releases.len();
         batch
             .shm_buffer_releases
@@ -520,7 +523,11 @@ impl CompositorState {
                 }
             });
         }
+        let before = self.pending_presentation_feedbacks.len();
         discard_surface(&mut self.pending_presentation_feedbacks, surface_id);
+        self.visible_pending_presentation_feedback_count = self
+            .visible_pending_presentation_feedback_count
+            .saturating_sub(before.saturating_sub(self.pending_presentation_feedbacks.len()));
         for batch in self.frame_batches.values_mut() {
             discard_surface(&mut batch.presentation_feedbacks, surface_id);
         }
@@ -530,6 +537,7 @@ impl CompositorState {
         for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
             pending.feedback.discarded();
         }
+        self.visible_pending_presentation_feedback_count = 0;
         for batch in self.frame_batches.values_mut() {
             for pending in std::mem::take(&mut batch.presentation_feedbacks) {
                 pending.feedback.discarded();
@@ -834,6 +842,9 @@ impl CompositorState {
         &mut self,
         callbacks: Vec<wl_callback::WlCallback>,
     ) {
+        for callback in &callbacks {
+            self.pending_frame_callback_surfaces.remove(&callback.id());
+        }
         let callbacks: Vec<_> = callbacks
             .into_iter()
             .filter(|callback| callback.is_alive())
@@ -847,6 +858,9 @@ impl CompositorState {
         callbacks: Vec<wl_callback::WlCallback>,
         time: u32,
     ) {
+        for callback in &callbacks {
+            self.pending_frame_callback_surfaces.remove(&callback.id());
+        }
         self.note_callbacks_completed(&callbacks);
         for callback in callbacks {
             client_pacing_log(

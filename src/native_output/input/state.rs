@@ -619,6 +619,18 @@ impl NativeInputState {
                     .push(NativeWindowAction::ToggleFullscreen);
                 effect.request_visual_redraw();
             }
+            BindingAction::SwitchWorkspace(workspace) => {
+                effect
+                    .window_actions
+                    .push(NativeWindowAction::SwitchWorkspace(workspace));
+                effect.request_visual_redraw();
+            }
+            BindingAction::MoveFocusedWindowToWorkspace(workspace) => {
+                effect
+                    .window_actions
+                    .push(NativeWindowAction::MoveFocusedWindowToWorkspace(workspace));
+                effect.request_visual_redraw();
+            }
             BindingAction::LaunchCommand(command) => {
                 effect.launch_command = Some(command);
                 effect.launch_source = Some(NativeLaunchSource::BindingApplication);

@@ -292,9 +292,9 @@ impl CompositorState {
                 if let Some(bridge) = self.clipboard_bridge.as_mut() {
                     let _ = bridge.clear_internal_selection();
                 }
-                self.publish_clipboard_to_focused_client();
+                self.publish_clipboard_to_keyboard_focused_client();
             } else {
-                self.publish_primary_to_focused_client();
+                self.publish_primary_to_keyboard_focused_client();
             }
             return;
         };
@@ -337,9 +337,9 @@ impl CompositorState {
                     let _ = bridge
                         .publish_internal_selection(commit.generation, binding.mime_types.clone());
                 }
-                self.publish_clipboard_to_focused_client();
+                self.publish_clipboard_to_keyboard_focused_client();
             }
-            SelectionKind::Primary => self.publish_primary_to_focused_client(),
+            SelectionKind::Primary => self.publish_primary_to_keyboard_focused_client(),
         }
     }
 
@@ -362,8 +362,8 @@ impl CompositorState {
             }
             self.publish_data_control_selection(kind);
             match kind {
-                SelectionKind::Clipboard => self.publish_clipboard_to_focused_client(),
-                SelectionKind::Primary => self.publish_primary_to_focused_client(),
+                SelectionKind::Clipboard => self.publish_clipboard_to_keyboard_focused_client(),
+                SelectionKind::Primary => self.publish_primary_to_keyboard_focused_client(),
             }
         }
     }

@@ -27,12 +27,12 @@ pub(crate) mod native_fence;
 mod program;
 
 pub(crate) use damage::{
-    BufferAge, FullRepaintReason, OutputDamage, OutputRect, RepaintMode, render_target_buffer_age,
+    BufferAge, EglPartialRepaintCapabilities, FullRepaintReason, OutputDamage, OutputRect,
+    PartialRepaintPlanner, RepaintMode, render_target_buffer_age,
 };
 use damage::{
-    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
-    EglPartialRepaintCapabilities, EglPresentedDamageState, PartialRepaintPlanner, RenderExecution,
-    RepaintPlan,
+    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
+    RenderExecution, RepaintPlan,
 };
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
@@ -143,7 +143,7 @@ impl EglSceneFrameCommit {
     pub(crate) fn empty_for_test() -> Self {
         Self {
             repaint_plan: RepaintPlan {
-                current_damage: OutputDamage::Empty,
+                render_damage: OutputDamage::Empty,
                 repair_damage: OutputDamage::Empty,
                 buffer_age: None,
                 mode: RepaintMode::Skip,
@@ -168,12 +168,12 @@ pub struct EglSceneDrawRequest<'a> {
     pub width: u32,
     pub height: u32,
     pub surfaces: &'a [RenderableSurface],
-    pub external_overlay_surface_ids: Vec<u32>,
-    pub popup_surface_ids: Vec<u32>,
+    pub external_overlay_surface_ids: &'a [u32],
+    pub popup_surface_ids: &'a [u32],
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
-    pub decoration_instances: Vec<DecorationRenderInstance>,
+    pub decoration_instances: &'a [DecorationRenderInstance],
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
 }
@@ -193,7 +193,6 @@ pub(crate) struct GlesSceneRenderer {
     cursor_commands: Vec<EglDrawCommand>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
-    wallpaper_resource: Option<EglImageResource>,
     cursor_resource: Option<EglImageResource>,
     cursor_resource_stale: bool,
     surface_resources: HashMap<u32, EglSurfaceResource>,
@@ -214,6 +213,24 @@ pub(crate) struct GlesRendererInfo {
     pub vendor: String,
     pub renderer: String,
     pub version: String,
+}
+
+fn push_output_background_command(
+    vertices: &mut Vec<EglTexturedVertex>,
+    commands: &mut Vec<EglDrawCommand>,
+    width: u32,
+    height: u32,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
+    push_draw_command(
+        vertices,
+        commands,
+        EglDrawLayer::Solid(compositor::ServerFrameColor::OutputBackground),
+        EglRect::new(0.0, 0.0, width as f32, height as f32),
+        width,
+        height,
+        framebuffer_origin,
+    );
 }
 
 impl GlesSceneRenderer {
@@ -284,7 +301,6 @@ impl GlesSceneRenderer {
             cursor_commands: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
-            wallpaper_resource: None,
             cursor_resource: None,
             cursor_resource_stale: false,
             surface_resources: HashMap::new(),
@@ -404,10 +420,9 @@ impl GlesSceneRenderer {
             scaled_visual_state.cursor = None;
         }
         self.frame_stats = GlesSceneFrameStats::default();
-        self.ensure_output_size(egl, egl_display, width, height)?;
-        self.ensure_wallpaper_resource(egl, egl_display, width, height)?;
+        self.ensure_output_size(width, height)?;
         self.ensure_frame_resources()?;
-        self.ensure_decoration_resources(egl, egl_display, &decoration_instances)?;
+        self.ensure_decoration_resources(egl, egl_display, decoration_instances)?;
         if scaled_visual_state.cursor.is_some() {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
@@ -419,7 +434,7 @@ impl GlesSceneRenderer {
         )?;
 
         let (base_surfaces, overlay_surfaces) =
-            split_external_overlay_surfaces(surfaces, &external_overlay_surface_ids);
+            split_external_overlay_surfaces(surfaces, external_overlay_surface_ids);
         let scene_surfaces = if external_overlay_surface_ids.is_empty() {
             surfaces
         } else {
@@ -432,8 +447,8 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
-            &decoration_instances,
-            &popup_surface_ids,
+            decoration_instances,
+            popup_surface_ids,
             framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
@@ -443,8 +458,8 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
-            &decoration_instances,
-            &popup_surface_ids,
+            decoration_instances,
+            popup_surface_ids,
             framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
@@ -490,8 +505,8 @@ impl GlesSceneRenderer {
                 width,
                 height,
                 scene_surfaces,
-                &decoration_instances,
-                &popup_surface_ids,
+                decoration_instances,
+                popup_surface_ids,
                 content_generation,
                 output_scale,
                 output_scale_key,
@@ -531,8 +546,13 @@ impl GlesSceneRenderer {
         })
     }
 
-    pub(crate) fn commit_presented(&mut self, frame: EglSceneFrameCommit) {
-        self.repaint_planner.commit_presented(&frame.repaint_plan);
+    pub(crate) fn commit_presented(
+        &mut self,
+        frame: EglSceneFrameCommit,
+        presented_transition_damage: OutputDamage,
+    ) {
+        self.repaint_planner
+            .commit_presented_transition(presented_transition_damage);
         self.damage_tracker.commit_presented(frame.damage_state);
         self.presented_scene_key = Some(frame.scene_key);
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
@@ -551,11 +571,9 @@ impl GlesSceneRenderer {
         let (width, height) = self.current_size;
         self.frame_stats.repaint_mode = plan.mode;
         self.frame_stats.buffer_age = plan.buffer_age;
-        self.frame_stats.current_damage_rects = plan.current_damage.rect_count();
-        self.frame_stats.current_damage_pixels = plan
-            .current_damage
-            .pixels(width, height)
-            .unwrap_or(u64::MAX);
+        self.frame_stats.current_damage_rects = plan.render_damage.rect_count();
+        self.frame_stats.current_damage_pixels =
+            plan.render_damage.pixels(width, height).unwrap_or(u64::MAX);
         self.frame_stats.repair_damage_rects = plan.repair_damage.rect_count();
         self.frame_stats.repair_damage_pixels =
             plan.repair_damage.pixels(width, height).unwrap_or(u64::MAX);
@@ -564,59 +582,17 @@ impl GlesSceneRenderer {
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
     }
 
-    fn ensure_output_size(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        width: u32,
-        height: u32,
-    ) -> RendererResult<()> {
+    fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {
         if self.current_size == (width, height) {
             return Ok(());
         }
 
         self.current_size = (width, height);
         self.repaint_planner.resize((width, height));
-        if let Some(resource) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
         self.scene_cache_key = None;
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
         }
-        Ok(())
-    }
-
-    fn ensure_wallpaper_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        width: u32,
-        height: u32,
-    ) -> RendererResult<()> {
-        if self
-            .wallpaper_resource
-            .as_ref()
-            .is_some_and(|resource| resource.size == (width, height))
-        {
-            return Ok(());
-        }
-
-        let mut pixels = vec![compositor::OUTPUT_BACKGROUND; width as usize * height as usize];
-        compositor::draw_wallpaper(&mut pixels, width, height);
-        let mut resource = create_uploaded_resource(&self.gl, width, height)?;
-        write_argb_pixels_to_resource(
-            &self.gl,
-            &resource,
-            SurfaceDamageRect::full(width, height),
-            &pixels,
-            &mut self.texture_upload_rgba,
-        );
-        if let Some(old) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, old);
-        }
-        resource.generation = 1;
-        self.wallpaper_resource = Some(resource);
         Ok(())
     }
 
@@ -1112,11 +1088,9 @@ impl GlesSceneRenderer {
         self.vertices.reserve((1 + surfaces.len()) * 6);
         self.commands.reserve(1 + surfaces.len());
 
-        push_draw_command(
+        push_output_background_command(
             &mut self.vertices,
             &mut self.commands,
-            EglDrawLayer::Wallpaper,
-            EglRect::new(0.0, 0.0, width as f32, height as f32),
             width,
             height,
             framebuffer_origin,
@@ -1400,10 +1374,6 @@ impl GlesSceneRenderer {
 
     fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<GlTexture> {
         match layer {
-            EglDrawLayer::Wallpaper => self
-                .wallpaper_resource
-                .as_ref()
-                .map(|resource| resource.texture),
             EglDrawLayer::Solid(color) => self
                 .frame_resources
                 .get(&color)
@@ -1428,9 +1398,6 @@ impl GlesSceneRenderer {
     }
 
     pub(crate) fn destroy(&mut self, egl: &EglInstance, egl_display: egl::Display) {
-        if let Some(resource) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
         if let Some(resource) = self.cursor_resource.take() {
             destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
@@ -2677,6 +2644,26 @@ mod tests {
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    #[test]
+    fn output_background_uses_dedicated_solid_scene_layer() {
+        let mut vertices = Vec::new();
+        let mut commands = Vec::new();
+        push_output_background_command(
+            &mut vertices,
+            &mut commands,
+            1280,
+            800,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(
+            commands.first().map(|command| command.layer),
+            Some(EglDrawLayer::Solid(
+                compositor::ServerFrameColor::OutputBackground
+            ))
+        );
+    }
 
     #[derive(Clone)]
     struct DropProbe(std::rc::Rc<std::cell::Cell<usize>>);

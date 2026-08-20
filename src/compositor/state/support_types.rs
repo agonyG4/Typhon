@@ -166,9 +166,12 @@ impl CompositorState {
         let interaction_id = interaction_id.or_else(|| {
             active_window.map(|snapshot| WindowInteractionId::new(snapshot.interaction_id))
         });
+        let timestamp_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
         resize_debug_log(|| {
             format!(
-                "event={event} interaction_id={} resize_interaction_id={} root={} serial={} sequence={} resizing={} geometry={geometry:?} outstanding_count={} acked_uncaptured_count={} queued_latest={:?} final_pending={:?} captured_count={} preview_active={}",
+                "timestamp_ns={timestamp_ns} input_hardware_timestamp_usec={} event={event} interaction_id={} resize_interaction_id={} root={} serial={} sequence={} resizing={} geometry={geometry:?} outstanding_count={} acked_uncaptured_count={} queued_latest={:?} final_pending={:?} captured_count={} preview_active={}",
+                self.last_pointer_motion_usec
+                    .map_or_else(|| "none".to_string(), |timestamp| timestamp.to_string()),
                 interaction_id.map_or_else(|| "none".to_string(), |id| id.get().to_string()),
                 flow_state
                     .and_then(|state| state.0)

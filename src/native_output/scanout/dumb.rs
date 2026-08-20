@@ -71,6 +71,7 @@ impl DumbFramebuffer {
     pub(crate) fn paint_server_frame(
         &mut self,
         renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
@@ -78,8 +79,14 @@ impl DumbFramebuffer {
     ) -> io::Result<NativePaintStats> {
         let total_start = Instant::now();
         let render_start = Instant::now();
-        let rendered =
-            renderer.render_server_frame(self.width, self.height, server, input_state, cursor_mode);
+        let rendered = renderer.render_server_frame(
+            self.width,
+            self.height,
+            resolved_scene,
+            server,
+            input_state,
+            cursor_mode,
+        );
         let render_us = elapsed_micros(render_start);
         let bytes = unsafe { slice::from_raw_parts_mut(self.mapping.cast::<u8>(), self.size) };
         let copy_start = Instant::now();

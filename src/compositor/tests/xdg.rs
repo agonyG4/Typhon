@@ -2,6 +2,48 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 #[test]
+fn unmapped_xdg_toplevel_does_not_establish_keyboard_focus_until_first_buffer_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    assert_eq!(capture_focused_surface_id(&commands), None);
+    assert_eq!(capture_keyboard_focus_surface_id(&commands), None);
+    assert_eq!(state.keyboard_enter_count, 0);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert!(capture_focused_surface_id(&commands).is_some());
+    assert!(capture_keyboard_focus_surface_id(&commands).is_some());
+    assert_eq!(state.keyboard_enter_count, 1);
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn wayland_client_can_create_xdg_toplevel_on_oblivion_server() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -145,6 +187,7 @@ fn xdg_activation_token_focuses_requested_toplevel_once() {
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let activation: client_xdg_activation_v1::XdgActivationV1 =
         globals.bind(&qh, 1..=1, ()).unwrap();
 
@@ -161,7 +204,11 @@ fn xdg_activation_token_focuses_requested_toplevel_once() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&target_surface, &shm, &qh, 32, 32).unwrap();
+    commit_test_buffered_surface(&focused_surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
     wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     let initial_focus = capture_focused_surface_id(&commands).expect("second toplevel focused");
 
     let activation_token = activation.get_activation_token(&qh, ());
@@ -273,7 +320,7 @@ fn sober_style_toplevel_reassociation_on_same_wl_surface_is_supported() {
     assert!(!snapshot.toplevel_has_app_id);
     assert!(!snapshot.toplevel_has_title);
     assert!(!snapshot.toplevel_has_non_default_constraints);
-    assert_eq!(snapshot.toplevel_mode, Some(ToplevelMode::Floating));
+    assert_eq!(snapshot.toplevel_mode, Some(ToplevelMode::Normal));
     assert_eq!(state.surface_configure_count, 2);
     assert_eq!(state.toplevel_configure_count, 2);
     assert_eq!(state.surface_configure_serials.len(), 2);

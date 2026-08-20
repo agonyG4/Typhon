@@ -24,17 +24,38 @@ fn pageflip_identity(
     }
 }
 
-fn confirmed_primary_from_worker_job(
+fn presented_primary_from_worker_job(
     job: &crate::native_output::kms_worker::KmsCommitJob,
-) -> Option<ConfirmedPrimaryAssignment> {
+    swapchain: Option<&AtomicOutputSwapchain>,
+) -> Option<PresentedPrimaryAssignment> {
     let transaction = job.owners.primary()?.transaction.as_ref();
+    let bundle_identity = job.identity();
+    let pageflip = crate::native_output::presentation::plane::PlanePageflipIdentity {
+        bundle_id: bundle_identity.id,
+        token: bundle_identity.token,
+        output_generation: bundle_identity.output_generation,
+        crtc_id: bundle_identity.crtc_id,
+    };
     match job.kind {
         AtomicCommitKind::CompositedPrimary { .. } => match transaction.planes().primary() {
-            PrimaryPlaneAssignment::CompositorFramebuffer { slot, .. } => {
-                Some(ConfirmedPrimaryAssignment::Composed {
+            PrimaryPlaneAssignment::CompositorFramebuffer {
+                slot,
+                framebuffer_id,
+            } => {
+                let swapchain = swapchain?;
+                if slot != swapchain.current()
+                    || swapchain.current_framebuffer_id().map(|id| id.get()) != Some(framebuffer_id)
+                {
+                    return None;
+                }
+                Some(PresentedPrimaryAssignment::Composed {
                     transaction_id: job.transaction_id,
                     token: job.token,
+                    pageflip,
                     slot,
+                    framebuffer_id,
+                    pool_generation: swapchain.pool_generation(),
+                    presentation_serial: swapchain.presentation_serial(),
                 })
             }
             PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
@@ -51,9 +72,10 @@ fn confirmed_primary_from_worker_job(
             else {
                 return None;
             };
-            Some(ConfirmedPrimaryAssignment::Direct {
+            Some(PresentedPrimaryAssignment::Direct {
                 transaction_id: job.transaction_id,
                 token: job.token,
+                pageflip,
                 surface_id: transaction.obligations().direct_surface_id()?,
                 key,
                 framebuffer_id,
@@ -177,7 +199,7 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
-            confirmed_primary_assignment,
+            presented_planes,
             confirmed_output_presentation,
             presentation_deadline,
             scheduled_presentation_target,
@@ -188,7 +210,7 @@ impl NativeRuntime {
             last_primary_presented_at_ns,
             direct_fallback_tracker,
             last_refresh_sequence,
-            last_renderable_surfaces: _,
+            scene_history,
             queued_redraw_requested: _,
             frame_index,
             known_toplevels: _,
@@ -524,7 +546,7 @@ impl NativeRuntime {
                     let token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
                     let identity = pageflip_identity(token, *drm_file_generation, target.crtc_id);
-                    if !self.presented_planes.promote_bundle(
+                    if !presented_planes.promote_bundle(
                         identity,
                         identity,
                         None,
@@ -567,6 +589,11 @@ impl NativeRuntime {
                         PageFlipToken::new(pageflip.user_data)
                             .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
                     )?;
+                }
+                let explicit_composited_pageflip =
+                    matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_)) && !direct_pending;
+                if !explicit_composited_pageflip {
+                    let _ = scene_history.promote_pageflip(pageflip.user_data);
                 }
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
@@ -678,13 +705,17 @@ impl NativeRuntime {
                                 .unwrap_or(u64::MAX),
                         );
                     }
+                    let direct_pageflip_identity =
+                        pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
                     cycle_direct::settle_direct_pageflip(
                         scanout,
+                        scene_history,
                         server,
                         output_transactions,
                         &mut self.presentation_trace,
                         atomic_cursor,
                         *drm_file_generation,
+                        direct_pageflip_identity,
                         transaction_id,
                         pageflip_token,
                         pageflip.user_data,
@@ -693,22 +724,23 @@ impl NativeRuntime {
                         presented_at_ns,
                         actual_logical_sequence,
                         presentation,
-                        confirmed_primary_assignment,
+                        &mut presented_planes.primary,
                         render_journal,
                         frame_pacing,
                         scheduled_presentation_target,
                     )?;
                     if *kms_commit_worker_transport
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                        && let Some(cursor) = atomic_cursor.as_ref()
                     {
                         let identity =
                             pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
-                        if !self.presented_planes.promote_bundle(
+                        if !presented_planes.promote_bundle(
                             identity,
                             identity,
-                            *confirmed_primary_assignment,
-                            Some(cursor.presented_plane_state()),
+                            presented_planes.primary,
+                            atomic_cursor
+                                .as_ref()
+                                .map(NativeAtomicCursor::presented_plane_state),
                         ) {
                             return Err(io::Error::other(
                                 "direct pageflip promotion identity mismatch",
@@ -736,12 +768,52 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("composited pageflip token is zero"))?;
-                    let previous_assignment = *confirmed_primary_assignment;
+                    let previous_assignment = presented_planes.primary;
+                    let presented_transition = scene_history
+                        .prepare_pageflip_transition(
+                            pageflip_token.get(),
+                            target.width,
+                            target.height,
+                        )
+                        .ok_or_else(|| {
+                            io::Error::other("composited pageflip has no matching scene transition")
+                        })?;
+                    self.presentation_trace.push(
+                        PresentationTransactionEvent::PresentedTransition {
+                            transaction_id,
+                            timestamp_ns: monotonic_now_ns()?,
+                            token: pageflip_token.get(),
+                            previous_frame_id: presented_transition.previous_frame_id,
+                            current_frame_id: presented_transition.current_frame_id,
+                            transition_damage_signature: presented_transition
+                                .damage
+                                .identity_signature(),
+                        },
+                    );
                     let CompositedPageflipCompletion {
                         presented: frame,
                         protocol_batch_id,
                         surface_damage,
-                    } = explicit.complete_pageflip(pageflip_token)?;
+                    } = explicit
+                        .complete_pageflip(pageflip_token, presented_transition.damage.clone())?;
+                    if frame.frame_id != presented_transition.current_frame_id {
+                        return Err(io::Error::other(
+                            "composited pageflip frame does not match scene transition",
+                        )
+                        .into());
+                    }
+                    if frame.transaction_id != transaction_id {
+                        return Err(io::Error::other(
+                            "composited pageflip transaction does not match output completion",
+                        )
+                        .into());
+                    }
+                    if !scene_history.promote_pageflip(pageflip_token.get()) {
+                        return Err(io::Error::other(
+                            "composited pageflip scene promotion did not match transition",
+                        )
+                        .into());
+                    }
                     if *kms_commit_worker_transport
                         == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                         && let Some(worker) = kms_commit_worker.as_ref()
@@ -766,12 +838,13 @@ impl NativeRuntime {
                     )?;
                     debug_assert!(prepared_logical.obligations().direct_surface_id().is_none());
                     let direct_transition = match previous_assignment {
-                        Some(ConfirmedPrimaryAssignment::Direct {
+                        Some(PresentedPrimaryAssignment::Direct {
                             transaction_id,
                             token,
                             surface_id,
                             key: candidate_key,
                             framebuffer_id,
+                            ..
                         }) => {
                             let expected = ExpectedPresentedDirectPrimary {
                                 transaction_id,
@@ -846,22 +919,34 @@ impl NativeRuntime {
                         tracker.observe_refresh(*last_refresh_sequence);
                         explicit.note_direct_composited_fallback(tracker.cycles);
                     }
-                    *confirmed_primary_assignment = Some(ConfirmedPrimaryAssignment::Composed {
+                    let swapchain = explicit.swapchain()?;
+                    let slot = swapchain.current();
+                    let pool_generation = swapchain.pool_generation();
+                    let presentation_serial = swapchain.presentation_serial();
+                    let framebuffer_id = explicit.framebuffer(slot)?.get();
+                    let pageflip =
+                        pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                    let presented_primary = Some(PresentedPrimaryAssignment::Composed {
                         transaction_id,
                         token: pageflip_token,
-                        slot: explicit.swapchain()?.current(),
+                        pageflip,
+                        slot,
+                        framebuffer_id,
+                        pool_generation,
+                        presentation_serial,
                     });
                     if *kms_commit_worker_transport
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                        && let Some(cursor) = atomic_cursor.as_ref()
                     {
                         let identity =
                             pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
-                        if !self.presented_planes.promote_bundle(
+                        if !presented_planes.promote_bundle(
                             identity,
                             identity,
-                            *confirmed_primary_assignment,
-                            Some(cursor.presented_plane_state()),
+                            presented_primary,
+                            atomic_cursor
+                                .as_ref()
+                                .map(NativeAtomicCursor::presented_plane_state),
                         ) {
                             return Err(io::Error::other(
                                 "composited pageflip promotion identity mismatch",
@@ -1101,7 +1186,10 @@ impl NativeRuntime {
                         .map(|ownership| {
                             let cursor_owner = ownership.job.owners.cursor();
                             (
-                                confirmed_primary_from_worker_job(&ownership.job),
+                                presented_primary_from_worker_job(
+                                    &ownership.job,
+                                    scanout.explicit_output_swapchain(),
+                                ),
                                 cursor_owner.map(|owner| {
                                     (
                                         owner.revision,
@@ -1193,7 +1281,7 @@ impl NativeRuntime {
                                     revision,
                                     coupling,
                                     delivery,
-                                    &self.presented_planes.cursor,
+                                    &presented_planes.cursor,
                                 )
                             });
                         let cursor = select_cursor_promotion(
@@ -1203,9 +1291,7 @@ impl NativeRuntime {
                             }),
                         );
                         if (primary.is_some() || cursor.is_some())
-                            && !self
-                                .presented_planes
-                                .promote_bundle(identity, identity, primary, cursor)
+                            && !presented_planes.promote_bundle(identity, identity, primary, cursor)
                         {
                             return Err(io::Error::other(
                                 "worker pageflip promotion identity mismatch",
@@ -1214,7 +1300,7 @@ impl NativeRuntime {
                         }
                         if let Some(worker) = kms_commit_worker.as_ref() {
                             worker.set_established_presented_base(
-                                self.presented_planes.revision,
+                                presented_planes.revision,
                                 *drm_file_generation,
                                 target.crtc_id,
                             );
@@ -1248,91 +1334,5 @@ impl NativeRuntime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
-    use crate::native_output::presentation::plane::{
-        CursorCoupling, CursorPlanePoint, CursorRevision, PresentedCursorDelivery,
-        PresentedCursorState,
-    };
-
-    #[test]
-    fn primary_software_presentation_wins_over_disabled_cursor_owner() {
-        let software = PresentedCursorState {
-            revision: CursorRevision::initial().advance_image(),
-            coupling: CursorCoupling::EmbeddedInPrimary,
-            delivery: PresentedCursorDelivery::Software,
-            framebuffer_id: None,
-            visible: true,
-            output_position: CursorPlanePoint { x: 200, y: 300 },
-            hotspot: CursorPlanePoint { x: 4, y: 5 },
-        };
-        let old_hardware = PresentedCursorState {
-            revision: CursorRevision::initial(),
-            coupling: CursorCoupling::IndependentPlane,
-            delivery: PresentedCursorDelivery::Hardware,
-            framebuffer_id: Some(91),
-            visible: true,
-            output_position: CursorPlanePoint { x: 10, y: 20 },
-            hotspot: CursorPlanePoint { x: 1, y: 2 },
-        };
-
-        assert_eq!(
-            select_cursor_promotion(
-                KmsPrimaryCursorPresentation::Promote(software),
-                Some(old_hardware),
-            ),
-            Some(software)
-        );
-    }
-
-    #[test]
-    fn primary_pageflip_uses_frozen_cursor_presentation_metadata() {
-        let frozen_state = AtomicCursorVisualState::hidden(64, 64);
-        let frozen = PresentedCursorState::from_atomic_with_delivery(
-            CursorRevision::initial().advance_image(),
-            CursorCoupling::EmbeddedInPrimary,
-            crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
-            &frozen_state,
-        );
-        let expected = frozen;
-
-        assert_eq!(
-            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Promote(frozen)),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn preserved_primary_cursor_does_not_fabricate_a_new_presentation() {
-        assert_eq!(
-            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Preserve),
-            None
-        );
-    }
-
-    #[test]
-    fn software_primary_metadata_freezes_revision_before_desired_advances() {
-        let mut cursor = crate::native_output::output::test_cursor_for_worker();
-        cursor.set_position(11, 22);
-        let frozen_state = cursor.desired().clone();
-        let frozen_revision = cursor.desired_revision();
-        let metadata =
-            crate::native_output::runtime::presentation_cursor::freeze_primary_cursor_presentation(
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
-                Some(&frozen_state),
-                Some(&cursor),
-                7,
-            );
-
-        cursor.set_position(900, 901);
-        let KmsPrimaryCursorPresentation::Promote(frozen) = metadata else {
-            panic!("software primary must carry frozen cursor metadata");
-        };
-        assert_eq!(frozen.revision, frozen_revision);
-        assert_eq!(frozen.output_position.x, 11);
-        assert_eq!(frozen.output_position.y, 22);
-        assert_eq!(frozen.delivery, PresentedCursorDelivery::Software);
-    }
-}
+#[path = "pageflip_tests.rs"]
+mod tests;

@@ -9,9 +9,12 @@ use super::super::decoration::{
     },
 };
 use super::super::{
-    DecorationRenderInstance, RenderGenerationCause, RenderableSurface, ResizeEdges, ToplevelMode,
-    WindowBackend, WindowId,
+    BeginWindowInteraction, DecorationRenderInstance, RenderGenerationCause, RenderableSurface,
+    ResizeEdges, ToplevelMode, WindowBackend, WindowId, WindowInteractionKind,
+    WindowInteractionSource,
 };
+use super::hit_testing::PointerSceneHit;
+use super::surface_focus::WindowFocusReason;
 use crate::compositor::render;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,9 +59,44 @@ impl WindowDecorationState {
 }
 
 impl super::super::CompositorState {
+    pub(in crate::compositor) fn surface_uses_server_side_decorations(
+        &self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> bool {
+        if mode == ToplevelMode::Fullscreen {
+            return false;
+        }
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        if let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id) {
+            return decoration_state.preference().effective_mode(true, false)
+                == DecorationMode::ServerSide;
+        }
+        matches!(window.backend, WindowBackend::X11(_))
+            && window.is_normal_x11_role()
+            && !window.x11_window_types.no_decorations
+    }
+
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {
-        let next = match self.decoration_hit_at(self.last_pointer_x, self.last_pointer_y) {
-            Some((window_id, _, DecorationHit::Button(kind))) => Some((window_id, kind)),
+        let hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
+        self.update_decoration_hover_for_scene_hit(&hit);
+    }
+
+    pub(in crate::compositor) fn update_decoration_hover_for_scene_hit(
+        &mut self,
+        hit: &PointerSceneHit,
+    ) {
+        let next = match hit {
+            PointerSceneHit::Decoration {
+                window_id,
+                hit: DecorationHit::Button(kind),
+                ..
+            } => Some((*window_id, *kind)),
             _ => None,
         };
         if self.decoration_button_hover == next {
@@ -66,6 +104,48 @@ impl super::super::CompositorState {
         }
         self.decoration_button_hover = next;
         self.advance_render_generation(RenderGenerationCause::WindowDecoration);
+    }
+
+    pub(in crate::compositor) fn decoration_hit_for_root_at(
+        &self,
+        root_surface_id: u32,
+        root_origin: (i32, i32),
+        x: f64,
+        y: f64,
+    ) -> Option<DecorationHit> {
+        let window_id = self.window_id_for_surface(root_surface_id)?;
+        let window = self.window(window_id)?;
+        let visual_geometry = self.current_visual_root_window_geometry(root_surface_id)?;
+        let mode = window.state.mode();
+        let fullscreen = mode == ToplevelMode::Fullscreen;
+        let decoration_mode =
+            if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
+                decoration_state
+                    .preference()
+                    .effective_mode(true, fullscreen)
+            } else if matches!(window.backend, WindowBackend::X11(_))
+                && window.is_normal_x11_role()
+                && !window.x11_window_types.no_decorations
+            {
+                if fullscreen {
+                    DecorationMode::None
+                } else {
+                    DecorationMode::ServerSide
+                }
+            } else {
+                return None;
+            };
+        let layout = DecorationLayout::for_window(
+            visual_geometry.width,
+            visual_geometry.height,
+            decoration_mode,
+            mode == ToplevelMode::Maximized,
+            fullscreen,
+            self.decoration_theme.metrics(),
+        )?;
+        let local_x = x - f64::from(root_origin.0) + f64::from(layout.client.x);
+        let local_y = y - f64::from(root_origin.1) + f64::from(layout.client.y);
+        layout.hit_test(local_x, local_y)
     }
 
     pub(in crate::compositor) fn decoration_theme_status(
@@ -132,8 +212,19 @@ impl super::super::CompositorState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn handle_decoration_button(
         &mut self,
+        button: u32,
+        pressed: bool,
+    ) -> bool {
+        let hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
+        self.handle_decoration_button_with_hit(Some(&hit), button, pressed)
+    }
+
+    pub(in crate::compositor) fn handle_decoration_button_with_hit(
+        &mut self,
+        scene_hit: Option<&PointerSceneHit>,
         button: u32,
         pressed: bool,
     ) -> bool {
@@ -147,60 +238,103 @@ impl super::super::CompositorState {
             self.advance_render_generation(RenderGenerationCause::WindowDecoration);
             return true;
         }
-        if button != LEFT_BUTTON && self.decoration_button_capture.is_none() {
-            return false;
-        }
         if pressed {
-            let hit = self.decoration_hit_at(self.last_pointer_x, self.last_pointer_y);
-            if button == LEFT_BUTTON
-                && let Some((window_id, _, DecorationHit::Titlebar)) = hit
-            {
+            let Some(PointerSceneHit::Decoration {
+                window_id,
+                root_surface_id,
+                hit: decoration_hit,
+            }) = scene_hit
+            else {
+                return false;
+            };
+            if button != LEFT_BUTTON {
+                return true;
+            }
+            if let DecorationHit::Titlebar = decoration_hit {
                 const DOUBLE_CLICK_WINDOW: std::time::Duration =
                     std::time::Duration::from_millis(500);
+                const DOUBLE_CLICK_DISTANCE: f64 = 8.0;
                 let now = Instant::now();
                 let double_click = self.decoration_last_titlebar_click.take().is_some_and(
-                    |(prior_window_id, prior_time)| {
-                        prior_window_id == window_id
+                    |(prior_window_id, prior_time, prior_x, prior_y)| {
+                        let delta_x = self.last_pointer_x - prior_x;
+                        let delta_y = self.last_pointer_y - prior_y;
+                        prior_window_id == *window_id
                             && now.duration_since(prior_time) <= DOUBLE_CLICK_WINDOW
+                            && delta_x.mul_add(delta_x, delta_y * delta_y)
+                                <= DOUBLE_CLICK_DISTANCE * DOUBLE_CLICK_DISTANCE
                     },
                 );
                 if double_click {
-                    let _ = self.toggle_maximize_desktop_window(window_id);
-                    self.decoration_titlebar_click_capture = Some((window_id, button));
+                    let _ = self.toggle_maximize_desktop_window(*window_id);
+                    self.decoration_titlebar_click_capture = Some((*window_id, button));
                     self.advance_render_generation(RenderGenerationCause::WindowDecoration);
                     return true;
                 }
-                self.decoration_last_titlebar_click = Some((window_id, now));
-                return self.begin_window_move_at_with_trigger(
-                    self.last_pointer_x,
-                    self.last_pointer_y,
-                    button,
-                );
+                self.decoration_last_titlebar_click =
+                    Some((*window_id, now, self.last_pointer_x, self.last_pointer_y));
+                let _ = self.begin_window_interaction_for_root(BeginWindowInteraction {
+                    window_id: Some(*window_id),
+                    root_surface_id: *root_surface_id,
+                    x: self.last_pointer_x,
+                    y: self.last_pointer_y,
+                    kind: WindowInteractionKind::Move,
+                    source: WindowInteractionSource::NativeBinding,
+                    trigger_button: Some(button),
+                    trigger_serial: None,
+                    pointer_motion_surface_id: None,
+                });
+                return true;
             }
-            let Some((window_id, root_surface_id, DecorationHit::Button(kind))) = hit else {
-                return false;
+            return match decoration_hit {
+                DecorationHit::Button(kind) => {
+                    let _ =
+                        self.activate_desktop_window(*window_id, WindowFocusReason::PointerPress);
+                    self.decoration_button_capture = Some(DecorationButtonCapture {
+                        window_id: *window_id,
+                        root_surface_id: *root_surface_id,
+                        kind: *kind,
+                        button,
+                    });
+                    self.advance_render_generation(RenderGenerationCause::WindowDecoration);
+                    true
+                }
+                DecorationHit::Resize(edge) => {
+                    let _ =
+                        self.activate_desktop_window(*window_id, WindowFocusReason::PointerPress);
+                    let _ = self.begin_window_interaction_for_root(BeginWindowInteraction {
+                        window_id: Some(*window_id),
+                        root_surface_id: *root_surface_id,
+                        x: self.last_pointer_x,
+                        y: self.last_pointer_y,
+                        kind: WindowInteractionKind::Resize(resize_edges_for_decoration_edge(
+                            *edge,
+                        )),
+                        source: WindowInteractionSource::NativeBinding,
+                        trigger_button: Some(button),
+                        trigger_serial: None,
+                        pointer_motion_surface_id: None,
+                    });
+                    true
+                }
+                DecorationHit::Titlebar => unreachable!("titlebar handled above"),
             };
-            self.decoration_button_capture = Some(DecorationButtonCapture {
-                window_id,
-                root_surface_id,
-                kind,
-                button,
-            });
-            self.advance_render_generation(RenderGenerationCause::WindowDecoration);
-            return true;
         }
 
         let Some(capture) = self.decoration_button_capture.take() else {
-            return false;
+            return scene_hit.is_some_and(|hit| matches!(hit, PointerSceneHit::Decoration { .. }));
         };
         if capture.button != button {
             self.advance_render_generation(RenderGenerationCause::WindowDecoration);
             return true;
         }
         let same_button = matches!(
-            self.decoration_hit_at(self.last_pointer_x, self.last_pointer_y),
-            Some((window_id, _, DecorationHit::Button(kind)))
-                if window_id == capture.window_id && kind == capture.kind
+            scene_hit,
+            Some(PointerSceneHit::Decoration {
+                window_id,
+                hit: DecorationHit::Button(kind),
+                ..
+            }) if *window_id == capture.window_id && *kind == capture.kind
         );
         if same_button {
             match capture.kind {
@@ -224,79 +358,14 @@ impl super::super::CompositorState {
         x: f64,
         y: f64,
     ) -> Option<(WindowId, u32, DecorationHit)> {
-        self.refresh_surface_origin_cache();
-        let origins = self.surface_origin_cache.clone();
-        for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
-            let root_surface_id = self.root_surface_id_for_surface(renderable.surface_id);
-            let root_index = self
-                .renderable_surfaces
-                .iter()
-                .position(|surface| surface.surface_id == root_surface_id)?;
-            let root_origin = origins.get(root_index).copied()?;
-
-            if renderable.surface_id != root_surface_id
-                && let Some((surface_x, surface_y)) = render::surface_local_point_at_origin(
-                    renderable,
-                    origins.get(index).copied()?,
-                    x,
-                    y,
-                )
-                && self.surface_accepts_input_at(renderable, surface_x, surface_y)
-            {
-                return None;
-            }
-            if renderable.surface_id != root_surface_id {
-                continue;
-            }
-
-            let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-                continue;
-            };
-            let Some(window) = self.window(window_id) else {
-                continue;
-            };
-            let mode = window.state.mode();
-            let fullscreen = mode == ToplevelMode::Fullscreen;
-            let decoration_mode =
-                if let Some(decoration_state) = self.xdg_decoration_states.get(&root_surface_id) {
-                    decoration_state
-                        .preference()
-                        .effective_mode(true, fullscreen)
-                } else if matches!(window.backend, WindowBackend::X11(_))
-                    && window.is_normal_x11_role()
-                    && !window.x11_window_types.no_decorations
-                {
-                    if fullscreen {
-                        DecorationMode::None
-                    } else {
-                        DecorationMode::ServerSide
-                    }
-                } else {
-                    continue;
-                };
-            let Some(layout) = DecorationLayout::for_window(
-                renderable.width,
-                renderable.height,
-                decoration_mode,
-                mode == ToplevelMode::Maximized,
-                mode == ToplevelMode::Fullscreen,
-                self.decoration_theme.metrics(),
-            ) else {
-                continue;
-            };
-            let local_x = x - f64::from(root_origin.0) + f64::from(layout.client.x);
-            let local_y = y - f64::from(root_origin.1) + f64::from(layout.client.y);
-            if let Some(hit) = layout.hit_test(local_x, local_y) {
-                return Some((window_id, root_surface_id, hit));
-            }
-            if let Some((surface_x, surface_y)) =
-                render::surface_local_point_at_origin(renderable, root_origin, x, y)
-                && self.surface_accepts_input_at(renderable, surface_x, surface_y)
-            {
-                return None;
-            }
+        match self.pointer_scene_hit_at(x, y) {
+            PointerSceneHit::Decoration {
+                window_id,
+                root_surface_id,
+                hit,
+            } => Some((window_id, root_surface_id, hit)),
+            PointerSceneHit::Client { .. } | PointerSceneHit::None => None,
         }
-        None
     }
 
     pub(in crate::compositor) fn native_decoration_render_instances(
@@ -343,14 +412,32 @@ impl super::super::CompositorState {
                 if decoration_mode != DecorationMode::ServerSide {
                     return None;
                 }
+                let visual_geometry =
+                    self.current_visual_root_window_geometry(surface.surface_id)?;
                 let layout = DecorationLayout::for_window(
-                    surface.width,
-                    surface.height,
+                    visual_geometry.width,
+                    visual_geometry.height,
                     decoration_mode,
                     mode == ToplevelMode::Maximized,
                     fullscreen,
                     metrics,
                 )?;
+                let (root_origin_x, root_origin_y) = origins.get(index).copied()?;
+                let instance_origin_x = root_origin_x.saturating_sub(layout.client.x);
+                let instance_origin_y = root_origin_y.saturating_sub(layout.client.y);
+                let pressed = self
+                    .decoration_button_capture
+                    .filter(|capture| capture.window_id == window_id)
+                    .filter(|capture| {
+                        matches!(
+                            layout.hit_test(
+                                self.last_pointer_x - f64::from(instance_origin_x),
+                                self.last_pointer_y - f64::from(instance_origin_y),
+                            ),
+                            Some(DecorationHit::Button(kind)) if kind == capture.kind
+                        )
+                    })
+                    .map(|capture| capture.kind);
                 let plan = build_render_plan(
                     &layout,
                     &self.decoration_theme,
@@ -362,14 +449,10 @@ impl super::super::CompositorState {
                             .decoration_button_hover
                             .filter(|(hover_window_id, _)| *hover_window_id == window_id)
                             .map(|(_, kind)| kind),
-                        pressed: self
-                            .decoration_button_capture
-                            .filter(|capture| capture.window_id == window_id)
-                            .map(|capture| capture.kind),
+                        pressed,
                     },
                     output_scale,
                 );
-                let (root_origin_x, root_origin_y) = origins.get(index).copied()?;
                 Some(DecorationRenderInstance {
                     origin_x: root_origin_x.saturating_sub(layout.client.x),
                     origin_y: root_origin_y.saturating_sub(layout.client.y),

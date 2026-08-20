@@ -1,24 +1,13 @@
 #![allow(dead_code)]
 
-use std::{io, num::NonZeroU64};
+use std::io;
 
+use crate::core::WindowId;
+use crate::wm::{WindowManagementState, WorkspaceId};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes};
 
 use super::{SurfacePlacement, WindowGeometry, WindowState};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WindowId(NonZeroU64);
-
-impl WindowId {
-    pub(crate) const fn new(value: NonZeroU64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWindowKind {
@@ -124,11 +113,31 @@ pub struct DesktopWindow {
     pub metadata: WindowMetadata,
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
+    pub(crate) management: Option<WindowManagementState>,
     pub state: WindowState,
     pub(crate) last_focus_serial: u64,
 }
 
 impl DesktopWindow {
+    pub(crate) fn is_workspace_managed(&self) -> bool {
+        match self.backend {
+            WindowBackend::Xdg(_) => self.kind == DesktopWindowKind::Managed,
+            WindowBackend::X11(_) => {
+                self.kind == DesktopWindowKind::Managed && self.is_normal_x11_role()
+            }
+        }
+    }
+
+    pub(crate) fn refresh_workspace_membership(&mut self, workspace: WorkspaceId) {
+        if self.is_workspace_managed() {
+            if self.management.is_none() {
+                self.management = Some(WindowManagementState::new(workspace));
+            }
+        } else {
+            self.management = None;
+        }
+    }
+
     pub(crate) fn is_normal_x11_role(&self) -> bool {
         matches!(
             self.x11_role,
@@ -170,6 +179,7 @@ impl DesktopWindow {
             metadata: WindowMetadata::default(),
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
+            management: None,
             state: WindowState::default(),
             last_focus_serial: 0,
         }
@@ -206,6 +216,7 @@ impl DesktopWindow {
             metadata: snapshot.metadata,
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
+            management: None,
             state: WindowState::default(),
             last_focus_serial: 0,
         }

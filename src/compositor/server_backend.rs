@@ -124,7 +124,8 @@ impl OwnCompositorServer {
         self.state
             .take_backend_commands()
             .into_iter()
-            .filter_map(|command| match command {
+            .filter_map(|command| {
+                match command {
                 crate::compositor::window_backend::WindowBackendCommand::Configure {
                     window,
                     geometry,
@@ -260,6 +261,31 @@ impl OwnCompositorServer {
                         frame_extents: self.state.x11_decoration_frame_extents(handle),
                     })
                 }
+                crate::compositor::window_backend::WindowBackendCommand::SetWorkspace {
+                    window,
+                    workspace,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::SetWorkspace {
+                        window: handle,
+                        workspace,
+                    })
+                }
+                crate::compositor::window_backend::WindowBackendCommand::PublishWorkspaceState {
+                    workspace_count,
+                    current_workspace,
+                    output_width,
+                    output_height,
+                } => Some(XwmCommand::PublishDesktopState {
+                    workspace_count,
+                    current_workspace,
+                    output_width,
+                    output_height,
+                }),
+            }
             })
             .collect()
     }

@@ -23,7 +23,7 @@ fn fullscreen_window_interaction_eligibility_rejects_move_and_all_resize_edges()
         ));
     }
     assert!(window_interaction_allowed_for_mode(
-        ToplevelMode::Floating,
+        ToplevelMode::Normal,
         WindowInteractionKind::Move,
     ));
 }
@@ -411,7 +411,10 @@ fn stale_interaction_update_is_ignored() {
 
     assert!(!state.update_window_interaction_by_id(WindowInteractionId::new(1), 150.0, 150.0));
 
-    assert!(state.pending_interactive_resize_update.is_none());
+    assert_eq!(
+        state.active_window_interaction_id(),
+        Some(WindowInteractionId::new(2))
+    );
 }
 
 #[test]
@@ -608,6 +611,7 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
             width: 360,
             height: 240,
             active_resize: Some(interaction_id),
+            mode_transition: false,
         },
     );
     state.active_toplevel_resizes.insert(
@@ -816,7 +820,6 @@ fn absolute_x11_resize_preserves_root_placement_mode() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 130.0));
-    assert!(state.apply_pending_interactive_resize_update());
 
     let expected = SurfacePlacement::absolute_root_at(30, 50);
     assert_eq!(
@@ -831,6 +834,40 @@ fn absolute_x11_resize_preserves_root_placement_mode() {
             ..
         }] if geometry.placement == expected
     ));
+}
+
+#[test]
+fn interactive_resize_updates_visual_geometry_before_frame_prepare() {
+    let surface_id = 42;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    let mut interaction = test_window_interaction(
+        1,
+        WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
+        None,
+    );
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 130.0));
+
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(30, 50),
+            280,
+            170,
+        )),
+        "processed pointer geometry must be visible before frame preparation",
+    );
 }
 
 #[test]
@@ -917,16 +954,25 @@ fn xdg_resize_trigger_release_reports_client_delivery() {
 }
 
 fn run_m7_resize_crossing_stress(source: WindowInteractionSource) {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
+    let snapshot = test_x11_snapshot(42);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(42, 300, 200));
     for cycle in 0..100 {
-        state.window_interaction = Some(test_window_interaction_with_target(
+        let mut interaction = test_window_interaction_with_target(
             cycle + 1,
             WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
             source,
             Some(0x110),
             Some(84),
-        ));
-        state.pending_interactive_resize_update = None;
+        );
+        interaction.window_id = window_id;
+        state.window_interaction = Some(interaction);
 
         let x = if cycle % 2 == 0 { 280.0 } else { 20.0 };
         let y = if cycle % 2 == 0 { 240.0 } else { 30.0 };
@@ -938,10 +984,6 @@ fn run_m7_resize_crossing_stress(source: WindowInteractionSource) {
         assert_eq!(
             interaction.pointer_motion_surface_id,
             Some(84),
-            "cycle {cycle}"
-        );
-        assert!(
-            state.pending_interactive_resize_update.is_some(),
             "cycle {cycle}"
         );
         assert!(state.cancel_window_interaction(WindowInteractionEndReason::ExplicitEnd));
@@ -967,14 +1009,6 @@ fn m7_a_hundred_managed_x11_resize_crossing_cycles_keep_motion_owner() {
 
 #[test]
 fn m7_a_hundred_pointer_refreshes_during_resize_keep_interaction_authority() {
-    let update = PendingInteractiveResizeUpdate {
-        root_surface_id: 42,
-        width: 320,
-        height: 240,
-        placement: SurfacePlacement::root_at(12, 24),
-        edges: ResizeEdges::new(true, false, true, false),
-        interaction_id: ResizeInteractionId::new(1),
-    };
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction_with_target(
             1,
@@ -983,14 +1017,12 @@ fn m7_a_hundred_pointer_refreshes_during_resize_keep_interaction_authority() {
             Some(0x110),
             Some(84),
         )),
-        pending_interactive_resize_update: Some(update),
         ..Default::default()
     };
 
     for cycle in 0..100 {
         state.clear_pointer_focus();
         assert!(state.window_interaction_active(), "cycle {cycle}");
-        assert_eq!(state.pending_interactive_resize_update, Some(update));
         assert_eq!(
             state.active_window_interaction_id(),
             Some(WindowInteractionId::new(1))
@@ -1399,14 +1431,6 @@ fn explicit_interaction_cancel_clears_interaction_cursor_override() {
 
 #[test]
 fn pointer_focus_clear_preserves_active_interaction_cursor_and_resize_preview() {
-    let update = PendingInteractiveResizeUpdate {
-        root_surface_id: 42,
-        width: 320,
-        height: 240,
-        placement: SurfacePlacement::root_at(12, 24),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-        interaction_id: ResizeInteractionId::new(1),
-    };
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction(
             1,
@@ -1416,7 +1440,6 @@ fn pointer_focus_clear_preserves_active_interaction_cursor_and_resize_preview() 
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::ResizeDiagonalNwSe,
         }),
-        pending_interactive_resize_update: Some(update),
         ..Default::default()
     };
 
@@ -1424,7 +1447,6 @@ fn pointer_focus_clear_preserves_active_interaction_cursor_and_resize_preview() 
 
     assert!(state.window_interaction_active());
     assert!(state.interaction_cursor_override.is_some());
-    assert_eq!(state.pending_interactive_resize_update, Some(update));
     assert_eq!(
         state.active_window_interaction_id(),
         Some(WindowInteractionId::new(1))

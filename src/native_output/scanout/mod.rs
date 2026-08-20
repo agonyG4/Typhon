@@ -366,6 +366,7 @@ impl NativeScanoutBackend {
     pub(crate) fn paint_server_frame(
         &mut self,
         renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
@@ -375,14 +376,33 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(_) => Err(io::Error::other(
                 "explicit Atomic output requires a frame-owned render transaction",
             )),
-            Self::NativeEglGbm(scanout) => {
-                scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
-            }
+            Self::NativeEglGbm(scanout) => scanout.paint_server_frame(
+                renderer,
+                resolved_scene,
+                server,
+                input_state,
+                cursor_mode,
+                damage,
+            ),
             Self::Gbm(scanout) => scanout
-                .paint_server_frame(renderer, server, input_state, cursor_mode, damage)
+                .paint_server_frame(
+                    renderer,
+                    resolved_scene,
+                    server,
+                    input_state,
+                    cursor_mode,
+                    damage,
+                )
                 .map(NativePaintOutcome::Rendered),
             Self::Dumb(framebuffer) => framebuffer
-                .paint_server_frame(renderer, server, input_state, cursor_mode, damage)
+                .paint_server_frame(
+                    renderer,
+                    resolved_scene,
+                    server,
+                    input_state,
+                    cursor_mode,
+                    damage,
+                )
                 .map(NativePaintOutcome::Rendered),
         }
     }
@@ -574,6 +594,13 @@ impl NativeScanoutBackend {
     pub(crate) fn explicit_output_swapchain(&self) -> Option<&AtomicOutputSwapchain> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.swapchain().ok(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn explicit_presented_direct_ownership(&self) -> Option<&DirectPrimaryOwnership> {
+        match self {
+            Self::AtomicEglGbm(scanout) => Some(scanout.presented_direct_ownership()),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
         }
     }

@@ -13,6 +13,7 @@ fn pointer_release_preserves_client_hidden_cursor_until_focus_changes() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -23,8 +24,15 @@ fn pointer_release_preserves_client_hidden_cursor_until_focus_changes() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();

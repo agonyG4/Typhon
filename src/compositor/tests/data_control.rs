@@ -42,17 +42,22 @@ fn data_control_real_client_sources_transfer_to_clipboard_and_primary_targets() 
         target_globals.bind(&target_qh, 1..=6, ()).unwrap();
     let shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
     let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+    let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
     let data_manager: client_wl_data_device_manager::WlDataDeviceManager =
         target_globals.bind(&target_qh, 1..=3, ()).unwrap();
     let _target_data_device = data_manager.get_data_device(&target_seat, &target_qh, ());
     let primary_manager: client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
         target_globals.bind(&target_qh, 1..=1, ()).unwrap();
     let _target_primary_device = primary_manager.get_device(&target_seat, &target_qh, ());
-    let (target_surface, _target_xdg_surface, _target_toplevel) =
+    let (target_surface, target_xdg_surface, _target_toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &target_qh, 160, 120).unwrap();
     target_surface.commit();
     target_connection.flush().unwrap();
     let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&target_xdg_surface);
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
     target_queue.roundtrip(&mut target_state).unwrap();
     source_device.set_selection(Some(&clipboard_source));
     source_device.set_primary_selection(Some(&primary_source));

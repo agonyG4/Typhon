@@ -13,6 +13,7 @@ fn primary_selection_real_client_pipe_transfer_and_reuse() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let _keyboard = seat.get_keyboard(&qh, ());
     let manager: client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
@@ -29,6 +30,10 @@ fn primary_selection_real_client_pipe_transfer_and_reuse() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
         .send(ServerCommand::KeyboardKey {
             key: 30,
@@ -43,7 +48,7 @@ fn primary_selection_real_client_pipe_transfer_and_reuse() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    assert_eq!(state.primary_selection_events, vec![false, true]);
+    assert_eq!(state.primary_selection_events, vec![true]);
     assert_eq!(state.primary_offer_mime_types, ["text/plain", "text/html"]);
 
     let offer = state

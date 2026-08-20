@@ -243,6 +243,16 @@ pub enum XwmCommand {
         client_list: Vec<X11WindowHandle>,
         stacking: Vec<X11WindowHandle>,
     },
+    SetWorkspace {
+        window: X11WindowHandle,
+        workspace: u32,
+    },
+    PublishDesktopState {
+        workspace_count: u32,
+        current_workspace: u32,
+        output_width: u32,
+        output_height: u32,
+    },
     BeginResizeSync {
         window: X11WindowHandle,
         geometry: X11Geometry,

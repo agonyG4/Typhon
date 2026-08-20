@@ -65,7 +65,7 @@ impl CompositorState {
         source: Option<wl_data_source::WlDataSource>,
         serial: u32,
     ) -> bool {
-        if !self.client_has_focus(client_id) {
+        if !self.client_has_keyboard_focus(client_id) {
             return false;
         }
         let Some(mutation_epoch) = self.selection_input_epoch(client_id, serial) else {
@@ -86,7 +86,7 @@ impl CompositorState {
                 let _ = bridge.clear_internal_selection();
             }
             self.retire_clipboard_selection_offers();
-            self.publish_clipboard_to_focused_client();
+            self.publish_clipboard_to_keyboard_focused_client();
             self.publish_data_control_selection(SelectionKind::Clipboard);
             return true;
         };
@@ -119,7 +119,7 @@ impl CompositorState {
             let _ = bridge.publish_internal_selection(commit.generation, binding.mime_types);
         }
         self.retire_clipboard_selection_offers();
-        self.publish_clipboard_to_focused_client();
+        self.publish_clipboard_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Clipboard);
         true
     }
@@ -165,7 +165,7 @@ impl CompositorState {
         }
         self.selection_state.mark_source_used(source_key);
         self.retire_clipboard_selection_offers();
-        self.publish_clipboard_to_focused_client();
+        self.publish_clipboard_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Clipboard);
     }
 
@@ -198,7 +198,7 @@ impl CompositorState {
             let _ = bridge.clear_internal_selection();
         }
         self.retire_clipboard_selection_offers();
-        self.publish_clipboard_to_focused_client();
+        self.publish_clipboard_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Clipboard);
     }
 
@@ -231,7 +231,7 @@ impl CompositorState {
             client_id: client_id.clone(),
             seat_id,
         });
-        if self.client_has_focus(&client_id) {
+        if self.client_has_keyboard_focus(&client_id) {
             self.publish_clipboard_to_data_device(&device);
         }
     }
@@ -284,8 +284,8 @@ impl CompositorState {
             }
             self.publish_data_control_selection(kind);
             match kind {
-                SelectionKind::Clipboard => self.publish_clipboard_to_focused_client(),
-                SelectionKind::Primary => self.publish_primary_to_focused_client(),
+                SelectionKind::Clipboard => self.publish_clipboard_to_keyboard_focused_client(),
+                SelectionKind::Primary => self.publish_primary_to_keyboard_focused_client(),
             }
         }
     }
@@ -420,15 +420,19 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn publish_clipboard_to_focused_client(&mut self) {
-        let Some(client_id) = self.focused_client_id() else {
+    pub(in crate::compositor) fn publish_clipboard_to_keyboard_focused_client(&mut self) {
+        let Some(client_id) = self.keyboard_focused_client_id() else {
             return;
         };
+        self.publish_clipboard_to_client(&client_id);
+    }
+
+    pub(in crate::compositor) fn publish_clipboard_to_client(&mut self, client_id: &ClientId) {
         let devices = self
             .data_devices
             .iter()
             .filter(|binding| {
-                binding.client_id == client_id
+                binding.client_id == *client_id
                     && binding.device.is_alive()
                     && binding.seat_id.interface().name == "wl_seat"
             })

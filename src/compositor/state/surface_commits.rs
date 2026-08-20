@@ -220,6 +220,7 @@ impl CompositorState {
             if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
                 node.mapped = true;
             }
+            self.refresh_active_scene_popup_view();
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: popup surface {surface_id} committed {width}x{height} at buffer offset {},{}",
@@ -240,7 +241,11 @@ impl CompositorState {
             let size = surface.buffer_size();
             self.record_surface_damage_commit(surface_id, damage, size.width, size.height);
         }
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        self.publish_surface_generation(
+            surface_id,
+            generation,
+            RenderGenerationCause::SurfaceCommit,
+        );
         self.record_surface_publication(
             surface_id,
             root_surface_id,
@@ -456,7 +461,11 @@ impl CompositorState {
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceDamage);
+        self.publish_surface_generation(
+            surface_id,
+            generation,
+            RenderGenerationCause::SurfaceDamage,
+        );
         if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
             self.note_xwayland_commit_observed(
                 surface_id,
@@ -897,12 +906,16 @@ impl CompositorState {
                         width: committed_size.width,
                         height: committed_size.height,
                         active_resize: None,
+                        mode_transition: false,
                     },
                 );
                 self.update_toplevel_visual_render_assignment(surface_id);
             }
             self.store_surface_placement(surface_id, placement);
-            self.advance_render_generation(RenderGenerationCause::WindowResize);
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::WindowResize,
+                self.surface_is_visible_in_active_workspace(surface_id),
+            );
         }
         self.complete_applied_resize_transaction(surface_id, resize);
         true
@@ -942,6 +955,7 @@ impl CompositorState {
         if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
             node.mapped = false;
         }
+        self.refresh_active_scene_popup_view();
         self.dismiss_popup_children_for_parent(surface_id);
         self.unmap_surface_content(surface_id);
         self.note_layer_surface_unmapped(surface_id);
@@ -990,6 +1004,9 @@ impl CompositorState {
         }
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        let scene_effect = removed_surface_ids
+            .iter()
+            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
         self.clear_resize_state_for_surfaces_with_reason(
             &removed_surface_ids,
             WindowInteractionEndReason::SurfaceUnmapped,
@@ -1030,8 +1047,16 @@ impl CompositorState {
             }
             let _ = self.focus_topmost_renderable_toplevel();
         }
+        if scene_effect {
+            self.rebuild_active_scene_view();
+        } else {
+            self.refresh_active_scene_surface_order();
+        }
         self.invalidate_surface_origin_cache();
-        self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::SurfaceUnmap,
+            scene_effect,
+        );
         true
     }
 
@@ -1102,8 +1127,19 @@ impl CompositorState {
             return false;
         }
 
+        let scene_effect = removed_surface_ids
+            .iter()
+            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
+        if scene_effect {
+            self.rebuild_active_scene_view();
+        } else {
+            self.refresh_active_scene_surface_order();
+        }
         self.invalidate_surface_origin_cache();
-        self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+        self.advance_render_generation_with_scene_effect(
+            RenderGenerationCause::SurfaceUnmap,
+            scene_effect,
+        );
         true
     }
 
@@ -1123,12 +1159,6 @@ impl CompositorState {
         self.resize_configure_flows
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
         let removed_flows = before_flows.saturating_sub(self.resize_configure_flows.len());
-        if self
-            .pending_interactive_resize_update
-            .is_some_and(|update| surface_ids.contains(&update.root_surface_id))
-        {
-            self.pending_interactive_resize_update = None;
-        }
         for commit in &mut self.pending_explicit_sync_commits {
             if surface_ids.contains(&commit.surface_id) {
                 commit.pending.resize_commit = None;
@@ -1323,7 +1353,11 @@ impl CompositorState {
             buffer_size.height,
         );
         self.reorder_renderable_surfaces_by_committed_stack();
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        self.publish_surface_generation(
+            surface_id,
+            generation,
+            RenderGenerationCause::SurfaceCommit,
+        );
         if surface_tree_debug_enabled() {
             eprintln!(
                 "oblivion-one compositor: surface_adopt surface={surface_id} had_buffer=true removed_root_node=false transactions_rekeyed=0"
@@ -1371,7 +1405,7 @@ impl CompositorState {
                             source,
                         );
                         self.note_layer_surface_buffer_published(surface_id);
-                        self.pending_frame_callbacks.extend(frame_callbacks);
+                        self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
                     }
                     decision => {
                         self.record_surface_publication_rejection(

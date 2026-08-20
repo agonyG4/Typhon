@@ -371,9 +371,24 @@ fn normalize_client_message(
     xwm: &mut Xwm,
     event: xproto::ClientMessageEvent,
 ) -> Result<(), XwmError> {
-    let handle = ensure_window(xwm, event.window)?;
     let data = event.data.as_data32();
-    if event.type_ == xwm.atoms.get(XwmAtomName::WlSurfaceSerial) {
+    if event.type_ == xwm.atoms.get(XwmAtomName::NetCurrentDesktop) {
+        if let Some(workspace) = crate::wm::WorkspaceId::from_ewmh(data[0]) {
+            xwm.outgoing_events
+                .push_back(XwmEvent::CurrentDesktopRequested(workspace));
+        }
+        return Ok(());
+    }
+    let handle = ensure_window(xwm, event.window)?;
+    if event.type_ == xwm.atoms.get(XwmAtomName::NetWmDesktop) {
+        if let Some(workspace) = crate::wm::WorkspaceId::from_ewmh(data[0]) {
+            xwm.outgoing_events
+                .push_back(XwmEvent::WindowWorkspaceRequested {
+                    window: handle,
+                    workspace,
+                });
+        }
+    } else if event.type_ == xwm.atoms.get(XwmAtomName::WlSurfaceSerial) {
         xwm.note_x11_surface_serial(handle, data[0], data[1])?;
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetWmState) {
         if let Some(action) = decode_state_action(data[0]) {
@@ -1348,6 +1363,81 @@ mod tests {
                     button: 1,
                     source: 1,
                 },
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_client_messages_are_normalized_and_invalid_indices_rejected() {
+        let generation = generation(31);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 114);
+        assert!(xwm.windows.insert_observed(handle));
+
+        let current = xproto::ClientMessageEvent::new(
+            32,
+            xwm.root,
+            xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
+            xproto::ClientMessageData::from([2, 0, 0, 0, 0]),
+        );
+        normalize(&mut xwm, Event::ClientMessage(current)).expect("normalize desktop request");
+        assert_eq!(
+            xwm.take_events().collect::<Vec<_>>(),
+            vec![XwmEvent::CurrentDesktopRequested(
+                crate::wm::WorkspaceId::new(3).unwrap()
+            )]
+        );
+
+        let extensible = xproto::ClientMessageEvent::new(
+            32,
+            xwm.root,
+            xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
+            xproto::ClientMessageData::from([10, 0, 0, 0, 0]),
+        );
+        normalize(&mut xwm, Event::ClientMessage(extensible))
+            .expect("extensible desktop request is normalized");
+        assert_eq!(
+            xwm.take_events().collect::<Vec<_>>(),
+            vec![XwmEvent::CurrentDesktopRequested(
+                crate::wm::WorkspaceId::new(11).unwrap()
+            )]
+        );
+
+        let invalid = xproto::ClientMessageEvent::new(
+            32,
+            xwm.root,
+            xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
+            xproto::ClientMessageData::from([u32::MAX, 0, 0, 0, 0]),
+        );
+        normalize(&mut xwm, Event::ClientMessage(invalid))
+            .expect("reserved desktop request is ignored");
+        assert!(xwm.take_events().next().is_none());
+
+        for index in [u32::MAX] {
+            let invalid = xproto::ClientMessageEvent::new(
+                32,
+                xwm.root,
+                xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
+                xproto::ClientMessageData::from([index, 0, 0, 0, 0]),
+            );
+            normalize(&mut xwm, Event::ClientMessage(invalid))
+                .expect("invalid desktop request is ignored");
+            assert!(xwm.take_events().next().is_none());
+        }
+
+        let window_request = xproto::ClientMessageEvent::new(
+            32,
+            handle.xid(),
+            xwm.atoms.get(XwmAtomName::NetWmDesktop),
+            xproto::ClientMessageData::from([8, 0, 0, 0, 0]),
+        );
+        normalize(&mut xwm, Event::ClientMessage(window_request))
+            .expect("normalize window workspace request");
+        assert_eq!(
+            xwm.take_events().collect::<Vec<_>>(),
+            vec![XwmEvent::WindowWorkspaceRequested {
+                window: handle,
+                workspace: crate::wm::WorkspaceId::new(9).unwrap(),
             }]
         );
     }

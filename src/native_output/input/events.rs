@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::wm::WorkspaceId;
 
 pub(crate) const WAYLAND_SCROLL_LINE_DISTANCE: f64 = 15.0;
 pub(crate) const EV_KEY: u16 = 0x01;
@@ -6,6 +7,13 @@ pub(crate) const EV_REL: u16 = 0x02;
 pub(crate) const KEY_1: u16 = 2;
 pub(crate) const KEY_2: u16 = 3;
 pub(crate) const KEY_3: u16 = 4;
+pub(crate) const KEY_4: u16 = 5;
+pub(crate) const KEY_5: u16 = 6;
+pub(crate) const KEY_6: u16 = 7;
+pub(crate) const KEY_7: u16 = 8;
+pub(crate) const KEY_8: u16 = 9;
+pub(crate) const KEY_9: u16 = 10;
+pub(crate) const KEY_0: u16 = 11;
 pub(crate) const KEY_TAB: u16 = 15;
 pub(crate) const KEY_Q: u16 = 16;
 pub(crate) const KEY_P: u16 = 25;
@@ -195,6 +203,8 @@ pub(crate) enum NativeWindowAction {
     EndInteraction,
     CloseActiveWindow,
     ToggleFullscreen,
+    SwitchWorkspace(WorkspaceId),
+    MoveFocusedWindowToWorkspace(WorkspaceId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

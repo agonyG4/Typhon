@@ -1003,8 +1003,7 @@ impl CompositorState {
                 self.last_application_keyboard_focus = self.focused_surface.clone();
             }
             self.exclusive_keyboard_layer_surface = Some(winner);
-            self.focused_surface = Some(surface.clone());
-            self.ensure_keyboard_focus(&surface);
+            self.focus_surface(surface.clone());
             layer_shell_debug_log(|| format!("focus_take surface={winner}"));
             return;
         }
@@ -1016,12 +1015,19 @@ impl CompositorState {
                 .filter(Resource::is_alive)
                 .filter(|surface| {
                     let root = self.root_surface_id_for_surface(compositor_surface_id(surface));
+                    let Some(window_id) = self.window_id_for_surface(root) else {
+                        return false;
+                    };
                     !self.layer_surfaces.contains_key(&root)
                         && self.toplevel_surfaces.contains_key(&root)
+                        && self.window(window_id).is_some_and(|window| {
+                            window.is_workspace_managed()
+                                && !window.state.is_minimized()
+                                && self.window_is_visible_in_active_workspace(window_id)
+                        })
                 });
             if let Some(previous) = previous {
-                self.focused_surface = Some(previous.clone());
-                self.ensure_keyboard_focus(&previous);
+                self.focus_surface(previous);
             } else {
                 self.focused_surface = None;
                 self.focused_window_id = None;
@@ -1070,8 +1076,7 @@ impl CompositorState {
             .focused_surface
             .clone()
             .filter(|focused| !same_surface_resource(focused, &surface));
-        self.focused_surface = Some(surface.clone());
-        self.ensure_keyboard_focus(&surface);
+        self.focus_surface(surface);
         true
     }
 
@@ -1092,6 +1097,7 @@ impl CompositorState {
     pub(in crate::compositor) fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.renderable_surfaces
             .iter()
+            .filter(|surface| self.surface_is_visible_in_active_workspace(surface.surface_id))
             .filter_map(|surface| {
                 let root_id = self.root_surface_id_for_surface(surface.surface_id);
                 self.layer_surfaces

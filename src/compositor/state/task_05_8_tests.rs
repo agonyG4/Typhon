@@ -5,6 +5,9 @@ use super::*;
 #[cfg(test)]
 mod task_05_8_tests {
     use super::*;
+    use crate::compositor::interaction::MAX_IN_FLIGHT_RESIZE_CONFIGURES;
+    use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceSwitchOutcome};
+    use std::borrow::Cow;
 
     pub(in crate::compositor) fn test_surface(
         surface_id: u32,
@@ -62,6 +65,89 @@ mod task_05_8_tests {
             buffer_id: None,
             interaction_id,
         }
+    }
+
+    #[test]
+    fn repeated_native_frame_resolution_borrows_stable_active_scene_view() {
+        let mut state = CompositorState::new(None);
+        let first = state.allocate_window_id().expect("first window id");
+        let second = state.allocate_window_id().expect("second window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(first, 801))
+            .expect("first window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(second, 802))
+            .expect("second window");
+        state.window_mut(second).expect("second window").management = Some(
+            WindowManagementState::new(WorkspaceId::new(2).expect("workspace two")),
+        );
+        state.renderable_surfaces.push(test_surface(801, 16, 16));
+        state.renderable_surfaces.push(test_surface(802, 16, 16));
+        state.rebuild_active_scene_view();
+        let rebuilds = state.active_scene_rebuild_count();
+
+        for _ in 0..1000 {
+            let surfaces = state.native_frame_renderable_surfaces();
+            assert!(matches!(surfaces, Cow::Borrowed(_)));
+            assert_eq!(
+                surfaces
+                    .iter()
+                    .map(|surface| surface.surface_id)
+                    .collect::<Vec<_>>(),
+                [801]
+            );
+        }
+        assert_eq!(state.active_scene_rebuild_count(), rebuilds);
+        assert_eq!(state.active_scene_surface_update_count(), 0);
+    }
+
+    #[test]
+    fn hidden_surface_publication_advances_global_but_not_active_scene_generation() {
+        let mut state = CompositorState::new(None);
+        let first = state.allocate_window_id().expect("first window id");
+        let second = state.allocate_window_id().expect("second window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(first, 811))
+            .expect("first window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(second, 812))
+            .expect("second window");
+        state.window_mut(second).expect("second window").management = Some(
+            WindowManagementState::new(WorkspaceId::new(2).expect("workspace two")),
+        );
+        state.renderable_surfaces.push(test_surface(811, 16, 16));
+        state.renderable_surfaces.push(test_surface(812, 16, 16));
+        state.rebuild_active_scene_view();
+        let scene_before = state.scene_render_generation;
+        let render_before = state.render_generation;
+
+        for generation in 2..=4 {
+            let surface = state
+                .renderable_surfaces
+                .iter_mut()
+                .find(|surface| surface.surface_id == 812)
+                .expect("hidden surface");
+            surface.generation = generation;
+            surface.commit_sequence = SurfaceCommitSequence(generation);
+            state.publish_surface_generation(
+                812,
+                generation as u64,
+                RenderGenerationCause::SurfaceCommit,
+            );
+        }
+
+        assert!(state.render_generation > render_before);
+        assert_eq!(state.scene_render_generation, scene_before);
+        assert_eq!(state.active_scene_surfaces()[0].surface_id, 811);
+
+        let workspace_two = WorkspaceId::new(2).expect("workspace two");
+        assert!(matches!(
+            state.activate_workspace(workspace_two),
+            WorkspaceSwitchOutcome::Changed { .. }
+        ));
+        assert_eq!(state.scene_render_generation, scene_before + 1);
+        assert_eq!(state.active_scene_surfaces()[0].surface_id, 812);
+        assert_eq!(state.active_scene_surfaces()[0].generation, 4);
     }
 
     fn install_captured_snapshot(
@@ -146,6 +232,7 @@ mod task_05_8_tests {
                 width: 944,
                 height: 526,
                 active_resize: Some(ResizeInteractionId::new(1)),
+                mode_transition: false,
             },
         );
 
@@ -176,10 +263,9 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(in crate::compositor) fn task_05_8_ack_waits_for_commit_before_freeing_configure_capacity()
-    {
+    pub(in crate::compositor) fn task_05_8_configure_window_allows_pipelined_resize_targets() {
         let mut flow = ResizeConfigureFlow::default();
-        let desired = PendingResizeConfigure {
+        let desired_a = PendingResizeConfigure {
             surface_id: 42,
             width: 1000,
             height: 700,
@@ -188,12 +274,12 @@ mod task_05_8_tests {
             resizing: true,
             interaction_id: ResizeInteractionId::new(1),
         };
-        flow.mark_sent(desired, 10, 1);
+        flow.mark_sent(desired_a, 10, 1);
 
         assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
         assert_eq!(flow.retained_configure_count(), 1);
         assert_eq!(flow.captured_count(), 0);
-        assert!(flow.queue(PendingResizeConfigure {
+        let desired_b = PendingResizeConfigure {
             surface_id: 42,
             width: 1200,
             height: 700,
@@ -201,10 +287,34 @@ mod task_05_8_tests {
             edges: ResizeEdges::BOTTOM_RIGHT,
             resizing: true,
             interaction_id: ResizeInteractionId::new(1),
+        };
+        assert!(flow.queue(desired_b));
+        let desired_b = flow
+            .take_sendable()
+            .expect("ACKed content must not block the next bounded configure");
+        flow.mark_sent(desired_b, 11, 2);
+
+        let desired_c = PendingResizeConfigure {
+            width: 1300,
+            ..desired_b
+        };
+        assert!(flow.queue(desired_c));
+        let desired_c = flow
+            .take_sendable()
+            .expect("the configure window should accept a third target");
+        flow.mark_sent(desired_c, 12, 3);
+
+        assert!(flow.queue(PendingResizeConfigure {
+            width: 1400,
+            ..desired_c
         }));
-        assert!(flow.take_sendable().is_none());
+        assert!(
+            flow.take_sendable().is_none(),
+            "configure pressure must be bounded"
+        );
+
         let snapshot = flow.capture(90).expect("ACKed resize snapshot");
-        assert!(flow.complete_applied(snapshot.sequence));
+        assert_eq!(snapshot.sequence, 1);
         assert!(flow.take_sendable().is_some());
     }
 
@@ -225,7 +335,8 @@ mod task_05_8_tests {
         let _snapshot = flow.capture(90).expect("old captured resize");
 
         let result = flow.begin_interaction(ResizeInteractionId::new(2));
-        assert_eq!(result.obsolete_in_flight_discarded, 1);
+        assert_eq!(result.obsolete_in_flight_discarded, 0);
+        assert_eq!(flow.captured_count(), 1);
         assert!(flow.queue(PendingResizeConfigure {
             surface_id: 42,
             width: 1200,
@@ -255,22 +366,167 @@ mod task_05_8_tests {
         assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
         let snapshot_a = flow.capture(90).expect("snapshot A");
 
-        assert!(flow.complete_applied(snapshot_a.sequence));
-        flow.mark_sent(
-            PendingResizeConfigure {
-                width: 1100,
-                ..desired
-            },
-            11,
-            2,
-        );
+        let desired_b = PendingResizeConfigure {
+            width: 1100,
+            ..desired
+        };
+        assert!(flow.queue(desired_b));
+        let desired_b = flow.take_sendable().expect("captured A is not pressure");
+        flow.mark_sent(desired_b, 11, 2);
         assert_eq!(flow.ack(11), ResizeAckDecision::Matched);
         let snapshot_b = flow.capture(91).expect("snapshot B");
 
         assert_eq!(snapshot_a.commit_sequence, 90);
         assert_eq!(snapshot_b.commit_sequence, 91);
-        assert_eq!(flow.captured_count(), 1);
-        assert_eq!(flow.retained_configure_count(), 1);
+        assert_eq!(flow.captured_count(), 2);
+        assert_eq!(flow.retained_configure_count(), 2);
+    }
+
+    #[test]
+    pub(in crate::compositor) fn newer_ack_supersedes_older_outstanding_configures() {
+        let mut flow = ResizeConfigureFlow::default();
+        let target = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(target, 10, 1);
+        flow.mark_sent(
+            PendingResizeConfigure {
+                width: 1100,
+                ..target
+            },
+            11,
+            2,
+        );
+        flow.mark_sent(
+            PendingResizeConfigure {
+                width: 1200,
+                ..target
+            },
+            12,
+            3,
+        );
+
+        assert_eq!(flow.ack(12), ResizeAckDecision::Matched);
+        assert_eq!(flow.outstanding_count(), 0);
+        assert_eq!(flow.acked_uncaptured_sequence(), Some(3));
+        assert_eq!(flow.ack(10), ResizeAckDecision::Stale);
+        assert_eq!(flow.ack(11), ResizeAckDecision::Stale);
+        assert!(flow.capture(90).is_some());
+    }
+
+    #[test]
+    pub(in crate::compositor) fn newer_ack_replaces_uncaptured_ack_before_commit() {
+        let mut flow = ResizeConfigureFlow::default();
+        let target = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(target, 10, 1);
+        flow.mark_sent(
+            PendingResizeConfigure {
+                width: 1100,
+                ..target
+            },
+            11,
+            2,
+        );
+
+        assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
+        assert_eq!(flow.ack(11), ResizeAckDecision::Matched);
+        assert_eq!(flow.acked_uncaptured_sequence(), Some(2));
+        let captured = flow.capture(90).expect("latest ACK owns the commit");
+        assert_eq!(captured.sequence, 2);
+    }
+
+    #[test]
+    pub(in crate::compositor) fn slow_resize_client_keeps_protocol_pressure_bounded() {
+        let mut flow = ResizeConfigureFlow::default();
+        let base = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(base, 10, 1);
+
+        for index in 0..1_000u32 {
+            let desired = PendingResizeConfigure {
+                width: 1001 + index,
+                ..base
+            };
+            assert!(flow.queue(desired));
+            if let Some(sendable) = flow.take_sendable() {
+                flow.mark_sent(sendable, 11 + index, 2 + u64::from(index));
+            }
+        }
+
+        assert!(flow.in_flight_configure_count() <= MAX_IN_FLIGHT_RESIZE_CONFIGURES);
+        assert!(flow.queued_latest().is_some());
+        assert!(flow.final_pending().is_none());
+        assert!(flow.retained_configure_count() <= MAX_IN_FLIGHT_RESIZE_CONFIGURES + 1);
+    }
+
+    #[test]
+    pub(in crate::compositor) fn final_resize_target_supersedes_queued_intermediate_target() {
+        let mut flow = ResizeConfigureFlow::default();
+        let base = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(base, 10, 1);
+        flow.mark_sent(
+            PendingResizeConfigure {
+                width: 1100,
+                ..base
+            },
+            11,
+            2,
+        );
+        flow.mark_sent(
+            PendingResizeConfigure {
+                width: 1200,
+                ..base
+            },
+            12,
+            3,
+        );
+        assert!(flow.queue(PendingResizeConfigure {
+            width: 1300,
+            ..base
+        }));
+
+        let final_target = PendingResizeConfigure {
+            width: 1400,
+            resizing: false,
+            ..base
+        };
+        assert!(flow.queue_final(final_target));
+        assert_eq!(flow.queued_latest(), None);
+        assert_eq!(flow.final_pending(), Some(final_target));
+
+        assert!(flow.take_sendable().is_none());
+        assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
+        assert!(flow.capture(90).is_some());
+        assert_eq!(flow.take_sendable(), Some(final_target));
     }
 
     #[test]
@@ -288,6 +544,7 @@ mod task_05_8_tests {
                 width: 1200,
                 height: 700,
                 active_resize: Some(interaction_id),
+                mode_transition: false,
             },
         );
         state.active_toplevel_resizes.insert(
@@ -334,6 +591,7 @@ mod task_05_8_tests {
                 width: 944,
                 height: 502,
                 active_resize: None,
+                mode_transition: false,
             },
         );
         state.update_toplevel_visual_render_assignment(surface_id);
@@ -367,6 +625,7 @@ mod task_05_8_tests {
                 width: 944,
                 height: 502,
                 active_resize: None,
+                mode_transition: false,
             },
         );
 
@@ -450,6 +709,7 @@ mod task_05_8_tests {
                 width: 1000,
                 height: 520,
                 active_resize: None,
+                mode_transition: false,
             },
         );
 

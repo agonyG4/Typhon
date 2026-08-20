@@ -139,6 +139,9 @@ impl CompositorState {
                 },
             );
         }
+        if resize_decision == ResizeAckDecision::Matched {
+            self.flush_pending_resize_configure();
+        }
     }
 
     pub(in crate::compositor) fn capture_acked_resize_for_surface_commit(

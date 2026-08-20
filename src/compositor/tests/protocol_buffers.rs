@@ -1,5 +1,11 @@
 use super::*;
 
+struct RawSurfaceFocusSnapshot {
+    state: RegistryTestState,
+    logical_focus: Option<u32>,
+    keyboard_focus: Option<u32>,
+}
+
 #[test]
 fn clipboard_ready_wayland_client_can_create_data_device() {
     let socket_name = unique_socket_name();
@@ -19,6 +25,104 @@ fn clipboard_ready_wayland_client_can_create_data_device() {
     stop_test_server(running, server_thread);
 
     result.unwrap();
+}
+
+#[test]
+fn raw_wl_surface_creation_does_not_establish_keyboard_focus() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    for surface_first in [true, false] {
+        let snapshot =
+            exercise_raw_surface_bind_order(&socket_path, &commands, surface_first).unwrap();
+        assert_eq!(
+            snapshot.logical_focus, None,
+            "surface_first={surface_first}"
+        );
+        assert_eq!(
+            snapshot.keyboard_focus, None,
+            "surface_first={surface_first}"
+        );
+        assert_eq!(
+            snapshot.state.keyboard_enter_count, 0,
+            "surface_first={surface_first}"
+        );
+        assert!(
+            snapshot.state.data_device_selection_events.is_empty(),
+            "surface_first={surface_first}"
+        );
+        assert!(
+            snapshot.state.primary_selection_events.is_empty(),
+            "surface_first={surface_first}"
+        );
+    }
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+#[ignore = "requires TYPHON_QT_WAYLAND_BOOTSTRAP_PROBE"]
+fn qt_wayland_bootstrap_probe_survives_active_clipboard_without_focus() {
+    let Ok(probe) = std::env::var("TYPHON_QT_WAYLAND_BOOTSTRAP_PROBE") else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let bridge = ScriptedClipboardBridge::with_host_selection(
+        HostClipboardOfferId(123),
+        vec!["text/plain".to_string(), "text/html".to_string()],
+        b"host clipboard payload",
+        requests,
+    );
+    let server =
+        OwnCompositorServer::bind_with_clipboard_bridge(&socket_name, Box::new(bridge)).unwrap();
+    let (running, server_thread) = spawn_test_server(server);
+
+    let status = std::process::Command::new(probe)
+        .env("XDG_RUNTIME_DIR", std::env::var("XDG_RUNTIME_DIR").unwrap())
+        .env("WAYLAND_DISPLAY", &socket_name)
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env("WAYLAND_DEBUG", "client")
+        .status()
+        .unwrap();
+
+    stop_test_server(running, server_thread);
+    assert!(status.success(), "Qt probe exited unsuccessfully: {status}");
+}
+
+fn exercise_raw_surface_bind_order(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    surface_first: bool,
+) -> Result<RawSurfaceFocusSnapshot, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ())?;
+    let primary_manager:
+        client_zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let surface = surface_first.then(|| compositor.create_surface(&qh, ()));
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let _data_device = manager.get_data_device(&seat, &qh, ());
+    let _primary_device = primary_manager.get_device(&seat, &qh, ());
+    let _surface = surface.unwrap_or_else(|| compositor.create_surface(&qh, ()));
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    Ok(RawSurfaceFocusSnapshot {
+        state,
+        logical_focus: capture_focused_surface_id(commands),
+        keyboard_focus: capture_keyboard_focus_surface_id(commands),
+    })
 }
 
 #[test]
@@ -44,6 +148,19 @@ fn clipboard_ready_wayland_clients_transfer_selection_without_compositor_bufferi
     assert_eq!(
         target_state.data_offer_mime_types,
         ["text/plain", "text/html"]
+    );
+    assert_eq!(
+        target_state.event_timeline,
+        [
+            TestWaylandEvent::DataOffer,
+            TestWaylandEvent::DataOfferMime("text/plain".to_string()),
+            TestWaylandEvent::DataOfferMime("text/html".to_string()),
+            TestWaylandEvent::SelectionSome,
+            TestWaylandEvent::KeyboardEnter {
+                surface_id: target_state.keyboard_enter_surface_id.unwrap(),
+            },
+            TestWaylandEvent::KeyboardModifiers,
+        ]
     );
     assert_eq!(source_state.data_source_send_mime_types, ["text/plain"]);
     assert_eq!(received, "clipboard payload");

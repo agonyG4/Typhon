@@ -427,7 +427,7 @@ impl NativeRuntime {
             drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
-            last_renderable_surfaces,
+            scene_history: _,
             queued_redraw_requested,
             frame_index,
             known_toplevels,
@@ -659,6 +659,10 @@ impl NativeRuntime {
                     NativePerfField::u64(
                         "resize_pending_updates_replaced",
                         resize.pending_resize_updates_replaced,
+                    ),
+                    NativePerfField::u64(
+                        "resize_configure_capacity_blocked",
+                        resize.resize_configure_capacity_blocked,
                     ),
                     NativePerfField::u64("resize_updates_applied", resize.resize_updates_applied),
                     NativePerfField::u64(

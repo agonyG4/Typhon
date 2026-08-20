@@ -30,16 +30,16 @@ use khronos_egl as egl;
 #[cfg(test)]
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
-    AcquireWatchChange, AstreaShortcutPhase, AsyncEligibility, DesktopComposeRequest,
-    DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
-    DrmContentType, EffectivePresentation, FramePresentation, FullscreenPresentationRejection,
-    KeyboardShortcutInhibitionSnapshot, OutputPosition as CompositorOutputPosition,
-    OutputPresentationMode, OutputRegion, OwnCompositorServer, PointerAxisComponent,
-    PointerAxisFrame, PointerAxisSource, PointerConstraintBackendId,
-    PointerConstraintBackendRequest, PointerConstraintMode,
+    AcquireWatchChange, AstreaShortcutPhase, AsyncEligibility, DecorationSceneSnapshot,
+    DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
+    DesktopVisualState, DrmContentType, EffectivePresentation, FramePresentation,
+    FullscreenPresentationRejection, KeyboardShortcutInhibitionSnapshot,
+    OutputPosition as CompositorOutputPosition, OutputPresentationMode, OutputRegion,
+    OwnCompositorServer, PointerAxisComponent, PointerAxisFrame, PointerAxisSource,
+    PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
     PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
-    RenderSceneElement, RenderSceneElementId, RenderableSurface, TearingPolicy,
+    RenderSceneElement, RenderSceneElementId, RenderableSurface, TearingPolicy, WindowId,
     render_scene_elements_for_surfaces, resize_debug_log,
 };
 use oblivion_one::native::kms::{
@@ -85,7 +85,8 @@ use oblivion_one::xwayland::{
 };
 use oblivion_one::{
     CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy,
-    compositor_app_command_with_policy_and_xwayland_and_cursor, shell_quote,
+    compositor_app_command_with_policy_and_xwayland_and_cursor, configure_astrea_shell_runtime,
+    shell_quote,
 };
 use wayland_server::Resource;
 
@@ -121,8 +122,10 @@ pub(crate) use presentation::trace::*;
 pub(crate) use presentation::transaction::*;
 pub(crate) use runtime::{
     NativeCursorRenderMode, NativeFrameRenderer, NativePointerConstraintBackend,
-    native_pointer_debug_log, run,
+    ResolvedNativeFrameScene, native_pointer_debug_log, run,
 };
+#[cfg(test)]
+pub(crate) use runtime::{NativeFrameSceneSnapshot, NativeSceneHistory};
 pub(crate) use scanout::*;
 
 #[cfg(test)]

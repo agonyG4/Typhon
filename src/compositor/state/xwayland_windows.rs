@@ -92,11 +92,22 @@ impl CompositorState {
             .unwrap_or(false);
 
         if !withdrawn_ids.is_empty() {
+            let scene_effect = withdrawn_ids
+                .iter()
+                .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
             self.renderable_surfaces
                 .retain(|surface| !withdrawn_ids.contains(&surface.surface_id));
+            if scene_effect {
+                self.rebuild_active_scene_view();
+            } else {
+                self.refresh_active_scene_surface_order();
+            }
             self.invalidate_surface_origin_cache();
             self.reconcile_all_surface_output_memberships();
-            self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::SurfaceUnmap,
+                scene_effect,
+            );
         }
 
         !withdrawn_ids.is_empty() || minimized_ids_removed
@@ -135,11 +146,6 @@ impl CompositorState {
         if let Some(flow) = self.resize_configure_flows.remove(&old_surface_id) {
             self.resize_configure_flows
                 .insert(replacement_surface_id, flow);
-        }
-        if let Some(update) = self.pending_interactive_resize_update.as_mut()
-            && update.root_surface_id == old_surface_id
-        {
-            update.root_surface_id = replacement_surface_id;
         }
         if let Some(interaction) = self.window_interaction.as_mut()
             && interaction.root_surface_id == old_surface_id
@@ -265,7 +271,11 @@ impl CompositorState {
         );
         self.reorder_renderable_surfaces_by_committed_stack();
         self.reapply_root_visual_assignment_after_surface_publication(surface_id);
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        self.publish_surface_generation(
+            surface_id,
+            generation,
+            RenderGenerationCause::SurfaceCommit,
+        );
         true
     }
 
@@ -437,7 +447,11 @@ impl CompositorState {
                         format!("{visual_clip_after_reapply:?}"),
                     )
             });
-            self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+            self.publish_surface_generation(
+                surface_id,
+                generation,
+                RenderGenerationCause::SurfaceCommit,
+            );
         }
         self.note_xwayland_buffer_ready(surface_id);
         self.note_xwayland_commit_observed(
@@ -449,7 +463,7 @@ impl CompositorState {
         if x11_window_minimized {
             self.complete_frame_callbacks(frame_callbacks);
         } else {
-            self.pending_frame_callbacks.extend(frame_callbacks);
+            self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
         }
     }
 }

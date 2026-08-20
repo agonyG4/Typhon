@@ -161,6 +161,7 @@ pub(in crate::compositor::tests) fn create_configured_client_toplevel_then_resiz
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
@@ -169,6 +170,10 @@ pub(in crate::compositor::tests) fn create_configured_client_toplevel_then_resiz
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::ResizeFocusedTo { width, height })?;
     queue.roundtrip(&mut state)?;

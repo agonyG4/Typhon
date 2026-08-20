@@ -6,7 +6,7 @@ use oblivion_one::cursor_theme::{validate_cursor_size, validate_cursor_theme};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 use support::{
     client::{self, AstreactlError},
-    discovery, output,
+    discovery, output, wallpaper,
 };
 
 fn main() -> ExitCode {
@@ -28,6 +28,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
     let mut positionals = Vec::new();
     let mut cursor_theme = None;
     let mut cursor_size = None;
+    let mut wallpaper_fit = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -85,7 +86,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...|decoration status|decoration list|decoration set-theme NAME|decoration reload>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...|decoration ...|wallpaper get|wallpaper list|wallpaper set PATH_OR_ID|wallpaper import PATH|wallpaper reset|wallpaper default>"
                 );
                 return Ok(0);
             }
@@ -99,7 +100,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
                 return Ok(0);
             }
             value if value.starts_with('-') => {
-                if value == "--theme" || value == "--size" {
+                if value == "--theme" || value == "--size" || value == "--fit" {
                     index += 1;
                     let argument = args.get(index).ok_or_else(|| {
                         AstreactlError::Usage(format!("missing value for {value}"))
@@ -114,13 +115,20 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
                             ));
                         }
                         cursor_theme = Some(argument.clone());
-                    } else {
+                    } else if value == "--size" {
                         if cursor_size.is_some() {
                             return Err(AstreactlError::Usage(
                                 "duplicate cursor --size".to_string(),
                             ));
                         }
                         cursor_size = Some(argument.clone());
+                    } else {
+                        if wallpaper_fit.is_some() {
+                            return Err(AstreactlError::Usage(
+                                "duplicate wallpaper --fit".to_string(),
+                            ));
+                        }
+                        wallpaper_fit = Some(argument.clone());
                     }
                 } else {
                     return Err(AstreactlError::Usage(format!("unknown option {value}")));
@@ -138,6 +146,34 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
     let command = positionals
         .first()
         .ok_or_else(|| AstreactlError::Usage("missing command".to_string()))?;
+    if command == "wallpaper" {
+        if instance.is_some() || socket.is_some() {
+            return Err(AstreactlError::Usage(
+                "wallpaper commands use the secure Paper endpoint and do not accept Typhon socket options".to_string(),
+            ));
+        }
+        if cursor_theme.is_some() || cursor_size.is_some() {
+            return Err(AstreactlError::Usage(
+                "wallpaper commands do not accept cursor options".to_string(),
+            ));
+        }
+        let (action, arguments) = parse_wallpaper_command(&positionals[1..], wallpaper_fit)?;
+        let wallpaper_timeout = if timeout_supplied {
+            timeout
+        } else {
+            wallpaper::DEFAULT_WALLPAPER_TIMEOUT
+        };
+        let result = wallpaper::request(action, arguments, wallpaper_timeout)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|_| AstreactlError::MalformedResponse)?
+            );
+        } else {
+            println!("{}", output::human(&result));
+        }
+        return Ok(0);
+    }
     let (display_command, wire_command, request_args) = if command == "cursor" {
         parse_cursor_command(&positionals[1..], cursor_theme, cursor_size)?
     } else if command == "decoration" {
@@ -148,7 +184,11 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         }
         parse_decoration_command(&positionals[1..])?
     } else {
-        if positionals.len() != 1 || cursor_theme.is_some() || cursor_size.is_some() {
+        if positionals.len() != 1
+            || cursor_theme.is_some()
+            || cursor_size.is_some()
+            || wallpaper_fit.is_some()
+        {
             return Err(AstreactlError::Usage(
                 "multiple commands are not allowed".to_string(),
             ));
@@ -178,6 +218,76 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(7);
     }
     Ok(0)
+}
+
+fn parse_wallpaper_command(
+    positionals: &[String],
+    fit: Option<String>,
+) -> Result<(&'static str, serde_json::Value), AstreactlError> {
+    let subcommand = positionals
+        .first()
+        .ok_or_else(|| AstreactlError::Usage("missing wallpaper subcommand".to_string()))?;
+    match subcommand.as_str() {
+        "get" | "list" | "reset" | "default" => {
+            if positionals.len() != 1 || fit.is_some() {
+                return Err(AstreactlError::Usage(
+                    "wallpaper get/list/reset/default take no extra arguments".to_string(),
+                ));
+            }
+            let action = match subcommand.as_str() {
+                "get" => "get",
+                "list" => "list",
+                "reset" => "reset",
+                _ => "default",
+            };
+            Ok((action, serde_json::json!({})))
+        }
+        "set" => {
+            if positionals.len() != 2 {
+                return Err(AstreactlError::Usage(
+                    "wallpaper set requires exactly one path or ID".to_string(),
+                ));
+            }
+            let fit = fit.unwrap_or_else(|| "cover".to_string()).to_lowercase();
+            if !matches!(
+                fit.as_str(),
+                "cover" | "contain" | "stretch" | "center" | "tile"
+            ) {
+                return Err(AstreactlError::Usage("invalid wallpaper fit".to_string()));
+            }
+            let target = &positionals[1];
+            let mut arguments = if target.starts_with("astrea://wallpaper/") {
+                serde_json::json!({"id": target})
+            } else {
+                serde_json::json!({"source": target})
+            };
+            arguments["fit"] = serde_json::json!(fit);
+            arguments["kind"] = serde_json::json!("image");
+            arguments["scope"] = serde_json::json!("global");
+            Ok(("set", arguments))
+        }
+        "import" => {
+            if positionals.len() != 2 {
+                return Err(AstreactlError::Usage(
+                    "wallpaper import requires exactly one path".to_string(),
+                ));
+            }
+            let fit = fit.unwrap_or_else(|| "cover".to_string()).to_lowercase();
+            if !matches!(
+                fit.as_str(),
+                "cover" | "contain" | "stretch" | "center" | "tile"
+            ) {
+                return Err(AstreactlError::Usage("invalid wallpaper fit".to_string()));
+            }
+            Ok((
+                "import",
+                serde_json::json!({"path": positionals[1], "fit": fit}),
+            ))
+        }
+        _ => Err(AstreactlError::Usage(format!(
+            "unknown wallpaper subcommand {subcommand}"
+        ))),
+    }
 }
 
 fn parse_decoration_command(
@@ -337,6 +447,61 @@ fn exit_code(error: &AstreactlError) -> u8 {
         | AstreactlError::MalformedResponse
         | AstreactlError::ProtocolMismatch
         | AstreactlError::ResponseIdMismatch { .. } => 6,
-        AstreactlError::Server(_) => 1,
+        AstreactlError::Server(_) | AstreactlError::Paper { .. } => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wallpaper_command;
+    use oblivion_one::astreactl::wallpaper::DEFAULT_WALLPAPER_TIMEOUT;
+    use oblivion_one::control_snapshots::AstreactlResult;
+
+    #[test]
+    fn wallpaper_parser_preserves_source_and_fit() {
+        let source = "/tmp/snow & café.png".to_string();
+        let (action, args) = parse_wallpaper_command(
+            &["set".to_string(), source.clone()],
+            Some("contain".to_string()),
+        )
+        .unwrap();
+        assert_eq!(action, "set");
+        assert_eq!(args["source"], source);
+        assert_eq!(args["fit"], "contain");
+        assert_eq!(args["kind"], "image");
+        assert_eq!(args["scope"], "global");
+    }
+
+    #[test]
+    fn wallpaper_parser_rejects_invalid_fit_and_typhon_socket_is_not_in_parser() {
+        assert!(
+            parse_wallpaper_command(
+                &["set".to_string(), "/tmp/wallpaper.png".to_string()],
+                Some("invalid".to_string()),
+            )
+            .is_err()
+        );
+        let (action, args) = parse_wallpaper_command(&["default".to_string()], None).unwrap();
+        assert_eq!(action, "default");
+        assert!(args.is_object());
+        let _ = std::mem::size_of::<AstreactlResult>();
+        assert!(DEFAULT_WALLPAPER_TIMEOUT >= std::time::Duration::from_secs(6));
+    }
+
+    #[test]
+    fn wallpaper_parser_supports_catalog_ids_and_imports() {
+        let (action, args) = parse_wallpaper_command(
+            &["set".to_string(), "astrea://wallpaper/user/abc".to_string()],
+            Some("center".to_string()),
+        )
+        .unwrap();
+        assert_eq!(action, "set");
+        assert_eq!(args["id"], "astrea://wallpaper/user/abc");
+        assert!(args.get("source").is_none());
+        let (action, args) =
+            parse_wallpaper_command(&["import".to_string(), "/tmp/source.png".to_string()], None)
+                .unwrap();
+        assert_eq!(action, "import");
+        assert_eq!(args["path"], "/tmp/source.png");
     }
 }

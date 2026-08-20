@@ -132,6 +132,7 @@ impl NativeGbmScanout {
     pub(crate) fn paint_server_frame(
         &mut self,
         renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
@@ -140,8 +141,14 @@ impl NativeGbmScanout {
         let total_start = Instant::now();
         let index = self.next_render_index()?;
         let render_start = Instant::now();
-        let rendered =
-            renderer.render_server_frame(self.width, self.height, server, input_state, cursor_mode);
+        let rendered = renderer.render_server_frame(
+            self.width,
+            self.height,
+            resolved_scene,
+            server,
+            input_state,
+            cursor_mode,
+        );
         let render_us = elapsed_micros(render_start);
         let buffer = &mut self.buffers[index];
         let byte_len = buffer

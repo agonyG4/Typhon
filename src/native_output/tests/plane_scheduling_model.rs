@@ -474,10 +474,14 @@ fn presented_bundle_promotes_primary_and_cursor_atomically() {
         output_generation: 72,
         crtc_id: 73,
     };
-    let primary = ConfirmedPrimaryState::Composed {
+    let primary = PresentedPrimaryState::Composed {
         transaction_id: OutputTransactionId::new(NonZeroU64::new(74).unwrap()),
         token: token(71),
+        pageflip: identity,
         slot: OutputSlotId::new(0).unwrap(),
+        framebuffer_id: 42,
+        pool_generation: 1,
+        presentation_serial: 1,
     };
     let mut visible = AtomicCursorVisualState::hidden(64, 64);
     visible.visible = true;
@@ -509,16 +513,20 @@ fn presented_snapshot_preserves_the_other_plane_and_rejects_every_stale_identity
         &AtomicCursorVisualState::hidden(64, 64),
     );
     let mut snapshot = PresentedPlaneSnapshot::initial(hidden);
-    let primary = ConfirmedPrimaryState::Composed {
-        transaction_id: OutputTransactionId::new(NonZeroU64::new(80).unwrap()),
-        token: token(81),
-        slot: OutputSlotId::new(1).unwrap(),
-    };
     let identity = PlanePageflipIdentity {
         bundle_id: bundle_id(82),
         token: token(81),
         output_generation: 83,
         crtc_id: 84,
+    };
+    let primary = PresentedPrimaryState::Composed {
+        transaction_id: OutputTransactionId::new(NonZeroU64::new(80).unwrap()),
+        token: token(81),
+        pageflip: identity,
+        slot: OutputSlotId::new(1).unwrap(),
+        framebuffer_id: 42,
+        pool_generation: 1,
+        presentation_serial: 1,
     };
     assert!(snapshot.promote_bundle(identity, identity, Some(primary), None));
 

@@ -151,6 +151,28 @@ impl OutputDamage {
         }
     }
 
+    pub(crate) fn identity_signature(&self) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |value: u64| {
+            signature ^= value;
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        };
+        match self {
+            Self::Empty => mix(0),
+            Self::Full => mix(1),
+            Self::Rects(rects) => {
+                mix(2);
+                for rect in rects {
+                    mix(rect.x as u64);
+                    mix(rect.y as u64);
+                    mix(u64::from(rect.width));
+                    mix(u64::from(rect.height));
+                }
+            }
+        }
+        signature
+    }
+
     pub(crate) fn pixels(&self, output_width: u32, output_height: u32) -> Option<u64> {
         match self {
             Self::Empty => Some(0),
@@ -380,7 +402,13 @@ impl FullRepaintReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepaintPlan {
-    pub(crate) current_damage: OutputDamage,
+    /// Damage that describes the logical scene rendered for this candidate.
+    ///
+    /// This is intentionally not the damage transition that belongs in a
+    /// presentation-domain buffer-age journal. A candidate may be rendered
+    /// while an older frame is still presented and may pageflip after another
+    /// candidate has become the actual predecessor.
+    pub(crate) render_damage: OutputDamage,
     pub(crate) repair_damage: OutputDamage,
     pub(crate) buffer_age: Option<u32>,
     pub(crate) mode: RepaintMode,
@@ -449,8 +477,15 @@ impl PartialRepaintPlanner {
 
     pub(crate) fn plan(&mut self, current_damage: OutputDamage, age: BufferAge) -> RepaintPlan {
         if current_damage == OutputDamage::Empty {
+            if !self.history_valid {
+                return self.full_plan(
+                    current_damage,
+                    age_value(age),
+                    FullRepaintReason::FirstFrameOrInvalidated,
+                );
+            }
             return RepaintPlan {
-                current_damage,
+                render_damage: current_damage,
                 repair_damage: OutputDamage::Empty,
                 buffer_age: age_value(age),
                 mode: RepaintMode::Skip,
@@ -547,7 +582,7 @@ impl PartialRepaintPlanner {
         }
         if repair_damage == OutputDamage::Empty {
             return RepaintPlan {
-                current_damage,
+                render_damage: current_damage,
                 repair_damage,
                 buffer_age: Some(age),
                 mode: RepaintMode::Skip,
@@ -596,7 +631,7 @@ impl PartialRepaintPlanner {
             );
         }
         RepaintPlan {
-            current_damage,
+            render_damage: current_damage,
             repair_damage,
             buffer_age: Some(age),
             mode: RepaintMode::Partial,
@@ -611,7 +646,7 @@ impl PartialRepaintPlanner {
         reason: FullRepaintReason,
     ) -> RepaintPlan {
         RepaintPlan {
-            current_damage,
+            render_damage: current_damage,
             repair_damage: OutputDamage::Full,
             buffer_age,
             mode: RepaintMode::Full,
@@ -619,8 +654,8 @@ impl PartialRepaintPlanner {
         }
     }
 
-    pub(crate) fn commit_presented(&mut self, plan: &RepaintPlan) {
-        self.history.push_front(plan.current_damage.clone());
+    pub(crate) fn commit_presented_transition(&mut self, transition_damage: OutputDamage) {
+        self.history.push_front(transition_damage);
         self.history.truncate(MAX_DAMAGE_HISTORY_FRAMES);
         self.history_valid = true;
     }

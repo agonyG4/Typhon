@@ -7,6 +7,7 @@ use crate::render_backend::buffer::{
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
+use crate::wm::WorkspaceManager;
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
@@ -110,10 +111,11 @@ mod toplevel_publication;
 mod toplevel_publication_state;
 mod window_backend;
 mod window_state;
+pub use crate::core::WindowId;
 use commit_debug::*;
 pub use desktop_window::{
-    DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata,
-    X11DesktopRole, X11PlacementPolicy,
+    DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowMetadata, X11DesktopRole,
+    X11PlacementPolicy,
 };
 #[allow(unused_imports)]
 pub(crate) use desktop_window::{
@@ -233,7 +235,7 @@ pub use render::{
     DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
     OUTPUT_BACKGROUND, RenderSceneElement, RenderSceneElementId, RenderSceneElementKind,
     ServerFrameColor, SurfaceRenderPlan, SurfaceRenderSpaceAssignment, SurfaceTargetRect,
-    SurfaceVisualAperture, WindowVisualGroup, compose_output, cursor_damage_rect, draw_wallpaper,
+    SurfaceVisualAperture, VisualStackGroup, WindowVisualGroup, compose_output, cursor_damage_rect,
     output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
     scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
     server_frame_rects_for_surface, surface_origin, surface_origins, surface_render_plan,
@@ -389,6 +391,7 @@ struct ToplevelVisualGeometry {
     width: u32,
     height: u32,
     active_resize: Option<ResizeInteractionId>,
+    mode_transition: bool,
 }
 impl ToplevelVisualGeometry {
     const fn window_geometry(self) -> WindowGeometry {
@@ -401,15 +404,6 @@ struct ActiveToplevelResize {
     flow_sequence: u64,
     edges: ResizeEdges,
     activated_at: Instant,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingInteractiveResizeUpdate {
-    root_surface_id: u32,
-    width: u32,
-    height: u32,
-    placement: SurfacePlacement,
-    edges: ResizeEdges,
-    interaction_id: ResizeInteractionId,
 }
 #[derive(Debug, Default, Clone, Copy)]
 struct XdgConfigureSerialState {
@@ -430,6 +424,8 @@ pub enum RenderGenerationCause {
     WindowMinimize,
     WindowRestore,
     WindowStack,
+    WorkspaceSwitch,
+    WorkspaceMove,
     OutputChange,
     CursorCommit,
     CursorMotion,
@@ -450,6 +446,8 @@ impl RenderGenerationCause {
             Self::WindowMinimize => "window_minimize",
             Self::WindowRestore => "window_restore",
             Self::WindowStack => "window_stack",
+            Self::WorkspaceSwitch => "workspace_switch",
+            Self::WorkspaceMove => "workspace_move",
             Self::OutputChange => "output_change",
             Self::CursorCommit => "cursor_commit",
             Self::CursorMotion => "cursor_motion",
@@ -490,6 +488,7 @@ pub struct CompositorState {
     pub xdg_popups: usize,
     pub last_app_id: Option<String>,
     pub renderable_surfaces: Vec<RenderableSurface>,
+    active_scene_view: ActiveSceneView,
     next_surface_id: u32,
     buffer_ids: BufferIdAllocator,
     surface_resources: HashMap<u32, wl_surface::WlSurface>,
@@ -544,6 +543,7 @@ pub struct CompositorState {
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
+    pub(in crate::compositor) workspace_manager: WorkspaceManager,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
     xwayland_scene_batch: XwaylandSceneBatchState,
@@ -575,7 +575,7 @@ pub struct CompositorState {
     decoration_button_capture: Option<DecorationButtonCapture>,
     decoration_button_hover: Option<(WindowId, DecorationButtonKind)>,
     decoration_titlebar_click_capture: Option<(WindowId, u32)>,
-    decoration_last_titlebar_click: Option<(WindowId, Instant)>,
+    decoration_last_titlebar_click: Option<(WindowId, Instant, f64, f64)>,
     decoration_theme: DecorationThemeSnapshot,
     decoration_theme_error: Option<String>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
@@ -586,7 +586,6 @@ pub struct CompositorState {
     window_interaction: Option<WindowInteraction>,
     interaction_cursor_override: Option<InteractionCursorOverride>,
     fullscreen_presentation: Option<FullscreenPresentationState>,
-    pending_interactive_resize_update: Option<PendingInteractiveResizeUpdate>,
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
     toplevel_visual_geometries: HashMap<u32, ToplevelVisualGeometry>,
     active_toplevel_resizes: HashMap<u32, ActiveToplevelResize>,
@@ -622,7 +621,10 @@ pub struct CompositorState {
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
+    pending_frame_callback_surfaces: HashMap<ObjectId, u32>,
+    visible_pending_frame_callback_count: usize,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
+    visible_pending_presentation_feedback_count: usize,
     frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     retired_frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     next_frame_batch_id: u64,
@@ -636,9 +638,15 @@ pub struct CompositorState {
     cursor_generation: u64,
     surface_tree_generation: Option<u64>,
     scene_render_generation: u64,
+    pointer_hit_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,
     surface_origin_cache: Vec<(i32, i32)>,
+    visual_stack_groups_cache_generation: Option<u64>,
+    visual_stack_groups_cache: Vec<VisualStackGroup>,
+    pointer_scene_hit_cache: Option<PointerSceneHitCache>,
+    pointer_hit_instrumentation_enabled: bool,
+    pointer_hit_metrics: PointerInputMetrics,
     gpu_protocol_capabilities: GpuProtocolCapabilities,
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: u64,

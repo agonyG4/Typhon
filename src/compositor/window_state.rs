@@ -71,7 +71,7 @@ impl WindowState {
     }
 
     pub(super) fn capture_restore_geometry(&mut self, geometry: WindowGeometry) {
-        if self.mode == ToplevelMode::Floating && self.restore_geometry.is_none() {
+        if self.mode == ToplevelMode::Normal && self.restore_geometry.is_none() {
             self.restore_geometry = Some(geometry);
         }
     }
@@ -84,7 +84,7 @@ impl WindowState {
 impl Default for WindowState {
     fn default() -> Self {
         Self {
-            mode: ToplevelMode::Floating,
+            mode: ToplevelMode::Normal,
             restore_geometry: None,
             minimized_surfaces: Vec::new(),
             minimized: false,
@@ -94,7 +94,7 @@ impl Default for WindowState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToplevelMode {
-    Floating,
+    Normal,
     Maximized,
     Fullscreen,
 }
@@ -102,7 +102,7 @@ pub(super) enum ToplevelMode {
 impl ToplevelMode {
     pub(super) const fn xdg_states(self) -> &'static [xdg_toplevel::State] {
         match self {
-            Self::Floating => &[],
+            Self::Normal => &[],
             Self::Maximized => &[xdg_toplevel::State::Maximized],
             Self::Fullscreen => &[xdg_toplevel::State::Fullscreen],
         }
@@ -132,4 +132,37 @@ pub(super) fn xdg_toplevel_state_bytes(states: &[xdg_toplevel::State]) -> Vec<u8
         bytes.extend_from_slice(&(*state as u32).to_ne_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_modes_publish_only_their_xdg_state() {
+        assert_eq!(ToplevelMode::Normal.xdg_states(), &[]);
+        assert_eq!(
+            ToplevelMode::Maximized.xdg_states(),
+            &[xdg_toplevel::State::Maximized]
+        );
+        assert_eq!(
+            ToplevelMode::Fullscreen.xdg_states(),
+            &[xdg_toplevel::State::Fullscreen]
+        );
+    }
+
+    #[test]
+    fn restore_geometry_is_captured_only_from_normal_protocol_mode() {
+        let normal_geometry = WindowGeometry::new(SurfacePlacement::root_at(1, 2), 300, 200);
+        let other_geometry = WindowGeometry::new(SurfacePlacement::root_at(3, 4), 500, 400);
+        let mut state = WindowState::default();
+
+        state.set_mode(ToplevelMode::Maximized);
+        state.capture_restore_geometry(other_geometry);
+        assert_eq!(state.take_restore_geometry(), None);
+
+        state.set_mode(ToplevelMode::Normal);
+        state.capture_restore_geometry(normal_geometry);
+        assert_eq!(state.take_restore_geometry(), Some(normal_geometry));
+    }
 }

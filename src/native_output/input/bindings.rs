@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::wm::WorkspaceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ModifierMask(u8);
@@ -42,6 +43,8 @@ pub(crate) enum BindingAction {
     ExitCompositor,
     CloseActiveWindow,
     ToggleFullscreen,
+    SwitchWorkspace(WorkspaceId),
+    MoveFocusedWindowToWorkspace(WorkspaceId),
     LaunchCommand(Vec<String>),
     LaunchSessionCommand(u8),
     BeginMove,
@@ -230,7 +233,7 @@ fn name_is_alt_tab_step(action: &BindingAction) -> bool {
 }
 
 pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
-    vec![
+    let mut bindings = vec![
         Binding {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
@@ -348,5 +351,96 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             inhibition: InhibitionPolicy::Bypass,
             reserved: true,
         },
-    ]
+    ];
+    for workspace in 1..=10 {
+        let workspace = WorkspaceId::new(workspace).expect("workspace binding id");
+        let key = workspace_key(workspace);
+        bindings.push(Binding {
+            modifiers: ModifierMask::SUPER,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(key),
+            action: BindingAction::SwitchWorkspace(workspace),
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        });
+        bindings.push(Binding {
+            modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(key),
+            action: BindingAction::MoveFocusedWindowToWorkspace(workspace),
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        });
+    }
+    bindings
+}
+
+const fn workspace_key(workspace: WorkspaceId) -> u16 {
+    match workspace.get() {
+        1 => KEY_1,
+        2 => KEY_2,
+        3 => KEY_3,
+        4 => KEY_4,
+        5 => KEY_5,
+        6 => KEY_6,
+        7 => KEY_7,
+        8 => KEY_8,
+        9 => KEY_9,
+        10 => KEY_0,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_workspace_bindings_are_typed_non_repeating_and_not_reserved() {
+        let mut manager = AstreaBindingManager::default();
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_0, true, false, false),
+            AstreaBindingMatch::Consumed {
+                action: BindingAction::SwitchWorkspace(WorkspaceId::new(10).unwrap()),
+                phase: AstreaShortcutPhase::Pressed,
+            }
+        );
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_0, true, true, false),
+            AstreaBindingMatch::Pass
+        );
+        assert_eq!(
+            manager.handle_key(
+                ModifierMask::SUPER | ModifierMask::SHIFT,
+                KEY_4,
+                true,
+                false,
+                false,
+            ),
+            AstreaBindingMatch::Consumed {
+                action: BindingAction::MoveFocusedWindowToWorkspace(WorkspaceId::new(4).unwrap(),),
+                phase: AstreaShortcutPhase::Pressed,
+            }
+        );
+    }
+
+    #[test]
+    fn session_switch_bindings_keep_their_reserved_modifier_boundary() {
+        let mut manager = AstreaBindingManager::default();
+        assert_eq!(
+            manager.handle_key(
+                ModifierMask::CTRL | ModifierMask::SHIFT | ModifierMask::ALT,
+                KEY_1,
+                true,
+                false,
+                true,
+            ),
+            AstreaBindingMatch::Consumed {
+                action: BindingAction::LaunchSessionCommand(1),
+                phase: AstreaShortcutPhase::Pressed,
+            }
+        );
+    }
 }

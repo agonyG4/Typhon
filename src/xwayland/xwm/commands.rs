@@ -53,6 +53,8 @@ impl XwmCommand {
             Self::Close(_) => "Close",
             Self::SetState { .. } => "SetState",
             Self::SyncClientLists { .. } => "SyncClientLists",
+            Self::SetWorkspace { .. } => "SetWorkspace",
+            Self::PublishDesktopState { .. } => "PublishDesktopState",
             Self::BeginResizeSync { .. } => "BeginResizeSync",
             Self::SetAllowCommits { .. } => "SetAllowCommits",
             Self::ReleaseResizeCommits { .. } => "ReleaseResizeCommits",
@@ -82,6 +84,8 @@ impl XwmCommand {
             Self::RestackExact { order, .. } => order.first().copied(),
             Self::Focus { window, .. } => *window,
             Self::SyncClientLists { .. } => None,
+            Self::SetWorkspace { window, .. } => Some(*window),
+            Self::PublishDesktopState { .. } => None,
         }
     }
 }
@@ -495,6 +499,48 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
         } => {
             publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
             publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
+        }
+        XwmCommand::SetWorkspace { window, workspace } => {
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    window.xid(),
+                    xwm.atoms.get(XwmAtomName::NetWmDesktop),
+                    AtomEnum::CARDINAL,
+                    &[workspace],
+                )
+                .map_err(XwmError::Connection)?;
+        }
+        XwmCommand::PublishDesktopState {
+            workspace_count,
+            current_workspace,
+            output_width,
+            output_height,
+        } => {
+            let viewport = vec![0; workspace_count.saturating_mul(2) as usize];
+            let workarea = (0..workspace_count)
+                .flat_map(|_| [0, 0, output_width, output_height])
+                .collect::<Vec<_>>();
+            for (atom, values) in [
+                (XwmAtomName::NetNumberOfDesktops, vec![workspace_count]),
+                (XwmAtomName::NetCurrentDesktop, vec![current_workspace]),
+                (
+                    XwmAtomName::NetDesktopGeometry,
+                    vec![output_width, output_height],
+                ),
+                (XwmAtomName::NetDesktopViewport, viewport),
+                (XwmAtomName::NetWorkarea, workarea),
+            ] {
+                xwm.connection
+                    .change_property32(
+                        PropMode::REPLACE,
+                        xwm.root,
+                        xwm.atoms.get(atom),
+                        AtomEnum::CARDINAL,
+                        &values,
+                    )
+                    .map_err(XwmError::Connection)?;
+            }
         }
         XwmCommand::BeginResizeSync {
             window,

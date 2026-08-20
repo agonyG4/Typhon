@@ -1,4 +1,121 @@
 use super::*;
+use std::borrow::Cow;
+
+use oblivion_one::compositor::{
+    DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
+};
+
+#[derive(Debug)]
+pub(crate) struct ResolvedNativeFrameScene<'a> {
+    pub(crate) surfaces: Cow<'a, [RenderableSurface]>,
+    pub(crate) decorations: Vec<DecorationRenderInstance>,
+    pub(crate) popup_surface_ids: Cow<'a, [u32]>,
+    pub(crate) external_overlay_surface_ids: Vec<u32>,
+    pub(crate) render_generation: u64,
+    pub(crate) visibility: FullscreenRenderPlanMetrics,
+    pub(crate) snapshot: NativeSceneSnapshot,
+}
+
+impl<'a> ResolvedNativeFrameScene<'a> {
+    pub(crate) fn from_server(server: &'a OwnCompositorServer) -> Self {
+        let surfaces = server.native_frame_renderable_surfaces();
+        let decorations =
+            server.native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0);
+        let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
+        let external_overlay_surface_ids = server.external_overlay_surface_ids();
+        let render_generation = server.scene_render_generation();
+        let snapshot = NativeSceneSnapshot::from_surfaces(
+            surfaces.as_ref(),
+            decorations
+                .iter()
+                .map(DecorationRenderInstance::scene_snapshot)
+                .collect(),
+        );
+        Self {
+            surfaces,
+            decorations,
+            popup_surface_ids,
+            external_overlay_surface_ids,
+            render_generation,
+            visibility: server.fullscreen_render_plan_metrics(),
+            snapshot,
+        }
+    }
+
+    pub(crate) fn surface_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.surfaces.iter().map(|surface| surface.surface_id)
+    }
+
+    pub(crate) fn decoration_identities(&self) -> impl Iterator<Item = (WindowId, u32)> + '_ {
+        self.decorations
+            .iter()
+            .map(DecorationRenderInstance::scene_snapshot)
+            .map(|snapshot| snapshot.identity())
+    }
+
+    pub(crate) fn visibility_signature(&self) -> u64 {
+        let metrics = self.visibility;
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        for value in [
+            metrics.fullscreen_active as u64,
+            u64::from(metrics.owner_root_surface_id.unwrap_or(0)),
+            metrics.solitary_tree_active as u64,
+            metrics.culled_surface_count as u64,
+            metrics.wallpaper_culled as u64,
+            metrics.visible_overlay_count as u64,
+            metrics.rejection.map_or(0, |rejection| {
+                match rejection {
+                    oblivion_one::compositor::FullscreenPresentationRejection::NoFullscreenOwner => 1,
+                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerMissing => 2,
+                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerMinimized => 3,
+                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerDoesNotCoverOutput => 4,
+                    oblivion_one::compositor::FullscreenPresentationRejection::OwnerOpacityUnknown => 5,
+                    oblivion_one::compositor::FullscreenPresentationRejection::OverlayVisible => 6,
+                    oblivion_one::compositor::FullscreenPresentationRejection::SoftwareCursorVisible => 7,
+                    oblivion_one::compositor::FullscreenPresentationRejection::TransformOrScaleIncompatible => 8,
+                }
+            }),
+        ] {
+            signature ^= value;
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        }
+        signature
+    }
+
+    pub(crate) fn snapshot(&self) -> NativeSceneSnapshot {
+        let snapshot_surface_ids = self
+            .snapshot
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        debug_assert_eq!(
+            self.surface_ids().collect::<Vec<_>>(),
+            snapshot_surface_ids,
+            "resolved frame scene and its snapshot diverged on surfaces"
+        );
+        let snapshot_decoration_ids = self
+            .snapshot
+            .decorations
+            .iter()
+            .map(DecorationSceneSnapshot::identity)
+            .collect::<Vec<_>>();
+        debug_assert_eq!(
+            self.decoration_identities().collect::<Vec<_>>(),
+            snapshot_decoration_ids,
+            "resolved frame scene and its snapshot diverged on decorations"
+        );
+        let mut snapshot = self.snapshot.clone();
+        snapshot.popup_surface_ids = self.popup_surface_ids.to_vec();
+        snapshot.external_overlay_surface_ids = self.external_overlay_surface_ids.clone();
+        snapshot.visibility_signature = self.visibility_signature();
+        snapshot
+    }
+
+    pub(crate) fn scene_identity_signature(&self) -> u64 {
+        self.snapshot().identity_signature()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeRepaintInputs {
@@ -63,7 +180,6 @@ pub(crate) fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
 pub(crate) struct NativeFrameRenderer {
     pub(crate) scene_renderer: DesktopSceneRenderer,
     pub(crate) frame: Vec<u32>,
-    pub(crate) frame_surfaces: Vec<RenderableSurface>,
 }
 
 impl NativeFrameRenderer {
@@ -73,7 +189,6 @@ impl NativeFrameRenderer {
         Self {
             scene_renderer: DesktopSceneRenderer::with_cursor_image(cursor_image),
             frame: Vec::new(),
-            frame_surfaces: Vec::new(),
         }
     }
 
@@ -638,24 +753,22 @@ impl NativeFrameRenderer {
         &mut self,
         width: u32,
         height: u32,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
     ) -> NativeRenderedFrame<'_> {
-        let surfaces = server.native_frame_renderable_surfaces();
-        let decorations =
-            server.native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0);
-        self.scene_renderer.set_decoration_instances(&decorations);
-        let popup_surface_ids = server.popup_surface_ids();
         self.scene_renderer
-            .set_popup_surface_ids(&popup_surface_ids);
+            .set_decoration_instances(&resolved_scene.decorations);
+        self.scene_renderer
+            .set_popup_surface_ids(&resolved_scene.popup_surface_ids);
         self.render_frame(NativeFrameRequest {
             width,
             height,
-            surfaces: surfaces.as_ref(),
-            external_overlay_surface_ids: server.external_overlay_surface_ids(),
+            surfaces: resolved_scene.surfaces.as_ref(),
+            external_overlay_surface_ids: resolved_scene.external_overlay_surface_ids.clone(),
             visual_state: input_state.desktop_visual_state(cursor_mode),
-            render_generation: server.scene_render_generation(),
+            render_generation: resolved_scene.render_generation,
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())
@@ -697,29 +810,27 @@ impl NativeFrameRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn egl_scene_draw_request<'a>(
-        &'a mut self,
+        &mut self,
         width: u32,
         height: u32,
+        resolved_scene: &'a ResolvedNativeFrameScene<'_>,
         server: &'a OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
-        let surfaces = server.native_frame_renderable_surfaces();
-        self.frame_surfaces.clear();
-        self.frame_surfaces.extend_from_slice(surfaces.as_ref());
         EglSceneDrawRequest {
             width,
             height,
-            surfaces: &self.frame_surfaces,
-            external_overlay_surface_ids: server.external_overlay_surface_ids(),
-            popup_surface_ids: server.popup_surface_ids(),
-            content_generation: native_scene_content_generation(server.scene_render_generation()),
+            surfaces: resolved_scene.surfaces.as_ref(),
+            external_overlay_surface_ids: &resolved_scene.external_overlay_surface_ids,
+            popup_surface_ids: &resolved_scene.popup_surface_ids,
+            content_generation: native_scene_content_generation(resolved_scene.render_generation),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
-            decoration_instances: server
-                .native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0),
+            decoration_instances: &resolved_scene.decorations,
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())

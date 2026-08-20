@@ -228,6 +228,7 @@ impl NativeSessionIo for NativeRuntime {
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
+        self.scene_history.discard_unpresented();
         self.scanout.suspend_page_flip()?;
         Ok(())
     }
@@ -319,7 +320,6 @@ impl NativeSessionIo for NativeRuntime {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
-        self.confirmed_primary_assignment = None;
         self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         self.submitted_worker_ownership.clear();
         self.worker_quarantine.jobs.clear();

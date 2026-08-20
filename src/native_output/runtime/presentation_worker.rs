@@ -4,7 +4,7 @@ pub(super) use super::plane_cycle::cursor_worker_opportunities;
 use super::presentation_cursor::{RuntimePlanePlan, presented_delivery_for_plan};
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    settle_failed_output_transaction, submit_plane_delta,
+    present_compatibility_frame, settle_failed_output_transaction, submit_plane_delta,
 };
 use super::*;
 use crate::native_output::kms_worker::{
@@ -16,6 +16,311 @@ use crate::native_output::presentation::plane::{
     CursorRevision, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
 };
 use oblivion_one::native::kms::FramebufferId;
+
+pub(super) fn record_composited_scene_identity(
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    transaction_id: OutputTransactionId,
+    frame_id: u64,
+    render_generation: u64,
+    resolved_scene_signature: u64,
+    render_damage_signature: u64,
+    repair_damage_signature: u64,
+    presented_at_render_frame_id: Option<u64>,
+    framebuffer_slot: u8,
+    buffer_age: Option<u32>,
+) -> NativeResult<()> {
+    presentation_trace.push(PresentationTransactionEvent::SceneIdentity {
+        transaction_id,
+        timestamp_ns: monotonic_now_ns()?,
+        frame_id,
+        render_generation,
+        resolved_scene_signature,
+        snapshot_scene_signature: resolved_scene_signature,
+        render_damage_signature,
+        repair_damage_signature,
+        presented_at_render_frame_id,
+        framebuffer_slot,
+        buffer_age,
+    });
+    Ok(())
+}
+
+pub(super) fn replace_atomic_ready_scene(
+    scene_history: &mut NativeSceneHistory,
+    resolved_snapshot: NativeSceneSnapshot,
+    frame_id: u64,
+    render_generation: u64,
+    cursor: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
+) {
+    let cursor_damage = scene_history.cursor_damage(cursor);
+    scene_history.replace_ready(NativeFrameSceneSnapshot {
+        frame_id,
+        render_generation,
+        scene: resolved_snapshot,
+        cursor_damage,
+    });
+}
+
+pub(super) fn record_atomic_rendered_scene(
+    scene_history: &mut NativeSceneHistory,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    frame_id: u64,
+    transaction_id: OutputTransactionId,
+    resolved_render_generation: u64,
+    resolved_snapshot: NativeSceneSnapshot,
+    resolved_scene_signature: u64,
+    render_damage_signature: u64,
+    repair_damage_signature: u64,
+    presented_at_render_frame_id: Option<u64>,
+    framebuffer_slot: u8,
+    cursor: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
+    buffer_age: Option<u32>,
+) -> NativeResult<()> {
+    replace_atomic_ready_scene(
+        scene_history,
+        resolved_snapshot,
+        frame_id,
+        resolved_render_generation,
+        cursor,
+    );
+    record_composited_scene_identity(
+        presentation_trace,
+        transaction_id,
+        frame_id,
+        resolved_render_generation,
+        resolved_scene_signature,
+        render_damage_signature,
+        repair_damage_signature,
+        presented_at_render_frame_id,
+        framebuffer_slot,
+        buffer_age,
+    )
+}
+
+pub(super) fn resolve_scene_and_damage<'a>(
+    direct: bool,
+    width: u32,
+    height: u32,
+    scene_history: &NativeSceneHistory,
+    server: &'a OwnCompositorServer,
+    cursor: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
+) -> (ResolvedNativeFrameScene<'a>, NativeOutputDamage) {
+    let resolved_scene = ResolvedNativeFrameScene::from_server(server);
+    let output_damage = native_output_damage_for_presented_scene(
+        direct,
+        width,
+        height,
+        scene_history,
+        &resolved_scene,
+        cursor,
+    );
+    (resolved_scene, output_damage)
+}
+
+pub(super) fn replace_ready_scene_and_signature(
+    scene_history: &mut NativeSceneHistory,
+    resolved_scene: &ResolvedNativeFrameScene<'_>,
+    frame_index: u64,
+    cursor: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
+) -> u64 {
+    replace_ready_scene(
+        scene_history,
+        resolved_scene,
+        frame_index,
+        cursor.0,
+        cursor.1,
+    );
+    resolved_scene.scene_identity_signature()
+}
+
+pub(super) fn record_compatibility_scene_identity(
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    scanout: &NativeScanoutBackend,
+    transaction_id: Option<OutputTransactionId>,
+    frame_id: u64,
+    render_generation: u64,
+    resolved_scene_signature: u64,
+) -> NativeResult<()> {
+    let Some(transaction_id) = transaction_id else {
+        return Ok(());
+    };
+    let buffer = scanout.buffer_snapshot();
+    let framebuffer_slot = buffer
+        .pending
+        .or(buffer.current)
+        .and_then(|slot| u8::try_from(slot).ok())
+        .unwrap_or(0);
+    record_composited_scene_identity(
+        presentation_trace,
+        transaction_id,
+        frame_id,
+        render_generation,
+        resolved_scene_signature,
+        0,
+        0,
+        None,
+        framebuffer_slot,
+        None,
+    )
+}
+
+pub(super) fn record_immediate_scene_identity(
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    transaction_id: Option<OutputTransactionId>,
+    frame_id: u64,
+    render_generation: u64,
+    resolved_scene_signature: u64,
+) -> NativeResult<OutputTransactionId> {
+    let transaction_id = transaction_id.ok_or_else(|| {
+        io::Error::other("immediate compatibility presentation has no transaction")
+    })?;
+    record_composited_scene_identity(
+        presentation_trace,
+        transaction_id,
+        frame_id,
+        render_generation,
+        resolved_scene_signature,
+        0,
+        0,
+        None,
+        0,
+        None,
+    )?;
+    Ok(transaction_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn present_composited_compatibility_frame(
+    scanout: &mut NativeScanoutBackend,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    output_generation: u64,
+    crtc_id: u32,
+    presentation_deadline: &PresentationDeadlinePlanner,
+    scheduled_presentation_target: Option<PresentationTarget>,
+    scheduler_now: MonotonicTimestampNs,
+    pacing_mode: NativeOutputPacingMode,
+    render_generation: u64,
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    cursor_epoch: u64,
+    frame_id: u64,
+    kms_backend: &KmsBackendSelection,
+    scene_history: &mut NativeSceneHistory,
+) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
+    let compatibility_target = scheduled_presentation_target
+        .or_else(|| presentation_deadline.reactive_target(scheduler_now))
+        .ok_or_else(|| {
+            io::Error::other("compatibility pageflip started without a presentation target")
+        })?;
+    let result = present_compatibility_frame(
+        scanout,
+        server,
+        output_transactions,
+        output_generation,
+        crtc_id,
+        compatibility_target,
+        pacing_mode,
+        render_generation,
+        effective_cursor,
+        cursor_epoch,
+        frame_id,
+        Some(kms_backend),
+        |scanout, presentation_mode| {
+            scanout.present(kms_backend, effective_cursor, presentation_mode)
+        },
+    );
+    if result.is_err() {
+        scene_history.discard_ready();
+    }
+    result
+}
+
+pub(super) fn native_scene_damage_for_resolved_scene(
+    width: u32,
+    height: u32,
+    previous_scene: &NativeSceneSnapshot,
+    resolved_scene: &ResolvedNativeFrameScene<'_>,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    native_output_damage_for_scene_snapshots(
+        width,
+        height,
+        previous_scene,
+        &resolved_scene.snapshot(),
+        cursor_damage,
+    )
+}
+
+pub(super) fn native_output_damage_for_resolved_scene(
+    direct: bool,
+    width: u32,
+    height: u32,
+    previous_scene: &NativeSceneSnapshot,
+    resolved_scene: &ResolvedNativeFrameScene<'_>,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    if direct {
+        NativeOutputDamage::full_output(width, height)
+    } else {
+        native_scene_damage_for_resolved_scene(
+            width,
+            height,
+            previous_scene,
+            resolved_scene,
+            cursor_damage,
+        )
+    }
+}
+
+pub(super) fn native_output_damage_for_presented_scene(
+    direct: bool,
+    width: u32,
+    height: u32,
+    scene_history: &NativeSceneHistory,
+    resolved_scene: &ResolvedNativeFrameScene<'_>,
+    cursor: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
+) -> NativeOutputDamage {
+    let Some(previous_scene) = scene_history.presented_scene_if_any() else {
+        return NativeOutputDamage::full_output(width, height);
+    };
+    native_output_damage_for_resolved_scene(
+        direct,
+        width,
+        height,
+        previous_scene,
+        resolved_scene,
+        scene_history.cursor_damage(cursor),
+    )
+}
+
+pub(super) fn replace_ready_scene(
+    scene_history: &mut NativeSceneHistory,
+    resolved_scene: &ResolvedNativeFrameScene<'_>,
+    frame_index: u64,
+    current_client_cursor_damage: Option<NativeClientCursorDamageState>,
+    current_software_cursor_damage: Option<NativeDamageRect>,
+) {
+    scene_history.replace_ready(NativeFrameSceneSnapshot::from_resolved_frame_scene(
+        frame_index,
+        resolved_scene,
+        scene_history.cursor_damage((current_client_cursor_damage, current_software_cursor_damage)),
+    ));
+}
 
 pub(super) fn can_queue_worker_primary(
     worker_mode: bool,
@@ -638,11 +943,8 @@ pub(super) fn finish_direct_worker_queued(
     crtc_id: u32,
     scene_generation: u64,
     _cursor_epoch: u64,
-    current_software_cursor_damage: Option<NativeDamageRect>,
     last_rendered_scene_generation: &mut u64,
     _last_submitted_cursor_epoch: &mut u64,
-    last_renderable_surfaces: &mut Vec<RenderableSurface>,
-    last_software_cursor_damage: &mut Option<NativeDamageRect>,
     frame_index: &mut u64,
     frame_submitted: &mut bool,
     transaction_id: OutputTransactionId,
@@ -655,6 +957,9 @@ pub(super) fn finish_direct_worker_queued(
 ) -> NativeResult<DirectWorkerQueueResult> {
     let commit_token = PageFlipToken::new(token)
         .ok_or_else(|| io::Error::other("Direct Atomic worker token is zero"))?;
+    let direct_surface_id = direct_lease.surface_id();
+    let direct_framebuffer_id = direct_lease.framebuffer_id();
+    let direct_candidate_key = direct_lease.key();
     let kind = AtomicCommitKind::DirectPrimary {
         transaction_id,
         direct_token: commit_token,
@@ -867,13 +1172,21 @@ pub(super) fn finish_direct_worker_queued(
         return Ok(DirectWorkerQueueResult::AdmissionRejected);
     }
     guard.commit();
+    presentation_trace.push(PresentationTransactionEvent::DirectIdentity {
+        transaction_id,
+        timestamp_ns: queued_at_ns,
+        surface_id: direct_surface_id,
+        framebuffer_id: direct_framebuffer_id,
+        content_epoch: direct_candidate_key.content.content_epoch.get(),
+        candidate_key: direct_candidate_key,
+        submission_token: token,
+        pageflip_token: token,
+    });
     presentation_trace.push(PresentationTransactionEvent::WorkerQueued {
         transaction_id,
         timestamp_ns: queued_at_ns,
     });
     *last_rendered_scene_generation = scene_generation;
-    *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-    *last_software_cursor_damage = current_software_cursor_damage;
     *frame_index = frame_index.saturating_add(1);
     *frame_submitted = true;
     Ok(DirectWorkerQueueResult::Queued)

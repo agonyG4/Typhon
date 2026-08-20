@@ -1,6 +1,10 @@
 use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
+    pub(in crate::compositor) const fn output_dimensions(&self) -> (u32, u32) {
+        (self.output_size.width, self.output_size.height)
+    }
+
     pub(in crate::compositor) fn surface_content_epoch(
         &self,
         surface_id: u32,
@@ -424,7 +428,7 @@ impl CompositorState {
             .record(damage, width, height);
     }
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
-        Self {
+        let mut state = Self {
             frame_clock_start: Some(Instant::now()),
             next_window_id: 1,
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
@@ -434,8 +438,11 @@ impl CompositorState {
             dmabuf_scanout_target_device_override: None,
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
+            pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()
-        }
+        };
+        state.rebuild_active_scene_view();
+        state
     }
     pub(in crate::compositor) fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
         self.buffer_ids.allocate()
@@ -444,6 +451,11 @@ impl CompositorState {
     pub(in crate::compositor) fn next_render_generation_value(&self) -> u64 {
         self.surface_tree_generation
             .unwrap_or_else(|| self.render_generation.saturating_add(1))
+    }
+
+    pub(in crate::compositor) fn advance_pointer_hit_generation(&mut self) -> u64 {
+        self.pointer_hit_generation = advance_nonzero_serial(self.pointer_hit_generation);
+        self.pointer_hit_generation
     }
 
     pub(in crate::compositor) fn begin_surface_tree_publication(&mut self) {
@@ -460,16 +472,45 @@ impl CompositorState {
         generation: u64,
         cause: RenderGenerationCause,
     ) {
+        self.set_render_generation_with_scene_effect(generation, cause, true);
+    }
+
+    fn set_render_generation_with_scene_effect(
+        &mut self,
+        generation: u64,
+        cause: RenderGenerationCause,
+        scene_effect: bool,
+    ) {
         self.render_generation = generation;
         self.render_generation_cause = cause;
         self.note_cursor_generation(cause);
-        if !matches!(
-            cause,
-            RenderGenerationCause::CursorCommit
-                | RenderGenerationCause::CursorMotion
-                | RenderGenerationCause::CursorState
-        ) {
-            self.scene_render_generation = generation;
+        if scene_effect
+            && !matches!(
+                cause,
+                RenderGenerationCause::CursorCommit
+                    | RenderGenerationCause::CursorMotion
+                    | RenderGenerationCause::CursorState
+            )
+        {
+            self.scene_render_generation = advance_nonzero_serial(self.scene_render_generation);
+        }
+    }
+
+    pub(in crate::compositor) fn publish_surface_generation(
+        &mut self,
+        surface_id: u32,
+        generation: u64,
+        cause: RenderGenerationCause,
+    ) {
+        let scene_effect = self.surface_is_visible_in_active_workspace(surface_id);
+        self.set_render_generation_with_scene_effect(generation, cause, scene_effect);
+        if scene_effect {
+            let root_surface_id = self.root_surface_id_for_surface(surface_id);
+            if root_surface_id == surface_id {
+                self.refresh_active_scene_surface_tree(root_surface_id);
+            } else {
+                self.refresh_active_scene_surface(surface_id);
+            }
         }
     }
 
@@ -477,8 +518,16 @@ impl CompositorState {
         &mut self,
         cause: RenderGenerationCause,
     ) -> u64 {
+        self.advance_render_generation_with_scene_effect(cause, true)
+    }
+
+    pub(in crate::compositor) fn advance_render_generation_with_scene_effect(
+        &mut self,
+        cause: RenderGenerationCause,
+        scene_effect: bool,
+    ) -> u64 {
         let generation = self.next_render_generation_value();
-        self.set_render_generation(generation, cause);
+        self.set_render_generation_with_scene_effect(generation, cause, scene_effect);
         self.update_all_active_confined_pointer_regions(cause.as_str());
         generation
     }
@@ -697,8 +746,8 @@ impl CompositorState {
                 let mode = self
                     .toplevel_window_state(*surface_id)
                     .map(WindowState::mode)
-                    .unwrap_or(ToplevelMode::Floating);
-                (mode != ToplevelMode::Floating
+                    .unwrap_or(ToplevelMode::Normal);
+                (mode != ToplevelMode::Normal
                     && !self
                         .toplevel_window_state(*surface_id)
                         .is_some_and(WindowState::is_minimized))
@@ -707,7 +756,7 @@ impl CompositorState {
             .collect::<Vec<_>>();
 
         for (surface_id, mode) in toplevels {
-            let geometry = self.window_geometry_for_mode(mode);
+            let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
             self.send_configure_root_window_to(
                 surface_id,
                 geometry.width,
@@ -719,6 +768,7 @@ impl CompositorState {
                 geometry.placement,
                 RenderGenerationCause::OutputChange,
             );
+            self.install_toplevel_visual_geometry(surface_id, geometry);
             if mode == ToplevelMode::Fullscreen {
                 self.refresh_fullscreen_presentation_owner(surface_id);
             }
@@ -736,7 +786,7 @@ impl CompositorState {
                 .iter()
                 .any(|surface| surface.surface_id == surface_id);
         let before = self.renderable_surfaces.len();
-        self.unregister_surface_resource(surface_id);
+        self.unregister_surface_resource_with_reason(surface_id, reason);
         let removed = before.saturating_sub(self.renderable_surfaces.len());
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
@@ -750,8 +800,23 @@ impl CompositorState {
         }
     }
 
+    #[allow(dead_code)]
     pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
+        self.unregister_surface_resource_with_reason(
+            surface_id,
+            SurfaceTeardownReason::ExplicitDestroy,
+        );
+    }
+
+    fn unregister_surface_resource_with_reason(
+        &mut self,
+        surface_id: u32,
+        reason: SurfaceTeardownReason,
+    ) {
         self.remove_keyboard_shortcut_inhibitors_for_surface(surface_id);
+        if reason != SurfaceTeardownReason::ClientDisconnected {
+            self.discard_frame_callbacks_for_surface(surface_id);
+        }
         if let Some(active) = self.active_fifo_barriers.get(&surface_id).copied() {
             self.clear_fifo_barrier_claim(
                 FifoBarrierClaim {
@@ -863,6 +928,7 @@ impl CompositorState {
                 && surface.placement.parent_surface_id != Some(surface_id)
         });
         if self.renderable_surfaces.len() != previous_renderable_count {
+            self.rebuild_active_scene_view();
             self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
         }
         self.clear_resize_state_for_surfaces_with_reason(

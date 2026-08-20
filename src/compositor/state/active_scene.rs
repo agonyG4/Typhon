@@ -1,0 +1,261 @@
+use super::*;
+use crate::wm::WorkspaceId;
+
+#[derive(Debug, Default)]
+pub(in crate::compositor) struct ActiveSceneView {
+    surfaces: Vec<RenderableSurface>,
+    surface_indices: HashMap<u32, usize>,
+    surface_origins: Vec<(i32, i32)>,
+    popup_surface_ids: Vec<u32>,
+    workspace: Option<WorkspaceId>,
+    rebuild_count: u64,
+    incremental_surface_update_count: u64,
+}
+
+impl ActiveSceneView {
+    pub(in crate::compositor) fn surfaces(&self) -> &[RenderableSurface] {
+        &self.surfaces
+    }
+
+    pub(in crate::compositor) fn popup_surface_ids(&self) -> &[u32] {
+        &self.popup_surface_ids
+    }
+
+    pub(in crate::compositor) fn surface_origins(&self) -> &[(i32, i32)] {
+        &self.surface_origins
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) const fn rebuild_count(&self) -> u64 {
+        self.rebuild_count
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) const fn incremental_surface_update_count(&self) -> u64 {
+        self.incremental_surface_update_count
+    }
+}
+
+impl CompositorState {
+    pub(in crate::compositor) fn rebuild_active_scene_view(&mut self) {
+        let workspace = self.active_workspace();
+        let surfaces: Vec<RenderableSurface> = self
+            .renderable_surfaces
+            .iter()
+            .filter(|surface| self.surface_is_visible_in_active_workspace(surface.surface_id))
+            .cloned()
+            .collect();
+        let surface_indices = surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| (surface.surface_id, index))
+            .collect();
+        let popup_surface_ids = self.active_popup_surface_ids_from_state();
+        let surface_origins = render::surface_origins(&surfaces);
+        self.active_scene_view.surfaces = surfaces;
+        self.active_scene_view.surface_indices = surface_indices;
+        self.active_scene_view.surface_origins = surface_origins;
+        self.active_scene_view.popup_surface_ids = popup_surface_ids;
+        self.active_scene_view.workspace = Some(workspace);
+        self.active_scene_view.rebuild_count =
+            self.active_scene_view.rebuild_count.saturating_add(1);
+        self.advance_pointer_hit_generation();
+        self.refresh_frame_work_visibility();
+    }
+
+    fn active_popup_surface_ids_from_state(&self) -> Vec<u32> {
+        let mut popup_surface_ids = self
+            .popup_surfaces
+            .keys()
+            .copied()
+            .filter(|surface_id| {
+                self.popup_nodes.get(surface_id).is_some_and(|node| {
+                    node.lifecycle == PopupLifecycle::Alive
+                        && node.mapped
+                        && self.surface_is_visible_in_active_workspace(*surface_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        popup_surface_ids.sort_unstable();
+        popup_surface_ids
+    }
+
+    pub(in crate::compositor) fn refresh_active_scene_popup_view(&mut self) {
+        let popup_surface_ids = self.active_popup_surface_ids_from_state();
+        if popup_surface_ids != self.active_scene_view.popup_surface_ids {
+            self.active_scene_view.popup_surface_ids = popup_surface_ids;
+            self.advance_pointer_hit_generation();
+        }
+    }
+
+    pub(in crate::compositor) fn refresh_active_scene_surface_order(&mut self) {
+        let mut visible_ids = Vec::new();
+        for surface in &self.renderable_surfaces {
+            if self.surface_is_visible_in_active_workspace(surface.surface_id) {
+                visible_ids.push(surface.surface_id);
+            }
+        }
+        let cached_ids = self
+            .active_scene_view
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        if visible_ids != cached_ids {
+            self.rebuild_active_scene_view();
+        }
+    }
+
+    pub(in crate::compositor) fn refresh_active_scene_surface(&mut self, surface_id: u32) {
+        if self.active_scene_view.workspace != Some(self.active_workspace()) {
+            self.rebuild_active_scene_view();
+            return;
+        }
+
+        let visible = self.surface_is_visible_in_active_workspace(surface_id);
+        let cached_index = self
+            .active_scene_view
+            .surface_indices
+            .get(&surface_id)
+            .copied();
+        if !visible {
+            if cached_index.is_some() {
+                self.rebuild_active_scene_view();
+            }
+            return;
+        }
+
+        let Some(updated) = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .cloned()
+        else {
+            if cached_index.is_some() {
+                self.rebuild_active_scene_view();
+            }
+            return;
+        };
+        if let Some(index) = cached_index {
+            let origin_changed = {
+                let previous = &self.active_scene_view.surfaces[index];
+                previous.x != updated.x
+                    || previous.y != updated.y
+                    || previous.placement != updated.placement
+                    || previous.render_placement != updated.render_placement
+            };
+            self.active_scene_view.surfaces[index] = updated;
+            if origin_changed {
+                self.active_scene_view.surface_origins =
+                    render::surface_origins(&self.active_scene_view.surfaces);
+            }
+            self.active_scene_view.incremental_surface_update_count = self
+                .active_scene_view
+                .incremental_surface_update_count
+                .saturating_add(1);
+        } else {
+            self.rebuild_active_scene_view();
+        }
+    }
+
+    pub(in crate::compositor) fn refresh_active_scene_surface_tree(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        if self.active_scene_view.workspace != Some(self.active_workspace()) {
+            self.rebuild_active_scene_view();
+            return;
+        }
+        let affected = self
+            .renderable_surfaces
+            .iter()
+            .filter(|surface| {
+                self.root_surface_id_for_surface(surface.surface_id) == root_surface_id
+            })
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let mut updated = 0usize;
+        let mut membership_changed = false;
+        let mut origins_changed = false;
+        for surface_id in affected {
+            let visible = self.surface_is_visible_in_active_workspace(surface_id);
+            let cached_index = self
+                .active_scene_view
+                .surface_indices
+                .get(&surface_id)
+                .copied();
+            let Some(source) = self
+                .renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .cloned()
+            else {
+                membership_changed |= cached_index.is_some();
+                continue;
+            };
+            match (visible, cached_index) {
+                (true, Some(index)) => {
+                    let previous = &self.active_scene_view.surfaces[index];
+                    origins_changed |= previous.x != source.x
+                        || previous.y != source.y
+                        || previous.placement != source.placement
+                        || previous.render_placement != source.render_placement;
+                    self.active_scene_view.surfaces[index] = source;
+                    updated = updated.saturating_add(1);
+                }
+                (true, None) | (false, Some(_)) => membership_changed = true,
+                (false, None) => {}
+            }
+        }
+        if membership_changed {
+            self.rebuild_active_scene_view();
+        } else if updated > 0 {
+            if origins_changed {
+                self.active_scene_view.surface_origins =
+                    render::surface_origins(&self.active_scene_view.surfaces);
+            }
+            self.active_scene_view.incremental_surface_update_count = self
+                .active_scene_view
+                .incremental_surface_update_count
+                .saturating_add(updated as u64);
+        }
+    }
+
+    pub(in crate::compositor) fn active_scene_surfaces(&self) -> &[RenderableSurface] {
+        if self.active_scene_view.workspace.is_none()
+            || (cfg!(test)
+                && self.active_scene_view.surfaces.is_empty()
+                && !self.renderable_surfaces.is_empty())
+        {
+            &self.renderable_surfaces
+        } else {
+            self.active_scene_view.surfaces()
+        }
+    }
+
+    pub(in crate::compositor) fn active_scene_popup_surface_ids(&self) -> &[u32] {
+        self.active_scene_view.popup_surface_ids()
+    }
+
+    pub(in crate::compositor) fn active_scene_surface_origins(&self) -> &[(i32, i32)] {
+        if self.active_scene_view.workspace.is_none()
+            || (cfg!(test)
+                && self.active_scene_view.surfaces.is_empty()
+                && !self.renderable_surfaces.is_empty())
+        {
+            &self.surface_origin_cache
+        } else {
+            self.active_scene_view.surface_origins()
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) const fn active_scene_rebuild_count(&self) -> u64 {
+        self.active_scene_view.rebuild_count()
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) const fn active_scene_surface_update_count(&self) -> u64 {
+        self.active_scene_view.incremental_surface_update_count()
+    }
+}

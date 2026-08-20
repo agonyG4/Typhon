@@ -1,4 +1,5 @@
 use super::*;
+use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceSwitchOutcome};
 use crate::xwayland::xwm::{
     X11Geometry, X11MetadataDelta, X11PublishedState, X11StackMode, X11WindowSnapshot,
     X11WindowType, X11WindowTypes,
@@ -65,6 +66,191 @@ fn xdg_toplevel_creation_builds_one_role_and_one_desktop_window() {
     state.insert_desktop_window(window).expect("insert window");
     assert_eq!(state.desktop_windows.len(), 1);
     assert_eq!(state.window_by_root_surface.get(&41), Some(&id));
+    assert_eq!(
+        state.window(id).expect("window").management,
+        Some(crate::wm::WindowManagementState::new(
+            crate::wm::WorkspaceId::new(1).unwrap()
+        ))
+    );
+    assert_eq!(
+        state
+            .window(id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Floating
+    );
+}
+
+#[test]
+fn managed_x11_toplevel_joins_the_active_workspace_as_floating() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 200, 201));
+
+    let management = state
+        .window(id)
+        .expect("window")
+        .management
+        .expect("managed X11 window has management state");
+    assert_eq!(management.workspace().get(), 1);
+    assert_eq!(management.layout(), LayoutMembership::Floating);
+}
+
+#[test]
+fn workspace_visibility_keeps_inactive_window_mapped_and_unminimized() {
+    let mut state = CompositorState::new(None);
+    let first = state.allocate_window_id().expect("first window id");
+    let second = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first, 401))
+        .expect("first window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second, 402))
+        .expect("second window");
+    let workspace_two = WorkspaceId::new(2).expect("workspace two");
+    state.window_mut(second).expect("second window").management =
+        Some(WindowManagementState::new(workspace_two));
+
+    assert!(state.window_is_visible_in_active_workspace(first));
+    assert!(!state.window_is_visible_in_active_workspace(second));
+    assert!(
+        !state
+            .window(second)
+            .expect("second window")
+            .state
+            .is_minimized()
+    );
+    assert_eq!(
+        state.window(second).expect("second window").root_surface_id,
+        402
+    );
+
+    assert_eq!(
+        state.activate_workspace(workspace_two),
+        WorkspaceSwitchOutcome::Changed {
+            previous: WorkspaceId::new(1).unwrap(),
+            current: workspace_two,
+        }
+    );
+    assert!(!state.window_is_visible_in_active_workspace(first));
+    assert!(state.window_is_visible_in_active_workspace(second));
+}
+
+#[test]
+fn workspace_switch_advances_scene_generation_once_and_noop_does_not_advance() {
+    let mut state = CompositorState::new(None);
+    let workspace_two = WorkspaceId::new(2).unwrap();
+    let before = state.scene_render_generation;
+
+    assert!(matches!(
+        state.activate_workspace(workspace_two),
+        WorkspaceSwitchOutcome::Changed { .. }
+    ));
+    assert_eq!(state.scene_render_generation, before + 1);
+    assert_eq!(
+        state.render_generation_cause(),
+        RenderGenerationCause::WorkspaceSwitch
+    );
+
+    let after_switch = state.scene_render_generation;
+    assert_eq!(
+        state.activate_workspace(workspace_two),
+        WorkspaceSwitchOutcome::NoChange
+    );
+    assert_eq!(state.scene_render_generation, after_switch);
+}
+
+#[test]
+fn moving_window_family_preserves_layout_and_keeps_active_workspace() {
+    let mut state = CompositorState::new(None);
+    let parent = state.allocate_window_id().expect("parent window id");
+    let child = state.allocate_window_id().expect("child window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(parent, 411))
+        .expect("parent window");
+    let mut child_window = DesktopWindow::new_xdg(child, 412);
+    child_window.relationships.parent = Some(parent);
+    state
+        .insert_desktop_window(child_window)
+        .expect("child window");
+    state.window_mut(parent).unwrap().management = Some(
+        WindowManagementState::new(WorkspaceId::new(1).unwrap())
+            .with_layout(LayoutMembership::Tiled),
+    );
+    state.window_mut(child).unwrap().management = Some(
+        WindowManagementState::new(WorkspaceId::new(1).unwrap())
+            .with_layout(LayoutMembership::Floating),
+    );
+
+    let workspace_two = WorkspaceId::new(2).unwrap();
+    // Moving a focused transient must canonicalize to the top-level family
+    // root before collecting descendants.
+    assert!(state.move_window_family_to_workspace(child, workspace_two));
+    assert_eq!(
+        state.workspace_manager.active_workspace(),
+        WorkspaceId::new(1).unwrap()
+    );
+    assert_eq!(
+        state
+            .window(parent)
+            .unwrap()
+            .management
+            .unwrap()
+            .workspace(),
+        workspace_two
+    );
+    assert_eq!(
+        state.window(child).unwrap().management.unwrap().workspace(),
+        workspace_two
+    );
+    assert_eq!(
+        state.window(parent).unwrap().management.unwrap().layout(),
+        LayoutMembership::Tiled
+    );
+    assert_eq!(
+        state.window(child).unwrap().management.unwrap().layout(),
+        LayoutMembership::Floating
+    );
+}
+
+#[test]
+fn removing_parent_preserves_child_workspace_membership() {
+    let mut state = CompositorState::new(None);
+    let parent = state.allocate_window_id().expect("parent window id");
+    let child = state.allocate_window_id().expect("child window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(parent, 421))
+        .expect("parent window");
+    let mut child_window = DesktopWindow::new_xdg(child, 422);
+    child_window.relationships.parent = Some(parent);
+    state
+        .insert_desktop_window(child_window)
+        .expect("child window");
+    let workspace_two = WorkspaceId::new(2).unwrap();
+    state.window_mut(child).unwrap().management =
+        Some(WindowManagementState::new(workspace_two).with_layout(LayoutMembership::Tiled));
+
+    state.remove_desktop_window(parent).expect("removed parent");
+    let child_window = state.window(child).expect("child remains");
+    assert_eq!(child_window.relationships.parent, None);
+    assert_eq!(child_window.management.unwrap().workspace(), workspace_two);
+    assert_eq!(
+        child_window.management.unwrap().layout(),
+        LayoutMembership::Tiled
+    );
+}
+
+#[test]
+fn auxiliary_x11_window_has_no_independent_workspace_membership() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut snapshot = x11_snapshot(generation, 202, 203);
+    snapshot.kind = DesktopWindowKind::OverrideRedirect;
+    let id = insert_x11(&mut state, snapshot);
+
+    assert_eq!(state.window(id).expect("window").management, None);
 }
 
 #[test]
@@ -371,6 +557,7 @@ fn x11_kind_delta_reclassifies_existing_window_as_override_redirect() {
     let window = state.window(id).expect("window");
     assert_eq!(window.kind, DesktopWindowKind::OverrideRedirect);
     assert_eq!(window.x11_role, Some(X11DesktopRole::OverrideRedirect));
+    assert_eq!(window.management, None);
     assert!(state.x11_client_lists().0.is_empty());
 }
 
@@ -605,7 +792,7 @@ fn managed_x11_placement_stays_visible_when_overlap_is_unavoidable() {
     );
 
     assert!(state.set_root_window_mode(305, ToplevelMode::Fullscreen));
-    assert!(state.restore_floating_root_window(305));
+    assert!(state.restore_normal_root_window(305));
     assert_eq!(state.surface_placement(305), frame.placement);
 }
 
@@ -964,7 +1151,9 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
     );
     assert_eq!(
         state.surface_placement(62),
-        state.maximized_window_geometry().placement
+        state
+            .window_geometry_for_surface_mode(62, ToplevelMode::Maximized)
+            .placement
     );
 
     let fullscreen = state
@@ -1023,10 +1212,10 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
             ..
         } if *window == id
     )));
-    assert!(state.restore_floating_root_window(snapshot.surface_id));
+    assert!(state.restore_normal_root_window(snapshot.surface_id));
     assert_eq!(
         state.window(id).expect("window").state.mode(),
-        ToplevelMode::Floating
+        ToplevelMode::Normal
     );
     assert_eq!(
         state.surface_placement(snapshot.surface_id),
@@ -1073,7 +1262,12 @@ fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
     ));
     assert_eq!(
         state.surface_placement(maximized_snapshot.surface_id),
-        state.maximized_window_geometry().placement
+        state
+            .window_geometry_for_surface_mode(
+                maximized_snapshot.surface_id,
+                ToplevelMode::Maximized,
+            )
+            .placement
     );
 }
 
@@ -1090,7 +1284,7 @@ fn x11_resize_queues_a_typed_backend_command() {
     state.queue_backend_configure(
         id,
         WindowGeometry::new(SurfacePlacement::root_at(30, 40), 1024, 768),
-        ToplevelMode::Floating,
+        ToplevelMode::Normal,
         true,
     );
     let commands = state.take_backend_commands();

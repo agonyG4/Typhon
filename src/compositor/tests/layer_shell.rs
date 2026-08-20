@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "layer_shell_full_output.rs"]
+mod layer_shell_full_output;
 #[path = "layer_shell_lifecycle.rs"]
 mod layer_shell_lifecycle;
 

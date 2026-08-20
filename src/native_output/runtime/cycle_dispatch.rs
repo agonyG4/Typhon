@@ -740,7 +740,7 @@ impl NativeRuntime {
             drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
-            last_renderable_surfaces,
+            scene_history: _,
             queued_redraw_requested,
             frame_index,
             known_toplevels,
@@ -1059,7 +1059,7 @@ impl NativeRuntime {
         } else if self
             .presented_planes
             .primary
-            .is_some_and(ConfirmedPrimaryAssignment::is_direct)
+            .is_some_and(PresentedPrimaryAssignment::is_direct)
         {
             FeatureState::Active
         } else if self.direct_scanout_qualification.is_qualified() {

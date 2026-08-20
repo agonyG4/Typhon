@@ -1,4 +1,315 @@
 use super::*;
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1 as client_zxdg_decoration_manager_v1,
+    zxdg_toplevel_decoration_v1 as client_zxdg_toplevel_decoration_v1,
+};
+
+#[test]
+fn overlapping_server_decoration_does_not_focus_window_underneath() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection_a = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals_a, mut queue_a) = registry_queue_init::<RegistryTestState>(&connection_a).unwrap();
+    let qh_a = queue_a.handle();
+    let compositor_a: client_wl_compositor::WlCompositor =
+        globals_a.bind(&qh_a, 1..=6, ()).unwrap();
+    let wm_base_a: client_xdg_wm_base::XdgWmBase = globals_a.bind(&qh_a, 1..=6, ()).unwrap();
+    let shm_a: client_wl_shm::WlShm = globals_a.bind(&qh_a, 1..=2, ()).unwrap();
+    let manager_a: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals_a.bind(&qh_a, 1..=1, ()).unwrap();
+    let seat_a: client_wl_seat::WlSeat = globals_a.bind(&qh_a, 1..=7, ()).unwrap();
+    let _keyboard_a = seat_a.get_keyboard(&qh_a, ());
+    let _pointer_a = seat_a.get_pointer(&qh_a, ());
+    let (surface_a, xdg_surface_a, toplevel_a) =
+        create_test_buffered_toplevel(&compositor_a, &wm_base_a, &shm_a, &qh_a, 160, 120).unwrap();
+    let decoration_a = manager_a.get_toplevel_decoration(&toplevel_a, &qh_a, ());
+    decoration_a.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface_a.commit();
+    connection_a.flush().unwrap();
+
+    let connection_b = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals_b, mut queue_b) = registry_queue_init::<RegistryTestState>(&connection_b).unwrap();
+    let qh_b = queue_b.handle();
+    let compositor_b: client_wl_compositor::WlCompositor =
+        globals_b.bind(&qh_b, 1..=6, ()).unwrap();
+    let wm_base_b: client_xdg_wm_base::XdgWmBase = globals_b.bind(&qh_b, 1..=6, ()).unwrap();
+    let shm_b: client_wl_shm::WlShm = globals_b.bind(&qh_b, 1..=2, ()).unwrap();
+    let manager_b: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals_b.bind(&qh_b, 1..=1, ()).unwrap();
+    let seat_b: client_wl_seat::WlSeat = globals_b.bind(&qh_b, 1..=7, ()).unwrap();
+    let _keyboard_b = seat_b.get_keyboard(&qh_b, ());
+    let _pointer_b = seat_b.get_pointer(&qh_b, ());
+    let (surface_b, xdg_surface_b, toplevel_b) =
+        create_test_buffered_toplevel(&compositor_b, &wm_base_b, &shm_b, &qh_b, 160, 120).unwrap();
+    let decoration_b = manager_b.get_toplevel_decoration(&toplevel_b, &qh_b, ());
+    decoration_b.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface_b.commit();
+    connection_b.flush().unwrap();
+
+    let mut state_a = RegistryTestState::default();
+    let mut state_b = RegistryTestState::default();
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface_a);
+    commit_registered_initial_xdg_test_buffer(&xdg_surface_b);
+    connection_a.flush().unwrap();
+    connection_b.flush().unwrap();
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+
+    wait_for_server_commands(&commands);
+    let initial_surfaces = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(
+        initial_surfaces.len(),
+        2,
+        "both test windows must be mapped"
+    );
+    let surface_a_id = initial_surfaces[0].surface_id;
+    let surface_b_id = initial_surfaces[1].surface_id;
+    focus_root_window(&commands, surface_b_id);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 70),
+        160,
+        120,
+    );
+    focus_root_window(&commands, surface_a_id);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 100),
+        160,
+        120,
+    );
+    raise_root_window(&commands, surface_a_id);
+    focus_root_window(&commands, surface_a_id);
+
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    let surface_a_snapshot = surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_a_id)
+        .expect("A renderable surface");
+    let a_window_id = capture_window_id_for_surface(&commands, surface_a_id).expect("A window id");
+    let b_window_id = capture_window_id_for_surface(&commands, surface_b_id).expect("B window id");
+    assert_ne!(a_window_id, b_window_id);
+
+    let client_x = f64::from(surface_a_snapshot.origin_x + 80);
+    let client_y = f64::from(surface_a_snapshot.origin_y + 30);
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: client_x,
+            y: client_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(capture_focused_window_id(&commands), Some(a_window_id));
+    let scene_generation_before_input_region = capture_scene_render_generation(&commands);
+    let titlebar_x = f64::from(surface_a_snapshot.origin_x + 20);
+    let titlebar_y = f64::from(surface_a_snapshot.origin_y - 13);
+
+    let empty_input_region = compositor_a.create_region(&qh_a, ());
+    surface_a.set_input_region(Some(&empty_input_region));
+    surface_a.commit();
+    connection_a.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(
+        capture_scene_render_generation(&commands),
+        scene_generation_before_input_region,
+        "input-region-only commit must not be mistaken for a render generation change"
+    );
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_b_id),
+        "stationary input-region removal must resolve the lower client"
+    );
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: titlebar_x,
+            y: titlebar_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(capture_pointer_focus_surface_id(&commands), None);
+    assert_eq!(capture_focused_window_id(&commands), Some(a_window_id));
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: client_x,
+            y: client_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+
+    let included_input_region = compositor_a.create_region(&qh_a, ());
+    included_input_region.add(0, 0, 160, 120);
+    surface_a.set_input_region(Some(&included_input_region));
+    surface_a.commit();
+    connection_a.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id),
+        "stationary input-region inclusion must resolve the front client"
+    );
+    let b_enters_before_titlebar = state_b.pointer_enter_count;
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: titlebar_x,
+            y: titlebar_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+
+    assert_eq!(capture_focused_window_id(&commands), Some(a_window_id));
+    assert_eq!(capture_pointer_focus_surface_id(&commands), None);
+    assert_eq!(
+        state_b.pointer_enter_count, b_enters_before_titlebar,
+        "B must not receive titlebar enter"
+    );
+
+    set_pointer_hit_instrumentation_enabled(&commands, true);
+    state_a.pointer_event_log.clear();
+    state_b.pointer_event_log.clear();
+    let focus_generation_before_stress = capture_focus_generation(&commands);
+    let b_enters_before_stress = state_b.pointer_enter_count;
+    let b_leaves_before_stress = state_b.pointer_leave_count;
+    let mut move_pointer = |x: f64, y: f64| {
+        commands
+            .send(ServerCommand::PointerMotion { x, y })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue_a.roundtrip(&mut state_a).unwrap();
+        queue_b.roundtrip(&mut state_b).unwrap();
+    };
+    let button_x = f64::from(surface_a_snapshot.origin_x + 145);
+    for _ in 0..1_000 {
+        move_pointer(client_x, client_y);
+        move_pointer(titlebar_x, titlebar_y);
+        move_pointer(button_x, titlebar_y);
+        move_pointer(client_x, client_y);
+    }
+    let pointer_crossings = state_a
+        .pointer_event_log
+        .iter()
+        .copied()
+        .filter(|event| *event == "enter" || *event == "leave")
+        .collect::<Vec<_>>();
+    assert_eq!(pointer_crossings.first().copied(), Some("enter"));
+    assert_eq!(pointer_crossings.get(1).copied(), Some("leave"));
+    assert_eq!(pointer_crossings.get(2).copied(), Some("enter"));
+    assert_eq!(
+        pointer_crossings
+            .iter()
+            .filter(|event| **event == "leave")
+            .count(),
+        1_000
+    );
+    assert_eq!(
+        pointer_crossings
+            .iter()
+            .filter(|event| **event == "enter")
+            .count(),
+        1_001
+    );
+    assert_eq!(state_b.pointer_enter_count, b_enters_before_stress);
+    assert_eq!(state_b.pointer_leave_count, b_leaves_before_stress);
+    assert_eq!(capture_focused_window_id(&commands), Some(a_window_id));
+    assert_eq!(
+        capture_keyboard_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    assert_eq!(
+        capture_focus_generation(&commands),
+        focus_generation_before_stress,
+        "client/SSD crossings must not churn desktop focus"
+    );
+    let pointer_metrics = capture_pointer_input_metrics(&commands);
+    assert!(pointer_metrics.pointer_scene_hit_calls >= 4_000);
+    assert_eq!(pointer_metrics.pointer_scene_hit_origin_cache_clones, 0);
+    assert_eq!(pointer_metrics.pointer_scene_hit_root_linear_searches, 0);
+    assert!(pointer_metrics.desktop_focus_pipeline_invocations > 0);
+    assert!(pointer_metrics.desktop_focus_same_window_noops > 0);
+
+    commands
+        .send(ServerCommand::BeginResize {
+            x: f64::from(surface_a_snapshot.origin_x + 20),
+            y: f64::from(surface_a_snapshot.origin_y - 24),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let resize_owner = capture_window_interaction_debug_snapshot(&commands)
+        .expect("overlapping resize margin must start an interaction");
+    assert_eq!(resize_owner.window_id, a_window_id.get());
+    assert_eq!(resize_owner.root_surface_id, surface_a_id);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+
+    let before_drag = capture_renderable_surface_snapshot(&commands);
+    let before_a_x = before_drag
+        .iter()
+        .find(|surface| surface.surface_id == surface_a_id)
+        .expect("A renderable surface before drag")
+        .origin_x;
+    let before_b_x = before_drag
+        .iter()
+        .find(|surface| surface.surface_id == surface_b_id)
+        .expect("B renderable surface before drag")
+        .origin_x;
+    commands
+        .send(ServerCommand::BeginMove {
+            x: titlebar_x,
+            y: titlebar_y,
+        })
+        .unwrap();
+    commands
+        .send(ServerCommand::UpdateInteraction {
+            x: titlebar_x + 20.0,
+            y: titlebar_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let drag_owner = capture_window_interaction_debug_snapshot(&commands)
+        .expect("titlebar drag must remain captured");
+    assert_eq!(drag_owner.window_id, a_window_id.get());
+    assert_eq!(drag_owner.root_surface_id, surface_a_id);
+    let after_drag = capture_renderable_surface_snapshot(&commands);
+    let after_a_x = after_drag
+        .iter()
+        .find(|surface| surface.surface_id == surface_a_id)
+        .expect("A renderable surface after drag")
+        .origin_x;
+    let after_b_x = after_drag
+        .iter()
+        .find(|surface| surface.surface_id == surface_b_id)
+        .expect("B renderable surface after drag")
+        .origin_x;
+    assert_ne!(after_a_x, before_a_x, "A must move from its titlebar");
+    assert_eq!(after_b_x, before_b_x, "B must not move under A's titlebar");
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let _ = decoration_a;
+    let _ = decoration_b;
+}
 
 #[test]
 fn window_interaction_absolute_motion_targets_only_original_surface() {

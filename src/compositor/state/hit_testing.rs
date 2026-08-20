@@ -1,34 +1,77 @@
 use super::*;
+use crate::compositor::decoration::types::DecorationHit;
 
-impl CompositorState {
-    pub(in crate::compositor) fn surface_id_at(&mut self, x: f64, y: f64) -> Option<u32> {
-        self.refresh_surface_origin_cache();
-        let origins = &self.surface_origin_cache;
-        for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
-            let Some(origin) = origins.get(index).copied() else {
-                continue;
-            };
-            let Some((surface_x, surface_y)) =
-                render::surface_local_point_at_origin(renderable, origin, x, y)
-            else {
-                continue;
-            };
-            if self.surface_accepts_input_at(renderable, surface_x, surface_y) {
-                return Some(renderable.surface_id);
-            }
+#[derive(Debug, Clone)]
+pub(in crate::compositor) enum PointerSceneHit {
+    Client {
+        target: PointerTarget,
+    },
+    Decoration {
+        window_id: WindowId,
+        root_surface_id: u32,
+        hit: DecorationHit,
+    },
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::compositor) struct PointerSceneHitCache {
+    x: f64,
+    y: f64,
+    scene_render_generation: u64,
+    pointer_hit_generation: u64,
+    hit: PointerSceneHit,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct PointerInputMetrics {
+    pub(in crate::compositor) pointer_scene_hit_calls: u64,
+    pub(in crate::compositor) pointer_scene_hit_cache_hits: u64,
+    pub(in crate::compositor) pointer_scene_hit_cache_misses: u64,
+    pub(in crate::compositor) pointer_scene_hit_groups_inspected: u64,
+    pub(in crate::compositor) pointer_scene_hit_surfaces_inspected: u64,
+    pub(in crate::compositor) pointer_scene_hit_origin_cache_clones: u64,
+    pub(in crate::compositor) pointer_scene_hit_root_linear_searches: u64,
+    pub(in crate::compositor) pointer_scene_hit_cpu_nanos: u64,
+    pub(in crate::compositor) desktop_focus_pipeline_invocations: u64,
+    pub(in crate::compositor) desktop_focus_same_window_noops: u64,
+    pub(in crate::compositor) keyboard_focus_reconciliations: u64,
+    pub(in crate::compositor) pointer_constraint_reconciliations: u64,
+}
+
+#[cfg(test)]
+impl PointerSceneHitCache {
+    pub(in crate::compositor) fn new_for_test(
+        x: f64,
+        y: f64,
+        scene_render_generation: u64,
+        pointer_hit_generation: u64,
+        hit: PointerSceneHit,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            scene_render_generation,
+            pointer_hit_generation,
+            hit,
         }
-
-        None
     }
 
+    pub(in crate::compositor) fn pointer_hit_generation(&self) -> u64 {
+        self.pointer_hit_generation
+    }
+}
+
+impl CompositorState {
     pub(in crate::compositor) fn root_surface_hit_at(
         &mut self,
         x: f64,
         y: f64,
     ) -> Option<RootSurfaceHit> {
         self.refresh_surface_origin_cache();
-        let origins = &self.surface_origin_cache;
-        for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        for (index, renderable) in surfaces.iter().enumerate().rev() {
             let Some(origin) = origins.get(index).copied() else {
                 continue;
             };
@@ -40,8 +83,7 @@ impl CompositorState {
             let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
                 continue;
             };
-            let Some(root_index) = self
-                .renderable_surfaces
+            let Some(root_index) = surfaces
                 .iter()
                 .position(|surface| surface.surface_id == root_surface_id)
             else {
@@ -50,7 +92,7 @@ impl CompositorState {
             let Some(root_origin) = origins.get(root_index).copied() else {
                 continue;
             };
-            let root_surface = &self.renderable_surfaces[root_index];
+            let root_surface = &surfaces[root_index];
             let local_x = x - f64::from(root_origin.0);
             let local_y = y - f64::from(root_origin.1);
             if window_frame_action_for_local_point(
@@ -93,11 +135,12 @@ impl CompositorState {
         y: f64,
     ) -> Option<(f64, f64, u32, u32)> {
         self.refresh_surface_origin_cache();
-        let root_index = self
-            .renderable_surfaces
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let root_index = surfaces
             .iter()
             .position(|surface| surface.surface_id == root_surface_id)?;
-        let root_origin = self.surface_origin_cache.get(root_index).copied()?;
+        let root_origin = origins.get(root_index).copied()?;
         let geometry = self.current_root_window_geometry(root_surface_id)?;
         let window_geometry = self
             .surface_window_geometries
@@ -125,40 +168,195 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<PointerTarget> {
+        let hit = self.pointer_scene_hit_at(x, y);
+        self.pointer_target_from_scene_hit(&hit, x, y)
+    }
+
+    pub(in crate::compositor) fn pointer_target_from_scene_hit(
+        &self,
+        hit: &PointerSceneHit,
+        x: f64,
+        y: f64,
+    ) -> Option<PointerTarget> {
+        match hit {
+            PointerSceneHit::Client { target } => Some(target.clone()),
+            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => {
+                if self.active_scene_surfaces().is_empty() {
+                    self.focused_surface.clone().map(|surface| PointerTarget {
+                        surface,
+                        surface_x: x,
+                        surface_y: y,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub(in crate::compositor) fn pointer_scene_hit_at(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> PointerSceneHit {
+        let instrumentation_enabled = self.pointer_hit_instrumentation_enabled;
+        let started_at = instrumentation_enabled.then(Instant::now);
+        if instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_scene_hit_calls += 1;
+        }
         self.refresh_surface_origin_cache();
-        let origins = &self.surface_origin_cache;
-        for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
-            let Some(origin) = origins.get(index).copied() else {
+        if let Some(cache) = self.pointer_scene_hit_cache.as_ref()
+            && cache.scene_render_generation == self.scene_render_generation
+            && cache.pointer_hit_generation == self.pointer_hit_generation
+            && cache.x == x
+            && cache.y == y
+        {
+            if instrumentation_enabled {
+                self.pointer_hit_metrics.pointer_scene_hit_cache_hits += 1;
+                self.pointer_hit_metrics.pointer_scene_hit_cpu_nanos += started_at
+                    .expect("instrumented hit-test has a start time")
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX))
+                    as u64;
+            }
+            return cache.hit.clone();
+        }
+
+        if instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_scene_hit_cache_misses += 1;
+        }
+        self.refresh_visual_stack_groups_cache();
+        let (hit, groups_inspected, surfaces_inspected) =
+            self.pointer_scene_hit_uncached(x, y, instrumentation_enabled);
+        if instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_scene_hit_groups_inspected += groups_inspected;
+            self.pointer_hit_metrics
+                .pointer_scene_hit_surfaces_inspected += surfaces_inspected;
+            self.pointer_hit_metrics.pointer_scene_hit_cpu_nanos += started_at
+                .expect("instrumented hit-test has a start time")
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX))
+                as u64;
+        }
+        self.pointer_scene_hit_cache = Some(PointerSceneHitCache {
+            x,
+            y,
+            scene_render_generation: self.scene_render_generation,
+            pointer_hit_generation: self.pointer_hit_generation,
+            hit: hit.clone(),
+        });
+        hit
+    }
+
+    fn pointer_scene_hit_uncached(
+        &self,
+        x: f64,
+        y: f64,
+        collect_metrics: bool,
+    ) -> (PointerSceneHit, u64, u64) {
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let mut groups_inspected = 0;
+        let mut surfaces_inspected = 0;
+        for group in self.visual_stack_groups_cache.iter().rev() {
+            if collect_metrics {
+                groups_inspected += 1;
+            }
+            let root_index = group.root_surface_index();
+            let Some(root_surface) = surfaces.get(root_index) else {
                 continue;
             };
-            let Some((surface_x, surface_y)) =
-                render::surface_local_point_at_origin(renderable, origin, x, y)
-            else {
-                continue;
-            };
-            if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
+            if root_surface.surface_id != group.root_surface_id() {
                 continue;
             }
-            let Some(surface) = self.surface_resource_by_id(renderable.surface_id) else {
+            let Some(root_origin) = origins.get(root_index).copied() else {
                 continue;
             };
+            if !group.is_popup()
+                && let Some(hit) =
+                    self.decoration_hit_for_root_at(group.root_surface_id(), root_origin, x, y)
+                && !self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+            {
+                let Some(window_id) = self.window_id_for_surface(group.root_surface_id()) else {
+                    continue;
+                };
+                return (
+                    PointerSceneHit::Decoration {
+                        window_id,
+                        root_surface_id: group.root_surface_id(),
+                        hit,
+                    },
+                    groups_inspected,
+                    surfaces_inspected,
+                );
+            }
+            for &index in group.surface_indices().iter().rev() {
+                if collect_metrics {
+                    surfaces_inspected += 1;
+                }
+                let Some(renderable) = surfaces.get(index) else {
+                    continue;
+                };
+                let Some(origin) = origins.get(index).copied() else {
+                    continue;
+                };
+                let Some((surface_x, surface_y)) =
+                    render::surface_local_point_at_origin(renderable, origin, x, y)
+                else {
+                    continue;
+                };
+                if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
+                    continue;
+                }
+                let Some(surface) = self.surface_resource_by_id(renderable.surface_id) else {
+                    continue;
+                };
 
-            return Some(PointerTarget {
-                surface,
-                surface_x,
-                surface_y,
-            });
+                return (
+                    PointerSceneHit::Client {
+                        target: PointerTarget {
+                            surface,
+                            surface_x,
+                            surface_y,
+                        },
+                    },
+                    groups_inspected,
+                    surfaces_inspected,
+                );
+            }
         }
+        (PointerSceneHit::None, groups_inspected, surfaces_inspected)
+    }
 
-        if self.renderable_surfaces.is_empty() {
-            self.focused_surface.clone().map(|surface| PointerTarget {
-                surface,
-                surface_x: x,
-                surface_y: y,
-            })
-        } else {
-            None
+    fn root_surface_accepts_input_at(
+        &self,
+        root_index: usize,
+        root_origin: (i32, i32),
+        x: f64,
+        y: f64,
+    ) -> bool {
+        let Some(root_surface) = self.active_scene_surfaces().get(root_index) else {
+            return false;
+        };
+        let Some((surface_x, surface_y)) =
+            render::surface_local_point_at_origin(root_surface, root_origin, x, y)
+        else {
+            return false;
+        };
+        self.surface_accepts_input_at(root_surface, surface_x, surface_y)
+    }
+
+    fn refresh_visual_stack_groups_cache(&mut self) {
+        if self.visual_stack_groups_cache_generation == Some(self.scene_render_generation) {
+            return;
         }
+        self.visual_stack_groups_cache = render::visual_stack_groups(
+            self.active_scene_surfaces(),
+            self.active_scene_popup_surface_ids(),
+        );
+        self.visual_stack_groups_cache_generation = Some(self.scene_render_generation);
     }
 
     fn pointer_target_at_visual_root_window(
@@ -168,11 +366,12 @@ impl CompositorState {
         y: f64,
     ) -> Option<PointerTarget> {
         self.refresh_surface_origin_cache();
-        let root_index = self
-            .renderable_surfaces
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let root_index = surfaces
             .iter()
             .position(|surface| surface.surface_id == root_surface_id)?;
-        let origin = self.surface_origin_cache.get(root_index).copied()?;
+        let origin = origins.get(root_index).copied()?;
         let geometry = self.current_visual_root_window_geometry(root_surface_id)?;
         let surface_x = x - f64::from(origin.0);
         let surface_y = y - f64::from(origin.1);
@@ -199,12 +398,13 @@ impl CompositorState {
     ) -> Option<PointerTarget> {
         let surface_id = compositor_surface_id(surface);
         self.refresh_surface_origin_cache();
-        let index = self
-            .renderable_surfaces
+        let surfaces = self.active_scene_surfaces();
+        let origins = self.active_scene_surface_origins();
+        let index = surfaces
             .iter()
             .position(|renderable| renderable.surface_id == surface_id)?;
-        let renderable = &self.renderable_surfaces[index];
-        let origin = self.surface_origin_cache.get(index).copied()?;
+        let renderable = &surfaces[index];
+        let origin = origins.get(index).copied()?;
         let (surface_x, surface_y) =
             render::surface_local_point_at_origin(renderable, origin, x, y)?;
         Some(PointerTarget {
@@ -247,17 +447,28 @@ impl CompositorState {
             return;
         }
 
-        let target = self
-            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
-            .or_else(|| {
-                visual_root_surface_id.and_then(|root_surface_id| {
-                    self.pointer_target_at_visual_root_window(
-                        root_surface_id,
-                        self.last_pointer_x,
-                        self.last_pointer_y,
-                    )
-                })
-            });
+        let scene_hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
+        if !self.pointer_scene_hit_allowed_by_popup_grab(&scene_hit) {
+            self.clear_pointer_focus();
+            pointer_debug_log("post-unlock focus target=blocked");
+            return;
+        }
+        let target = match scene_hit {
+            PointerSceneHit::Client { target } => Some(target),
+            PointerSceneHit::Decoration { .. } => {
+                self.focus_desktop_window_at_pointer_scene_hit(&scene_hit);
+                self.clear_pointer_focus();
+                pointer_debug_log("post-unlock focus target=decoration");
+                return;
+            }
+            PointerSceneHit::None => visual_root_surface_id.and_then(|root_surface_id| {
+                self.pointer_target_at_visual_root_window(
+                    root_surface_id,
+                    self.last_pointer_x,
+                    self.last_pointer_y,
+                )
+            }),
+        };
         let Some(target) = target else {
             self.clear_pointer_focus();
             pointer_debug_log("post-unlock focus target=none");
@@ -290,10 +501,20 @@ impl CompositorState {
             return;
         }
 
-        let target = self
-            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
-            .filter(|target| target.surface.is_alive())
-            .filter(|target| self.pointer_target_allowed_by_popup_grab(target));
+        let scene_hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
+        if !self.pointer_scene_hit_allowed_by_popup_grab(&scene_hit) {
+            self.clear_pointer_focus();
+            return;
+        }
+        if matches!(scene_hit, PointerSceneHit::Decoration { .. }) {
+            self.focus_desktop_window_at_pointer_scene_hit(&scene_hit);
+        }
+        let target = match scene_hit {
+            PointerSceneHit::Client { target } if target.surface.is_alive() => Some(target),
+            PointerSceneHit::Client { .. }
+            | PointerSceneHit::Decoration { .. }
+            | PointerSceneHit::None => None,
+        };
         if let Some(target) = target.as_ref() {
             self.focus_desktop_window_at_pointer_target(target);
         }
@@ -356,17 +577,27 @@ impl CompositorState {
             return;
         }
 
-        let target = self
-            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
-            .or_else(|| {
-                terminal_visual_root_surface_id.and_then(|root_surface_id| {
-                    self.pointer_target_at_visual_root_window(
-                        root_surface_id,
-                        self.last_pointer_x,
-                        self.last_pointer_y,
-                    )
-                })
-            });
+        let scene_hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
+        if !self.pointer_scene_hit_allowed_by_popup_grab(&scene_hit) {
+            self.clear_pointer_focus();
+            return;
+        }
+        if matches!(scene_hit, PointerSceneHit::Decoration { .. }) {
+            self.focus_desktop_window_at_pointer_scene_hit(&scene_hit);
+            self.clear_pointer_focus();
+            return;
+        }
+        let target = match scene_hit {
+            PointerSceneHit::Client { target } => Some(target),
+            PointerSceneHit::None => terminal_visual_root_surface_id.and_then(|root_surface_id| {
+                self.pointer_target_at_visual_root_window(
+                    root_surface_id,
+                    self.last_pointer_x,
+                    self.last_pointer_y,
+                )
+            }),
+            PointerSceneHit::Decoration { .. } => None,
+        };
         let new_surface_id = target
             .as_ref()
             .map(|target| compositor_surface_id(&target.surface));
@@ -800,6 +1031,14 @@ impl CompositorState {
         }
         if let Some(active) = self.active_confined_pointer_binding() {
             self.pin_confined_pointer_focus(&active);
+            return Vec::new();
+        }
+        if self.pointer_surface.is_none()
+            && self.pointer_entered_surfaces.is_empty()
+            && self.active_client_cursor.is_none()
+            && self.cursor_visibility.client_hidden_pointer.is_none()
+            && self.cursor_visibility.client_cursor_pointer.is_none()
+        {
             return Vec::new();
         }
         if let Some(surface_id) = self.pointer_surface.as_ref().map(compositor_surface_id) {

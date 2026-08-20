@@ -1,5 +1,6 @@
 use super::*;
 
+mod active_scene;
 mod client_lifecycle;
 mod commit_timing_runtime;
 mod cursor;
@@ -38,6 +39,7 @@ mod window_decoration;
 mod window_interaction;
 mod window_resize;
 mod windows;
+mod workspaces;
 mod xdg_lifecycle;
 mod xwayland_mode;
 mod xwayland_scene;
@@ -53,6 +55,8 @@ pub use xwayland_scene::{
     XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot,
 };
 
+#[allow(unused_imports)]
+pub(in crate::compositor) use active_scene::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
 pub(in crate::compositor) use commit_timing_runtime::CommitTimingTargetClaim;
@@ -141,6 +145,8 @@ pub(in crate::compositor) use window_interaction::*;
 pub(in crate::compositor) use window_resize::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use windows::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use workspaces::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xdg_lifecycle::*;
 #[allow(unused_imports)]

@@ -288,6 +288,7 @@ fn cursor_restore_from_different_same_client_pointer_with_stale_serial_is_ignore
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer_a = seat.get_pointer(&qh, ());
     let pointer_b = seat.get_pointer(&qh, ());
@@ -299,6 +300,10 @@ fn cursor_restore_from_different_same_client_pointer_with_stale_serial_is_ignore
     connection.flush().unwrap();
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     commands
         .send(ServerCommand::PointerMotion {
@@ -822,6 +827,7 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
@@ -834,8 +840,15 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1832,6 +1845,7 @@ fn pointer_release_deactivates_locked_constraint() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
@@ -1844,8 +1858,15 @@ fn pointer_release_deactivates_locked_constraint() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1892,6 +1913,7 @@ fn backend_pointer_constraint_failure_marks_constraint_defunct() {
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
@@ -1904,8 +1926,15 @@ fn backend_pointer_constraint_failure_marks_constraint_defunct() {
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();

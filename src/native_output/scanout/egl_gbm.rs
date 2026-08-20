@@ -509,6 +509,7 @@ impl NativeEglGbmScanout {
     pub(crate) fn paint_server_frame(
         &mut self,
         renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
@@ -535,6 +536,7 @@ impl NativeEglGbmScanout {
         let request = renderer.egl_scene_draw_request(
             self.width,
             self.height,
+            resolved_scene,
             server,
             input_state,
             cursor_mode,
@@ -584,7 +586,13 @@ impl NativeEglGbmScanout {
             self.scene.frame_swap_failed();
             return Err(native_egl_io_error(error));
         }
-        self.scene.commit_presented(scene_commit);
+        // Compatibility EGL queries buffer age from the EGL surface and
+        // settles around EGL swap order. Keep its journal in that backend's
+        // swap/render domain; the explicit Atomic path supplies confirmed KMS
+        // presentation transitions separately at pageflip.
+        let presented_transition_damage = scene_commit.repaint_plan().render_damage.clone();
+        self.scene
+            .commit_presented(scene_commit, presented_transition_damage);
         let scene_stats = self.scene.last_frame_stats();
         let swap_us = elapsed_micros(swap_start);
         let bo = unsafe { self.surface.lock_front_buffer() }.map_err(|error| {

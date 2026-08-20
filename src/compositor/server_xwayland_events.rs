@@ -51,7 +51,17 @@ impl OwnCompositorServer {
                 eprintln!(
                     "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focus_outcome={focus_outcome:?}"
                 );
-                let mut commands = Vec::with_capacity(2);
+                let mut commands = Vec::with_capacity(3);
+                if let Some(workspace) = self.state.window(window_id).and_then(|window| {
+                    window
+                        .management
+                        .map(|management| management.workspace().to_ewmh())
+                }) {
+                    commands.push(XwmCommand::SetWorkspace {
+                        window: handle,
+                        workspace,
+                    });
+                }
                 if self
                     .state
                     .window(window_id)

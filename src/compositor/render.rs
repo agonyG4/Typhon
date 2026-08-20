@@ -35,11 +35,6 @@ pub const fn cascaded_root_position(root_index: usize) -> (i32, i32) {
     )
 }
 
-const WALLPAPER_TOP_LEFT: Rgb = Rgb::new(18, 21, 28);
-const WALLPAPER_TOP_RIGHT: Rgb = Rgb::new(20, 58, 54);
-const WALLPAPER_BOTTOM_LEFT: Rgb = Rgb::new(58, 34, 49);
-const WALLPAPER_BOTTOM_RIGHT: Rgb = Rgb::new(68, 51, 28);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopVisualState {
     pub cursor: Option<(i32, i32)>,
@@ -151,19 +146,44 @@ impl DecorationRenderInstance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowVisualGroup {
+pub struct VisualStackGroup {
     root_surface_id: u32,
+    root_surface_index: usize,
     surface_indices: Vec<usize>,
+    popup: bool,
+}
+
+impl VisualStackGroup {
+    pub fn root_surface_id(&self) -> u32 {
+        self.root_surface_id
+    }
+
+    pub fn root_surface_index(&self) -> usize {
+        self.root_surface_index
+    }
+
+    pub fn surface_indices(&self) -> &[usize] {
+        &self.surface_indices
+    }
+
+    pub fn is_popup(&self) -> bool {
+        self.popup
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowVisualGroup {
+    visual: VisualStackGroup,
     decoration_index: Option<usize>,
 }
 
 impl WindowVisualGroup {
     pub fn root_surface_id(&self) -> u32 {
-        self.root_surface_id
+        self.visual.root_surface_id()
     }
 
     pub fn surface_indices(&self) -> &[usize] {
-        &self.surface_indices
+        self.visual.surface_indices()
     }
 
     pub fn decoration_index(&self) -> Option<usize> {
@@ -196,27 +216,13 @@ impl WindowVisualGroup {
     }
 }
 
-/// Return the authoritative back-to-front normal-window visual order.
-///
-/// A group owns its root and every descendant surface, plus the optional SSD
-/// for that root.  Renderers may choose a different command representation,
-/// but they must consume this ownership order rather than appending all SSD
-/// primitives after unrelated windows.
-pub fn window_visual_stack_order(
+/// Return the shared back-to-front visual ownership groups used by rendering
+/// and input. Ordinary client subsurfaces stay with their root window; popup
+/// roots split into their own group so they remain above the parent SSD.
+pub fn visual_stack_groups(
     surfaces: &[RenderableSurface],
-    decorations: &[DecorationRenderInstance],
-) -> Vec<WindowVisualGroup> {
-    window_visual_stack_order_with_popups(surfaces, decorations, &[])
-}
-
-/// Return visual ownership order while keeping XDG popups above their parent
-/// window's server-side decoration. Ordinary client subsurfaces remain in
-/// their normal window group.
-fn window_visual_stack_order_with_popups(
-    surfaces: &[RenderableSurface],
-    decorations: &[DecorationRenderInstance],
     popup_surface_ids: &[u32],
-) -> Vec<WindowVisualGroup> {
+) -> Vec<VisualStackGroup> {
     let root_indices = surface_root_indices(surfaces);
     let popup_surface_ids = popup_surface_ids.iter().copied().collect::<HashSet<_>>();
     let index_by_id = surfaces
@@ -246,23 +252,51 @@ fn window_visual_stack_order_with_popups(
     }
     group_roots
         .into_iter()
-        .map(|root_index| {
-            let root = &surfaces[root_index];
-            WindowVisualGroup {
-                root_surface_id: root.surface_id,
-                surface_indices: visual_roots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, root)| (*root == root_index).then_some(index))
-                    .collect(),
-                decoration_index: (!popup_surface_ids.contains(&root.surface_id))
-                    .then(|| {
-                        decorations
-                            .iter()
-                            .position(|decoration| decoration.root_surface_id == root.surface_id)
+        .map(|root_index| VisualStackGroup {
+            root_surface_id: surfaces[root_index].surface_id,
+            root_surface_index: root_index,
+            surface_indices: visual_roots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, root)| (*root == root_index).then_some(index))
+                .collect(),
+            popup: popup_surface_ids.contains(&surfaces[root_index].surface_id),
+        })
+        .collect()
+}
+
+/// Return the authoritative back-to-front normal-window visual order.
+///
+/// A group owns its root and every descendant surface, plus the optional SSD
+/// for that root.  Renderers may choose a different command representation,
+/// but they must consume this ownership order rather than appending all SSD
+/// primitives after unrelated windows.
+pub fn window_visual_stack_order(
+    surfaces: &[RenderableSurface],
+    decorations: &[DecorationRenderInstance],
+) -> Vec<WindowVisualGroup> {
+    window_visual_stack_order_with_popups(surfaces, decorations, &[])
+}
+
+/// Return visual ownership order while keeping XDG popups above their parent
+/// window's server-side decoration. Ordinary client subsurfaces remain in
+/// their normal window group.
+fn window_visual_stack_order_with_popups(
+    surfaces: &[RenderableSurface],
+    decorations: &[DecorationRenderInstance],
+    popup_surface_ids: &[u32],
+) -> Vec<WindowVisualGroup> {
+    visual_stack_groups(surfaces, popup_surface_ids)
+        .into_iter()
+        .map(|visual| WindowVisualGroup {
+            decoration_index: (!visual.is_popup())
+                .then(|| {
+                    decorations.iter().position(|decoration| {
+                        decoration.root_surface_id == visual.root_surface_id()
                     })
-                    .flatten(),
-            }
+                })
+                .flatten(),
+            visual,
         })
         .collect()
 }
@@ -565,10 +599,6 @@ struct SceneFullRebuild<'a> {
 #[derive(Debug)]
 pub struct DesktopSceneRenderer {
     cursor_image: Arc<CompositorCursorImage>,
-    wallpaper: Vec<u32>,
-    wallpaper_width: u32,
-    wallpaper_height: u32,
-    wallpaper_generation: u64,
     scene: Vec<u32>,
     scene_width: u32,
     scene_height: u32,
@@ -601,10 +631,6 @@ impl DesktopSceneRenderer {
     pub fn with_cursor_image(cursor_image: Arc<CompositorCursorImage>) -> Self {
         Self {
             cursor_image,
-            wallpaper: Vec::new(),
-            wallpaper_width: 0,
-            wallpaper_height: 0,
-            wallpaper_generation: 0,
             scene: Vec::new(),
             scene_width: 0,
             scene_height: 0,
@@ -846,10 +872,6 @@ impl DesktopSceneRenderer {
         self.scene_generation
     }
 
-    pub fn wallpaper_generation(&self) -> u64 {
-        self.wallpaper_generation
-    }
-
     pub fn last_rebuild_kind(&self) -> DesktopSceneRebuildKind {
         self.last_rebuild_kind
     }
@@ -877,7 +899,6 @@ impl DesktopSceneRenderer {
     ) {
         self.last_orphan_decoration_count =
             WindowVisualGroup::orphan_decoration_count(surfaces, &self.decoration_instances);
-        self.ensure_wallpaper(frame_width, frame_height);
         let output_scale_key = output_scale_key(output_scale);
 
         let pixel_count = frame_width.saturating_mul(frame_height) as usize;
@@ -960,12 +981,7 @@ impl DesktopSceneRenderer {
         }
 
         for damage_rect in damage_rects.iter().copied() {
-            copy_wallpaper_rect_to_scene(
-                &mut self.scene,
-                &self.wallpaper,
-                frame_width,
-                damage_rect,
-            );
+            fill_output_background_rect(&mut self.scene, frame_width, frame_height, damage_rect);
             draw_window_visual_groups(WindowVisualDrawRequest {
                 frame: &mut self.scene,
                 frame_width,
@@ -1037,12 +1053,8 @@ impl DesktopSceneRenderer {
         self.scene_height = frame_height;
         self.scene_output_scale_key = output_scale_key;
         self.scene_content_generation = content_generation;
-        if self.scene.len() == self.wallpaper.len() {
-            self.scene.copy_from_slice(&self.wallpaper);
-        } else {
-            self.scene.resize(pixel_count, OUTPUT_BACKGROUND);
-            draw_wallpaper(&mut self.scene, frame_width, frame_height);
-        }
+        self.scene.resize(pixel_count, OUTPUT_BACKGROUND);
+        self.scene.fill(OUTPUT_BACKGROUND);
 
         draw_window_visual_groups(WindowVisualDrawRequest {
             frame: &mut self.scene,
@@ -1067,7 +1079,8 @@ impl DesktopSceneRenderer {
         if frame.len() == self.scene.len() {
             frame.copy_from_slice(&self.scene);
         } else {
-            draw_wallpaper(frame, frame_width, frame_height);
+            let _ = (frame_width, frame_height);
+            frame.fill(OUTPUT_BACKGROUND);
         }
         self.last_frame_copy_kind = DesktopFrameCopyKind::Full;
     }
@@ -1087,22 +1100,6 @@ impl DesktopSceneRenderer {
             copy_scene_rect_to_frame(&self.scene, frame, frame_width, *rect);
         }
         self.last_frame_copy_kind = DesktopFrameCopyKind::Partial;
-    }
-
-    fn ensure_wallpaper(&mut self, frame_width: u32, frame_height: u32) {
-        let pixel_count = frame_width.saturating_mul(frame_height) as usize;
-        if self.wallpaper_width == frame_width
-            && self.wallpaper_height == frame_height
-            && self.wallpaper.len() == pixel_count
-        {
-            return;
-        }
-
-        self.wallpaper_width = frame_width;
-        self.wallpaper_height = frame_height;
-        self.wallpaper.resize(pixel_count, OUTPUT_BACKGROUND);
-        draw_wallpaper(&mut self.wallpaper, frame_width, frame_height);
-        self.wallpaper_generation = self.wallpaper_generation.saturating_add(1);
     }
 }
 
@@ -1447,26 +1444,6 @@ fn decoration_damage_output_rect(
     .clipped_to_output(frame_width, frame_height)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rgb {
-    red: u8,
-    green: u8,
-    blue: u8,
-}
-
-impl Rgb {
-    const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
-    }
-
-    fn to_pixel(self) -> u32 {
-        0xff00_0000
-            | (u32::from(self.red) << 16)
-            | (u32::from(self.green) << 8)
-            | u32::from(self.blue)
-    }
-}
-
 pub fn compose_output(
     frame: &mut [u32],
     frame_width: u32,
@@ -1474,7 +1451,7 @@ pub fn compose_output(
     surfaces: &[RenderableSurface],
     visual_state: DesktopVisualState,
 ) {
-    draw_wallpaper(frame, frame_width, frame_height);
+    frame.fill(OUTPUT_BACKGROUND);
     draw_client_surfaces(frame, frame_width, frame_height, surfaces);
 
     if let Some((cursor_x, cursor_y)) = visual_state.cursor {
@@ -1880,6 +1857,7 @@ fn output_damage_rect_for_element(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServerFrameColor {
+    OutputBackground,
     XwaylandBacking,
     Border,
     Titlebar,
@@ -1887,7 +1865,8 @@ pub enum ServerFrameColor {
 }
 
 impl ServerFrameColor {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::OutputBackground,
         Self::XwaylandBacking,
         Self::Border,
         Self::Titlebar,
@@ -1896,6 +1875,7 @@ impl ServerFrameColor {
 
     pub const fn pixel(self) -> u32 {
         match self {
+            Self::OutputBackground => OUTPUT_BACKGROUND,
             Self::XwaylandBacking => 0xff00_0000,
             Self::Border => SERVER_FRAME_BORDER_COLOR,
             Self::Titlebar => SERVER_FRAME_TITLEBAR_COLOR,
@@ -2674,22 +2654,6 @@ pub fn surface_local_point_at_origin(
     }
 }
 
-pub fn draw_wallpaper(frame: &mut [u32], frame_width: u32, frame_height: u32) {
-    if frame_width == 0 || frame_height == 0 {
-        frame.fill(OUTPUT_BACKGROUND);
-        return;
-    }
-
-    for y in 0..frame_height {
-        for x in 0..frame_width {
-            let pixel_index = (y * frame_width + x) as usize;
-            if let Some(pixel) = frame.get_mut(pixel_index) {
-                *pixel = wallpaper_pixel(x, y, frame_width, frame_height);
-            }
-        }
-    }
-}
-
 pub fn cursor_damage_rect(
     cursor_x: i32,
     cursor_y: i32,
@@ -2712,23 +2676,6 @@ pub fn cursor_damage_rect(
         width: u32::try_from(right - left).ok()?,
         height: u32::try_from(bottom - top).ok()?,
     })
-}
-
-fn wallpaper_pixel(x: u32, y: u32, width: u32, height: u32) -> u32 {
-    let horizontal = gradient_step(x, width);
-    let vertical = gradient_step(y, height);
-    let top = mix_rgb(WALLPAPER_TOP_LEFT, WALLPAPER_TOP_RIGHT, horizontal);
-    let bottom = mix_rgb(WALLPAPER_BOTTOM_LEFT, WALLPAPER_BOTTOM_RIGHT, horizontal);
-    let base = mix_rgb(top, bottom, vertical);
-    let diagonal = gradient_step(x.saturating_add(y), width.saturating_add(height).max(1));
-
-    Rgb::new(
-        base.red.saturating_add((diagonal / 12) as u8),
-        base.green
-            .saturating_add((u32::from(255u8.saturating_sub(diagonal as u8)) / 18) as u8),
-        base.blue.saturating_add((vertical / 14) as u8),
-    )
-    .to_pixel()
 }
 
 pub fn normalized_output_scale(output_scale: f64) -> f64 {
@@ -2794,24 +2741,6 @@ pub fn scale_desktop_visual_state(
         scale_logical_coordinate(cursor_x, output_scale),
         scale_logical_coordinate(cursor_y, output_scale),
     )
-}
-
-fn gradient_step(position: u32, extent: u32) -> u32 {
-    let last = extent.saturating_sub(1).max(1);
-    position.min(last) * 255 / last
-}
-
-fn mix_rgb(start: Rgb, end: Rgb, step: u32) -> Rgb {
-    Rgb::new(
-        mix_channel(start.red, end.red, step),
-        mix_channel(start.green, end.green, step),
-        mix_channel(start.blue, end.blue, step),
-    )
-}
-
-fn mix_channel(start: u8, end: u8, step: u32) -> u8 {
-    let inverse = 255 - step;
-    ((u32::from(start) * inverse + u32::from(end) * step) / 255) as u8
 }
 
 fn draw_cursor(
@@ -2965,30 +2894,27 @@ fn blit_surface_with_plan(
     }
 }
 
-fn copy_wallpaper_rect_to_scene(
+fn fill_output_background_rect(
     scene: &mut [u32],
-    wallpaper: &[u32],
     frame_width: u32,
+    frame_height: u32,
     rect: OutputRect,
 ) {
-    if frame_width == 0 {
+    let Some(rect) = rect.clipped_to_output(frame_width, frame_height) else {
         return;
-    }
+    };
 
     let frame_width = frame_width as usize;
-    let left = rect.x.max(0) as usize;
-    let top = rect.y.max(0) as usize;
+    let left = rect.x as usize;
+    let top = rect.y as usize;
     let row_width = rect.width as usize;
     for output_y in top..top.saturating_add(rect.height as usize) {
         let row_start = output_y.saturating_mul(frame_width).saturating_add(left);
         let row_end = row_start.saturating_add(row_width);
-        let Some(wallpaper_row) = wallpaper.get(row_start..row_end) else {
-            continue;
-        };
         let Some(scene_row) = scene.get_mut(row_start..row_end) else {
             continue;
         };
-        scene_row.copy_from_slice(wallpaper_row);
+        scene_row.fill(OUTPUT_BACKGROUND);
     }
 }
 
@@ -3313,10 +3239,16 @@ mod tests {
         )];
 
         let ordinary_groups =
-            window_visual_stack_order(&[root.clone(), ordinary_subsurface], &decorations);
+            window_visual_stack_order(&[root.clone(), ordinary_subsurface.clone()], &decorations);
         assert_eq!(ordinary_groups.len(), 1);
         assert_eq!(ordinary_groups[0].surface_indices(), &[0, 1]);
         assert_eq!(ordinary_groups[0].decoration_index(), Some(0));
+        let ordinary_visual_groups = visual_stack_groups(&[root.clone(), ordinary_subsurface], &[]);
+        assert_eq!(ordinary_visual_groups.len(), 1);
+        assert_eq!(ordinary_visual_groups[0].root_surface_id(), 701);
+        assert_eq!(ordinary_visual_groups[0].root_surface_index(), 0);
+        assert_eq!(ordinary_visual_groups[0].surface_indices(), &[0, 1]);
+        assert!(!ordinary_visual_groups[0].is_popup());
 
         let popup_surfaces = vec![root, popup];
         let popup_groups =
@@ -3332,6 +3264,13 @@ mod tests {
         assert_eq!(popup_groups[0].decoration_index(), Some(0));
         assert_eq!(popup_groups[1].surface_indices(), &[1]);
         assert_eq!(popup_groups[1].decoration_index(), None);
+        let popup_visual_groups = visual_stack_groups(&popup_surfaces, &[703]);
+        assert_eq!(popup_visual_groups.len(), 2);
+        assert_eq!(popup_visual_groups[0].root_surface_id(), 701);
+        assert_eq!(popup_visual_groups[0].root_surface_index(), 0);
+        assert_eq!(popup_visual_groups[1].root_surface_id(), 703);
+        assert_eq!(popup_visual_groups[1].root_surface_index(), 1);
+        assert!(popup_visual_groups[1].is_popup());
 
         let mut renderer = DesktopSceneRenderer::default();
         renderer.set_decoration_instances(&decorations);
@@ -3352,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_scene_renderer_reuses_wallpaper_cache_until_size_changes() {
+    fn desktop_scene_renderer_uses_neutral_background_on_full_rebuild() {
         let mut renderer = DesktopSceneRenderer::default();
         let mut frame = vec![0; 16 * 12];
 
@@ -3363,16 +3302,7 @@ mod tests {
             &[],
             DesktopVisualState::wallpaper_only(),
         );
-        let first_generation = renderer.wallpaper_generation();
-
-        renderer.compose(
-            &mut frame,
-            16,
-            12,
-            &[],
-            DesktopVisualState::with_cursor(4, 4),
-        );
-        assert_eq!(renderer.wallpaper_generation(), first_generation);
+        assert!(frame.iter().all(|pixel| *pixel == OUTPUT_BACKGROUND));
 
         let mut resized = vec![0; 20 * 12];
         renderer.compose(
@@ -3382,7 +3312,7 @@ mod tests {
             &[],
             DesktopVisualState::wallpaper_only(),
         );
-        assert_eq!(renderer.wallpaper_generation(), first_generation + 1);
+        assert!(resized.iter().all(|pixel| *pixel == OUTPUT_BACKGROUND));
     }
 
     #[test]
@@ -3626,8 +3556,6 @@ mod tests {
         assert!(server_frame_rects_for_surface(&surface).is_empty());
 
         let mut frame = vec![0; 1300 * 900];
-        draw_wallpaper(&mut frame, 1300, 900);
-        let wallpaper_pixel = frame[100 * 1300 + 100];
         let transparent_surface = RenderableSurface {
             buffer: shm_buffer(800, 600, vec![0x0000_0000; 800 * 600]),
             ..surface
@@ -3639,7 +3567,7 @@ mod tests {
             std::slice::from_ref(&transparent_surface),
             DesktopVisualState::wallpaper_only(),
         );
-        assert_eq!(frame[100 * 1300 + 100], wallpaper_pixel);
+        assert_eq!(frame[100 * 1300 + 100], OUTPUT_BACKGROUND);
     }
 
     #[test]
@@ -4573,6 +4501,43 @@ mod tests {
         assert_eq!(frame[72 * 96 + 72], 0xffff_0000);
     }
 
+    #[test]
+    fn desktop_scene_renderer_repairs_exposed_region_from_lower_background_surface() {
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 16 * 16];
+        let lower = solid_test_surface(701, 0, 0, 8, 8, 0xff00_ff00);
+        let upper = solid_test_surface(702, 0, 0, 4, 4, 0xffff_0000);
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 16,
+            frame_height: 16,
+            output_scale: 1.0,
+            surfaces: &[lower.clone(), upper],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        assert_eq!(frame[0], 0xffff_0000);
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 16,
+            frame_height: 16,
+            output_scale: 1.0,
+            surfaces: std::slice::from_ref(&lower),
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 2,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+
+        assert_eq!(frame[0], 0xff00_ff00);
+        assert_eq!(frame[3 * 16 + 3], 0xff00_ff00);
+        assert_eq!(frame[7 * 16 + 7], 0xff00_ff00);
+    }
+
     fn test_decoration_instance(origin_x: i32, origin_y: i32) -> DecorationRenderInstance {
         let layout = crate::compositor::decoration::layout::DecorationLayout::for_window(
             20,
@@ -4983,21 +4948,17 @@ mod tests {
             DesktopVisualState::wallpaper_only(),
         );
 
-        let mut wallpaper = vec![0; 96 * 96];
-        draw_wallpaper(&mut wallpaper, 96, 96);
-        assert_eq!(frame[72 * 96 + 72], wallpaper[72 * 96 + 72]);
+        assert_eq!(frame[72 * 96 + 72], OUTPUT_BACKGROUND);
         assert_eq!(frame[72 * 96 + 74], 0xff00_00ff);
     }
 
     #[test]
-    fn compose_output_draws_desktop_wallpaper_when_empty() {
+    fn compose_output_draws_neutral_background_when_empty() {
         let mut frame = vec![0; 12 * 8];
 
         compose_output(&mut frame, 12, 8, &[], DesktopVisualState::wallpaper_only());
 
-        assert_eq!(frame[0] >> 24, 0xff);
-        assert_ne!(frame[0], frame[11]);
-        assert_ne!(frame[0], frame[7 * 12]);
+        assert!(frame.iter().all(|pixel| *pixel == OUTPUT_BACKGROUND));
     }
 
     #[test]
@@ -5167,9 +5128,7 @@ mod tests {
         );
 
         let titlebar_pixel = ((72 - 12) * 120 + 76) as usize;
-        let mut wallpaper = vec![0; 120 * 120];
-        draw_wallpaper(&mut wallpaper, 120, 120);
-        assert_eq!(frame[titlebar_pixel], wallpaper[titlebar_pixel]);
+        assert_eq!(frame[titlebar_pixel], OUTPUT_BACKGROUND);
     }
 
     #[test]
@@ -5194,16 +5153,8 @@ mod tests {
             buffer_transform: wl_output::Transform::Normal,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
-        let mut wallpaper = vec![0; 96 * 96];
         let mut with_surface = vec![0; 96 * 96];
 
-        compose_output(
-            &mut wallpaper,
-            96,
-            96,
-            &[],
-            DesktopVisualState::wallpaper_only(),
-        );
         compose_output(
             &mut with_surface,
             96,
@@ -5213,7 +5164,7 @@ mod tests {
         );
 
         let origin = (72 * 96 + 72) as usize;
-        assert_eq!(with_surface[origin], wallpaper[origin]);
+        assert_eq!(with_surface[origin], OUTPUT_BACKGROUND);
     }
 
     #[test]

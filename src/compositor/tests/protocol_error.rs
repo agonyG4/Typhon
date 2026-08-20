@@ -75,6 +75,7 @@ fn xdg_role_after_cursor_surface_is_rejected_and_healthy_client_survives() {
     let compositor_a: client_wl_compositor::WlCompositor =
         globals_a.bind(&qh_a, 1..=6, ()).unwrap();
     let wm_base_a: client_xdg_wm_base::XdgWmBase = globals_a.bind(&qh_a, 1..=6, ()).unwrap();
+    let shm_a: client_wl_shm::WlShm = globals_a.bind(&qh_a, 1..=1, ()).unwrap();
     let seat_a: client_wl_seat::WlSeat = globals_a.bind(&qh_a, 1..=7, ()).unwrap();
     let pointer_a = seat_a.get_pointer(&qh_a, ());
     let origin = compositor_a.create_surface(&qh_a, ());
@@ -84,6 +85,10 @@ fn xdg_role_after_cursor_surface_is_rejected_and_healthy_client_survives() {
     origin.commit();
     connection_a.flush().unwrap();
     let mut state = RegistryTestState::default();
+    queue_a.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&origin, &shm_a, &qh_a, 32, 32).unwrap();
+    connection_a.flush().unwrap();
+    wait_for_server_commands(&commands);
     queue_a.roundtrip(&mut state).unwrap();
     commands
         .send(ServerCommand::PointerMotion {

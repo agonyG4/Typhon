@@ -790,7 +790,8 @@ impl NativeRuntime {
                 ),
                 NativePerfField::bool(
                     "direct_scanout_active",
-                    self.confirmed_primary_assignment
+                    self.presented_planes
+                        .primary
                         .is_some_and(|assignment| assignment.is_direct()),
                 ),
                 NativePerfField::bool(

@@ -127,6 +127,44 @@ fn exact_presented_direct_identity_retires_successfully() {
     assert!(ownership.presented.is_none());
 }
 
+#[test]
+fn presented_direct_identity_validation_uses_physical_ownership() {
+    let ownership = presented_ownership_for_release_test();
+    assert_eq!(
+        ownership.validate_presented_identity(expected_presented_identity_for_release_test()),
+        Ok(())
+    );
+    assert_eq!(
+        ownership.validate_presented_identity(ExpectedPresentedDirectPrimary {
+            framebuffer_id: 44,
+            ..expected_presented_identity_for_release_test()
+        }),
+        Err(DirectRetirementMismatch::FramebufferId)
+    );
+}
+
+#[test]
+fn presented_direct_identity_validation_rejects_submitted_or_suspended_only_ownership() {
+    let key = test_key();
+    let (submitted_lease, _cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
+    let mut submitted_only = DirectPrimaryOwnership::default();
+    submitted_only
+        .accept_submitted(test_submitted(143, submitted_lease))
+        .expect("submitted direct resource");
+    assert_eq!(
+        submitted_only.validate_presented_identity(expected_presented_identity_for_release_test()),
+        Err(DirectRetirementMismatch::MissingOwnership)
+    );
+
+    let (suspended_lease, _cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
+    let mut suspended_only = DirectPrimaryOwnership::default();
+    suspended_only.suspended.push(suspended_lease);
+    assert_eq!(
+        suspended_only.validate_presented_identity(expected_presented_identity_for_release_test()),
+        Err(DirectRetirementMismatch::MissingOwnership)
+    );
+}
+
 fn assert_retirement_mismatch(
     expected: ExpectedPresentedDirectPrimary,
     reason: DirectRetirementMismatch,

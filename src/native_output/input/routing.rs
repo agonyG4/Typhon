@@ -1389,6 +1389,15 @@ pub(crate) fn apply_native_window_action(
         }
         NativeWindowAction::CloseActiveWindow => server.close_focused_window(),
         NativeWindowAction::ToggleFullscreen => server.toggle_fullscreen_focused_window(),
+        NativeWindowAction::SwitchWorkspace(workspace) => {
+            matches!(
+                server.activate_workspace(workspace),
+                oblivion_one::wm::WorkspaceSwitchOutcome::Changed { .. }
+            )
+        }
+        NativeWindowAction::MoveFocusedWindowToWorkspace(workspace) => {
+            server.move_focused_window_to_workspace(workspace)
+        }
     };
     resize_perf.observe_action(action, changed, perf);
     changed

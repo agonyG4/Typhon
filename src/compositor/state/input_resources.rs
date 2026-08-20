@@ -28,7 +28,7 @@ impl CompositorState {
             return;
         }
         self.keyboard_resources.push(keyboard);
-        if let Some(surface) = self.focused_surface.clone() {
+        if let Some(surface) = self.keyboard_surface.clone() {
             self.ensure_keyboard_focus(&surface);
         }
     }
@@ -267,6 +267,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {
+        if self.pointer_hit_instrumentation_enabled {
+            self.pointer_hit_metrics.keyboard_focus_reconciliations += 1;
+        }
         if self
             .keyboard_surface
             .as_ref()
@@ -275,6 +278,7 @@ impl CompositorState {
             return;
         }
 
+        let previous_client_id = self.keyboard_focused_client_id();
         self.clear_keyboard_focus();
         self.keyboard_resources.retain(Resource::is_alive);
         let keyboards = self
@@ -285,6 +289,23 @@ impl CompositorState {
             .collect::<Vec<_>>();
         if keyboards.is_empty() {
             return;
+        }
+
+        let target_client_id = surface.client().map(|client| client.id());
+        if previous_client_id != target_client_id {
+            if let Some(previous_client_id) = previous_client_id.as_ref() {
+                self.publish_primary_clear_to_client(previous_client_id);
+            }
+            if let Some(target_client_id) = target_client_id.as_ref() {
+                self.publish_clipboard_to_client(target_client_id);
+                if self
+                    .selection_state
+                    .active_selection(SelectionKind::Primary)
+                    .is_some()
+                {
+                    self.publish_primary_to_client(target_client_id);
+                }
+            }
         }
 
         let serial = self.next_configure_serial();
@@ -312,7 +333,6 @@ impl CompositorState {
             wayland_resource_client_label(surface)
         ));
         self.keyboard_surface = Some(surface.clone());
-        self.publish_clipboard_to_focused_client();
         self.refresh_keyboard_shortcut_inhibition();
     }
 
@@ -381,9 +401,9 @@ impl CompositorState {
             self.send_confined_pointer_motion(x, y);
             return;
         }
-        self.update_pointer_position(x, y);
         if self.window_interaction_active() {
             self.update_window_interaction(x, y);
+            self.update_pointer_position(x, y);
             let _ = self.send_window_interaction_pointer_motion(
                 u64::from(wayland_event_time()).saturating_mul(1_000),
                 x,
@@ -391,18 +411,23 @@ impl CompositorState {
             );
             return;
         }
+        self.update_pointer_position_state(x, y);
+        let hit = self.pointer_scene_hit_at(x, y);
         self.update_drag_target_at(x, y);
         if self.send_implicit_pointer_grab_motion(x, y) {
+            self.update_decoration_hover_for_scene_hit(&hit);
             return;
         }
-        let Some(target) = self.pointer_target_at(x, y) else {
+        self.update_decoration_hover_for_scene_hit(&hit);
+        if !self.pointer_scene_hit_allowed_by_popup_grab(&hit) {
+            self.clear_pointer_focus();
+            return;
+        }
+        let PointerSceneHit::Client { target } = hit else {
+            self.focus_desktop_window_at_pointer_scene_hit(&hit);
             self.clear_pointer_focus();
             return;
         };
-        if !self.pointer_target_allowed_by_popup_grab(&target) {
-            self.clear_pointer_focus();
-            return;
-        }
         self.focus_desktop_window_at_pointer_target(&target);
         let time = wayland_event_time();
         self.ensure_pointer_focus(&target.surface);
@@ -505,13 +530,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn update_pointer_position(&mut self, x: f64, y: f64) {
+        self.update_pointer_position_state(x, y);
+        self.update_decoration_hover();
+    }
+
+    fn update_pointer_position_state(&mut self, x: f64, y: f64) {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_visible_cursor = changed
             && (self.interaction_cursor_override.is_some()
                 || self.client_cursor_render_state().is_some());
         self.last_pointer_x = x;
         self.last_pointer_y = y;
-        self.update_decoration_hover();
         if moves_visible_cursor {
             self.advance_cursor_generation();
         }

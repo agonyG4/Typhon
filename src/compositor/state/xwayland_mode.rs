@@ -27,7 +27,7 @@ impl CompositorState {
             return false;
         }
 
-        let restore_geometry = if mode_changed && mode != ToplevelMode::Floating {
+        let restore_geometry = if mode_changed && mode != ToplevelMode::Normal {
             self.current_visual_root_window_geometry(root_surface_id)
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
                 .or(current_geometry)
@@ -50,7 +50,7 @@ impl CompositorState {
             self.restore_minimized_desktop_window(window_id);
         }
 
-        let target_geometry = if mode == ToplevelMode::Floating && mode_changed {
+        let target_geometry = if mode == ToplevelMode::Normal && mode_changed {
             self.window_mut(window_id)
                 .and_then(|window| window.state.take_restore_geometry())
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
@@ -59,7 +59,7 @@ impl CompositorState {
                     WindowGeometry::new(self.surface_placement(root_surface_id), 1, 1)
                 })
         } else {
-            self.window_geometry_for_mode(mode)
+            self.window_geometry_for_surface_mode(root_surface_id, mode)
         };
         if let Some(window) = self.window_mut(window_id) {
             window.state.set_mode(mode);
@@ -136,12 +136,14 @@ impl CompositorState {
                 width: geometry.width,
                 height: geometry.height,
                 active_resize: None,
+                mode_transition: false,
             },
         ) != Some(ToplevelVisualGeometry {
             placement: geometry.placement,
             width: geometry.width,
             height: geometry.height,
             active_resize: None,
+            mode_transition: false,
         });
         self.update_pending_xwayland_visual_content(root_surface_id);
         self.update_toplevel_visual_render_assignment(root_surface_id);

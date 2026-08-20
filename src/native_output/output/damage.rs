@@ -237,6 +237,115 @@ pub(crate) struct NativeDamageRect {
     pub(crate) height: u32,
 }
 
+/// Geometry and mapped damage metadata for a scene. It deliberately excludes
+/// `RenderableSurface::buffer`, so submitted-frame history never owns a copy
+/// of client pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeSceneSurfaceSnapshot {
+    pub(crate) surface_id: u32,
+    pub(crate) bounds: Option<NativeDamageRect>,
+    pub(crate) damage: Vec<NativeDamageRect>,
+    pub(crate) content_generation: u64,
+    pub(crate) commit_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NativeSceneSnapshot {
+    pub(crate) surfaces: Vec<NativeSceneSurfaceSnapshot>,
+    pub(crate) decorations: Vec<DecorationSceneSnapshot>,
+    pub(crate) popup_surface_ids: Vec<u32>,
+    pub(crate) external_overlay_surface_ids: Vec<u32>,
+    pub(crate) visibility_signature: u64,
+}
+
+impl NativeSceneSnapshot {
+    pub(crate) fn from_surfaces(
+        surfaces: &[RenderableSurface],
+        decorations: Vec<DecorationSceneSnapshot>,
+    ) -> Self {
+        let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
+        let surfaces = elements
+            .iter()
+            .zip(surfaces)
+            .map(|(element, surface)| {
+                let RenderSceneElementId::Surface(surface_id) = element.id();
+                let buffer_size = element.buffer_size();
+                let damage = element
+                    .damage()
+                    .clipped_rects(buffer_size.width, buffer_size.height)
+                    .into_iter()
+                    .filter_map(|rect| NativeDamageRect::from_render_element_damage(element, rect))
+                    .collect();
+                NativeSceneSurfaceSnapshot {
+                    surface_id,
+                    bounds: NativeDamageRect::from_render_element_bounds(element),
+                    damage,
+                    content_generation: element.generation(),
+                    commit_sequence: surface.commit_sequence.get(),
+                }
+            })
+            .collect();
+        Self {
+            surfaces,
+            decorations,
+            popup_surface_ids: Vec::new(),
+            external_overlay_surface_ids: Vec::new(),
+            visibility_signature: 0,
+        }
+    }
+
+    pub(crate) fn identity_signature(&self) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        let mut mix = |value: u64| {
+            signature ^= value;
+            signature = signature.wrapping_mul(0x1000_0000_01b3);
+        };
+        for surface in &self.surfaces {
+            mix(1);
+            mix(u64::from(surface.surface_id));
+            if let Some(bounds) = surface.bounds {
+                mix(1);
+                mix(bounds.x as u64);
+                mix(bounds.y as u64);
+                mix(u64::from(bounds.width));
+                mix(u64::from(bounds.height));
+            } else {
+                mix(0);
+            }
+            mix(surface.content_generation);
+            mix(surface.commit_sequence);
+            for damage in &surface.damage {
+                mix(damage.x as u64);
+                mix(damage.y as u64);
+                mix(u64::from(damage.width));
+                mix(u64::from(damage.height));
+            }
+        }
+        for decoration in &self.decorations {
+            mix(2);
+            let (window_id, root_surface_id) = decoration.identity();
+            mix(window_id.get());
+            mix(u64::from(root_surface_id));
+            let (x, y, width, height) = decoration.bounds();
+            mix(x as u64);
+            mix(y as u64);
+            mix(u64::from(width));
+            mix(u64::from(height));
+            mix(decoration.visual_signature());
+        }
+        for surface_id in &self.popup_surface_ids {
+            mix(3);
+            mix(u64::from(*surface_id));
+        }
+        for surface_id in &self.external_overlay_surface_ids {
+            mix(4);
+            mix(u64::from(*surface_id));
+        }
+        mix(self.visibility_signature);
+        signature
+    }
+}
+
 impl NativeDamageRect {
     pub(crate) fn from_render_element_bounds(element: &RenderSceneElement) -> Option<Self> {
         let target = element.visible_target();
@@ -423,6 +532,7 @@ impl NativeDamageAccumulator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_surfaces(
         output_width: u32,
         output_height: u32,
@@ -432,6 +542,7 @@ impl NativeDamageAccumulator {
         Self::from_render_elements(output_width, output_height, &elements)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_render_elements(
         output_width: u32,
         output_height: u32,
@@ -444,6 +555,7 @@ impl NativeDamageAccumulator {
         accumulator
     }
 
+    #[cfg(test)]
     pub(crate) fn from_surface_bounds_changes(
         output_width: u32,
         output_height: u32,
@@ -460,6 +572,54 @@ impl NativeDamageAccumulator {
         )
     }
 
+    pub(crate) fn from_decoration_bounds_changes(
+        output_width: u32,
+        output_height: u32,
+        previous_decorations: &[DecorationSceneSnapshot],
+        current_decorations: &[DecorationSceneSnapshot],
+    ) -> Self {
+        let previous_bounds = native_decoration_bounds_by_id(previous_decorations);
+        let current_bounds = native_decoration_bounds_by_id(current_decorations);
+        let previous_signatures = previous_decorations
+            .iter()
+            .map(|snapshot| (snapshot.identity(), snapshot.visual_signature()))
+            .collect::<HashMap<_, _>>();
+        let current_signatures = current_decorations
+            .iter()
+            .map(|snapshot| (snapshot.identity(), snapshot.visual_signature()))
+            .collect::<HashMap<_, _>>();
+
+        let mut accumulator = Self::for_output(output_width, output_height);
+        for (identity, previous_rect) in &previous_bounds {
+            let current_rect = current_bounds.get(identity).copied();
+            let visual_changed =
+                current_signatures.get(identity) != previous_signatures.get(identity);
+            if current_rect != Some(*previous_rect) || visual_changed {
+                if let Some(previous_rect) =
+                    previous_rect.clipped_to_output(output_width, output_height)
+                {
+                    accumulator.rects.push(previous_rect);
+                }
+                if let Some(current_rect) = current_rect
+                    && let Some(current_rect) =
+                        current_rect.clipped_to_output(output_width, output_height)
+                {
+                    accumulator.rects.push(current_rect);
+                }
+            }
+        }
+        for (identity, current_rect) in current_bounds {
+            if !previous_bounds.contains_key(&identity)
+                && let Some(current_rect) =
+                    current_rect.clipped_to_output(output_width, output_height)
+            {
+                accumulator.rects.push(current_rect);
+            }
+        }
+        accumulator
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_render_element_bounds_changes(
         output_width: u32,
         output_height: u32,
@@ -513,6 +673,7 @@ impl NativeDamageAccumulator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn add_render_element(&mut self, element: &RenderSceneElement) {
         let buffer_size = element.buffer_size();
         for rect in element
@@ -558,6 +719,7 @@ impl NativeDamageAccumulator {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn native_element_bounds_by_id(
     output_width: u32,
     output_height: u32,
@@ -569,6 +731,29 @@ pub(crate) fn native_element_bounds_by_id(
             let rect = NativeDamageRect::from_render_element_bounds(element)?
                 .clipped_to_output(output_width, output_height)?;
             Some((element.id(), rect))
+        })
+        .collect()
+}
+
+fn native_decoration_bounds_by_id(
+    decorations: &[DecorationSceneSnapshot],
+) -> HashMap<(WindowId, u32), NativeDamageRect> {
+    decorations
+        .iter()
+        .filter_map(|snapshot| {
+            let (x, y, width, height) = snapshot.bounds();
+            if width == 0 || height == 0 {
+                return None;
+            }
+            Some((
+                snapshot.identity(),
+                NativeDamageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            ))
         })
         .collect()
 }
@@ -661,6 +846,7 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
     damage
 }
 
+#[cfg(test)]
 pub(crate) fn native_output_damage_for_scene_and_cursor(
     width: u32,
     height: u32,
@@ -669,6 +855,30 @@ pub(crate) fn native_output_damage_for_scene_and_cursor(
     scene_changed: bool,
     cursor_damage: NativeCursorDamageBounds,
 ) -> NativeOutputDamage {
+    native_output_damage_for_scene_and_cursor_with_decorations(
+        width,
+        height,
+        previous_surfaces,
+        surfaces,
+        &[],
+        &[],
+        scene_changed,
+        cursor_damage,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn native_output_damage_for_scene_and_cursor_with_decorations(
+    width: u32,
+    height: u32,
+    previous_surfaces: &[RenderableSurface],
+    surfaces: &[RenderableSurface],
+    previous_decorations: &[DecorationSceneSnapshot],
+    decorations: &[DecorationSceneSnapshot],
+    scene_changed: bool,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    let decorations_changed = previous_decorations != decorations;
     let mut damage = if scene_changed {
         let mut scene = NativeDamageAccumulator::from_surfaces(width, height, surfaces);
         scene.extend(NativeDamageAccumulator::from_surface_bounds_changes(
@@ -677,12 +887,26 @@ pub(crate) fn native_output_damage_for_scene_and_cursor(
             previous_surfaces,
             surfaces,
         ));
+        scene.extend(NativeDamageAccumulator::from_decoration_bounds_changes(
+            width,
+            height,
+            previous_decorations,
+            decorations,
+        ));
         let damage = scene.into_output_damage();
         if damage.is_empty() {
             NativeOutputDamage::full_output(width, height)
         } else {
             damage
         }
+    } else if decorations_changed {
+        NativeDamageAccumulator::from_decoration_bounds_changes(
+            width,
+            height,
+            previous_decorations,
+            decorations,
+        )
+        .into_output_damage()
     } else {
         NativeOutputDamage::empty()
     };
@@ -700,6 +924,162 @@ pub(crate) fn native_output_damage_for_scene_and_cursor(
         );
     }
     damage
+}
+
+/// Computes repaint from the visual transition between the scene that is
+/// actually presented and the exact scene captured for the current frame.
+///
+/// Logical render-generation bookkeeping may say that a retry is unchanged,
+/// but a rejected retry still targets a buffer containing the older presented
+/// scene.  Presentation-relative snapshot identity is therefore the damage
+/// authority; scheduling generation state must not suppress this transition.
+pub(crate) fn native_output_damage_for_scene_snapshots(
+    width: u32,
+    height: u32,
+    previous: &NativeSceneSnapshot,
+    current: &NativeSceneSnapshot,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    if previous.popup_surface_ids != current.popup_surface_ids
+        || previous.external_overlay_surface_ids != current.external_overlay_surface_ids
+        || previous.visibility_signature != current.visibility_signature
+    {
+        return NativeOutputDamage::full_output(width, height);
+    }
+    let mut scene = native_scene_surface_transition_damage(
+        width,
+        height,
+        &previous.surfaces,
+        &current.surfaces,
+    );
+    scene.extend(NativeDamageAccumulator::from_decoration_bounds_changes(
+        width,
+        height,
+        &previous.decorations,
+        &current.decorations,
+    ));
+    let mut damage = scene.into_output_damage();
+    if cursor_damage.previous_client != cursor_damage.client
+        || cursor_damage.previous_software != cursor_damage.software
+    {
+        damage = damage.union_surface_rects(
+            cursor_damage
+                .previous_client
+                .and_then(|state| state.rect)
+                .into_iter()
+                .chain(cursor_damage.client.and_then(|state| state.rect))
+                .chain(cursor_damage.previous_software)
+                .chain(cursor_damage.software),
+        );
+    }
+    damage
+}
+
+fn native_scene_surface_transition_damage(
+    output_width: u32,
+    output_height: u32,
+    previous: &[NativeSceneSurfaceSnapshot],
+    current: &[NativeSceneSurfaceSnapshot],
+) -> NativeDamageAccumulator {
+    let previous_by_id = previous
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    let current_by_id = current
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    let mut accumulator = NativeDamageAccumulator::for_output(output_width, output_height);
+    for (surface_id, previous_surface) in &previous_by_id {
+        let Some(current_surface) = current_by_id.get(surface_id) else {
+            push_clipped_scene_rect(
+                &mut accumulator,
+                output_width,
+                output_height,
+                previous_surface.bounds,
+            );
+            continue;
+        };
+
+        let visual_changed = previous_surface.bounds != current_surface.bounds
+            || previous_surface.content_generation != current_surface.content_generation
+            || previous_surface.commit_sequence != current_surface.commit_sequence;
+        if visual_changed {
+            push_clipped_scene_rect(
+                &mut accumulator,
+                output_width,
+                output_height,
+                previous_surface.bounds,
+            );
+            push_clipped_scene_rect(
+                &mut accumulator,
+                output_width,
+                output_height,
+                current_surface.bounds,
+            );
+            if current_surface.damage.is_empty() {
+                push_clipped_scene_rect(
+                    &mut accumulator,
+                    output_width,
+                    output_height,
+                    current_surface.bounds,
+                );
+            } else {
+                push_clipped_scene_damage(
+                    &mut accumulator,
+                    output_width,
+                    output_height,
+                    &current_surface.damage,
+                );
+            }
+        } else {
+            push_clipped_scene_damage(
+                &mut accumulator,
+                output_width,
+                output_height,
+                &current_surface.damage,
+            );
+        }
+    }
+    for (surface_id, current_surface) in &current_by_id {
+        if !previous_by_id.contains_key(surface_id) {
+            push_clipped_scene_rect(
+                &mut accumulator,
+                output_width,
+                output_height,
+                current_surface.bounds,
+            );
+            push_clipped_scene_damage(
+                &mut accumulator,
+                output_width,
+                output_height,
+                &current_surface.damage,
+            );
+        }
+    }
+    accumulator
+}
+
+fn push_clipped_scene_rect(
+    accumulator: &mut NativeDamageAccumulator,
+    output_width: u32,
+    output_height: u32,
+    rect: Option<NativeDamageRect>,
+) {
+    if let Some(rect) = rect.and_then(|rect| rect.clipped_to_output(output_width, output_height)) {
+        accumulator.rects.push(rect);
+    }
+}
+
+fn push_clipped_scene_damage(
+    accumulator: &mut NativeDamageAccumulator,
+    output_width: u32,
+    output_height: u32,
+    damage: &[NativeDamageRect],
+) {
+    for rect in damage {
+        push_clipped_scene_rect(accumulator, output_width, output_height, Some(*rect));
+    }
 }
 
 pub(crate) fn native_repaint_cause_label(

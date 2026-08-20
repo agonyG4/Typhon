@@ -292,23 +292,10 @@ pub(super) fn direct_scanout_debug(message: impl std::fmt::Display) {
 }
 
 impl DirectPrimaryOwnership {
-    fn retirement_mismatch(
+    fn presented_identity_mismatch(
         &self,
         expected: ExpectedPresentedDirectPrimary,
-        worker_owns_current: bool,
     ) -> Option<DirectRetirementMismatch> {
-        if self.presented.is_none() {
-            return Some(DirectRetirementMismatch::MissingOwnership);
-        }
-        if self.submitted.is_some() {
-            return Some(DirectRetirementMismatch::SubmittedOwnership);
-        }
-        if worker_owns_current {
-            return Some(DirectRetirementMismatch::WorkerOwnership);
-        }
-        if !self.suspended.is_empty() {
-            return Some(DirectRetirementMismatch::SuspendedOwnership);
-        }
         let presented = self
             .presented
             .as_ref()
@@ -333,12 +320,43 @@ impl DirectPrimaryOwnership {
             })
     }
 
+    fn retirement_mismatch(
+        &self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_owns_current: bool,
+    ) -> Option<DirectRetirementMismatch> {
+        if self.presented.is_none() {
+            return Some(DirectRetirementMismatch::MissingOwnership);
+        }
+        if self.submitted.is_some() {
+            return Some(DirectRetirementMismatch::SubmittedOwnership);
+        }
+        if worker_owns_current {
+            return Some(DirectRetirementMismatch::WorkerOwnership);
+        }
+        if !self.suspended.is_empty() {
+            return Some(DirectRetirementMismatch::SuspendedOwnership);
+        }
+        self.presented_identity_mismatch(expected)
+    }
+
     pub(crate) fn validate_presented_direct(
         &self,
         expected: ExpectedPresentedDirectPrimary,
         worker_owns_current: bool,
     ) -> Result<(), DirectRetirementMismatch> {
         self.retirement_mismatch(expected, worker_owns_current)
+            .map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn validate_presented_identity(
+        &self,
+        expected: ExpectedPresentedDirectPrimary,
+    ) -> Result<(), DirectRetirementMismatch> {
+        if self.presented.is_none() {
+            return Err(DirectRetirementMismatch::MissingOwnership);
+        }
+        self.presented_identity_mismatch(expected)
             .map_or(Ok(()), Err)
     }
 

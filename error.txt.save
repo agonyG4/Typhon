@@ -1,0 +1,6 @@
+bug 1, ao dar resize fica com uma aura e tambem nao consegui replicar mas por algum motivo tava votlando frames enquanto eu tava escrevendo essa mensagem e ao passar o mouse novamente no kitty desbugou nao consegui replicar
+ao colocar em fullscreen e dar resize e mover ao tirar de fullscreen ele fica com tamanho pequeno
+e a title bar ta acima das janelas tipo eu boto a janela pra tras e a title bar fica na frente de tudo e a borda das janelas tambem, e quero que remova as bordas das janelas
+e no firefox ao segurar a janela tipo nas abas e arrastar pra fora o firefox crasha imediatamente
+e copie a velocidade de Scroll do hyprland
+se eu dou Super + F pra colocar em fullscreen a Dock ficar por cima do app, a dock deveria sumir

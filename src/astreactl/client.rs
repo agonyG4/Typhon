@@ -31,6 +31,7 @@ pub enum AstreactlError {
     ProtocolMismatch,
     ResponseIdMismatch { expected: u64, actual: u64 },
     Server(ControlError),
+    Paper { code: String, message: String },
 }
 
 impl fmt::Display for AstreactlError {
@@ -53,6 +54,7 @@ impl fmt::Display for AstreactlError {
                 error.code.as_str(),
                 error.detail.as_deref().unwrap_or(&error.message)
             ),
+            Self::Paper { code, message } => write!(formatter, "{code}: {message}"),
         }
     }
 }

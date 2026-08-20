@@ -69,6 +69,7 @@ pub(super) fn submit_ready_frame(
     presentation_trace: &mut PresentationTransactionTraceRing,
     pacing_mode: NativeOutputPacingMode,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
+    scene_history: &mut NativeSceneHistory,
     frame_index: &mut u64,
     frame_submitted: &mut bool,
     perf: NativePerfLogger,
@@ -154,6 +155,11 @@ pub(super) fn submit_ready_frame(
             else {
                 return Ok(ReadySubmissionResult::Unavailable);
             };
+            // The explicit Atomic path owns the KMS presentation token. Move
+            // the exact rendered scene from ready to submitted only after the
+            // backend has accepted that token; pageflip-time transition
+            // preparation is keyed by this same token.
+            scene_history.queue_submission_or_error(token)?;
             explicit.mark_composited_submission();
             (
                 NativePresentResult::AsyncSubmitted {
@@ -221,6 +227,7 @@ pub(super) fn submit_ready_frame(
             ) {
                 Ok(result) => result,
                 Err(error) => {
+                    scene_history.discard_ready();
                     if pacing_frame_id.is_some()
                         && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
                     {
@@ -248,7 +255,7 @@ pub(super) fn submit_ready_frame(
             let compatibility_target = compatibility_target.ok_or_else(|| {
                 io::Error::other("compatibility pageflip started without a target")
             })?;
-            present_compatibility_frame(
+            let result = present_compatibility_frame(
                 scanout,
                 server,
                 output_transactions,
@@ -264,7 +271,14 @@ pub(super) fn submit_ready_frame(
                 |scanout, presentation_mode| {
                     scanout.present(kms_backend, cursor, presentation_mode)
                 },
-            )?
+            );
+            match result {
+                Ok(result) => result,
+                Err(error) => {
+                    scene_history.discard_ready();
+                    return Err(error);
+                }
+            }
         };
     #[cfg(test)]
     native_io_recorder.record(NativeIoOperation::ScanoutPresent);
@@ -275,6 +289,13 @@ pub(super) fn submit_ready_frame(
             framebuffer_id,
             transaction_id,
         } => {
+            if !explicit_submission && !scene_history.queue_submission(token) {
+                scene_history.discard_ready();
+                return Err(io::Error::other(
+                    "compatibility submission has no rendered scene snapshot",
+                )
+                .into());
+            }
             let atomic_primary_registered = if worker_mode {
                 true
             } else {
@@ -369,6 +390,12 @@ pub(super) fn submit_ready_frame(
             });
         }
         NativePresentResult::Immediate => {
+            if !scene_history.promote_immediate() {
+                return Err(io::Error::other(
+                    "immediate compatibility presentation has no rendered scene snapshot",
+                )
+                .into());
+            }
             let transaction_id = compatibility_transaction_id.ok_or_else(|| {
                 io::Error::other("immediate compatibility presentation has no transaction")
             })?;

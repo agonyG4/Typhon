@@ -1,4 +1,4 @@
-use super::transaction::OutputTransactionId;
+use super::transaction::{DirectScanoutCandidateKey, OutputTransactionId};
 use std::{collections::VecDeque, fmt::Write as _};
 
 const HISTOGRAM_BUCKETS_NS: [u64; 8] = [
@@ -34,6 +34,37 @@ pub(crate) enum PresentationTransactionEvent {
     RenderCompleted {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
+    },
+    SceneIdentity {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+        frame_id: u64,
+        render_generation: u64,
+        resolved_scene_signature: u64,
+        snapshot_scene_signature: u64,
+        render_damage_signature: u64,
+        repair_damage_signature: u64,
+        presented_at_render_frame_id: Option<u64>,
+        framebuffer_slot: u8,
+        buffer_age: Option<u32>,
+    },
+    PresentedTransition {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+        token: u64,
+        previous_frame_id: Option<u64>,
+        current_frame_id: u64,
+        transition_damage_signature: u64,
+    },
+    DirectIdentity {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+        surface_id: u32,
+        framebuffer_id: u32,
+        content_epoch: u64,
+        candidate_key: DirectScanoutCandidateKey,
+        submission_token: u64,
+        pageflip_token: u64,
     },
     TestOnlyStarted {
         transaction_id: OutputTransactionId,
@@ -93,6 +124,9 @@ impl PresentationTransactionEvent {
             Self::TransactionBuilt { .. } => "transaction_built",
             Self::RenderStarted { .. } => "render_started",
             Self::RenderCompleted { .. } => "render_completed",
+            Self::SceneIdentity { .. } => "scene_identity",
+            Self::PresentedTransition { .. } => "presented_transition",
+            Self::DirectIdentity { .. } => "direct_identity",
             Self::TestOnlyStarted { .. } => "test_only_started",
             Self::TestOnlyCompleted { .. } => "test_only_completed",
             Self::KmsSubmitStarted { .. } => "kms_submit_started",
@@ -116,6 +150,9 @@ impl PresentationTransactionEvent {
             | Self::TransactionBuilt { transaction_id, .. }
             | Self::RenderStarted { transaction_id, .. }
             | Self::RenderCompleted { transaction_id, .. }
+            | Self::SceneIdentity { transaction_id, .. }
+            | Self::PresentedTransition { transaction_id, .. }
+            | Self::DirectIdentity { transaction_id, .. }
             | Self::TestOnlyStarted { transaction_id, .. }
             | Self::TestOnlyCompleted { transaction_id, .. }
             | Self::KmsSubmitStarted { transaction_id, .. }
@@ -139,6 +176,9 @@ impl PresentationTransactionEvent {
             | Self::TransactionBuilt { timestamp_ns, .. }
             | Self::RenderStarted { timestamp_ns, .. }
             | Self::RenderCompleted { timestamp_ns, .. }
+            | Self::SceneIdentity { timestamp_ns, .. }
+            | Self::PresentedTransition { timestamp_ns, .. }
+            | Self::DirectIdentity { timestamp_ns, .. }
             | Self::TestOnlyStarted { timestamp_ns, .. }
             | Self::TestOnlyCompleted { timestamp_ns, .. }
             | Self::KmsSubmitStarted { timestamp_ns, .. }

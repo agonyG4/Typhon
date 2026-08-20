@@ -22,8 +22,8 @@ fn test_buffer_identity() -> BufferIdentity {
 mod binding_launch;
 mod direct_scanout_stage4;
 mod frame;
-mod fullscreen_frame_scene;
 mod fullscreen_cadence;
+mod fullscreen_frame_scene;
 mod input;
 mod input_interaction_liveness;
 mod input_protocol;

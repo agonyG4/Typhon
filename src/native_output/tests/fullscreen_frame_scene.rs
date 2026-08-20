@@ -35,7 +35,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Owned(renderer_surfaces.clone()),
         decorations: Vec::new(),
-        popup_surface_ids: Vec::new(),
+        popup_surface_ids: Cow::Owned(Vec::new()),
         external_overlay_surface_ids: Vec::new(),
         render_generation: 1,
         visibility: FullscreenRenderPlanMetrics {
@@ -244,7 +244,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
         );
         for _ in 0..age {
             let plan = planner.plan(OutputDamage::Full, BufferAge::Value(0));
-            planner.commit_presented(&plan);
+            planner.commit_presented_transition(plan.render_damage.clone());
         }
         let current_damage = native_output_damage_for_scene_snapshots(
             WIDTH,

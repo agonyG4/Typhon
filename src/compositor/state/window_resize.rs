@@ -93,7 +93,7 @@ impl CompositorState {
                     geometry,
                     self.window(window_id)
                         .map(|window| window.state.mode())
-                        .unwrap_or(ToplevelMode::Floating),
+                        .unwrap_or(ToplevelMode::Normal),
                     true,
                 );
             }
@@ -124,7 +124,9 @@ impl CompositorState {
             .configures_requested
             .saturating_add(1);
         let flow = self.resize_configure_flows.entry(surface_id).or_default();
-        let was_blocked = flow.has_in_flight() || flow.latest_desired().is_some();
+        let queued_before = flow.queued_latest();
+        let capacity_blocked = flow.in_flight_configure_count()
+            >= crate::compositor::interaction::MAX_IN_FLIGHT_RESIZE_CONFIGURES;
         let queued = flow.queue(pending);
         self.update_resize_retained_configure_peak(surface_id);
         if !queued {
@@ -133,10 +135,15 @@ impl CompositorState {
                 .duplicate_configure_sizes_skipped
                 .saturating_add(1);
         }
-        if queued && was_blocked {
+        let replaced_queued = queued && queued_before.is_some() && queued_before != Some(pending);
+        if replaced_queued {
             self.resize_flow_metrics.geometries_coalesced = self
                 .resize_flow_metrics
                 .geometries_coalesced
+                .saturating_add(1);
+            self.resize_flow_metrics.pending_resize_updates_replaced = self
+                .resize_flow_metrics
+                .pending_resize_updates_replaced
                 .saturating_add(1);
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -144,6 +151,23 @@ impl CompositorState {
                     pending.width, pending.height,
                 );
             }
+        }
+        if queued && capacity_blocked {
+            self.resize_flow_metrics.resize_configure_capacity_blocked = self
+                .resize_flow_metrics
+                .resize_configure_capacity_blocked
+                .saturating_add(1);
+        }
+        if queued {
+            self.resize_flow_debug_event(
+                "configure_queued",
+                surface_id,
+                None,
+                None,
+                None,
+                true,
+                Some(WindowGeometry::new(placement, width, height)),
+            );
         }
         self.preview_resize_root_window_to(
             surface_id,
@@ -238,6 +262,7 @@ impl CompositorState {
                         width: geometry.width,
                         height: geometry.height,
                         active_resize: None,
+                        mode_transition: false,
                     })
             });
         let render_target_cleared = self
@@ -263,6 +288,7 @@ impl CompositorState {
                 width,
                 height,
                 active_resize: Some(interaction_id),
+                mode_transition: false,
             },
         );
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
@@ -316,6 +342,19 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
+        let converged_mode_geometry = self
+            .toplevel_visual_geometries
+            .get(&root_surface_id)
+            .copied()
+            .filter(|visual| visual.mode_transition && visual.active_resize.is_none())
+            .and_then(|visual| {
+                (self.current_root_window_geometry(root_surface_id)
+                    == Some(visual.window_geometry()))
+                .then_some(visual)
+            });
+        if converged_mode_geometry.is_some() {
+            self.toplevel_visual_geometries.remove(&root_surface_id);
+        }
         let geometry = self
             .surface_window_geometries
             .get(&root_surface_id)
@@ -357,6 +396,7 @@ impl CompositorState {
                 }
             }
             self.invalidate_surface_origin_cache();
+            self.refresh_active_scene_surface_tree(root_surface_id);
             self.reconcile_all_surface_output_memberships();
             return;
         };
@@ -406,7 +446,36 @@ impl CompositorState {
             }
         }
         self.invalidate_surface_origin_cache();
+        self.refresh_active_scene_surface_tree(root_surface_id);
         self.reconcile_all_surface_output_memberships();
+    }
+
+    pub(in crate::compositor) fn install_toplevel_visual_geometry(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+    ) {
+        let target_cleared = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .and_then(|surface| surface.render_target_size.take())
+            .is_some();
+        let visual = ToplevelVisualGeometry {
+            placement: geometry.placement,
+            width: geometry.width,
+            height: geometry.height,
+            active_resize: None,
+            mode_transition: true,
+        };
+        let changed = self
+            .toplevel_visual_geometries
+            .insert(root_surface_id, visual)
+            != Some(visual);
+        self.update_toplevel_visual_render_assignment(root_surface_id);
+        if changed || target_cleared {
+            self.advance_render_generation(RenderGenerationCause::WindowMode);
+        }
     }
 
     pub(in crate::compositor) fn clear_toplevel_visual_render_assignment(
@@ -423,22 +492,34 @@ impl CompositorState {
             }
         }
         self.invalidate_surface_origin_cache();
+        self.refresh_active_scene_surface_tree(root_surface_id);
     }
 
     pub(in crate::compositor) fn flush_pending_resize_configure(&mut self) -> bool {
-        let surface_ids = self
-            .resize_configure_flows
-            .iter()
-            .filter_map(|(surface_id, flow)| flow.has_sendable().then_some(*surface_id))
-            .collect::<Vec<_>>();
         let mut sent = false;
-        for surface_id in surface_ids {
-            let desired = self
+        loop {
+            let surface_ids = self
                 .resize_configure_flows
-                .get_mut(&surface_id)
-                .and_then(ResizeConfigureFlow::take_sendable);
-            if let Some(desired) = desired {
-                sent |= self.send_resize_configure(desired);
+                .iter()
+                .filter_map(|(surface_id, flow)| flow.has_sendable().then_some(*surface_id))
+                .collect::<Vec<_>>();
+            if surface_ids.is_empty() {
+                break;
+            }
+            let mut sent_this_round = false;
+            for surface_id in surface_ids {
+                let desired = self
+                    .resize_configure_flows
+                    .get_mut(&surface_id)
+                    .and_then(ResizeConfigureFlow::take_sendable);
+                if let Some(desired) = desired {
+                    let configured = self.send_resize_configure(desired);
+                    sent |= configured;
+                    sent_this_round |= configured;
+                }
+            }
+            if !sent_this_round {
+                break;
             }
         }
         sent
@@ -465,7 +546,7 @@ impl CompositorState {
                 geometry,
                 self.window(window_id)
                     .map(|window| window.state.mode())
-                    .unwrap_or(ToplevelMode::Floating),
+                    .unwrap_or(ToplevelMode::Normal),
             );
             return true;
         }

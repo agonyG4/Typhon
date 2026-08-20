@@ -26,6 +26,9 @@ pub(super) enum PipelineSnapshotError {
         owner: &'static str,
         transaction_id: OutputTransactionId,
     },
+    MissingPresentedDirectOwnership {
+        transaction_id: OutputTransactionId,
+    },
     UnexpectedSwapchainRole {
         owner: &'static str,
         transaction_id: OutputTransactionId,
@@ -286,71 +289,164 @@ fn commit_snapshot(
     })
 }
 
-fn validate_confirmed_primary(
-    current: ConfirmedPrimaryState,
+fn validate_presented_primary(
+    current: PresentedPrimaryState,
     swapchain: &AtomicOutputSwapchain,
-    ledger: &OutputTransactionLedger,
+    direct_ownership: Option<&DirectPrimaryOwnership>,
+    output_generation: u64,
+    crtc_id: u32,
 ) -> Result<(), PipelineSnapshotError> {
-    let (transaction_id, owner) = match current {
-        ConfirmedPrimaryState::Composed { transaction_id, .. } => {
-            (transaction_id, "current_composed")
-        }
-        ConfirmedPrimaryState::Direct { transaction_id, .. } => (transaction_id, "current_direct"),
-    };
-    let record = ledger
-        .transaction_including_terminal(transaction_id)
-        .ok_or(PipelineSnapshotError::MissingTransaction {
-            owner,
+    match current {
+        PresentedPrimaryState::Composed {
             transaction_id,
-        })?;
-    if !matches!(
-        record.state(),
-        OutputTransactionState::Terminal(OutputTransactionTerminal::Presented { .. })
-    ) {
-        return Err(PipelineSnapshotError::TransactionStateMismatch {
-            owner,
-            transaction_id,
-            actual: record.state().kind(),
-        });
-    }
-    match (
-        current,
-        record.descriptor().content(),
-        record.descriptor().planes().primary(),
-    ) {
-        (
-            ConfirmedPrimaryState::Composed { slot, .. },
-            OutputTransactionContent::Composited { .. },
-            PrimaryPlaneAssignment::CompositorFramebuffer {
-                slot: plane_slot, ..
-            },
-        ) if slot == plane_slot && slot == swapchain.current() => Ok(()),
-        (
-            ConfirmedPrimaryState::Direct {
-                surface_id,
-                key,
-                framebuffer_id,
-                ..
-            },
-            OutputTransactionContent::Direct {
-                key: content_key, ..
-            },
-            PrimaryPlaneAssignment::ClientFramebuffer {
-                key: plane_key,
-                framebuffer_id: plane_framebuffer_id,
-            },
-        ) if key == content_key
-            && key == plane_key
-            && framebuffer_id == plane_framebuffer_id
-            && record.descriptor().obligations().direct_surface_id() == Some(surface_id) =>
-        {
+            token,
+            pageflip,
+            slot,
+            framebuffer_id,
+            pool_generation,
+            presentation_serial,
+        } => {
+            if token != pageflip.token {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "pageflip_token",
+                    transaction_id,
+                ));
+            }
+            if pageflip.bundle_id
+                != crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                    token,
+                )
+            {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "bundle_id",
+                    transaction_id,
+                ));
+            }
+            if pageflip.output_generation != output_generation {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "output_generation",
+                    transaction_id,
+                ));
+            }
+            if pageflip.crtc_id != crtc_id {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "crtc_id",
+                    transaction_id,
+                ));
+            }
+            if slot != swapchain.current() {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "slot",
+                    transaction_id,
+                ));
+            }
+            if pool_generation != swapchain.pool_generation() {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "pool_generation",
+                    transaction_id,
+                ));
+            }
+            if presentation_serial != swapchain.presentation_serial() {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "presentation_serial",
+                    transaction_id,
+                ));
+            }
+            if swapchain.current_framebuffer_id().map(|id| id.get()) != Some(framebuffer_id) {
+                return Err(identity_mismatch(
+                    "current_composed",
+                    "framebuffer_id",
+                    transaction_id,
+                ));
+            }
             Ok(())
         }
-        _ => Err(identity_mismatch(
-            owner,
-            "confirmed_primary",
+        PresentedPrimaryState::Direct {
             transaction_id,
-        )),
+            token,
+            pageflip,
+            surface_id,
+            key,
+            framebuffer_id,
+        } => {
+            if token != pageflip.token {
+                return Err(identity_mismatch(
+                    "current_direct",
+                    "pageflip_token",
+                    transaction_id,
+                ));
+            }
+            if pageflip.bundle_id
+                != crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                    token,
+                )
+            {
+                return Err(identity_mismatch(
+                    "current_direct",
+                    "bundle_id",
+                    transaction_id,
+                ));
+            }
+            if pageflip.output_generation != output_generation {
+                return Err(identity_mismatch(
+                    "current_direct",
+                    "output_generation",
+                    transaction_id,
+                ));
+            }
+            if key.output_generation != output_generation {
+                return Err(identity_mismatch(
+                    "current_direct",
+                    "output_generation",
+                    transaction_id,
+                ));
+            }
+            if pageflip.crtc_id != crtc_id {
+                return Err(identity_mismatch(
+                    "current_direct",
+                    "crtc_id",
+                    transaction_id,
+                ));
+            }
+            let ownership = direct_ownership
+                .ok_or(PipelineSnapshotError::MissingPresentedDirectOwnership { transaction_id })?;
+            ownership
+                .validate_presented_identity(ExpectedPresentedDirectPrimary {
+                    transaction_id,
+                    token,
+                    surface_id,
+                    candidate_key: key,
+                    framebuffer_id,
+                })
+                .map_err(|reason| {
+                    identity_mismatch(
+                        "current_direct",
+                        direct_identity_field(reason),
+                        transaction_id,
+                    )
+                })
+        }
+    }
+}
+
+const fn direct_identity_field(reason: DirectRetirementMismatch) -> &'static str {
+    match reason {
+        DirectRetirementMismatch::MissingOwnership => "presented_ownership",
+        DirectRetirementMismatch::SubmittedOwnership => "submitted_ownership",
+        DirectRetirementMismatch::WorkerOwnership => "worker_ownership",
+        DirectRetirementMismatch::SuspendedOwnership => "suspended_ownership",
+        DirectRetirementMismatch::TransactionId => "transaction_id",
+        DirectRetirementMismatch::PageflipToken => "pageflip_token",
+        DirectRetirementMismatch::CandidateKey => "candidate_key",
+        DirectRetirementMismatch::SurfaceId => "surface_id",
+        DirectRetirementMismatch::FramebufferId => "framebuffer_id",
     }
 }
 
@@ -379,23 +475,24 @@ pub(super) fn build_output_pipeline_snapshot(
     swapchain: &AtomicOutputSwapchain,
     ledger: &OutputTransactionLedger,
     arbiter: &AtomicCommitArbiter,
-    current_primary: Option<ConfirmedPrimaryState>,
+    legacy_primary: Option<PresentedPrimaryState>,
     rendering_target: Option<PresentationTarget>,
     triple_capability: TripleCapability,
     legacy_cursor: Option<&crate::native_output::output::NativeAtomicCursor>,
 ) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
     let mut presented_planes =
-        crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(current_primary);
+        crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(legacy_primary);
     if let Some(cursor) = legacy_cursor {
         presented_planes.cursor = cursor.presented_plane_state();
     }
     build_output_pipeline_snapshot_with_presented(
         output_generation,
+        7,
         pacing_mode,
         swapchain,
         ledger,
         arbiter,
-        presented_planes.primary,
+        None,
         rendering_target,
         triple_capability,
         presented_planes,
@@ -405,11 +502,12 @@ pub(super) fn build_output_pipeline_snapshot(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_output_pipeline_snapshot_with_presented(
     output_generation: u64,
+    crtc_id: u32,
     pacing_mode: NativeOutputPacingMode,
     swapchain: &AtomicOutputSwapchain,
     ledger: &OutputTransactionLedger,
     arbiter: &AtomicCommitArbiter,
-    current_primary: Option<ConfirmedPrimaryState>,
+    direct_ownership: Option<&DirectPrimaryOwnership>,
     rendering_target: Option<PresentationTarget>,
     triple_capability: TripleCapability,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
@@ -421,8 +519,14 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                 slot: swapchain.current(),
             })
         })?;
-    if let Some(current) = current_primary {
-        validate_confirmed_primary(current, swapchain, ledger)?;
+    if let Some(current) = presented_planes.primary {
+        validate_presented_primary(
+            current,
+            swapchain,
+            direct_ownership,
+            output_generation,
+            crtc_id,
+        )?;
     }
     let kernel_submitted = arbiter
         .kernel_submitted_commit()
@@ -511,7 +615,6 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
         output_generation,
         pacing_mode,
         presented_planes,
-        current_primary,
         kernel_submitted,
         worker_queued_next,
         prepared,
@@ -538,11 +641,12 @@ impl NativeRuntime {
         };
         let snapshot = build_output_pipeline_snapshot_with_presented(
             self.drm_file_generation,
+            self.target.crtc_id,
             self.adaptive_buffering.pacing_mode(),
             swapchain,
             &self.output_transactions,
             &self.atomic_commit_arbiter,
-            self.presented_planes.primary,
+            self.scanout.explicit_presented_direct_ownership(),
             self.scheduled_presentation_target,
             capability,
             self.presented_planes,
@@ -550,6 +654,10 @@ impl NativeRuntime {
         Ok(Some(snapshot))
     }
 }
+
+#[cfg(test)]
+#[path = "presentation_pipeline_direct_tests.rs"]
+mod direct_tests;
 
 #[cfg(test)]
 mod tests {
@@ -657,7 +765,13 @@ mod tests {
     }
 
     fn insert_cursor(ledger: &mut OutputTransactionLedger) -> OutputTransactionId {
-        let id = transaction_id(1);
+        insert_cursor_with_id(ledger, transaction_id(1))
+    }
+
+    fn insert_cursor_with_id(
+        ledger: &mut OutputTransactionLedger,
+        id: OutputTransactionId,
+    ) -> OutputTransactionId {
         ledger
             .insert(
                 OutputTransaction::cursor_plane_delta(
@@ -704,6 +818,112 @@ mod tests {
             cursor_content_key: None,
             color_epoch: 0,
         }
+    }
+
+    fn composed_primary(
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        pool_generation: u64,
+        presentation_serial: u64,
+    ) -> PresentedPrimaryState {
+        PresentedPrimaryState::Composed {
+            transaction_id,
+            token,
+            pageflip,
+            slot,
+            framebuffer_id,
+            pool_generation,
+            presentation_serial,
+        }
+    }
+
+    fn completed_composed_fixture(
+        history_capacity: usize,
+    ) -> (
+        AtomicOutputSwapchain,
+        OutputTransactionLedger,
+        AtomicCommitArbiter,
+        PresentedPrimaryState,
+    ) {
+        let mut swapchain = ready_swapchain();
+        let ready = swapchain.ready_identity().unwrap();
+        let mut ledger = OutputTransactionLedger::with_capacities(8, history_capacity);
+        insert_composited(&mut ledger, ready, ready.slot, 42);
+        let pageflip = token(11);
+        swapchain.submit_ready(pageflip, None).unwrap();
+        ledger
+            .mark_submitted(ready.transaction_id, pageflip, MonotonicTimestampNs::new(1))
+            .unwrap();
+        let mut arbiter = AtomicCommitArbiter::new();
+        arbiter
+            .reserve(
+                pageflip,
+                1,
+                7,
+                AtomicCommitKind::CompositedPrimary {
+                    transaction_id: ready.transaction_id,
+                    frame_id: ready.frame_id,
+                    framebuffer_id: 42,
+                },
+                1,
+            )
+            .unwrap();
+        swapchain.complete_pageflip(pageflip, 1).unwrap();
+        arbiter.complete(pageflip, 1, 7);
+        ledger
+            .mark_presented(
+                ready.transaction_id,
+                pageflip,
+                1,
+                MonotonicTimestampNs::new(2),
+                Some(1),
+            )
+            .unwrap();
+        let pageflip_identity =
+            crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+                pageflip, 1, 7,
+            );
+        let current = composed_primary(
+            ready.transaction_id,
+            pageflip,
+            pageflip_identity,
+            ready.slot,
+            42,
+            1,
+            1,
+        );
+        (swapchain, ledger, arbiter, current)
+    }
+
+    fn assert_presented_primary_mismatch(
+        swapchain: &AtomicOutputSwapchain,
+        ledger: &OutputTransactionLedger,
+        arbiter: &AtomicCommitArbiter,
+        current: PresentedPrimaryState,
+        field: &'static str,
+    ) {
+        assert_eq!(
+            build_output_pipeline_snapshot_with_presented(
+                1,
+                7,
+                NativeOutputPacingMode::ReactiveDouble,
+                swapchain,
+                ledger,
+                arbiter,
+                None,
+                None,
+                TripleCapability::Capable,
+                PresentedPlaneSnapshot::legacy(Some(current)),
+            ),
+            Err(PipelineSnapshotError::IdentityMismatch {
+                owner: "current_composed",
+                field,
+                transaction_id: current.transaction_id(),
+            })
+        );
     }
 
     #[test]
@@ -1003,10 +1223,17 @@ mod tests {
                 Some(1),
             )
             .unwrap();
-        let current = ConfirmedPrimaryState::Composed {
+        let current = PresentedPrimaryState::Composed {
             transaction_id: ready.transaction_id,
             token: pageflip,
+            pageflip:
+                crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+                    pageflip, 1, 7,
+                ),
             slot: ready.slot,
+            framebuffer_id: 42,
+            pool_generation: 1,
+            presentation_serial: 1,
         };
         let confirmed = build_output_pipeline_snapshot(
             1,
@@ -1020,6 +1247,204 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(confirmed.current_primary, Some(current));
+        assert_eq!(confirmed.presented_planes.primary, Some(current));
+    }
+
+    #[derive(Clone, Copy)]
+    enum ComposedMismatch {
+        Slot,
+        Framebuffer,
+        PoolGeneration,
+        PresentationSerial,
+        OutputGeneration,
+        CRTC,
+        Bundle,
+    }
+
+    fn composed_mismatch(
+        current: PresentedPrimaryState,
+        mismatch: ComposedMismatch,
+    ) -> (PresentedPrimaryState, &'static str) {
+        let PresentedPrimaryState::Composed {
+            transaction_id,
+            token,
+            pageflip,
+            slot,
+            framebuffer_id,
+            pool_generation,
+            presentation_serial,
+        } = current
+        else {
+            unreachable!();
+        };
+        let other_slot = if slot == OutputSlotId::new(0).unwrap() {
+            OutputSlotId::new(1).unwrap()
+        } else {
+            OutputSlotId::new(0).unwrap()
+        };
+        let (pageflip, slot, framebuffer_id, pool_generation, presentation_serial, field) =
+            match mismatch {
+                ComposedMismatch::Slot => (
+                    pageflip,
+                    other_slot,
+                    framebuffer_id,
+                    pool_generation,
+                    presentation_serial,
+                    "slot",
+                ),
+                ComposedMismatch::Framebuffer => (
+                    pageflip,
+                    slot,
+                    framebuffer_id + 1,
+                    pool_generation,
+                    presentation_serial,
+                    "framebuffer_id",
+                ),
+                ComposedMismatch::PoolGeneration => (
+                    pageflip,
+                    slot,
+                    framebuffer_id,
+                    pool_generation + 1,
+                    presentation_serial,
+                    "pool_generation",
+                ),
+                ComposedMismatch::PresentationSerial => (
+                    pageflip,
+                    slot,
+                    framebuffer_id,
+                    pool_generation,
+                    presentation_serial + 1,
+                    "presentation_serial",
+                ),
+                ComposedMismatch::OutputGeneration => (
+                    crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+                        token, 2, 7,
+                    ),
+                    slot,
+                    framebuffer_id,
+                    pool_generation,
+                    presentation_serial,
+                    "output_generation",
+                ),
+                ComposedMismatch::CRTC => (
+                    crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+                        token, 1, 8,
+                    ),
+                    slot,
+                    framebuffer_id,
+                    pool_generation,
+                    presentation_serial,
+                    "crtc_id",
+                ),
+                ComposedMismatch::Bundle => (
+                    crate::native_output::presentation::plane::PlanePageflipIdentity {
+                        bundle_id:
+                            crate::native_output::presentation::plane::KmsCommitBundleId::new(
+                                NonZeroU64::new(99).unwrap(),
+                            ),
+                        ..pageflip
+                    },
+                    slot,
+                    framebuffer_id,
+                    pool_generation,
+                    presentation_serial,
+                    "bundle_id",
+                ),
+            };
+        (
+            composed_primary(
+                transaction_id,
+                token,
+                pageflip,
+                slot,
+                framebuffer_id,
+                pool_generation,
+                presentation_serial,
+            ),
+            field,
+        )
+    }
+
+    #[test]
+    fn presented_composed_primary_rejects_physical_identity_mismatches() {
+        let (swapchain, ledger, arbiter, current) = completed_composed_fixture(8);
+        for mismatch in [
+            ComposedMismatch::Slot,
+            ComposedMismatch::Framebuffer,
+            ComposedMismatch::PoolGeneration,
+            ComposedMismatch::PresentationSerial,
+            ComposedMismatch::OutputGeneration,
+            ComposedMismatch::CRTC,
+            ComposedMismatch::Bundle,
+        ] {
+            let (invalid, field) = composed_mismatch(current, mismatch);
+            assert_presented_primary_mismatch(&swapchain, &ledger, &arbiter, invalid, field);
+        }
+    }
+
+    #[test]
+    fn presented_composed_primary_survives_origin_history_eviction() {
+        let (swapchain, mut ledger, arbiter, current) = completed_composed_fixture(1);
+        let unrelated = insert_cursor_with_id(&mut ledger, transaction_id(2));
+        ledger
+            .mark_dropped(
+                unrelated,
+                OutputTransactionDropReason::NoVisualChange,
+                MonotonicTimestampNs::new(3),
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .transaction_including_terminal(current.transaction_id())
+                .is_none()
+        );
+
+        let snapshot = build_output_pipeline_snapshot(
+            1,
+            NativeOutputPacingMode::ReactiveDouble,
+            &swapchain,
+            &ledger,
+            &arbiter,
+            Some(current),
+            None,
+            TripleCapability::Capable,
+            None,
+        )
+        .expect("a physically current primary must not depend on history");
+        assert_eq!(snapshot.presented_planes.primary, Some(current));
+    }
+
+    #[test]
+    fn presented_composed_primary_survives_cursor_plane_churn() {
+        let (swapchain, mut ledger, arbiter, current) = completed_composed_fixture(2);
+        for value in 2..=12 {
+            let unrelated = insert_cursor_with_id(&mut ledger, transaction_id(value));
+            ledger
+                .mark_dropped(
+                    unrelated,
+                    OutputTransactionDropReason::NoVisualChange,
+                    MonotonicTimestampNs::new(value),
+                )
+                .unwrap();
+        }
+        assert!(
+            ledger
+                .transaction_including_terminal(current.transaction_id())
+                .is_none()
+        );
+
+        let snapshot = build_output_pipeline_snapshot(
+            1,
+            NativeOutputPacingMode::ReactiveDouble,
+            &swapchain,
+            &ledger,
+            &arbiter,
+            Some(current),
+            None,
+            TripleCapability::Capable,
+            None,
+        )
+        .expect("cursor churn must not invalidate the physically current primary");
+        assert_eq!(snapshot.presented_planes.primary, Some(current));
     }
 }

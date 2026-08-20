@@ -54,7 +54,7 @@ impl CompositorState {
             .is_some_and(|active| active.surface_id == surface_id)
             && self.cursor_visibility.lock_hidden_constraint_id.is_none()
         {
-            self.pending_frame_callbacks.extend(frame_callbacks);
+            self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
         } else {
             self.complete_frame_callbacks(frame_callbacks);
         }

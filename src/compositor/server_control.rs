@@ -5,6 +5,7 @@ use crate::control_snapshots::{
     ControlWindowId, GeometrySnapshot, WindowKindSnapshot, WindowListSnapshot, WindowSnapshot,
     bounded_window_list,
 };
+use crate::wm::WindowManagementState;
 
 impl OwnCompositorServer {
     pub fn revoke_astrea_shell_pid(&mut self, pid: u32) {
@@ -48,7 +49,7 @@ impl OwnCompositorServer {
             fullscreen: matches!(mode, ToplevelMode::Fullscreen),
             urgent: None,
             skip_taskbar: x11 && window.is_auxiliary_x11_role(),
-            workspace: None,
+            workspace: control_workspace_label(window.management),
             output: Some("oblivion-1".to_string()),
             geometry,
             focus_serial: None,
@@ -96,5 +97,26 @@ impl OwnCompositorServer {
         self.state
             .focused_window_id
             .and_then(|id| self.control_window_snapshot(id))
+    }
+}
+
+fn control_workspace_label(management: Option<WindowManagementState>) -> Option<String> {
+    management.map(|management| management.workspace().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_workspace_label;
+    use crate::wm::{WindowManagementState, WorkspaceId};
+
+    #[test]
+    fn control_snapshot_publishes_numeric_workspace_or_none() {
+        assert_eq!(
+            control_workspace_label(Some(WindowManagementState::new(
+                WorkspaceId::new(1).unwrap()
+            ))),
+            Some("1".to_string())
+        );
+        assert_eq!(control_workspace_label(None), None);
     }
 }

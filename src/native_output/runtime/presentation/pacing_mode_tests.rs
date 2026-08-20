@@ -917,14 +917,27 @@ fn compatibility_present_result_matrix_has_exactly_one_terminal_per_transaction(
 
 #[test]
 fn composed_to_direct_becomes_active_only_after_pageflip() {
-    let composed = ConfirmedPrimaryAssignment::Composed {
+    let composed = PresentedPrimaryAssignment::Composed {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(1).unwrap()),
         token: PageFlipToken::new(11).unwrap(),
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+            PageFlipToken::new(11).unwrap(),
+            1,
+            0,
+        ),
         slot: OutputSlotId::new(0).unwrap(),
+        framebuffer_id: 42,
+        pool_generation: 1,
+        presentation_serial: 1,
     };
-    let direct = ConfirmedPrimaryAssignment::Direct {
+    let direct = PresentedPrimaryAssignment::Direct {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(2).unwrap()),
         token: PageFlipToken::new(12).unwrap(),
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+            PageFlipToken::new(12).unwrap(),
+            1,
+            0,
+        ),
         surface_id: 7,
         key: test_confirmed_direct_key(),
         framebuffer_id: 42,
@@ -942,16 +955,26 @@ fn composed_to_direct_becomes_active_only_after_pageflip() {
 
 #[test]
 fn direct_to_direct_retains_old_resource_until_replacement_pageflip() {
-    let old = ConfirmedPrimaryAssignment::Direct {
+    let old = PresentedPrimaryAssignment::Direct {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(3).unwrap()),
         token: PageFlipToken::new(13).unwrap(),
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+            PageFlipToken::new(13).unwrap(),
+            1,
+            0,
+        ),
         surface_id: 8,
         key: test_confirmed_direct_key(),
         framebuffer_id: 42,
     };
-    let replacement = ConfirmedPrimaryAssignment::Direct {
+    let replacement = PresentedPrimaryAssignment::Direct {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(4).unwrap()),
         token: PageFlipToken::new(14).unwrap(),
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+            PageFlipToken::new(14).unwrap(),
+            1,
+            0,
+        ),
         surface_id: 9,
         key: test_confirmed_direct_key(),
         framebuffer_id: 43,
@@ -984,10 +1007,18 @@ fn direct_real_submit_rejection_invalidates_cache_and_requests_composition() {
 
 #[test]
 fn rejected_direct_attempt_does_not_invalidate_presented_damage_history() {
-    let confirmed = Some(ConfirmedPrimaryAssignment::Composed {
+    let confirmed = Some(PresentedPrimaryAssignment::Composed {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(5).unwrap()),
         token: PageFlipToken::new(15).unwrap(),
+        pageflip: crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+            PageFlipToken::new(15).unwrap(),
+            1,
+            0,
+        ),
         slot: OutputSlotId::new(0).unwrap(),
+        framebuffer_id: 42,
+        pool_generation: 1,
+        presentation_serial: 1,
     });
     let after_rejection = confirmed;
     assert_eq!(after_rejection, confirmed);

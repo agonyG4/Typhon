@@ -96,7 +96,9 @@ impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDevice
                     client_id: client.id(),
                     seat_id: seat.id(),
                 });
-                state.publish_primary_to_device(&device);
+                if state.client_has_keyboard_focus(&client.id()) {
+                    state.publish_primary_to_device(&device);
+                }
             }
             zwp_primary_selection_device_manager_v1::Request::Destroy => {}
             other => {
@@ -126,7 +128,7 @@ impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, Prim
         match request {
             zwp_primary_selection_device_v1::Request::SetSelection { source, serial } => {
                 if data.seat_id.interface().name != "wl_seat"
-                    || !state.client_has_focus(&data.client_id)
+                    || !state.client_has_keyboard_focus(&data.client_id)
                 {
                     return;
                 }
@@ -288,7 +290,7 @@ impl CompositorState {
             self.cancel_selection_source(SelectionKind::Primary, replaced_source);
         }
         self.selection_state.mark_source_used(source_key);
-        self.publish_primary_to_focused_client();
+        self.publish_primary_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Primary);
     }
 
@@ -305,7 +307,7 @@ impl CompositorState {
         if let Some(source_key) = clear.cleared_source {
             self.cancel_selection_source(SelectionKind::Primary, source_key);
         }
-        self.publish_primary_to_focused_client();
+        self.publish_primary_to_keyboard_focused_client();
         self.publish_data_control_selection(SelectionKind::Primary);
     }
 
@@ -321,7 +323,7 @@ impl CompositorState {
             .selection_state
             .remove_source_key(binding.selection_key, mutation_epoch);
         if cleared.contains(&SelectionKind::Primary) {
-            self.publish_primary_to_focused_client();
+            self.publish_primary_to_keyboard_focused_client();
             self.publish_data_control_selection(SelectionKind::Primary);
         }
     }
@@ -337,15 +339,19 @@ impl CompositorState {
         });
     }
 
-    pub(in crate::compositor) fn publish_primary_to_focused_client(&mut self) {
-        let Some(client_id) = self.focused_client_id() else {
+    pub(in crate::compositor) fn publish_primary_to_keyboard_focused_client(&mut self) {
+        let Some(client_id) = self.keyboard_focused_client_id() else {
             return;
         };
+        self.publish_primary_to_client(&client_id);
+    }
+
+    pub(in crate::compositor) fn publish_primary_to_client(&mut self, client_id: &ClientId) {
         let devices = self
             .primary_devices
             .iter()
             .filter(|binding| {
-                binding.client_id == client_id
+                binding.client_id == *client_id
                     && binding.device.is_alive()
                     && binding.seat_id.interface().name == "wl_seat"
             })

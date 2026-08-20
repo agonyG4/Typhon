@@ -1262,6 +1262,9 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) {
+        if self.pointer_hit_instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_constraint_reconciliations += 1;
+        }
         let ids = self
             .pointer_constraints
             .values()

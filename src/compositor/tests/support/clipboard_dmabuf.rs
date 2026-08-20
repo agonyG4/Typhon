@@ -25,6 +25,7 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     let source_wm_base: client_xdg_wm_base::XdgWmBase =
         source_globals.bind(&source_qh, 1..=6, ())?;
     let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ())?;
+    let source_shm: client_wl_shm::WlShm = source_globals.bind(&source_qh, 1..=1, ())?;
     let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
         source_globals.bind(&source_qh, 1..=3, ())?;
     let _source_keyboard = source_seat.get_keyboard(&source_qh, ());
@@ -39,6 +40,10 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     source_connection.flush()?;
 
     let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state)?;
+    commit_test_buffered_surface(&source_surface, &source_shm, &source_qh, 32, 32)?;
+    source_connection.flush()?;
+    wait_for_server_commands(commands);
     source_queue.roundtrip(&mut source_state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,
@@ -64,9 +69,11 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     let target_wm_base: client_xdg_wm_base::XdgWmBase =
         target_globals.bind(&target_qh, 1..=6, ())?;
     let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ())?;
+    let target_shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ())?;
     let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
         target_globals.bind(&target_qh, 1..=3, ())?;
     let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+    let _target_data_device = target_manager.get_data_device(&target_seat, &target_qh, ());
     let target_surface = target_compositor.create_surface(&target_qh, ());
     let target_xdg_surface = target_wm_base.get_xdg_surface(&target_surface, &target_qh, ());
     let _target_toplevel = target_xdg_surface.get_toplevel(&target_qh, ());
@@ -75,8 +82,9 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
 
     let mut target_state = RegistryTestState::default();
     target_queue.roundtrip(&mut target_state)?;
-    let _target_data_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    commit_test_buffered_surface(&target_surface, &target_shm, &target_qh, 32, 32)?;
     target_connection.flush()?;
+    wait_for_server_commands(commands);
     target_queue.roundtrip(&mut target_state)?;
 
     let offer = target_state
@@ -111,6 +119,7 @@ pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_off
     let source_wm_base: client_xdg_wm_base::XdgWmBase =
         source_globals.bind(&source_qh, 1..=6, ())?;
     let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ())?;
+    let source_shm: client_wl_shm::WlShm = source_globals.bind(&source_qh, 1..=1, ())?;
     let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
         source_globals.bind(&source_qh, 1..=3, ())?;
     let source_keyboard = source_seat.get_keyboard(&source_qh, ());
@@ -124,6 +133,10 @@ pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_off
     source_connection.flush()?;
 
     let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state)?;
+    commit_test_buffered_surface(&source_surface, &source_shm, &source_qh, 32, 32)?;
+    source_connection.flush()?;
+    wait_for_server_commands(commands);
     source_queue.roundtrip(&mut source_state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,
@@ -149,6 +162,7 @@ pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_off
     let target_wm_base: client_xdg_wm_base::XdgWmBase =
         target_globals.bind(&target_qh, 1..=6, ())?;
     let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ())?;
+    let target_shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ())?;
     let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
         target_globals.bind(&target_qh, 1..=3, ())?;
     let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
@@ -159,6 +173,10 @@ pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_off
     target_connection.flush()?;
 
     let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state)?;
+    commit_test_buffered_surface(&target_surface, &target_shm, &target_qh, 32, 32)?;
+    target_connection.flush()?;
+    wait_for_server_commands(commands);
     target_queue.roundtrip(&mut target_state)?;
     let _target_data_device = target_manager.get_data_device(&target_seat, &target_qh, ());
     target_connection.flush()?;
@@ -205,6 +223,7 @@ pub(in crate::compositor::tests) fn receive_host_clipboard_from_bridge(
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let manager: client_wl_data_device_manager::WlDataDeviceManager =
         globals.bind(&qh, 1..=3, ())?;
     let _keyboard = seat.get_keyboard(&qh, ());
@@ -216,6 +235,10 @@ pub(in crate::compositor::tests) fn receive_host_clipboard_from_bridge(
     connection.flush()?;
 
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::KeyboardKey {
         key: 30,

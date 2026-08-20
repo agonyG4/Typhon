@@ -97,6 +97,32 @@ pub fn human(result: &AstreactlResult) -> String {
             .map(|theme| sanitize_terminal_text(theme))
             .collect::<Vec<_>>()
             .join("\n"),
+        AstreactlResult::Wallpaper(snapshot) => format!(
+            "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
+            sanitize_terminal_text(&snapshot.state),
+            sanitize_terminal_text(&snapshot.effective.source),
+            snapshot
+                .configured
+                .as_ref()
+                .map(|descriptor| sanitize_terminal_text(&descriptor.source))
+                .unwrap_or_else(|| "Factory default".to_string()),
+            sanitize_terminal_text(&snapshot.fallback),
+            snapshot.generation,
+            sanitize_terminal_text(&snapshot.last_error),
+        ),
+        AstreactlResult::WallpaperList(snapshot) => snapshot
+            .wallpapers
+            .iter()
+            .map(|wallpaper| {
+                format!(
+                    "{}\t{}\t{}",
+                    sanitize_terminal_text(&wallpaper.logical_id),
+                    sanitize_terminal_text(&wallpaper.display_name),
+                    sanitize_terminal_text(&wallpaper.source),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 

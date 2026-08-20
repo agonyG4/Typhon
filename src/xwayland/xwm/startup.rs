@@ -42,6 +42,7 @@ use super::{
         OwnershipTransitionError, STARTUP_SELECTION_TIMESTAMP, manager_message_data,
     },
 };
+use crate::wm::WorkspaceManager;
 use crate::xwayland::XwaylandGeneration;
 
 const MAX_SETUP_BYTES: usize = 64 * 1024;
@@ -731,12 +732,21 @@ impl XwmStartup {
             .ok_or(XwmStartupError::InvalidScreen)?;
         let width = u32::from(screen.width_in_pixels);
         let height = u32::from(screen.height_in_pixels);
+        let workspace_count = WorkspaceManager::default().workspace_count();
         for (atom, values) in [
-            (XwmAtomName::NetNumberOfDesktops, vec![1]),
+            (XwmAtomName::NetNumberOfDesktops, vec![workspace_count]),
             (XwmAtomName::NetCurrentDesktop, vec![0]),
             (XwmAtomName::NetDesktopGeometry, vec![width, height]),
-            (XwmAtomName::NetDesktopViewport, vec![0, 0]),
-            (XwmAtomName::NetWorkarea, vec![0, 0, width, height]),
+            (
+                XwmAtomName::NetDesktopViewport,
+                vec![0; workspace_count.saturating_mul(2) as usize],
+            ),
+            (
+                XwmAtomName::NetWorkarea,
+                (0..workspace_count)
+                    .flat_map(|_| [0, 0, width, height])
+                    .collect(),
+            ),
         ] {
             self.queue_property32(root, atom, xproto::AtomEnum::CARDINAL.into(), &values)?;
         }

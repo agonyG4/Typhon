@@ -195,6 +195,7 @@ struct NativeRuntimeBootstrapTail {
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
     vrr_plan: NativeVrrPlan,
+    initial_presented_scene: NativeFrameSceneSnapshot,
 }
 impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
@@ -228,6 +229,7 @@ impl NativeRuntime {
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
             vrr_plan,
+            initial_presented_scene,
         } = parts;
         let mut legacy_cursor = pre_kms_legacy_cursor;
         scanout.finish_initial_scanout();
@@ -246,9 +248,11 @@ impl NativeRuntime {
                 legacy_cursor = None;
                 cursor_render_mode = NativeCursorRenderMode::Software;
                 let fallback_damage = NativeOutputDamage::full_output(target.width, target.height);
+                let fallback_resolved_scene = ResolvedNativeFrameScene::from_server(&server);
                 let fallback_paint = scanout
                     .paint_server_frame(
                         &mut frame_renderer,
+                        &fallback_resolved_scene,
                         &server,
                         &input_state,
                         cursor_render_mode,
@@ -508,7 +512,7 @@ impl NativeRuntime {
             .map_or(0, NativeAtomicCursor::desired_epoch);
         let last_primary_presented_at_ns = None;
         let cursor_output_arbitration = NativeCursorOutputArbitration::default();
-        let last_renderable_surfaces = server.renderable_surfaces().to_vec();
+        let scene_history = NativeSceneHistory::new(initial_presented_scene);
         let last_client_cursor_damage = None;
         let last_software_cursor_damage = None;
         let last_client_cursor_path = None;
@@ -626,7 +630,6 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
-            confirmed_primary_assignment: None,
             confirmed_output_presentation: ConfirmedOutputPresentationState::default(),
             presentation_deadline,
             scheduled_presentation_target,
@@ -643,7 +646,7 @@ impl NativeRuntime {
             last_refresh_sequence: 0,
             last_submitted_cursor_epoch,
             last_primary_presented_at_ns,
-            last_renderable_surfaces,
+            scene_history,
             last_client_cursor_damage,
             last_software_cursor_damage,
             last_client_cursor_path,
@@ -1021,6 +1024,7 @@ impl NativeRuntime {
             input_plan.primary.as_str()
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
+        let initial_resolved_scene = ResolvedNativeFrameScene::from_server(&server);
         let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
             effective_atomic_cursor_state(cursor, cursor_render_mode, input_state.cursor_visible())
                 .kms_state()
@@ -1047,6 +1051,7 @@ impl NativeRuntime {
             let parts = match explicit.render_to_slot(
                 slot,
                 &mut frame_renderer,
+                &initial_resolved_scene,
                 &server,
                 &input_state,
                 cursor_render_mode,
@@ -1072,6 +1077,7 @@ impl NativeRuntime {
         } else {
             match scanout.paint_server_frame(
         &mut frame_renderer,
+        &initial_resolved_scene,
         &server,
         &input_state,
         cursor_render_mode,
@@ -1112,6 +1118,7 @@ impl NativeRuntime {
             )?;
             scanout.paint_server_frame(
                 &mut frame_renderer,
+                &initial_resolved_scene,
                 &server,
                 &input_state,
                 cursor_render_mode,
@@ -1122,6 +1129,8 @@ impl NativeRuntime {
             }
         }
     .require_rendered("initial native scanout")?;
+        #[rustfmt::skip] let initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(0, &initial_resolved_scene, NativeCursorDamageBounds::default());
+        drop(initial_resolved_scene);
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =
             resolve_native_app_gpu_policy(app_gpu_preference, scanout.kind())?;
@@ -1347,6 +1356,7 @@ impl NativeRuntime {
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
             vrr_plan,
+            initial_presented_scene,
         })
     }
 }

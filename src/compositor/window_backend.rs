@@ -34,6 +34,16 @@ pub(crate) enum WindowBackendCommand {
         minimized: bool,
         activated: bool,
     },
+    SetWorkspace {
+        window: WindowId,
+        workspace: u32,
+    },
+    PublishWorkspaceState {
+        workspace_count: u32,
+        current_workspace: u32,
+        output_width: u32,
+        output_height: u32,
+    },
 }
 
 pub(crate) fn backend_for_window(window: WindowBackend) -> WindowBackend {
