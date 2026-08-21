@@ -37,6 +37,7 @@ mod plane_cycle_tests;
 mod planner;
 mod presentation;
 mod presentation_cursor;
+mod presentation_cycle;
 mod presentation_direct;
 mod presentation_metrics;
 mod presentation_pipeline;

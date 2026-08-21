@@ -294,31 +294,8 @@ impl NativeRuntime {
                 };
                 if let Some(miss) = observed_miss {
                     pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
-                    let prepared_frame_exists = explicit.swapchain()?.ready_slot().is_some()
-                        || explicit.swapchain()?.rendering_slot().is_some();
-                    let future_primary_depth = u8::from(
-                        atomic_commit_arbiter
-                            .pending_atomic_commit()
-                            .is_some_and(|commit| commit.kind.is_primary()),
-                    )
-                    .saturating_add(u8::from(
-                        atomic_commit_arbiter
-                            .worker_queued_commit()
-                            .is_some_and(|commit| commit.kind.is_primary()),
-                    ))
-                    .saturating_add(u8::from(prepared_frame_exists));
                     let buffering_mode_before = adaptive_buffering.mode();
-                    adaptive_buffering.observe_with_pipeline(
-                        before.total_cost_ns,
-                        timing.target.refresh_interval,
-                        Some(miss),
-                        *last_refresh_sequence,
-                        timing.signaled_at,
-                        frame_scheduler.visual_work_queued(),
-                        adaptive_buffering.capability(),
-                        prepared_frame_exists,
-                        future_primary_depth,
-                    );
+                    adaptive_buffering.observe_o1_outcome(Some(miss));
                     frame_pacing.note_adaptive_transition(
                         buffering_mode_before,
                         adaptive_buffering.mode(),
@@ -961,7 +938,6 @@ impl NativeRuntime {
                             .get()
                             .saturating_sub(frame.submit_started_at.get()),
                     );
-                    let refresh = frame.target.refresh_interval;
                     let mut proven_miss = pending_proven_deadline_miss
                         .take()
                         .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));
@@ -1021,32 +997,8 @@ impl NativeRuntime {
                             proven_miss = classified_miss;
                         }
                     }
-                    let prediction = render_journal
-                        .prediction_with_kms_guard(refresh, presentation_timing.apply_guard_ns());
-                    let prepared_frame_exists = scanout.third_slot_owned();
-                    let future_primary_depth = u8::from(
-                        atomic_commit_arbiter
-                            .pending_atomic_commit()
-                            .is_some_and(|commit| commit.kind.is_primary()),
-                    )
-                    .saturating_add(u8::from(
-                        atomic_commit_arbiter
-                            .worker_queued_commit()
-                            .is_some_and(|commit| commit.kind.is_primary()),
-                    ))
-                    .saturating_add(u8::from(prepared_frame_exists));
                     let buffering_mode_before = adaptive_buffering.mode();
-                    adaptive_buffering.observe_with_pipeline(
-                        prediction.total_cost_ns,
-                        refresh,
-                        proven_miss,
-                        actual_logical_sequence,
-                        presented_at,
-                        server.has_unowned_frame_work() || frame_scheduler.visual_work_queued(),
-                        adaptive_buffering.capability(),
-                        prepared_frame_exists,
-                        future_primary_depth,
-                    );
+                    adaptive_buffering.observe_o1_outcome(proven_miss);
                     frame_pacing.note_adaptive_transition(
                         buffering_mode_before,
                         adaptive_buffering.mode(),

@@ -11,7 +11,7 @@ use oblivion_one::control_snapshots::{
     RepaintPerformanceSnapshot, SignedTimingSummarySnapshot, TimingSummarySnapshot,
     WorkerTimingPerformanceSnapshot,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 const RENDER_REPAINT_REASON_COUNT: usize = 12;
 const RENDER_BUFFER_AGE_BUCKET_COUNT: usize = 6;
@@ -259,6 +259,10 @@ impl NativeRuntime {
             });
         let presentation_timing = self.presentation_timing;
         let presentation_timing_snapshot = presentation_timing.snapshot();
+        let service_prediction = self.render_journal.prediction_with_kms_guard(
+            Duration::from_nanos(presentation_timing.mode().refresh_interval_ns()),
+            presentation_timing.apply_guard_ns(),
+        );
         let compositor_cpu_render =
             timing_summary_snapshot(self.render_telemetry.snapshot().compositor_cpu_render);
         let mut timing_scopes = BTreeMap::new();
@@ -271,6 +275,22 @@ impl NativeRuntime {
             buffering: BufferingPerformanceSnapshot {
                 reactive_double_frames: buffering.reactive_double_frames,
                 predictive_triple_frames: buffering.predictive_triple_frames,
+                future_primary_credit: self.adaptive_buffering.future_primary_credit(),
+                extra_credit_grants: self.adaptive_buffering.extra_credit_grants(),
+                extra_credit_revokes: self.adaptive_buffering.extra_credit_revokes(),
+                pre_render_abandoned: self.presentation_deadline.pre_render_abandoned(),
+                predicted_render_ready_service_ns: service_prediction
+                    .main_event_loop_wake_guard_ns
+                    .saturating_add(service_prediction.render_risk_ns),
+                predicted_kms_lead_ns: service_prediction.kms_total_lead_ns,
+                predicted_total_service_ns: service_prediction.total_cost_ns,
+                last_overlap_required_ns: self.adaptive_buffering.last_overlap_required_ns(),
+                positive_overlap_observations: self
+                    .adaptive_buffering
+                    .positive_overlap_observations(),
+                nonpositive_overlap_observations: self
+                    .adaptive_buffering
+                    .nonpositive_overlap_observations(),
                 render_ahead_attempts: buffering.render_ahead_attempts,
                 render_ahead_ready: buffering.render_ahead_ready,
                 ready_submits: buffering.ready_submits,
