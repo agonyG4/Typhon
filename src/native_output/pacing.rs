@@ -335,7 +335,7 @@ mod tests {
         pacing.note_adaptive_transition(
             AdaptiveBufferingMode::Double,
             AdaptiveBufferingMode::Triple,
-            Some(ProvenDeadlineMiss::Presentation),
+            Some(ProvenDeadlineMiss::KmsApplyGuard),
         );
 
         assert_eq!(pacing.adaptive_triple_entries_predicted, 0);
@@ -1243,12 +1243,12 @@ impl NativeFramePacing {
             (
                 AdaptiveBufferingMode::Double,
                 AdaptiveBufferingMode::Triple,
-                Some(ProvenDeadlineMiss::AtomicSubmit),
+                Some(ProvenDeadlineMiss::KmsDispatch),
             ) => self.adaptive_triple_entries_proven_submit_miss += 1,
             (
                 AdaptiveBufferingMode::Double,
                 AdaptiveBufferingMode::Triple,
-                Some(ProvenDeadlineMiss::Presentation),
+                Some(ProvenDeadlineMiss::KmsApplyGuard),
             ) => self.adaptive_triple_entries_proven_presentation_miss += 1,
             (AdaptiveBufferingMode::Double, AdaptiveBufferingMode::Triple, Some(_)) => {
                 self.adaptive_triple_entries_proven_render_miss += 1;

@@ -455,6 +455,10 @@ impl NativeRuntime {
         )
         .map_err(io::Error::other)?;
         let presentation_deadline = PresentationDeadlinePlanner::new(refresh_interval);
+        let presentation_timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&target.mode, refresh_interval_ns),
+            drm_file_generation,
+        );
         let scheduled_presentation_target = None;
         let render_journal = AdaptiveRenderJournal::default();
         let adaptive_buffering = AdaptiveBufferingController::new(triple_buffer_policy);
@@ -631,6 +635,7 @@ impl NativeRuntime {
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
             confirmed_output_presentation: ConfirmedOutputPresentationState::default(),
+            presentation_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,

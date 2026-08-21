@@ -202,6 +202,7 @@ impl NativeRuntime {
             presented_planes,
             confirmed_output_presentation,
             presentation_deadline,
+            presentation_timing,
             scheduled_presentation_target,
             render_journal,
             adaptive_buffering,
@@ -269,17 +270,21 @@ impl NativeRuntime {
                         .saturating_sub(timing.composite_started_at.get()),
                     timing.signaled_at,
                 );
-                let before = render_journal.prediction(timing.target.refresh_interval);
+                let before = render_journal.prediction_with_kms_guard(
+                    timing.target.refresh_interval,
+                    presentation_timing.apply_guard_ns(),
+                );
+                let commit_deadline_ns = timing.submit_window.commit_complete_deadline_ns();
                 let observed_miss = match timing.quality {
                     FenceTimestampQuality::ExactSyncFile
-                        if timing.signaled_at > timing.target.presentation_time =>
+                        if timing.signaled_at.get() > commit_deadline_ns =>
                     {
                         Some(ProvenDeadlineMiss::ExactRender)
                     }
                     FenceTimestampQuality::ObservedApproximate
                         if approximate_observation_is_late(
                             timing.signaled_at.get(),
-                            timing.target.presentation_time.get(),
+                            commit_deadline_ns,
                             before.p95_wake_lateness_ns,
                         ) =>
                     {
@@ -288,7 +293,7 @@ impl NativeRuntime {
                     _ => None,
                 };
                 if let Some(miss) = observed_miss {
-                    pending_proven_deadline_miss.get_or_insert(miss);
+                    pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
                     let prepared_frame_exists = explicit.swapchain()?.ready_slot().is_some()
                         || explicit.swapchain()?.rendering_slot().is_some();
                     let future_primary_depth = u8::from(
@@ -688,22 +693,26 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("direct pageflip token is zero"))?;
-                    if *kms_commit_worker_transport
-                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                        && let Some(worker) = kms_commit_worker.as_ref()
+                    if !presentation_mode.is_async()
                         && let Some(ownership) = submitted_worker_ownership
                             .iter()
                             .find(|ownership| ownership.job.token == pageflip_token)
                     {
-                        worker.record_worker_target_result(
-                            ownership.job.output_generation,
+                        let window = ownership.job.submit_window;
+                        let outcome = KmsPresentationOutcome::classify(
+                            &window,
+                            None,
+                            ownership.submit_returned_at.get(),
                             ownership.job.target.sequence,
                             actual_logical_sequence,
-                            ownership.submit_returned_at.get(),
-                            ownership.job.target.presentation_time.get(),
-                            u64::try_from(ownership.job.target.refresh_interval.as_nanos())
-                                .unwrap_or(u64::MAX),
                         );
+                        if let Some(mode_key) = window.mode_key() {
+                            presentation_timing.observe_pageflip(
+                                ownership.job.output_generation,
+                                mode_key,
+                                outcome,
+                            );
+                        }
                     }
                     let direct_pageflip_identity =
                         pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
@@ -813,20 +822,6 @@ impl NativeRuntime {
                             "composited pageflip scene promotion did not match transition",
                         )
                         .into());
-                    }
-                    if *kms_commit_worker_transport
-                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                        && let Some(worker) = kms_commit_worker.as_ref()
-                    {
-                        worker.record_worker_target_result(
-                            *drm_file_generation,
-                            frame.target.sequence,
-                            actual_logical_sequence,
-                            frame.submit_returned_at.get(),
-                            frame.target.presentation_time.get(),
-                            u64::try_from(frame.target.refresh_interval.as_nanos())
-                                .unwrap_or(u64::MAX),
-                        );
                     }
                     let prepared_logical = prepare_presented_output_transaction(
                         output_transactions,
@@ -967,45 +962,67 @@ impl NativeRuntime {
                             .saturating_sub(frame.submit_started_at.get()),
                     );
                     let refresh = frame.target.refresh_interval;
-                    let before_sample = render_journal.prediction(refresh);
-                    let mut proven_miss = pending_proven_deadline_miss.take();
+                    let mut proven_miss = pending_proven_deadline_miss
+                        .take()
+                        .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));
                     if let Some((signaled_at, quality)) = frame.fence_signal {
                         frame_pacing.note_fence_timestamp_quality(quality);
                         render_journal.record_render_sample(
                             render_sample_duration_ns(frame.composite_started_at, signaled_at),
                             signaled_at,
                         );
-                        let target_ns = frame.target.presentation_time.get();
-                        let fence_miss = match quality {
-                            FenceTimestampQuality::ExactSyncFile
-                                if signaled_at.get() > target_ns =>
-                            {
+                    }
+                    let outcome = if presentation_mode.is_async() {
+                        None
+                    } else {
+                        let payload_ready_at_ns = frame
+                            .fence_signal
+                            .map(|(signaled_at, _)| signaled_at.get())
+                            .or(Some(frame.rendered_at.get()));
+                        Some(KmsPresentationOutcome::classify(
+                            &frame.submit_window,
+                            payload_ready_at_ns,
+                            frame.submit_returned_at.get(),
+                            frame.target.sequence,
+                            actual_logical_sequence,
+                        ))
+                    };
+                    if let Some(outcome) = outcome {
+                        if let Some(mode_key) = frame.submit_window.mode_key() {
+                            presentation_timing.observe_pageflip(
+                                *drm_file_generation,
+                                mode_key,
+                                outcome,
+                            );
+                        }
+                        let classified_miss = match (outcome, frame.fence_signal) {
+                            (KmsPresentationOutcome::RenderReadinessMiss, Some((_, quality))) => {
+                                Some(match quality {
+                                    FenceTimestampQuality::ExactSyncFile => {
+                                        ProvenDeadlineMiss::ExactRender
+                                    }
+                                    FenceTimestampQuality::ObservedApproximate => {
+                                        ProvenDeadlineMiss::GuardedApproximateRender
+                                    }
+                                })
+                            }
+                            (KmsPresentationOutcome::RenderReadinessMiss, None) => {
                                 Some(ProvenDeadlineMiss::ExactRender)
                             }
-                            FenceTimestampQuality::ObservedApproximate
-                                if approximate_observation_is_late(
-                                    signaled_at.get(),
-                                    target_ns,
-                                    before_sample.p95_wake_lateness_ns,
-                                ) =>
-                            {
-                                Some(ProvenDeadlineMiss::GuardedApproximateRender)
+                            (KmsPresentationOutcome::KmsDispatchMiss, _) => {
+                                Some(ProvenDeadlineMiss::KmsDispatch)
                             }
-                            _ => None,
+                            (KmsPresentationOutcome::KmsApplyGuardMiss, _) => {
+                                Some(ProvenDeadlineMiss::KmsApplyGuard)
+                            }
+                            (KmsPresentationOutcome::TargetHit, _) => None,
                         };
-                        if let Some(miss) = fence_miss {
-                            proven_miss = Some(miss);
+                        if proven_miss.is_none() {
+                            proven_miss = classified_miss;
                         }
                     }
-                    if frame.submit_returned_at.get() > frame.target.presentation_time.get() {
-                        proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
-                    }
-                    proven_miss = merge_presentation_miss(
-                        proven_miss,
-                        frame.target.sequence,
-                        actual_logical_sequence,
-                    );
-                    let prediction = render_journal.prediction(refresh);
+                    let prediction = render_journal
+                        .prediction_with_kms_guard(refresh, presentation_timing.apply_guard_ns());
                     let prepared_frame_exists = scanout.third_slot_owned();
                     let future_primary_depth = u8::from(
                         atomic_commit_arbiter

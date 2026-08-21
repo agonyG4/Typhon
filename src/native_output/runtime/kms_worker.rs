@@ -107,6 +107,7 @@ pub(super) fn queue_explicit_composited_frame(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
+    submit_window: KmsSubmitWindow,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -219,6 +220,7 @@ pub(super) fn queue_explicit_composited_frame(
         crtc_id,
         kind,
         target,
+        submit_window,
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
@@ -311,6 +313,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     output_generation: u64,
     crtc_id: u32,
     target: PresentationTarget,
+    submit_window: KmsSubmitWindow,
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
@@ -452,6 +455,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         crtc_id,
         kind,
         target,
+        submit_window,
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
@@ -879,6 +883,10 @@ impl NativeRuntime {
                     .record_worker_queue_residency(ownership.queue_residency_ns);
                 self.render_journal
                     .record_worker_submit_wake_lateness(ownership.submit_wake_lateness_ns);
+                self.render_journal
+                    .record_worker_pre_submit(ownership.pre_submit_duration_ns);
+                self.render_journal
+                    .record_worker_dispatch(ownership.dispatch_duration_ns);
                 self.render_journal
                     .record_submission_budget(ownership.submission_budget_ns);
                 let _output_generation = ownership.job.output_generation;
@@ -1343,22 +1351,6 @@ impl NativeRuntime {
                 {
                     self.scanout.note_direct_real_submit_attempt(false);
                 }
-            }
-            KmsWorkerEvent::SubmitLate {
-                bundle: _,
-                transaction_id,
-                token,
-                late_by_ns,
-            } => {
-                self.pending_proven_deadline_miss
-                    .get_or_insert(ProvenDeadlineMiss::AtomicSubmit);
-                self.perf.log("native.kms_commit_worker", || {
-                    vec![
-                        NativePerfField::u64("late_transaction_id", transaction_id.get()),
-                        NativePerfField::u64("late_token", token.get()),
-                        NativePerfField::u64("late_by_ns", late_by_ns),
-                    ]
-                });
             }
             KmsWorkerEvent::PageflipTimeout {
                 bundle: _,

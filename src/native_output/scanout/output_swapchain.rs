@@ -18,7 +18,7 @@ use crate::native_output::OutputTransactionId;
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::presentation::{
-    plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
+    kms_timing::KmsSubmitWindow, plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
 };
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
@@ -166,6 +166,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
     pub(crate) target: PresentationTarget,
+    pub(crate) submit_window: KmsSubmitWindow,
     pub(crate) render_fence: NativeRenderFence,
     pub(crate) scene_commit: EglSceneFrameCommit,
     pub(crate) surface_damage: SurfaceDamagePresentation,
@@ -394,6 +395,13 @@ impl AtomicOutputSwapchain {
             render_generation,
             pool_generation: self.pool_generation,
             target,
+            submit_window: KmsSubmitWindow::try_new(
+                target.presentation_time.get(),
+                target.submit_not_before().get(),
+                0,
+                0,
+            )
+            .expect("test output frame has a reachable submit window"),
             render_fence,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
             surface_damage,
@@ -490,6 +498,8 @@ impl AtomicOutputSwapchain {
                 estimated: true,
                 predicted_unreachable: false,
             },
+            submit_window: KmsSubmitWindow::try_new(now.get(), now.get(), 0, 0)
+                .expect("test ready frame has a reachable submit window"),
             render_fence,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
             surface_damage: SurfaceDamagePresentation::default(),
@@ -1020,6 +1030,10 @@ impl AtomicOutputSwapchain {
 
     pub(crate) fn ready_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
         self.ready.as_ref().map(Into::into)
+    }
+
+    pub(crate) fn ready_submit_window(&self) -> Option<KmsSubmitWindow> {
+        self.ready.as_ref().map(|frame| frame.submit_window)
     }
 
     pub(crate) fn pending_frame_mut(&mut self) -> Option<&mut RenderedOutputFrame> {

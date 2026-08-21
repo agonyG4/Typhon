@@ -522,6 +522,8 @@ pub struct BufferingPerformanceSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct WorkerTimingPerformanceSnapshot {
     pub submit_wake_lateness: SignedTimingSummarySnapshot,
+    pub pre_submit_duration: TimingSummarySnapshot,
+    pub dispatch_duration: TimingSummarySnapshot,
     pub ioctl_duration: TimingSummarySnapshot,
     pub queue_residency: TimingSummarySnapshot,
     pub submit_earliness: SignedTimingSummarySnapshot,
@@ -529,11 +531,7 @@ pub struct WorkerTimingPerformanceSnapshot {
     pub submit_ack_delay: TimingSummarySnapshot,
     pub pageflip_ack_delay: TimingSummarySnapshot,
     pub test_only_duration: TimingSummarySnapshot,
-    pub current_safety_margin_us: u64,
-    pub target_hit_same_refresh: u64,
-    pub target_miss_one_refresh: u64,
-    pub target_miss_two_or_more_refreshes: u64,
-    pub target_stale_or_out_of_order: u64,
+    pub dispatch_budget_us: u64,
     pub late_before_ioctl: u64,
     pub late_after_ioctl: u64,
     pub test_only_count: u64,
@@ -543,6 +541,16 @@ pub struct WorkerTimingPerformanceSnapshot {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct KmsPerformanceSnapshot {
+    pub mode_refresh_interval_ns: u64,
+    pub mode_blanking_interval_ns: Option<u64>,
+    pub base_apply_guard_ns: u64,
+    pub adaptive_apply_guard_ns: u64,
+    pub total_apply_guard_ns: u64,
+    pub target_hits: u64,
+    pub pre_render_unreachable: u64,
+    pub render_readiness_misses: u64,
+    pub dispatch_misses: u64,
+    pub apply_guard_misses: u64,
     pub worker_jobs_enqueued: u64,
     pub worker_jobs_submitted: u64,
     pub worker_jobs_rejected: u64,

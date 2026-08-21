@@ -1,7 +1,6 @@
 use super::thread::{
     KmsCommitExecutor, KmsWorkerFatalReason, KmsWorkerSubmission, KmsWorkerSubmitFailure,
 };
-use super::timing::KmsTimingDecision;
 use super::*;
 use crate::native_output::output::test_cursor_for_worker;
 use crate::native_output::runtime::NativeCursorOutputArbitration;
@@ -70,153 +69,6 @@ fn force_legacy_is_unsupported() {
     );
 }
 
-#[test]
-fn reactive_double_submits_at_not_before() {
-    use oblivion_one::native::presentation_deadline::{
-        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
-    };
-    use std::time::Duration;
-
-    let target = PresentationTarget {
-        sequence: 1,
-        presentation_time: MonotonicTimestampNs::new(20_000_000),
-        submit_not_before: MonotonicTimestampNs::new(10_000_000),
-        render_start_deadline: MonotonicTimestampNs::new(0),
-        refresh_interval: Duration::from_millis(16),
-        reason: PresentationTargetReason::ReactiveDouble,
-        clock_generation: 1,
-        estimated: false,
-        predicted_unreachable: false,
-    };
-
-    let model = KmsCommitTimingModel::new(target.refresh_interval);
-    assert_eq!(
-        model.submit_at(target, 1_000_000),
-        KmsTimingDecision {
-            submit_deadline_ns: 10_000_000,
-            submit_at_ns: 10_000_000,
-            late: false,
-            late_by_ns: 0,
-        }
-    );
-}
-
-#[test]
-fn predictive_job_uses_bounded_safety_margin() {
-    use oblivion_one::native::presentation_deadline::{
-        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
-    };
-    use std::time::Duration;
-
-    let target = PresentationTarget {
-        sequence: 1,
-        presentation_time: MonotonicTimestampNs::new(20_000_000),
-        submit_not_before: MonotonicTimestampNs::new(2_000_000),
-        render_start_deadline: MonotonicTimestampNs::new(0),
-        refresh_interval: Duration::from_millis(16),
-        reason: PresentationTargetReason::Normal,
-        clock_generation: 1,
-        estimated: false,
-        predicted_unreachable: false,
-    };
-
-    let model = KmsCommitTimingModel::new(target.refresh_interval);
-    assert_eq!(model.submit_at(target, 1_000_000).submit_at_ns, 19_000_000);
-}
-
-#[test]
-fn timing_model_never_violates_submit_not_before_when_late() {
-    use oblivion_one::native::presentation_deadline::{
-        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
-    };
-    use std::time::Duration;
-
-    let target = PresentationTarget {
-        sequence: 1,
-        presentation_time: MonotonicTimestampNs::new(20_000_000),
-        submit_not_before: MonotonicTimestampNs::new(10_000_000),
-        render_start_deadline: MonotonicTimestampNs::new(0),
-        refresh_interval: Duration::from_millis(16),
-        reason: PresentationTargetReason::Normal,
-        clock_generation: 1,
-        estimated: false,
-        predicted_unreachable: false,
-    };
-
-    let model = KmsCommitTimingModel::new(target.refresh_interval);
-    assert_eq!(model.submit_at(target, 30_000_000).submit_at_ns, 30_000_000);
-}
-
-#[test]
-fn late_sample_increases_margin_immediately() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
-    model.observe_submit_delta_ns(2_000_000);
-    assert_eq!(model.safety_margin_ns(), 2_100_000);
-}
-
-#[test]
-fn submit_return_feedback_increases_margin_from_real_boundary() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
-    model.observe_submit_result(12_000_000, 10_000_000);
-    assert_eq!(model.safety_margin_ns(), 2_100_000);
-}
-
-#[test]
-fn early_samples_decay_margin_gradually() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
-    model.observe_submit_delta_ns(2_000_000);
-    let before = model.safety_margin_ns();
-    model.observe_submit_delta_ns(-1_000_000);
-    assert!(model.safety_margin_ns() < before);
-    assert_eq!(model.safety_margin_ns(), before - (before - 100_000) / 16);
-}
-
-#[test]
-fn margin_is_bounded_by_half_refresh() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_micros(100));
-    model.observe_submit_delta_ns(10_000_000);
-    assert_eq!(model.safety_margin_ns(), 50_000);
-}
-
-#[test]
-fn timing_model_requalifies_after_refresh_interval_change() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
-    model.observe_submit_delta_ns(10_000_000);
-    assert_eq!(model.safety_margin_ns(), 3_000_000);
-
-    model.reconfigure_refresh_interval(Duration::from_millis(4));
-
-    assert_eq!(model.safety_margin_ns(), 2_000_000);
-}
-
-#[test]
-fn submission_budget_combines_submit_wake_and_ioctl_once() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
-    for _ in 0..20 {
-        model.observe_submission(300_000, 700_000);
-    }
-    let budget = model.submission_budget();
-
-    assert_eq!(budget.submit_wake_lateness_ns, 300_000);
-    assert_eq!(budget.ioctl_duration_ns, 700_000);
-    assert_eq!(budget.submission_budget_ns, 1_100_000);
-}
-
-#[test]
-fn submission_budget_is_bounded_by_half_the_refresh_interval() {
-    use std::time::Duration;
-    let mut model = KmsCommitTimingModel::new(Duration::from_millis(4));
-    model.observe_submission(10_000_000, 10_000_000);
-
-    assert_eq!(model.submission_budget().submission_budget_ns, 2_000_000);
-}
-
 pub(super) fn test_job(token: u64) -> KmsCommitJob {
     let transaction_id = OutputTransactionId::new(
         std::num::NonZeroU64::new(token).expect("test transaction ID is nonzero"),
@@ -247,6 +99,10 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
             estimated: true,
             predicted_unreachable: false,
         },
+        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+            0, 0, 0, 0,
+        )
+        .unwrap(),
         validation_base: KmsValidationBase::Presented {
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                 None,
@@ -393,9 +249,6 @@ pub(super) fn wait_for_fence_event(
             assert!(events.iter().any(|event| match event {
                 KmsWorkerEvent::Submitted { ownership } => ownership.job.token.get() == token,
                 KmsWorkerEvent::BusyDeferred {
-                    token: event_token, ..
-                }
-                | KmsWorkerEvent::SubmitLate {
                     token: event_token, ..
                 }
                 | KmsWorkerEvent::PageflipTimeout {

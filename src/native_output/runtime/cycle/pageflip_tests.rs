@@ -71,6 +71,13 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
         crtc_id: 7,
         kind,
         target,
+        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+            target.presentation_time.get(),
+            target.submit_not_before().get(),
+            0,
+            0,
+        )
+        .unwrap(),
         validation_base: KmsValidationBase::Presented {
             snapshot: PresentedPlaneSnapshot::legacy(None),
             output_generation: 1,

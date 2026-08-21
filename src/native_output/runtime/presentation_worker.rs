@@ -211,6 +211,7 @@ pub(super) fn present_composited_compatibility_frame(
     presentation_deadline: &PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     scheduler_now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     effective_cursor: Option<&AtomicCursorVisualState>,
@@ -220,7 +221,7 @@ pub(super) fn present_composited_compatibility_frame(
     scene_history: &mut NativeSceneHistory,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let compatibility_target = scheduled_presentation_target
-        .or_else(|| presentation_deadline.reactive_target(scheduler_now))
+        .or_else(|| presentation_deadline.reactive_target(scheduler_now, predicted_total_cost))
         .ok_or_else(|| {
             io::Error::other("compatibility pageflip started without a presentation target")
         })?;
@@ -565,6 +566,7 @@ pub(super) fn queue_plane_delta_for_presentation(
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     cursor_target: PresentationTarget,
+    submit_window: Option<KmsSubmitWindow>,
     crtc_id: u32,
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
@@ -582,6 +584,8 @@ pub(super) fn queue_plane_delta_for_presentation(
         output_transactions,
         presentation_trace,
         cursor_target,
+        submit_window
+            .ok_or_else(|| io::Error::other("cursor target has no reachable submit window"))?,
         crtc_id,
         output_generation,
         pacing_mode,
@@ -612,6 +616,7 @@ pub(super) fn present_cursor_for_presentation(
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     cursor_target: PresentationTarget,
+    submit_window: Option<KmsSubmitWindow>,
     crtc_id: u32,
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
@@ -643,6 +648,7 @@ pub(super) fn present_cursor_for_presentation(
             output_transactions,
             presentation_trace,
             cursor_target,
+            submit_window,
             crtc_id,
             output_generation,
             pacing_mode,
@@ -699,6 +705,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
+    submit_window: KmsSubmitWindow,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -717,6 +724,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         transaction_id,
         output_generation,
         crtc_id,
+        submit_window,
         cursor_update,
         cursor_delivery,
         primary_cursor_presentation,
@@ -755,6 +763,10 @@ pub(super) fn submit_explicit_ready_for_presentation(
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
+        let submit_window = explicit
+            .swapchain()?
+            .ready_submit_window()
+            .ok_or_else(|| io::Error::other("ready explicit frame has no submit window"))?;
         let frozen_cursor_plan = explicit
             .swapchain()?
             .ready_cursor_plan()
@@ -792,6 +804,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             transaction_id,
             output_generation,
             crtc_id,
+            submit_window,
             cursor_update,
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
@@ -865,6 +878,7 @@ pub(super) fn queue_compatibility_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     target: PresentationTarget,
+    submit_window: KmsSubmitWindow,
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
@@ -891,6 +905,7 @@ pub(super) fn queue_compatibility_for_presentation(
         output_generation,
         crtc_id,
         target,
+        submit_window,
         pacing_mode,
         render_generation,
         cursor,
@@ -951,6 +966,7 @@ pub(super) fn finish_direct_worker_queued(
     token: u64,
     framebuffer_id: u32,
     direct_target: PresentationTarget,
+    submit_window: KmsSubmitWindow,
     direct_lease: DirectPrimaryLease,
     admission: KmsCommitAdmissionPermit,
     test_only: KmsTestOnlyPolicy,
@@ -1007,6 +1023,7 @@ pub(super) fn finish_direct_worker_queued(
         crtc_id,
         kind,
         target: direct_target,
+        submit_window,
         validation_base: context.validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {

@@ -79,6 +79,7 @@ impl NativeRuntime {
             output_transactions,
             presented_planes,
             confirmed_output_presentation,
+            presentation_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -270,7 +271,12 @@ impl NativeRuntime {
         }
         let scheduler_now = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let refresh_interval = super::plane_cycle::output_refresh_interval(*refresh_hz);
-        let prediction = render_journal.prediction_at(scheduler_now, refresh_interval);
+        let prediction = render_journal.prediction_at_with_kms_guard(
+            scheduler_now,
+            refresh_interval,
+            presentation_timing.apply_guard_ns(),
+        );
+        let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
         let triple_capability = match scanout.explicit_output_swapchain() {
             Some(swapchain) => derive_triple_capability(TripleCapabilityInputs {
@@ -311,7 +317,7 @@ impl NativeRuntime {
             frame_scheduler,
             *scheduled_presentation_target,
             scheduler_now,
-            Duration::from_nanos(prediction.total_cost_ns),
+            predicted_total_cost,
         );
         #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         #[rustfmt::skip] let pending_target = if explicit_output && frame_scheduler.visual_work_queued() && scheduled_presentation_target.is_none() { pending_target_for_scanout(scanout)? } else { None };
@@ -320,7 +326,7 @@ impl NativeRuntime {
             pacing_mode,
             pending_target,
             scheduler_now,
-            Duration::from_nanos(prediction.total_cost_ns),
+            predicted_total_cost,
             explicit_output,
             frame_scheduler.visual_work_queued(),
             *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force,
@@ -539,10 +545,23 @@ impl NativeRuntime {
         {
             let desired = effective_cursor.clone();
             let cursor_target = (*scheduled_presentation_target)
-                .or_else(|| presentation_deadline.reactive_target(scheduler_now))
+                .or_else(|| {
+                    presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
+                })
                 .ok_or_else(|| {
                     io::Error::other("cursor-only Atomic output has no presentation target")
                 })?;
+            let cursor_submit_window = presentation_timing
+                .submit_window(
+                    cursor_target.presentation_time.get(),
+                    cursor_target.submit_not_before().get(),
+                    prediction.kms_dispatch_budget_ns,
+                )
+                .map(Some)
+                .unwrap_or_else(|_| {
+                    presentation_timing.record_unreachable_target();
+                    None
+                });
             #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,
@@ -554,6 +573,7 @@ impl NativeRuntime {
                 output_transactions,
                 presentation_trace,
                 cursor_target,
+                cursor_submit_window,
                 target.crtc_id,
                 *drm_file_generation,
                 pacing_mode,
@@ -595,8 +615,22 @@ impl NativeRuntime {
             scheduler_decision,
             SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
         ) {
-            let compatibility_target = (*scheduled_presentation_target)
-                .or_else(|| presentation_deadline.reactive_target(scheduler_now));
+            let compatibility_target = (*scheduled_presentation_target).or_else(|| {
+                presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
+            });
+            let compatibility_submit_window = compatibility_target.and_then(|target| {
+                match presentation_timing.submit_window(
+                    target.presentation_time.get(),
+                    target.submit_not_before().get(),
+                    prediction.kms_dispatch_budget_ns,
+                ) {
+                    Ok(window) => Some(window),
+                    Err(_) => {
+                        presentation_timing.record_unreachable_target();
+                        None
+                    }
+                }
+            });
             match super::presentation_ready::submit_ready_frame(
                 scheduler_decision,
                 worker_mode,
@@ -609,6 +643,7 @@ impl NativeRuntime {
                 mode_label,
                 *refresh_hz,
                 compatibility_target,
+                compatibility_submit_window,
                 render_generation,
                 effective_cursor.as_ref(),
                 cursor_epoch,
@@ -663,15 +698,22 @@ impl NativeRuntime {
                         presentation_deadline,
                         *scheduled_presentation_target,
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        predicted_total_cost,
                     ),
                     NativeOutputPacingMode::PredictiveTriple => scheduled_presentation_target
                         .or_else(|| {
-                            presentation_deadline.reactive_target(MonotonicTimestampNs::new(
-                                monotonic_now_ns().ok()?,
-                            ))
+                            presentation_deadline.reactive_target(
+                                MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                                predicted_total_cost,
+                            )
                         }),
                 };
                 if let Some(direct_target) = direct_target
+                    && let Ok(direct_submit_window) = presentation_timing.submit_window(
+                        direct_target.presentation_time.get(),
+                        direct_target.submit_not_before().get(),
+                        prediction.kms_dispatch_budget_ns,
+                    )
                     && worker_mode
                     && kms_commit_worker.is_some()
                 {
@@ -741,6 +783,7 @@ impl NativeRuntime {
                                 token,
                                 framebuffer_id,
                                 direct_target,
+                                direct_submit_window,
                                 *lease,
                                 admission,
                                 test_only,
@@ -828,14 +871,30 @@ impl NativeRuntime {
                     ),
                     PacingField::u64(
                         "prediction_worker_submit_wake_ns",
-                        prediction.p95_worker_submit_wake_lateness_ns,
+                        prediction.p95_wake_lateness_ns,
+                    ),
+                    PacingField::u64(
+                        "prediction_worker_pre_submit_ns",
+                        prediction.p95_worker_pre_submit_ns,
+                    ),
+                    PacingField::u64(
+                        "prediction_worker_dispatch_ns",
+                        prediction.p95_worker_dispatch_ns,
                     ),
                     PacingField::u64("prediction_atomic_ioctl_ns", prediction.p95_atomic_ioctl_ns),
                     PacingField::u64(
-                        "prediction_submission_budget_ns",
-                        prediction.submission_budget_ns,
+                        "prediction_kms_dispatch_budget_ns",
+                        prediction.kms_dispatch_budget_ns,
                     ),
-                    PacingField::u64("dynamic_safety_margin_ns", prediction.safety_margin_ns),
+                    PacingField::u64(
+                        "prediction_kms_apply_guard_ns",
+                        prediction.kms_apply_guard_ns,
+                    ),
+                    PacingField::u64("prediction_kms_total_lead_ns", prediction.kms_total_lead_ns),
+                    PacingField::u64(
+                        "main_event_loop_wake_guard_ns",
+                        prediction.main_event_loop_wake_guard_ns,
+                    ),
                     PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
                     PacingField::u64("refresh_interval_ns", refresh_interval.as_nanos() as u64),
                     PacingField::bool("idle_wake_guard", prediction.idle_wake_guard),
@@ -939,12 +998,14 @@ impl NativeRuntime {
                                     presentation_deadline,
                                     scheduled_presentation_target,
                                     MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                    predicted_total_cost,
                                 )
                             }
                             NativeOutputPacingMode::PredictiveTriple => {
                                 scheduled_presentation_target.take().or_else(|| {
                                     presentation_deadline.reactive_target(
                                         MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                                        predicted_total_cost,
                                     )
                                 })
                             }
@@ -954,6 +1015,19 @@ impl NativeRuntime {
                                 "explicit Atomic render started without a presentation target",
                             )
                         })?;
+                        let submit_window = match presentation_timing.submit_window(
+                            frame_target.presentation_time.get(),
+                            frame_target.submit_not_before().get(),
+                            prediction.kms_dispatch_budget_ns,
+                        ) {
+                            Ok(window) => window,
+                            Err(_) => {
+                                presentation_timing.record_unreachable_target();
+                                presentation_deadline.clear_scheduled_target();
+                                *queued_redraw_requested = true;
+                                return Ok(());
+                            }
+                        };
                         presentation_deadline.clear_scheduled_target();
                         let (cursor_assignment, frozen_cursor_plane_owner) =
                             freeze_cursor_assignment_for_render(
@@ -972,6 +1046,7 @@ impl NativeRuntime {
                             render_generation,
                             *drm_file_generation,
                             frame_target,
+                            submit_window,
                             pacing_mode,
                             cursor_assignment,
                             direct_inspection
@@ -1244,7 +1319,7 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
-                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, *drm_file_generation, target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history)? };
+                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, *drm_file_generation, target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, predicted_total_cost, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history)? };
                             #[cfg(test)]
                             if !render_ahead {
                                 native_io_recorder.record(NativeIoOperation::ScanoutPresent);

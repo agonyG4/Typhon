@@ -567,6 +567,10 @@ fn worker_queue_owns_direct_resource_before_submit() {
             framebuffer_id: 42,
         },
         target: test_target(),
+        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+            0, 0, 0, 0,
+        )
+        .unwrap(),
         validation_base: KmsValidationBase::Presented {
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                 None,

@@ -372,6 +372,13 @@ impl NativeSessionIo for NativeRuntime {
 
     fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
         self.drm_file_generation = allocate_native_drm_file_generation();
+        self.presentation_timing.reconfigure(
+            KmsModeTiming::from_mode(
+                &self.target.mode,
+                1_000_000_000u64 / u64::from(self.refresh_hz.max(1)),
+            ),
+            self.drm_file_generation,
+        );
         self.abandon_direct_fallback();
         self.scanout
             .rebind_session_generation(self.drm_file_generation);

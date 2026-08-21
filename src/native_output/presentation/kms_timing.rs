@@ -51,7 +51,7 @@ impl KmsModeTiming {
             })
             .flatten()
             .filter(|interval| *interval != 0)
-            .unwrap_or(fallback_refresh_interval_ns);
+            .unwrap_or(fallback_refresh_interval_ns.max(1));
         let blanking_interval_ns = progressive
             .then(|| {
                 u64::from(mode.vtotal - mode.vdisplay)

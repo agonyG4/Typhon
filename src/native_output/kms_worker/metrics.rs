@@ -2,10 +2,16 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-const UNSIGNED_BUCKET_LIMITS_NS: [u64; 8] = [
+const UNSIGNED_BUCKET_LIMITS_NS: [u64; 14] = [
+    50_000,
     100_000,
+    150_000,
+    250_000,
+    375_000,
     500_000,
+    750_000,
     1_000_000,
+    1_500_000,
     2_000_000,
     5_000_000,
     10_000_000,
@@ -13,18 +19,30 @@ const UNSIGNED_BUCKET_LIMITS_NS: [u64; 8] = [
     u64::MAX,
 ];
 
-const SIGNED_BUCKET_LIMITS_NS: [i64; 16] = [
+const SIGNED_BUCKET_LIMITS_NS: [i64; 28] = [
     -25_000_000,
     -10_000_000,
     -5_000_000,
     -2_000_000,
+    -1_500_000,
     -1_000_000,
+    -750_000,
     -500_000,
+    -375_000,
+    -250_000,
+    -150_000,
     -100_000,
+    -50_000,
     0,
+    50_000,
     100_000,
+    150_000,
+    250_000,
+    375_000,
     500_000,
+    750_000,
     1_000_000,
+    1_500_000,
     2_000_000,
     5_000_000,
     10_000_000,
@@ -191,10 +209,10 @@ impl AtomicSignedTimingSummary {
     }
 }
 
-fn percentile_bucket<T: Copy>(
+fn percentile_bucket<T: Copy, const N: usize>(
     count: u64,
     percentile: u64,
-    limits: [T; 8],
+    limits: [T; N],
     read_bucket: impl Fn(usize) -> u64,
 ) -> T {
     let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
@@ -205,13 +223,13 @@ fn percentile_bucket<T: Copy>(
             return limit;
         }
     }
-    limits[7]
+    limits[N - 1]
 }
 
-fn percentile_bucket_signed<T: Copy>(
+fn percentile_bucket_signed<T: Copy, const N: usize>(
     count: u64,
     percentile: u64,
-    limits: [T; 16],
+    limits: [T; N],
     read_bucket: impl Fn(usize) -> u64,
 ) -> T {
     let rank = count.saturating_mul(percentile).saturating_add(99) / 100;
@@ -222,12 +240,14 @@ fn percentile_bucket_signed<T: Copy>(
             return limit;
         }
     }
-    limits[15]
+    limits[N - 1]
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct WorkerTimingMetrics {
     submit_wake_lateness: AtomicSignedTimingSummary,
+    pre_submit_duration: AtomicTimingSummary,
+    dispatch_duration: AtomicTimingSummary,
     ioctl_duration: AtomicTimingSummary,
     queue_residency: AtomicTimingSummary,
     submit_earliness: AtomicSignedTimingSummary,
@@ -235,11 +255,7 @@ pub(crate) struct WorkerTimingMetrics {
     submit_ack_delay: AtomicTimingSummary,
     pageflip_ack_delay: AtomicTimingSummary,
     test_only_duration: AtomicTimingSummary,
-    current_safety_margin_ns: AtomicU64,
-    target_same_refresh: AtomicU64,
-    target_miss_one_refresh: AtomicU64,
-    target_miss_two_or_more: AtomicU64,
-    target_stale_or_out_of_order: AtomicU64,
+    dispatch_budget_ns: AtomicU64,
     late_before_ioctl: AtomicU64,
     late_after_ioctl: AtomicU64,
     test_only_count: AtomicU64,
@@ -248,6 +264,8 @@ pub(crate) struct WorkerTimingMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WorkerTimingSnapshot {
     pub(crate) submit_wake_lateness: SignedTimingSummarySnapshot,
+    pub(crate) pre_submit_duration: TimingSummarySnapshot,
+    pub(crate) dispatch_duration: TimingSummarySnapshot,
     pub(crate) ioctl_duration: TimingSummarySnapshot,
     pub(crate) queue_residency: TimingSummarySnapshot,
     pub(crate) submit_earliness: SignedTimingSummarySnapshot,
@@ -255,64 +273,45 @@ pub(crate) struct WorkerTimingSnapshot {
     pub(crate) submit_ack_delay: TimingSummarySnapshot,
     pub(crate) pageflip_ack_delay: TimingSummarySnapshot,
     pub(crate) test_only_duration: TimingSummarySnapshot,
-    pub(crate) current_safety_margin_ns: u64,
-    pub(crate) target_same_refresh: u64,
-    pub(crate) target_miss_one_refresh: u64,
-    pub(crate) target_miss_two_or_more: u64,
-    pub(crate) target_stale_or_out_of_order: u64,
+    pub(crate) dispatch_budget_ns: u64,
     pub(crate) late_before_ioctl: u64,
     pub(crate) late_after_ioctl: u64,
     pub(crate) test_only_count: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerTargetResult {
-    SameRefresh,
-    MissedOneRefresh,
-    MissedTwoOrMoreRefreshes,
-    StaleOrOutOfOrder,
-}
-
-impl WorkerTargetResult {
-    pub(crate) fn from_sequences(target: u64, presented: u64) -> Self {
-        match presented.cmp(&target) {
-            std::cmp::Ordering::Less => Self::StaleOrOutOfOrder,
-            std::cmp::Ordering::Equal => Self::SameRefresh,
-            std::cmp::Ordering::Greater => match presented - target {
-                1 => Self::MissedOneRefresh,
-                _ => Self::MissedTwoOrMoreRefreshes,
-            },
-        }
-    }
 }
 
 impl WorkerTimingMetrics {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_submission(
         &self,
-        submit_deadline_ns: u64,
+        planned_worker_wake_ns: u64,
+        actual_worker_wait_returned_ns: u64,
+        commit_complete_deadline_ns: u64,
         target_presentation_ns: u64,
         submit_started_ns: u64,
         submit_returned_ns: u64,
         queue_residency_ns: u64,
+        pre_submit_duration_ns: u64,
         ioctl_duration_ns: u64,
-        safety_margin_ns: u64,
+        dispatch_duration_ns: u64,
+        dispatch_budget_ns: u64,
     ) {
-        let wake_delta_ns = signed_delta(submit_started_ns, submit_deadline_ns);
+        let wake_delta_ns = signed_delta(actual_worker_wait_returned_ns, planned_worker_wake_ns);
         let submit_earliness_ns = signed_delta(target_presentation_ns, submit_started_ns);
         let submit_return_earliness_ns = signed_delta(target_presentation_ns, submit_returned_ns);
         self.submit_wake_lateness.record(wake_delta_ns);
+        self.pre_submit_duration.record(pre_submit_duration_ns);
+        self.dispatch_duration.record(dispatch_duration_ns);
         self.submit_earliness.record(submit_earliness_ns);
         self.submit_return_earliness
             .record(submit_return_earliness_ns);
         self.ioctl_duration.record(ioctl_duration_ns);
         self.queue_residency.record(queue_residency_ns);
-        self.current_safety_margin_ns
-            .store(safety_margin_ns, Ordering::Relaxed);
+        self.dispatch_budget_ns
+            .store(dispatch_budget_ns, Ordering::Relaxed);
         if wake_delta_ns > 0 {
             self.late_before_ioctl.fetch_add(1, Ordering::Relaxed);
         }
-        if submit_return_earliness_ns < 0 {
+        if submit_returned_ns > commit_complete_deadline_ns {
             self.late_after_ioctl.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -330,27 +329,11 @@ impl WorkerTimingMetrics {
         self.test_only_duration.record(duration_ns);
     }
 
-    pub(crate) fn record_target_result(&self, target: u64, presented: u64) {
-        match WorkerTargetResult::from_sequences(target, presented) {
-            WorkerTargetResult::SameRefresh => {
-                self.target_same_refresh.fetch_add(1, Ordering::Relaxed);
-            }
-            WorkerTargetResult::MissedOneRefresh => {
-                self.target_miss_one_refresh.fetch_add(1, Ordering::Relaxed);
-            }
-            WorkerTargetResult::MissedTwoOrMoreRefreshes => {
-                self.target_miss_two_or_more.fetch_add(1, Ordering::Relaxed);
-            }
-            WorkerTargetResult::StaleOrOutOfOrder => {
-                self.target_stale_or_out_of_order
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
     pub(crate) fn snapshot(&self) -> WorkerTimingSnapshot {
         WorkerTimingSnapshot {
             submit_wake_lateness: self.submit_wake_lateness.snapshot(),
+            pre_submit_duration: self.pre_submit_duration.snapshot(),
+            dispatch_duration: self.dispatch_duration.snapshot(),
             ioctl_duration: self.ioctl_duration.snapshot(),
             queue_residency: self.queue_residency.snapshot(),
             submit_earliness: self.submit_earliness.snapshot(),
@@ -358,11 +341,7 @@ impl WorkerTimingMetrics {
             submit_ack_delay: self.submit_ack_delay.snapshot(),
             pageflip_ack_delay: self.pageflip_ack_delay.snapshot(),
             test_only_duration: self.test_only_duration.snapshot(),
-            current_safety_margin_ns: self.current_safety_margin_ns.load(Ordering::Relaxed),
-            target_same_refresh: self.target_same_refresh.load(Ordering::Relaxed),
-            target_miss_one_refresh: self.target_miss_one_refresh.load(Ordering::Relaxed),
-            target_miss_two_or_more: self.target_miss_two_or_more.load(Ordering::Relaxed),
-            target_stale_or_out_of_order: self.target_stale_or_out_of_order.load(Ordering::Relaxed),
+            dispatch_budget_ns: self.dispatch_budget_ns.load(Ordering::Relaxed),
             late_before_ioctl: self.late_before_ioctl.load(Ordering::Relaxed),
             late_after_ioctl: self.late_after_ioctl.load(Ordering::Relaxed),
             test_only_count: self.test_only_count.load(Ordering::Relaxed),
@@ -415,7 +394,9 @@ mod tests {
     #[test]
     fn signed_timing_keeps_early_and_late_values() {
         let metrics = WorkerTimingMetrics::default();
-        metrics.record_submission(10_000, 20_000, 9_000, 21_000, 100, 200, 1_000);
+        metrics.record_submission(
+            11_000, 10_000, 20_000, 20_000, 9_000, 21_000, 100, 300, 200, 500, 1_000,
+        );
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.submit_wake_lateness.last_ns, -1_000);
         assert_eq!(snapshot.submit_earliness.last_ns, 11_000);

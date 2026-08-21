@@ -3,6 +3,7 @@
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
@@ -28,6 +29,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) crtc_id: u32,
     pub(crate) kind: AtomicCommitKind,
     pub(crate) target: PresentationTarget,
+    pub(crate) submit_window: KmsSubmitWindow,
     pub(crate) validation_base: KmsValidationBase,
     pub(crate) queued_at: MonotonicTimestampNs,
     pub(crate) primary: KmsPrimaryUpdate,
@@ -120,10 +122,15 @@ pub(crate) fn validation_base_ready(
 pub(crate) struct KmsSubmittedOwnership {
     pub(crate) job: KmsCommitJob,
     pub(crate) out_fence: Option<OwnedFd>,
+    pub(crate) planned_worker_wake_at: MonotonicTimestampNs,
+    pub(crate) actual_worker_wait_returned_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) queue_residency_ns: u64,
     pub(crate) submit_wake_lateness_ns: u64,
+    pub(crate) pre_submit_duration_ns: u64,
+    pub(crate) ioctl_duration_ns: u64,
+    pub(crate) dispatch_duration_ns: u64,
     pub(crate) submission_budget_ns: u64,
 }
 

@@ -127,8 +127,8 @@ pub enum TripleEntryReason {
 pub enum ProvenDeadlineMiss {
     ExactRender,
     GuardedApproximateRender,
-    AtomicSubmit,
-    Presentation,
+    KmsDispatch,
+    KmsApplyGuard,
 }
 
 #[doc(hidden)]
@@ -138,7 +138,7 @@ pub fn merge_presentation_miss(
     actual_sequence: u64,
 ) -> Option<ProvenDeadlineMiss> {
     existing.or_else(|| {
-        (actual_sequence > planned_sequence).then_some(ProvenDeadlineMiss::Presentation)
+        (actual_sequence > planned_sequence).then_some(ProvenDeadlineMiss::KmsApplyGuard)
     })
 }
 
@@ -179,12 +179,14 @@ pub struct RenderPrediction {
     pub p95_wake_lateness_ns: u64,
     pub p95_atomic_submit_ns: u64,
     pub p95_worker_queue_residency_ns: u64,
-    pub p95_worker_submit_wake_lateness_ns: u64,
+    pub p95_worker_pre_submit_ns: u64,
+    pub p95_worker_dispatch_ns: u64,
     pub p95_atomic_ioctl_ns: u64,
-    pub submission_budget_ns: u64,
+    pub main_event_loop_wake_guard_ns: u64,
+    pub kms_dispatch_budget_ns: u64,
+    pub kms_apply_guard_ns: u64,
+    pub kms_total_lead_ns: u64,
     pub p95_target_slip_ns: u64,
-    pub submit_allowance_ns: u64,
-    pub safety_margin_ns: u64,
     pub total_cost_ns: u64,
     pub idle_wake_guard: bool,
 }
@@ -197,6 +199,8 @@ pub struct AdaptiveRenderJournal {
     atomic_submit_samples_ns: VecDeque<u64>,
     worker_queue_residency_samples_ns: VecDeque<u64>,
     worker_submit_wake_lateness_samples_ns: VecDeque<u64>,
+    worker_pre_submit_samples_ns: VecDeque<u64>,
+    worker_dispatch_samples_ns: VecDeque<u64>,
     submission_budget_samples_ns: VecDeque<u64>,
     target_slip_samples_ns: VecDeque<u64>,
     ewma_render_ns: u64,
@@ -215,6 +219,8 @@ impl Default for AdaptiveRenderJournal {
             atomic_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             worker_queue_residency_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             worker_submit_wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            worker_pre_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            worker_dispatch_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             target_slip_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             ewma_render_ns: 0,
@@ -268,6 +274,14 @@ impl AdaptiveRenderJournal {
         push_bounded(&mut self.worker_submit_wake_lateness_samples_ns, sample_ns);
     }
 
+    pub fn record_worker_pre_submit(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.worker_pre_submit_samples_ns, sample_ns);
+    }
+
+    pub fn record_worker_dispatch(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.worker_dispatch_samples_ns, sample_ns);
+    }
+
     pub fn record_submission_budget(&mut self, sample_ns: u64) {
         push_bounded(&mut self.submission_budget_samples_ns, sample_ns);
     }
@@ -281,7 +295,15 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn prediction(&self, refresh_interval: Duration) -> RenderPrediction {
-        self.base_prediction(refresh_interval, false)
+        self.base_prediction(refresh_interval, false, 0)
+    }
+
+    pub fn prediction_with_kms_guard(
+        &self,
+        refresh_interval: Duration,
+        kms_apply_guard_ns: u64,
+    ) -> RenderPrediction {
+        self.base_prediction(refresh_interval, false, kms_apply_guard_ns)
     }
 
     pub fn prediction_at(
@@ -297,7 +319,24 @@ impl AdaptiveRenderJournal {
         if idle {
             self.idle_guard_consumed = true;
         }
-        self.base_prediction(refresh_interval, idle)
+        self.base_prediction(refresh_interval, idle, 0)
+    }
+
+    pub fn prediction_at_with_kms_guard(
+        &mut self,
+        now: MonotonicTimestampNs,
+        refresh_interval: Duration,
+        kms_apply_guard_ns: u64,
+    ) -> RenderPrediction {
+        let refresh_ns = duration_ns(refresh_interval).max(1);
+        let idle = !self.idle_guard_consumed
+            && self.last_presented_at.is_some_and(|last| {
+                now.get().saturating_sub(last.get()) >= refresh_ns.saturating_mul(100)
+            });
+        if idle {
+            self.idle_guard_consumed = true;
+        }
+        self.base_prediction(refresh_interval, idle, kms_apply_guard_ns)
     }
 
     pub(crate) const fn ewma_render_ns(&self) -> u64 {
@@ -316,7 +355,12 @@ impl AdaptiveRenderJournal {
         *self = Self::default();
     }
 
-    fn base_prediction(&self, refresh_interval: Duration, idle: bool) -> RenderPrediction {
+    fn base_prediction(
+        &self,
+        refresh_interval: Duration,
+        idle: bool,
+        kms_apply_guard_ns: u64,
+    ) -> RenderPrediction {
         let refresh_ns = duration_ns(refresh_interval).max(1);
         let p90 = self.p90_recent_render_ns();
         let central_risk = self
@@ -335,31 +379,33 @@ impl AdaptiveRenderJournal {
         let p95_wake = nearest_rank(&self.wake_lateness_samples_ns, 95);
         let p95_ioctl = nearest_rank(&self.atomic_submit_samples_ns, 95);
         let p95_worker_wake = nearest_rank(&self.worker_submit_wake_lateness_samples_ns, 95);
+        let p95_worker_pre_submit = nearest_rank(&self.worker_pre_submit_samples_ns, 95);
+        let p95_worker_dispatch = nearest_rank(&self.worker_dispatch_samples_ns, 95);
         let p95_queue_residency = nearest_rank(&self.worker_queue_residency_samples_ns, 95);
-        let measured_submission_budget = p95_worker_wake
-            .saturating_add(p95_ioctl)
-            .saturating_add(100_000);
+        let measured_dispatch_budget = p95_worker_wake
+            .saturating_add(p95_worker_dispatch.max(p95_ioctl))
+            .saturating_add(50_000);
         let exported_submission_budget = nearest_rank(&self.submission_budget_samples_ns, 95);
-        let submission_budget = if exported_submission_budget != 0 {
+        let kms_dispatch_budget = if exported_submission_budget != 0 {
             exported_submission_budget
         } else if self.atomic_submit_samples_ns.len() < 20 {
-            measured_submission_budget.max(250_000)
+            measured_dispatch_budget.max(250_000)
         } else {
-            measured_submission_budget
+            measured_dispatch_budget
         };
-        let submit_allowance = submission_budget;
         let ceiling = 2_000_000_u64.min(refresh_ns / 4).max(500_000);
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
-        let safety_margin = if self.wake_lateness_samples_ns.len() < 20
+        let main_event_loop_wake_guard = if self.wake_lateness_samples_ns.len() < 20
             || self.atomic_submit_samples_ns.len() < 20
         {
             dynamic_margin.max(1_000_000)
         } else {
             dynamic_margin
         };
+        let kms_total_lead = kms_dispatch_budget.saturating_add(kms_apply_guard_ns);
         let mut total = render_risk
-            .saturating_add(submit_allowance)
-            .saturating_add(safety_margin);
+            .saturating_add(main_event_loop_wake_guard)
+            .saturating_add(kms_total_lead);
         if idle {
             total = total.max(refresh_ns.saturating_sub(100_000));
         }
@@ -371,12 +417,14 @@ impl AdaptiveRenderJournal {
             p95_wake_lateness_ns: p95_wake,
             p95_atomic_submit_ns: p95_ioctl,
             p95_worker_queue_residency_ns: p95_queue_residency,
-            p95_worker_submit_wake_lateness_ns: p95_worker_wake,
+            p95_worker_pre_submit_ns: p95_worker_pre_submit,
+            p95_worker_dispatch_ns: p95_worker_dispatch,
             p95_atomic_ioctl_ns: p95_ioctl,
-            submission_budget_ns: submission_budget,
+            main_event_loop_wake_guard_ns: main_event_loop_wake_guard,
+            kms_dispatch_budget_ns: kms_dispatch_budget,
+            kms_apply_guard_ns,
+            kms_total_lead_ns: kms_total_lead,
             p95_target_slip_ns: nearest_rank(&self.target_slip_samples_ns, 95),
-            submit_allowance_ns: submit_allowance,
-            safety_margin_ns: safety_margin,
             total_cost_ns: total,
             idle_wake_guard: idle,
         }
@@ -617,11 +665,11 @@ pub fn triple_buffering_doctor_severity(
 
 const fn triple_entry_reason_for_miss(miss: ProvenDeadlineMiss) -> TripleEntryReason {
     match miss {
-        ProvenDeadlineMiss::AtomicSubmit => TripleEntryReason::ProvenSubmitMiss,
+        ProvenDeadlineMiss::KmsDispatch => TripleEntryReason::ProvenSubmitMiss,
         ProvenDeadlineMiss::ExactRender | ProvenDeadlineMiss::GuardedApproximateRender => {
             TripleEntryReason::ProvenReadinessMiss
         }
-        ProvenDeadlineMiss::Presentation => TripleEntryReason::ProvenPresentationMiss,
+        ProvenDeadlineMiss::KmsApplyGuard => TripleEntryReason::ProvenPresentationMiss,
     }
 }
 
@@ -768,8 +816,8 @@ mod tests {
         let journal = AdaptiveRenderJournal::default();
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.render_risk_ns, 4_000_000);
-        assert_eq!(prediction.submit_allowance_ns, 250_000);
-        assert_eq!(prediction.safety_margin_ns, 1_000_000);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
+        assert_eq!(prediction.main_event_loop_wake_guard_ns, 1_000_000);
         assert_eq!(prediction.total_cost_ns, 5_250_000);
     }
 
@@ -781,8 +829,8 @@ mod tests {
             journal.record_atomic_submit(100_000);
         }
         let prediction = journal.prediction(Duration::from_millis(4));
-        assert_eq!(prediction.safety_margin_ns, 1_000_000);
-        assert_eq!(prediction.submit_allowance_ns, 200_000);
+        assert_eq!(prediction.main_event_loop_wake_guard_ns, 1_000_000);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 150_000);
     }
 
     #[test]
@@ -848,7 +896,7 @@ mod tests {
         off.observe(
             0,
             refresh,
-            Some(ProvenDeadlineMiss::Presentation),
+            Some(ProvenDeadlineMiss::KmsApplyGuard),
             2,
             MonotonicTimestampNs::new(2),
             false,
@@ -868,7 +916,7 @@ mod tests {
     fn presentation_sequence_slip_becomes_proven_miss() {
         assert_eq!(
             merge_presentation_miss(None, 40, 41),
-            Some(ProvenDeadlineMiss::Presentation)
+            Some(ProvenDeadlineMiss::KmsApplyGuard)
         );
     }
 
@@ -879,8 +927,8 @@ mod tests {
             Some(ProvenDeadlineMiss::ExactRender)
         );
         assert_eq!(
-            merge_presentation_miss(Some(ProvenDeadlineMiss::AtomicSubmit), 40, 42,),
-            Some(ProvenDeadlineMiss::AtomicSubmit)
+            merge_presentation_miss(Some(ProvenDeadlineMiss::KmsDispatch), 40, 42,),
+            Some(ProvenDeadlineMiss::KmsDispatch)
         );
     }
 
@@ -950,7 +998,7 @@ mod tests {
         policy.observe(
             0,
             refresh,
-            Some(ProvenDeadlineMiss::Presentation),
+            Some(ProvenDeadlineMiss::KmsApplyGuard),
             100,
             MonotonicTimestampNs::new(0),
             false,
@@ -1018,7 +1066,7 @@ mod tests {
         let refresh = Duration::from_millis(10);
         for (miss, reason) in [
             (
-                ProvenDeadlineMiss::AtomicSubmit,
+                ProvenDeadlineMiss::KmsDispatch,
                 TripleEntryReason::ProvenSubmitMiss,
             ),
             (
@@ -1030,7 +1078,7 @@ mod tests {
                 TripleEntryReason::ProvenReadinessMiss,
             ),
             (
-                ProvenDeadlineMiss::Presentation,
+                ProvenDeadlineMiss::KmsApplyGuard,
                 TripleEntryReason::ProvenPresentationMiss,
             ),
         ] {
@@ -1055,7 +1103,7 @@ mod tests {
         policy.observe(
             0,
             refresh,
-            Some(ProvenDeadlineMiss::Presentation),
+            Some(ProvenDeadlineMiss::KmsApplyGuard),
             100,
             MonotonicTimestampNs::new(0),
             false,
@@ -1063,7 +1111,7 @@ mod tests {
         policy.observe(
             7_000_000,
             refresh,
-            Some(ProvenDeadlineMiss::Presentation),
+            Some(ProvenDeadlineMiss::KmsApplyGuard),
             120,
             MonotonicTimestampNs::new(200_000_000),
             true,
@@ -1216,9 +1264,9 @@ mod tests {
         assert_eq!(prediction.p90_recent_render_ns, 109);
         assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
         assert_eq!(prediction.p95_worker_queue_residency_ns, 2_115);
-        assert_eq!(prediction.p95_worker_submit_wake_lateness_ns, 3_115);
+        assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
         assert_eq!(prediction.p95_atomic_ioctl_ns, 4_115);
-        assert_eq!(prediction.submission_budget_ns, 5_115);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 5_115);
         assert_eq!(prediction.p95_target_slip_ns, 6_115);
     }
 

@@ -229,6 +229,8 @@ fn worker_signed_timing_summary_snapshot(
 fn worker_timing_snapshot(snapshot: WorkerTimingSnapshot) -> WorkerTimingPerformanceSnapshot {
     WorkerTimingPerformanceSnapshot {
         submit_wake_lateness: worker_signed_timing_summary_snapshot(snapshot.submit_wake_lateness),
+        pre_submit_duration: worker_timing_summary_snapshot(snapshot.pre_submit_duration),
+        dispatch_duration: worker_timing_summary_snapshot(snapshot.dispatch_duration),
         ioctl_duration: worker_timing_summary_snapshot(snapshot.ioctl_duration),
         queue_residency: worker_timing_summary_snapshot(snapshot.queue_residency),
         submit_earliness: worker_signed_timing_summary_snapshot(snapshot.submit_earliness),
@@ -238,11 +240,7 @@ fn worker_timing_snapshot(snapshot: WorkerTimingSnapshot) -> WorkerTimingPerform
         submit_ack_delay: worker_timing_summary_snapshot(snapshot.submit_ack_delay),
         pageflip_ack_delay: worker_timing_summary_snapshot(snapshot.pageflip_ack_delay),
         test_only_duration: worker_timing_summary_snapshot(snapshot.test_only_duration),
-        current_safety_margin_us: snapshot.current_safety_margin_ns / 1_000,
-        target_hit_same_refresh: snapshot.target_same_refresh,
-        target_miss_one_refresh: snapshot.target_miss_one_refresh,
-        target_miss_two_or_more_refreshes: snapshot.target_miss_two_or_more,
-        target_stale_or_out_of_order: snapshot.target_stale_or_out_of_order,
+        dispatch_budget_us: snapshot.dispatch_budget_ns / 1_000,
         late_before_ioctl: snapshot.late_before_ioctl,
         late_after_ioctl: snapshot.late_after_ioctl,
         test_only_count: snapshot.test_only_count,
@@ -259,6 +257,8 @@ impl NativeRuntime {
             .map_or_else(WorkerMetricsSnapshot::default, |worker| {
                 worker.metrics_snapshot()
             });
+        let presentation_timing = self.presentation_timing;
+        let presentation_timing_snapshot = presentation_timing.snapshot();
         let compositor_cpu_render =
             timing_summary_snapshot(self.render_telemetry.snapshot().compositor_cpu_render);
         let mut timing_scopes = BTreeMap::new();
@@ -281,6 +281,16 @@ impl NativeRuntime {
                 triple_exits: buffering.triple_exits,
             },
             kms: KmsPerformanceSnapshot {
+                mode_refresh_interval_ns: presentation_timing.mode().refresh_interval_ns(),
+                mode_blanking_interval_ns: presentation_timing.mode().blanking_interval_ns(),
+                base_apply_guard_ns: presentation_timing.base_mode_guard_ns(),
+                adaptive_apply_guard_ns: presentation_timing.adaptive_apply_guard_ns(),
+                total_apply_guard_ns: presentation_timing.apply_guard_ns(),
+                target_hits: presentation_timing_snapshot.target_hits,
+                pre_render_unreachable: presentation_timing_snapshot.unreachable_targets,
+                render_readiness_misses: presentation_timing_snapshot.render_readiness_misses,
+                dispatch_misses: presentation_timing_snapshot.dispatch_misses,
+                apply_guard_misses: presentation_timing_snapshot.apply_guard_misses,
                 worker_jobs_enqueued: worker.jobs_enqueued,
                 worker_jobs_submitted: worker.jobs_submitted,
                 worker_jobs_rejected: worker.jobs_rejected,

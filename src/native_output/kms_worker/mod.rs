@@ -9,8 +9,6 @@ mod queue;
 mod thread;
 mod timing;
 
-#[cfg(test)]
-pub(crate) use metrics::WorkerTargetResult;
 pub(crate) use metrics::{
     SignedTimingSummarySnapshot, TimingSummarySnapshot, WorkerTimingMetrics, WorkerTimingSnapshot,
 };
@@ -34,7 +32,7 @@ pub(crate) use queue::{
 #[cfg(test)]
 pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent, ValidationBaseInvalidationReason};
-pub(crate) use timing::KmsCommitTimingModel;
+pub(crate) use timing::{KmsWorkerDispatchBudget, KmsWorkerDispatchModel};
 
 #[cfg(test)]
 mod direct_lease_tests;

@@ -663,6 +663,14 @@ mod ownership_tests {
                 framebuffer_id: 42,
             },
             target,
+            submit_window:
+                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                    target.presentation_time.get(),
+                    target.submit_not_before().get(),
+                    0,
+                    0,
+                )
+                .unwrap(),
             validation_base: KmsValidationBase::Presented {
                 snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                     None,

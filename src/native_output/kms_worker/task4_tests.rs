@@ -593,12 +593,19 @@ fn terminal_worker_transports_preserve_both_bundle_owners() {
         KmsSubmittedOwnership {
             job,
             out_fence: None,
+            planned_worker_wake_at:
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
+            actual_worker_wait_returned_at:
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
             submit_started_at:
                 oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(1),
             submit_returned_at:
                 oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(2),
             queue_residency_ns: 1,
             submit_wake_lateness_ns: 0,
+            pre_submit_duration_ns: 0,
+            ioctl_duration_ns: 1,
+            dispatch_duration_ns: 1,
             submission_budget_ns: 1,
         };
     assert_two_owners(&submitted.job, primary_id, cursor_id);

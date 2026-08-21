@@ -85,7 +85,6 @@ impl NativeRuntime {
             }
             KmsWorkerEvent::Fatal { .. }
             | KmsWorkerEvent::BusyDeferred { .. }
-            | KmsWorkerEvent::SubmitLate { .. }
             | KmsWorkerEvent::PageflipTimeout { .. }
             | KmsWorkerEvent::CursorSidecarReturned { .. }
             | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),
@@ -253,7 +252,6 @@ impl NativeRuntime {
                 }
                 KmsWorkerEvent::Fatal { .. }
                 | KmsWorkerEvent::BusyDeferred { .. }
-                | KmsWorkerEvent::SubmitLate { .. }
                 | KmsWorkerEvent::PageflipTimeout { .. }
                 | KmsWorkerEvent::CursorSidecarReturned { .. }
                 | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),

@@ -90,6 +90,10 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             direct_token: token,
             framebuffer_id: 42,
         },
+        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+            0, 0, 0, 0,
+        )
+        .unwrap(),
         target: PresentationTarget {
             sequence: 70,
             presentation_time: MonotonicTimestampNs::new(0),
@@ -240,10 +244,15 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
     let ownership = KmsSubmittedOwnership {
         job: test_uncertain_direct_job(lease),
         out_fence: Some(test_eventfd()),
+        planned_worker_wake_at: MonotonicTimestampNs::new(0),
+        actual_worker_wait_returned_at: MonotonicTimestampNs::new(0),
         submit_started_at: MonotonicTimestampNs::new(1),
         submit_returned_at: MonotonicTimestampNs::new(2),
         queue_residency_ns: 0,
         submit_wake_lateness_ns: 0,
+        pre_submit_duration_ns: 0,
+        ioctl_duration_ns: 1,
+        dispatch_duration_ns: 1,
         submission_budget_ns: 1_000_000,
     };
     let mut emergency = Vec::new();

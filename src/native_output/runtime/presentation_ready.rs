@@ -52,6 +52,7 @@ pub(super) fn submit_ready_frame(
     mode_label: &str,
     refresh_hz: u32,
     compatibility_target: Option<PresentationTarget>,
+    compatibility_submit_window: Option<KmsSubmitWindow>,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
@@ -197,6 +198,9 @@ pub(super) fn submit_ready_frame(
                     }
                 },
             );
+            let Some(compatibility_submit_window) = compatibility_submit_window else {
+                return Ok(ReadySubmissionResult::Unavailable);
+            };
             let result = match queue_compatibility_for_presentation(
                 worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?,
                 scanout,
@@ -208,6 +212,7 @@ pub(super) fn submit_ready_frame(
                 output_generation,
                 crtc_id,
                 compatibility_target,
+                compatibility_submit_window,
                 pacing_mode,
                 render_generation,
                 cursor,
