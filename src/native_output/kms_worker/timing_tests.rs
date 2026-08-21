@@ -1,5 +1,7 @@
+use super::thread::worker_wait_is_armed;
 use super::timing::KmsWorkerDispatchModel;
 use super::*;
+use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 
 #[test]
 fn worker_timing_records_pageflip_ack_delay() {
@@ -45,4 +47,18 @@ fn worker_dispatch_budget_does_not_include_queue_residency() {
     model.record(0, 100_000, 200_000);
 
     assert_eq!(model.budget().dispatch_budget_ns, 350_000);
+}
+
+#[test]
+fn reactive_double_does_not_wait_for_a_late_planned_worker_wake() {
+    assert!(!worker_wait_is_armed(
+        PresentationTargetReason::ReactiveDouble,
+        200,
+        100,
+    ));
+    assert!(worker_wait_is_armed(
+        PresentationTargetReason::PredictedPressure,
+        200,
+        100,
+    ));
 }

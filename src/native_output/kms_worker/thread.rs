@@ -23,7 +23,7 @@ use crate::native_output::{
 };
 use oblivion_one::native::kms::AtomicCommitSubmitter;
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
-use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTargetReason};
 use std::{
     collections::VecDeque,
     io,
@@ -763,7 +763,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         let now_ns = monotonic_now_ns();
         let planned_worker_wake_at = job.submit_window.worker_wake_at_ns();
-        let wait_armed = planned_worker_wake_at > now_ns;
+        let wait_armed = worker_wait_is_armed(job.target.reason, planned_worker_wake_at, now_ns);
         let actual_worker_wait_returned_at = if wait_armed {
             let Some(returned_at) = wait_until_or_quiesce(&shared, planned_worker_wake_at) else {
                 drop(executing);
@@ -1107,6 +1107,14 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             }
         }
     }
+}
+
+pub(super) fn worker_wait_is_armed(
+    target_reason: PresentationTargetReason,
+    planned_worker_wake_at: u64,
+    now_ns: u64,
+) -> bool {
+    target_reason != PresentationTargetReason::ReactiveDouble && planned_worker_wake_at > now_ns
 }
 
 #[derive(Debug)]
