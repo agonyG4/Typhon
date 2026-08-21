@@ -395,14 +395,7 @@ impl NativeRuntime {
         } else {
             None
         };
-        let extra_future_primary_owned = pipeline_snapshot
-            .as_ref()
-            .is_some_and(|pipeline| pipeline.future_primary_depth() >= 2);
-        adaptive_buffering.observe_overlap_for_target(
-            pending_target,
-            overlap_required_ns,
-            extra_future_primary_owned,
-        );
+        #[rustfmt::skip] adaptive_buffering.observe_overlap_for_target(pending_target, overlap_required_ns, pipeline_snapshot.as_ref().is_some_and(|pipeline| pipeline.future_primary_depth() >= 2));
         let mut scheduler_decision = if explicit_output {
             let decision = frame_scheduler.decision_with_pipeline_diagnostics(
                 ExplicitAtomicSchedulerContext {
