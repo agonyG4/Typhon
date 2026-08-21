@@ -11,6 +11,7 @@ pub enum ProtocolGlobal {
     WpPointerWarp,
     WpRelativePointer,
     WpPointerConstraints,
+    WpCursorShape,
     WpIdleInhibit,
     WpKeyboardShortcutsInhibit,
     WpPrimarySelection,
@@ -42,6 +43,7 @@ impl ProtocolGlobal {
             Self::WpPointerWarp => "wp_pointer_warp_v1",
             Self::WpRelativePointer => "zwp_relative_pointer_manager_v1",
             Self::WpPointerConstraints => "zwp_pointer_constraints_v1",
+            Self::WpCursorShape => "wp_cursor_shape_manager_v1",
             Self::WpIdleInhibit => "zwp_idle_inhibit_manager_v1",
             Self::WpKeyboardShortcutsInhibit => "zwp_keyboard_shortcuts_inhibit_manager_v1",
             Self::WpPrimarySelection => "zwp_primary_selection_device_manager_v1",
@@ -66,6 +68,7 @@ pub struct InputProtocolCapabilities {
     pub relative_pointer: bool,
     pub pointer_constraints: bool,
     pub pointer_warp: bool,
+    pub cursor_shape: bool,
     pub keyboard_shortcuts_inhibit: bool,
     pub idle_inhibit: bool,
 }
@@ -76,6 +79,7 @@ impl InputProtocolCapabilities {
             relative_pointer: false,
             pointer_constraints: false,
             pointer_warp: false,
+            cursor_shape: true,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: false,
         }
@@ -86,6 +90,7 @@ impl InputProtocolCapabilities {
             relative_pointer: true,
             pointer_constraints: true,
             pointer_warp: true,
+            cursor_shape: true,
             keyboard_shortcuts_inhibit: true,
             idle_inhibit: true,
         }
@@ -305,6 +310,9 @@ pub fn client_protocols_for_capabilities_with_presentation(
     }
     if input_capabilities.relative_pointer {
         protocols.insert(insert_at, ProtocolGlobal::WpRelativePointer);
+    }
+    if input_capabilities.cursor_shape {
+        protocols.insert(insert_at, ProtocolGlobal::WpCursorShape);
     }
     if input_capabilities.idle_inhibit {
         protocols.insert(insert_at, ProtocolGlobal::WpIdleInhibit);

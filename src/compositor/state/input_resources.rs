@@ -196,6 +196,51 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn set_pointer_shape(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        shape: u32,
+    ) {
+        let Some(pointer_surface) = self.pointer_surface.as_ref() else {
+            return;
+        };
+        let focused_client = resource_belongs_to_surface_client(pointer, pointer_surface);
+        let exact_serial = self.pointer_has_current_enter_serial(pointer, serial, pointer_surface);
+        if !focused_client || !exact_serial {
+            pointer_debug_log("shape request ignored reason=invalid-focus-or-enter-serial");
+            return;
+        }
+        let resolves_pending_unlock = self
+            .pending_locked_pointer_reveal
+            .as_ref()
+            .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
+        let choice = ClientCursorChoice::Shape {
+            pointer: pointer.clone(),
+            shape,
+        };
+        let changed = self
+            .focused_client_cursor
+            .as_ref()
+            .is_none_or(|current| !current.is_same_as(&choice));
+        self.focused_client_cursor = Some(choice);
+        self.cursor_visibility.client_hidden_pointer = None;
+        self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
+        pointer_debug_log(format!(
+            "cursor request client_shape pointer={} shape={} serial={}",
+            pointer.id().protocol_id(),
+            shape,
+            serial
+        ));
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+        }
+        self.sync_cursor_visibility_request();
+        if resolves_pending_unlock {
+            self.finalize_pending_locked_pointer_reveal("client_shape_cursor");
+        }
+    }
+
     pub(in crate::compositor) fn is_cursor_surface(&self, surface_id: u32) -> bool {
         self.cursor_surface_ids.contains(&surface_id)
     }
@@ -236,6 +281,13 @@ impl CompositorState {
                 .focused_client_cursor
                 .as_ref()
                 .is_some_and(ClientCursorChoice::is_hidden)
+    }
+
+    pub(in crate::compositor) fn client_cursor_shape(&self) -> Option<u32> {
+        match self.focused_client_cursor.as_ref()? {
+            ClientCursorChoice::Shape { shape, .. } => Some(*shape),
+            ClientCursorChoice::Hidden { .. } | ClientCursorChoice::Surface(_) => None,
+        }
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {

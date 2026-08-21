@@ -979,6 +979,10 @@ impl OwnCompositorServer {
         self.state.client_cursor_explicitly_hidden()
     }
 
+    pub fn client_cursor_shape(&self) -> Option<u32> {
+        self.state.client_cursor_shape()
+    }
+
     pub fn cursor_visibility_requested(&self) -> bool {
         self.state.cursor_visibility.visible
     }

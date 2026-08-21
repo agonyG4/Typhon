@@ -3,6 +3,7 @@ mod advanced;
 mod buffers;
 mod commit_timing;
 mod core;
+pub(crate) mod cursor_shape;
 mod data_control;
 mod data_device;
 mod fifo;

@@ -156,6 +156,13 @@ pub(crate) const CORE_XDG_REQUEST_CONTRACTS: &[RequestContract] = &[
     ),
     contract!("wl_pointer", "set_cursor", 1, ProtocolError, "input_serial"),
     contract!(
+        "wp_cursor_shape_device_v1",
+        "set_shape",
+        1,
+        ProtocolError,
+        "pointer_cursor"
+    ),
+    contract!(
         "wl_pointer",
         "release",
         3,
@@ -530,6 +537,7 @@ pub(crate) const WP_COLOR_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_RELATIVE_POINTER_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_POINTER_CONSTRAINTS_V1: u32 = 1;
 pub(crate) const WP_POINTER_WARP_V1: u32 = 1;
+pub(crate) const WP_CURSOR_SHAPE_MANAGER_V1: u32 = 2;
 pub(crate) const ZWP_IDLE_INHIBIT_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1: u32 = 1;
@@ -571,6 +579,7 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     ),
     GlobalAdvertisement::new("zwp_pointer_constraints_v1", ZWP_POINTER_CONSTRAINTS_V1),
     GlobalAdvertisement::new("wp_pointer_warp_v1", WP_POINTER_WARP_V1),
+    GlobalAdvertisement::new("wp_cursor_shape_manager_v1", WP_CURSOR_SHAPE_MANAGER_V1),
     GlobalAdvertisement::new("zwp_idle_inhibit_manager_v1", ZWP_IDLE_INHIBIT_MANAGER_V1),
     GlobalAdvertisement::new(
         "zwp_keyboard_shortcuts_inhibit_manager_v1",
