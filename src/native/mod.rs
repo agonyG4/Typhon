@@ -1,6 +1,7 @@
 //! Native runtime event scheduling primitives.
 
 pub mod adaptive_buffering;
+pub mod buffering;
 pub mod control;
 pub mod drm;
 pub mod event_loop;
