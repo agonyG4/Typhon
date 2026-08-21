@@ -970,14 +970,14 @@ pub(crate) fn client_cursor_image(
     {
         return None;
     }
-    let geometry = crate::cursor_geometry::geometry_for_surface(
-        crate::cursor_geometry::CursorSize::new(source_size.width, source_size.height),
+    let geometry = oblivion_one::cursor_geometry::geometry_for_surface(
+        oblivion_one::cursor_geometry::CursorSize::new(source_size.width, source_size.height),
         surface.buffer_scale,
         surface.buffer_transform,
         surface
             .viewport_destination
-            .map(|size| crate::cursor_geometry::CursorSize::new(size.width, size.height)),
-        crate::cursor_geometry::CursorHotspot::new(hotspot_x, hotspot_y),
+            .map(|size| oblivion_one::cursor_geometry::CursorSize::new(size.width, size.height)),
+        oblivion_one::cursor_geometry::CursorHotspot::new(hotspot_x, hotspot_y),
         output_scale,
     )
     .ok()?;

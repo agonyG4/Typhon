@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use zbus::{
@@ -18,6 +21,8 @@ use crate::{
 pub const BACKEND_BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.oblivion";
 pub const BACKEND_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 pub const PORTAL_DESKTOP: &str = "OblivionOne";
+
+static NEXT_PORTAL_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortalSettingValue {
@@ -334,15 +339,30 @@ fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, contents)?;
-    fs::rename(temporary, path)
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT_PORTAL_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = fs::write(&temporary, contents) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor_persistence::CursorPersistenceError;
     use crate::cursor_theme::CursorConfiguration;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SETTINGS_ROOT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn notification_backend_tracks_add_and_remove() {
@@ -408,11 +428,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "typhon-portal-settings-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_SETTINGS_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
+        std::fs::create_dir(&root).expect("temporary configuration directory");
         let store = crate::cursor_persistence::CursorConfigurationStore::new(root.clone())
             .expect("temporary configuration store");
         let first = CursorConfiguration::new("default", 24).unwrap();
@@ -420,10 +438,23 @@ mod tests {
         store.write(&first).expect("first cursor configuration");
         let backend = SettingsBackend { store };
         assert_eq!(backend.configuration(), first);
-        backend
-            .store
-            .write(&second)
-            .expect("second cursor configuration");
+        let mut second_committed = false;
+        for attempt in 0..100 {
+            match backend.store.write(&second) {
+                Ok(_) => {
+                    second_committed = true;
+                    break;
+                }
+                Err(CursorPersistenceError::Busy) if attempt < 99 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("second cursor configuration: {error:?}"),
+            }
+        }
+        assert!(
+            second_committed,
+            "second cursor configuration remained busy"
+        );
         assert_eq!(backend.configuration(), second);
         let _ = std::fs::remove_dir_all(root);
     }

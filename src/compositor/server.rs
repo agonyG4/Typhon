@@ -6,6 +6,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+use super::astrea_shell_capability::test_capability_path;
 use super::astrea_shell_capability::{AstreaShellCapability, AstreaShellCapabilityVerifier};
 use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
 use super::protocols::versions;
@@ -296,12 +298,7 @@ impl OwnCompositorServer {
         let astrea_shell_capability = {
             #[cfg(test)]
             {
-                let path = std::env::temp_dir().join(format!(
-                    ".oblivion-one-test-capability-{}-{}",
-                    std::process::id(),
-                    socket_name
-                ));
-                AstreaShellCapability::create_for_path(path)?
+                AstreaShellCapability::create_for_path(test_capability_path(&socket_name))?
             }
             #[cfg(not(test))]
             {

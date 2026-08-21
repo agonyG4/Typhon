@@ -791,7 +791,7 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end_at_least(10_000);
+    let returned_out = pipe_read_end_at_least(input_raw + 1);
     let returned_out_raw = returned_out.as_raw_fd();
     assert_ne!(input_raw, returned_out_raw);
     std::mem::forget(returned_out);
@@ -863,7 +863,7 @@ fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end_at_least(10_000);
+    let returned_out = pipe_read_end_at_least(input_raw + 1);
     let returned_out_raw = returned_out.as_raw_fd();
     assert_ne!(input_raw, returned_out_raw);
     std::mem::forget(returned_out);

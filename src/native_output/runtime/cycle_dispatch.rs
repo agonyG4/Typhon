@@ -698,13 +698,12 @@ impl NativeRuntime {
             self.cursor_manager
                 .active_image_for_shape(self.server.compositor_cursor_shape())
         } else {
-            self.server.client_cursor_shape().map_or_else(
-                || {
-                    self.cursor_manager
-                        .active_image_for_shape(self.server.compositor_cursor_shape())
-                },
-                |shape| self.cursor_manager.active_image_for_protocol_shape(shape),
-            )
+            match self.server.client_cursor_shape() {
+                Some(shape) => self.cursor_manager.active_image_for_protocol_shape(shape),
+                None => self
+                    .cursor_manager
+                    .active_image_for_shape(self.server.compositor_cursor_shape()),
+            }
         };
         self.frame_renderer
             .set_cursor_image(self.cursor_image.clone());

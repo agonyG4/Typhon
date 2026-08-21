@@ -16,10 +16,10 @@ pub(super) fn synchronize_active_cursor_image(
     let image = if server.interaction_cursor_override_active() {
         cursor_manager.active_image_for_shape(server.compositor_cursor_shape())
     } else {
-        server.client_cursor_shape().map_or_else(
-            || cursor_manager.active_image_for_shape(server.compositor_cursor_shape()),
-            |shape| cursor_manager.active_image_for_protocol_shape(shape),
-        )
+        match server.client_cursor_shape() {
+            Some(shape) => cursor_manager.active_image_for_protocol_shape(shape),
+            None => cursor_manager.active_image_for_shape(server.compositor_cursor_shape()),
+        }
     };
     if !std::sync::Arc::ptr_eq(cursor_image, &image) {
         *cursor_image = image.clone();

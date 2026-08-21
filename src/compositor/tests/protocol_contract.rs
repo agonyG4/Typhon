@@ -177,6 +177,7 @@ fn core_xdg_request_contracts_are_classified_and_version_bounded() {
             "wl_seat" | "wl_pointer" | "wl_keyboard" => versions::WL_SEAT,
             "wl_output" => versions::WL_OUTPUT,
             "wl_subcompositor" | "wl_subsurface" => versions::WL_SUBCOMPOSITOR,
+            "wp_cursor_shape_device_v1" => versions::WP_CURSOR_SHAPE_MANAGER_V1,
             "xdg_wm_base" | "xdg_positioner" | "xdg_surface" | "xdg_toplevel" | "xdg_popup" => {
                 versions::XDG_WM_BASE
             }

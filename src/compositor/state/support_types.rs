@@ -296,7 +296,7 @@ mod pointer_debug_tests {
             48,
             64,
             2,
-            wl_output::Transform::Rot90,
+            wl_output::Transform::_90,
             32,
             24,
             Some((3, 4)),

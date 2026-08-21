@@ -2,9 +2,9 @@ use super::super::*;
 use wayland_protocols::wp::cursor_shape::v1::server::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
-use wayland_server::{GlobalDispatch, New, Resource};
+use wayland_server::{GlobalDispatch, New, Resource, WEnum};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub(crate) enum ProtocolCursorShape {
     Default = 1,
@@ -142,6 +142,12 @@ impl ProtocolCursorShape {
     }
 }
 
+fn protocol_cursor_shape_from_wire(
+    shape: WEnum<wp_cursor_shape_device_v1::Shape>,
+) -> Result<ProtocolCursorShape, ()> {
+    ProtocolCursorShape::try_from(u32::from(shape))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CursorShapeDeviceData {
     pointer: wl_pointer::WlPointer,
@@ -209,7 +215,7 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, CursorShapeDevic
         match request {
             wp_cursor_shape_device_v1::Request::Destroy => {}
             wp_cursor_shape_device_v1::Request::SetShape { serial, shape } => {
-                let Ok(shape) = ProtocolCursorShape::try_from(shape) else {
+                let Ok(shape) = protocol_cursor_shape_from_wire(shape) else {
                     state.post_protocol_error(
                         client,
                         resource,
@@ -249,7 +255,29 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, CursorShapeDevic
 
 #[cfg(test)]
 mod tests {
-    use super::ProtocolCursorShape;
+    use super::{ProtocolCursorShape, protocol_cursor_shape_from_wire};
+    use std::collections::HashSet;
+
+    #[test]
+    fn protocol_cursor_shape_can_be_used_as_a_cache_key() {
+        let mut shapes = HashSet::new();
+        shapes.insert(ProtocolCursorShape::Pointer);
+
+        assert!(shapes.contains(&ProtocolCursorShape::Pointer));
+    }
+
+    #[test]
+    fn protocol_cursor_shape_wire_values_preserve_known_and_unknown_values() {
+        let known: wayland_server::WEnum<
+            wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Shape,
+        > = 4_u32.into();
+
+        assert_eq!(
+            protocol_cursor_shape_from_wire(known),
+            Ok(ProtocolCursorShape::Pointer)
+        );
+        assert!(protocol_cursor_shape_from_wire(wayland_server::WEnum::Unknown(99_u32)).is_err());
+    }
 
     #[test]
     fn protocol_cursor_shape_accepts_all_version_two_values() {
