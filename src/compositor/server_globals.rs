@@ -2,7 +2,8 @@ use super::*;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
 use wayland_protocols::wp::{
     commit_timing::v1::server::wp_commit_timing_manager_v1,
-    content_type::v1::server::wp_content_type_manager_v1, fifo::v1::server::wp_fifo_manager_v1,
+    content_type::v1::server::wp_content_type_manager_v1,
+    cursor_shape::v1::server::wp_cursor_shape_manager_v1, fifo::v1::server::wp_fifo_manager_v1,
     keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibit_manager_v1,
     tearing_control::v1::server::wp_tearing_control_manager_v1,
 };
@@ -78,6 +79,13 @@ pub(super) fn register_minimum_globals(
             versions::WP_POINTER_WARP_V1,
             (),
         );
+    }
+    if input_capabilities.cursor_shape {
+        display.create_global::<
+            CompositorState,
+            wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+            _,
+        >(versions::WP_CURSOR_SHAPE_MANAGER_V1, ());
     }
     if input_capabilities.idle_inhibit {
         display.create_global::<

@@ -183,8 +183,9 @@ fn start_launcher_resolves_repo_when_invoked_through_installed_symlink() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized_stdout = stdout.replace("\\(", "(").replace("\\)", ")");
     assert!(
-        stdout.contains(&format!(
+        normalized_stdout.contains(&format!(
             "{}/target/release/oblivion-one",
             repo_dir.display()
         )),

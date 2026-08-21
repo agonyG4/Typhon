@@ -55,9 +55,9 @@ impl CompositorState {
 
     pub(in crate::compositor) fn unregister_pointer(&mut self, pointer: &wl_pointer::WlPointer) {
         let owned_active_cursor = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
-            .is_some_and(|active| same_wayland_resource(&active.pointer, pointer));
+            .is_some_and(|choice| same_wayland_resource(choice.pointer(), pointer));
         let owned_cursor_visibility = self
             .cursor_visibility
             .client_hidden_pointer
@@ -70,7 +70,7 @@ impl CompositorState {
                 .is_some_and(|owner| same_wayland_resource(owner, pointer));
         let preserve_client_cursor_claim = owned_active_cursor || owned_cursor_visibility;
         if owned_active_cursor {
-            self.active_client_cursor = None;
+            self.focused_client_cursor = None;
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
         if preserve_client_cursor_claim {
@@ -79,6 +79,9 @@ impl CompositorState {
             // or another live pointer supplies a replacement cursor.
             self.cursor_visibility.client_hidden_pointer = Some(pointer.clone());
             self.cursor_visibility.client_cursor_pointer = None;
+            self.focused_client_cursor = Some(ClientCursorChoice::Hidden {
+                pointer: pointer.clone(),
+            });
         }
         self.pointer_resources
             .retain(|resource| !same_wayland_resource(resource, pointer));
@@ -90,10 +93,12 @@ impl CompositorState {
             .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
         self.deactivate_pointer_constraints_for_pointer(pointer, false);
         if owned_active_cursor {
-            pointer_debug_log(format!(
-                "cursor cleanup pointer={} reason=owning-pointer-destroyed",
-                pointer.id().protocol_id()
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor cleanup pointer={} reason=owning-pointer-destroyed",
+                    pointer.id().protocol_id()
+                )
+            });
         }
         if preserve_client_cursor_claim {
             self.sync_cursor_visibility_request();
@@ -114,16 +119,18 @@ impl CompositorState {
         let focused_client = resource_belongs_to_surface_client(pointer, pointer_surface);
         let exact_serial = self.pointer_has_current_enter_serial(pointer, serial, pointer_surface);
         let valid = focused_client && exact_serial;
-        pointer_debug_log(format!(
-            "cursor request pointer={} client={} serial={} valid={} exact_serial={} focused_client={} null={}",
-            pointer.id().protocol_id(),
-            wayland_resource_client_label(pointer),
-            serial,
-            valid,
-            exact_serial,
-            focused_client,
-            surface.is_none()
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request pointer={} client={} serial={} valid={} exact_serial={} focused_client={} null={}",
+                pointer.id().protocol_id(),
+                wayland_resource_client_label(pointer),
+                serial,
+                valid,
+                exact_serial,
+                focused_client,
+                surface.is_none()
+            )
+        });
         if !valid {
             pointer_debug_log("cursor request ignored reason=invalid-focus-or-enter-serial");
             return;
@@ -133,7 +140,14 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
         let Some(surface) = surface else {
-            let changed = self.active_client_cursor.take().is_some();
+            let choice = ClientCursorChoice::Hidden {
+                pointer: pointer.clone(),
+            };
+            let changed = self
+                .focused_client_cursor
+                .as_ref()
+                .is_none_or(|current| !current.is_same_as(&choice));
+            self.focused_client_cursor = Some(choice);
             self.cursor_visibility.client_hidden_pointer = Some(pointer.clone());
             self.cursor_visibility.client_cursor_pointer = None;
             if changed {
@@ -147,43 +161,93 @@ impl CompositorState {
         };
         let surface_id = compositor_surface_id(&surface);
         if let Err(error) = self.assign_surface_role(surface_id, SurfaceRole::Cursor) {
-            pointer_debug_log(format!(
-                "cursor request rejected pointer={} surface={} reason={}",
-                pointer.id().protocol_id(),
-                surface_id,
-                error.message()
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor request rejected pointer={} surface={} reason={}",
+                    pointer.id().protocol_id(),
+                    surface_id,
+                    error.message()
+                )
+            });
             return;
         }
         self.cursor_surface_ids.insert(surface_id);
         self.unmap_surface_content(surface_id);
-        let changed = self.active_client_cursor.as_ref().is_none_or(|active| {
-            !same_wayland_resource(&active.pointer, pointer)
-                || active.surface_id != surface_id
-                || active.hotspot_x != hotspot_x
-                || active.hotspot_y != hotspot_y
-        });
-        self.active_client_cursor = Some(ActiveClientCursor {
+        let choice = ClientCursorChoice::Surface(ActiveClientCursor {
             pointer: pointer.clone(),
             surface_id,
             hotspot_x,
             hotspot_y,
         });
+        let changed = self
+            .focused_client_cursor
+            .as_ref()
+            .is_none_or(|current| !current.is_same_as(&choice));
+        self.focused_client_cursor = Some(choice);
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
-        pointer_debug_log(format!(
-            "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
-            pointer.id().protocol_id(),
-            surface_id,
-            hotspot_x,
-            hotspot_y
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
+                pointer.id().protocol_id(),
+                surface_id,
+                hotspot_x,
+                hotspot_y
+            )
+        });
         if changed {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
         self.sync_cursor_visibility_request();
         if resolves_pending_unlock {
             self.finalize_pending_locked_pointer_reveal("client_cursor_surface");
+        }
+    }
+
+    pub(in crate::compositor) fn set_pointer_shape(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        shape: u32,
+    ) {
+        let Some(pointer_surface) = self.pointer_surface.as_ref() else {
+            return;
+        };
+        let focused_client = resource_belongs_to_surface_client(pointer, pointer_surface);
+        let exact_serial = self.pointer_has_current_enter_serial(pointer, serial, pointer_surface);
+        if !focused_client || !exact_serial {
+            pointer_debug_log("shape request ignored reason=invalid-focus-or-enter-serial");
+            return;
+        }
+        let resolves_pending_unlock = self
+            .pending_locked_pointer_reveal
+            .as_ref()
+            .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
+        let choice = ClientCursorChoice::Shape {
+            pointer: pointer.clone(),
+            shape,
+        };
+        let changed = self
+            .focused_client_cursor
+            .as_ref()
+            .is_none_or(|current| !current.is_same_as(&choice));
+        self.focused_client_cursor = Some(choice);
+        self.cursor_visibility.client_hidden_pointer = None;
+        self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request client_shape pointer={} shape={} serial={}",
+                pointer.id().protocol_id(),
+                shape,
+                serial
+            )
+        });
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+        }
+        self.sync_cursor_visibility_request();
+        if resolves_pending_unlock {
+            self.finalize_pending_locked_pointer_reveal("client_shape_cursor");
         }
     }
 
@@ -203,7 +267,7 @@ impl CompositorState {
         if self.cursor_visibility.client_hidden_pointer.is_some() {
             return None;
         }
-        let active = self.active_client_cursor.as_ref()?;
+        let active = self.focused_client_cursor.as_ref()?.surface()?;
         let surface = self.client_cursor_surfaces.get(&active.surface_id)?;
         Some(ClientCursorRenderState {
             surface,
@@ -215,13 +279,25 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn active_client_cursor_has_content(&self) -> bool {
-        self.active_client_cursor
+        self.focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
     }
 
     pub(in crate::compositor) fn client_cursor_explicitly_hidden(&self) -> bool {
         self.cursor_visibility.client_hidden_pointer.is_some()
+            || self
+                .focused_client_cursor
+                .as_ref()
+                .is_some_and(ClientCursorChoice::is_hidden)
+    }
+
+    pub(in crate::compositor) fn client_cursor_shape(&self) -> Option<u32> {
+        match self.focused_client_cursor.as_ref()? {
+            ClientCursorChoice::Shape { shape, .. } => Some(*shape),
+            ClientCursorChoice::Hidden { .. } | ClientCursorChoice::Surface(_) => None,
+        }
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {

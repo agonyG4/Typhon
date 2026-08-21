@@ -66,6 +66,31 @@ missing or malformed pointer rejects the candidate. Shape transitions
 invalidate software cursor bounds and cause the atomic or legacy hardware path
 to rebuild its image even when the theme generation is unchanged.
 
+## GTK, Flatpak, and Wayland client interoperability
+
+Cursor size is a logical value. A client buffer is first converted with its
+`wl_surface` buffer scale and transform; output scale is applied once at
+presentation. The software renderer and native cursor-image conversion use
+the same geometry model. Viewport-scaled cursor surfaces remain on software
+composition until a complete viewport-aware native conversion is available.
+
+The `wp_cursor_shape_manager_v1` global is advertised at version 2 only when
+the input capability plan enables cursor shapes. Its pointer-device path
+validates the enum and serial, rejects version-2-only values on version 1,
+and replaces a surface cursor and a shape cursor through the same typed
+`ClientCursorChoice` state. Theme lookup is lazy, alias-bounded, memoized, and
+capped at 16 loaded protocol-shape images per theme generation; missing or
+malformed shapes reuse the loaded pointer image.
+
+The local Settings portal backend exposes the compatibility namespace
+`org.gnome.desktop.interface` with only `cursor-theme` (string) and
+`cursor-size` (signed 32-bit integer). Each `Read`/`ReadAll` request reads the
+canonical cursor configuration boundary; a read failure returns the validated
+default without writing it back. This namespace is an intentional GTK
+compatibility extension, not a claim that the keys are standardized by the
+XDG Settings portal. `SettingChanged` notifications for these keys remain
+pending Linux runtime qualification.
+
 ## Persistence
 
 The file is:
@@ -222,9 +247,13 @@ XCURSOR_SIZE=<desired logical size>
 ```
 
 Already-running Wayland clients that own their own cursor surfaces may continue
-to draw those surfaces and are not guaranteed to reload. M4 does not implement
-XSettings, desktop portals, wallpaper, Dock integration, window mutation,
-remote control, subscriptions, or multi-output cursor policy.
+to draw those surfaces and are not guaranteed to reload. Future supervised
+children receive `XCURSOR_THEME` and `XCURSOR_SIZE` only on their command
+environment; Typhon's process-global environment is unchanged. Flatpak and
+D-Bus activation inherit their own sandbox/session boundary and must be
+qualified separately. XSettings, wallpaper, Dock integration, window
+mutation, remote control, subscriptions, and multi-output cursor policy remain
+outside this closure.
 
 ## Errors and qualification
 
@@ -264,3 +293,18 @@ Verify movement, resize cursors, hide/show, hardware presentation when
 available, software fallback, suspend/resume, and persistence across a
 compositor restart. A qualification result should only be reported when a
 real running Typhon session was actually queried.
+
+The source/model checks cover logical buffer scaling, transforms and hotspots,
+fractional output scaling, software/native visual bounds, portal value types
+and request-time reads, mixed surface/shape ownership, invalid/inert shape
+requests, bounded shape caching, theme-generation invalidation, and command-
+local child environment scope. The following runtime checks are pending until
+a suitable Linux environment is used:
+
+```text
+NOT RUN — Linux target/environment required
+```
+
+That pending set includes DRM/KMS, libinput, native Wayland, GTK3, GTK4/
+Libadwaita, Flatpak GTK, D-Bus Settings reads, XWayland, Qt Wayland, Sober
+when available, hardware cursor presentation, and `SettingChanged` behavior.

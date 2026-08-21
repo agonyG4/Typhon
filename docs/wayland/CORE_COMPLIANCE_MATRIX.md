@@ -60,7 +60,29 @@ Core/XDG request matrix, but they must remain synchronized with
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
 | `wl_seat` | 8 | Implemented |
+| `wp_cursor_shape_manager_v1` | 2 | Implemented (pointer capability gated) |
 | `xwayland_shell_v1` | 1 | Implemented for the active private XWayland client |
+
+## Cursor-shape extension inventory
+
+The cursor-shape global is enabled only by the input capability plan. The
+pointer-device path is fully validated; tablet-tool creation remains outside
+the advertised input capabilities and is intentionally partial.
+
+| interface | advertised | request/event | XML since | dispatch owner | classification | status |
+|---|---:|---|---:|---|---|---|
+| `wp_cursor_shape_manager_v1` | 2 | request `destroy` | 1 | `protocols/cursor_shape.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
+| `wp_cursor_shape_manager_v1` | 2 | request `get_pointer` | 1 | `protocols/cursor_shape.rs` | Implemented | Implemented |
+| `wp_cursor_shape_manager_v1` | 2 | request `get_tablet_tool_v2` | 1 | `protocols/cursor_shape.rs` | CapabilityRejected | Partial |
+| `wp_cursor_shape_device_v1` | n/a | request `destroy` | 1 | `protocols/cursor_shape.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
+| `wp_cursor_shape_device_v1` | n/a | request `set_shape` | 1 | `protocols/cursor_shape.rs` | ProtocolError | Implemented |
+
+`set_shape` validates the shape enum, version-2-only values, pointer ownership,
+focus, and the latest pointer-enter serial. It shares replacement state with
+`wl_pointer.set_cursor`; invalid or stale requests do not mutate the current
+cursor choice. Deterministic source/model coverage is in
+`cursor_shape.rs`, the compositor plan tests, protocol contract tests, and the
+cursor ownership tests.
 
 ## Qualified frame-pacing extension inventory
 
@@ -294,6 +316,7 @@ the inventory.
 | `xdg_toplevel.wm_capabilities` | `state/windows.rs` | `xdg_toplevel_v5_receives_capabilities_before_initial_configure` | none | 5-6 | Implemented | only maximize/fullscreen are advertised |
 | `xdg_popup.reposition` | `protocols/xdg.rs` | `wayland_client_xdg_popup_reposition_sends_repositioned_and_reconfigures` | `xdg_wm_base.invalid_positioner` | 3-6 | Implemented | latest-request policy is deterministic |
 | `wl_pointer` axis metadata | `native_output/input/routing.rs`, `state/input_dispatch.rs` | `libinput_v120_conversion_uses_logical_steps_and_signed_remainders`, `libinput_v120_conversion_keeps_devices_and_axes_independent`, `libinput_v120_conversion_does_not_create_discrete_finger_or_continuous_steps`, `wl_pointer_v4_receives_only_legacy_axis_events`, `wayland_client_receives_pointer_axis_from_native_input_bridge` | none | 4-7 | Partial | logical v120 conversion and version/order semantics are deterministic; hardware-specific source/stop combinations still require native validation |
+| `wp_cursor_shape_device_v1.set_shape` | `protocols/cursor_shape.rs`, `state/input_resources.rs` | `protocol_cursor_shape_accepts_all_version_two_values`, cursor ownership/serial tests | `invalid_shape` | 2 | Implemented | pointer path is source/model verified; tablet-tool and native GTK qualification remain pending |
 | compliance request fallback | `state_data.rs`, `protocols/*.rs` | `unhandled_request_classification_is_explicit`, `core_xdg_request_contracts_are_classified_and_version_bounded` | none | advertised bounds | Implemented | future/generated fallbacks are classified explicitly; a supported fallback increments `supported_request_unhandled_total` |
 
 `configure_bounds` is `Not applicable`: Typhon deliberately does not

@@ -173,6 +173,7 @@ use super::{
     shm::{ShmBufferData, invalid_buffer_for_cpu_read, invalid_shm_buffer},
 };
 use crate::compositor::{WindowConstraints, WindowId};
+use crate::cursor_geometry::logical_size;
 
 pub(super) type ToplevelSizeConstraints = WindowConstraints;
 
@@ -676,10 +677,6 @@ impl SurfaceData {
             })
             .unwrap_or(true)
     }
-}
-
-fn transform_swaps_dimensions(transform: wl_output::Transform) -> bool {
-    matches!(transform as i32, 1 | 3 | 5 | 7)
 }
 
 fn convert_pending_damage(
@@ -1204,18 +1201,14 @@ impl PendingSurfaceBuffer {
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
     ) -> io::Result<BufferSize> {
-        let buffer_scale = buffer_scale.max(1);
-        let (buffer_width, buffer_height) = if transform_swaps_dimensions(buffer_transform) {
-            (self.data.height()?, self.data.width()?)
-        } else {
-            (self.data.width()?, self.data.height()?)
-        };
-        if buffer_width % buffer_scale != 0 || buffer_height % buffer_scale != 0 {
-            return Err(invalid_shm_buffer());
-        }
-        let width = buffer_width / buffer_scale;
-        let height = buffer_height / buffer_scale;
-        BufferSize::new(width, height).ok_or_else(invalid_shm_buffer)
+        let size = logical_size(
+            self.data.width()?,
+            self.data.height()?,
+            buffer_scale,
+            buffer_transform,
+        )
+        .map_err(|_| invalid_shm_buffer())?;
+        BufferSize::new(size.width, size.height).ok_or_else(invalid_shm_buffer)
     }
 
     pub(super) fn to_renderable_surface(

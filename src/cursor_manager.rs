@@ -1,5 +1,6 @@
 //! Runtime-owned cursor configuration, loading, publication, and retirement.
 
+use crate::compositor::ProtocolCursorShape;
 use crate::control_snapshots::{
     CursorAssetSource, CursorBackendSnapshot, CursorConfigSource, CursorPersistenceSnapshot,
     CursorSnapshot,
@@ -7,9 +8,9 @@ use crate::control_snapshots::{
 use crate::cursor_persistence::{CursorConfigurationStore, CursorPersistenceError};
 use crate::cursor_theme::{
     CompositorCursorImage, CompositorCursorShape, CursorConfiguration, CursorShapeImages,
-    CursorThemeLoadError, default_cursor_configuration,
+    CursorThemeLoadError, default_cursor_configuration, load_protocol_shape_image,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use std::thread::{self, JoinHandle};
 
 const INITIAL_CURSOR_GENERATION: u64 = 1;
 const MAX_RETIRED_GENERATIONS: usize = 16;
+const MAX_PROTOCOL_CURSOR_SHAPES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorManagerError {
@@ -157,6 +159,8 @@ pub struct CursorThemeManager {
     store: Option<CursorConfigurationStore>,
     loader: Option<Box<dyn CursorThemeLoader>>,
     retired: VecDeque<RetiredCursorGeneration>,
+    protocol_shape_cache: HashMap<ProtocolCursorShape, Arc<CompositorCursorImage>>,
+    protocol_shape_fallbacks: HashSet<ProtocolCursorShape>,
     diagnostics: CursorDiagnostics,
 }
 
@@ -178,6 +182,8 @@ impl CursorThemeManager {
             store: Some(store),
             loader: Some(loader),
             retired: VecDeque::new(),
+            protocol_shape_cache: HashMap::new(),
+            protocol_shape_fallbacks: HashSet::new(),
             diagnostics: CursorDiagnostics::default(),
         }
     }
@@ -328,6 +334,43 @@ impl CursorThemeManager {
         shape: CompositorCursorShape,
     ) -> Arc<CompositorCursorImage> {
         self.active.image(shape)
+    }
+
+    pub fn active_image_for_protocol_shape(
+        &mut self,
+        shape_value: u32,
+    ) -> Arc<CompositorCursorImage> {
+        let pointer = self.active_image();
+        let Ok(shape) = ProtocolCursorShape::try_from(shape_value) else {
+            return pointer;
+        };
+        if let Some(image) = self.protocol_shape_cache.get(&shape) {
+            return image.clone();
+        }
+        if self.protocol_shape_fallbacks.contains(&shape) {
+            return pointer;
+        }
+        let image = load_protocol_shape_image(
+            &self.active.configuration.theme,
+            self.active.configuration.size_px,
+            shape,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| pointer.clone());
+        if Arc::ptr_eq(&image, &pointer)
+            || self.protocol_shape_cache.len() >= MAX_PROTOCOL_CURSOR_SHAPES
+        {
+            self.protocol_shape_fallbacks.insert(shape);
+        } else {
+            self.protocol_shape_cache.insert(shape, image.clone());
+        }
+        image
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_shape_cache_len(&self) -> usize {
+        self.protocol_shape_cache.len()
     }
 
     pub const fn asset_source(&self) -> CursorAssetSource {
@@ -633,6 +676,8 @@ impl CursorThemeManager {
         self.source = source;
         self.persistence = persistence;
         self.generation = self.generation.saturating_add(1);
+        self.protocol_shape_cache.clear();
+        self.protocol_shape_fallbacks.clear();
         match kind {
             CursorMutationKind::Theme => {
                 self.diagnostics.successful_theme_changes =
@@ -1063,6 +1108,35 @@ fn map_persistence_error(error: CursorPersistenceError) -> CursorManagerError {
 mod tests {
     use super::*;
 
+    struct TestLoader;
+
+    impl CursorThemeLoader for TestLoader {
+        fn load(
+            &mut self,
+            configuration: &CursorConfiguration,
+        ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
+            Ok(LoadedCursorTheme::new(
+                configuration.clone(),
+                Arc::new(CompositorCursorImage::builtin_fallback()),
+            ))
+        }
+    }
+
+    fn test_manager() -> CursorThemeManager {
+        let configuration = CursorConfiguration::new("default", 24).unwrap();
+        CursorThemeManager::new(
+            configuration.clone(),
+            LoadedCursorTheme::new(
+                configuration,
+                Arc::new(CompositorCursorImage::builtin_fallback()),
+            ),
+            CursorConfigSource::Default,
+            CursorPersistenceSnapshot::Missing,
+            CursorConfigurationStore::unavailable(CursorPersistenceError::Missing),
+            Box::new(TestLoader),
+        )
+    }
+
     #[test]
     fn notification_retries_interrupted_writes_and_accepts_a_full_eventfd() {
         let mut calls = 0;
@@ -1114,5 +1188,43 @@ mod tests {
         let result = drain_eventfd_with(|_| Ok(std::mem::size_of::<u64>() - 1));
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn protocol_shape_cache_is_bounded() {
+        let mut manager = test_manager();
+
+        for shape in 1..=36 {
+            let _ = manager.active_image_for_protocol_shape(shape);
+        }
+
+        assert!(manager.protocol_shape_cache_len() <= MAX_PROTOCOL_CURSOR_SHAPES);
+        assert!(manager.protocol_shape_cache_len() <= 36);
+    }
+
+    #[test]
+    fn theme_generation_replaces_protocol_shape_cache() {
+        let mut manager = test_manager();
+        manager.protocol_shape_cache.insert(
+            ProtocolCursorShape::Pointer,
+            Arc::new(CompositorCursorImage::builtin_fallback()),
+        );
+        assert_eq!(manager.protocol_shape_cache_len(), 1);
+
+        manager
+            .reload_with(CursorConfiguration::new("default", 24).unwrap())
+            .unwrap();
+
+        assert_eq!(manager.protocol_shape_cache_len(), 0);
+    }
+
+    #[test]
+    fn missing_protocol_shape_falls_back_to_pointer() {
+        let mut manager = test_manager();
+        let pointer = manager.active_image();
+
+        let image = manager.active_image_for_protocol_shape(0);
+
+        assert!(Arc::ptr_eq(&image, &pointer));
     }
 }

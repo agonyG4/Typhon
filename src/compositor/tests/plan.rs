@@ -13,6 +13,7 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
         "wp_viewporter",
         "wp_fractional_scale_manager_v1",
         "wp_presentation",
+        "wp_cursor_shape_manager_v1",
         "zxdg_decoration_manager_v1",
         "zwp_linux_dmabuf_v1",
         "wp_linux_drm_syncobj_manager_v1",
@@ -101,6 +102,7 @@ fn protocol_capability_policy_does_not_duplicate_globals() {
             relative_pointer: true,
             pointer_constraints: true,
             pointer_warp: true,
+            cursor_shape: false,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: true,
         },
@@ -122,6 +124,7 @@ fn protocol_capability_policy_does_not_duplicate_globals() {
             "duplicated global {name}"
         );
     }
+    assert!(!names.contains(&"wp_cursor_shape_manager_v1"));
 }
 
 #[test]

@@ -862,12 +862,15 @@ impl CompositorState {
         self.cursor_surface_ids.remove(&surface_id);
         let removed_cursor_content = self.client_cursor_surfaces.remove(&surface_id).is_some();
         let active_cursor_pointer = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .map(|active| active.pointer.clone());
         if let Some(pointer) = active_cursor_pointer {
-            self.active_client_cursor = None;
+            self.focused_client_cursor = Some(ClientCursorChoice::Hidden {
+                pointer: pointer.clone(),
+            });
             self.cursor_visibility.client_cursor_pointer = None;
             self.cursor_visibility.client_hidden_pointer = Some(pointer);
             pointer_debug_log(format!(

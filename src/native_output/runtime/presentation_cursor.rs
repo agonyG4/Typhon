@@ -13,7 +13,14 @@ pub(super) fn synchronize_active_cursor_image(
     queued_redraw_requested: &mut bool,
 ) {
     cursor_manager.collect_retired_generations();
-    let image = cursor_manager.active_image_for_shape(server.compositor_cursor_shape());
+    let image = if server.interaction_cursor_override_active() {
+        cursor_manager.active_image_for_shape(server.compositor_cursor_shape())
+    } else {
+        match server.client_cursor_shape() {
+            Some(shape) => cursor_manager.active_image_for_protocol_shape(shape),
+            None => cursor_manager.active_image_for_shape(server.compositor_cursor_shape()),
+        }
+    };
     if !std::sync::Arc::ptr_eq(cursor_image, &image) {
         *cursor_image = image.clone();
         frame_renderer.set_cursor_image(image.clone());
@@ -71,8 +78,10 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
     let theme_cursor_visible = input_state.cursor_visible();
     let client_cursor = server.client_cursor_render_state();
     let client_cursor_active = client_cursor.is_some();
+    let client_shape_active =
+        !server.interaction_cursor_override_active() && server.client_cursor_shape().is_some();
     let resolved_cursor_source = resolve_native_cursor_source_with_hidden(
-        client_cursor_active,
+        client_cursor_active || client_shape_active,
         server.client_cursor_explicitly_hidden(),
         server.interaction_cursor_override_active(),
         theme_cursor_visible,
@@ -143,15 +152,22 @@ pub(super) fn prepare_cursor_image(
     perf: NativePerfLogger,
 ) -> bool {
     if let Some(client) = client_cursor {
-        let source_key =
-            NativeCursorImageKey::for_surface(client.surface, client.hotspot_x, client.hotspot_y);
+        let source_key = NativeCursorImageKey::for_surface_at_output_scale(
+            client.surface,
+            client.hotspot_x,
+            client.hotspot_y,
+            cursor.output_scale_milli(),
+        );
         let image_ready = if cursor.client_image_matches(source_key) {
             true
         } else if cursor.client_image_failure_matches(source_key) {
             false
-        } else if let Some(image) =
-            client_cursor_image(client.surface, client.hotspot_x, client.hotspot_y)
-        {
+        } else if let Some(image) = client_cursor_image(
+            client.surface,
+            client.hotspot_x,
+            client.hotspot_y,
+            cursor.output_scale(),
+        ) {
             match cursor.replace_image(kms.file(), image, source_key) {
                 Ok(()) => true,
                 Err(_) => {
@@ -164,14 +180,20 @@ pub(super) fn prepare_cursor_image(
             false
         };
         if image_ready {
-            let x = client
-                .logical_x
-                .saturating_add(client.surface.x)
-                .saturating_add(client.hotspot_x);
-            let y = client
-                .logical_y
-                .saturating_add(client.surface.y)
-                .saturating_add(client.hotspot_y);
+            let x = oblivion_one::compositor::scale_logical_coordinate(
+                client
+                    .logical_x
+                    .saturating_add(client.surface.x)
+                    .saturating_add(client.hotspot_x),
+                cursor.output_scale(),
+            );
+            let y = oblivion_one::compositor::scale_logical_coordinate(
+                client
+                    .logical_y
+                    .saturating_add(client.surface.y)
+                    .saturating_add(client.hotspot_y),
+                cursor.output_scale(),
+            );
             cursor.set_position(x, y);
         }
         image_ready

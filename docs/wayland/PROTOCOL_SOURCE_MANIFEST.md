@@ -55,7 +55,7 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
   libinput device and horizontal/vertical axis for legacy
   `wl_pointer.axis_discrete` clients (120 units equals one step).
 
-### Stable and already-advertised extension XML
+### Stable, staging, and already-advertised extension XML
 
 - `xdg-shell`: `wayland-protocols-0.32.12/protocols/stable/xdg-shell/xdg-shell.xml`
 - `viewporter`: `wayland-protocols-0.32.12/protocols/stable/viewporter/viewporter.xml`
@@ -66,6 +66,7 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 - `linux-drm-syncobj`: `wayland-protocols-0.32.12/protocols/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml`
 - `pointer-warp`: `wayland-protocols-0.32.12/protocols/staging/pointer-warp/pointer-warp-v1.xml`
 - `xdg-activation`: `wayland-protocols-0.32.12/protocols/staging/xdg-activation/xdg-activation-v1.xml`
+- `cursor-shape`: `wayland-protocols-0.32.12/protocols/staging/cursor-shape/cursor-shape-v1.xml`
 - `pointer-constraints`: `wayland-protocols-0.32.12/protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml`
 - `relative-pointer`: `wayland-protocols-0.32.12/protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml`
 - `primary-selection`: `wayland-protocols-0.32.12/protocols/unstable/primary-selection/primary-selection-unstable-v1.xml`
@@ -93,6 +94,7 @@ Typhon’s local generated protocols are invoked from:
 | stable `viewporter.xml` | `dcb12279a03746301fe490aaed4b38a403485a925abfce2ccfceb644e104fe71` |
 | stable `presentation-time.xml` | `dffac93bcb2bb1d8c385e72b8a8c2c0d4d79a336866322f3ba886dce2b27b1e2` |
 | stable `linux-dmabuf-v1.xml` | `ef39de11196083a41e865737f71e89a9ce3d61b94d2dbbed9b156cd89d6bb97f` |
+| staging `cursor-shape-v1.xml` | `bb57d91e53a79dadab7c612dab87c233393cee73673feefa7442cfbfdd9aed2f` |
 | WLR `wlr-layer-shell-unstable-v1.xml` | `87e0b9c837aecd6977f76f3c47d73088b7159871f5d979dc1840f6cadb5e2ed8` |
 | Astrea `astrea-toplevel-management-v1.xml` | `e693df18b4da304378bf2e1f1a681a278ad25439c205a407303563e3f182f237` |
 
@@ -152,6 +154,7 @@ The target contract is:
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `wl_seat` | 8 | always |
+| `wp_cursor_shape_manager_v1` | 2 | cursor-shape input capability |
 | `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |
 | `wp_fifo_manager_v1` | 1 | qualified native frame-pacing capability |
 | `wp_commit_timing_manager_v1` | 1 | qualified native frame-pacing capability |
@@ -186,6 +189,16 @@ No version is upgraded by this milestone.
   fixed seed and operation index.
 
 ## Deliberate compositor-policy choices
+
+- The cursor-shape manager is advertised at version 2 only when
+  `InputProtocolCapabilities.cursor_shape` is enabled. Typhon implements the
+  pointer-device path, including enum/serial/focus validation and replacement
+  with `wl_pointer.set_cursor`; tablet-tool creation is not advertised as a
+  capability.
+- The portal's `org.gnome.desktop.interface` cursor keys are an intentional
+  compatibility namespace for GTK clients. They are not presented here as a
+  standardized XDG Settings schema, and live `SettingChanged` notification
+  qualification remains pending on Linux.
 
 - Typhon remains single-output. The current output geometry/mode/scale/name/
   description and `done` policy is preserved; no `OutputId` or hotplug model

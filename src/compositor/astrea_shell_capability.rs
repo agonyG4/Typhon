@@ -12,6 +12,16 @@ pub(crate) const ASTREA_SHELL_CAPABILITY_FILE_ENV: &str = "ASTREA_SHELL_CAPABILI
 const CAPABILITY_BYTES: usize = 32;
 const CAPABILITY_HEX_BYTES: usize = CAPABILITY_BYTES * 2;
 
+#[cfg(test)]
+pub(crate) fn test_capability_path(socket_name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "oblivion-one-test-capabilities-{}",
+            std::process::id()
+        ))
+        .join(format!("capability-{socket_name}"))
+}
+
 pub(crate) struct AstreaShellCapability {
     value: [u8; CAPABILITY_HEX_BYTES],
     path: PathBuf,
