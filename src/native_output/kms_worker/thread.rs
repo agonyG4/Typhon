@@ -763,7 +763,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         let now_ns = monotonic_now_ns();
         let planned_worker_wake_at = job.submit_window.worker_wake_at_ns();
-        let actual_worker_wait_returned_at = if planned_worker_wake_at > now_ns {
+        let wait_armed = planned_worker_wake_at > now_ns;
+        let actual_worker_wait_returned_at = if wait_armed {
             let Some(returned_at) = wait_until_or_quiesce(&shared, planned_worker_wake_at) else {
                 drop(executing);
                 quiesce_with_jobs(&shared, vec![job]);
@@ -773,7 +774,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         } else {
             now_ns
         };
-        if actual_worker_wait_returned_at > planned_worker_wake_at {
+        if wait_armed && actual_worker_wait_returned_at > planned_worker_wake_at {
             shared
                 .metrics
                 .late_wakeups
@@ -921,8 +922,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .submit_duration_ns_max
                         .fetch_max(submit_duration_ns, std::sync::atomic::Ordering::Relaxed);
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
-                    let submit_wake_lateness_ns =
-                        actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at);
+                    let submit_wake_lateness_ns = wait_armed
+                        .then(|| {
+                            actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at)
+                        })
+                        .unwrap_or(0);
                     let pre_submit_duration_ns =
                         pre_submit_completed_at.saturating_sub(pre_submit_started_at);
                     let dispatch_duration_ns =
