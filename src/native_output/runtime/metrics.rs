@@ -1,4 +1,4 @@
-use super::planner::visual_target_deadline_for_mode;
+use super::planner::visual_target_deadline_for_target;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
 use crate::native_output::{
@@ -278,6 +278,13 @@ impl NativeRuntime {
                 future_primary_credit: self.adaptive_buffering.future_primary_credit(),
                 extra_credit_grants: self.adaptive_buffering.extra_credit_grants(),
                 extra_credit_revokes: self.adaptive_buffering.extra_credit_revokes(),
+                o1_credit2_useful_hits: buffering.o1_credit2_useful_hits,
+                o1_credit2_unnecessary_hits: buffering.o1_credit2_unnecessary_hits,
+                o1_credit2_ineffective_misses: buffering.o1_credit2_ineffective_misses,
+                o1_credit2_granted_not_consumed: buffering.o1_credit2_granted_not_consumed,
+                o1_credit2_drain_events: buffering.o1_credit2_drain_events,
+                o1_credit2_refill_suppressed_while_draining: buffering
+                    .o1_credit2_refill_suppressed_while_draining,
                 pre_render_abandoned: self.presentation_deadline.pre_render_abandoned(),
                 predicted_render_ready_service_ns: service_prediction
                     .main_event_loop_wake_guard_ns
@@ -1156,10 +1163,7 @@ impl NativeRuntime {
             fields
         });
         let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
-        let visual_deadline = visual_target_deadline_for_mode(
-            self.adaptive_buffering.pacing_mode(),
-            self.scheduled_presentation_target,
-        );
+        let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
         let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
         let now_ns = monotonic_now_ns()?;
         self.frame_pacing.note_deadline_state(

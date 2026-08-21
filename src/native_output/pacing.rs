@@ -398,7 +398,8 @@ use std::sync::{
     mpsc::{SyncSender, sync_channel},
 };
 use std::thread;
-
+#[path = "pacing_o1.rs"]
+mod pacing_o1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NativeOutputFrameId(u64);
 
@@ -407,7 +408,6 @@ impl NativeOutputFrameId {
         self.0
     }
 }
-
 #[derive(Debug)]
 pub(crate) struct NativeOutputFrameIdSequence {
     next: u64,
@@ -682,6 +682,13 @@ pub(crate) struct NativeFramePacing {
     pub(crate) adaptive_triple_entries_proven_submit_miss: u64,
     pub(crate) adaptive_triple_entries_proven_presentation_miss: u64,
     pub(crate) adaptive_triple_exits: u64,
+    pub(crate) o1_credit2_useful_hits: u64,
+    pub(crate) o1_credit2_unnecessary_hits: u64,
+    pub(crate) o1_credit2_ineffective_misses: u64,
+    pub(crate) o1_credit2_granted_not_consumed: u64,
+    pub(crate) o1_credit2_drain_events: u64,
+    pub(crate) o1_credit2_refill_suppressed_while_draining: u64,
+    o1_credit2_pending_grant: bool,
     pub(crate) sync_file_info_exact: u64,
     pub(crate) sync_file_info_approximate: u64,
     pipeline_waits: [u64; 10],
@@ -730,6 +737,12 @@ pub(crate) struct NativeBufferingMetrics {
     pub(crate) triple_entries_submit_miss: u64,
     pub(crate) triple_entries_presentation_miss: u64,
     pub(crate) triple_exits: u64,
+    pub(crate) o1_credit2_useful_hits: u64,
+    pub(crate) o1_credit2_unnecessary_hits: u64,
+    pub(crate) o1_credit2_ineffective_misses: u64,
+    pub(crate) o1_credit2_granted_not_consumed: u64,
+    pub(crate) o1_credit2_drain_events: u64,
+    pub(crate) o1_credit2_refill_suppressed_while_draining: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -785,6 +798,13 @@ impl NativeFramePacing {
             adaptive_triple_entries_proven_submit_miss: 0,
             adaptive_triple_entries_proven_presentation_miss: 0,
             adaptive_triple_exits: 0,
+            o1_credit2_useful_hits: 0,
+            o1_credit2_unnecessary_hits: 0,
+            o1_credit2_ineffective_misses: 0,
+            o1_credit2_granted_not_consumed: 0,
+            o1_credit2_drain_events: 0,
+            o1_credit2_refill_suppressed_while_draining: 0,
+            o1_credit2_pending_grant: false,
             sync_file_info_exact: 0,
             sync_file_info_approximate: 0,
             pipeline_waits: [0; 10],
@@ -843,6 +863,9 @@ impl NativeFramePacing {
     ) {
         if !self.enabled {
             return;
+        }
+        if render_ahead {
+            self.o1_credit2_pending_grant = false;
         }
         match (pacing_mode, render_ahead) {
             (NativeOutputPacingMode::ReactiveDouble, false) => {
@@ -1290,6 +1313,13 @@ impl NativeFramePacing {
             triple_entries_submit_miss: self.adaptive_triple_entries_proven_submit_miss,
             triple_entries_presentation_miss: self.adaptive_triple_entries_proven_presentation_miss,
             triple_exits: self.adaptive_triple_exits,
+            o1_credit2_useful_hits: self.o1_credit2_useful_hits,
+            o1_credit2_unnecessary_hits: self.o1_credit2_unnecessary_hits,
+            o1_credit2_ineffective_misses: self.o1_credit2_ineffective_misses,
+            o1_credit2_granted_not_consumed: self.o1_credit2_granted_not_consumed,
+            o1_credit2_drain_events: self.o1_credit2_drain_events,
+            o1_credit2_refill_suppressed_while_draining: self
+                .o1_credit2_refill_suppressed_while_draining,
         }
     }
 

@@ -294,8 +294,12 @@ impl NativeRuntime {
                 };
                 if let Some(miss) = observed_miss {
                     pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
+                    let desired_credit_before = adaptive_buffering.desired_credit();
                     let buffering_mode_before = adaptive_buffering.mode();
                     adaptive_buffering.observe_o1_outcome(Some(miss));
+                    if desired_credit_before == 1 && adaptive_buffering.desired_credit() == 2 {
+                        frame_pacing.note_o1_credit2_grant();
+                    }
                     frame_pacing.note_adaptive_transition(
                         buffering_mode_before,
                         adaptive_buffering.mode(),
@@ -997,12 +1001,21 @@ impl NativeRuntime {
                             proven_miss = classified_miss;
                         }
                     }
+                    let desired_credit_before = adaptive_buffering.desired_credit();
                     let buffering_mode_before = adaptive_buffering.mode();
                     adaptive_buffering.observe_o1_outcome(proven_miss);
+                    if desired_credit_before == 1 && adaptive_buffering.desired_credit() == 2 {
+                        frame_pacing.note_o1_credit2_grant();
+                    }
                     frame_pacing.note_adaptive_transition(
                         buffering_mode_before,
                         adaptive_buffering.mode(),
                         proven_miss,
+                    );
+                    frame_pacing.note_o1_credit2_outcome(
+                        frame.target.reason,
+                        adaptive_buffering.last_overlap_required_ns(),
+                        proven_miss.is_none(),
                     );
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
                         planned_sequence: frame.target.sequence,
