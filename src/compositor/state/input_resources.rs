@@ -93,10 +93,12 @@ impl CompositorState {
             .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
         self.deactivate_pointer_constraints_for_pointer(pointer, false);
         if owned_active_cursor {
-            pointer_debug_log(format!(
-                "cursor cleanup pointer={} reason=owning-pointer-destroyed",
-                pointer.id().protocol_id()
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor cleanup pointer={} reason=owning-pointer-destroyed",
+                    pointer.id().protocol_id()
+                )
+            });
         }
         if preserve_client_cursor_claim {
             self.sync_cursor_visibility_request();
@@ -117,16 +119,18 @@ impl CompositorState {
         let focused_client = resource_belongs_to_surface_client(pointer, pointer_surface);
         let exact_serial = self.pointer_has_current_enter_serial(pointer, serial, pointer_surface);
         let valid = focused_client && exact_serial;
-        pointer_debug_log(format!(
-            "cursor request pointer={} client={} serial={} valid={} exact_serial={} focused_client={} null={}",
-            pointer.id().protocol_id(),
-            wayland_resource_client_label(pointer),
-            serial,
-            valid,
-            exact_serial,
-            focused_client,
-            surface.is_none()
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request pointer={} client={} serial={} valid={} exact_serial={} focused_client={} null={}",
+                pointer.id().protocol_id(),
+                wayland_resource_client_label(pointer),
+                serial,
+                valid,
+                exact_serial,
+                focused_client,
+                surface.is_none()
+            )
+        });
         if !valid {
             pointer_debug_log("cursor request ignored reason=invalid-focus-or-enter-serial");
             return;
@@ -157,12 +161,14 @@ impl CompositorState {
         };
         let surface_id = compositor_surface_id(&surface);
         if let Err(error) = self.assign_surface_role(surface_id, SurfaceRole::Cursor) {
-            pointer_debug_log(format!(
-                "cursor request rejected pointer={} surface={} reason={}",
-                pointer.id().protocol_id(),
-                surface_id,
-                error.message()
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor request rejected pointer={} surface={} reason={}",
+                    pointer.id().protocol_id(),
+                    surface_id,
+                    error.message()
+                )
+            });
             return;
         }
         self.cursor_surface_ids.insert(surface_id);
@@ -180,13 +186,15 @@ impl CompositorState {
         self.focused_client_cursor = Some(choice);
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
-        pointer_debug_log(format!(
-            "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
-            pointer.id().protocol_id(),
-            surface_id,
-            hotspot_x,
-            hotspot_y
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
+                pointer.id().protocol_id(),
+                surface_id,
+                hotspot_x,
+                hotspot_y
+            )
+        });
         if changed {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
@@ -226,12 +234,14 @@ impl CompositorState {
         self.focused_client_cursor = Some(choice);
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
-        pointer_debug_log(format!(
-            "cursor request client_shape pointer={} shape={} serial={}",
-            pointer.id().protocol_id(),
-            shape,
-            serial
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "cursor request client_shape pointer={} shape={} serial={}",
+                pointer.id().protocol_id(),
+                shape,
+                serial
+            )
+        });
         if changed {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }

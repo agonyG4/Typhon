@@ -136,6 +136,26 @@ pub(in crate::compositor) fn pointer_debug_log_lazy(message: impl FnOnce() -> St
     }
 }
 
+pub(in crate::compositor) fn cursor_geometry_debug_message(
+    event: &str,
+    client: &str,
+    surface_id: u32,
+    source: &str,
+    buffer_width: u32,
+    buffer_height: u32,
+    buffer_scale: u32,
+    transform: wl_output::Transform,
+    logical_width: u32,
+    logical_height: u32,
+    hotspot: Option<(i32, i32)>,
+    viewport_destination: Option<BufferSize>,
+    output_scale: f64,
+) -> String {
+    format!(
+        "cursor surface commit event={event} client={client} surface={surface_id} source={source} buffer={buffer_width}x{buffer_height} buffer_scale={buffer_scale} transform={transform:?} logical={logical_width}x{logical_height} hotspot={hotspot:?} viewport_destination={viewport_destination:?} output_scale={output_scale:.3}"
+    )
+}
+
 impl RelativeMotionDebugState {
     pub(in crate::compositor) fn note_dispatch(&mut self, message: impl FnOnce() -> String) {
         self.dispatch_total = self.dispatch_total.saturating_add(1);
@@ -264,5 +284,31 @@ mod pointer_debug_tests {
 
         assert_eq!(message, None);
         assert!(!formatted.get());
+    }
+
+    #[test]
+    fn enabled_cursor_geometry_diagnostic_contains_scaling_inputs() {
+        let message = cursor_geometry_debug_message(
+            "published",
+            "client-7",
+            42,
+            "shm",
+            48,
+            64,
+            2,
+            wl_output::Transform::Rot90,
+            32,
+            24,
+            Some((3, 4)),
+            None,
+            1.25,
+        );
+
+        assert!(message.contains("client=client-7"));
+        assert!(message.contains("buffer=48x64"));
+        assert!(message.contains("buffer_scale=2"));
+        assert!(message.contains("logical=32x24"));
+        assert!(message.contains("hotspot=Some((3, 4))"));
+        assert!(message.contains("output_scale=1.250"));
     }
 }

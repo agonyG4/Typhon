@@ -306,6 +306,26 @@ mod tests {
     }
 
     #[test]
+    fn unspecialized_supervised_child_does_not_receive_cursor_overrides() {
+        let child = compositor_app_command_with_policy_and_xwayland_and_cursor(
+            "oblivion-one-test",
+            &["true".to_string()],
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("command should be created");
+        let env = child
+            .get_envs()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(env.get("XCURSOR_THEME"), None);
+        assert_eq!(env.get("XCURSOR_SIZE"), None);
+    }
+
+    #[test]
     fn compositor_app_env_preserves_portals_and_disables_accessibility_gvfs_and_lsfg_noise() {
         let launch_env = CompositorAppEnvironment::wayland_only("oblivion-one-test");
         let mut command = Command::new("true");
