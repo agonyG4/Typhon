@@ -399,7 +399,7 @@ fn predictive_triple_only_schedules_pending_plus_one() {
     let mut planner = PresentationDeadlinePlanner::new(Duration::from_millis(10));
     planner.note_presented(MonotonicTimestampNs::new(10_000_000));
     let pending = planner
-        .reactive_target(MonotonicTimestampNs::new(11_000_000))
+        .reactive_target(MonotonicTimestampNs::new(11_000_000), Duration::ZERO)
         .unwrap();
 
     assert_eq!(

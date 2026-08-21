@@ -109,21 +109,23 @@ pub(super) fn reactive_or_commit_timing_target(
     planner: &PresentationDeadlinePlanner,
     scheduled: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
     scheduled
         .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
-        .or_else(|| planner.reactive_target(now))
+        .or_else(|| planner.reactive_target(now, predicted_total_cost))
 }
 
 pub(super) fn take_reactive_or_commit_timing_target(
     planner: &PresentationDeadlinePlanner,
     scheduled: &mut Option<PresentationTarget>,
     now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
     scheduled
         .take()
         .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
-        .or_else(|| planner.reactive_target(now))
+        .or_else(|| planner.reactive_target(now, predicted_total_cost))
 }
 
 pub(super) fn plan_scheduled_target_for_mode(

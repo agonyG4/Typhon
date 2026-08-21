@@ -53,7 +53,7 @@ use oblivion_one::native::{
     adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
         AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
-        approximate_observation_is_late, merge_presentation_miss, render_sample_duration_ns,
+        approximate_observation_is_late, render_sample_duration_ns,
     },
     control::NativeControlServer,
     drm::{
@@ -114,6 +114,7 @@ pub(crate) use launch::*;
 pub(crate) use output::*;
 use pacing::*;
 pub(crate) use perf::*;
+pub(crate) use presentation::kms_timing::*;
 pub(crate) use presentation::ledger::*;
 pub(crate) use presentation::pipeline::*;
 pub(crate) use presentation::plane_policy::*;

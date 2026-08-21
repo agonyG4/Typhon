@@ -169,18 +169,20 @@ impl PresentationDeadlinePlanner {
         Some(target)
     }
 
-    pub fn reactive_target(&self, now: MonotonicTimestampNs) -> Option<PresentationTarget> {
-        let sequence = self.last_presented_sequence.checked_add(1)?;
-        let (presentation_time, estimated) = match self.last_presented_at {
-            Some(last_presented_at) => {
-                (last_presented_at.checked_add(self.refresh_interval)?, false)
-            }
-            None => (now.checked_add(self.refresh_interval)?, true),
-        };
+    pub fn reactive_target(
+        &self,
+        now: MonotonicTimestampNs,
+        predicted_total_cost: Duration,
+    ) -> Option<PresentationTarget> {
+        let ready_at = now.checked_add(predicted_total_cost)?;
+        let (sequence, presentation_time, estimated) = self.earliest_reachable(ready_at)?;
         Some(PresentationTarget {
             sequence,
             presentation_time,
             submit_not_before: now,
+            // Reactive Double starts rendering as soon as the normal frame
+            // opportunity arrives. The reachable target is accounting
+            // metadata and must not turn into a render-start gate.
             render_start_deadline: now,
             refresh_interval: self.refresh_interval,
             reason: PresentationTargetReason::ReactiveDouble,
@@ -497,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn reactive_target_is_non_gating_n_plus_one_metadata() {
+    fn reactive_target_is_non_gating_reachable_metadata() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         assert_eq!(
             planner.note_presented(MonotonicTimestampNs::new(70_000_000)),
@@ -505,7 +507,10 @@ mod tests {
         );
 
         let target = planner
-            .reactive_target(MonotonicTimestampNs::new(75_000_000))
+            .reactive_target(
+                MonotonicTimestampNs::new(75_000_000),
+                Duration::from_millis(2),
+            )
             .unwrap();
 
         assert_eq!(target.sequence, 2);
@@ -517,17 +522,21 @@ mod tests {
     }
 
     #[test]
-    fn reactive_target_never_selects_n_plus_two_after_a_late_wake() {
+    fn reactive_target_selects_first_reachable_opportunity_after_a_late_wake() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(MonotonicTimestampNs::new(70_000_000));
 
         let target = planner
-            .reactive_target(MonotonicTimestampNs::new(95_000_000))
+            .reactive_target(
+                MonotonicTimestampNs::new(95_000_000),
+                Duration::from_millis(2),
+            )
             .unwrap();
 
-        assert_eq!(target.sequence, 2);
-        assert_eq!(target.presentation_time.get(), 80_000_000);
+        assert_eq!(target.sequence, 4);
+        assert_eq!(target.presentation_time.get(), 100_000_000);
         assert_eq!(target.submit_not_before().get(), 95_000_000);
+        assert_eq!(target.render_start_deadline.get(), 95_000_000);
         assert_eq!(planner.scheduled_target(), None);
     }
 
@@ -536,7 +545,9 @@ mod tests {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
         let mut presented_at = MonotonicTimestampNs::new(0);
         for expected_sequence in 1..=1_000 {
-            let target = planner.reactive_target(presented_at).unwrap();
+            let target = planner
+                .reactive_target(presented_at, Duration::ZERO)
+                .unwrap();
             assert_eq!(target.sequence, expected_sequence);
             assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
             assert_eq!(planner.scheduled_target(), None);
