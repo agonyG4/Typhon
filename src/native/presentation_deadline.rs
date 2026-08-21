@@ -138,7 +138,9 @@ impl PresentationDeadlinePlanner {
             .unwrap_or_else(|| self.last_presented_sequence.saturating_add(1));
         self.last_presented_sequence = logical_sequence;
         self.last_presented_at = Some(presented_at);
-        self.scheduled = None;
+        if self.scheduled.take().is_some() {
+            self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
+        }
         logical_sequence
     }
 
@@ -366,7 +368,9 @@ impl PresentationDeadlinePlanner {
         self.last_presented_sequence = 0;
         self.last_presented_at = None;
         self.refresh_interval = nonzero_refresh(refresh_interval);
-        self.scheduled = None;
+        if self.scheduled.take().is_some() {
+            self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
+        }
     }
 
     pub const fn is_current(&self, target: PresentationTarget) -> bool {
@@ -584,6 +588,20 @@ mod tests {
         planner.invalidate(Duration::from_nanos(REFRESH_NS));
 
         assert!(!planner.is_current(target));
+        assert_eq!(planner.pre_render_abandoned(), 1);
+    }
+
+    #[test]
+    fn presented_successor_terminates_unstarted_scheduled_target() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner
+            .plan_normal(MonotonicTimestampNs::new(1), Duration::from_millis(2))
+            .unwrap();
+
+        planner.note_presented(MonotonicTimestampNs::new(10_000_000));
+
+        assert_eq!(planner.scheduled_target(), None);
+        assert_eq!(planner.pre_render_abandoned(), 1);
     }
 
     #[test]
