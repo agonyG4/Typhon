@@ -320,7 +320,7 @@ impl NativeRuntime {
             predicted_total_cost,
         );
         #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
-        #[rustfmt::skip] let pending_target = if explicit_output && frame_scheduler.visual_work_queued() && scheduled_presentation_target.is_none() { pending_target_for_scanout(scanout)? } else { None };
+        #[rustfmt::skip] let pending_target = if explicit_output && frame_scheduler.visual_work_queued() { pending_target_for_scanout(scanout)? } else { None };
         *scheduled_presentation_target = plan_visual_target_for_mode(
             presentation_deadline,
             pacing_mode,

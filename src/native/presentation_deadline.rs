@@ -201,33 +201,9 @@ impl PresentationDeadlinePlanner {
         predicted_total_cost: Duration,
         lower_bound: PresentationTarget,
     ) -> Option<PresentationTarget> {
-        if !self.is_current(lower_bound) {
-            return self.reactive_target(now, predicted_total_cost);
-        }
         let ready_at = now.checked_add(predicted_total_cost)?;
-        let base = self.earliest_reachable(ready_at)?;
-
-        let refresh_ns = duration_ns(self.refresh_interval).max(1);
-        let mut sequence = lower_bound.sequence.checked_add(1)?;
-        let mut presentation_time = lower_bound
-            .presentation_time
-            .checked_add(self.refresh_interval)?;
-        if presentation_time < ready_at {
-            let intervals = (ready_at.get() - presentation_time.get()).div_ceil(refresh_ns);
-            sequence = sequence.checked_add(intervals)?;
-            presentation_time = MonotonicTimestampNs::new(
-                presentation_time
-                    .get()
-                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
-            );
-        }
-
         let (sequence, presentation_time, estimated) =
-            if base.1 > presentation_time || (base.1 == presentation_time && base.0 > sequence) {
-                (base.0, base.1, base.2 || lower_bound.estimated)
-            } else {
-                (sequence, presentation_time, base.2 || lower_bound.estimated)
-            };
+            self.earliest_reachable_after(ready_at, lower_bound)?;
 
         Some(PresentationTarget {
             sequence,
@@ -240,6 +216,40 @@ impl PresentationDeadlinePlanner {
             estimated,
             predicted_unreachable: false,
         })
+    }
+
+    /// Replan a scheduled target which has fallen behind an already-owned
+    /// future target. A later protocol lower bound remains a valid lower
+    /// bound, so preserving the target reason is safe.
+    pub fn plan_target_after(
+        &mut self,
+        lower_bound: PresentationTarget,
+        now: MonotonicTimestampNs,
+        predicted_total_cost: Duration,
+        reason: PresentationTargetReason,
+    ) -> Option<PresentationTarget> {
+        if !self.is_current(lower_bound) {
+            return None;
+        }
+        let ready_at = now.checked_add(predicted_total_cost)?;
+        let (sequence, presentation_time, estimated) =
+            self.earliest_reachable_after(ready_at, lower_bound)?;
+        let submit_not_before = if estimated || reason == PresentationTargetReason::ReactiveDouble {
+            now
+        } else {
+            submit_not_before(presentation_time, self.refresh_interval)
+        };
+        let target = self.make_target(
+            sequence,
+            presentation_time,
+            predicted_total_cost,
+            reason,
+            estimated,
+            false,
+            submit_not_before,
+        );
+        self.scheduled = Some(target);
+        Some(target)
     }
 
     pub const fn scheduled_target(&self) -> Option<PresentationTarget> {
@@ -340,6 +350,36 @@ impl PresentationDeadlinePlanner {
             .checked_add(intervals.checked_mul(refresh_ns)?)
             .map(MonotonicTimestampNs)?;
         Some((sequence, presentation_time, false))
+    }
+
+    fn earliest_reachable_after(
+        &self,
+        ready_at: MonotonicTimestampNs,
+        lower_bound: PresentationTarget,
+    ) -> Option<(u64, MonotonicTimestampNs, bool)> {
+        if !self.is_current(lower_bound) {
+            return self.earliest_reachable(ready_at);
+        }
+        let base = self.earliest_reachable(ready_at)?;
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let mut sequence = lower_bound.sequence.checked_add(1)?;
+        let mut presentation_time = lower_bound
+            .presentation_time
+            .checked_add(self.refresh_interval)?;
+        if presentation_time < ready_at {
+            let intervals = (ready_at.get() - presentation_time.get()).div_ceil(refresh_ns);
+            sequence = sequence.checked_add(intervals)?;
+            presentation_time = MonotonicTimestampNs::new(
+                presentation_time
+                    .get()
+                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
+            );
+        }
+        if base.1 > presentation_time || (base.1 == presentation_time && base.0 > sequence) {
+            Some((base.0, base.1, base.2 || lower_bound.estimated))
+        } else {
+            Some((sequence, presentation_time, base.2 || lower_bound.estimated))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

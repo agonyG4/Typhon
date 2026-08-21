@@ -168,7 +168,18 @@ pub(super) fn plan_visual_target_for_mode(
     force_validation: bool,
     scheduled: Option<PresentationTarget>,
 ) -> Option<PresentationTarget> {
-    if !explicit_output || !visual_work_queued || scheduled.is_some() {
+    if !explicit_output || !visual_work_queued {
+        return scheduled;
+    }
+    if let (Some(pending), Some(scheduled)) = (pending_target, scheduled)
+        && !strictly_later_target(pending, scheduled)
+    {
+        return planner.plan_target_after(pending, now, predicted_total_cost, scheduled.reason);
+    }
+    if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
+        return None;
+    }
+    if scheduled.is_some() {
         return scheduled;
     }
     let reason = if force_validation {
@@ -184,6 +195,12 @@ pub(super) fn plan_visual_target_for_mode(
         predicted_total_cost,
         reason,
     )
+}
+
+fn strictly_later_target(earlier: PresentationTarget, later: PresentationTarget) -> bool {
+    earlier.clock_generation == later.clock_generation
+        && later.sequence > earlier.sequence
+        && later.presentation_time > earlier.presentation_time
 }
 
 pub(super) fn visual_target_deadline_for_mode(
