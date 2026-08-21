@@ -9,7 +9,14 @@
 use crate::native::presentation_deadline::MonotonicTimestampNs;
 use std::time::Duration;
 
-const NEGATIVE_SLACK_OBSERVATIONS_TO_REVOKE: u8 = 3;
+mod credit;
+mod simulator;
+
+pub use credit::{ElasticFuturePrimaryCredit, O1CreditDemandController, O1CreditDemandReason};
+pub use simulator::{
+    SimulatedO1Config, SimulatedO1Event, SimulatedO1EventKind, SimulatedO1EventModel,
+    SimulatedO1Result, SimulatedO1State, simulate_o1, simulate_o1_with_render_services,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PresentationOpportunityId {
@@ -250,212 +257,8 @@ impl PipelineServiceEstimate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ElasticFuturePrimaryCredit {
-    effective: u8,
-    ceiling: u8,
-    negative_slack_observations: u8,
-    grants: u64,
-    revokes: u64,
-}
-
-impl Default for ElasticFuturePrimaryCredit {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ElasticFuturePrimaryCredit {
-    pub const fn new() -> Self {
-        Self {
-            effective: 1,
-            ceiling: 2,
-            negative_slack_observations: 0,
-            grants: 0,
-            revokes: 0,
-        }
-    }
-
-    pub const fn with_ceiling(ceiling: u8) -> Self {
-        let ceiling = clamp_credit_ceiling(ceiling);
-        Self {
-            effective: 1,
-            ceiling,
-            negative_slack_observations: 0,
-            grants: 0,
-            revokes: 0,
-        }
-    }
-
-    pub const fn effective(self) -> u8 {
-        self.effective
-    }
-
-    pub const fn ceiling(self) -> u8 {
-        self.ceiling
-    }
-
-    pub const fn grants(self) -> u64 {
-        self.grants
-    }
-
-    pub const fn revokes(self) -> u64 {
-        self.revokes
-    }
-
-    pub fn observe_overlap(&mut self, overlap_required_ns: u64) {
-        self.observe_overlap_with_ownership(overlap_required_ns, false);
-    }
-
-    pub fn observe_overlap_with_ownership(
-        &mut self,
-        overlap_required_ns: u64,
-        future_primary_owned: bool,
-    ) {
-        if overlap_required_ns > 0 {
-            self.negative_slack_observations = 0;
-            if self.effective < self.ceiling {
-                self.effective = self.ceiling;
-                self.grants = self.grants.saturating_add(1);
-            }
-            return;
-        }
-
-        // Capacity may not be revoked while the extra physical future
-        // primary is still owned.  Its lease must settle or be abandoned
-        // before the controller can observe a drained pipeline.
-        if future_primary_owned {
-            self.negative_slack_observations = 0;
-            return;
-        }
-
-        self.negative_slack_observations = self.negative_slack_observations.saturating_add(1);
-        if self.effective > 1
-            && self.negative_slack_observations >= NEGATIVE_SLACK_OBSERVATIONS_TO_REVOKE
-        {
-            self.effective = 1;
-            self.revokes = self.revokes.saturating_add(1);
-        }
-    }
-
-    pub fn set_ceiling(&mut self, ceiling: u8) {
-        self.ceiling = clamp_credit_ceiling(ceiling);
-        if self.effective > self.ceiling {
-            self.effective = self.ceiling;
-            self.revokes = self.revokes.saturating_add(1);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SimulatedO1Config {
-    pub refresh_interval_ns: u64,
-    pub render_service_ns: u64,
-    pub dispatch_service_ns: u64,
-    pub apply_guard_ns: u64,
-    pub apply_delay_ns: u64,
-    pub frames: u32,
-    pub worker_enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SimulatedO1Result {
-    pub target_hits: u32,
-    pub render_readiness_misses: u32,
-    pub dispatch_misses: u32,
-    pub apply_guard_misses: u32,
-    pub max_future_primary_depth: u8,
-    pub credit_one_observations: u32,
-    pub credit_two_observations: u32,
-    pub target_mutations: u32,
-    pub intentional_queue_latency_ns: u64,
-}
-
-/// Deterministic virtual-time model used to qualify planner/controller
-/// interactions without EGL, DRM, or thread scheduling.
-pub fn simulate_o1(config: SimulatedO1Config) -> SimulatedO1Result {
-    let services = vec![config.render_service_ns; config.frames as usize];
-    simulate_o1_with_render_services(config, &services)
-}
-
-pub fn simulate_o1_with_render_services(
-    config: SimulatedO1Config,
-    render_services_ns: &[u64],
-) -> SimulatedO1Result {
-    let refresh = config.refresh_interval_ns.max(1);
-    let mut result = SimulatedO1Result::default();
-    let mut credit = ElasticFuturePrimaryCredit::new();
-    let mut predecessor_presentation = refresh;
-
-    for frame in 0..config.frames {
-        let render_service_ns = render_services_ns
-            .get(frame as usize)
-            .copied()
-            .unwrap_or(config.render_service_ns);
-        let successor_presentation = predecessor_presentation.saturating_add(refresh);
-        let estimate = PipelineServiceEstimate::new(
-            0,
-            render_service_ns,
-            config.dispatch_service_ns,
-            config.apply_guard_ns,
-        );
-        let overlap = estimate.overlap_required_ns(
-            MonotonicTimestampNs::new(predecessor_presentation),
-            MonotonicTimestampNs::new(successor_presentation),
-        );
-        credit.observe_overlap(overlap);
-        if credit.effective() == 1 {
-            result.credit_one_observations = result.credit_one_observations.saturating_add(1);
-        } else {
-            result.credit_two_observations = result.credit_two_observations.saturating_add(1);
-        }
-        result.max_future_primary_depth = result.max_future_primary_depth.max(credit.effective());
-
-        // Worker transport changes dispatch observations, not the physical
-        // opportunity chosen by O1.  The virtual model deliberately keeps
-        // both transports on the same timeline so that this invariant is
-        // tested independently of worker implementation details.
-        let start = if credit.effective() == 2 && overlap > 0 {
-            successor_presentation
-                .saturating_sub(config.apply_guard_ns)
-                .saturating_sub(config.dispatch_service_ns)
-                .saturating_sub(render_service_ns)
-        } else {
-            predecessor_presentation
-        };
-        let ready = start.saturating_add(render_service_ns);
-        let submit_returned = ready.saturating_add(config.dispatch_service_ns);
-        let deadline = successor_presentation.saturating_sub(config.apply_guard_ns);
-        if ready > deadline {
-            result.render_readiness_misses = result.render_readiness_misses.saturating_add(1);
-        } else if submit_returned > deadline {
-            result.dispatch_misses = result.dispatch_misses.saturating_add(1);
-        } else if config.apply_delay_ns > config.apply_guard_ns {
-            result.apply_guard_misses = result.apply_guard_misses.saturating_add(1);
-        } else {
-            result.target_hits = result.target_hits.saturating_add(1);
-        }
-        result.intentional_queue_latency_ns = result
-            .intentional_queue_latency_ns
-            .saturating_add(start.saturating_sub(predecessor_presentation));
-        predecessor_presentation = successor_presentation;
-    }
-
-    result
-}
-
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-const fn clamp_credit_ceiling(ceiling: u8) -> u8 {
-    if ceiling < 1 {
-        1
-    } else if ceiling > 2 {
-        2
-    } else {
-        ceiling
-    }
 }
 
 #[cfg(test)]
@@ -551,18 +354,13 @@ mod tests {
     }
 
     #[test]
-    fn extra_credit_waits_for_future_primary_settlement_before_revoke() {
+    fn extra_credit_revokes_after_three_negative_observations() {
         let mut credit = ElasticFuturePrimaryCredit::new();
         credit.observe_overlap(1);
         assert_eq!(credit.effective(), 2);
 
         for _ in 0..3 {
-            credit.observe_overlap_with_ownership(0, true);
-        }
-        assert_eq!(credit.effective(), 2);
-
-        for _ in 0..3 {
-            credit.observe_overlap_with_ownership(0, false);
+            credit.observe_overlap(0);
         }
         assert_eq!(credit.effective(), 1);
         assert_eq!(credit.revokes(), 1);
