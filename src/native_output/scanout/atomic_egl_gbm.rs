@@ -718,6 +718,7 @@ impl AtomicEglGbmScanout {
         target: PresentationTarget,
         submit_window: KmsSubmitWindow,
         pacing_mode: NativeOutputPacingMode,
+        future_primary_limit: u8,
         cursor: Option<CursorPlaneAssignment>,
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
@@ -778,7 +779,7 @@ impl AtomicEglGbmScanout {
         };
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
-            let slot = swapchain.acquire_render_slot_for(pacing_mode)?;
+            let slot = swapchain.acquire_render_slot_for_limit(future_primary_limit)?;
             (slot, swapchain.next_frame_id(), swapchain.pool_generation())
         };
         let framebuffer_id = match self.framebuffer(slot) {

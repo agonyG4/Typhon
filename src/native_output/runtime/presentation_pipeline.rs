@@ -489,6 +489,7 @@ pub(super) fn build_output_pipeline_snapshot(
         output_generation,
         7,
         pacing_mode,
+        u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
         swapchain,
         ledger,
         arbiter,
@@ -504,6 +505,7 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
     output_generation: u64,
     crtc_id: u32,
     pacing_mode: NativeOutputPacingMode,
+    future_primary_limit: u8,
     swapchain: &AtomicOutputSwapchain,
     ledger: &OutputTransactionLedger,
     arbiter: &AtomicCommitArbiter,
@@ -513,7 +515,7 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
 ) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
     swapchain
-        .validate_invariants_for(pacing_mode)
+        .validate_invariants_for_limit(future_primary_limit)
         .map_err(|_| {
             PipelineSnapshotError::PipelineInvariant(PipelineValidationError::SlotAliasing {
                 slot: swapchain.current(),
@@ -613,6 +615,7 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
     };
     let snapshot = OutputPipelineSnapshot {
         output_generation,
+        future_primary_limit: future_primary_limit.clamp(1, 2),
         pacing_mode,
         presented_planes,
         kernel_submitted,
@@ -643,6 +646,7 @@ impl NativeRuntime {
             self.drm_file_generation,
             self.target.crtc_id,
             self.adaptive_buffering.pacing_mode(),
+            self.adaptive_buffering.desired_credit(),
             swapchain,
             &self.output_transactions,
             &self.atomic_commit_arbiter,
@@ -910,6 +914,7 @@ mod tests {
                 1,
                 7,
                 NativeOutputPacingMode::ReactiveDouble,
+                1,
                 swapchain,
                 ledger,
                 arbiter,

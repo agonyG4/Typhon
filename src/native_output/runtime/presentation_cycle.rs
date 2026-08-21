@@ -5,10 +5,9 @@ use super::frame::{
     update_cursor_output_arbitration,
 };
 use super::planner::{
-    NativePresentationPath, NativePresentationPlanInput, pending_target_for_scanout,
-    plan_native_presentation_path, plan_visual_target_for_mode,
-    prepare_presentation_target_for_mode, reactive_or_commit_timing_target,
-    take_reactive_or_commit_timing_target,
+    NativePresentationPath, NativePresentationPlanInput, pacing_mode_for_target,
+    pending_target_for_scanout, plan_native_presentation_path, plan_visual_target_for_budget,
+    prepare_presentation_target, reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
@@ -153,8 +152,7 @@ impl NativeRuntime {
                     cursor_preference: *cursor_preference,
                     cursor_scheduling_policy: *cursor_scheduling_policy,
                     presented_primary: presented_planes.primary,
-                    predictive_triple_active: adaptive_buffering.mode()
-                        == AdaptiveBufferingMode::Triple,
+                    predictive_triple_active: adaptive_buffering.desired_credit() > 1,
                     client_cursor_active,
                     cursor_render_mode,
                     last_client_cursor_damage,
@@ -320,10 +318,8 @@ impl NativeRuntime {
                 Some(estimate.overlap_required_ns(predecessor.presentation_time, successor))
             })
             .unwrap_or(0);
-        let render_ahead_allowed = adaptive_buffering.mode() == AdaptiveBufferingMode::Triple;
-        let pacing_mode = adaptive_buffering.pacing_mode();
-        *scheduled_presentation_target = prepare_presentation_target_for_mode(
-            pacing_mode,
+        let render_ahead_allowed = adaptive_buffering.desired_credit() > 1;
+        *scheduled_presentation_target = prepare_presentation_target(
             explicit_output,
             presentation_deadline,
             server,
@@ -333,9 +329,9 @@ impl NativeRuntime {
             predicted_total_cost,
         );
         #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
-        *scheduled_presentation_target = plan_visual_target_for_mode(
+        *scheduled_presentation_target = plan_visual_target_for_budget(
             presentation_deadline,
-            pacing_mode,
+            render_ahead_allowed,
             pending_target,
             scheduler_now,
             predicted_total_cost,
@@ -344,8 +340,9 @@ impl NativeRuntime {
             *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force,
             *scheduled_presentation_target,
         );
+        let pacing_mode = pacing_mode_for_target(*scheduled_presentation_target);
         let effective_render_target_available = if explicit_output {
-            scanout.render_target_available_for(pacing_mode)
+            scanout.render_target_available_for_limit(adaptive_buffering.desired_credit())
         } else {
             scanout.render_target_available()
         };
@@ -361,6 +358,7 @@ impl NativeRuntime {
                 *drm_file_generation,
                 target.crtc_id,
                 pacing_mode,
+                adaptive_buffering.desired_credit(),
                 swapchain,
                 output_transactions,
                 atomic_commit_arbiter,
@@ -395,7 +393,21 @@ impl NativeRuntime {
         } else {
             None
         };
-        #[rustfmt::skip] adaptive_buffering.observe_overlap_for_target(pending_target, overlap_required_ns, pipeline_snapshot.as_ref().is_some_and(|pipeline| pipeline.future_primary_depth() >= 2));
+        let desired_credit_before_observation = adaptive_buffering.desired_credit();
+        #[rustfmt::skip] adaptive_buffering.observe_overlap_for_target(pending_target, overlap_required_ns);
+        let desired_credit_after_observation = adaptive_buffering.desired_credit();
+        if desired_credit_before_observation == 1 && desired_credit_after_observation == 2 {
+            frame_pacing.note_o1_credit2_grant();
+        } else if desired_credit_before_observation == 2
+            && desired_credit_after_observation == 1
+            && pipeline_snapshot
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.future_primary_depth() > 0)
+        {
+            frame_pacing.note_o1_credit2_granted_not_consumed();
+            frame_pacing.note_o1_credit2_drain();
+            frame_pacing.note_o1_credit2_refill_suppressed_while_draining();
+        }
         let mut scheduler_decision = if explicit_output {
             let decision = frame_scheduler.decision_with_pipeline_diagnostics(
                 ExplicitAtomicSchedulerContext {
@@ -725,22 +737,15 @@ impl NativeRuntime {
                 && !scanout.direct_scanout_inhibited()
                 && direct_candidate_changed
             {
-                let direct_target = match pacing_mode {
-                    NativeOutputPacingMode::ReactiveDouble => reactive_or_commit_timing_target(
+                let direct_target = scheduled_presentation_target.or_else(|| {
+                    reactive_or_commit_timing_target(
                         presentation_deadline,
-                        *scheduled_presentation_target,
+                        None,
                         pending_target,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
                         predicted_total_cost,
-                    ),
-                    NativeOutputPacingMode::PredictiveTriple => scheduled_presentation_target
-                        .or_else(|| {
-                            presentation_deadline.reactive_target(
-                                MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                                predicted_total_cost,
-                            )
-                        }),
-                };
+                    )
+                });
                 if let Some(direct_target) = direct_target
                     && let Ok(direct_submit_window) = presentation_timing.submit_window(
                         direct_target.presentation_time.get(),
@@ -943,30 +948,22 @@ impl NativeRuntime {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let expected_scene_signature = resolved_scene.scene_identity_signature();
                         drop(resolved_scene);
-                        let frame_target = match pacing_mode {
-                            NativeOutputPacingMode::ReactiveDouble => {
-                                take_reactive_or_commit_timing_target(
+                        let frame_target = scheduled_presentation_target
+                            .take()
+                            .or_else(|| {
+                                reactive_or_commit_timing_target(
                                     presentation_deadline,
-                                    scheduled_presentation_target,
+                                    None,
                                     pending_target,
-                                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                    MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
                                     predicted_total_cost,
                                 )
-                            }
-                            NativeOutputPacingMode::PredictiveTriple => {
-                                scheduled_presentation_target.take().or_else(|| {
-                                    presentation_deadline.reactive_target(
-                                        MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                                        predicted_total_cost,
-                                    )
-                                })
-                            }
-                        }
-                        .ok_or_else(|| {
-                            io::Error::other(
-                                "explicit Atomic render started without a presentation target",
-                            )
-                        })?;
+                            })
+                            .ok_or_else(|| {
+                                io::Error::other(
+                                    "explicit Atomic render started without a presentation target",
+                                )
+                            })?;
                         let submit_window = match presentation_timing.submit_window(
                             frame_target.presentation_time.get(),
                             frame_target.submit_not_before().get(),
@@ -1000,6 +997,7 @@ impl NativeRuntime {
                             frame_target,
                             submit_window,
                             pacing_mode,
+                            adaptive_buffering.desired_credit(),
                             cursor_assignment,
                             direct_inspection
                                 .candidate_key

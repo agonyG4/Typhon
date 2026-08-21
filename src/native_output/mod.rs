@@ -51,9 +51,9 @@ use oblivion_one::native::kms::{
 use oblivion_one::native::scheduler::SchedulerFrameContext;
 use oblivion_one::native::{
     adaptive_buffering::{
-        AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
-        AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
-        approximate_observation_is_late, render_sample_duration_ns,
+        AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
+        FenceTimestampQuality, ProvenDeadlineMiss, approximate_observation_is_late,
+        render_sample_duration_ns,
     },
     control::NativeControlServer,
     drm::{

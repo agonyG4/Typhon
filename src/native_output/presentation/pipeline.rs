@@ -193,6 +193,7 @@ impl PreparedCompositedState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputPipelineSnapshot {
     pub(crate) output_generation: u64,
+    pub(crate) future_primary_limit: u8,
     pub(crate) pacing_mode: NativeOutputPacingMode,
     /// Canonical immutable identity of the planes most recently promoted by a
     /// matching pageflip.
@@ -219,7 +220,6 @@ pub(crate) enum PipelineValidationError {
     FuturePrimaryDepthExceeded {
         depth: u8,
     },
-    ReactiveDoubleOwnsPreparedWithQueuedPrimary,
     NonMonotonicTargetOrder {
         earlier_sequence: u64,
         later_sequence: u64,
@@ -289,16 +289,14 @@ impl OutputPipelineSnapshot {
     pub(crate) fn can_render_composed(&self) -> bool {
         !self.direct_active()
             && !self.prepared.is_present()
-            && self.future_primary_depth() < 2
+            && self.future_primary_depth() < self.future_primary_limit
             && self.free_compositor_slots > 0
     }
 
     pub(crate) fn can_pre_admit_primary(&self) -> bool {
         matches!(self.prepared, PreparedCompositedState::Ready { .. })
             && self.worker_queued_next.is_none()
-            && self.future_primary_depth() <= 2
-            && (self.pacing_mode == NativeOutputPacingMode::PredictiveTriple
-                || self.kernel_submitted.is_none())
+            && self.future_primary_depth() <= self.future_primary_limit
             && !self.kernel_plane_delta()
     }
 
@@ -352,16 +350,6 @@ impl OutputPipelineSnapshot {
         if depth > 2 {
             return Err(PipelineValidationError::FuturePrimaryDepthExceeded { depth });
         }
-        if self.pacing_mode == NativeOutputPacingMode::ReactiveDouble
-            && self.prepared.is_present()
-            && [self.kernel_submitted, self.worker_queued_next]
-                .into_iter()
-                .flatten()
-                .any(|commit| commit.kind.is_primary())
-        {
-            return Err(PipelineValidationError::ReactiveDoubleOwnsPreparedWithQueuedPrimary);
-        }
-
         let mut targets = [self.kernel_submitted, self.worker_queued_next]
             .into_iter()
             .flatten()
@@ -393,8 +381,8 @@ impl OutputPipelineSnapshot {
 }
 
 impl PresentationPipelineView for OutputPipelineSnapshot {
-    fn pacing_mode(&self) -> NativeOutputPacingMode {
-        self.pacing_mode
+    fn future_primary_limit(&self) -> u8 {
+        self.future_primary_limit
     }
 
     fn kernel_commit_occupied(&self) -> bool {

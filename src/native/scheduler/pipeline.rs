@@ -1,4 +1,4 @@
-use super::{NativeFrameScheduler, NativeOutputPacingMode, SchedulerDecision};
+use super::{NativeFrameScheduler, SchedulerDecision};
 use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ pub enum SchedulerPreparedPrimary {
 }
 
 pub trait PresentationPipelineView {
-    fn pacing_mode(&self) -> NativeOutputPacingMode;
+    fn future_primary_limit(&self) -> u8;
     fn kernel_commit_occupied(&self) -> bool;
     fn kernel_primary_submitted(&self) -> bool;
     fn worker_commit_occupied(&self) -> bool;
@@ -113,13 +113,12 @@ impl NativeFrameScheduler {
         };
 
         if pipeline.worker_primary_queued() {
-            if pipeline.pacing_mode() == NativeOutputPacingMode::PredictiveTriple
-                && self.visual_work_queued
+            if self.visual_work_queued
                 && matches!(prepared, SchedulerPreparedPrimary::None)
                 && context.render_ahead_allowed
                 && pipeline.triple_capable()
                 && context.presentation_target.is_some()
-                && pipeline.future_primary_depth() < 2
+                && pipeline.future_primary_depth() < pipeline.future_primary_limit()
                 && pipeline.free_compositor_slots() > 0
                 && !pipeline.direct_active()
             {
@@ -133,28 +132,6 @@ impl NativeFrameScheduler {
             }
             return SchedulerDecision::WaitForWorkerQueue;
         }
-        if pipeline.pacing_mode() == NativeOutputPacingMode::ReactiveDouble {
-            if pipeline.kernel_primary_submitted() {
-                return if self.visual_work_queued {
-                    SchedulerDecision::WaitForBuffer
-                } else {
-                    SchedulerDecision::WaitForPageFlip
-                };
-            }
-            if matches!(prepared, SchedulerPreparedPrimary::Ready { .. }) {
-                if pipeline.kernel_commit_occupied() {
-                    return SchedulerDecision::WaitForPageFlip;
-                }
-                return ready_submit_decision(now_ns, ready_target);
-            }
-            if matches!(prepared, SchedulerPreparedPrimary::Rendering) {
-                return SchedulerDecision::WaitForBuffer;
-            }
-            if self.visual_work_queued {
-                return SchedulerDecision::Render;
-            }
-        }
-
         if pipeline.kernel_primary_submitted() {
             if matches!(prepared, SchedulerPreparedPrimary::Ready { .. })
                 && context.worker_queue_available
@@ -172,10 +149,12 @@ impl NativeFrameScheduler {
             if pipeline.free_compositor_slots() == 0 {
                 return SchedulerDecision::WaitForBuffer;
             }
-            if !context.render_ahead_allowed
-                || !pipeline.triple_capable()
+            if !context.render_ahead_allowed {
+                return SchedulerDecision::WaitForBuffer;
+            }
+            if !pipeline.triple_capable()
                 || context.presentation_target.is_none()
-                || pipeline.future_primary_depth() >= 2
+                || pipeline.future_primary_depth() >= pipeline.future_primary_limit()
                 || pipeline.direct_active()
             {
                 return SchedulerDecision::WaitForPageFlip;
@@ -246,7 +225,9 @@ impl NativeFrameScheduler {
                 Some(PipelineWaitReason::PreparedFrameExists)
             }
             SchedulerDecision::WaitForBuffer => Some(PipelineWaitReason::NoFreeSlot),
-            SchedulerDecision::WaitForPageFlip if pipeline.future_primary_depth() >= 2 => {
+            SchedulerDecision::WaitForPageFlip
+                if pipeline.future_primary_depth() >= pipeline.future_primary_limit() =>
+            {
                 Some(PipelineWaitReason::FuturePrimaryDepthFull)
             }
             SchedulerDecision::WaitForPageFlip if pipeline.direct_active() => {

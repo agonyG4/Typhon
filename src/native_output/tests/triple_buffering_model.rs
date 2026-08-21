@@ -51,6 +51,7 @@ fn empty_snapshot() -> OutputPipelineSnapshot {
     OutputPipelineSnapshot {
         output_generation: 1,
         pacing_mode: NativeOutputPacingMode::PredictiveTriple,
+        future_primary_limit: 2,
         presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
             None,
         ),
@@ -221,10 +222,7 @@ fn reactive_double_rejects_pending_plus_prepared() {
         target: target(2),
     };
 
-    assert_eq!(
-        snapshot.validate(),
-        Err(PipelineValidationError::ReactiveDoubleOwnsPreparedWithQueuedPrimary)
-    );
+    assert_eq!(snapshot.validate(), Ok(()));
 }
 
 #[test]
@@ -451,10 +449,22 @@ fn worker_pre_admits_ready_primary_before_its_submit_not_before_deadline() {
 fn reactive_double_does_not_pre_admit_behind_kernel_primary() {
     let mut snapshot = with_current(empty_snapshot());
     snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.future_primary_limit = 1;
     snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
     snapshot.prepared = ready(2, 2, 2);
 
     assert!(!snapshot.can_pre_admit_primary());
+}
+
+#[test]
+fn compatibility_mode_does_not_override_explicit_future_primary_limit() {
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.future_primary_limit = 2;
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    snapshot.prepared = ready(2, 2, 2);
+
+    assert!(snapshot.can_pre_admit_primary());
 }
 
 #[test]

@@ -71,8 +71,7 @@ pub(super) fn plan_commit_timing_target(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_presentation_target_for_mode(
-    pacing_mode: NativeOutputPacingMode,
+pub(super) fn prepare_presentation_target(
     explicit_output: bool,
     planner: &mut PresentationDeadlinePlanner,
     server: &mut OwnCompositorServer,
@@ -81,17 +80,6 @@ pub(super) fn prepare_presentation_target_for_mode(
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
-    let scheduled = if pacing_mode == NativeOutputPacingMode::ReactiveDouble
-        && scheduled.is_some_and(|target| target.reason != PresentationTargetReason::CommitTiming)
-    {
-        // Revoking extra capacity terminates an unstarted render lease.  The
-        // next Reactive frame will allocate a fresh reachable opportunity;
-        // the old target is never silently reused or moved.
-        let _ = planner.abandon_scheduled_target();
-        None
-    } else {
-        scheduled
-    };
     let scheduled = if explicit_output {
         plan_commit_timing_target(
             planner,
@@ -126,25 +114,7 @@ pub(super) fn reactive_or_commit_timing_target(
         })
 }
 
-pub(super) fn take_reactive_or_commit_timing_target(
-    planner: &PresentationDeadlinePlanner,
-    scheduled: &mut Option<PresentationTarget>,
-    lower_bound: Option<PresentationTarget>,
-    now: MonotonicTimestampNs,
-    predicted_total_cost: Duration,
-) -> Option<PresentationTarget> {
-    scheduled
-        .take()
-        .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
-        .or_else(|| {
-            lower_bound
-                .and_then(|lower_bound| {
-                    planner.reactive_target_after(now, predicted_total_cost, lower_bound)
-                })
-                .or_else(|| planner.reactive_target(now, predicted_total_cost))
-        })
-}
-
+#[cfg(test)]
 pub(super) fn plan_scheduled_target_for_mode(
     planner: &mut PresentationDeadlinePlanner,
     pacing_mode: NativeOutputPacingMode,
@@ -153,16 +123,34 @@ pub(super) fn plan_scheduled_target_for_mode(
     predicted_total_cost: Duration,
     reason: PresentationTargetReason,
 ) -> Option<PresentationTarget> {
-    if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
+    plan_scheduled_target_for_budget(
+        planner,
+        pacing_mode == NativeOutputPacingMode::PredictiveTriple,
+        pending_target,
+        now,
+        predicted_total_cost,
+        reason,
+    )
+}
+
+pub(super) fn plan_scheduled_target_for_budget(
+    planner: &mut PresentationDeadlinePlanner,
+    render_ahead_allowed: bool,
+    pending_target: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    reason: PresentationTargetReason,
+) -> Option<PresentationTarget> {
+    if !render_ahead_allowed {
         return None;
     }
     planner.plan_render_ahead(pending_target?, now, predicted_total_cost, reason)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn plan_visual_target_for_mode(
+pub(super) fn plan_visual_target_for_budget(
     planner: &mut PresentationDeadlinePlanner,
-    pacing_mode: NativeOutputPacingMode,
+    render_ahead_allowed: bool,
     pending_target: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
@@ -184,20 +172,20 @@ pub(super) fn plan_visual_target_for_mode(
         debug_assert_eq!(abandoned, Some(scheduled));
         return planner.plan_successor_after(pending, now, predicted_total_cost, scheduled.reason);
     }
-    if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
-        return None;
-    }
     if scheduled.is_some() {
         return scheduled;
+    }
+    if !render_ahead_allowed {
+        return None;
     }
     let reason = if force_validation {
         PresentationTargetReason::ForcedValidation
     } else {
         PresentationTargetReason::PredictedPressure
     };
-    plan_scheduled_target_for_mode(
+    plan_scheduled_target_for_budget(
         planner,
-        pacing_mode,
+        render_ahead_allowed,
         pending_target,
         now,
         predicted_total_cost,
@@ -211,6 +199,7 @@ fn strictly_later_target(earlier: PresentationTarget, later: PresentationTarget)
         && later.presentation_time > earlier.presentation_time
 }
 
+#[cfg(test)]
 pub(super) fn visual_target_deadline_for_mode(
     pacing_mode: NativeOutputPacingMode,
     scheduled_target: Option<PresentationTarget>,
@@ -220,6 +209,36 @@ pub(super) fn visual_target_deadline_for_mode(
             .is_some_and(|target| target.reason == PresentationTargetReason::CommitTiming))
     .then(|| scheduled_target.map(|target| target.render_start_deadline.get()))
     .flatten()
+}
+
+pub(super) fn visual_target_deadline_for_target(
+    scheduled_target: Option<PresentationTarget>,
+) -> Option<u64> {
+    scheduled_target
+        .filter(|target| {
+            !matches!(
+                target.reason,
+                PresentationTargetReason::ReactiveDouble | PresentationTargetReason::Normal
+            )
+        })
+        .map(|target| target.render_start_deadline.get())
+}
+
+pub(super) const fn pacing_mode_for_target(
+    target: Option<PresentationTarget>,
+) -> NativeOutputPacingMode {
+    match target {
+        Some(target) => match target.reason {
+            PresentationTargetReason::PredictedPressure
+            | PresentationTargetReason::ProvenReadinessMiss
+            | PresentationTargetReason::ForcedValidation
+            | PresentationTargetReason::CommitTiming => NativeOutputPacingMode::PredictiveTriple,
+            PresentationTargetReason::ReactiveDouble | PresentationTargetReason::Normal => {
+                NativeOutputPacingMode::ReactiveDouble
+            }
+        },
+        None => NativeOutputPacingMode::ReactiveDouble,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

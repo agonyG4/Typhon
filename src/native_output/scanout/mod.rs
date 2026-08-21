@@ -627,10 +627,16 @@ impl NativeScanoutBackend {
     }
 
     pub(crate) fn render_target_available_for(&self, pacing_mode: NativeOutputPacingMode) -> bool {
+        self.render_target_available_for_limit(
+            u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
+        )
+    }
+
+    pub(crate) fn render_target_available_for_limit(&self, future_primary_limit: u8) -> bool {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout
-                .swapchain()
-                .is_ok_and(|swapchain| swapchain.render_target_available_for(pacing_mode)),
+            Self::AtomicEglGbm(scanout) => scanout.swapchain().is_ok_and(|swapchain| {
+                swapchain.render_target_available_for_limit(future_primary_limit)
+            }),
             Self::NativeEglGbm(scanout) => scanout.render_target_available(),
             Self::Gbm(scanout) => scanout.render_target_available(),
             Self::Dumb(_) => true,

@@ -292,6 +292,15 @@ impl AtomicOutputSwapchain {
         &mut self,
         pacing_mode: NativeOutputPacingMode,
     ) -> io::Result<OutputSlotId> {
+        self.acquire_render_slot_for_limit(
+            u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
+        )
+    }
+
+    pub(crate) fn acquire_render_slot_for_limit(
+        &mut self,
+        future_primary_limit: u8,
+    ) -> io::Result<OutputSlotId> {
         self.ensure_operational()?;
         if self.rendering.is_some() {
             return Err(io::Error::other("an output slot is already rendering"));
@@ -299,9 +308,9 @@ impl AtomicOutputSwapchain {
         if self.ready.is_some() {
             return Err(io::Error::other("an output frame is already ready"));
         }
-        if pacing_mode == NativeOutputPacingMode::ReactiveDouble && self.pending.is_some() {
+        if future_primary_limit < 2 && self.pending.is_some() {
             return Err(io::Error::other(
-                "ReactiveDouble cannot acquire a third output slot while pageflip is pending",
+                "future-primary limit cannot acquire a third output slot while pageflip is pending",
             ));
         }
         let slot = self
@@ -314,10 +323,16 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn render_target_available_for(&self, pacing_mode: NativeOutputPacingMode) -> bool {
+        self.render_target_available_for_limit(
+            u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
+        )
+    }
+
+    pub(crate) fn render_target_available_for_limit(&self, future_primary_limit: u8) -> bool {
         !self.is_poisoned()
             && self.rendering.is_none()
             && self.ready.is_none()
-            && !(pacing_mode == NativeOutputPacingMode::ReactiveDouble && self.pending.is_some())
+            && !(future_primary_limit < 2 && self.pending.is_some())
             && self.free_slot_count() > 0
     }
 
@@ -1178,8 +1193,14 @@ impl AtomicOutputSwapchain {
         &self,
         pacing_mode: NativeOutputPacingMode,
     ) -> io::Result<()> {
+        self.validate_invariants_for_limit(
+            u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
+        )
+    }
+
+    pub(crate) fn validate_invariants_for_limit(&self, future_primary_limit: u8) -> io::Result<()> {
         self.validate_invariants()?;
-        if pacing_mode == NativeOutputPacingMode::ReactiveDouble
+        if future_primary_limit < 2
             && (self.pending.is_some() || self.worker_queued.is_some())
             && (self.ready.is_some() || self.rendering.is_some())
         {

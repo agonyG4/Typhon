@@ -1,4 +1,7 @@
-use super::super::planner::{plan_scheduled_target_for_mode, visual_target_deadline_for_mode};
+use super::super::planner::{
+    plan_scheduled_target_for_budget, plan_scheduled_target_for_mode,
+    plan_visual_target_for_budget, visual_target_deadline_for_mode,
+};
 use super::kms_worker::{
     ValidationBaseInvalidationDisposition, WorkerRejectionKind, direct_rejection_policy,
     validation_base_invalidation_disposition,
@@ -85,6 +88,39 @@ fn reactive_double_never_schedules_a_normal_visual_target() {
 
     assert_eq!(target, None);
     assert_eq!(planner.scheduled_target(), None);
+}
+
+#[test]
+fn demand_revoke_preserves_an_already_armed_render_ahead_target() {
+    let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10));
+    planner.note_presented(MonotonicTimestampNs::new(10));
+    let pending = planner
+        .reactive_target(MonotonicTimestampNs::new(11), Duration::ZERO)
+        .unwrap();
+    let armed = plan_scheduled_target_for_budget(
+        &mut planner,
+        true,
+        Some(pending),
+        MonotonicTimestampNs::new(12),
+        Duration::from_nanos(2),
+        PresentationTargetReason::PredictedPressure,
+    )
+    .unwrap();
+
+    let kept = plan_visual_target_for_budget(
+        &mut planner,
+        false,
+        Some(pending),
+        MonotonicTimestampNs::new(12),
+        Duration::from_nanos(2),
+        true,
+        true,
+        false,
+        Some(armed),
+    );
+
+    assert_eq!(kept, Some(armed));
+    assert_eq!(planner.scheduled_target(), Some(armed));
 }
 
 #[test]
