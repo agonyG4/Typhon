@@ -172,12 +172,15 @@ impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for Compos
     ) {
         match request {
             wp_cursor_shape_manager_v1::Request::Destroy => {}
-            wp_cursor_shape_manager_v1::Request::GetPointer { id, pointer } => {
+            wp_cursor_shape_manager_v1::Request::GetPointer {
+                cursor_shape_device,
+                pointer,
+            } => {
                 let same_client = pointer
                     .client()
                     .is_some_and(|owner| owner.id() == client.id());
                 if same_client && pointer.is_alive() {
-                    data_init.init(id, CursorShapeDeviceData { pointer });
+                    data_init.init(cursor_shape_device, CursorShapeDeviceData { pointer });
                 }
             }
             _ => {

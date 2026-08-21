@@ -27,7 +27,7 @@ impl CompositorState {
         let client = self
             .surface_resources
             .get(&surface_id)
-            .map(wayland_resource_client_label)
+            .map(|surface| wayland_resource_client_label(surface))
             .unwrap_or_else(|| "unknown".to_string());
         let output_scale = f64::from(self.output_scale.preferred_scale()) / 120.0;
         pointer_debug_log_lazy(|| {
@@ -158,7 +158,7 @@ impl CompositorState {
         let client = self
             .surface_resources
             .get(&surface_id)
-            .map(wayland_resource_client_label)
+            .map(|surface| wayland_resource_client_label(surface))
             .unwrap_or_else(|| "unknown".to_string());
         let output_scale = f64::from(self.output_scale.preferred_scale()) / 120.0;
         pointer_debug_log_lazy(|| {
