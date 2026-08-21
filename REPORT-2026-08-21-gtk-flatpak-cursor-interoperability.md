@@ -117,11 +117,16 @@ Passed:
 ```text
 rtk cargo fmt --check
 rtk git diff --check
+rtk git diff --check main...HEAD
 ```
 
-The focused Cargo test command was attempted:
+The following build/test commands were attempted and all stopped at the same
+native dependency boundary before Typhon compilation:
 
 ```text
+rtk cargo check --locked --all-targets
+rtk cargo clippy --locked --all-targets --all-features
+rtk cargo test --locked --all-targets
 rtk cargo test --locked cursor_manager --lib
 ```
 
@@ -138,6 +143,14 @@ Este programa está bloqueado por uma política de grupo... (os error 1260)
 ```
 
 No Linux distribution or machine-wide configuration was installed or changed.
+
+The requested source-layout script was also attempted. Windows policy blocked
+the `bash` executable before the script could run:
+
+```text
+rtk run "bash bin/check-source-layout"
+Este programa está bloqueado por uma política de grupo... (os error 1260)
+```
 
 ## Linux qualification checklist
 
@@ -179,4 +192,3 @@ qualification.
 
 The documentation commit for this report is intentionally separate from the
 source/model commits.
-
