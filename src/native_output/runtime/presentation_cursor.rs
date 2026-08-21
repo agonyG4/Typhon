@@ -152,8 +152,12 @@ pub(super) fn prepare_cursor_image(
     perf: NativePerfLogger,
 ) -> bool {
     if let Some(client) = client_cursor {
-        let source_key =
-            NativeCursorImageKey::for_surface(client.surface, client.hotspot_x, client.hotspot_y);
+        let source_key = NativeCursorImageKey::for_surface_at_output_scale(
+            client.surface,
+            client.hotspot_x,
+            client.hotspot_y,
+            cursor.output_scale_milli(),
+        );
         let image_ready = if cursor.client_image_matches(source_key) {
             true
         } else if cursor.client_image_failure_matches(source_key) {

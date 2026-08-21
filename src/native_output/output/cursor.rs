@@ -55,10 +55,20 @@ pub(crate) struct NativeCursorImageKey {
     pub(crate) height: u32,
     pub(crate) buffer_scale: u32,
     pub(crate) buffer_transform: u32,
+    pub(crate) output_scale_milli: u32,
 }
 
 impl NativeCursorImageKey {
     pub(crate) fn for_surface(surface: &RenderableSurface, hotspot_x: i32, hotspot_y: i32) -> Self {
+        Self::for_surface_at_output_scale(surface, hotspot_x, hotspot_y, 1_000)
+    }
+
+    pub(crate) fn for_surface_at_output_scale(
+        surface: &RenderableSurface,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        output_scale_milli: u32,
+    ) -> Self {
         Self {
             surface_id: surface.surface_id,
             buffer_id: surface.buffer_id().get(),
@@ -69,6 +79,7 @@ impl NativeCursorImageKey {
             height: surface.height,
             buffer_scale: surface.buffer_scale,
             buffer_transform: cursor_transform_key(surface.buffer_transform),
+            output_scale_milli: output_scale_milli.max(1),
         }
     }
 }
@@ -175,6 +186,10 @@ impl NativeAtomicCursor {
 
     pub(crate) fn output_scale(&self) -> f64 {
         f64::from(self.output_scale_milli.max(1)) / 1_000.0
+    }
+
+    pub(crate) fn output_scale_milli(&self) -> u32 {
+        self.output_scale_milli.max(1)
     }
 
     pub(crate) fn pin_framebuffer_for(
