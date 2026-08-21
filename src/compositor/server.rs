@@ -969,7 +969,10 @@ impl OwnCompositorServer {
     }
 
     pub fn client_cursor_request_active(&self) -> bool {
-        self.state.active_client_cursor.is_some()
+        self.state
+            .focused_client_cursor
+            .as_ref()
+            .is_some_and(|choice| !choice.is_hidden())
     }
 
     pub fn client_cursor_explicitly_hidden(&self) -> bool {

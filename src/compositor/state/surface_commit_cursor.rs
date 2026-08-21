@@ -23,8 +23,9 @@ impl CompositorState {
         self.current_surface_buffers.insert(surface_id, pending);
         self.client_cursor_surfaces.insert(surface_id, surface);
         if let Some(active) = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .cloned()
             && self
@@ -49,8 +50,9 @@ impl CompositorState {
         );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         if self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .is_some_and(|active| active.surface_id == surface_id)
             && self.cursor_visibility.lock_hidden_constraint_id.is_none()
         {
@@ -127,8 +129,9 @@ impl CompositorState {
         );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         if let Some(active) = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .cloned()
             && self
@@ -166,11 +169,15 @@ impl CompositorState {
             self.queue_dmabuf_buffer_release(release);
         }
         let active_cursor_pointer = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .map(|active| active.pointer.clone());
         if let Some(pointer) = active_cursor_pointer {
+            self.focused_client_cursor = Some(ClientCursorChoice::Hidden {
+                pointer: pointer.clone(),
+            });
             self.cursor_visibility.client_cursor_pointer = None;
             self.cursor_visibility.client_hidden_pointer = Some(pointer);
             self.advance_render_generation(RenderGenerationCause::CursorState);

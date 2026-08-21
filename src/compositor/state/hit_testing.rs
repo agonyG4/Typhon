@@ -1035,7 +1035,7 @@ impl CompositorState {
         }
         if self.pointer_surface.is_none()
             && self.pointer_entered_surfaces.is_empty()
-            && self.active_client_cursor.is_none()
+            && self.focused_client_cursor.is_none()
             && self.cursor_visibility.client_hidden_pointer.is_none()
             && self.cursor_visibility.client_cursor_pointer.is_none()
         {
@@ -1044,7 +1044,7 @@ impl CompositorState {
         if let Some(surface_id) = self.pointer_surface.as_ref().map(compositor_surface_id) {
             self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
         }
-        let cleared_client_cursor = self.active_client_cursor.take().is_some();
+        let cleared_client_cursor = self.focused_client_cursor.take().is_some();
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = None;
         if cleared_client_cursor {

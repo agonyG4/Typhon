@@ -549,7 +549,7 @@ pub struct CompositorState {
     xwayland_scene_batch: XwaylandSceneBatchState,
     pub(in crate::compositor) backend_commands: Vec<window_backend::WindowBackendCommand>,
     cursor_surface_ids: HashSet<u32>,
-    active_client_cursor: Option<ActiveClientCursor>,
+    focused_client_cursor: Option<ClientCursorChoice>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
     xwayland: XwaylandCompositorState,
     surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,

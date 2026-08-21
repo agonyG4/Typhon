@@ -58,6 +58,63 @@ pub(crate) struct ActiveClientCursor {
     pub(crate) hotspot_y: i32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum ClientCursorChoice {
+    Hidden {
+        pointer: wl_pointer::WlPointer,
+    },
+    Surface(ActiveClientCursor),
+    Shape {
+        pointer: wl_pointer::WlPointer,
+        shape: u32,
+    },
+}
+
+impl ClientCursorChoice {
+    pub(crate) fn pointer(&self) -> &wl_pointer::WlPointer {
+        match self {
+            Self::Hidden { pointer } | Self::Shape { pointer, .. } => pointer,
+            Self::Surface(active) => &active.pointer,
+        }
+    }
+
+    pub(crate) fn surface(&self) -> Option<&ActiveClientCursor> {
+        match self {
+            Self::Surface(active) => Some(active),
+            Self::Hidden { .. } | Self::Shape { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden { .. })
+    }
+
+    pub(crate) fn is_same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Hidden { pointer: left }, Self::Hidden { pointer: right }) => {
+                same_wayland_resource(left, right)
+            }
+            (Self::Surface(left), Self::Surface(right)) => {
+                same_wayland_resource(&left.pointer, &right.pointer)
+                    && left.surface_id == right.surface_id
+                    && left.hotspot_x == right.hotspot_x
+                    && left.hotspot_y == right.hotspot_y
+            }
+            (
+                Self::Shape {
+                    pointer: left,
+                    shape: left_shape,
+                },
+                Self::Shape {
+                    pointer: right,
+                    shape: right_shape,
+                },
+            ) => same_wayland_resource(left, right) && left_shape == right_shape,
+            _ => false,
+        }
+    }
+}
+
 pub(in crate::compositor) fn pointer_debug_log(message: impl AsRef<str>) {
     if pointer_debug_enabled() {
         eprintln!("typhon pointer: {}", message.as_ref());
