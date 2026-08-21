@@ -189,6 +189,10 @@ qualification.
 - `f0d79d2d` — cursor-shape protocol support.
 - `e3d09058` — shape cache and hardware/software scaling closure.
 - `5834f519` — gated interoperability diagnostics and launch-boundary tests.
+- `1fcf017` — bind the generated cursor-shape new-id request correctly.
+- `4f90da3` — invalidate native client images when output scale changes.
+- `874dd376` — interoperability documentation and initial closure report.
+- `0e316ae` — final verification status note.
 
 The documentation commit for this report is intentionally separate from the
 source/model commits.
