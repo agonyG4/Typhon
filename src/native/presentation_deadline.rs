@@ -192,6 +192,56 @@ impl PresentationDeadlinePlanner {
         })
     }
 
+    /// Select the first reachable refresh opportunity strictly after an
+    /// already-owned future target. The lower bound is an ownership/order
+    /// constraint, not a render-start deadline.
+    pub fn reactive_target_after(
+        &self,
+        now: MonotonicTimestampNs,
+        predicted_total_cost: Duration,
+        lower_bound: PresentationTarget,
+    ) -> Option<PresentationTarget> {
+        if !self.is_current(lower_bound) {
+            return self.reactive_target(now, predicted_total_cost);
+        }
+        let ready_at = now.checked_add(predicted_total_cost)?;
+        let base = self.earliest_reachable(ready_at)?;
+
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let mut sequence = lower_bound.sequence.checked_add(1)?;
+        let mut presentation_time = lower_bound
+            .presentation_time
+            .checked_add(self.refresh_interval)?;
+        if presentation_time < ready_at {
+            let intervals = (ready_at.get() - presentation_time.get()).div_ceil(refresh_ns);
+            sequence = sequence.checked_add(intervals)?;
+            presentation_time = MonotonicTimestampNs::new(
+                presentation_time
+                    .get()
+                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
+            );
+        }
+
+        let (sequence, presentation_time, estimated) =
+            if base.1 > presentation_time || (base.1 == presentation_time && base.0 > sequence) {
+                (base.0, base.1, base.2 || lower_bound.estimated)
+            } else {
+                (sequence, presentation_time, base.2 || lower_bound.estimated)
+            };
+
+        Some(PresentationTarget {
+            sequence,
+            presentation_time,
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: self.refresh_interval,
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: self.clock_generation,
+            estimated,
+            predicted_unreachable: false,
+        })
+    }
+
     pub const fn scheduled_target(&self) -> Option<PresentationTarget> {
         self.scheduled
     }
@@ -538,6 +588,54 @@ mod tests {
         assert_eq!(target.submit_not_before().get(), 95_000_000);
         assert_eq!(target.render_start_deadline.get(), 95_000_000);
         assert_eq!(planner.scheduled_target(), None);
+    }
+
+    #[test]
+    fn reactive_target_after_preserves_strict_order_with_a_future_target() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let lower_bound = planner
+            .reactive_target(
+                MonotonicTimestampNs::new(75_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        let target = planner
+            .reactive_target_after(
+                MonotonicTimestampNs::new(75_000_000),
+                Duration::from_millis(2),
+                lower_bound,
+            )
+            .unwrap();
+
+        assert_eq!(target.sequence, 3);
+        assert_eq!(target.presentation_time.get(), 90_000_000);
+        assert_eq!(target.render_start_deadline.get(), 75_000_000);
+        assert_eq!(target.submit_not_before().get(), 75_000_000);
+    }
+
+    #[test]
+    fn reactive_target_after_skips_multiple_unreachable_opportunities() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let lower_bound = planner
+            .reactive_target(
+                MonotonicTimestampNs::new(75_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        let target = planner
+            .reactive_target_after(
+                MonotonicTimestampNs::new(95_000_000),
+                Duration::from_millis(2),
+                lower_bound,
+            )
+            .unwrap();
+
+        assert_eq!(target.sequence, 4);
+        assert_eq!(target.presentation_time.get(), 100_000_000);
     }
 
     #[test]

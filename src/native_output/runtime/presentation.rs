@@ -546,6 +546,15 @@ impl NativeRuntime {
             let desired = effective_cursor.clone();
             let cursor_target = (*scheduled_presentation_target)
                 .or_else(|| {
+                    pending_target.and_then(|pending_target| {
+                        presentation_deadline.reactive_target_after(
+                            scheduler_now,
+                            predicted_total_cost,
+                            pending_target,
+                        )
+                    })
+                })
+                .or_else(|| {
                     presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
                 })
                 .ok_or_else(|| {
@@ -615,9 +624,19 @@ impl NativeRuntime {
             scheduler_decision,
             SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
         ) {
-            let compatibility_target = (*scheduled_presentation_target).or_else(|| {
-                presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
-            });
+            let compatibility_target = (*scheduled_presentation_target)
+                .or_else(|| {
+                    pending_target.and_then(|pending_target| {
+                        presentation_deadline.reactive_target_after(
+                            scheduler_now,
+                            predicted_total_cost,
+                            pending_target,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    presentation_deadline.reactive_target(scheduler_now, predicted_total_cost)
+                });
             let compatibility_submit_window = compatibility_target.and_then(|target| {
                 match presentation_timing.submit_window(
                     target.presentation_time.get(),
@@ -697,6 +716,7 @@ impl NativeRuntime {
                     NativeOutputPacingMode::ReactiveDouble => reactive_or_commit_timing_target(
                         presentation_deadline,
                         *scheduled_presentation_target,
+                        pending_target,
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
                         predicted_total_cost,
                     ),
@@ -997,6 +1017,7 @@ impl NativeRuntime {
                                 take_reactive_or_commit_timing_target(
                                     presentation_deadline,
                                     scheduled_presentation_target,
+                                    pending_target,
                                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                                     predicted_total_cost,
                                 )

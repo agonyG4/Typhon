@@ -108,24 +108,38 @@ pub(super) fn prepare_presentation_target_for_mode(
 pub(super) fn reactive_or_commit_timing_target(
     planner: &PresentationDeadlinePlanner,
     scheduled: Option<PresentationTarget>,
+    lower_bound: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
     scheduled
         .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
-        .or_else(|| planner.reactive_target(now, predicted_total_cost))
+        .or_else(|| {
+            lower_bound
+                .and_then(|lower_bound| {
+                    planner.reactive_target_after(now, predicted_total_cost, lower_bound)
+                })
+                .or_else(|| planner.reactive_target(now, predicted_total_cost))
+        })
 }
 
 pub(super) fn take_reactive_or_commit_timing_target(
     planner: &PresentationDeadlinePlanner,
     scheduled: &mut Option<PresentationTarget>,
+    lower_bound: Option<PresentationTarget>,
     now: MonotonicTimestampNs,
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
     scheduled
         .take()
         .filter(|target| target.reason == PresentationTargetReason::CommitTiming)
-        .or_else(|| planner.reactive_target(now, predicted_total_cost))
+        .or_else(|| {
+            lower_bound
+                .and_then(|lower_bound| {
+                    planner.reactive_target_after(now, predicted_total_cost, lower_bound)
+                })
+                .or_else(|| planner.reactive_target(now, predicted_total_cost))
+        })
 }
 
 pub(super) fn plan_scheduled_target_for_mode(
