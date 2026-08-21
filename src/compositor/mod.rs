@@ -112,6 +112,8 @@ mod toplevel_publication;
 mod toplevel_publication_state;
 mod window_backend;
 mod window_state;
+mod workspace_protocol;
+use workspace_protocol::WorkspaceProtocolState;
 pub use crate::core::WindowId;
 use commit_debug::*;
 pub use desktop_window::{
@@ -503,6 +505,7 @@ pub struct CompositorState {
     next_fifo_barrier_generation: u64,
     surface_pacing_metrics: SurfacePacingMetrics,
     output_resources: Vec<wl_output::WlOutput>,
+    workspace_protocol: WorkspaceProtocolState,
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
     pointer_resources: Vec<wl_pointer::WlPointer>,
@@ -823,3 +826,5 @@ mod state;
 use state::*;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workspace_protocol_tests;

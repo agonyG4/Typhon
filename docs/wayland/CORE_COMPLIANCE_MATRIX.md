@@ -57,6 +57,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `astrea_shell_auth_manager_v1` | 1 | Partial |
 | `astrea_shell_control_manager_v1` | 1 | Partial |
 | `astrea_toplevel_manager_v1` | 2 | Partial |
+| `ext_workspace_manager_v1` | 1 | Partial |
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
 | `wl_seat` | 8 | Implemented |

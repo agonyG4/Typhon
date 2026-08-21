@@ -117,6 +117,7 @@ impl CompositorState {
         if !focused_layer_surface && !layer_focus_after_switch {
             let _ = self.focus_topmost_renderable_toplevel();
         }
+        self.publish_workspace_state();
         outcome
     }
 

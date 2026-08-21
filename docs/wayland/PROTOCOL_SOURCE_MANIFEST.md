@@ -73,6 +73,7 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 - `idle-inhibit`: `wayland-protocols-0.32.12/protocols/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml`
 - `xdg-decoration`: `wayland-protocols-0.32.12/protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml`
 - `ext-data-control`: `wayland-protocols-0.32.12/protocols/staging/ext-data-control/ext-data-control-v1.xml`
+- `ext-workspace`: `wayland-protocols-0.32.12/protocols/staging/ext-workspace/ext-workspace-v1.xml`
 - `wlr-layer-shell`: `wayland-protocols-wlr-0.3.12/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml`
 
 Generated module routing used by the locked crates is in
@@ -95,6 +96,7 @@ Typhon’s local generated protocols are invoked from:
 | stable `presentation-time.xml` | `dffac93bcb2bb1d8c385e72b8a8c2c0d4d79a336866322f3ba886dce2b27b1e2` |
 | stable `linux-dmabuf-v1.xml` | `ef39de11196083a41e865737f71e89a9ce3d61b94d2dbbed9b156cd89d6bb97f` |
 | staging `cursor-shape-v1.xml` | `bb57d91e53a79dadab7c612dab87c233393cee73673feefa7442cfbfdd9aed2f` |
+| staging `ext-workspace-v1.xml` | `2437063d2011a06419380ab97acb84fe424a9747f004205b298fd407ace1a6dd` |
 | WLR `wlr-layer-shell-unstable-v1.xml` | `87e0b9c837aecd6977f76f3c47d73088b7159871f5d979dc1840f6cadb5e2ed8` |
 | Astrea `astrea-toplevel-management-v1.xml` | `e693df18b4da304378bf2e1f1a681a278ad25439c205a407303563e3f182f237` |
 
@@ -151,6 +153,7 @@ The target contract is:
 | `astrea_shortcuts_manager_v1` | 1 | always |
 | `astrea_shell_control_manager_v1` | 1 | always |
 | `astrea_toplevel_manager_v1` | 2 | always |
+| `ext_workspace_manager_v1` | 1 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `wl_seat` | 8 | always |

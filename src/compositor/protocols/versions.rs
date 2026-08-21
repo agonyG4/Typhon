@@ -558,6 +558,7 @@ pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 2;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
 pub(crate) const WL_SEAT: u32 = 8;
+pub(crate) const EXT_WORKSPACE_MANAGER_V1: u32 = 1;
 pub(crate) const XWAYLAND_SHELL_V1: u32 = crate::xwayland::XWAYLAND_SHELL_V1_VERSION;
 
 pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
@@ -615,6 +616,7 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("xdg_wm_base", XDG_WM_BASE),
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),
     GlobalAdvertisement::new("wl_seat", WL_SEAT),
+    GlobalAdvertisement::new("ext_workspace_manager_v1", EXT_WORKSPACE_MANAGER_V1),
     GlobalAdvertisement::new("xwayland_shell_v1", XWAYLAND_SHELL_V1),
 ];
 

@@ -34,6 +34,9 @@ impl CompositorState {
             self.output_refresh,
         );
         self.output_resources.push(output);
+        if let Some(output) = self.output_resources.last().cloned() {
+            self.publish_workspace_output_enter(&output);
+        }
         self.reconcile_all_surface_output_memberships();
     }
 
@@ -42,6 +45,7 @@ impl CompositorState {
         output: &wl_output::WlOutput,
     ) {
         let output_id = output.id().protocol_id();
+        self.publish_workspace_output_leave(output);
         let affected_surfaces = self
             .surface_output_memberships
             .iter()

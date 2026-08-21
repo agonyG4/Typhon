@@ -1,5 +1,6 @@
 use super::*;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
+use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1;
 use wayland_protocols::wp::{
     commit_timing::v1::server::wp_commit_timing_manager_v1,
     content_type::v1::server::wp_content_type_manager_v1,
@@ -176,6 +177,10 @@ pub(super) fn register_minimum_globals(
         );
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(versions::XDG_WM_BASE, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(versions::WL_OUTPUT, ());
+    display.create_global::<CompositorState, ext_workspace_manager_v1::ExtWorkspaceManagerV1, _>(
+        versions::EXT_WORKSPACE_MANAGER_V1,
+        (),
+    );
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(versions::WL_SEAT, ());
     display.create_global::<CompositorState, xwayland_shell_v1::XwaylandShellV1, _>(
         versions::XWAYLAND_SHELL_V1,

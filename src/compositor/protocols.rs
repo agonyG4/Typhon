@@ -22,5 +22,6 @@ mod syncobj;
 mod toplevel_management;
 pub(crate) mod versions;
 mod viewport;
+mod workspace;
 mod xdg;
 mod xwayland;
