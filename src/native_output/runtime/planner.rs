@@ -82,9 +82,12 @@ pub(super) fn prepare_presentation_target_for_mode(
     predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
     let scheduled = if pacing_mode == NativeOutputPacingMode::ReactiveDouble
-        && scheduled.is_none_or(|target| target.reason != PresentationTargetReason::CommitTiming)
+        && scheduled.is_some_and(|target| target.reason != PresentationTargetReason::CommitTiming)
     {
-        planner.clear_scheduled_target();
+        // Revoking extra capacity terminates an unstarted render lease.  The
+        // next Reactive frame will allocate a fresh reachable opportunity;
+        // the old target is never silently reused or moved.
+        let _ = planner.abandon_scheduled_target();
         None
     } else {
         scheduled
@@ -174,7 +177,12 @@ pub(super) fn plan_visual_target_for_mode(
     if let (Some(pending), Some(scheduled)) = (pending_target, scheduled)
         && !strictly_later_target(pending, scheduled)
     {
-        return planner.plan_target_after(pending, now, predicted_total_cost, scheduled.reason);
+        // The old target is no longer a valid live opportunity claim.  End it
+        // before allocating a successor; never mutate an armed target into a
+        // later vblank merely because the frontier moved.
+        let abandoned = planner.abandon_scheduled_target();
+        debug_assert_eq!(abandoned, Some(scheduled));
+        return planner.plan_successor_after(pending, now, predicted_total_cost, scheduled.reason);
     }
     if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
         return None;

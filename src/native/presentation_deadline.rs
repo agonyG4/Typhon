@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use crate::native::buffering::{OpportunityLease, OpportunityLeaseReason, PresentationOpportunity};
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonotonicTimestampNs(u64);
@@ -72,6 +74,29 @@ impl PresentationTarget {
     pub const fn predicted_unreachable(self) -> bool {
         self.predicted_unreachable
     }
+
+    pub const fn opportunity(self) -> PresentationOpportunity {
+        PresentationOpportunity::fixed_vsync(
+            crate::native::buffering::PresentationOpportunityId::new(
+                self.clock_generation,
+                self.sequence,
+            ),
+            self.presentation_time,
+            self.refresh_interval,
+        )
+    }
+
+    pub const fn opportunity_lease(self) -> OpportunityLease {
+        let reason = match self.reason {
+            PresentationTargetReason::ReactiveDouble => OpportunityLeaseReason::VisualWork,
+            PresentationTargetReason::Normal => OpportunityLeaseReason::VisualWork,
+            PresentationTargetReason::PredictedPressure => OpportunityLeaseReason::RenderAhead,
+            PresentationTargetReason::ProvenReadinessMiss => OpportunityLeaseReason::Recovery,
+            PresentationTargetReason::ForcedValidation => OpportunityLeaseReason::ForcedValidation,
+            PresentationTargetReason::CommitTiming => OpportunityLeaseReason::CommitTiming,
+        };
+        OpportunityLease::arm(self.opportunity(), reason)
+    }
 }
 
 #[doc(hidden)]
@@ -82,6 +107,7 @@ pub struct PresentationDeadlinePlanner {
     last_presented_at: Option<MonotonicTimestampNs>,
     refresh_interval: Duration,
     scheduled: Option<PresentationTarget>,
+    pre_render_abandoned: u64,
 }
 
 impl PresentationDeadlinePlanner {
@@ -92,6 +118,7 @@ impl PresentationDeadlinePlanner {
             last_presented_at: None,
             refresh_interval: nonzero_refresh(refresh_interval),
             scheduled: None,
+            pre_render_abandoned: 0,
         }
     }
 
@@ -221,7 +248,7 @@ impl PresentationDeadlinePlanner {
     /// Replan a scheduled target which has fallen behind an already-owned
     /// future target. A later protocol lower bound remains a valid lower
     /// bound, so preserving the target reason is safe.
-    pub fn plan_target_after(
+    pub fn plan_successor_after(
         &mut self,
         lower_bound: PresentationTarget,
         now: MonotonicTimestampNs,
@@ -258,6 +285,20 @@ impl PresentationDeadlinePlanner {
 
     pub fn clear_scheduled_target(&mut self) {
         self.scheduled = None;
+    }
+
+    /// End a target that has not entered rendering.  The caller must allocate
+    /// a new target identity; this method never retargets the old value.
+    pub fn abandon_scheduled_target(&mut self) -> Option<PresentationTarget> {
+        let abandoned = self.scheduled.take();
+        if abandoned.is_some() {
+            self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
+        }
+        abandoned
+    }
+
+    pub const fn pre_render_abandoned(&self) -> u64 {
+        self.pre_render_abandoned
     }
 
     pub fn plan_render_ahead(
@@ -543,6 +584,36 @@ mod tests {
         planner.invalidate(Duration::from_nanos(REFRESH_NS));
 
         assert!(!planner.is_current(target));
+    }
+
+    #[test]
+    fn overtaken_target_is_abandoned_before_a_new_successor_is_allocated() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let original = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        assert_eq!(planner.abandon_scheduled_target(), Some(original));
+        let replacement = planner
+            .plan_successor_after(
+                PresentationTarget {
+                    sequence: original.sequence + 1,
+                    presentation_time: MonotonicTimestampNs::new(90_000_000),
+                    ..original
+                },
+                MonotonicTimestampNs::new(95_000_000),
+                Duration::from_millis(2),
+                PresentationTargetReason::PredictedPressure,
+            )
+            .unwrap();
+
+        assert_ne!(replacement.identity(), original.identity());
+        assert_eq!(planner.pre_render_abandoned(), 1);
+        assert_eq!(planner.scheduled_target(), Some(replacement));
     }
 
     #[test]

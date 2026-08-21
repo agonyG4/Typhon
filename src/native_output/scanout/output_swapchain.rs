@@ -20,6 +20,7 @@ use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::presentation::{
     kms_timing::KmsSubmitWindow, plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
 };
+use oblivion_one::native::buffering::PresentationOpportunityFrontier;
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 
@@ -1148,6 +1149,22 @@ impl AtomicOutputSwapchain {
                 ));
             }
         }
+        let frontier = PresentationOpportunityFrontier::from_claims(
+            [
+                self.pending.as_ref().map(|pending| pending.frame.target),
+                self.worker_queued
+                    .as_ref()
+                    .map(|queued| queued.frame.target),
+                self.ready.as_ref().map(|ready| ready.target),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|target| target.opportunity().id()),
+        )
+        .map_err(|error| {
+            io::Error::other(format!("presentation opportunity frontier: {error:?}"))
+        })?;
+        let _latest_claim = frontier.latest();
         if let (Some(pending), Some(worker)) = (&self.pending, &self.worker_queued) {
             validate_strictly_later_target(pending.frame.target, worker.frame.target)?;
         }

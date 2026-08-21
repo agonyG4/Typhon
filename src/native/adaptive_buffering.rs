@@ -1,14 +1,13 @@
 //! Deadline risk prediction and bounded adaptive-buffering policy.
 #![allow(dead_code)] // Wired into the native runtime in Task 12.
 
+use crate::native::buffering::ElasticFuturePrimaryCredit;
 use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use crate::native::scheduler::NativeOutputPacingMode;
 use std::collections::VecDeque;
 use std::time::Duration;
 
 const SAMPLE_CAPACITY: usize = 120;
-const MIN_HYSTERESIS_PRESENTATIONS: u64 = 10;
-const MIN_HYSTERESIS_NS: u64 = 100_000_000;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,9 +435,12 @@ impl AdaptiveRenderJournal {
 pub struct AdaptiveBufferingController {
     policy: AdaptiveTripleBufferPolicy,
     mode: AdaptiveBufferingMode,
+    o1_credit: ElasticFuturePrimaryCredit,
+    last_overlap_target: Option<(u64, u64)>,
+    last_overlap_required_ns: u64,
+    positive_overlap_observations: u64,
+    nonpositive_overlap_observations: u64,
     entry_reason: Option<TripleEntryReason>,
-    entered_at: Option<(u64, MonotonicTimestampNs)>,
-    low_pressure_since: Option<(u64, MonotonicTimestampNs)>,
     capability: TripleCapability,
     force_unavailable_blocker: Option<TripleCapabilityBlocker>,
 }
@@ -448,9 +450,15 @@ impl AdaptiveBufferingController {
         Self {
             policy,
             mode: AdaptiveBufferingMode::Double,
+            o1_credit: ElasticFuturePrimaryCredit::with_ceiling(match policy {
+                AdaptiveTripleBufferPolicy::Force => 2,
+                AdaptiveTripleBufferPolicy::Off | AdaptiveTripleBufferPolicy::Auto => 1,
+            }),
+            last_overlap_target: None,
+            last_overlap_required_ns: 0,
+            positive_overlap_observations: 0,
+            nonpositive_overlap_observations: 0,
             entry_reason: None,
-            entered_at: None,
-            low_pressure_since: None,
             capability: TripleCapability::Unavailable(
                 TripleCapabilityBlocker::ExplicitSwapchainUnavailable,
             ),
@@ -458,166 +466,161 @@ impl AdaptiveBufferingController {
         }
     }
 
-    pub fn observe(
-        &mut self,
-        predicted_total_cost_ns: u64,
-        refresh_interval: Duration,
-        proven_miss: Option<ProvenDeadlineMiss>,
-        presentation_sequence: u64,
-        presentation_time: MonotonicTimestampNs,
-        visual_work: bool,
-    ) {
-        self.observe_with_pipeline(
-            predicted_total_cost_ns,
-            refresh_interval,
-            proven_miss,
-            presentation_sequence,
-            presentation_time,
-            visual_work,
-            TripleCapability::Capable,
-            false,
-            0,
-        );
-    }
-
     pub fn apply_capability(&mut self, capability: TripleCapability) {
         self.capability = capability;
         match (self.policy, capability) {
             (AdaptiveTripleBufferPolicy::Off, _) => {
+                self.o1_credit.set_ceiling(1);
                 self.mode = AdaptiveBufferingMode::Double;
                 self.force_unavailable_blocker = None;
             }
             (AdaptiveTripleBufferPolicy::Force, TripleCapability::Unavailable(blocker)) => {
+                self.o1_credit.set_ceiling(1);
                 self.force_unavailable_blocker = Some(blocker);
                 if self.mode != AdaptiveBufferingMode::Triple {
                     self.mode = AdaptiveBufferingMode::Double;
                     self.entry_reason = None;
-                    self.entered_at = None;
-                    self.low_pressure_since = None;
                 }
             }
             (AdaptiveTripleBufferPolicy::Force, TripleCapability::Capable) => {
+                self.o1_credit.set_ceiling(2);
                 self.mode = AdaptiveBufferingMode::Triple;
                 self.entry_reason = Some(TripleEntryReason::ForcedValidation);
                 self.force_unavailable_blocker = None;
             }
             (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Unavailable(_)) => {
+                self.o1_credit.set_ceiling(1);
                 self.force_unavailable_blocker = None;
                 if self.mode != AdaptiveBufferingMode::Triple {
                     self.mode = AdaptiveBufferingMode::Double;
                     self.entry_reason = None;
-                    self.entered_at = None;
-                    self.low_pressure_since = None;
                 }
             }
             (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Capable) => {
+                self.o1_credit.set_ceiling(2);
                 self.force_unavailable_blocker = None;
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn observe_with_pipeline(
+    /// Feed O1's overlap decision into buffering policy.  This is capacity
+    /// control only: it never changes an already armed presentation target.
+    pub fn observe_overlap_required(&mut self, overlap_required_ns: u64) {
+        self.observe_overlap_required_with_ownership(overlap_required_ns, false);
+    }
+
+    /// Evaluate overlap once for a predecessor opportunity.  Scheduler wake
+    /// retries may inspect the same pending target many times; those retries
+    /// must not look like repeated pressure observations.
+    pub fn observe_overlap_for_target(
         &mut self,
-        predicted_total_cost_ns: u64,
-        refresh_interval: Duration,
-        proven_miss: Option<ProvenDeadlineMiss>,
-        presentation_sequence: u64,
-        presentation_time: MonotonicTimestampNs,
-        visual_work: bool,
-        capability: TripleCapability,
-        prepared_frame_exists: bool,
-        future_primary_depth: u8,
+        predecessor: Option<PresentationTarget>,
+        overlap_required_ns: u64,
+        future_primary_owned: bool,
     ) {
-        self.capability = capability;
-        if self.policy == AdaptiveTripleBufferPolicy::Off {
+        let target_identity = predecessor.map(PresentationTarget::identity);
+        if self.last_overlap_target == target_identity {
             return;
         }
-        let TripleCapability::Capable = capability else {
-            self.force_unavailable_blocker = match (self.policy, capability) {
-                (AdaptiveTripleBufferPolicy::Force, TripleCapability::Unavailable(blocker)) => {
-                    Some(blocker)
-                }
-                _ => None,
-            };
-            if self.mode != AdaptiveBufferingMode::Triple
-                || (!prepared_frame_exists && future_primary_depth <= 1)
-            {
+        self.last_overlap_target = target_identity;
+        self.last_overlap_required_ns = overlap_required_ns;
+        if overlap_required_ns > 0 {
+            self.positive_overlap_observations =
+                self.positive_overlap_observations.saturating_add(1);
+        } else {
+            self.nonpositive_overlap_observations =
+                self.nonpositive_overlap_observations.saturating_add(1);
+        }
+        self.observe_overlap_required_with_ownership(overlap_required_ns, future_primary_owned);
+    }
+
+    /// Observe overlap while preserving extra capacity until the currently
+    /// owned future primary has settled.
+    pub fn observe_overlap_required_with_ownership(
+        &mut self,
+        overlap_required_ns: u64,
+        future_primary_owned: bool,
+    ) {
+        match self.policy {
+            AdaptiveTripleBufferPolicy::Off => {
+                self.o1_credit.set_ceiling(1);
                 self.mode = AdaptiveBufferingMode::Double;
-                self.entry_reason = None;
-                self.entered_at = None;
-                self.low_pressure_since = None;
             }
-            return;
-        };
-        self.force_unavailable_blocker = None;
-        let refresh_ns = duration_ns(refresh_interval).max(1);
-        if self.policy == AdaptiveTripleBufferPolicy::Force {
-            if self.mode != AdaptiveBufferingMode::Triple {
-                self.mode = AdaptiveBufferingMode::Triple;
-                self.entry_reason = Some(TripleEntryReason::ForcedValidation);
-                self.entered_at = Some((presentation_sequence, presentation_time));
-            }
-            return;
-        }
-        if self.mode == AdaptiveBufferingMode::Double {
-            let predictive_entry =
-                visual_work && proven_miss.is_none() && predicted_total_cost_ns >= refresh_ns;
-            let reason = match self.policy {
-                AdaptiveTripleBufferPolicy::Auto => {
-                    proven_miss.map(triple_entry_reason_for_miss).or_else(|| {
-                        predictive_entry.then_some(TripleEntryReason::PredictedDeadlinePressure)
-                    })
+            AdaptiveTripleBufferPolicy::Force => {
+                if self.capability == TripleCapability::Capable {
+                    self.o1_credit.set_ceiling(2);
+                    self.mode = AdaptiveBufferingMode::Triple;
+                } else {
+                    self.o1_credit.set_ceiling(1);
+                    self.mode = AdaptiveBufferingMode::Double;
                 }
-                _ => None,
-            };
-            if let Some(reason) = reason {
-                self.mode = AdaptiveBufferingMode::Triple;
-                self.entry_reason = Some(reason);
-                self.entered_at = Some((presentation_sequence, presentation_time));
-                self.low_pressure_since = None;
             }
-            return;
+            AdaptiveTripleBufferPolicy::Auto => {
+                if self.capability == TripleCapability::Capable {
+                    let before = self.o1_credit.effective();
+                    self.o1_credit
+                        .observe_overlap_with_ownership(overlap_required_ns, future_primary_owned);
+                    if before == 1 && self.o1_credit.effective() == 2 {
+                        self.entry_reason = Some(TripleEntryReason::PredictedDeadlinePressure);
+                    } else if self.o1_credit.effective() == 1 {
+                        self.entry_reason = None;
+                    }
+                } else {
+                    self.o1_credit.set_ceiling(1);
+                    self.entry_reason = None;
+                }
+                self.sync_o1_mode();
+            }
         }
-        if self.mode != AdaptiveBufferingMode::Triple {
-            return;
-        }
-        let Some((entry_sequence, entry_time)) = self.entered_at else {
-            return;
-        };
-        let hold_complete = elapsed_both(
-            entry_sequence,
-            entry_time,
-            presentation_sequence,
-            presentation_time,
-        );
-        if proven_miss.is_some() || at_least_percent(predicted_total_cost_ns, refresh_ns, 95) {
-            self.low_pressure_since = None;
-            return;
-        }
-        if !hold_complete {
-            return;
-        }
-        let low_pressure = below_percent(predicted_total_cost_ns, refresh_ns, 80);
-        if !low_pressure {
-            return;
-        }
-        let low_start = *self
-            .low_pressure_since
-            .get_or_insert((presentation_sequence, presentation_time));
-        if elapsed_both(
-            low_start.0,
-            low_start.1,
-            presentation_sequence,
-            presentation_time,
-        ) && !prepared_frame_exists
-            && future_primary_depth <= 1
+    }
+
+    /// Apply pageflip evidence without reviving the legacy global mode
+    /// hysteresis.  A proven outcome may grant capacity, but never retargets a
+    /// live frame.
+    pub fn observe_o1_outcome(&mut self, proven_miss: Option<ProvenDeadlineMiss>) {
+        if self.policy == AdaptiveTripleBufferPolicy::Auto
+            && self.capability == TripleCapability::Capable
+            && let Some(miss) = proven_miss
         {
-            self.mode = AdaptiveBufferingMode::Double;
-            self.entry_reason = None;
-            self.entered_at = None;
-            self.low_pressure_since = None;
+            self.o1_credit.observe_overlap(1);
+            self.entry_reason = Some(triple_entry_reason_for_miss(miss));
         }
+        self.sync_o1_mode();
+    }
+
+    fn sync_o1_mode(&mut self) {
+        self.mode = if self.o1_credit.effective() == 2
+            && self.capability == TripleCapability::Capable
+            && self.policy != AdaptiveTripleBufferPolicy::Off
+        {
+            AdaptiveBufferingMode::Triple
+        } else {
+            AdaptiveBufferingMode::Double
+        };
+    }
+
+    pub const fn future_primary_credit(&self) -> u8 {
+        self.o1_credit.effective()
+    }
+
+    pub const fn extra_credit_grants(&self) -> u64 {
+        self.o1_credit.grants()
+    }
+
+    pub const fn extra_credit_revokes(&self) -> u64 {
+        self.o1_credit.revokes()
+    }
+
+    pub const fn last_overlap_required_ns(&self) -> u64 {
+        self.last_overlap_required_ns
+    }
+
+    pub const fn positive_overlap_observations(&self) -> u64 {
+        self.positive_overlap_observations
+    }
+
+    pub const fn nonpositive_overlap_observations(&self) -> u64 {
+        self.nonpositive_overlap_observations
     }
 
     pub const fn mode(&self) -> AdaptiveBufferingMode {
@@ -680,24 +683,6 @@ pub fn approximate_observation_is_late(
     p95_wake_lateness_ns: u64,
 ) -> bool {
     observed_ns > target_ns.saturating_add(p95_wake_lateness_ns.max(500_000))
-}
-
-fn elapsed_both(
-    start_sequence: u64,
-    start_time: MonotonicTimestampNs,
-    sequence: u64,
-    time: MonotonicTimestampNs,
-) -> bool {
-    sequence.saturating_sub(start_sequence) >= MIN_HYSTERESIS_PRESENTATIONS
-        && time.get().saturating_sub(start_time.get()) >= MIN_HYSTERESIS_NS
-}
-
-fn at_least_percent(value: u64, total: u64, percent: u64) -> bool {
-    u128::from(value) * 100 >= u128::from(total) * u128::from(percent)
-}
-
-fn below_percent(value: u64, total: u64, percent: u64) -> bool {
-    u128::from(value) * 100 < u128::from(total) * u128::from(percent)
 }
 
 fn push_bounded(samples: &mut VecDeque<u64>, value: u64) {
@@ -854,62 +839,59 @@ mod tests {
     }
 
     #[test]
-    fn auto_entry_and_count_plus_time_exit_are_hysteretic() {
-        let refresh = Duration::from_millis(10);
-        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        policy.observe(
-            10_000_000,
-            refresh,
-            None,
-            1,
-            MonotonicTimestampNs::new(10_000_000),
-            true,
-        );
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-
-        for sequence in 2..=21 {
-            policy.observe(
-                7_000_000,
-                refresh,
-                None,
-                sequence,
-                MonotonicTimestampNs::new(sequence * 10_000_000),
-                true,
-            );
-        }
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
-    }
-
-    #[test]
     fn off_never_enters_and_force_enters_for_visual_work() {
-        let refresh = Duration::from_millis(10);
         let mut off = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Off);
-        off.observe(
-            20_000_000,
-            refresh,
-            Some(ProvenDeadlineMiss::ExactRender),
-            1,
-            MonotonicTimestampNs::new(1),
-            true,
-        );
-        assert_eq!(off.mode(), AdaptiveBufferingMode::Double);
-        off.observe(
-            0,
-            refresh,
-            Some(ProvenDeadlineMiss::KmsApplyGuard),
-            2,
-            MonotonicTimestampNs::new(2),
-            false,
-        );
+        off.apply_capability(TripleCapability::Capable);
+        off.observe_overlap_required(1);
         assert_eq!(off.mode(), AdaptiveBufferingMode::Double);
 
         let mut force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
-        force.observe(0, refresh, None, 1, MonotonicTimestampNs::new(1), true);
+        force.apply_capability(TripleCapability::Capable);
+        force.observe_overlap_required(0);
         assert_eq!(force.mode(), AdaptiveBufferingMode::Triple);
         assert_eq!(
             force.entry_reason(),
             Some(TripleEntryReason::ForcedValidation)
         );
+    }
+
+    #[test]
+    fn overlap_is_observed_once_per_predecessor_opportunity() {
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        policy.apply_capability(TripleCapability::Capable);
+        let target = crate::native::presentation_deadline::PresentationTarget {
+            sequence: 10,
+            presentation_time: MonotonicTimestampNs::new(100),
+            submit_not_before: MonotonicTimestampNs::new(0),
+            render_start_deadline: MonotonicTimestampNs::new(0),
+            refresh_interval: Duration::from_nanos(10),
+            reason:
+                crate::native::presentation_deadline::PresentationTargetReason::PredictedPressure,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        };
+
+        policy.observe_overlap_for_target(Some(target), 1, true);
+        for _ in 0..10 {
+            policy.observe_overlap_for_target(Some(target), 0, true);
+        }
+        assert_eq!(policy.extra_credit_grants(), 1);
+        assert_eq!(policy.future_primary_credit(), 2);
+
+        policy.observe_overlap_for_target(None, 0, false);
+        let target = crate::native::presentation_deadline::PresentationTarget {
+            sequence: 11,
+            ..target
+        };
+        policy.observe_overlap_for_target(Some(target), 0, false);
+        let target = crate::native::presentation_deadline::PresentationTarget {
+            sequence: 12,
+            ..target
+        };
+        policy.observe_overlap_for_target(Some(target), 0, false);
+        assert_eq!(policy.future_primary_credit(), 1);
+        assert_eq!(policy.extra_credit_revokes(), 1);
     }
 
     #[test]
@@ -941,16 +923,8 @@ mod tests {
     #[test]
     fn proven_presentation_miss_enters_triple_without_next_frame_already_queued() {
         let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        let proven_miss = merge_presentation_miss(None, 100, 101);
-
-        policy.observe(
-            0,
-            Duration::from_millis(10),
-            proven_miss,
-            101,
-            MonotonicTimestampNs::new(10_000_000),
-            false,
-        );
+        policy.apply_capability(TripleCapability::Capable);
+        policy.observe_o1_outcome(Some(ProvenDeadlineMiss::KmsApplyGuard));
 
         assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
         assert_eq!(
@@ -960,110 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn predicted_pressure_still_requires_visual_work() {
-        let refresh = Duration::from_millis(10);
-        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-
-        policy.observe(
-            20_000_000,
-            refresh,
-            None,
-            100,
-            MonotonicTimestampNs::new(1_000_000_000),
-            false,
-        );
-
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
-
-        policy.observe(
-            20_000_000,
-            refresh,
-            None,
-            101,
-            MonotonicTimestampNs::new(1_010_000_000),
-            true,
-        );
-
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-        assert_eq!(
-            policy.entry_reason(),
-            Some(TripleEntryReason::PredictedDeadlinePressure)
-        );
-    }
-
-    #[test]
-    fn adaptive_hysteresis_uses_actual_presentation_sequence() {
-        let refresh = Duration::from_millis(10);
-        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        policy.observe(
-            0,
-            refresh,
-            Some(ProvenDeadlineMiss::KmsApplyGuard),
-            100,
-            MonotonicTimestampNs::new(0),
-            false,
-        );
-
-        // Ten planned targets may have elapsed, but the output has not
-        // presented another logical sequence yet.
-        policy.observe(
-            7_000_000,
-            refresh,
-            None,
-            100,
-            MonotonicTimestampNs::new(100_000_000),
-            true,
-        );
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-
-        for sequence in 101..=109 {
-            policy.observe(
-                7_000_000,
-                refresh,
-                None,
-                sequence,
-                MonotonicTimestampNs::new(sequence * 1_000_000),
-                true,
-            );
-        }
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-
-        policy.observe(
-            7_000_000,
-            refresh,
-            None,
-            110,
-            MonotonicTimestampNs::new(110_000_000),
-            true,
-        );
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-
-        for sequence in 111..=119 {
-            policy.observe(
-                7_000_000,
-                refresh,
-                None,
-                sequence,
-                MonotonicTimestampNs::new(sequence * 1_000_000),
-                true,
-            );
-        }
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
-
-        policy.observe(
-            7_000_000,
-            refresh,
-            None,
-            120,
-            MonotonicTimestampNs::new(210_000_000),
-            true,
-        );
-        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
-    }
-
-    #[test]
     fn proven_miss_entry_reasons_preserve_specific_precedence() {
-        let refresh = Duration::from_millis(10);
         for (miss, reason) in [
             (
                 ProvenDeadlineMiss::KmsDispatch,
@@ -1083,14 +954,8 @@ mod tests {
             ),
         ] {
             let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-            policy.observe(
-                0,
-                refresh,
-                Some(miss),
-                100,
-                MonotonicTimestampNs::new(100_000_000),
-                false,
-            );
+            policy.apply_capability(TripleCapability::Capable);
+            policy.observe_o1_outcome(Some(miss));
             assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
             assert_eq!(policy.entry_reason(), Some(reason));
         }
@@ -1098,39 +963,17 @@ mod tests {
 
     #[test]
     fn presentation_miss_does_not_exit_existing_triple_hold() {
-        let refresh = Duration::from_millis(10);
         let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        policy.observe(
-            0,
-            refresh,
-            Some(ProvenDeadlineMiss::KmsApplyGuard),
-            100,
-            MonotonicTimestampNs::new(0),
-            false,
-        );
-        policy.observe(
-            7_000_000,
-            refresh,
-            Some(ProvenDeadlineMiss::KmsApplyGuard),
-            120,
-            MonotonicTimestampNs::new(200_000_000),
-            true,
-        );
+        policy.apply_capability(TripleCapability::Capable);
+        policy.observe_o1_outcome(Some(ProvenDeadlineMiss::KmsApplyGuard));
+        policy.observe_o1_outcome(Some(ProvenDeadlineMiss::KmsApplyGuard));
 
         assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
     }
 
     #[test]
     fn no_miss_and_no_visual_work_does_not_transition() {
-        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        policy.observe(
-            0,
-            Duration::from_millis(10),
-            None,
-            100,
-            MonotonicTimestampNs::new(100_000_000),
-            false,
-        );
+        let policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
 
         assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
         assert_eq!(policy.entry_reason(), None);
@@ -1141,14 +984,8 @@ mod tests {
         let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
         let scheduler = NativeFrameScheduler::new(165, 0);
 
-        policy.observe(
-            0,
-            Duration::from_millis(10),
-            merge_presentation_miss(None, 100, 101),
-            101,
-            MonotonicTimestampNs::new(10_000_000),
-            false,
-        );
+        policy.apply_capability(TripleCapability::Capable);
+        policy.observe_o1_outcome(Some(ProvenDeadlineMiss::KmsApplyGuard));
 
         assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
         assert!(!scheduler.visual_work_queued());
@@ -1166,18 +1003,12 @@ mod tests {
 
     #[test]
     fn pacing_mode_maps_force_and_auto_triple_to_predictive_triple() {
-        let refresh = Duration::from_millis(10);
         let mut force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
-        force.observe(0, refresh, None, 1, MonotonicTimestampNs::new(1), true);
+        force.apply_capability(TripleCapability::Capable);
+        force.observe_overlap_required(0);
         let mut auto = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        auto.observe(
-            10_000_000,
-            refresh,
-            None,
-            1,
-            MonotonicTimestampNs::new(10_000_000),
-            true,
-        );
+        auto.apply_capability(TripleCapability::Capable);
+        auto.observe_overlap_required(1);
 
         assert_eq!(
             force.pacing_mode(),
@@ -1273,17 +1104,10 @@ mod tests {
     #[test]
     fn force_never_bypasses_an_exact_capability_blocker() {
         let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
-        controller.observe_with_pipeline(
-            20_000_000,
-            Duration::from_millis(10),
-            None,
-            1,
-            MonotonicTimestampNs::new(10_000_000),
-            true,
-            TripleCapability::Unavailable(TripleCapabilityBlocker::PrimaryInFenceUnavailable),
-            false,
-            0,
-        );
+        controller.apply_capability(TripleCapability::Unavailable(
+            TripleCapabilityBlocker::PrimaryInFenceUnavailable,
+        ));
+        controller.observe_overlap_required(1);
 
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
         assert_eq!(
@@ -1315,153 +1139,61 @@ mod tests {
     }
 
     #[test]
-    fn triple_exit_waits_until_prepared_is_empty_and_future_depth_is_at_most_one() {
-        let refresh = Duration::from_millis(10);
-        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        controller.observe_with_pipeline(
-            10_000_000,
-            refresh,
-            None,
-            1,
-            MonotonicTimestampNs::new(10_000_000),
-            true,
-            TripleCapability::Capable,
-            false,
-            0,
-        );
-        for sequence in 2..=30 {
-            controller.observe_with_pipeline(
-                7_000_000,
-                refresh,
-                None,
-                sequence,
-                MonotonicTimestampNs::new(sequence * 10_000_000),
-                true,
-                TripleCapability::Capable,
-                false,
-                2,
-            );
-        }
-        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
-
-        for sequence in 31..=41 {
-            controller.observe_with_pipeline(
-                7_000_000,
-                refresh,
-                None,
-                sequence,
-                MonotonicTimestampNs::new(sequence * 10_000_000),
-                true,
-                TripleCapability::Capable,
-                false,
-                1,
-            );
-        }
-        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
-    }
-
-    #[test]
     fn capability_loss_drains_two_future_primaries_before_leaving_triple() {
-        let refresh = Duration::from_millis(10);
         let blocker = TripleCapabilityBlocker::SubmissionTransportUnhealthy;
         let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-        controller.observe_with_pipeline(
-            10_000_000,
-            refresh,
-            None,
-            1,
-            MonotonicTimestampNs::new(10_000_000),
-            true,
-            TripleCapability::Capable,
-            false,
-            0,
-        );
+        controller.apply_capability(TripleCapability::Capable);
+        controller.observe_overlap_required(1);
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
 
         controller.apply_capability(TripleCapability::Unavailable(blocker));
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
-        controller.observe_with_pipeline(
-            7_000_000,
-            refresh,
-            None,
-            2,
-            MonotonicTimestampNs::new(20_000_000),
-            true,
-            TripleCapability::Unavailable(blocker),
-            false,
-            2,
-        );
-        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+        controller.observe_overlap_required(0);
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+    }
+}
 
-        controller.observe_with_pipeline(
-            7_000_000,
-            refresh,
-            None,
-            3,
-            MonotonicTimestampNs::new(30_000_000),
-            true,
-            TripleCapability::Unavailable(blocker),
-            false,
-            1,
-        );
+#[cfg(test)]
+mod o1_tests {
+    use super::*;
+
+    #[test]
+    fn auto_credit_grants_from_overlap_not_total_refresh_cost() {
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        controller.apply_capability(TripleCapability::Capable);
+
+        controller.observe_overlap_required(1);
+
+        assert_eq!(controller.future_primary_credit(), 2);
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+    }
+
+    #[test]
+    fn auto_credit_revokes_after_stable_negative_slack() {
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        controller.apply_capability(TripleCapability::Capable);
+        controller.observe_overlap_required(1);
+
+        for _ in 0..3 {
+            controller.observe_overlap_required(0);
+        }
+
+        assert_eq!(controller.future_primary_credit(), 1);
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
     }
 
     #[test]
-    fn ninety_five_percent_pressure_resets_exit_candidacy_at_common_refresh_rates() {
-        for refresh_ns in [16_666_667, 8_333_333, 6_944_444, 6_060_606] {
-            let refresh = Duration::from_nanos(refresh_ns);
-            let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
-            controller.observe_with_pipeline(
-                refresh_ns,
-                refresh,
-                None,
-                1,
-                MonotonicTimestampNs::new(refresh_ns),
-                true,
-                TripleCapability::Capable,
-                false,
-                0,
-            );
-            for sequence in 2..=20 {
-                controller.observe_with_pipeline(
-                    refresh_ns * 79 / 100,
-                    refresh,
-                    None,
-                    sequence,
-                    MonotonicTimestampNs::new(sequence * refresh_ns),
-                    true,
-                    TripleCapability::Capable,
-                    false,
-                    0,
-                );
-            }
-            controller.observe_with_pipeline(
-                refresh_ns.saturating_mul(95).div_ceil(100),
-                refresh,
-                None,
-                21,
-                MonotonicTimestampNs::new(21 * refresh_ns),
-                true,
-                TripleCapability::Capable,
-                false,
-                0,
-            );
-            for sequence in 22..=30 {
-                controller.observe_with_pipeline(
-                    refresh_ns * 79 / 100,
-                    refresh,
-                    None,
-                    sequence,
-                    MonotonicTimestampNs::new(sequence * refresh_ns),
-                    true,
-                    TripleCapability::Capable,
-                    false,
-                    0,
-                );
-            }
-            assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
-        }
+    fn credit_two_does_not_change_after_capability_is_lost_until_owned_depth_drains() {
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        controller.apply_capability(TripleCapability::Capable);
+        controller.observe_overlap_required(1);
+        controller.apply_capability(TripleCapability::Unavailable(
+            TripleCapabilityBlocker::OutputGenerationUnstable,
+        ));
+        controller.observe_overlap_required(0);
+
+        assert_eq!(controller.future_primary_credit(), 1);
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
     }
 }
 

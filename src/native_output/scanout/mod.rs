@@ -622,15 +622,6 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn third_slot_owned(&self) -> bool {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.swapchain().is_ok_and(|swapchain| {
-                swapchain.ready_slot().is_some() || swapchain.rendering_slot().is_some()
-            }),
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => false,
-        }
-    }
-
     pub(crate) fn render_target_available(&self) -> bool {
         self.render_target_available_for(NativeOutputPacingMode::PredictiveTriple)
     }
