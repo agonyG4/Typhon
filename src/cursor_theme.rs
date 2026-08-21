@@ -489,6 +489,26 @@ pub(crate) fn load_cursor_theme(
     ))
 }
 
+pub(crate) fn load_protocol_shape_image(
+    theme_name: &str,
+    requested_size: u32,
+    shape: crate::compositor::ProtocolCursorShape,
+) -> Result<Option<Arc<CompositorCursorImage>>, CursorThemeLoadError> {
+    let theme = CursorTheme::load(theme_name);
+    let theme_exists = cursor_theme_directory_exists(theme_name);
+    let mut cache = HashMap::new();
+    load_alias_image(
+        &theme,
+        theme_name,
+        shape.aliases(),
+        requested_size,
+        false,
+        false,
+        theme_exists,
+        &mut cache,
+    )
+}
+
 #[cfg(test)]
 fn load_cursor_from_theme(
     theme_name: &str,
@@ -508,15 +528,36 @@ fn load_shape_image(
     theme_exists: bool,
     cache: &mut HashMap<PathBuf, Result<Arc<CompositorCursorImage>, CursorThemeLoadError>>,
 ) -> Result<Option<Arc<CompositorCursorImage>>, CursorThemeLoadError> {
-    let Some((path, _)) = shape
-        .aliases()
+    load_alias_image(
+        theme,
+        theme_name,
+        shape.aliases(),
+        requested_size,
+        required,
+        matches!(shape, CompositorCursorShape::Pointer),
+        theme_exists,
+        cache,
+    )
+}
+
+fn load_alias_image(
+    theme: &CursorTheme,
+    theme_name: &str,
+    aliases: &[&str],
+    requested_size: u32,
+    required: bool,
+    pointer_required: bool,
+    theme_exists: bool,
+    cache: &mut HashMap<PathBuf, Result<Arc<CompositorCursorImage>, CursorThemeLoadError>>,
+) -> Result<Option<Arc<CompositorCursorImage>>, CursorThemeLoadError> {
+    let Some((path, _)) = aliases
         .iter()
         .find_map(|name| theme.load_icon_with_depth(name))
     else {
         return if required {
             Err(if !theme_exists {
                 CursorThemeLoadError::ThemeNotFound
-            } else if matches!(shape, CompositorCursorShape::Pointer) {
+            } else if pointer_required {
                 CursorThemeLoadError::RequiredPointerMissing
             } else {
                 CursorThemeLoadError::ThemeNotFound

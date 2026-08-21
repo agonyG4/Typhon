@@ -124,7 +124,7 @@ impl ProtocolCursorShape {
             Self::NeswResize => &["nesw-resize", "size_bdiag"],
             Self::NwseResize => &["nwse-resize", "size_fdiag"],
             Self::ColResize => &["col-resize", "vertical-text"],
-            Self::RowResize => &["row-resize", "row-resize"],
+            Self::RowResize => &["row-resize", "h_double_arrow"],
             Self::AllScroll => &["all-scroll", "fleur"],
             Self::ZoomIn => &["zoom-in"],
             Self::ZoomOut => &["zoom-out"],
@@ -179,13 +179,6 @@ impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for Compos
                 if same_client && pointer.is_alive() {
                     data_init.init(id, CursorShapeDeviceData { pointer });
                 }
-            }
-            wp_cursor_shape_manager_v1::Request::GetTabletToolV2 { .. } => {
-                state.compliance_metrics.note_unhandled_request(
-                    "wp_cursor_shape_manager_v1",
-                    resource.version(),
-                    UnhandledRequestClass::SupportedButUnhandled,
-                );
             }
             _ => {
                 state.compliance_metrics.note_unhandled_request(

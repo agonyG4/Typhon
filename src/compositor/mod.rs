@@ -89,6 +89,7 @@ mod popup;
 mod presentation;
 mod presentation_modes;
 mod protocols;
+pub(crate) use protocols::cursor_shape::ProtocolCursorShape;
 mod render;
 mod runtime_files;
 mod selection;

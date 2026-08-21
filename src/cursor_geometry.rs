@@ -107,7 +107,7 @@ pub fn transform_hotspot(
         Transform::Flipped => (width - 1 - x, y),
         Transform::Flipped90 => (y, x),
         Transform::Flipped180 => (x, height - 1 - y),
-        Transform::Flipped270 => (height - 1 - y, width - 1 - x),
+        Transform::Flipped270 => (width - 1 - y, height - 1 - x),
         _ => return Err(CursorGeometryError::UnsupportedTransform),
     };
     Ok(CursorHotspot::new(
@@ -296,7 +296,7 @@ mod tests {
         );
         assert_eq!(
             transform_hotspot(hotspot, source, Transform::Flipped270).unwrap(),
-            Hotspot::new(0, 2)
+            Hotspot::new(1, 1)
         );
     }
 

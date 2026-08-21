@@ -173,6 +173,10 @@ impl NativeAtomicCursor {
         &self.desired
     }
 
+    pub(crate) fn output_scale(&self) -> f64 {
+        f64::from(self.output_scale_milli.max(1)) / 1_000.0
+    }
+
     pub(crate) fn pin_framebuffer_for(
         &self,
         state: &AtomicCursorVisualState,
@@ -934,6 +938,7 @@ pub(crate) fn client_cursor_image(
     surface: &RenderableSurface,
     hotspot_x: i32,
     hotspot_y: i32,
+    output_scale: f64,
 ) -> Option<Arc<CompositorCursorImage>> {
     // A viewport can crop or scale a cursor buffer. Until that transformation
     // is represented in the native image conversion, use software composition
@@ -950,14 +955,25 @@ pub(crate) fn client_cursor_image(
     {
         return None;
     }
+    let geometry = crate::cursor_geometry::geometry_for_surface(
+        crate::cursor_geometry::CursorSize::new(source_size.width, source_size.height),
+        surface.buffer_scale,
+        surface.buffer_transform,
+        surface
+            .viewport_destination
+            .map(|size| crate::cursor_geometry::CursorSize::new(size.width, size.height)),
+        crate::cursor_geometry::CursorHotspot::new(hotspot_x, hotspot_y),
+        output_scale,
+    )
+    .ok()?;
     let (pixels, (source_width, source_height)) = transform_cursor_pixels(
         pixels,
         source_size.width,
         source_size.height,
         surface.buffer_transform,
     )?;
-    let target_width = usize::try_from(surface.width).ok()?;
-    let target_height = usize::try_from(surface.height).ok()?;
+    let target_width = usize::try_from(geometry.physical_size.width).ok()?;
+    let target_height = usize::try_from(geometry.physical_size.height).ok()?;
     let mut normalized = vec![0; target_width.checked_mul(target_height)?];
     for y in 0..target_height {
         let source_y = y.saturating_mul(source_height) / target_height;
@@ -966,23 +982,12 @@ pub(crate) fn client_cursor_image(
             normalized[y * target_width + x] = pixels[source_y * source_width + source_x];
         }
     }
-    let hotspot = normalize_cursor_hotspot(
-        hotspot_x,
-        hotspot_y,
-        source_size.width,
-        source_size.height,
-        source_width as u32,
-        source_height as u32,
-        surface.width,
-        surface.height,
-        surface.buffer_transform,
-    )?;
     CompositorCursorImage::from_argb8888(
         normalized,
-        surface.width,
-        surface.height,
-        hotspot.0,
-        hotspot.1,
+        geometry.physical_size.width,
+        geometry.physical_size.height,
+        geometry.physical_hotspot.x,
+        geometry.physical_hotspot.y,
     )
     .ok()
     .map(Arc::new)
