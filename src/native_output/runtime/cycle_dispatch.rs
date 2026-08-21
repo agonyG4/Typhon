@@ -694,9 +694,17 @@ impl NativeRuntime {
         if !change.published {
             return;
         }
-        self.cursor_image = self
-            .cursor_manager
-            .active_image_for_shape(self.server.compositor_cursor_shape());
+        self.cursor_image = if self.server.interaction_cursor_override_active() {
+            self.cursor_manager
+                .active_image_for_shape(self.server.compositor_cursor_shape())
+        } else {
+            match self.server.client_cursor_shape() {
+                Some(shape) => self.cursor_manager.active_image_for_protocol_shape(shape),
+                None => self
+                    .cursor_manager
+                    .active_image_for_shape(self.server.compositor_cursor_shape()),
+            }
+        };
         self.frame_renderer
             .set_cursor_image(self.cursor_image.clone());
         self.scanout.set_cursor_image(self.cursor_image.clone());

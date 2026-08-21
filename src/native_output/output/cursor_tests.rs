@@ -531,12 +531,33 @@ fn client_cursor_image_key_changes_for_commit_and_hotspot() {
         height: 32,
         buffer_scale: 1,
         buffer_transform: 0,
+        output_scale_milli: 1_000,
     };
     let mut next = first;
     next.commit_sequence += 1;
     assert_ne!(first, next);
     next = first;
     next.hotspot_x += 1;
+    assert_ne!(first, next);
+}
+
+#[test]
+fn client_cursor_image_key_changes_for_output_scale() {
+    let first = NativeCursorImageKey {
+        surface_id: 7,
+        buffer_id: 11,
+        commit_sequence: 3,
+        hotspot_x: 1,
+        hotspot_y: 2,
+        width: 32,
+        height: 32,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    };
+    let mut next = first;
+    next.output_scale_milli = 1_250;
+
     assert_ne!(first, next);
 }
 

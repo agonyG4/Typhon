@@ -7,6 +7,7 @@ pub mod compositor;
 pub mod control;
 pub mod control_snapshots;
 pub mod core;
+pub mod cursor_geometry;
 pub mod cursor_manager;
 pub mod cursor_persistence;
 pub mod cursor_theme;
@@ -302,6 +303,26 @@ mod tests {
         );
         assert_eq!(std::env::var_os("XCURSOR_THEME"), theme_before);
         assert_eq!(std::env::var_os("XCURSOR_SIZE"), size_before);
+    }
+
+    #[test]
+    fn unspecialized_supervised_child_does_not_receive_cursor_overrides() {
+        let child = compositor_app_command_with_policy_and_xwayland_and_cursor(
+            "oblivion-one-test",
+            &["true".to_string()],
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("command should be created");
+        let env = child
+            .get_envs()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(env.get("XCURSOR_THEME"), None);
+        assert_eq!(env.get("XCURSOR_SIZE"), None);
     }
 
     #[test]

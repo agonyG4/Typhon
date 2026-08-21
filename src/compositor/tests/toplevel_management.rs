@@ -359,11 +359,8 @@ fn authenticate_toplevel_client(
     queue: &mut wayland_client::EventQueue<ToplevelClientState>,
     state: &mut ToplevelClientState,
 ) {
-    let capability_path = std::env::temp_dir().join(format!(
-        ".oblivion-one-test-capability-{}-{}",
-        std::process::id(),
-        socket_name
-    ));
+    let capability_path =
+        crate::compositor::astrea_shell_capability::test_capability_path(socket_name);
     let capability = std::fs::read_to_string(capability_path).unwrap();
     let auth = globals
         .bind::<client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1, _, _>(qh, 1..=1, ())

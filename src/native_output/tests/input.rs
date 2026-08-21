@@ -1452,8 +1452,10 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
     pump_native_input_server_until_cursor(&mut server);
     let updates_before = server.resize_flow_metrics().resize_updates_applied;
     let raw_updates_before = server.resize_flow_metrics().raw_pointer_resize_updates;
-    let x = 132.0;
-    let y = 112.0;
+    // Move toward the top-left resize corner so the test grows the window
+    // beyond the compositor's generic minimum size.
+    let x = 52.0;
+    let y = 52.0;
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
 
@@ -1492,8 +1494,8 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
         active,
         ClientEvent::Active {
             pointer_motion_count: pointer_motion_count + 1,
-            pointer_surface_x: Some(60.0),
-            pointer_surface_y: Some(40.0),
+            pointer_surface_x: Some(20.0),
+            pointer_surface_y: Some(14.0),
             pointer_enter_count,
             pointer_leave_count,
         }
@@ -1581,8 +1583,8 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
         finished,
         ClientEvent::Finished {
             pointer_motion_count: pointer_motion_count + 2,
-            pointer_surface_x: Some(61.0),
-            pointer_surface_y: Some(42.0),
+            pointer_surface_x: Some(21.0),
+            pointer_surface_y: Some(16.0),
             pointer_enter_count,
             pointer_leave_count,
         }

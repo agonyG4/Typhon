@@ -67,11 +67,8 @@ impl Dispatch<client_astrea_shortcut_v1::AstreaShortcutV1, ()> for AuthTestState
 #[test]
 fn capability_authenticates_exact_wayland_client_for_private_shortcuts() {
     let socket_name = format!("typhon-shell-auth-{}", std::process::id());
-    let capability_path = std::env::temp_dir().join(format!(
-        ".oblivion-one-test-capability-{}-{}",
-        std::process::id(),
-        socket_name
-    ));
+    let capability_path =
+        crate::compositor::astrea_shell_capability::test_capability_path(&socket_name);
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let capability = std::fs::read_to_string(&capability_path).unwrap();
     let (commands, server_thread) = spawn_controllable_test_server(server);

@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use zbus::{
@@ -10,13 +13,22 @@ use zbus::{
     zvariant::{ObjectPath, OwnedValue, Value},
 };
 
+use crate::{
+    cursor_persistence::CursorConfigurationStore,
+    cursor_theme::{CursorConfiguration, default_cursor_configuration},
+};
+
 pub const BACKEND_BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.oblivion";
 pub const BACKEND_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 pub const PORTAL_DESKTOP: &str = "OblivionOne";
 
+static NEXT_PORTAL_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortalSettingValue {
     U32(u32),
+    I32(i32),
+    String(String),
     Rgb(f64, f64, f64),
 }
 
@@ -113,6 +125,13 @@ impl PortalRuntime {
 }
 
 pub fn settings_for_namespaces(namespaces: &[String]) -> PortalSettings {
+    settings_for_configuration(namespaces, &default_cursor_configuration())
+}
+
+pub fn settings_for_configuration(
+    namespaces: &[String],
+    configuration: &CursorConfiguration,
+) -> PortalSettings {
     let mut values = PortalSettings::new();
     if namespace_requested(namespaces, "org.freedesktop.appearance") {
         values.insert(
@@ -124,6 +143,21 @@ pub fn settings_for_namespaces(namespaces: &[String]) -> PortalSettings {
                 (
                     "accent-color".to_string(),
                     PortalSettingValue::Rgb(0.42, 0.64, 1.0),
+                ),
+            ]),
+        );
+    }
+    if namespace_requested(namespaces, "org.gnome.desktop.interface") {
+        values.insert(
+            "org.gnome.desktop.interface".to_string(),
+            BTreeMap::from([
+                (
+                    "cursor-theme".to_string(),
+                    PortalSettingValue::String(configuration.theme.clone()),
+                ),
+                (
+                    "cursor-size".to_string(),
+                    PortalSettingValue::I32(configuration.size_px as i32),
                 ),
             ]),
         );
@@ -152,9 +186,10 @@ pub fn run_backend() -> zbus::Result<()> {
 
 async fn run_backend_async() -> zbus::Result<()> {
     let notifications = NotificationBackend::default();
+    let settings = SettingsBackend::from_environment();
     let _connection = zbus::connection::Builder::session()?
         .name(BACKEND_BUS_NAME)?
-        .serve_at(BACKEND_OBJECT_PATH, SettingsBackend)?
+        .serve_at(BACKEND_OBJECT_PATH, settings)?
         .serve_at(BACKEND_OBJECT_PATH, notifications)?
         .serve_at(BACKEND_OBJECT_PATH, AccessBackend)?
         .build()
@@ -163,12 +198,28 @@ async fn run_backend_async() -> zbus::Result<()> {
     Ok(())
 }
 
-struct SettingsBackend;
+struct SettingsBackend {
+    store: CursorConfigurationStore,
+}
+
+impl SettingsBackend {
+    fn from_environment() -> Self {
+        let store = CursorConfigurationStore::from_environment()
+            .unwrap_or_else(CursorConfigurationStore::unavailable);
+        Self { store }
+    }
+
+    fn configuration(&self) -> CursorConfiguration {
+        self.store
+            .read()
+            .unwrap_or_else(|_| default_cursor_configuration())
+    }
+}
 
 #[interface(name = "org.freedesktop.impl.portal.Settings")]
 impl SettingsBackend {
     fn read_all(&self, namespaces: Vec<String>) -> BTreeMap<String, BTreeMap<String, OwnedValue>> {
-        settings_for_namespaces(&namespaces)
+        settings_for_configuration(&namespaces, &self.configuration())
             .into_iter()
             .map(|(namespace, values)| {
                 (
@@ -183,7 +234,9 @@ impl SettingsBackend {
     }
 
     fn read(&self, namespace: &str, key: &str) -> fdo::Result<OwnedValue> {
-        setting_value(namespace, key)
+        settings_for_configuration(&[namespace.to_string()], &self.configuration())
+            .remove(namespace)
+            .and_then(|mut values| values.remove(key))
             .map(setting_to_owned_value)
             .ok_or_else(|| fdo::Error::Failed(format!("unknown setting {namespace}.{key}")))
     }
@@ -258,6 +311,10 @@ impl AccessBackend {
 fn setting_to_owned_value(value: PortalSettingValue) -> OwnedValue {
     match value {
         PortalSettingValue::U32(value) => OwnedValue::from(value),
+        PortalSettingValue::I32(value) => OwnedValue::from(value),
+        PortalSettingValue::String(value) => Value::from(value)
+            .try_into()
+            .expect("static string portal setting must be representable as DBus value"),
         PortalSettingValue::Rgb(red, green, blue) => Value::from((red, green, blue))
             .try_into()
             .expect("static RGB portal setting must be representable as DBus value"),
@@ -282,14 +339,30 @@ fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, contents)?;
-    fs::rename(temporary, path)
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT_PORTAL_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = fs::write(&temporary, contents) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor_persistence::CursorPersistenceError;
+    use crate::cursor_theme::CursorConfiguration;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SETTINGS_ROOT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn notification_backend_tracks_add_and_remove() {
@@ -303,5 +376,86 @@ mod tests {
             .unwrap();
 
         assert!(backend.notifications.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_cursor_settings_are_filtered_to_the_gnome_interface_namespace() {
+        let configuration = CursorConfiguration::new("Bibata", 32).unwrap();
+        let values = settings_for_configuration(
+            &["org.gnome.desktop.interface".to_string()],
+            &configuration,
+        );
+
+        assert_eq!(
+            values["org.gnome.desktop.interface"]["cursor-theme"],
+            PortalSettingValue::String("Bibata".to_string())
+        );
+        assert_eq!(
+            values["org.gnome.desktop.interface"]["cursor-size"],
+            PortalSettingValue::I32(32)
+        );
+        assert_eq!(values["org.gnome.desktop.interface"].len(), 2);
+    }
+
+    #[test]
+    fn canonical_cursor_settings_follow_namespace_matching_rules() {
+        let configuration = CursorConfiguration::new("default", 24).unwrap();
+
+        for namespaces in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["org.gnome.desktop.*".to_string()],
+        ] {
+            let values = settings_for_configuration(&namespaces, &configuration);
+            assert!(values.contains_key("org.gnome.desktop.interface"));
+        }
+
+        assert!(
+            settings_for_configuration(
+                &["org.gnome.desktop.background".to_string()],
+                &configuration
+            )
+            .is_empty()
+        );
+        assert!(
+            settings_for_configuration(&["org.example.unknown".to_string()], &configuration)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn settings_backend_reads_the_latest_persisted_configuration_per_request() {
+        let root = std::env::temp_dir().join(format!(
+            "typhon-portal-settings-{}-{}",
+            std::process::id(),
+            NEXT_SETTINGS_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("temporary configuration directory");
+        let store = crate::cursor_persistence::CursorConfigurationStore::new(root.clone())
+            .expect("temporary configuration store");
+        let first = CursorConfiguration::new("default", 24).unwrap();
+        let second = CursorConfiguration::new("Bibata", 32).unwrap();
+        store.write(&first).expect("first cursor configuration");
+        let backend = SettingsBackend { store };
+        assert_eq!(backend.configuration(), first);
+        let mut second_committed = false;
+        for attempt in 0..100 {
+            match backend.store.write(&second) {
+                Ok(_) => {
+                    second_committed = true;
+                    break;
+                }
+                Err(CursorPersistenceError::Busy) if attempt < 99 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("second cursor configuration: {error:?}"),
+            }
+        }
+        assert!(
+            second_committed,
+            "second cursor configuration remained busy"
+        );
+        assert_eq!(backend.configuration(), second);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

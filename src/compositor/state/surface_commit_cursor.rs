@@ -18,13 +18,43 @@ impl CompositorState {
             return;
         };
         let buffer_size = surface.buffer_size();
+        let hotspot = self
+            .focused_client_cursor
+            .as_ref()
+            .and_then(ClientCursorChoice::surface)
+            .filter(|active| active.surface_id == surface_id)
+            .map(|active| (active.hotspot_x, active.hotspot_y));
+        let client = self
+            .surface_resources
+            .get(&surface_id)
+            .map(|surface| wayland_resource_client_label(surface))
+            .unwrap_or_else(|| "unknown".to_string());
+        let output_scale = f64::from(self.output_scale.preferred_scale()) / 120.0;
+        pointer_debug_log_lazy(|| {
+            cursor_geometry_debug_message(
+                "published",
+                &client,
+                surface_id,
+                &format!("{:?}", surface.buffer_source()),
+                buffer_size.width,
+                buffer_size.height,
+                surface.buffer_scale,
+                surface.buffer_transform,
+                surface.width,
+                surface.height,
+                hotspot,
+                surface.viewport_destination,
+                output_scale,
+            )
+        });
         self.note_explicit_commit_published(commit_id);
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.client_cursor_surfaces.insert(surface_id, surface);
         if let Some(active) = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .cloned()
             && self
@@ -36,10 +66,12 @@ impl CompositorState {
             self.cursor_visibility.client_hidden_pointer = None;
             self.cursor_visibility.client_cursor_pointer = Some(active.pointer);
             self.sync_cursor_visibility_request();
-            pointer_debug_log(format!(
-                "cursor surface buffer restored surface={} reason=new-client-buffer",
-                surface_id
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor surface buffer restored surface={} reason=new-client-buffer",
+                    surface_id
+                )
+            });
         }
         self.record_surface_damage_commit(
             surface_id,
@@ -49,8 +81,9 @@ impl CompositorState {
         );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         if self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .is_some_and(|active| active.surface_id == surface_id)
             && self.cursor_visibility.lock_hidden_constraint_id.is_none()
         {
@@ -117,6 +150,34 @@ impl CompositorState {
             existing.buffer_size().width,
             existing.buffer_size().height,
         );
+        let logical_width = existing.width;
+        let logical_height = existing.height;
+        let buffer_scale = existing.buffer_scale;
+        let buffer_transform = existing.buffer_transform;
+        let viewport_destination = existing.viewport_destination;
+        let client = self
+            .surface_resources
+            .get(&surface_id)
+            .map(|surface| wayland_resource_client_label(surface))
+            .unwrap_or_else(|| "unknown".to_string());
+        let output_scale = f64::from(self.output_scale.preferred_scale()) / 120.0;
+        pointer_debug_log_lazy(|| {
+            cursor_geometry_debug_message(
+                "damage-only",
+                &client,
+                surface_id,
+                "unchanged",
+                buffer_size.width,
+                buffer_size.height,
+                buffer_scale,
+                buffer_transform,
+                logical_width,
+                logical_height,
+                None,
+                viewport_destination,
+                output_scale,
+            )
+        });
         let journal_damage = existing.damage.clone();
         let journal_size = existing.buffer_size();
         self.record_surface_damage_commit(
@@ -127,8 +188,9 @@ impl CompositorState {
         );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         if let Some(active) = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .cloned()
             && self
@@ -166,25 +228,30 @@ impl CompositorState {
             self.queue_dmabuf_buffer_release(release);
         }
         let active_cursor_pointer = self
-            .active_client_cursor
+            .focused_client_cursor
             .as_ref()
+            .and_then(ClientCursorChoice::surface)
             .filter(|active| active.surface_id == surface_id)
             .map(|active| active.pointer.clone());
         if let Some(pointer) = active_cursor_pointer {
+            self.focused_client_cursor = Some(ClientCursorChoice::Hidden {
+                pointer: pointer.clone(),
+            });
             self.cursor_visibility.client_cursor_pointer = None;
             self.cursor_visibility.client_hidden_pointer = Some(pointer);
             self.advance_render_generation(RenderGenerationCause::CursorState);
             self.sync_cursor_visibility_request();
-            pointer_debug_log(format!(
-                "cursor surface buffer removed surface={} reason=null-buffer-commit",
-                surface_id
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "cursor surface buffer removed surface={} reason=null-buffer-commit",
+                    surface_id
+                )
+            });
         } else if removed {
             self.advance_render_generation(RenderGenerationCause::CursorCommit);
-            pointer_debug_log(format!(
-                "cursor surface buffer removed surface={}",
-                surface_id
-            ));
+            pointer_debug_log_lazy(|| {
+                format!("cursor surface buffer removed surface={}", surface_id)
+            });
         }
     }
 }
