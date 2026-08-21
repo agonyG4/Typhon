@@ -7,6 +7,7 @@ pub mod compositor;
 pub mod control;
 pub mod control_snapshots;
 pub mod core;
+pub mod cursor_geometry;
 pub mod cursor_manager;
 pub mod cursor_persistence;
 pub mod cursor_theme;
