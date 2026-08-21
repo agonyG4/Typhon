@@ -159,7 +159,6 @@ impl KmsCommitWorkerHandle {
             .name("typhon-kms-commit".to_string())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    try_enable_best_effort_realtime();
                     run_worker(thread_shared.clone(), executor);
                 }));
                 if result.is_err() {
@@ -1109,38 +1108,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         }
     }
 }
-
-#[cfg(target_os = "linux")]
-fn try_enable_best_effort_realtime() {
-    if std::env::var_os("OBLIVION_ONE_KMS_WORKER_RR").is_none() {
-        return;
-    }
-
-    let minimum_priority = unsafe { libc::sched_get_priority_min(libc::SCHED_RR) };
-    if minimum_priority < 0 {
-        eprintln!(
-            "native KMS worker: best-effort SCHED_RR unavailable: {}",
-            io::Error::last_os_error()
-        );
-        return;
-    }
-
-    let parameters = libc::sched_param {
-        sched_priority: minimum_priority,
-    };
-    let policy = libc::SCHED_RR | libc::SCHED_RESET_ON_FORK;
-    if unsafe { libc::sched_setscheduler(0, policy, &parameters) } != 0 {
-        eprintln!(
-            "native KMS worker: best-effort SCHED_RR unavailable: {}",
-            io::Error::last_os_error()
-        );
-    } else {
-        eprintln!("native KMS worker: best-effort SCHED_RR enabled priority={minimum_priority}");
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn try_enable_best_effort_realtime() {}
 
 #[derive(Debug)]
 struct ExecutingKmsJob {
