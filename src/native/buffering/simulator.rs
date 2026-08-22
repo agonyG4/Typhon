@@ -384,10 +384,12 @@ impl SimulatedO1EventModel {
                             &mut frames,
                             &state,
                             event.frame,
-                            event.generation,
-                            event.at_ns,
-                            self.config.worker_enabled,
-                            self.config.dispatch_service_ns,
+                            TransportProgressContext {
+                                generation: event.generation,
+                                at_ns: event.at_ns,
+                                worker_enabled: self.config.worker_enabled,
+                                dispatch_service_ns: self.config.dispatch_service_ns,
+                            },
                         );
                     }
                 }
@@ -404,10 +406,12 @@ impl SimulatedO1EventModel {
                             &mut frames,
                             &state,
                             event.frame,
-                            event.generation,
-                            event.at_ns,
-                            self.config.worker_enabled,
-                            self.config.dispatch_service_ns,
+                            TransportProgressContext {
+                                generation: event.generation,
+                                at_ns: event.at_ns,
+                                worker_enabled: self.config.worker_enabled,
+                                dispatch_service_ns: self.config.dispatch_service_ns,
+                            },
                         );
                     }
                 }
@@ -565,10 +569,12 @@ impl SimulatedO1EventModel {
                             &mut frames,
                             &state,
                             next_frame,
-                            state.output_generation,
-                            event.at_ns,
-                            self.config.worker_enabled,
-                            self.config.dispatch_service_ns,
+                            TransportProgressContext {
+                                generation: state.output_generation,
+                                at_ns: event.at_ns,
+                                worker_enabled: self.config.worker_enabled,
+                                dispatch_service_ns: self.config.dispatch_service_ns,
+                            },
                         );
                     }
                     schedule_waiting_render(
@@ -704,10 +710,7 @@ fn queue_transport_progress(
     frames: &mut [Option<SimulatedFrame>],
     state: &SimulatedO1State,
     frame_id: u32,
-    generation: u64,
-    at_ns: i64,
-    worker_enabled: bool,
-    dispatch_service_ns: u64,
+    context: TransportProgressContext,
 ) {
     let Some(frame) = frames.get_mut(frame_id as usize).and_then(Option::as_mut) else {
         return;
@@ -715,19 +718,21 @@ fn queue_transport_progress(
     if frame.invalidated || frame.transport_scheduled {
         return;
     }
-    let (kind, scheduled_at) = if worker_enabled {
+    let (kind, scheduled_at) = if context.worker_enabled {
         if state.worker_queued == Some(frame_id) {
-            (SimulatedO1EventKind::SubmitStarted, at_ns)
+            (SimulatedO1EventKind::SubmitStarted, context.at_ns)
         } else if state.prepared == Some(frame_id) && state.worker_queued.is_none() {
             (
                 SimulatedO1EventKind::WorkerWake,
-                at_ns.saturating_add(dispatch_service_ns as i64),
+                context
+                    .at_ns
+                    .saturating_add(context.dispatch_service_ns as i64),
             )
         } else {
             return;
         }
     } else if state.prepared == Some(frame_id) {
-        (SimulatedO1EventKind::SubmitStarted, at_ns)
+        (SimulatedO1EventKind::SubmitStarted, context.at_ns)
     } else {
         return;
     };
@@ -739,10 +744,18 @@ fn queue_transport_progress(
             at_ns: scheduled_at,
             order: 0,
             frame: frame_id,
-            generation,
+            generation: context.generation,
             kind,
         },
     );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransportProgressContext {
+    generation: u64,
+    at_ns: i64,
+    worker_enabled: bool,
+    dispatch_service_ns: u64,
 }
 
 fn schedule_waiting_render(
