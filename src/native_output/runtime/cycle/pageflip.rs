@@ -1012,10 +1012,7 @@ impl NativeRuntime {
                         adaptive_buffering.mode(),
                         proven_miss,
                     );
-                    frame_pacing.note_o1_credit2_outcome(
-                        frame.o1_admission,
-                        proven_miss.is_none(),
-                    );
+                    frame_pacing.note_o1_credit2_outcome(frame.o1_admission, proven_miss.is_none());
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
                         planned_sequence: frame.target.sequence,
                         actual_sequence: actual_logical_sequence,

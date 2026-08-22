@@ -14,8 +14,8 @@ use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
     DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
 };
-use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
 use oblivion_one::native::buffering::O1AdmissionObservation;
+use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},

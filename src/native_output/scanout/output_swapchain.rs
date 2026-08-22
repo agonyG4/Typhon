@@ -7,8 +7,8 @@ use std::{
 use std::num::NonZeroU64;
 
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
-use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 use oblivion_one::native::buffering::O1AdmissionObservation;
+use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 #[cfg(test)]
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};

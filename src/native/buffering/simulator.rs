@@ -325,8 +325,8 @@ impl SimulatedO1EventModel {
                         .expect("render event frame exists");
                     frame.render_requested = false;
                     frame.admitted = true;
-                    frame.render_ahead = demand.effective() == 2
-                        && state.owned_future_primary_depth >= 1;
+                    frame.render_ahead =
+                        demand.effective() == 2 && state.owned_future_primary_depth >= 1;
                     frame.used_extra_credit = frame.render_ahead;
                     frame.render_started_ns = Some(event.at_ns);
                     state.rendering = Some(event.frame);
@@ -558,9 +558,8 @@ impl SimulatedO1EventModel {
                     }
                     if !frame.terminalized {
                         frame.terminalized = true;
-                        result.terminalized_submitted_frames = result
-                            .terminalized_submitted_frames
-                            .saturating_add(1);
+                        result.terminalized_submitted_frames =
+                            result.terminalized_submitted_frames.saturating_add(1);
                     }
                     if let Some(next_frame) = state.worker_queued.or(state.prepared) {
                         queue_transport_progress(
@@ -600,9 +599,8 @@ impl SimulatedO1EventModel {
                             frame.render_requested = false;
                             if frame.submitted && !frame.terminalized {
                                 frame.terminalized = true;
-                                result.terminalized_submitted_frames = result
-                                    .terminalized_submitted_frames
-                                    .saturating_add(1);
+                                result.terminalized_submitted_frames =
+                                    result.terminalized_submitted_frames.saturating_add(1);
                             }
                         }
                     }
@@ -630,9 +628,8 @@ impl SimulatedO1EventModel {
                     frame.render_requested = false;
                     if frame.submitted && !frame.terminalized {
                         frame.terminalized = true;
-                        result.terminalized_submitted_frames = result
-                            .terminalized_submitted_frames
-                            .saturating_add(1);
+                        result.terminalized_submitted_frames =
+                            result.terminalized_submitted_frames.saturating_add(1);
                     }
                 }
                 SimulatedO1EventKind::CommitTimingConstraintChanged => {}
@@ -648,15 +645,15 @@ impl SimulatedO1EventModel {
 
         result.credit_grants = demand.grants();
         result.credit_revokes = demand.revokes();
-        result.credit2_granted_not_consumed = result
-            .credit2_granted_not_consumed
-            .saturating_add(result.credit_grants.saturating_sub(
+        result.credit2_granted_not_consumed = result.credit2_granted_not_consumed.saturating_add(
+            result.credit_grants.saturating_sub(
                 frames
                     .iter()
                     .flatten()
                     .filter(|frame| frame.used_extra_credit)
                     .count() as u64,
-            ));
+            ),
+        );
         result.submitted_frame_liveness_violations = result
             .submitted_frames
             .saturating_sub(result.terminalized_submitted_frames);
@@ -780,7 +777,11 @@ fn schedule_waiting_render(
                 && !frame.invalidated
                 && !frame.submitted
         })
-        .and_then(|frame| frames.iter().position(|candidate| candidate.as_ref() == Some(frame)))
+        .and_then(|frame| {
+            frames
+                .iter()
+                .position(|candidate| candidate.as_ref() == Some(frame))
+        })
         .and_then(|index| u32::try_from(index).ok())
     else {
         return;
@@ -955,10 +956,19 @@ mod tests {
         let synchronous = simulate_o1(synchronous_config);
 
         assert_eq!(worker.target_hits, synchronous.target_hits);
-        assert_eq!(worker.render_readiness_misses, synchronous.render_readiness_misses);
+        assert_eq!(
+            worker.render_readiness_misses,
+            synchronous.render_readiness_misses
+        );
         assert_eq!(worker.dispatch_misses, synchronous.dispatch_misses);
-        assert_eq!(worker.later_refresh_pageflips, synchronous.later_refresh_pageflips);
-        assert_eq!(worker.max_future_primary_depth, synchronous.max_future_primary_depth);
+        assert_eq!(
+            worker.later_refresh_pageflips,
+            synchronous.later_refresh_pageflips
+        );
+        assert_eq!(
+            worker.max_future_primary_depth,
+            synchronous.max_future_primary_depth
+        );
         assert_eq!(worker.submitted_frames, synchronous.submitted_frames);
         assert_eq!(
             worker.terminalized_submitted_frames,
@@ -968,7 +978,10 @@ mod tests {
             worker.submitted_frame_liveness_violations,
             synchronous.submitted_frame_liveness_violations
         );
-        assert_eq!(worker.max_kernel_submitted_owners, synchronous.max_kernel_submitted_owners);
+        assert_eq!(
+            worker.max_kernel_submitted_owners,
+            synchronous.max_kernel_submitted_owners
+        );
     }
 
     #[test]
@@ -1050,7 +1063,10 @@ mod tests {
 
         assert!(result.later_refresh_pageflips > 0);
         assert_eq!(result.submitted_frame_liveness_violations, 0);
-        assert_eq!(result.submitted_frames, result.terminalized_submitted_frames);
+        assert_eq!(
+            result.submitted_frames,
+            result.terminalized_submitted_frames
+        );
     }
 
     #[test]
@@ -1082,7 +1098,10 @@ mod tests {
             .run_with_events(&services, &[generation_change]);
 
         assert!(result.submitted_frames > 0);
-        assert_eq!(result.submitted_frames, result.terminalized_submitted_frames);
+        assert_eq!(
+            result.submitted_frames,
+            result.terminalized_submitted_frames
+        );
         assert_eq!(result.submitted_frame_liveness_violations, 0);
     }
 }

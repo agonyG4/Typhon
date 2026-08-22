@@ -95,12 +95,16 @@ mod tests {
         let mut adaptive = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
         adaptive.apply_capability(TripleCapability::Capable);
 
-        let decision = observe_current_o1_opportunity(&mut adaptive, Some(predecessor()), 1_200_000);
+        let decision =
+            observe_current_o1_opportunity(&mut adaptive, Some(predecessor()), 1_200_000);
 
         assert_eq!(decision.desired_credit_before, 1);
         assert_eq!(decision.desired_credit_after, 2);
         assert!(decision.granted_extra_credit);
-        assert!(decision.desired_credit_after > 1, "RenderAhead must be allowed in this decision");
+        assert!(
+            decision.desired_credit_after > 1,
+            "RenderAhead must be allowed in this decision"
+        );
 
         let retry = observe_current_o1_opportunity(&mut adaptive, Some(predecessor()), 0);
         assert_eq!(retry.desired_credit_before, 2);
