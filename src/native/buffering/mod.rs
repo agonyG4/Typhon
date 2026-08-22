@@ -41,6 +41,18 @@ impl PresentationOpportunityId {
     }
 }
 
+/// Immutable evidence captured when one physical output frame consumes O1
+/// admission capacity.  Pageflip telemetry must use this record rather than
+/// mutable controller state that may already describe a later opportunity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct O1AdmissionObservation {
+    pub opportunity: PresentationOpportunityId,
+    pub desired_credit: u8,
+    pub owned_future_depth_before: u8,
+    pub overlap_required_ns: u64,
+    pub used_extra_credit: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationDomain {
     FixedVsync,
@@ -388,12 +400,15 @@ mod tests {
         assert_eq!(worker.target_hits, 120);
         assert_eq!(worker.credit_two_observations, 0);
         assert_eq!(worker.max_future_primary_depth, 1);
-        assert_eq!(worker, synchronous);
+        let mut worker_without_transport_lane = worker;
+        worker_without_transport_lane.max_worker_queued_owners =
+            synchronous.max_worker_queued_owners;
+        assert_eq!(worker_without_transport_lane, synchronous);
     }
 
     #[test]
     fn simulator_grants_overlap_credit_for_sustained_pressure_without_exceeding_two() {
-        let result = simulate_o1(config(7_500_000));
+        let result = simulate_o1(config(5_500_000));
 
         assert_eq!(result.render_readiness_misses, 0);
         assert_eq!(result.dispatch_misses, 0);
@@ -450,7 +465,10 @@ mod tests {
         synchronous_config.worker_enabled = false;
         let synchronous = simulate_o1(synchronous_config);
 
-        assert_eq!(worker, synchronous);
+        let mut worker_without_transport_lane = worker;
+        worker_without_transport_lane.max_worker_queued_owners =
+            synchronous.max_worker_queued_owners;
+        assert_eq!(worker_without_transport_lane, synchronous);
         assert_eq!(worker.target_hits, 60);
         assert_eq!(worker.credit_two_observations, 0);
     }

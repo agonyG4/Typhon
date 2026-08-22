@@ -1013,8 +1013,7 @@ impl NativeRuntime {
                         proven_miss,
                     );
                     frame_pacing.note_o1_credit2_outcome(
-                        frame.target.reason,
-                        adaptive_buffering.last_overlap_required_ns(),
+                        frame.o1_admission,
                         proven_miss.is_none(),
                     );
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {

@@ -864,9 +864,6 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        if render_ahead {
-            self.o1_credit2_pending_grant = false;
-        }
         match (pacing_mode, render_ahead) {
             (NativeOutputPacingMode::ReactiveDouble, false) => {
                 self.reactive_double_frames += 1;

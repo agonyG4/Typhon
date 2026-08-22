@@ -15,6 +15,7 @@ use oblivion_one::compositor::{
     DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
 };
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
+use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},
@@ -719,6 +720,7 @@ impl AtomicEglGbmScanout {
         submit_window: KmsSubmitWindow,
         pacing_mode: NativeOutputPacingMode,
         future_primary_limit: u8,
+        o1_admission: Option<O1AdmissionObservation>,
         cursor: Option<CursorPlaneAssignment>,
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
@@ -991,6 +993,7 @@ impl AtomicEglGbmScanout {
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
             frozen_cursor_plane_owner,
+            o1_admission,
         };
         let framebuffer_slot = frame.slot.get();
         match self.swapchain_mut()?.finish_render_owned(frame) {
@@ -1061,6 +1064,7 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             composite_started_at,
             rendered_at,
+            o1_admission,
             ..
         } = completed.frame;
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
@@ -1093,6 +1097,7 @@ impl AtomicEglGbmScanout {
                 submit_started_at: completed.submit_started_at,
                 submit_returned_at: completed.submit_returned_at,
                 fence_signal,
+                o1_admission,
             },
             protocol_batch_id,
             surface_damage,
@@ -1302,6 +1307,7 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+    pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }
 
 impl AtomicRenderedFrameParts {

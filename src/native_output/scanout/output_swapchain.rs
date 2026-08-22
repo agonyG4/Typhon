@@ -8,6 +8,7 @@ use std::num::NonZeroU64;
 
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
+use oblivion_one::native::buffering::O1AdmissionObservation;
 #[cfg(test)]
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -179,6 +180,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) cpu_encode_duration_ns: u64,
     pub(crate) frozen_cursor_plan: FrozenPrimaryCursorPlan,
     pub(crate) frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+    pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }
 
 #[derive(Debug)]
@@ -435,6 +437,7 @@ impl AtomicOutputSwapchain {
                     crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip,
             },
             frozen_cursor_plane_owner: None,
+            o1_admission: None,
         })
     }
 
@@ -529,6 +532,7 @@ impl AtomicOutputSwapchain {
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan,
             frozen_cursor_plane_owner,
+            o1_admission: None,
         });
         Ok(())
     }
