@@ -18,6 +18,10 @@ use super::presentation_metrics::{
     PipelineSchedulingDiagnostics, build_render_begin_fields, finish_no_primary_work,
     log_native_frame, log_output_pipeline_snapshot, note_same_buffer_suppressed,
 };
+use super::presentation_o1::{
+    admission_observation_for_frame, observe_current_o1_opportunity,
+    overlap_required_for_current_opportunity,
+};
 use super::presentation_pipeline::build_output_pipeline_snapshot_with_presented;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
@@ -300,25 +304,13 @@ impl NativeRuntime {
             }
         };
         adaptive_buffering.apply_capability(triple_capability);
-        let overlap_required_ns = pending_target
-            .and_then(|predecessor| {
-                let refresh_ns = u64::try_from(predecessor.refresh_interval.as_nanos()).ok()?;
-                let successor = MonotonicTimestampNs::new(
-                    predecessor
-                        .presentation_time
-                        .get()
-                        .checked_add(refresh_ns)?,
-                );
-                let estimate = PipelineServiceEstimate::new(
-                    prediction.main_event_loop_wake_guard_ns,
-                    prediction.render_risk_ns,
-                    prediction.kms_dispatch_budget_ns,
-                    prediction.kms_apply_guard_ns,
-                );
-                Some(estimate.overlap_required_ns(predecessor.presentation_time, successor))
-            })
-            .unwrap_or(0);
-        let render_ahead_allowed = adaptive_buffering.desired_credit() > 1;
+        #[rustfmt::skip] let estimate = PipelineServiceEstimate::new(prediction.main_event_loop_wake_guard_ns, prediction.render_risk_ns, prediction.kms_dispatch_budget_ns, prediction.kms_apply_guard_ns);
+        let overlap_required_ns =
+            overlap_required_for_current_opportunity(pending_target, refresh_interval, estimate);
+        let o1_demand =
+            observe_current_o1_opportunity(adaptive_buffering, pending_target, overlap_required_ns);
+        let desired_credit = o1_demand.desired_credit_after;
+        let render_ahead_allowed = desired_credit > 1;
         *scheduled_presentation_target = prepare_presentation_target(
             explicit_output,
             presentation_deadline,
@@ -342,7 +334,7 @@ impl NativeRuntime {
         );
         let pacing_mode = pacing_mode_for_target(*scheduled_presentation_target);
         let effective_render_target_available = if explicit_output {
-            scanout.render_target_available_for_limit(adaptive_buffering.desired_credit())
+            scanout.render_target_available_for_limit(desired_credit)
         } else {
             scanout.render_target_available()
         };
@@ -358,7 +350,7 @@ impl NativeRuntime {
                 *drm_file_generation,
                 target.crtc_id,
                 pacing_mode,
-                adaptive_buffering.desired_credit(),
+                desired_credit,
                 swapchain,
                 output_transactions,
                 atomic_commit_arbiter,
@@ -393,13 +385,9 @@ impl NativeRuntime {
         } else {
             None
         };
-        let desired_credit_before_observation = adaptive_buffering.desired_credit();
-        #[rustfmt::skip] adaptive_buffering.observe_overlap_for_target(pending_target, overlap_required_ns);
-        let desired_credit_after_observation = adaptive_buffering.desired_credit();
-        if desired_credit_before_observation == 1 && desired_credit_after_observation == 2 {
+        if o1_demand.granted_extra_credit {
             frame_pacing.note_o1_credit2_grant();
-        } else if desired_credit_before_observation == 2
-            && desired_credit_after_observation == 1
+        } else if o1_demand.revoked_extra_credit
             && pipeline_snapshot
                 .as_ref()
                 .is_some_and(|pipeline| pipeline.future_primary_depth() > 0)
@@ -964,6 +952,15 @@ impl NativeRuntime {
                                     "explicit Atomic render started without a presentation target",
                                 )
                             })?;
+                        let o1_admission = Some(admission_observation_for_frame(
+                            frame_target,
+                            desired_credit,
+                            pipeline_snapshot
+                                .as_ref()
+                                .map_or(0, |pipeline| pipeline.future_primary_depth()),
+                            o1_demand.overlap_required_ns,
+                            scheduler_decision == SchedulerDecision::RenderAhead,
+                        ));
                         let submit_window = match presentation_timing.submit_window(
                             frame_target.presentation_time.get(),
                             frame_target.submit_not_before().get(),
@@ -997,7 +994,8 @@ impl NativeRuntime {
                             frame_target,
                             submit_window,
                             pacing_mode,
-                            adaptive_buffering.desired_credit(),
+                            desired_credit,
+                            o1_admission,
                             cursor_assignment,
                             direct_inspection
                                 .candidate_key
@@ -1033,6 +1031,9 @@ impl NativeRuntime {
                             }
                             #[rustfmt::skip]
                             AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot } => {
+                                if o1_admission.is_some_and(|admission| admission.used_extra_credit) {
+                                    frame_pacing.note_o1_credit2_extra_credit_consumed();
+                                }
                                 record_atomic_rendered_scene(
                                     scene_history,
                                     presentation_trace,

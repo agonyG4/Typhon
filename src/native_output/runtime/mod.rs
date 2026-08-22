@@ -40,6 +40,7 @@ mod presentation_cursor;
 mod presentation_cycle;
 mod presentation_direct;
 mod presentation_metrics;
+mod presentation_o1;
 mod presentation_pipeline;
 mod presentation_protocol;
 mod presentation_ready;
