@@ -292,7 +292,7 @@ impl CompositorState {
         let mut pointer_frames_sent = 0usize;
         for pointer in &self.locked_relative_recipient_cache.frame_pointers {
             if pointer.is_alive() {
-                send_pointer_frame_if_supported(&pointer);
+                send_pointer_frame_if_supported(pointer);
                 pointer_frames_sent += 1;
             }
         }
