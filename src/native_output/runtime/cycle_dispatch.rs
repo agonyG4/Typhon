@@ -762,6 +762,7 @@ impl NativeRuntime {
             pointer_constraint_backend,
             seat_session,
             process_supervisor,
+            render_telemetry,
             shutdown: _,
             session: _,
             ..
@@ -818,6 +819,11 @@ impl NativeRuntime {
         input_devices.drain_events_into(input_batch);
         let input_drain_us = elapsed_micros(input_drain_start);
         let raw_input_events = input_batch.raw.len();
+        for _ in 0..raw_input_events {
+            render_telemetry
+                .resource_efficiency
+                .record_raw_input_event();
+        }
         let input_event_timestamp_usec = matches!(
             input_devices.kind(),
             NativeInputBackendKind::LibseatLibinputUdev
@@ -833,12 +839,20 @@ impl NativeRuntime {
         .flatten();
         input_batch.coalesce_pointer_motion_events();
         let coalesced_input_events = input_batch.coalesced.len();
+        for _ in 0..coalesced_input_events {
+            render_telemetry
+                .resource_efficiency
+                .record_coalesced_input_event();
+        }
         for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
                 server.keyboard_shortcut_inhibition_snapshot(),
             );
             effect.append(input_state.handle_hardware_input_event(event));
+            if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
+                render_telemetry.resource_efficiency.record_pointer_sample();
+            }
             let effect_requested_redraw = effect.redraw_requested;
             let cursor_visible = !server.client_cursor_explicitly_hidden()
                 && (server.client_cursor_render_state().is_some()

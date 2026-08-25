@@ -29,16 +29,22 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
-        let protocol_work = cycle.wakeup.reasons.wayland_listener()
+        let wayland_client_work = cycle.wakeup.reasons.wayland_listener()
             || cycle.wakeup.reasons.wayland_clients()
-            || cycle.wakeup.reasons.control()
+            || cycle.wakeup.reasons.input();
+        let wayland_dispatch_work = wayland_client_work || cycle.wakeup.reasons.control();
+        let xwayland_work = cycle.wakeup.reasons.xwayland_listen()
+            || cycle.wakeup.reasons.xwayland_display_ready()
+            || cycle.wakeup.reasons.xwayland_xwm()
+            || cycle.wakeup.reasons.xwayland_stderr()
             || !cycle.wakeup.xwayland_events.is_empty();
+        let protocol_work = wayland_dispatch_work || xwayland_work;
         let cursor_work =
             cycle.wakeup.reasons.cursor_io_worker() || !cycle.wakeup.cursor_io_events.is_empty();
-        let primary_scene_work = cycle.redraw_requested;
+        let primary_scene_work = cycle.redraw_requested || self.queued_redraw_requested;
         let work_decision = NativeWorkDecision::new(
             NativeWorkClass::from_flags(protocol_work, cursor_work, primary_scene_work),
-            protocol_work || !cycle.wakeup.xwayland_events.is_empty(),
+            xwayland_work,
             cycle.wakeup.reasons.timer(),
             cycle.wakeup.reasons.explicit_sync_acquire(),
             primary_scene_work,
@@ -58,14 +64,21 @@ impl NativeRuntime {
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
-        self.reap_supervised_children(&cycle)?;
-        let xwm_drain_started = Instant::now();
-        self.dispatch_xwayland_events(&cycle.wakeup)?;
-        self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
-        if self.xwayland.generation().is_some() {
-            self.attach_xwayland_private_client()?;
-        } else {
-            self.revoke_xwayland_private_client();
+        if cycle.wakeup.reasons.child_signal()
+            || self.shutdown.state() == ShutdownState::StoppingChildren
+        {
+            self.reap_supervised_children(&cycle)?;
+        }
+        if xwayland_work {
+            let xwm_drain_started = Instant::now();
+            self.dispatch_xwayland_events(&cycle.wakeup)?;
+            self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
+            if self.xwayland.generation().is_some() {
+                self.attach_xwayland_private_client()?;
+            } else {
+                self.revoke_xwayland_private_client();
+            }
+            self.sync_xwayland_reactor_sources()?;
         }
         if cycle.wakeup.reasons.timer() {
             self.control_server.expire_idle_clients(
@@ -80,11 +93,18 @@ impl NativeRuntime {
             }
             self.sync_xwayland_reactor_sources()?;
         }
-        self.sync_xwayland_reactor_sources()?;
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
-            self.dispatch_suspended_sources(&cycle)?;
-            self.server.progress_surface_pacing(monotonic_now_ns()?);
+            if wayland_dispatch_work
+                || cycle.wakeup.reasons.drm()
+                || cycle.wakeup.reasons.timer()
+                || cycle.wakeup.reasons.explicit_sync_acquire()
+            {
+                self.dispatch_suspended_sources(&cycle)?;
+            }
+            if cycle.wakeup.reasons.timer() {
+                self.server.progress_surface_pacing(monotonic_now_ns()?);
+            }
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
                 return Ok(());
@@ -99,16 +119,23 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        self.dispatch_wayland_and_input(&mut cycle)?;
-        self.server.progress_surface_pacing(monotonic_now_ns()?);
+        if wayland_dispatch_work {
+            self.dispatch_wayland_and_input(&mut cycle)?;
+        }
+        if cycle.wakeup.reasons.timer() {
+            self.server.progress_surface_pacing(monotonic_now_ns()?);
+        }
         self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
         self.service_control_events(&cycle.wakeup)?;
         self.service_cursor_io_completions(&cycle.wakeup)?;
-        self.dispatch_xwayland_client_disconnects()?;
-        self.dispatch_xwayland_shell_binds()?;
-        self.initialize_managed_xwayland()?;
-        cycle.redraw_requested |= self.dispatch_xwayland_scene_batch()?;
-        self.sync_xwayland_reactor_sources()?;
+        let xwayland_scene_work = wayland_client_work || xwayland_work;
+        if xwayland_scene_work {
+            self.dispatch_xwayland_client_disconnects()?;
+            self.dispatch_xwayland_shell_binds()?;
+            self.initialize_managed_xwayland()?;
+            cycle.redraw_requested |= self.dispatch_xwayland_scene_batch()?;
+            self.sync_xwayland_reactor_sources()?;
+        }
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
         }
@@ -118,25 +145,43 @@ impl NativeRuntime {
             }
             return Ok(());
         }
-        drain_pending_process_launches_with_xwayland_environment_and_cursor(
-            &mut self.server,
-            &mut self.process_supervisor,
-            &mut self.astrea_launch_tracker,
-            self.effective_app_gpu_policy,
-            self.perf,
-            &mut self.pending_launches,
-            self.xwayland.normal_app_environment(),
-            Some(self.cursor_manager.desired_configuration()),
-        );
-        let prepare_started = Instant::now();
-        self.process_acquire_and_prepare(&cycle)?;
-        self.note_timing_scope("prepare_frame", prepare_started.elapsed());
+        if wayland_dispatch_work || xwayland_scene_work {
+            drain_pending_process_launches_with_xwayland_environment_and_cursor(
+                &mut self.server,
+                &mut self.process_supervisor,
+                &mut self.astrea_launch_tracker,
+                self.effective_app_gpu_policy,
+                self.perf,
+                &mut self.pending_launches,
+                self.xwayland.normal_app_environment(),
+                Some(self.cursor_manager.desired_configuration()),
+            );
+        }
+        let prepare_work = wayland_dispatch_work
+            || xwayland_scene_work
+            || cursor_work
+            || cycle.wakeup.reasons.explicit_sync_acquire()
+            || cycle.redraw_requested
+            || self.queued_redraw_requested;
+        if prepare_work {
+            let prepare_started = Instant::now();
+            self.process_acquire_and_prepare(&cycle)?;
+            self.note_timing_scope("prepare_frame", prepare_started.elapsed());
+        } else {
+            self.resource_efficiency_mut().record_acquire_prepare_skip();
+        }
         if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
-        let render_started = Instant::now();
-        self.render_present_and_update_metrics(&mut cycle)?;
-        self.note_timing_scope("egl_draw", render_started.elapsed());
+        let presentation_work = prepare_work || cycle.frame_completed;
+        if presentation_work {
+            let render_started = Instant::now();
+            self.render_present_and_update_metrics(&mut cycle)?;
+            self.note_timing_scope("egl_draw", render_started.elapsed());
+        } else {
+            self.resource_efficiency_mut()
+                .record_presentation_planning_skip();
+        }
         self.flush_presentation_trace()?;
         Ok(())
     }
