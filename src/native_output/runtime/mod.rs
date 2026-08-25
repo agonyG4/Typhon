@@ -80,8 +80,8 @@ pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
-    ResolvedNativeFrameScene, earliest_native_deadline, native_pointer_debug_log,
-    native_pointer_debug_log_lazy, normalize_refresh_hz,
+    ResolvedNativeFrameScene, earliest_native_deadline, native_pointer_debug_log_lazy,
+    normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{
@@ -273,6 +273,7 @@ pub(crate) struct NativeRuntime {
     legacy_cursor: Option<NativeLegacyHardwareCursor>,
     kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
+    input_batch: NativeInputBatch,
     seat_session: Option<NativeSeatSession>,
     session: NativeSessionLifecycle,
     pending_session_recovery: Option<NativeScanoutRecovery>,

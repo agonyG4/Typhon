@@ -741,6 +741,7 @@ impl NativeRuntime {
             atomic_cursor,
             legacy_cursor,
             input_devices,
+            input_batch,
             acquire_notifier,
             acquire_watches,
             parked_acquire_watches: _,
@@ -814,24 +815,25 @@ impl NativeRuntime {
         }
         let mut skipped_input_repaints = 0usize;
         let input_drain_start = Instant::now();
-        let raw_events = input_devices.drain_events();
+        input_devices.drain_events_into(input_batch);
         let input_drain_us = elapsed_micros(input_drain_start);
-        let raw_input_events = raw_events.len();
+        let raw_input_events = input_batch.raw.len();
         let input_event_timestamp_usec = matches!(
             input_devices.kind(),
             NativeInputBackendKind::LibseatLibinputUdev
                 | NativeInputBackendKind::DirectLibinputUdev
         )
         .then(|| {
-            raw_events
+            input_batch
+                .raw
                 .iter()
                 .filter_map(|event| event.timestamp_usec())
                 .max()
         })
         .flatten();
-        let coalesced_events = coalesce_pointer_motion_events(raw_events);
-        let coalesced_input_events = coalesced_events.len();
-        for (event_index, event) in coalesced_events.into_iter().enumerate() {
+        input_batch.coalesce_pointer_motion_events();
+        let coalesced_input_events = input_batch.coalesced.len();
+        for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
                 server.keyboard_shortcut_inhibition_snapshot(),

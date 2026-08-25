@@ -123,13 +123,20 @@ impl NativeInputBackend {
         }
     }
 
-    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+    pub(crate) fn drain_events_into(&mut self, batch: &mut NativeInputBatch) {
+        batch.raw.clear();
         match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
-                backend.drain_events()
+                backend.drain_events_into(&mut batch.raw);
             }
-            Self::RawEvdev(backend) => backend.drain_events(),
+            Self::RawEvdev(backend) => backend.drain_events_into(&mut batch.raw),
         }
+    }
+
+    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+        let mut batch = NativeInputBatch::default();
+        self.drain_events_into(&mut batch);
+        batch.raw
     }
 }
 
@@ -229,29 +236,32 @@ impl LibinputInputBackend {
         })
     }
 
-    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+        events.clear();
         if self.suspended {
-            return Vec::new();
+            return;
         }
-        self.drain_events_unconditionally()
+        self.drain_events_unconditionally(events);
     }
 
-    fn drain_events_unconditionally(&mut self) -> Vec<NativeHardwareInputEvent> {
+    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
+        self.drain_events_into(&mut events);
+        events
+    }
+
+    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+        events.clear();
         if let Err(error) = self.input.dispatch() {
             eprintln!("native input: libinput dispatch failed: {error}");
-            return events;
+            return;
         }
         for event in &mut self.input {
-            let device_key = ::input::event::EventTrait::device(&event)
-                .sysname()
-                .to_owned();
             if let Some(event) = hardware_input_event_from_libinput(
                 event,
                 self.output_width,
                 self.output_height,
                 &mut self.scroll_v120_remainders,
-                &device_key,
             ) {
                 events.push(event);
                 if events.len() >= 256 {
@@ -259,11 +269,16 @@ impl LibinputInputBackend {
                 }
             }
         }
-        events
     }
 
     fn discard_events_unconditionally(&mut self) {
-        while self.drain_events_unconditionally().len() == 256 {}
+        let mut events = Vec::with_capacity(256);
+        loop {
+            self.drain_events_unconditionally(&mut events);
+            if events.len() != 256 {
+                break;
+            }
+        }
     }
 
     fn suspend_for_session(&mut self) {
@@ -532,8 +547,8 @@ pub(crate) fn hardware_input_event_from_libinput(
     output_width: u32,
     output_height: u32,
     scroll_v120_remainders: &mut HashMap<String, ScrollV120Remainder>,
-    device_key: &str,
 ) -> Option<NativeHardwareInputEvent> {
+    use ::input::event::EventTrait;
     use ::input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
     #[allow(deprecated)]
     use ::input::event::pointer::{
@@ -611,6 +626,8 @@ pub(crate) fn hardware_input_event_from_libinput(
             let vertical = libinput_scroll_axis_value(event.has_axis(Axis::Vertical), || {
                 event.scroll_value(Axis::Vertical)
             });
+            let device = event.device();
+            let device_key = device.sysname();
             Some(NativeHardwareInputEvent::PointerAxis(PointerAxisFrame {
                 timestamp_usec: event.time_usec(),
                 source: PointerAxisSource::Wheel,
@@ -618,18 +635,14 @@ pub(crate) fn hardware_input_event_from_libinput(
                     event.has_axis(Axis::Horizontal),
                     horizontal,
                     || event.scroll_value_v120(Axis::Horizontal),
-                    scroll_v120_remainders
-                        .entry(device_key.to_owned())
-                        .or_default(),
+                    libinput_scroll_v120_remainder(scroll_v120_remainders, device_key),
                     true,
                 ),
                 vertical: wheel_axis_component(
                     event.has_axis(Axis::Vertical),
                     vertical,
                     || event.scroll_value_v120(Axis::Vertical),
-                    scroll_v120_remainders
-                        .entry(device_key.to_owned())
-                        .or_default(),
+                    libinput_scroll_v120_remainder(scroll_v120_remainders, device_key),
                     false,
                 ),
             }))
@@ -670,6 +683,18 @@ pub(crate) fn hardware_input_event_from_libinput(
         }
         _ => None,
     }
+}
+
+fn libinput_scroll_v120_remainder<'a>(
+    remainders: &'a mut HashMap<String, ScrollV120Remainder>,
+    device_key: &str,
+) -> &'a mut ScrollV120Remainder {
+    if !remainders.contains_key(device_key) {
+        remainders.insert(device_key.to_owned(), ScrollV120Remainder::default());
+    }
+    remainders
+        .get_mut(device_key)
+        .expect("libinput wheel remainder inserted or already present")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,30 +868,42 @@ impl NativeInputDevices {
         }
     }
 
-    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+        events.clear();
         if self.suspended {
-            return Vec::new();
+            return;
         }
-        self.drain_events_unconditionally()
+        self.drain_events_unconditionally(events);
     }
 
-    fn drain_events_unconditionally(&mut self) -> Vec<NativeHardwareInputEvent> {
+    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
+        self.drain_events_into(&mut events);
+        events
+    }
+
+    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+        events.clear();
         for device in &mut self.devices {
             while let Some(event) = read_linux_input_event(device) {
                 if let Some(event) = NativeHardwareInputEvent::from_linux_event(event) {
                     events.push(event);
                 }
                 if events.len() >= 256 {
-                    return events;
+                    return;
                 }
             }
         }
-        events
     }
 
     fn discard_events_unconditionally(&mut self) {
-        while !self.drain_events_unconditionally().is_empty() {}
+        let mut events = Vec::with_capacity(256);
+        loop {
+            self.drain_events_unconditionally(&mut events);
+            if events.is_empty() {
+                break;
+            }
+        }
     }
 
     pub(crate) fn suspend_for_session(&mut self) {
