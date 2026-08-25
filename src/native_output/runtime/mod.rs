@@ -46,6 +46,7 @@ mod presentation_protocol;
 mod presentation_ready;
 mod presentation_transactions;
 mod presentation_worker;
+mod resource_efficiency;
 mod scene_history;
 mod session;
 mod session_io;
@@ -57,6 +58,9 @@ mod xwayland_reactor;
 mod xwayland_reactor_tests;
 
 use metrics::NativeRenderTelemetry;
+pub(crate) use resource_efficiency::{
+    NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
+};
 pub(crate) use scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
@@ -415,6 +419,14 @@ impl NativeRuntime {
             .entry(name)
             .or_default()
             .record(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
+
+    pub(super) const fn resource_efficiency(&self) -> &ResourceEfficiencyMetrics {
+        &self.render_telemetry.resource_efficiency
+    }
+
+    pub(super) fn resource_efficiency_mut(&mut self) -> &mut ResourceEfficiencyMetrics {
+        &mut self.render_telemetry.resource_efficiency
     }
 }
 

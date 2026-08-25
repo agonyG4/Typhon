@@ -592,6 +592,35 @@ pub struct KmsPerformanceSnapshot {
     pub missed_refresh_3x_or_more: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ResourceEfficiencyPerformanceSnapshot {
+    pub native_cycles: u64,
+    pub input_ready: u64,
+    pub raw_input_events: u64,
+    pub coalesced_input_events: u64,
+    pub pointer_samples: u64,
+    pub primary_scene_attempts: u64,
+    pub primary_scene_renders: u64,
+    pub primary_scene_submits: u64,
+    pub cursor_only_opportunities: u64,
+    pub cursor_only_submits: u64,
+    pub protocol_only_completions: u64,
+    pub pure_input_completions: u64,
+    pub hit_test_locality: u64,
+    pub hit_test_full_scans: u64,
+    pub xwayland_sync_requests: u64,
+    pub xwayland_reconciliations: u64,
+    pub xwayland_unchanged_skips: u64,
+    pub xwayland_environment_materializations: u64,
+    pub pacing_progressions: u64,
+    pub acquire_prepare_runs: u64,
+    pub acquire_prepare_skips: u64,
+    pub presentation_planning_runs: u64,
+    pub presentation_planning_skips: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -600,6 +629,7 @@ pub struct PerformanceSnapshot {
     pub repaint: RepaintPerformanceSnapshot,
     pub buffering: BufferingPerformanceSnapshot,
     pub kms: KmsPerformanceSnapshot,
+    pub resource_efficiency: ResourceEfficiencyPerformanceSnapshot,
     pub timing_scopes: std::collections::BTreeMap<String, TimingSummarySnapshot>,
 }
 
@@ -695,6 +725,150 @@ mod tests {
     fn snapshot_objects_are_deserializable_and_require_all_fields() {
         let result = serde_json::from_value::<StatusSnapshot>(serde_json::json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn performance_snapshot_round_trips_resource_efficiency_field() {
+        let timing = serde_json::json!({
+            "count": 0,
+            "totalUs": 0,
+            "lastUs": 0,
+            "meanUs": 0,
+            "p50Us": 0,
+            "p95Us": 0,
+            "p99Us": 0,
+            "maxUs": 0,
+        });
+        let signed_timing = serde_json::json!({
+            "count": 0,
+            "totalUs": 0,
+            "lastUs": 0,
+            "meanUs": 0,
+            "p50Us": 0,
+            "p95Us": 0,
+            "p99Us": 0,
+            "minUs": 0,
+            "maxUs": 0,
+        });
+        let value = serde_json::json!({
+            "compositorCpuRender": timing,
+            "repaint": {
+                "skipFrames": 0,
+                "partialFrames": 0,
+                "fullFrames": 0,
+                "bufferAgeBuckets": {},
+                "partialRepairPixels": 0,
+                "fullOutputPixels": 0,
+                "fullRepaintReasons": {},
+            },
+            "buffering": {
+                "reactiveDoubleFrames": 0,
+                "predictiveTripleFrames": 0,
+                "futurePrimaryCredit": 0,
+                "extraCreditGrants": 0,
+                "extraCreditRevokes": 0,
+                "o1Credit2UsefulHits": 0,
+                "o1Credit2UnnecessaryHits": 0,
+                "o1Credit2IneffectiveMisses": 0,
+                "o1Credit2GrantedNotConsumed": 0,
+                "o1Credit2DrainEvents": 0,
+                "o1Credit2RefillSuppressedWhileDraining": 0,
+                "preRenderAbandoned": 0,
+                "predictedRenderReadyServiceNs": 0,
+                "predictedKmsLeadNs": 0,
+                "predictedTotalServiceNs": 0,
+                "lastOverlapRequiredNs": 0,
+                "positiveOverlapObservations": 0,
+                "nonpositiveOverlapObservations": 0,
+                "renderAheadAttempts": 0,
+                "renderAheadReady": 0,
+                "readySubmits": 0,
+                "tripleEntriesPredicted": 0,
+                "tripleEntriesRenderMiss": 0,
+                "tripleEntriesSubmitMiss": 0,
+                "tripleEntriesPresentationMiss": 0,
+                "tripleExits": 0,
+            },
+            "kms": {
+                "modeRefreshIntervalNs": 0,
+                "modeBlankingIntervalNs": null,
+                "baseApplyGuardNs": 0,
+                "adaptiveApplyGuardNs": 0,
+                "totalApplyGuardNs": 0,
+                "targetHits": 0,
+                "preRenderUnreachable": 0,
+                "renderReadinessMisses": 0,
+                "dispatchMisses": 0,
+                "applyGuardMisses": 0,
+                "workerJobsEnqueued": 0,
+                "workerJobsSubmitted": 0,
+                "workerJobsRejected": 0,
+                "workerLateWakeups": 0,
+                "workerSubmitDurationMaxUs": 0,
+                "workerQueueResidencyMaxUs": 0,
+                "workerQueueDepthMax": 0,
+                "workerTiming": {
+                    "submitWakeLateness": signed_timing,
+                    "preSubmitDuration": timing,
+                    "dispatchDuration": timing,
+                    "ioctlDuration": timing,
+                    "queueResidency": timing,
+                    "submitEarliness": signed_timing,
+                    "submitReturnEarliness": signed_timing,
+                    "submitAckDelay": timing,
+                    "pageflipAckDelay": timing,
+                    "testOnlyDuration": timing,
+                    "dispatchBudgetUs": 0,
+                    "lateBeforeIoctl": 0,
+                    "lateAfterIoctl": 0,
+                    "testOnlyCount": 0,
+                },
+                "mainLoopWakeLatenessP50Us": 0,
+                "mainLoopWakeLatenessP95Us": 0,
+                "mainLoopWakeLatenessP99Us": 0,
+                "mainLoopTargetSlipP50Us": 0,
+                "mainLoopTargetSlipP95Us": 0,
+                "mainLoopTargetSlipP99Us": 0,
+                "pageflipIntervalP50Us": 0,
+                "pageflipIntervalP95Us": 0,
+                "pageflipIntervalP99Us": 0,
+                "commitToPresentP50Us": 0,
+                "commitToPresentP95Us": 0,
+                "commitToPresentP99Us": 0,
+                "missedRefresh1x": 0,
+                "missedRefresh2x": 0,
+                "missedRefresh3xOrMore": 0,
+            },
+            "resourceEfficiency": {
+                "nativeCycles": 7,
+                "inputReady": 0,
+                "rawInputEvents": 0,
+                "coalescedInputEvents": 0,
+                "pointerSamples": 0,
+                "primarySceneAttempts": 0,
+                "primarySceneRenders": 0,
+                "primarySceneSubmits": 0,
+                "cursorOnlyOpportunities": 0,
+                "cursorOnlySubmits": 0,
+                "protocolOnlyCompletions": 0,
+                "pureInputCompletions": 0,
+                "hitTestLocality": 0,
+                "hitTestFullScans": 0,
+                "xwaylandSyncRequests": 0,
+                "xwaylandReconciliations": 0,
+                "xwaylandUnchangedSkips": 0,
+                "xwaylandEnvironmentMaterializations": 0,
+                "pacingProgressions": 0,
+                "acquirePrepareRuns": 0,
+                "acquirePrepareSkips": 0,
+                "presentationPlanningRuns": 0,
+                "presentationPlanningSkips": 0,
+            },
+            "timingScopes": {},
+        });
+
+        let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), value);
     }
 
     #[test]

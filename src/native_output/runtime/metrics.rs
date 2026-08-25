@@ -1,4 +1,5 @@
 use super::planner::visual_target_deadline_for_target;
+use super::resource_efficiency::ResourceEfficiencyMetrics;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
 use crate::native_output::{
@@ -26,6 +27,7 @@ pub(super) struct NativeRenderTelemetry {
     partial_repair_pixels: u64,
     full_output_pixels: u64,
     full_repaint_reasons: [u64; RENDER_REPAINT_REASON_COUNT],
+    pub(super) resource_efficiency: ResourceEfficiencyMetrics,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -342,6 +344,7 @@ impl NativeRuntime {
                 missed_refresh_2x: pacing.missed_refresh_2x,
                 missed_refresh_3x_or_more: pacing.missed_refresh_3x_or_more,
             },
+            resource_efficiency: self.resource_efficiency().snapshot(),
             timing_scopes,
         }
     }
