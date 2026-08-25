@@ -158,6 +158,8 @@ pub struct XwaylandService {
     pub(crate) config: XwaylandConfig,
     pub(crate) metrics: XwaylandMetrics,
     lease: Option<DisplayLease>,
+    app_environment: Option<XwaylandAppEnvironment>,
+    reactor_registration_generation: u64,
     state: ServiceState,
     crash_times_ns: VecDeque<u64>,
     backoff_level: usize,
@@ -204,12 +206,22 @@ impl XwaylandService {
         } else {
             ServiceState::Disabled
         };
+        let app_environment = lease.as_ref().map(|lease| XwaylandAppEnvironment {
+            display: lease.display().to_string(),
+            xauthority: lease.xauthority_path().to_owned(),
+        });
+        let mut metrics = XwaylandMetrics::default();
+        if app_environment.is_some() {
+            metrics.environment_materializations = 1;
+        }
         Ok(Self {
             mode,
             next_generation: NonZeroU64::new(1).expect("one is nonzero"),
             config,
-            metrics: XwaylandMetrics::default(),
+            metrics,
             lease,
+            app_environment,
+            reactor_registration_generation: 1,
             state,
             crash_times_ns: VecDeque::new(),
             backoff_level: 0,
@@ -262,23 +274,18 @@ impl XwaylandService {
         self.mode.is_eager()
     }
 
-    pub fn app_environment(&self) -> Option<XwaylandAppEnvironment> {
+    pub fn app_environment(&self) -> Option<&XwaylandAppEnvironment> {
         match self.state {
             ServiceState::Disabled | ServiceState::Failed => None,
             ServiceState::Armed
             | ServiceState::Starting(_)
             | ServiceState::RunningBase(_)
             | ServiceState::Running(_)
-            | ServiceState::Backoff { .. } => {
-                self.lease.as_ref().map(|lease| XwaylandAppEnvironment {
-                    display: lease.display().to_string(),
-                    xauthority: lease.xauthority_path().to_owned(),
-                })
-            }
+            | ServiceState::Backoff { .. } => self.app_environment.as_ref(),
         }
     }
 
-    pub fn normal_app_environment(&self) -> Option<XwaylandAppEnvironment> {
+    pub fn normal_app_environment(&self) -> Option<&XwaylandAppEnvironment> {
         if !self.mode.is_managed()
             || matches!(self.state, ServiceState::Disabled | ServiceState::Failed)
         {
@@ -289,6 +296,21 @@ impl XwaylandService {
 
     pub fn is_managed(&self) -> bool {
         self.mode.is_managed()
+    }
+
+    pub fn reactor_registration_generation(&self) -> u64 {
+        self.reactor_registration_generation
+    }
+
+    pub fn record_reactor_sync(&mut self, reconciled: bool) {
+        self.metrics.reactor_sync_requests = self.metrics.reactor_sync_requests.saturating_add(1);
+        if reconciled {
+            self.metrics.reactor_reconciliations =
+                self.metrics.reactor_reconciliations.saturating_add(1);
+        } else {
+            self.metrics.reactor_unchanged_skips =
+                self.metrics.reactor_unchanged_skips.saturating_add(1);
+        }
     }
 
     pub fn note_reactor_registration(
@@ -619,6 +641,7 @@ impl XwaylandService {
                     return Ok(false);
                 }
                 self.metrics.xwm_reactor_events = self.metrics.xwm_reactor_events.saturating_add(1);
+                self.bump_reactor_registration_generation();
                 let readable = flags & libc::EPOLLIN as u32 != 0;
                 let writable = flags & libc::EPOLLOUT as u32 != 0;
                 if matches!(self.state, ServiceState::Starting(_)) && (readable || writable) {
@@ -984,6 +1007,9 @@ impl XwaylandService {
     }
 
     pub fn record_association_events(&mut self, events: &[XwaylandAssociationEvent]) {
+        if !events.is_empty() {
+            self.bump_reactor_registration_generation();
+        }
         let mut stale_or_rejected = 0u64;
         if let ServiceState::Running(resources) = &mut self.state {
             for event in events.iter().copied() {
@@ -1199,6 +1225,7 @@ impl XwaylandService {
     }
 
     pub fn flush_managed_commands(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
+        self.bump_reactor_registration_generation();
         let result = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.flush().err().map(io::Error::other),
             _ => None,
@@ -1271,6 +1298,7 @@ impl XwaylandService {
     pub fn begin_shutdown(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
         self.stop_current(supervisor)?;
         self.private_client = None;
+        self.app_environment = None;
         if self.retired_lease.is_none() {
             self.retired_lease = self.lease.take();
         } else {
@@ -1475,6 +1503,7 @@ impl XwaylandService {
     }
 
     fn replace_state(&mut self, next: ServiceState) {
+        self.bump_reactor_registration_generation();
         let previous = std::mem::replace(&mut self.state, next);
         match previous {
             ServiceState::Starting(resources) => {
@@ -1494,5 +1523,10 @@ impl XwaylandService {
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => {}
         }
+    }
+
+    fn bump_reactor_registration_generation(&mut self) {
+        self.reactor_registration_generation =
+            self.reactor_registration_generation.saturating_add(1);
     }
 }

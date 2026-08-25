@@ -1264,7 +1264,7 @@ pub(crate) struct NativeInputApplyContext<'a> {
     pub(crate) app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     pub(crate) seat_session: Option<&'a NativeSeatSession>,
     pub(crate) process_supervisor: &'a mut ChildSupervisor,
-    pub(crate) xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    pub(crate) xwayland: Option<&'a oblivion_one::xwayland::XwaylandAppEnvironment>,
 }
 
 pub(crate) fn apply_compositor_only_pointer_position(

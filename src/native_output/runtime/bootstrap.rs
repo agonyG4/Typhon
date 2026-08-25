@@ -568,6 +568,7 @@ impl NativeRuntime {
             log_native_app_spawn(perf, &launch);
             pending_launches.push_back(launch);
         }
+        let xwayland_environment_materialized = xwayland_app_environment.is_some();
         let mut runtime = Self {
             server,
             cursor_image,
@@ -609,6 +610,7 @@ impl NativeRuntime {
             vrr_plan,
             xwayland,
             xwayland_reactor_tokens,
+            xwayland_reactor_generation: 0,
             xwayland_client_identity: None,
             drm_reactor_token: Some(drm_reactor_token),
             output_render_fence_token: None,
@@ -676,6 +678,11 @@ impl NativeRuntime {
             timing_scopes: std::collections::BTreeMap::new(),
             render_telemetry: NativeRenderTelemetry::default(),
         };
+        if xwayland_environment_materialized {
+            runtime
+                .resource_efficiency_mut()
+                .record_xwayland_environment_materialization();
+        }
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
     }

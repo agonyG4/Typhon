@@ -98,7 +98,7 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment(
     command: Vec<String>,
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     source: NativeLaunchSource,
-    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
 ) -> NativeResult<Option<NativeAppLaunchPerf>> {
     launch_native_shell_command_with_xwayland_environment_and_cursor(
         server,
@@ -117,7 +117,7 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
     command: Vec<String>,
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     source: NativeLaunchSource,
-    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
     cursor: Option<oblivion_one::cursor_theme::CursorConfiguration>,
 ) -> NativeResult<Option<NativeAppLaunchPerf>> {
     let Some(request) = native_launch_request(command, app_gpu_policy, source) else {
@@ -131,7 +131,7 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
             let socket_name = socket_name.clone();
             let argv = request.argv.clone();
             let gpu_policy = request.gpu_policy;
-            let xwayland = xwayland.clone();
+            let xwayland = xwayland.cloned();
             let cursor = cursor.clone();
             supervisor.spawn_restartable(
                 move || {
@@ -153,7 +153,7 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
             &socket_name,
             &request.argv,
             request.gpu_policy,
-            xwayland.as_ref(),
+            xwayland,
             cursor.as_ref(),
         )? {
             Some(command) => supervisor.spawn(command, process_options),
@@ -218,7 +218,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
-    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
     cursor: Option<&oblivion_one::cursor_theme::CursorConfiguration>,
 ) {
     let socket_name = server.socket_name().to_string();
@@ -240,7 +240,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
             &socket_name,
             &request.argv,
             request.gpu_policy,
-            xwayland.as_ref(),
+            xwayland,
             cursor,
         ) {
             Ok(Some(command)) => command,

@@ -118,6 +118,7 @@ impl XwaylandService {
             }
             self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandWrite, error);
         }
+        self.bump_reactor_registration_generation();
         Ok(())
     }
 
@@ -126,6 +127,7 @@ impl XwaylandService {
         now_ns: u64,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
+        self.bump_reactor_registration_generation();
         let focus_error = if let ServiceState::Running(resources) = &mut self.state {
             resources
                 .xwm
@@ -146,6 +148,7 @@ impl XwaylandService {
         now_ns: u64,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
+        self.bump_reactor_registration_generation();
         if let Some(pending) = self.pending_termination {
             if !supervisor.contains_id(pending.process_id) {
                 self.pending_termination = None;

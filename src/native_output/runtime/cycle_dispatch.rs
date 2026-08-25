@@ -717,10 +717,10 @@ impl NativeRuntime {
         &mut self,
         cycle: &mut NativeCycleState,
     ) -> NativeResult<()> {
-        let xwayland_app_environment = self.xwayland.normal_app_environment();
         if cycle.wakeup.reasons.input() {
             NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
         }
+        let xwayland_app_environment = self.xwayland.normal_app_environment();
         let perf = self.perf;
         let Self {
             server,

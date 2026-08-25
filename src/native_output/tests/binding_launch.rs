@@ -17,6 +17,10 @@ fn binding_application_launch_receives_current_xwayland_environment() {
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
     let xauthority = PathBuf::from("/run/user/1000/typhon authority/current auth");
+    let xwayland = oblivion_one::xwayland::XwaylandAppEnvironment {
+        display: ":43".to_string(),
+        xauthority: xauthority.clone(),
+    };
 
     let application = apply_native_input_effect(
         NativeInputEffect {
@@ -38,10 +42,7 @@ fn binding_application_launch_receives_current_xwayland_environment() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::Accelerated,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
-            xwayland: Some(oblivion_one::xwayland::XwaylandAppEnvironment {
-                display: ":43".to_string(),
-                xauthority: xauthority.clone(),
-            }),
+            xwayland: Some(&xwayland),
         },
     )
     .unwrap();

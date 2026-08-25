@@ -5,6 +5,28 @@ pub(crate) fn sync_xwayland_reactor_sources(
     service: &mut XwaylandService,
     tokens: &mut Vec<(ReactorToken, XwaylandReactorRegistration)>,
 ) -> NativeResult<()> {
+    let mut last_synced_generation = 0;
+    let _ = sync_xwayland_reactor_sources_with_generation(
+        event_loop,
+        service,
+        tokens,
+        &mut last_synced_generation,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn sync_xwayland_reactor_sources_with_generation(
+    event_loop: &mut NativeEventLoop,
+    service: &mut XwaylandService,
+    tokens: &mut Vec<(ReactorToken, XwaylandReactorRegistration)>,
+    last_synced_generation: &mut u64,
+) -> NativeResult<bool> {
+    let current_generation = service.reactor_registration_generation();
+    if current_generation == *last_synced_generation {
+        service.record_reactor_sync(false);
+        return Ok(false);
+    }
+    service.record_reactor_sync(true);
     let desired: Vec<_> = service.reactor_registrations().collect();
     let mut retained = Vec::new();
     for (token, registration) in tokens.drain(..) {
@@ -45,5 +67,6 @@ pub(crate) fn sync_xwayland_reactor_sources(
         tokens.push((token, registration));
     }
     service.finish_reactor_teardown()?;
-    Ok(())
+    *last_synced_generation = service.reactor_registration_generation();
+    Ok(true)
 }

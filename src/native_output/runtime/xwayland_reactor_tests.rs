@@ -94,6 +94,45 @@ fn sync_sources(
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
+#[test]
+fn unchanged_xwayland_reactor_generation_skips_reconciliation() {
+    let mut event_loop = NativeEventLoop::new().expect("reactor");
+    let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig {
+        mode: XwaylandMode::Off,
+        profile: XwaylandProfile::Foundation,
+        binary: PathBuf::from("/bin/true"),
+        log_stderr: false,
+        display_min: 1,
+        display_max: 1,
+    })
+    .expect("disabled XWayland service");
+    let mut tokens = Vec::new();
+    let mut last_synced_generation = 0;
+
+    assert!(
+        super::sync_xwayland_reactor_sources_with_generation(
+            &mut event_loop,
+            &mut service,
+            &mut tokens,
+            &mut last_synced_generation,
+        )
+        .expect("initial XWayland reactor reconciliation")
+    );
+    assert_eq!(
+        last_synced_generation,
+        service.reactor_registration_generation()
+    );
+    assert!(
+        !super::sync_xwayland_reactor_sources_with_generation(
+            &mut event_loop,
+            &mut service,
+            &mut tokens,
+            &mut last_synced_generation,
+        )
+        .expect("unchanged XWayland reactor generation")
+    );
+}
+
 fn process_server_events(
     receiver: &mpsc::Receiver<ServerEvents>,
     service: &mut XwaylandService,

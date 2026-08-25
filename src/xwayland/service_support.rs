@@ -314,6 +314,7 @@ impl XwaylandService {
         registered: bool,
         reactor_token: Option<u64>,
     ) {
+        self.bump_reactor_registration_generation();
         if registration.purpose == super::XwaylandReactorPurpose::Xwm {
             let action = if registered { "add" } else { "remove" };
             let state = match registration.owner {

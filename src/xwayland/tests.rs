@@ -1246,7 +1246,11 @@ fn process_exit_during_starting_retires_sources_before_resources() {
 fn shutdown_unregisters_listeners_before_lease_release() {
     let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
     let display = service.display_number().expect("display");
-    let environment = service.app_environment().expect("app environment");
+    let auth_path = service
+        .app_environment()
+        .expect("app environment")
+        .xauthority
+        .clone();
     let registrations = service.reactor_registrations().collect::<Vec<_>>();
     assert_eq!(registrations.len(), 2);
 
@@ -1278,7 +1282,7 @@ fn shutdown_unregisters_listeners_before_lease_release() {
         .expect("finish lease teardown");
     assert!(!service.has_pending_reactor_teardown());
     assert!(!root.join(format!(".X{display}-lock")).exists());
-    assert!(!environment.xauthority.exists());
+    assert!(!auth_path.exists());
 
     drop(event_loop);
     drop(service);
@@ -1391,7 +1395,8 @@ fn installed_xwayland_private_socket_smoke_test() -> Result<(), Box<dyn std::err
     let auth_path = service
         .app_environment()
         .expect("enabled service has app environment")
-        .xauthority;
+        .xauthority
+        .clone();
 
     // A real local connection is the lazy trigger. The connection is closed
     // immediately; the inherited X listener remains owned by the service.

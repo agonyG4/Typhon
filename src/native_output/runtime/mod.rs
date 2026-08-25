@@ -112,7 +112,9 @@ pub(crate) use session_io::{
 pub(crate) use shutdown::{
     NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,
 };
-pub(super) use xwayland_reactor::sync_xwayland_reactor_sources;
+pub(super) use xwayland_reactor::{
+    sync_xwayland_reactor_sources, sync_xwayland_reactor_sources_with_generation,
+};
 
 pub(super) struct NativeCycleState {
     pub(super) wakeup: NativeWakeup,
@@ -288,6 +290,7 @@ pub(crate) struct NativeRuntime {
     vrr_plan: NativeVrrPlan,
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
+    xwayland_reactor_generation: u64,
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
     drm_reactor_token: Option<ReactorToken>,
     output_render_fence_token: Option<ReactorToken>,
@@ -381,11 +384,20 @@ impl NativeRuntime {
     }
 
     fn sync_xwayland_reactor_sources(&mut self) -> NativeResult<()> {
-        sync_xwayland_reactor_sources(
+        let reconciled = sync_xwayland_reactor_sources_with_generation(
             &mut self.event_loop,
             &mut self.xwayland,
             &mut self.xwayland_reactor_tokens,
-        )
+            &mut self.xwayland_reactor_generation,
+        )?;
+        let metrics = self.resource_efficiency_mut();
+        metrics.record_xwayland_sync_request();
+        if reconciled {
+            metrics.record_xwayland_reconciliation();
+        } else {
+            metrics.record_xwayland_unchanged_skip();
+        }
+        Ok(())
     }
 
     fn attach_xwayland_private_client(&mut self) -> NativeResult<()> {
