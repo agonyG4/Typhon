@@ -84,6 +84,27 @@ impl CompositorState {
                 .any(|surface_id| self.root_surface_id_for_surface(*surface_id) == root_surface_id)
     }
 
+    pub(in crate::compositor) fn advance_relative_pointer_resources_generation(&mut self) {
+        self.relative_pointer_resources_generation = self
+            .relative_pointer_resources_generation
+            .wrapping_add(1)
+            .max(1);
+        self.locked_relative_recipient_cache.invalidate();
+    }
+
+    pub(in crate::compositor) fn invalidate_locked_relative_recipient_cache(&mut self) {
+        self.locked_relative_recipient_cache.invalidate();
+    }
+
+    fn retain_live_relative_pointer_resources(&mut self) {
+        let before = self.relative_pointer_resources.len();
+        self.relative_pointer_resources
+            .retain(|resource| resource.resource.is_alive() && resource.source_pointer.is_alive());
+        if self.relative_pointer_resources.len() != before {
+            self.advance_relative_pointer_resources_generation();
+        }
+    }
+
     pub(in crate::compositor) fn add_relative_pointer_resource(
         &mut self,
         pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
@@ -100,6 +121,7 @@ impl CompositorState {
                 resource: pointer,
                 source_pointer,
             });
+        self.advance_relative_pointer_resources_generation();
     }
 
     pub(in crate::compositor) fn remove_relative_pointer_resource(
@@ -111,8 +133,12 @@ impl CompositorState {
             pointer.id().protocol_id(),
             wayland_resource_client_label(pointer)
         ));
+        let before = self.relative_pointer_resources.len();
         self.relative_pointer_resources
             .retain(|resource| !same_wayland_resource(&resource.resource, pointer));
+        if self.relative_pointer_resources.len() != before {
+            self.advance_relative_pointer_resources_generation();
+        }
     }
 
     pub(in crate::compositor) fn send_relative_pointer_motion(
@@ -123,8 +149,7 @@ impl CompositorState {
         if motion.is_zero() {
             return;
         }
-        self.relative_pointer_resources
-            .retain(|resource| resource.resource.is_alive() && resource.source_pointer.is_alive());
+        self.retain_live_relative_pointer_resources();
         let live_relative_count = self.relative_pointer_resources.len();
         if let Some(active) = self.active_locked_pointer_binding() {
             self.pin_locked_pointer_focus(&active);
@@ -168,47 +193,23 @@ impl CompositorState {
         let utime_lo = (timestamp_usec & 0xffff_ffff) as u32;
         let pointer_entered =
             self.pointer_resource_entered_surface(&active.pointer, &active.surface);
-        let relative_pointers = self.relative_pointer_resources.clone();
-        let mut recipients: Vec<RelativePointerResource> = Vec::new();
-        let mut exact_source_pointer_count = 0usize;
-        let mut same_client_count = 0usize;
-        let mut same_seat_count = 0usize;
-        let mut stale_count = 0usize;
-        let mut cross_client_count = 0usize;
-
-        for relative_pointer in relative_pointers {
-            if !relative_pointer.resource.is_alive() || !relative_pointer.source_pointer.is_alive()
-            {
-                stale_count += 1;
-                continue;
-            }
-            if !resource_belongs_to_surface_client(&relative_pointer.resource, &active.surface)
-                || !resource_belongs_to_surface_client(
-                    &relative_pointer.source_pointer,
-                    &active.surface,
-                )
-            {
-                cross_client_count += 1;
-                continue;
-            }
-            same_client_count += 1;
-            // Typhon currently exposes a single wl_seat. Exact wl_pointer
-            // resource equality is too strict because clients may create
-            // constraints and relative-pointer resources from different
-            // wl_pointer objects on the same client seat. When multi-seat
-            // support is added, store and compare an explicit seat id here.
-            same_seat_count += 1;
-            if same_wayland_resource(&relative_pointer.source_pointer, &active.pointer) {
-                exact_source_pointer_count += 1;
-            }
-            if !recipients.iter().any(|recipient| {
-                same_wayland_resource(&recipient.resource, &relative_pointer.resource)
-            }) {
-                recipients.push(relative_pointer);
-            }
+        let cache_key = LockedRelativeRecipientCacheKey {
+            resource_generation: self.relative_pointer_resources_generation,
+            constraint_generation: active.generation,
+            surface_id: compositor_surface_id(&active.surface),
+            source_pointer_id: active.pointer.id().protocol_id(),
+        };
+        if !self.locked_relative_recipient_cache.matches(cache_key) {
+            self.rebuild_locked_relative_recipient_cache(cache_key, active);
         }
-
-        let selected_recipient_count = recipients.len();
+        let exact_source_pointer_count = self
+            .locked_relative_recipient_cache
+            .exact_source_pointer_count;
+        let same_client_count = self.locked_relative_recipient_cache.same_client_count;
+        let same_seat_count = self.locked_relative_recipient_cache.same_seat_count;
+        let stale_count = self.locked_relative_recipient_cache.stale_count;
+        let cross_client_count = self.locked_relative_recipient_cache.cross_client_count;
+        let selected_recipient_count = self.locked_relative_recipient_cache.recipients.len();
 
         if self.relative_motion_debug.should_log_route_snapshot() {
             let relative_sources = self
@@ -245,7 +246,9 @@ impl CompositorState {
         }
 
         pointer_debug_log_lazy(|| {
-            let dispatched_ids = recipients
+            let dispatched_ids = self
+                .locked_relative_recipient_cache
+                .recipients
                 .iter()
                 .map(|relative_pointer| relative_pointer.resource.id().protocol_id())
                 .collect::<Vec<_>>();
@@ -262,9 +265,9 @@ impl CompositorState {
             )
         });
 
-        let mut frame_pointers: Vec<wl_pointer::WlPointer> = Vec::new();
         let mut relative_events_sent = 0usize;
-        for relative_pointer in recipients {
+        for index in 0..selected_recipient_count {
+            let relative_pointer = &self.locked_relative_recipient_cache.recipients[index];
             relative_pointer.resource.relative_motion(
                 utime_hi,
                 utime_lo,
@@ -274,13 +277,6 @@ impl CompositorState {
                 motion.dy_unaccelerated,
             );
             relative_events_sent += 1;
-            if relative_pointer.source_pointer.is_alive()
-                && !frame_pointers
-                    .iter()
-                    .any(|pointer| same_wayland_resource(pointer, &relative_pointer.source_pointer))
-            {
-                frame_pointers.push(relative_pointer.source_pointer.clone());
-            }
             self.relative_motion_debug.note_dispatch(|| format!(
                 "relative motion dispatched constraint={} generation={} pointer={} source_pointer={} relative={} dx={} dy={}",
                 active.constraint_id,
@@ -292,9 +288,9 @@ impl CompositorState {
                 motion.dy
             ));
         }
-        let unique_source_pointer_count = frame_pointers.len();
+        let unique_source_pointer_count = self.locked_relative_recipient_cache.frame_pointers.len();
         let mut pointer_frames_sent = 0usize;
-        for pointer in frame_pointers {
+        for pointer in &self.locked_relative_recipient_cache.frame_pointers {
             if pointer.is_alive() {
                 send_pointer_frame_if_supported(&pointer);
                 pointer_frames_sent += 1;
@@ -344,6 +340,66 @@ impl CompositorState {
             };
             self.relative_motion_debug.note_drop(reason);
         }
+    }
+
+    fn rebuild_locked_relative_recipient_cache(
+        &mut self,
+        key: LockedRelativeRecipientCacheKey,
+        active: &ActiveLockedPointerRouting,
+    ) {
+        let cache = &mut self.locked_relative_recipient_cache;
+        cache.key = None;
+        cache.recipients.clear();
+        cache.frame_pointers.clear();
+        cache.exact_source_pointer_count = 0;
+        cache.same_client_count = 0;
+        cache.same_seat_count = 0;
+        cache.stale_count = 0;
+        cache.cross_client_count = 0;
+
+        for relative_pointer in &self.relative_pointer_resources {
+            if !relative_pointer.resource.is_alive() || !relative_pointer.source_pointer.is_alive()
+            {
+                cache.stale_count += 1;
+                continue;
+            }
+            if !resource_belongs_to_surface_client(&relative_pointer.resource, &active.surface)
+                || !resource_belongs_to_surface_client(
+                    &relative_pointer.source_pointer,
+                    &active.surface,
+                )
+            {
+                cache.cross_client_count += 1;
+                continue;
+            }
+            cache.same_client_count += 1;
+            // Typhon currently exposes a single wl_seat. Exact wl_pointer
+            // resource equality is too strict because clients may create
+            // constraints and relative-pointer resources from different
+            // wl_pointer objects on the same client seat. When multi-seat
+            // support is added, store and compare an explicit seat id here.
+            cache.same_seat_count += 1;
+            if same_wayland_resource(&relative_pointer.source_pointer, &active.pointer) {
+                cache.exact_source_pointer_count += 1;
+            }
+            if cache.recipients.iter().any(|recipient| {
+                same_wayland_resource(&recipient.resource, &relative_pointer.resource)
+            }) {
+                continue;
+            }
+            cache.recipients.push(relative_pointer.clone());
+            if relative_pointer.source_pointer.is_alive()
+                && !cache
+                    .frame_pointers
+                    .iter()
+                    .any(|pointer| same_wayland_resource(pointer, &relative_pointer.source_pointer))
+            {
+                cache
+                    .frame_pointers
+                    .push(relative_pointer.source_pointer.clone());
+            }
+        }
+        cache.key = Some(key);
     }
 
     pub(in crate::compositor) fn dispatch_relative_pointer_motion_to_surface_client(
@@ -1107,4 +1163,41 @@ fn send_pointer_axis_frame_to_resource(pointer: &wl_pointer::WlPointer, frame: P
         }
     }
     send_pointer_frame_if_supported(pointer);
+}
+
+#[cfg(test)]
+mod locked_relative_recipient_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_requires_all_locked_relative_lifecycle_identities() {
+        let key = LockedRelativeRecipientCacheKey {
+            resource_generation: 7,
+            constraint_generation: 11,
+            surface_id: 13,
+            source_pointer_id: 17,
+        };
+        let cache = LockedRelativeRecipientCache {
+            key: Some(key),
+            ..Default::default()
+        };
+
+        assert!(cache.matches(key));
+        assert!(!cache.matches(LockedRelativeRecipientCacheKey {
+            resource_generation: 8,
+            ..key
+        }));
+        assert!(!cache.matches(LockedRelativeRecipientCacheKey {
+            constraint_generation: 12,
+            ..key
+        }));
+        assert!(!cache.matches(LockedRelativeRecipientCacheKey {
+            surface_id: 14,
+            ..key
+        }));
+        assert!(!cache.matches(LockedRelativeRecipientCacheKey {
+            source_pointer_id: 18,
+            ..key
+        }));
+    }
 }

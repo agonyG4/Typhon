@@ -16,6 +16,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn clear_pointer_constraint(&mut self) {
         self.pointer_constraint.clear();
+        self.invalidate_locked_relative_recipient_cache();
     }
 
     pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
@@ -219,6 +220,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn clear_active_locked_pointer_routing(&mut self) {
         self.active_locked_pointer_routing = None;
+        self.invalidate_locked_relative_recipient_cache();
     }
 
     pub(in crate::compositor) fn pin_locked_pointer_focus(
@@ -745,6 +747,7 @@ impl CompositorState {
                 surface_x,
                 surface_y
             ));
+            self.invalidate_locked_relative_recipient_cache();
             self.active_locked_pointer_routing = Some(ActiveLockedPointerRouting {
                 constraint_id,
                 generation,
@@ -904,6 +907,7 @@ impl CompositorState {
         emit_event: bool,
         queue_backend_deactivate: bool,
     ) {
+        self.invalidate_locked_relative_recipient_cache();
         let Some((
             was_active,
             was_pending,

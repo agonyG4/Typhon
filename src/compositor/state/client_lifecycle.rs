@@ -142,10 +142,14 @@ impl CompositorState {
 
         self.keyboard_resources
             .retain(|keyboard| !resource_owned_by_client(keyboard, client_id));
+        let before_relative_resources = self.relative_pointer_resources.len();
         self.relative_pointer_resources.retain(|relative| {
             !resource_owned_by_client(&relative.resource, client_id)
                 && !resource_owned_by_client(&relative.source_pointer, client_id)
         });
+        if self.relative_pointer_resources.len() != before_relative_resources {
+            self.advance_relative_pointer_resources_generation();
+        }
         let outputs = self
             .output_resources
             .iter()

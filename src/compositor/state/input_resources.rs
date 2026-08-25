@@ -89,8 +89,12 @@ impl CompositorState {
             .retain(|(resource, _)| !same_wayland_resource(resource, pointer));
         self.pointer_enter_serials
             .retain(|entry| !same_wayland_resource(&entry.pointer, pointer));
+        let before = self.relative_pointer_resources.len();
         self.relative_pointer_resources
             .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
+        if self.relative_pointer_resources.len() != before {
+            self.advance_relative_pointer_resources_generation();
+        }
         self.deactivate_pointer_constraints_for_pointer(pointer, false);
         if owned_active_cursor {
             pointer_debug_log_lazy(|| {

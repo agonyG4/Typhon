@@ -510,6 +510,8 @@ pub struct CompositorState {
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
     pointer_resources: Vec<wl_pointer::WlPointer>,
     relative_pointer_resources: Vec<RelativePointerResource>,
+    relative_pointer_resources_generation: u64,
+    locked_relative_recipient_cache: LockedRelativeRecipientCache,
     idle_inhibitor_resources: Vec<IdleInhibitorBinding>,
     idle_manager: IdleManager,
     output_size: OutputSize,
@@ -763,6 +765,33 @@ struct RelativeMotionDebugState {
 struct RelativePointerResource {
     resource: zwp_relative_pointer_v1::ZwpRelativePointerV1,
     source_pointer: wl_pointer::WlPointer,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockedRelativeRecipientCacheKey {
+    resource_generation: u64,
+    constraint_generation: u64,
+    surface_id: u32,
+    source_pointer_id: u32,
+}
+#[derive(Debug, Default)]
+struct LockedRelativeRecipientCache {
+    key: Option<LockedRelativeRecipientCacheKey>,
+    recipients: Vec<RelativePointerResource>,
+    frame_pointers: Vec<wl_pointer::WlPointer>,
+    exact_source_pointer_count: usize,
+    same_client_count: usize,
+    same_seat_count: usize,
+    stale_count: usize,
+    cross_client_count: usize,
+}
+impl LockedRelativeRecipientCache {
+    fn matches(&self, key: LockedRelativeRecipientCacheKey) -> bool {
+        self.key == Some(key)
+    }
+
+    fn invalidate(&mut self) {
+        self.key = None;
+    }
 }
 #[derive(Debug, Clone)]
 struct PointerConstraint {
