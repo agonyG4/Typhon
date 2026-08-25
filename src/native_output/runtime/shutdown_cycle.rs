@@ -97,6 +97,8 @@ impl NativeRuntime {
                 control_events: Vec::new(),
                 cursor_io_events: Vec::new(),
             },
+            work_class: NativeWorkClass::NoOutputWork,
+            fast_path_completed: false,
             pageflip_drain_us: 0,
             pageflip_completed: false,
             completed_pageflip_token: None,

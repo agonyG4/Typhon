@@ -67,6 +67,11 @@ impl ReactorToken {
 pub struct WakeReasons(u32);
 
 impl WakeReasons {
+    #[doc(hidden)]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
     const DRM: u32 = 1 << 0;
     const KMS_COMMIT_WORKER: u32 = 1 << 13;
     const CURSOR_IO_WORKER: u32 = 1 << 15;

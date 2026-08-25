@@ -19,6 +19,38 @@ pub fn run(
     runtime.run()
 }
 impl NativeRuntime {
+    fn native_runtime_state(&self, cycle: &NativeCycleState, now_ns: u64) -> NativeRuntimeState {
+        NativeRuntimeState {
+            scene_dirty: cycle.redraw_requested
+                || self.queued_redraw_requested
+                || self.server.has_pending_frame_prepare_work(),
+            cursor_only_due: self.cursor_output_arbitration.pending()
+                && self.cursor_output_arbitration.due(now_ns),
+            explicit_sync_pending: self.server.has_pending_explicit_sync_work(),
+            pacing_active: self.server.has_surface_pacing_work(),
+            pacing_due: self.should_progress_surface_pacing(now_ns),
+            xwayland_generation_changed: self.xwayland.reactor_registration_generation()
+                != self.xwayland_reactor_generation,
+            recovery_required: self.pending_session_recovery.is_some(),
+            shutdown_requested: cycle.shutdown_requested,
+        }
+    }
+
+    pub(super) fn should_progress_surface_pacing(&self, now_ns: u64) -> bool {
+        self.server.has_surface_pacing_work()
+            || self
+                .server
+                .next_surface_pacing_deadline_ns()
+                .is_some_and(|deadline| deadline <= now_ns)
+    }
+
+    pub(super) fn should_process_acquire_and_prepare(&self, cycle: &NativeCycleState) -> bool {
+        let now_ns = monotonic_now_ns().unwrap_or_default();
+        let state = self.native_runtime_state(cycle, now_ns);
+        let domains = NativeWorkDomains::classify(&cycle.wakeup, &state);
+        domains.scene || domains.cursor || domains.explicit_sync
+    }
+
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
         while !self.shutdown.is_complete() {
             self.run_cycle()?;
@@ -29,30 +61,13 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
-        let wayland_client_work = cycle.wakeup.reasons.wayland_listener()
-            || cycle.wakeup.reasons.wayland_clients()
-            || cycle.wakeup.reasons.input();
-        let wayland_dispatch_work = wayland_client_work || cycle.wakeup.reasons.control();
-        let xwayland_work = cycle.wakeup.reasons.xwayland_listen()
-            || cycle.wakeup.reasons.xwayland_display_ready()
-            || cycle.wakeup.reasons.xwayland_xwm()
-            || cycle.wakeup.reasons.xwayland_stderr()
-            || !cycle.wakeup.xwayland_events.is_empty();
-        let protocol_work = wayland_dispatch_work || xwayland_work;
-        let cursor_work =
-            cycle.wakeup.reasons.cursor_io_worker() || !cycle.wakeup.cursor_io_events.is_empty();
-        let primary_scene_work = cycle.redraw_requested || self.queued_redraw_requested;
-        let work_decision = NativeWorkDecision::new(
-            NativeWorkClass::from_flags(protocol_work, cursor_work, primary_scene_work),
-            xwayland_work,
-            cycle.wakeup.reasons.timer(),
-            cycle.wakeup.reasons.explicit_sync_acquire(),
-            primary_scene_work,
-            cycle.wakeup.reasons.control(),
-            cycle.wakeup.reasons.child_signal(),
-            !self.session.permits_output(),
-            cycle.shutdown_requested,
-        );
+        let now_ns = monotonic_now_ns()?;
+        let runtime_state = self.native_runtime_state(&cycle, now_ns);
+        let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
+        let wayland_client_work = work_domains.wayland_protocol;
+        let xwayland_work = work_domains.xwayland;
+        let work_decision = NativeWorkDomains::from_wakeup(&cycle.wakeup, &runtime_state);
+        cycle.work_class = work_decision.work_class;
         {
             let metrics = self.resource_efficiency_mut();
             metrics.record_native_cycle();
@@ -64,12 +79,10 @@ impl NativeRuntime {
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
-        if cycle.wakeup.reasons.child_signal()
-            || self.shutdown.state() == ShutdownState::StoppingChildren
-        {
+        if work_domains.children || self.shutdown.state() == ShutdownState::StoppingChildren {
             self.reap_supervised_children(&cycle)?;
         }
-        if xwayland_work {
+        if work_domains.xwayland {
             let xwm_drain_started = Instant::now();
             self.dispatch_xwayland_events(&cycle.wakeup)?;
             self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
@@ -95,22 +108,26 @@ impl NativeRuntime {
         }
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
-            if wayland_dispatch_work
-                || cycle.wakeup.reasons.drm()
-                || cycle.wakeup.reasons.timer()
-                || cycle.wakeup.reasons.explicit_sync_acquire()
+            if work_domains.wayland_dispatch
+                || work_domains.presentation
+                || work_domains.surface_pacing
+                || work_domains.explicit_sync
             {
                 self.dispatch_suspended_sources(&cycle)?;
             }
-            if cycle.wakeup.reasons.timer() {
+            if work_domains.surface_pacing {
                 self.server.progress_surface_pacing(monotonic_now_ns()?);
             }
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
                 return Ok(());
             }
-            self.service_control_events(&cycle.wakeup)?;
-            self.service_cursor_io_completions(&cycle.wakeup)?;
+            if work_domains.control {
+                self.service_control_events(&cycle.wakeup)?;
+            }
+            if work_domains.cursor {
+                self.service_cursor_io_completions(&cycle.wakeup)?;
+            }
             self.arm_suspended_deadline()?;
             return Ok(());
         }
@@ -119,15 +136,19 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        if wayland_dispatch_work {
+        if work_domains.wayland_dispatch {
             self.dispatch_wayland_and_input(&mut cycle)?;
         }
-        if cycle.wakeup.reasons.timer() {
+        if work_domains.surface_pacing {
             self.server.progress_surface_pacing(monotonic_now_ns()?);
         }
         self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
-        self.service_control_events(&cycle.wakeup)?;
-        self.service_cursor_io_completions(&cycle.wakeup)?;
+        if work_domains.control {
+            self.service_control_events(&cycle.wakeup)?;
+        }
+        if work_domains.cursor {
+            self.service_cursor_io_completions(&cycle.wakeup)?;
+        }
         let xwayland_scene_work = wayland_client_work || xwayland_work;
         if xwayland_scene_work {
             self.dispatch_xwayland_client_disconnects()?;
@@ -145,7 +166,7 @@ impl NativeRuntime {
             }
             return Ok(());
         }
-        if wayland_dispatch_work || xwayland_scene_work {
+        if work_domains.wayland_dispatch || xwayland_scene_work {
             drain_pending_process_launches_with_xwayland_environment_and_cursor(
                 &mut self.server,
                 &mut self.process_supervisor,
@@ -157,12 +178,7 @@ impl NativeRuntime {
                 Some(self.cursor_manager.desired_configuration()),
             );
         }
-        let prepare_work = wayland_dispatch_work
-            || xwayland_scene_work
-            || cursor_work
-            || cycle.wakeup.reasons.explicit_sync_acquire()
-            || cycle.redraw_requested
-            || self.queued_redraw_requested;
+        let prepare_work = self.should_process_acquire_and_prepare(&cycle);
         if prepare_work {
             let prepare_started = Instant::now();
             self.process_acquire_and_prepare(&cycle)?;
@@ -176,12 +192,31 @@ impl NativeRuntime {
         let presentation_work = prepare_work || cycle.frame_completed;
         if presentation_work {
             let render_started = Instant::now();
+            self.resource_efficiency_mut()
+                .record_presentation_planning_run();
             self.render_present_and_update_metrics(&mut cycle)?;
+            let metrics = self.resource_efficiency_mut();
+            match cycle.work_class {
+                NativeWorkClass::PrimaryScene => {
+                    if cycle.frame_rendered {
+                        metrics.record_primary_scene_render();
+                    }
+                    if cycle.frame_submitted {
+                        metrics.record_primary_scene_submit();
+                    }
+                }
+                NativeWorkClass::CursorOnly if cycle.frame_submitted => {
+                    metrics.record_cursor_only_submit();
+                }
+                NativeWorkClass::NoOutputWork | NativeWorkClass::ProtocolOnly => {}
+                NativeWorkClass::CursorOnly => {}
+            }
             self.note_timing_scope("egl_draw", render_started.elapsed());
         } else {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
         }
+        cycle.fast_path_completed = !prepare_work && !presentation_work;
         self.flush_presentation_trace()?;
         Ok(())
     }

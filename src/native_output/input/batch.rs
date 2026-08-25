@@ -7,11 +7,6 @@ pub(crate) struct NativeInputBatch {
 }
 
 impl NativeInputBatch {
-    pub(crate) fn clear(&mut self) {
-        self.raw.clear();
-        self.coalesced.clear();
-    }
-
     pub(crate) fn coalesce_pointer_motion_events(&mut self) {
         self.coalesced.clear();
         let mut pending_motion = None;
@@ -56,7 +51,8 @@ mod tests {
         batch.coalesced.reserve(8);
         let raw_capacity = batch.raw.capacity();
         let coalesced_capacity = batch.coalesced.capacity();
-        batch.clear();
+        batch.raw.clear();
+        batch.coalesced.clear();
         assert_eq!(batch.raw.capacity(), raw_capacity);
         assert_eq!(batch.coalesced.capacity(), coalesced_capacity);
     }

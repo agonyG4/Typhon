@@ -455,6 +455,11 @@ impl CompositorState {
 
     pub(in crate::compositor) fn advance_pointer_hit_generation(&mut self) -> u64 {
         self.pointer_hit_generation = advance_nonzero_serial(self.pointer_hit_generation);
+        self.pointer_hit_metrics
+            .pointer_hit_generation_invalidations = self
+            .pointer_hit_metrics
+            .pointer_hit_generation_invalidations
+            .saturating_add(1);
         self.pointer_hit_generation
     }
 

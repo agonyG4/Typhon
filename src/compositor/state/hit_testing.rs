@@ -28,6 +28,9 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) pointer_scene_hit_calls: u64,
     pub(in crate::compositor) pointer_scene_hit_cache_hits: u64,
     pub(in crate::compositor) pointer_scene_hit_cache_misses: u64,
+    pub(in crate::compositor) full_scene_hit_scans: u64,
+    pub(in crate::compositor) owner_locality_fast_hits: u64,
+    pub(in crate::compositor) pointer_hit_generation_invalidations: u64,
     pub(in crate::compositor) pointer_scene_hit_groups_inspected: u64,
     pub(in crate::compositor) pointer_scene_hit_surfaces_inspected: u64,
     pub(in crate::compositor) pointer_scene_hit_origin_cache_clones: u64,
@@ -226,6 +229,10 @@ impl CompositorState {
         if instrumentation_enabled {
             self.pointer_hit_metrics.pointer_scene_hit_cache_misses += 1;
         }
+        self.pointer_hit_metrics.full_scene_hit_scans = self
+            .pointer_hit_metrics
+            .full_scene_hit_scans
+            .saturating_add(1);
         self.refresh_visual_stack_groups_cache();
         let (hit, groups_inspected, surfaces_inspected) =
             self.pointer_scene_hit_uncached(x, y, instrumentation_enabled);

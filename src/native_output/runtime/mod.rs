@@ -52,6 +52,7 @@ mod session;
 mod session_io;
 mod shutdown;
 mod shutdown_cycle;
+mod work_domains;
 mod xwayland;
 mod xwayland_reactor;
 #[cfg(test)]
@@ -62,6 +63,7 @@ pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
 };
 pub(crate) use scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
+pub(super) use work_domains::{NativeRuntimeState, NativeWorkDomains};
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{
@@ -118,6 +120,8 @@ pub(super) use xwayland_reactor::{
 
 pub(super) struct NativeCycleState {
     pub(super) wakeup: NativeWakeup,
+    pub(super) work_class: NativeWorkClass,
+    pub(super) fast_path_completed: bool,
     pub(super) pageflip_drain_us: u64,
     pub(super) pageflip_completed: bool,
     pub(super) completed_pageflip_token: Option<u64>,

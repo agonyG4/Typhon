@@ -242,6 +242,11 @@ fn pointer_scene_hit_metrics_cover_repeated_positions_without_hot_path_clones() 
     assert_eq!(metrics.pointer_scene_hit_calls, 10_003);
     assert!(metrics.pointer_scene_hit_cache_hits >= 1);
     assert!(metrics.pointer_scene_hit_cache_misses >= 7_500);
+    assert_eq!(
+        metrics.full_scene_hit_scans,
+        metrics.pointer_scene_hit_cache_misses
+    );
+    assert_eq!(metrics.owner_locality_fast_hits, 0);
     assert!(metrics.pointer_scene_hit_groups_inspected > 0);
     assert!(metrics.pointer_scene_hit_surfaces_inspected > 0);
     assert_eq!(metrics.pointer_scene_hit_origin_cache_clones, 0);

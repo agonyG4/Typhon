@@ -1,0 +1,227 @@
+use super::{NativeWakeup, NativeWorkClass, NativeWorkDecision};
+
+/// Runtime state that is not encoded in a single reactor wakeup.
+///
+/// This is deliberately a compact, allocation-free snapshot.  The native
+/// loop uses it to keep readiness domains independent: input can be drained
+/// without promoting a hardware cursor wake into a scene render, while an
+/// explicit-sync or pacing deadline still gets serviced promptly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeRuntimeState {
+    pub(super) scene_dirty: bool,
+    pub(super) cursor_only_due: bool,
+    pub(super) explicit_sync_pending: bool,
+    pub(super) pacing_active: bool,
+    pub(super) pacing_due: bool,
+    pub(super) xwayland_generation_changed: bool,
+    pub(super) recovery_required: bool,
+    pub(super) shutdown_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeWorkDomains {
+    pub(super) input: bool,
+    pub(super) wayland_protocol: bool,
+    pub(super) wayland_dispatch: bool,
+    pub(super) scene: bool,
+    pub(super) cursor: bool,
+    pub(super) presentation: bool,
+    pub(super) explicit_sync: bool,
+    pub(super) surface_pacing: bool,
+    pub(super) xwayland: bool,
+    pub(super) control: bool,
+    pub(super) children: bool,
+    pub(super) session: bool,
+    pub(super) shutdown: bool,
+}
+
+impl NativeWorkDomains {
+    pub(super) fn from_wakeup(
+        wakeup: &NativeWakeup,
+        state: &NativeRuntimeState,
+    ) -> NativeWorkDecision {
+        Self::classify(wakeup, state).decision()
+    }
+
+    pub(super) fn classify(wakeup: &NativeWakeup, state: &NativeRuntimeState) -> Self {
+        let reasons = wakeup.reasons;
+        let input = reasons.input();
+        let wayland_protocol = reasons.wayland_listener() || reasons.wayland_clients();
+        let control = reasons.control();
+        let children = reasons.child_signal();
+        let session = reasons.seat();
+        let xwayland = reasons.xwayland_listen()
+            || reasons.xwayland_display_ready()
+            || reasons.xwayland_xwm()
+            || reasons.xwayland_stderr()
+            || !wakeup.xwayland_events.is_empty()
+            || state.xwayland_generation_changed;
+        let explicit_sync = reasons.explicit_sync_acquire()
+            || !wakeup.explicit_sync_acquire_tokens.is_empty()
+            || state.explicit_sync_pending;
+        let cursor = reasons.cursor_io_worker()
+            || !wakeup.cursor_io_events.is_empty()
+            || state.cursor_only_due;
+        let wayland_dispatch = wayland_protocol || input || control;
+        let surface_pacing = state.pacing_due
+            || (state.pacing_active
+                && (reasons.timer() || wayland_dispatch || explicit_sync || state.scene_dirty));
+        let scene = state.scene_dirty || state.recovery_required;
+        let presentation = reasons.drm()
+            || reasons.kms_commit_worker()
+            || reasons.output_render_fence()
+            || state.recovery_required;
+
+        Self {
+            input,
+            wayland_protocol,
+            wayland_dispatch,
+            scene,
+            cursor,
+            presentation,
+            explicit_sync,
+            surface_pacing,
+            xwayland,
+            control,
+            children,
+            session,
+            shutdown: state.shutdown_requested,
+        }
+    }
+
+    pub(super) const fn decision(self) -> NativeWorkDecision {
+        let protocol_work = self.wayland_protocol
+            || self.xwayland
+            || self.explicit_sync
+            || self.surface_pacing
+            || self.control
+            || self.children
+            || self.session;
+        NativeWorkDecision::new(
+            NativeWorkClass::from_flags(protocol_work, self.cursor, self.scene),
+            self.xwayland,
+            self.surface_pacing,
+            self.explicit_sync,
+            self.scene,
+            self.control,
+            self.children,
+            self.session,
+            self.shutdown,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oblivion_one::native::event_loop::WakeReasons;
+
+    const INPUT: u32 = 1 << 3;
+    const TIMER: u32 = 1 << 4;
+    const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
+    const CHILD_SIGNAL: u32 = 1 << 6;
+    const SEAT: u32 = 1 << 7;
+    const XWAYLAND_XWM: u32 = 1 << 11;
+    const CONTROL: u32 = 1 << 14;
+
+    fn wakeup(bits: u32) -> NativeWakeup {
+        NativeWakeup {
+            reasons: WakeReasons::from_bits(bits),
+            ready_sources: 1,
+            blocked_ns: 0,
+            timer_lateness_ns: None,
+            explicit_sync_acquire_tokens: Vec::new(),
+            xwayland_events: Vec::new(),
+            control_events: Vec::new(),
+            cursor_io_events: Vec::new(),
+        }
+    }
+
+    fn state() -> NativeRuntimeState {
+        NativeRuntimeState {
+            pacing_active: false,
+            ..NativeRuntimeState::default()
+        }
+    }
+
+    #[test]
+    fn input_with_stable_hardware_cursor_is_a_pure_input_fast_path() {
+        let decision = NativeWorkDomains::from_wakeup(&wakeup(INPUT), &state());
+
+        assert_eq!(decision.work_class, NativeWorkClass::NoOutputWork);
+        assert!(!decision.service_primary_scene);
+        assert!(!decision.service_xwayland);
+        assert!(!decision.service_pacing);
+    }
+
+    #[test]
+    fn input_with_explicit_sync_requires_acquire_service() {
+        let decision =
+            NativeWorkDomains::from_wakeup(&wakeup(INPUT | EXPLICIT_SYNC_ACQUIRE), &state());
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_explicit_sync_acquire);
+    }
+
+    #[test]
+    fn input_with_pacing_deadline_requires_pacing_service() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(INPUT | TIMER),
+            &NativeRuntimeState {
+                pacing_due: true,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_pacing);
+    }
+
+    #[test]
+    fn input_with_xwm_readiness_requires_xwayland_service() {
+        let decision = NativeWorkDomains::from_wakeup(&wakeup(INPUT | XWAYLAND_XWM), &state());
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_xwayland);
+    }
+
+    #[test]
+    fn input_with_control_child_and_session_readiness_services_each_domain() {
+        let domains =
+            NativeWorkDomains::classify(&wakeup(INPUT | CONTROL | CHILD_SIGNAL | SEAT), &state());
+
+        assert!(domains.wayland_dispatch);
+        assert!(domains.control);
+        assert!(domains.children);
+        assert!(domains.session);
+        assert_eq!(domains.decision().work_class, NativeWorkClass::ProtocolOnly);
+    }
+
+    #[test]
+    fn input_with_cursor_deadline_is_cursor_only() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                cursor_only_due: true,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::CursorOnly);
+        assert!(!decision.service_primary_scene);
+    }
+
+    #[test]
+    fn input_with_scene_dirty_or_interaction_is_primary_scene() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                scene_dirty: true,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::PrimaryScene);
+        assert!(decision.service_primary_scene);
+    }
+}

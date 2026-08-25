@@ -326,6 +326,8 @@ impl NativeRuntime {
         if !self.session.permits_output() {
             return Ok(NativeCycleState {
                 wakeup,
+                work_class: NativeWorkClass::NoOutputWork,
+                fast_path_completed: false,
                 pageflip_drain_us: 0,
                 pageflip_completed: false,
                 completed_pageflip_token: None,
@@ -1291,6 +1293,8 @@ impl NativeRuntime {
         }
         Ok(NativeCycleState {
             wakeup,
+            work_class: NativeWorkClass::NoOutputWork,
+            fast_path_completed: false,
             pageflip_drain_us,
             pageflip_completed,
             completed_pageflip_token,

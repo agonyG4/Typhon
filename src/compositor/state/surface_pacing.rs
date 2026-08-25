@@ -359,6 +359,12 @@ impl CompositorState {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn has_surface_pacing_work(&self) -> bool {
+        !self.active_fifo_barriers.is_empty()
+            || !self.pending_surface_tree_transactions.is_empty()
+            || self.has_pending_commit_timing()
+    }
+
     pub(in crate::compositor) fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
         let mut deadline = self
             .active_fifo_barriers

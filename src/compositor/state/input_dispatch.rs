@@ -1200,4 +1200,47 @@ mod locked_relative_recipient_cache_tests {
             ..key
         }));
     }
+
+    #[test]
+    fn resource_lifetime_invalidation_keeps_warm_cache_capacity() {
+        let key = LockedRelativeRecipientCacheKey {
+            resource_generation: 3,
+            constraint_generation: 5,
+            surface_id: 7,
+            source_pointer_id: 9,
+        };
+        let mut cache = LockedRelativeRecipientCache {
+            key: Some(key),
+            recipients: Vec::with_capacity(4),
+            frame_pointers: Vec::with_capacity(2),
+            ..Default::default()
+        };
+        let recipient_capacity = cache.recipients.capacity();
+        let frame_capacity = cache.frame_pointers.capacity();
+
+        cache.invalidate();
+
+        assert!(!cache.matches(key));
+        assert_eq!(cache.recipients.capacity(), recipient_capacity);
+        assert_eq!(cache.frame_pointers.capacity(), frame_capacity);
+    }
+
+    #[test]
+    fn client_or_resource_mutation_requires_a_new_generation() {
+        let key = LockedRelativeRecipientCacheKey {
+            resource_generation: 21,
+            constraint_generation: 34,
+            surface_id: 55,
+            source_pointer_id: 89,
+        };
+        let cache = LockedRelativeRecipientCache {
+            key: Some(key),
+            ..Default::default()
+        };
+
+        assert!(!cache.matches(LockedRelativeRecipientCacheKey {
+            resource_generation: key.resource_generation + 1,
+            ..key
+        }));
+    }
 }

@@ -37,6 +37,11 @@ impl OwnCompositorServer {
     /// change pacing readiness.  Native output folds this into its existing
     /// deadline arbitration.
     #[doc(hidden)]
+    pub fn has_surface_pacing_work(&self) -> bool {
+        self.state.has_surface_pacing_work()
+    }
+
+    #[doc(hidden)]
     pub fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
         self.state.next_surface_pacing_deadline_ns()
     }
