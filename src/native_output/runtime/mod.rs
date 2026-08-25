@@ -81,7 +81,7 @@ pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
     ResolvedNativeFrameScene, earliest_native_deadline, native_pointer_debug_log,
-    normalize_refresh_hz,
+    native_pointer_debug_log_lazy, normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 mod egl_renderer;
 mod native_output;
+mod pointer_debug;
 
 use oblivion_one::{
     CompositorAppGpuPreference,

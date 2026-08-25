@@ -546,9 +546,11 @@ pub(crate) struct NativePointerConstraintBackend {
 }
 
 pub(crate) fn native_pointer_debug_log(message: impl AsRef<str>) {
-    if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
-        eprintln!("typhon pointer: {}", message.as_ref());
-    }
+    crate::pointer_debug::log(message);
+}
+
+pub(crate) fn native_pointer_debug_log_lazy(message: impl FnOnce() -> String) {
+    crate::pointer_debug::log_lazy(message);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -622,10 +624,12 @@ impl NativePointerConstraintBackend {
                 restore_position,
             } => self.deactivate(id, restore_position),
             PointerConstraintBackendRequest::WarpPointer { position } => {
-                native_pointer_debug_log(format!(
-                    "backend warp requested position=({},{})",
-                    position.x, position.y
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "backend warp requested position=({},{})",
+                        position.x, position.y
+                    )
+                });
                 NativePointerConstraintBackendAction {
                     cursor_position: Some(position),
                     ..NativePointerConstraintBackendAction::default()

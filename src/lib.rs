@@ -15,6 +15,7 @@ mod defaults;
 mod launch_env;
 pub mod native;
 mod paths;
+mod pointer_debug;
 pub mod portal;
 pub mod process;
 pub mod render_backend;

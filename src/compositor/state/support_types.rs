@@ -116,14 +116,11 @@ impl ClientCursorChoice {
 }
 
 pub(in crate::compositor) fn pointer_debug_log(message: impl AsRef<str>) {
-    if pointer_debug_enabled() {
-        eprintln!("typhon pointer: {}", message.as_ref());
-    }
+    crate::pointer_debug::log(message);
 }
 
 pub(in crate::compositor) fn pointer_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("TYPHON_POINTER_DEBUG").is_some())
+    crate::pointer_debug::enabled()
 }
 
 fn pointer_debug_message<T>(enabled: bool, message: impl FnOnce() -> T) -> Option<T> {
@@ -131,9 +128,7 @@ fn pointer_debug_message<T>(enabled: bool, message: impl FnOnce() -> T) -> Optio
 }
 
 pub(in crate::compositor) fn pointer_debug_log_lazy(message: impl FnOnce() -> String) {
-    if let Some(message) = pointer_debug_message(pointer_debug_enabled(), message) {
-        eprintln!("typhon pointer: {message}");
-    }
+    crate::pointer_debug::log_lazy(message);
 }
 
 pub(in crate::compositor) fn cursor_geometry_debug_message(

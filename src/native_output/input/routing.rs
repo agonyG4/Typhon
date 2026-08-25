@@ -1257,36 +1257,44 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
         }
         for request in requests {
             let cursor_position = input_state.cursor_position_f64();
-            native_pointer_debug_log(format!(
-                "pointer.constraint native_request {:?} cursor=({},{})",
-                request, cursor_position.x, cursor_position.y
-            ));
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.constraint native_request {:?} cursor=({},{})",
+                    request, cursor_position.x, cursor_position.y
+                )
+            });
             if let Some(id) = pointer_constraint_activation_request_id(&request)
                 && !server.pointer_constraint_backend_activation_current(id)
             {
-                native_pointer_debug_log(format!(
-                    "pointer.constraint native_request dropped stale id={} generation={} rollback=not_needed",
-                    id.constraint_id, id.generation
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.constraint native_request dropped stale id={} generation={} rollback=not_needed",
+                        id.constraint_id, id.generation
+                    )
+                });
                 continue;
             }
             let action = backend.handle_request(request, cursor_position);
             if let Some((id, reason)) = action.failed {
-                native_pointer_debug_log(format!(
-                    "pointer.constraint native_failed id={} generation={} reason={}",
-                    id.constraint_id, id.generation, reason
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.constraint native_failed id={} generation={} reason={}",
+                        id.constraint_id, id.generation, reason
+                    )
+                });
                 server.pointer_constraint_backend_failed(id, reason);
             }
             if let Some(constraint) = action.activated {
-                native_pointer_debug_log(format!(
-                    "pointer.constraint native_activated id={} generation={} mode={:?} anchor=({},{})",
-                    constraint.id.constraint_id,
-                    constraint.id.generation,
-                    constraint.mode,
-                    constraint.anchor.x,
-                    constraint.anchor.y
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.constraint native_activated id={} generation={} mode={:?} anchor=({},{})",
+                        constraint.id.constraint_id,
+                        constraint.id.generation,
+                        constraint.mode,
+                        constraint.anchor.x,
+                        constraint.anchor.y
+                    )
+                });
                 match constraint.mode {
                     PointerConstraintMode::Locked => {
                         input_state.set_pointer_locked_at(constraint.anchor)
@@ -1301,10 +1309,12 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 server.pointer_constraint_backend_activated(constraint.id);
             }
             if let Some(restore_position) = action.restore_position {
-                native_pointer_debug_log(format!(
-                    "pointer.unlock native_restore output=({},{})",
-                    restore_position.x, restore_position.y
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.unlock native_restore output=({},{})",
+                        restore_position.x, restore_position.y
+                    )
+                });
                 input_state.clear_pointer_constraint();
                 let effect = input_state.restore_cursor_position(restore_position);
                 redraw_requested |= effect.requires_frame_repaint(cursor_mode);
@@ -1314,14 +1324,18 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 redraw_requested |= effect.requires_frame_repaint(cursor_mode);
             }
             if let Some(id) = action.deactivated {
-                native_pointer_debug_log(format!(
-                    "pointer.constraint native_deactivated id={} generation={}",
-                    id.constraint_id, id.generation
-                ));
+                native_pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.constraint native_deactivated id={} generation={}",
+                        id.constraint_id, id.generation
+                    )
+                });
                 server.pointer_constraint_backend_deactivated(id);
             }
             if let Some(visible) = action.cursor_visibility_changed {
-                native_pointer_debug_log(format!("cursor visibility native visible={}", visible));
+                native_pointer_debug_log_lazy(|| {
+                    format!("cursor visibility native visible={}", visible)
+                });
                 let changed = input_state.set_cursor_visible(visible);
                 if cursor_mode.is_software() && changed {
                     redraw_requested = true;

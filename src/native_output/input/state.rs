@@ -414,15 +414,17 @@ impl NativeInputState {
         if !self.pointer_constraint.locked() {
             effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
         }
-        native_pointer_debug_log(format!(
-            "pointer.motion native locked={} absolute_updated={} relative=({},{}) cursor=({},{})",
-            locked_at_start,
-            effect.pointer_motion.is_some(),
-            sample.relative.map(|relative| relative.dx).unwrap_or(0.0),
-            sample.relative.map(|relative| relative.dy).unwrap_or(0.0),
-            self.cursor_x,
-            self.cursor_y
-        ));
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.motion native locked={} absolute_updated={} relative=({},{}) cursor=({},{})",
+                locked_at_start,
+                effect.pointer_motion.is_some(),
+                sample.relative.map(|relative| relative.dx).unwrap_or(0.0),
+                sample.relative.map(|relative| relative.dy).unwrap_or(0.0),
+                self.cursor_x,
+                self.cursor_y
+            )
+        });
         effect
     }
 
