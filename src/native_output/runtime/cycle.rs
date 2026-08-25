@@ -29,6 +29,32 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
+        let protocol_work = cycle.wakeup.reasons.wayland_listener()
+            || cycle.wakeup.reasons.wayland_clients()
+            || cycle.wakeup.reasons.control()
+            || !cycle.wakeup.xwayland_events.is_empty();
+        let cursor_work =
+            cycle.wakeup.reasons.cursor_io_worker() || !cycle.wakeup.cursor_io_events.is_empty();
+        let primary_scene_work = cycle.redraw_requested;
+        let work_decision = NativeWorkDecision::new(
+            NativeWorkClass::from_flags(protocol_work, cursor_work, primary_scene_work),
+            protocol_work || !cycle.wakeup.xwayland_events.is_empty(),
+            cycle.wakeup.reasons.timer(),
+            cycle.wakeup.reasons.explicit_sync_acquire(),
+            primary_scene_work,
+            cycle.wakeup.reasons.control(),
+            cycle.wakeup.reasons.child_signal(),
+            !self.session.permits_output(),
+            cycle.shutdown_requested,
+        );
+        {
+            let metrics = self.resource_efficiency_mut();
+            metrics.record_native_cycle();
+            if cycle.wakeup.reasons.input() {
+                metrics.record_input_ready();
+            }
+            metrics.record_work_decision(work_decision);
+        }
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );

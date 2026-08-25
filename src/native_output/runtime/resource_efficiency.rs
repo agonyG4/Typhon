@@ -171,6 +171,24 @@ impl ResourceEfficiencyMetrics {
     pub(super) fn record_presentation_planning_skip(&mut self) {
         self.presentation_planning_skips = self.presentation_planning_skips.saturating_add(1);
     }
+
+    pub(super) fn record_work_decision(&mut self, decision: NativeWorkDecision) {
+        match decision.work_class {
+            NativeWorkClass::NoOutputWork => self.record_pure_input_completion(),
+            NativeWorkClass::ProtocolOnly => self.record_protocol_only_completion(),
+            NativeWorkClass::CursorOnly => self.record_cursor_only_opportunity(),
+            NativeWorkClass::PrimaryScene => self.record_primary_scene_attempt(),
+        }
+        if decision.service_xwayland {
+            self.record_xwayland_sync_request();
+        }
+        if decision.service_pacing {
+            self.record_pacing_progression();
+        }
+        if decision.service_explicit_sync_acquire {
+            self.record_acquire_prepare_run();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
