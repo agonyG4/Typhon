@@ -1946,7 +1946,7 @@ fn active_window_interaction_motion_updates_geometry_before_exact_client_dispatc
         .0;
 
     let pointer_update = interaction_route
-        .find("update_pointer_position_without_client_dispatch")
+        .find("update_interaction_pointer_position_without_client_dispatch")
         .expect("active route should update compositor pointer position");
     let interaction_update = interaction_route
         .find("NativeWindowAction::UpdateInteraction")
@@ -1956,8 +1956,42 @@ fn active_window_interaction_motion_updates_geometry_before_exact_client_dispatc
         .expect("active route should dispatch exact-target absolute motion");
     assert!(pointer_update < interaction_update);
     assert!(interaction_update < client_dispatch);
+    assert!(interaction_route.contains("update_window_interaction_for_input_without_flush"));
+    assert!(
+        interaction_route.contains("send_window_interaction_pointer_motion_without_publication")
+    );
     assert!(!interaction_route.contains("send_pointer_motion_sample"));
     assert!(!interaction_route.contains("send_relative_pointer_motion"));
+    assert!(!interaction_route.contains("publish_astrea_toplevel_updates"));
+}
+
+#[test]
+fn native_pointer_routes_do_not_reconcile_astrea_as_part_of_input_delivery() {
+    let routing = include_str!("../input/routing.rs");
+    let apply = routing
+        .split_once("pub(crate) fn apply_native_input_effect")
+        .expect("native input application routing")
+        .1;
+
+    assert!(apply.contains("send_pointer_motion_sample_without_publication"));
+    assert!(apply.contains("send_keyboard_key_without_publication"));
+    assert!(apply.contains("send_pointer_button_without_publication"));
+    assert!(!apply.contains("publish_astrea_toplevel_updates"));
+}
+
+#[test]
+fn native_input_batch_defers_and_coalesces_write_side_flushes() {
+    let mut server =
+        OwnCompositorServer::bind(format!("typhon-native-input-batch-{}", std::process::id()))
+            .unwrap();
+
+    server.begin_native_input_batch();
+    assert!(!server.end_native_input_batch().unwrap());
+
+    server.begin_native_input_batch();
+    server.flush_wayland_clients().unwrap();
+    server.flush_wayland_clients().unwrap();
+    assert!(server.end_native_input_batch().unwrap());
 }
 
 #[test]

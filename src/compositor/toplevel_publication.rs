@@ -152,6 +152,10 @@ pub(crate) struct AstreaToplevelMetrics {
     pub(crate) pending_initial_managers: u64,
     pub(crate) terminal_managers: u64,
     pub(crate) publication_continuations: u64,
+    pub(crate) publication_gate_checks: u64,
+    pub(crate) publication_clean_gate_skips: u64,
+    pub(crate) reconcile_calls: u64,
+    pub(crate) prune_passes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +292,14 @@ impl Default for AstreaToplevelPublisher {
 }
 
 impl AstreaToplevelPublisher {
+    pub(in crate::compositor) fn clean_summary(&self) -> AstreaToplevelPublicationSummary {
+        AstreaToplevelPublicationSummary {
+            revision: self.revision,
+            manager_count: self.manager_count(),
+            ..AstreaToplevelPublicationSummary::default()
+        }
+    }
+
     fn refresh_resource_metrics(&mut self) {
         self.metrics.active_handles = self.active_handle_count() as u64;
         self.metrics.retired_handles = self.retired_handle_count() as u64;
@@ -746,6 +758,7 @@ impl AstreaToplevelPublisher {
         collection: Option<AstreaToplevelCollection>,
         dirty_snapshots: BTreeMap<WindowId, Option<AstreaToplevelSnapshot>>,
     ) -> AstreaToplevelPublicationSummary {
+        self.metrics.reconcile_calls = self.metrics.reconcile_calls.saturating_add(1);
         self.prune_dead_resources();
         self.refresh_resource_metrics();
 
@@ -1280,6 +1293,7 @@ impl AstreaToplevelPublisher {
     }
 
     pub(in crate::compositor) fn prune_dead_resources(&mut self) {
+        self.metrics.prune_passes = self.metrics.prune_passes.saturating_add(1);
         let before_retired = self.retired_handles.len();
         self.retired_handles
             .retain(|_, handle| handle.resource.is_alive());

@@ -14,6 +14,10 @@ pub(crate) struct ResourceEfficiencyMetrics {
     pub(super) cursor_only_submits: u64,
     pub(super) protocol_only_completions: u64,
     pub(super) pure_input_completions: u64,
+    pub(super) input_only_cycles: u64,
+    pub(super) wayland_read_dispatch_cycles: u64,
+    pub(super) server_tick_calls: u64,
+    pub(super) client_flushes: u64,
     pub(super) hit_test_locality: u64,
     pub(super) hit_test_full_scans: u64,
     pub(super) xwayland_sync_requests: u64,
@@ -42,6 +46,10 @@ impl ResourceEfficiencyMetrics {
             cursor_only_submits: self.cursor_only_submits,
             protocol_only_completions: self.protocol_only_completions,
             pure_input_completions: self.pure_input_completions,
+            input_only_cycles: self.input_only_cycles,
+            wayland_read_dispatch_cycles: self.wayland_read_dispatch_cycles,
+            server_tick_calls: self.server_tick_calls,
+            client_flushes: self.client_flushes,
             hit_test_locality: self.hit_test_locality,
             hit_test_full_scans: self.hit_test_full_scans,
             xwayland_sync_requests: self.xwayland_sync_requests,
@@ -114,6 +122,26 @@ impl ResourceEfficiencyMetrics {
     #[inline]
     pub(super) fn record_pure_input_completion(&mut self) {
         self.pure_input_completions = self.pure_input_completions.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_input_only_cycle(&mut self) {
+        self.input_only_cycles = self.input_only_cycles.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_wayland_read_dispatch_cycle(&mut self) {
+        self.wayland_read_dispatch_cycles = self.wayland_read_dispatch_cycles.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_server_tick_call(&mut self) {
+        self.server_tick_calls = self.server_tick_calls.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_client_flush(&mut self) {
+        self.client_flushes = self.client_flushes.saturating_add(1);
     }
 
     #[inline]
@@ -223,6 +251,7 @@ pub(crate) struct NativeWorkDecision {
     pub(super) service_xwayland: bool,
     pub(super) service_pacing: bool,
     pub(super) service_explicit_sync_acquire: bool,
+    pub(super) service_astrea_publication: bool,
     pub(super) service_primary_scene: bool,
     pub(super) service_control: bool,
     pub(super) service_children: bool,
@@ -236,6 +265,7 @@ impl NativeWorkDecision {
         service_xwayland: bool,
         service_pacing: bool,
         service_explicit_sync_acquire: bool,
+        service_astrea_publication: bool,
         service_primary_scene: bool,
         service_control: bool,
         service_children: bool,
@@ -247,6 +277,7 @@ impl NativeWorkDecision {
             service_xwayland,
             service_pacing,
             service_explicit_sync_acquire,
+            service_astrea_publication,
             service_primary_scene,
             service_control,
             service_children,
@@ -296,6 +327,10 @@ mod tests {
         metrics.record_cursor_only_submit();
         metrics.record_protocol_only_completion();
         metrics.record_pure_input_completion();
+        metrics.record_input_only_cycle();
+        metrics.record_wayland_read_dispatch_cycle();
+        metrics.record_server_tick_call();
+        metrics.record_client_flush();
         metrics.record_hit_test_locality();
         metrics.record_hit_test_full_scan();
         metrics.record_xwayland_sync_request();
@@ -323,6 +358,10 @@ mod tests {
                 cursor_only_submits: 1,
                 protocol_only_completions: 1,
                 pure_input_completions: 1,
+                input_only_cycles: 1,
+                wayland_read_dispatch_cycles: 1,
+                server_tick_calls: 1,
+                client_flushes: 1,
                 hit_test_locality: 1,
                 hit_test_full_scans: 1,
                 xwayland_sync_requests: 1,

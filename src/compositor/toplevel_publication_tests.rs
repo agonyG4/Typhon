@@ -82,6 +82,23 @@ fn dirty_windows_are_coalesced_and_bounded() {
 }
 
 #[test]
+fn clean_publication_gate_skips_reconcile_and_pruning() {
+    let mut publisher = AstreaToplevelPublisher {
+        initial_reconciliation_pending: false,
+        ..AstreaToplevelPublisher::default()
+    };
+
+    assert!(!publisher.should_reconcile());
+    assert_eq!(publisher.metrics.publication_gate_checks, 1);
+    assert_eq!(publisher.metrics.publication_clean_gate_skips, 1);
+    assert_eq!(publisher.metrics.reconcile_calls, 0);
+    assert_eq!(publisher.metrics.prune_passes, 0);
+
+    publisher.mark_window_dirty(id(1));
+    assert!(publisher.should_reconcile());
+}
+
+#[test]
 fn action_tokens_reject_manager_scoped_duplicates_and_reuse_released_tokens() {
     assert_eq!(
         crate::compositor::toplevel_actions::MAX_ASTREA_PENDING_ACTIONS,

@@ -25,7 +25,7 @@ impl OwnCompositorServer {
         button: u32,
     ) -> WindowInteractionButtonRelease {
         let ended = self.state.end_window_interaction_for_button(button);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         ended
     }
 
@@ -34,7 +34,7 @@ impl OwnCompositorServer {
         context: WindowInteractionReleaseContext,
     ) -> bool {
         let forwarded = self.state.send_client_owned_trigger_release(context);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         forwarded
     }
 }

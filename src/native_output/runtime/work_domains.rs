@@ -12,6 +12,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
     pub(super) explicit_sync_pending: bool,
+    pub(super) astrea_publication_due: bool,
     pub(super) pacing_active: bool,
     pub(super) pacing_due: bool,
     pub(super) xwayland_generation_changed: bool,
@@ -23,6 +24,7 @@ pub(crate) struct NativeRuntimeState {
 pub(crate) struct NativeWorkDomains {
     pub(super) input: bool,
     pub(super) wayland_protocol: bool,
+    pub(super) astrea_publication: bool,
     pub(super) wayland_dispatch: bool,
     pub(super) scene: bool,
     pub(super) cursor: bool,
@@ -60,13 +62,18 @@ impl NativeWorkDomains {
         let explicit_sync = reasons.explicit_sync_acquire()
             || !wakeup.explicit_sync_acquire_tokens.is_empty()
             || state.explicit_sync_pending;
+        let astrea_publication = state.astrea_publication_due;
         let cursor = reasons.cursor_io_worker()
             || !wakeup.cursor_io_events.is_empty()
             || state.cursor_only_due;
-        let wayland_dispatch = wayland_protocol || input || control;
+        let wayland_dispatch = wayland_protocol;
         let surface_pacing = state.pacing_due
             || (state.pacing_active
-                && (reasons.timer() || wayland_dispatch || explicit_sync || state.scene_dirty));
+                && (reasons.timer()
+                    || wayland_protocol
+                    || control
+                    || explicit_sync
+                    || state.scene_dirty));
         let scene = state.scene_dirty || state.visual_work_deadline_due || state.recovery_required;
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
@@ -77,6 +84,7 @@ impl NativeWorkDomains {
         Self {
             input,
             wayland_protocol,
+            astrea_publication,
             wayland_dispatch,
             scene,
             cursor,
@@ -93,6 +101,7 @@ impl NativeWorkDomains {
 
     pub(super) const fn decision(self) -> NativeWorkDecision {
         let protocol_work = self.wayland_protocol
+            || self.astrea_publication
             || self.xwayland
             || self.explicit_sync
             || self.surface_pacing
@@ -104,6 +113,7 @@ impl NativeWorkDomains {
             self.xwayland,
             self.surface_pacing,
             self.explicit_sync,
+            self.astrea_publication,
             self.scene,
             self.control,
             self.children,
@@ -157,6 +167,28 @@ mod tests {
     }
 
     #[test]
+    fn input_only_readiness_does_not_request_wayland_read_dispatch() {
+        let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
+
+        assert!(!domains.wayland_dispatch);
+    }
+
+    #[test]
+    fn one_thousand_independent_input_wakes_do_not_count_as_wayland_ticks() {
+        let mut input_cycles = 0;
+        let mut wayland_read_dispatches = 0;
+
+        for _ in 0..1_000 {
+            let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
+            input_cycles += u64::from(domains.input);
+            wayland_read_dispatches += u64::from(domains.wayland_dispatch);
+        }
+
+        assert_eq!(input_cycles, 1_000);
+        assert_eq!(wayland_read_dispatches, 0);
+    }
+
+    #[test]
     fn input_with_explicit_sync_requires_acquire_service() {
         let decision =
             NativeWorkDomains::from_wakeup(&wakeup(INPUT | EXPLICIT_SYNC_ACQUIRE), &state());
@@ -192,7 +224,7 @@ mod tests {
         let domains =
             NativeWorkDomains::classify(&wakeup(INPUT | CONTROL | CHILD_SIGNAL | SEAT), &state());
 
-        assert!(domains.wayland_dispatch);
+        assert!(!domains.wayland_dispatch);
         assert!(domains.control);
         assert!(domains.children);
         assert!(domains.session);

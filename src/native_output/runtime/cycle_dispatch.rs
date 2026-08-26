@@ -716,6 +716,7 @@ impl NativeRuntime {
     pub(super) fn dispatch_wayland_and_input(
         &mut self,
         cycle: &mut NativeCycleState,
+        dispatch_wayland: bool,
     ) -> NativeResult<()> {
         if cycle.wakeup.reasons.input() {
             NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
@@ -769,9 +770,17 @@ impl NativeRuntime {
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
-        let tick_start = Instant::now();
-        let accepted = server.tick()?;
-        let tick_us = elapsed_micros(tick_start);
+        let (accepted, tick_us) = if dispatch_wayland {
+            render_telemetry
+                .resource_efficiency
+                .record_server_tick_call();
+            let tick_start = Instant::now();
+            let accepted = server.tick()?;
+            render_telemetry.resource_efficiency.record_client_flush();
+            (accepted, elapsed_micros(tick_start))
+        } else {
+            (0, 0)
+        };
         let mut redraw_requested = process_native_pointer_constraint_backend_requests(
             server,
             pointer_constraint_backend,
@@ -814,6 +823,7 @@ impl NativeRuntime {
                 server.accepted_clients()
             );
         }
+        server.begin_native_input_batch();
         let mut skipped_input_repaints = 0usize;
         let input_drain_start = Instant::now();
         input_devices.drain_events_into(input_batch);
@@ -868,12 +878,15 @@ impl NativeRuntime {
                 perf,
             ) {
                 if *cursor_preference == NativeCursorPreference::Hardware {
-                    acquire_watches.shutdown(event_loop)?;
+                    let shutdown_result = acquire_watches.shutdown(event_loop);
+                    let _ = server.end_native_input_batch();
+                    shutdown_result?;
                     return Err(error.into());
                 }
+                let _ = server.end_native_input_batch();
                 return Err(error.into());
             }
-            let application = apply_native_input_effect(
+            let application = match apply_native_input_effect(
                 effect,
                 NativeInputApplyContext {
                     server,
@@ -885,7 +898,13 @@ impl NativeRuntime {
                     process_supervisor,
                     xwayland: xwayland_app_environment.clone(),
                 },
-            )?;
+            ) {
+                Ok(application) => application,
+                Err(error) => {
+                    let _ = server.end_native_input_batch();
+                    return Err(error.into());
+                }
+            };
             if application.exit_requested {
                 cycle.shutdown_requested = true;
                 break;
@@ -904,31 +923,65 @@ impl NativeRuntime {
                 &format!("event_index={event_index}"),
             );
             redraw_requested |= interaction_reconciled;
-            if may_change_pointer_constraints {
-                let _ = server.tick()?;
-                redraw_requested |= process_native_pointer_constraint_backend_requests(
+            // A readable Wayland wake already paid for this cycle's one
+            // read-side dispatch. Native-only key/button input retains the
+            // narrow follow-up for pointer-constraint state, but combined
+            // readiness must not turn into a duplicate full tick.
+            if may_change_pointer_constraints && !dispatch_wayland {
+                render_telemetry
+                    .resource_efficiency
+                    .record_server_tick_call();
+                if let Err(error) = server.tick() {
+                    let _ = server.end_native_input_batch();
+                    return Err(error.into());
+                }
+                redraw_requested |= match process_native_pointer_constraint_backend_requests(
                     server,
                     pointer_constraint_backend,
                     input_state,
                     *cursor_render_mode,
-                )?;
-                synchronize_cursor_state_for_server(
+                ) {
+                    Ok(redraw_requested) => redraw_requested,
+                    Err(error) => {
+                        let _ = server.end_native_input_batch();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = synchronize_cursor_state_for_server(
                     server,
                     atomic_cursor,
                     legacy_cursor,
                     input_state,
-                )?;
+                ) {
+                    let _ = server.end_native_input_batch();
+                    return Err(error.into());
+                }
             }
         }
         let interaction_reconciled = reconcile_trigger_liveness(server, input_state, "batch_end");
         redraw_requested |= interaction_reconciled;
-        redraw_requested |= process_native_pointer_constraint_backend_requests(
+        redraw_requested |= match process_native_pointer_constraint_backend_requests(
             server,
             pointer_constraint_backend,
             input_state,
             *cursor_render_mode,
-        )?;
-        synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
+        ) {
+            Ok(redraw_requested) => redraw_requested,
+            Err(error) => {
+                let _ = server.end_native_input_batch();
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)
+        {
+            let _ = server.end_native_input_batch();
+            return Err(error.into());
+        }
+        let client_flush = server.end_native_input_batch()?;
+        if client_flush {
+            render_telemetry.resource_efficiency.record_client_flush();
+        }
         if let Some(event_timestamp_us) = input_event_timestamp_usec {
             let dispatch_latency_us = monotonic_now_ns()?
                 .saturating_div(1_000)

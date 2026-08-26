@@ -1020,29 +1020,41 @@ pub(crate) fn apply_native_input_effect(
         fallback_spawn_failed: None,
     };
     application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
-        context
-            .server
-            .update_pointer_position_without_client_dispatch(x, y)
+        if context.server.window_interaction_active() {
+            context
+                .server
+                .update_interaction_pointer_position_without_client_dispatch(x, y)
+        } else {
+            context
+                .server
+                .update_pointer_position_without_client_dispatch(x, y)
+        }
     });
     for event in effect.keyboard_events {
-        context.server.send_keyboard_key(event.key, event.pressed);
+        context
+            .server
+            .send_keyboard_key_without_publication(event.key, event.pressed);
     }
     if context.server.window_interaction_active() {
         if let Some((x, y)) = effect.pointer_motion {
             let pointer_changed = context
                 .server
-                .update_pointer_position_without_client_dispatch(x, y);
-            let interaction_outcome = context.server.update_window_interaction_for_input(x, y);
+                .update_interaction_pointer_position_without_client_dispatch(x, y);
+            let interaction_outcome = context
+                .server
+                .update_window_interaction_for_input_without_flush(x, y);
             context.resize_perf.observe_action(
                 NativeWindowAction::UpdateInteraction { x, y },
                 interaction_outcome.changed(),
                 context.perf,
             );
-            let _ = context.server.send_window_interaction_pointer_motion(
-                effect.pointer_motion_usec.unwrap_or(0),
-                x,
-                y,
-            );
+            let _ = context
+                .server
+                .send_window_interaction_pointer_motion_without_publication(
+                    effect.pointer_motion_usec.unwrap_or(0),
+                    x,
+                    y,
+                );
             application.redraw_requested |= interaction_primary_redraw_requested(
                 context.cursor_mode,
                 pointer_changed,
@@ -1052,7 +1064,7 @@ pub(crate) fn apply_native_input_effect(
     } else if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
         context
             .server
-            .send_pointer_motion_sample(CompositorPointerMotionSample {
+            .send_pointer_motion_sample_without_publication(CompositorPointerMotionSample {
                 timestamp_usec: effect.pointer_motion_usec.unwrap_or(0),
                 absolute: effect
                     .pointer_motion
@@ -1120,7 +1132,7 @@ pub(crate) fn apply_native_input_effect(
         }
         context
             .server
-            .send_pointer_button(event.button, event.pressed);
+            .send_pointer_button_without_publication(event.button, event.pressed);
     }
     if let Some(frame) = effect.pointer_axis {
         context.server.send_pointer_axis_frame(frame);

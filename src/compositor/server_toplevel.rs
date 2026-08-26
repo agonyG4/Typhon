@@ -11,6 +11,9 @@ impl CompositorState {
         &mut self,
         display: &DisplayHandle,
     ) -> AstreaToplevelPublicationSummary {
+        if !self.astrea_toplevel_publisher.should_reconcile() {
+            return self.astrea_toplevel_publisher.clean_summary();
+        }
         let needs_full = self.astrea_toplevel_publisher.needs_full_reconciliation();
         let dirty_ids = self.astrea_toplevel_publisher.dirty_window_ids();
         let dirty_snapshots = dirty_ids
@@ -69,6 +72,29 @@ impl CompositorState {
 }
 
 impl OwnCompositorServer {
+    pub fn begin_native_input_batch(&mut self) {
+        self.native_input_batch_active = true;
+        self.native_input_batch_flush_pending = false;
+    }
+
+    pub fn end_native_input_batch(&mut self) -> Result<bool, CompositorError> {
+        self.native_input_batch_active = false;
+        let flush_pending = std::mem::take(&mut self.native_input_batch_flush_pending);
+        if flush_pending {
+            self.display.flush_clients()?;
+        }
+        Ok(flush_pending)
+    }
+
+    pub fn flush_wayland_clients(&mut self) -> Result<(), CompositorError> {
+        if self.native_input_batch_active {
+            self.native_input_batch_flush_pending = true;
+            return Ok(());
+        }
+        self.display.flush_clients()?;
+        Ok(())
+    }
+
     pub fn has_pending_astrea_toplevel_publication(&self) -> bool {
         self.state.has_pending_astrea_toplevel_publication()
     }
@@ -78,16 +104,25 @@ impl OwnCompositorServer {
         self.state.reconcile_astrea_toplevels(&display)
     }
 
+    pub fn service_pending_astrea_toplevel_updates(&mut self) {
+        self.publish_astrea_toplevel_updates();
+    }
+
     pub fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
         self.state.send_keyboard_key(key, pressed);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn send_keyboard_key_without_publication(&mut self, key: u32, pressed: bool) {
+        self.state.send_keyboard_key(key, pressed);
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn send_pointer_motion(&mut self, x: f64, y: f64) {
         self.state.send_pointer_motion(x, y);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn update_pointer_position_without_client_dispatch(&mut self, x: f64, y: f64) -> bool {
@@ -95,10 +130,24 @@ impl OwnCompositorServer {
             .update_pointer_position_without_client_dispatch(x, y)
     }
 
+    pub fn update_interaction_pointer_position_without_client_dispatch(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        self.state
+            .update_interaction_pointer_position_without_client_dispatch(x, y)
+    }
+
     pub fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
         self.state.send_pointer_motion_sample(sample);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn send_pointer_motion_sample_without_publication(&mut self, sample: PointerMotionSample) {
+        self.state.send_pointer_motion_sample(sample);
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn send_window_interaction_pointer_motion(
@@ -111,48 +160,66 @@ impl OwnCompositorServer {
             .state
             .send_window_interaction_pointer_motion(timestamp_usec, x, y);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
+        dispatched
+    }
+
+    pub fn send_window_interaction_pointer_motion_without_publication(
+        &mut self,
+        timestamp_usec: u64,
+        x: f64,
+        y: f64,
+    ) -> usize {
+        let dispatched = self
+            .state
+            .send_window_interaction_pointer_motion(timestamp_usec, x, y);
+        let _ = self.flush_wayland_clients();
         dispatched
     }
 
     pub fn send_pointer_button(&mut self, button: u32, pressed: bool) {
         self.state.send_pointer_button(button, pressed);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn send_pointer_button_without_publication(&mut self, button: u32, pressed: bool) {
+        self.state.send_pointer_button(button, pressed);
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn minimize_focused_window(&mut self) -> bool {
         let minimized = self.state.minimize_focused_window();
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         minimized
     }
 
     pub fn close_focused_window(&mut self) -> bool {
         let closed = self.state.close_focused_window();
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         closed
     }
 
     pub fn restore_next_minimized_window(&mut self) -> bool {
         let restored = self.state.restore_next_minimized_window();
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         restored
     }
 
     pub fn activate_window(&mut self, surface_id: u32) -> bool {
         let activated = self.state.activate_root_window(surface_id);
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         activated
     }
 
     pub fn toggle_maximize_focused_window(&mut self) -> bool {
         let changed = self.state.toggle_maximize_focused_window();
         self.publish_astrea_toplevel_updates();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         changed
     }
 

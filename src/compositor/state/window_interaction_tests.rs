@@ -1523,6 +1523,35 @@ fn interaction_cursor_motion_advances_cursor_generation_only() {
 }
 
 #[test]
+fn interaction_pointer_motion_updates_local_state_without_generic_hover_hit_testing() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        pointer_hit_instrumentation_enabled: true,
+        ..Default::default()
+    };
+
+    assert!(state.update_interaction_pointer_position_without_client_dispatch(150.0, 125.0));
+    assert_eq!(state.pointer_hit_metrics.pointer_scene_hit_calls, 0);
+    assert_eq!(
+        state.pointer_hit_metrics.interaction_pointer_local_updates,
+        1
+    );
+    assert_eq!(
+        state
+            .pointer_hit_metrics
+            .interaction_generic_hover_hit_tests_avoided,
+        1
+    );
+}
+
+#[test]
 fn fullscreen_transition_clears_interaction_cursor_override() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction_with_target(

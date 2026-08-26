@@ -85,6 +85,8 @@ pub struct OwnCompositorServer {
     xwayland_disconnects: Vec<XwaylandClientIdentity>,
     gpu_buffer_protocols_enabled: bool,
     shutdown_releases_armed: bool,
+    pub(super) native_input_batch_active: bool,
+    pub(super) native_input_batch_flush_pending: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
@@ -368,6 +370,8 @@ impl OwnCompositorServer {
             gpu_buffer_protocols_enabled: gpu_buffers_enabled
                 && gpu_capabilities.any_global_enabled(),
             shutdown_releases_armed: true,
+            native_input_batch_active: false,
+            native_input_batch_flush_pending: false,
         })
     }
 
@@ -1175,12 +1179,12 @@ impl OwnCompositorServer {
 
     pub fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         self.state.send_pointer_axis(horizontal, vertical);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn send_pointer_axis_frame(&mut self, frame: PointerAxisFrame) {
         self.state.send_pointer_axis_frame(frame);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn take_pointer_constraint_backend_requests(
@@ -1196,7 +1200,7 @@ impl OwnCompositorServer {
 
     pub fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
         self.state.pointer_constraint_backend_activated(id);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn pointer_constraint_backend_activation_current(
@@ -1208,7 +1212,7 @@ impl OwnCompositorServer {
 
     pub fn pointer_constraint_backend_deactivated(&mut self, id: PointerConstraintBackendId) {
         self.state.pointer_constraint_backend_deactivated(id);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn pointer_constraint_backend_failed(
@@ -1218,12 +1222,12 @@ impl OwnCompositorServer {
     ) {
         self.state
             .pointer_constraint_backend_failed(id, reason.as_ref());
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
         let started = self.state.begin_window_move_at(x, y);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         started
     }
 
@@ -1236,13 +1240,13 @@ impl OwnCompositorServer {
         let started = self
             .state
             .begin_window_move_at_with_trigger(x, y, trigger_button);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         started
     }
 
     pub fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
         let started = self.state.begin_window_resize_at(x, y);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         started
     }
 
@@ -1255,7 +1259,7 @@ impl OwnCompositorServer {
         let started = self
             .state
             .begin_window_resize_at_with_trigger(x, y, trigger_button);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         started
     }
 
@@ -1284,13 +1288,13 @@ impl OwnCompositorServer {
 
     pub fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
         let started = self.state.begin_window_frame_action_at(x, y);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         started
     }
 
     pub fn update_window_interaction(&mut self, x: f64, y: f64) -> bool {
         let updated = self.state.update_window_interaction(x, y);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         updated
     }
 
@@ -1300,20 +1304,28 @@ impl OwnCompositorServer {
         y: f64,
     ) -> InteractionUpdateOutcome {
         let outcome = self.state.update_window_interaction_for_input(x, y);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         outcome
+    }
+
+    pub fn update_window_interaction_for_input_without_flush(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> InteractionUpdateOutcome {
+        self.state.update_window_interaction_for_input(x, y)
     }
 
     pub fn end_window_interaction(&mut self) {
         self.state.end_window_interaction();
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn cancel_window_interaction_for_session_suspend(&mut self) -> bool {
         let cancelled = self
             .state
             .cancel_window_interaction(WindowInteractionEndReason::SessionSuspended);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         cancelled
     }
 
@@ -1327,7 +1339,7 @@ impl OwnCompositorServer {
         let reconciled = self
             .state
             .reconcile_window_interaction_trigger(trigger_pressed);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         reconciled
     }
 
@@ -1345,7 +1357,7 @@ impl OwnCompositorServer {
         let dispatched = self
             .state
             .emit_astrea_shortcut(namespace, name, phase, timestamp);
-        let _ = self.display.flush_clients();
+        let _ = self.flush_wayland_clients();
         dispatched
     }
 
@@ -1537,7 +1549,7 @@ impl OwnCompositorServer {
         self.state.poll_clipboard_bridge();
         self.state
             .progress_surface_pacing(super::pacing::client_pacing_now_ns());
-        self.display.flush_clients()?;
+        self.flush_wayland_clients()?;
         dispatch_result?;
         Ok(accepted)
     }

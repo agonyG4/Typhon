@@ -41,6 +41,8 @@ impl NativeRuntime {
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
             explicit_sync_pending: self.server.has_pending_explicit_sync_work(),
+            astrea_publication_due: cycle.wakeup.reasons.timer()
+                && self.server.has_pending_astrea_toplevel_publication(),
             pacing_active: self.server.has_surface_pacing_work(),
             pacing_due: self.should_progress_surface_pacing(now_ns),
             xwayland_generation_changed: self.xwayland.reactor_registration_generation()
@@ -89,6 +91,12 @@ impl NativeRuntime {
                 metrics.record_input_ready();
             }
             metrics.record_work_decision(work_decision);
+            if work_domains.input && !work_domains.wayland_protocol {
+                metrics.record_input_only_cycle();
+            }
+            if work_domains.wayland_dispatch {
+                metrics.record_wayland_read_dispatch_cycle();
+            }
         }
         self.server.set_commit_debug_pageflip_pending(
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
@@ -123,6 +131,7 @@ impl NativeRuntime {
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
             if work_domains.wayland_dispatch
+                || work_domains.astrea_publication
                 || work_domains.presentation
                 || work_domains.surface_pacing
                 || work_domains.explicit_sync
@@ -150,13 +159,22 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        if work_domains.wayland_dispatch {
-            self.dispatch_wayland_and_input(&mut cycle)?;
+        if work_domains.wayland_dispatch || work_domains.input {
+            self.dispatch_wayland_and_input(&mut cycle, work_domains.wayland_dispatch)?;
+        }
+        if work_domains.astrea_publication && !work_domains.wayland_dispatch {
+            self.server.service_pending_astrea_toplevel_updates();
+            self.server.flush_wayland_clients()?;
+            self.resource_efficiency_mut().record_client_flush();
         }
         if work_domains.surface_pacing {
             self.server.progress_surface_pacing(monotonic_now_ns()?);
         }
-        self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
+        if work_domains.wayland_dispatch {
+            self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
+        } else if work_domains.input {
+            self.note_timing_scope("input_dispatch", wayland_dispatch_started.elapsed());
+        }
         if work_domains.control {
             self.service_control_events(&cycle.wakeup)?;
         }
@@ -180,7 +198,7 @@ impl NativeRuntime {
             }
             return Ok(());
         }
-        if work_domains.wayland_dispatch || xwayland_scene_work {
+        if work_domains.wayland_dispatch || work_domains.control || xwayland_scene_work {
             drain_pending_process_launches_with_xwayland_environment_and_cursor(
                 &mut self.server,
                 &mut self.process_supervisor,
@@ -229,6 +247,9 @@ impl NativeRuntime {
         } else {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
+        }
+        if !presentation_work {
+            self.arm_runtime_deadline()?;
         }
         cycle.fast_path_completed = !prepare_work && !presentation_work;
         self.flush_presentation_trace()?;
@@ -492,9 +513,7 @@ impl NativeRuntime {
             self,
             NativeSuspendedReadiness {
                 wayland: cycle.wakeup.reasons.wayland_listener()
-                    || cycle.wakeup.reasons.wayland_clients()
-                    || (cycle.wakeup.reasons.timer()
-                        && self.server.has_pending_astrea_toplevel_publication()),
+                    || cycle.wakeup.reasons.wayland_clients(),
                 input: cycle.wakeup.reasons.input(),
                 drm: cycle.wakeup.reasons.drm(),
                 timer: cycle.wakeup.reasons.timer(),
@@ -502,7 +521,13 @@ impl NativeRuntime {
                 redraw: false,
                 cursor: false,
             },
-        )
+        )?;
+        if cycle.wakeup.reasons.timer() && self.server.has_pending_astrea_toplevel_publication() {
+            self.server.service_pending_astrea_toplevel_updates();
+            self.server.flush_wayland_clients()?;
+            self.resource_efficiency_mut().record_client_flush();
+        }
+        Ok(())
     }
     fn log_session_transition(&self, from: &str, to: &str, reason: &str) {
         self.perf.log("native.session_transition", || {

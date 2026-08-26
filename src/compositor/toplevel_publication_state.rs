@@ -1,6 +1,18 @@
 use super::toplevel_publication::{AstreaToplevelCollection, AstreaToplevelPublisher};
 
 impl AstreaToplevelPublisher {
+    pub(in crate::compositor) fn should_reconcile(&mut self) -> bool {
+        self.metrics.publication_gate_checks =
+            self.metrics.publication_gate_checks.saturating_add(1);
+        if self.has_pending_publication() {
+            true
+        } else {
+            self.metrics.publication_clean_gate_skips =
+                self.metrics.publication_clean_gate_skips.saturating_add(1);
+            false
+        }
+    }
+
     pub(in crate::compositor) fn has_pending_publication(&self) -> bool {
         self.transaction.is_some()
             || self.initial_reconciliation_pending

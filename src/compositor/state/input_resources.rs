@@ -655,6 +655,28 @@ impl CompositorState {
         moves_visible_cursor
     }
 
+    pub(in crate::compositor) fn update_interaction_pointer_position_without_client_dispatch(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        self.pointer_hit_metrics.interaction_pointer_local_updates = self
+            .pointer_hit_metrics
+            .interaction_pointer_local_updates
+            .saturating_add(1);
+        self.pointer_hit_metrics
+            .interaction_generic_hover_hit_tests_avoided = self
+            .pointer_hit_metrics
+            .interaction_generic_hover_hit_tests_avoided
+            .saturating_add(1);
+        let changed = self.last_pointer_x != x || self.last_pointer_y != y;
+        let moves_visible_cursor = changed
+            && (self.interaction_cursor_override.is_some()
+                || self.client_cursor_render_state().is_some());
+        self.update_pointer_position_state(x, y);
+        moves_visible_cursor
+    }
+
     pub(in crate::compositor) fn send_pointer_motion_sample(
         &mut self,
         sample: PointerMotionSample,

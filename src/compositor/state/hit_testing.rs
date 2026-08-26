@@ -43,6 +43,9 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) raw_pointer_motion_samples: u64,
     pub(in crate::compositor) interaction_pointer_resource_iterations: u64,
     pub(in crate::compositor) interaction_pointer_temporary_vectors: u64,
+    pub(in crate::compositor) interaction_pointer_local_updates: u64,
+    pub(in crate::compositor) interaction_generic_hover_hit_tests_avoided: u64,
+    pub(in crate::compositor) pointer_focus_transitions: u64,
     pub(in crate::compositor) pointer_scene_hit_cpu_nanos: u64,
     pub(in crate::compositor) desktop_focus_pipeline_invocations: u64,
     pub(in crate::compositor) desktop_focus_same_window_noops: u64,
@@ -906,6 +909,10 @@ impl CompositorState {
             return;
         }
 
+        self.pointer_hit_metrics.pointer_focus_transitions = self
+            .pointer_hit_metrics
+            .pointer_focus_transitions
+            .saturating_add(1);
         if self.pointer_surface.is_some() {
             self.clear_pointer_focus();
         }

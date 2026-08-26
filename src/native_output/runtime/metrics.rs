@@ -406,6 +406,38 @@ fn xwayland_scene_metric_fields(
 }
 
 impl NativeRuntime {
+    pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
+        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
+        let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
+        let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
+        let now_ns = monotonic_now_ns()?;
+        self.event_loop.arm_deadline(earliest_native_deadline(
+            earliest_native_deadline(
+                earliest_native_deadline(scheduler_deadline, visual_deadline),
+                atomic_commit_deadline,
+            ),
+            earliest_native_deadline(
+                self.acquire_watches.next_fallback_deadline_ns(),
+                earliest_native_deadline(
+                    self.xwayland.next_deadline_ns(),
+                    earliest_native_deadline(
+                        self.cursor_output_arbitration.deadline_ns(),
+                        earliest_native_deadline(
+                            self.control_server.next_deadline_ns(),
+                            earliest_native_deadline(
+                                self.server
+                                    .has_pending_astrea_toplevel_publication()
+                                    .then_some(now_ns),
+                                self.server.next_surface_pacing_deadline_ns(),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ))?;
+        Ok(())
+    }
+
     pub(super) fn update_cycle_metrics(
         &mut self,
         cycle: &NativeCycleState,
@@ -1165,10 +1197,9 @@ impl NativeRuntime {
             }
             fields
         });
+        let now_ns = monotonic_now_ns()?;
         let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
         let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
-        let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
-        let now_ns = monotonic_now_ns()?;
         self.frame_pacing.note_deadline_state(
             scheduler_decision,
             now_ns,
@@ -1177,30 +1208,7 @@ impl NativeRuntime {
             self.frame_scheduler.ready_frame_queued() || self.scanout.ready_frame_queued(),
             cycle.wakeup.reasons.timer(),
         );
-        self.event_loop.arm_deadline(earliest_native_deadline(
-            earliest_native_deadline(
-                earliest_native_deadline(scheduler_deadline, visual_deadline),
-                atomic_commit_deadline,
-            ),
-            earliest_native_deadline(
-                self.acquire_watches.next_fallback_deadline_ns(),
-                earliest_native_deadline(
-                    self.xwayland.next_deadline_ns(),
-                    earliest_native_deadline(
-                        self.cursor_output_arbitration.deadline_ns(),
-                        earliest_native_deadline(
-                            self.control_server.next_deadline_ns(),
-                            earliest_native_deadline(
-                                self.server
-                                    .has_pending_astrea_toplevel_publication()
-                                    .then_some(now_ns),
-                                self.server.next_surface_pacing_deadline_ns(),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        ))?;
+        self.arm_runtime_deadline()?;
         Ok(())
     }
 }
