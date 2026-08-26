@@ -184,6 +184,68 @@ fn owned_cursor_snapshot_queues_after_desired_motion_advances() {
 }
 
 #[test]
+fn cursor_output_liveness_uses_kms_visible_state() {
+    let mut cursor = test_cursor();
+
+    assert!(!cursor.needs_output_liveness());
+
+    cursor.set_position(100, 200);
+    assert!(!cursor.needs_output_liveness());
+
+    cursor.current = cursor.desired.clone();
+    cursor.set_visible(true);
+    assert!(cursor.needs_output_liveness());
+
+    cursor.current = cursor.desired.clone();
+    cursor.set_position(120, 220);
+    assert!(cursor.needs_output_liveness());
+}
+
+#[test]
+fn cursor_output_liveness_uses_worker_owned_state() {
+    let mut cursor = test_cursor();
+    cursor.current.visible = true;
+    cursor.desired.visible = true;
+    cursor.set_position(100, 200);
+    let queued_epoch = cursor.desired_epoch();
+    let queued_state = cursor.desired().clone();
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(81).expect("test transaction ID is nonzero"),
+    );
+    let token = PageFlipToken::new(81).unwrap();
+
+    cursor
+        .queue_worker_submission(transaction_id, token, queued_epoch, queued_state)
+        .unwrap();
+    cursor.set_position(0, 0);
+
+    assert!(cursor.needs_output_liveness());
+}
+
+#[test]
+fn cursor_output_liveness_survives_a_newer_state_during_inflight_submission() {
+    let mut cursor = test_cursor();
+    cursor.current.visible = true;
+    cursor.desired.visible = true;
+    cursor.set_position(100, 200);
+    let submitted_epoch = cursor.desired_epoch();
+    let submitted_state = cursor.desired().clone();
+    let submitted_revision = cursor.desired_revision();
+    let token = PageFlipToken::new(82).unwrap();
+
+    cursor.begin_submission_at_revision_with_capability_key(
+        token,
+        submitted_state,
+        submitted_epoch,
+        submitted_revision,
+        None,
+    );
+    cursor.set_position(0, 0);
+
+    assert!(cursor.needs_output_liveness());
+}
+
+#[test]
 fn composed_cursor_fallback_counter_is_separate_from_general_fallbacks() {
     let mut cursor = test_cursor();
 

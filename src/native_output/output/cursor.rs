@@ -212,6 +212,16 @@ impl NativeAtomicCursor {
         &self.current
     }
 
+    pub(crate) fn needs_output_liveness(&self) -> bool {
+        let future_output = self
+            .worker_queued
+            .as_ref()
+            .map(|queued| &queued.visual_state)
+            .or_else(|| self.pending_token.as_ref().map(|_| &self.submitted))
+            .unwrap_or(&self.current);
+        !self.desired.kms_equivalent(future_output)
+    }
+
     pub(crate) fn presented_plane_state(
         &self,
     ) -> crate::native_output::presentation::plane::PresentedCursorState {
@@ -1060,6 +1070,7 @@ fn cursor_source_coordinate(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn normalize_cursor_hotspot(
     hotspot_x: i32,
