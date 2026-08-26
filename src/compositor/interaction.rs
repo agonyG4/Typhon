@@ -52,6 +52,23 @@ pub enum WindowInteractionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionUpdateOutcome {
+    NoChange,
+    ReplacedPending,
+    QueuedNewVisualWork,
+}
+
+impl InteractionUpdateOutcome {
+    pub const fn changed(self) -> bool {
+        !matches!(self, Self::NoChange)
+    }
+
+    pub const fn queued_new_visual_work(self) -> bool {
+        matches!(self, Self::QueuedNewVisualWork)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum InteractionCursorShape {
     Move,
     ResizeHorizontal,

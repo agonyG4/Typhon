@@ -1734,7 +1734,7 @@ pub(in crate::compositor::tests) fn capture_decorated_tree_during_root_resize_co
         x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 344.0,
         y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
     })?;
-    commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::PresentFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 

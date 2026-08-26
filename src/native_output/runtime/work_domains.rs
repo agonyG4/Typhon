@@ -9,6 +9,7 @@ use super::{NativeWakeup, NativeWorkClass, NativeWorkDecision};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeRuntimeState {
     pub(super) scene_dirty: bool,
+    pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
     pub(super) explicit_sync_pending: bool,
     pub(super) pacing_active: bool,
@@ -66,10 +67,11 @@ impl NativeWorkDomains {
         let surface_pacing = state.pacing_due
             || (state.pacing_active
                 && (reasons.timer() || wayland_dispatch || explicit_sync || state.scene_dirty));
-        let scene = state.scene_dirty || state.recovery_required;
+        let scene = state.scene_dirty || state.visual_work_deadline_due || state.recovery_required;
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
             || reasons.output_render_fence()
+            || state.visual_work_deadline_due
             || state.recovery_required;
 
         Self {
@@ -223,5 +225,28 @@ mod tests {
 
         assert_eq!(decision.work_class, NativeWorkClass::PrimaryScene);
         assert!(decision.service_primary_scene);
+    }
+
+    #[test]
+    fn queued_visual_work_waits_until_its_deadline() {
+        let waiting = NativeWorkDomains::from_wakeup(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                visual_work_deadline_due: false,
+                ..state()
+            },
+        );
+        assert_eq!(waiting.work_class, NativeWorkClass::NoOutputWork);
+        assert!(!waiting.service_primary_scene);
+
+        let due = NativeWorkDomains::from_wakeup(
+            &wakeup(TIMER),
+            &NativeRuntimeState {
+                visual_work_deadline_due: true,
+                ..state()
+            },
+        );
+        assert_eq!(due.work_class, NativeWorkClass::PrimaryScene);
+        assert!(due.service_primary_scene);
     }
 }

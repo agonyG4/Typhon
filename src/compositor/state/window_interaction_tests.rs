@@ -184,13 +184,19 @@ fn floating_resize_coalesces_geometry_until_frame_flush() {
     interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
     state.window_interaction = Some(interaction);
 
-    assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 120.0));
+    assert_eq!(
+        state.update_window_interaction_by_id_for_input(interaction.id, 120.0, 120.0),
+        InteractionUpdateOutcome::QueuedNewVisualWork
+    );
     for pointer_x in 130..=1127 {
         assert!(
             state.update_window_interaction_by_id(interaction.id, f64::from(pointer_x), 150.0,)
         );
     }
-    assert!(state.update_window_interaction_by_id(interaction.id, 140.0, 150.0));
+    assert_eq!(
+        state.update_window_interaction_by_id_for_input(interaction.id, 140.0, 150.0),
+        InteractionUpdateOutcome::ReplacedPending
+    );
     assert_eq!(state.resize_flow_metrics.raw_pointer_resize_updates, 1_000);
     assert_eq!(
         state.resize_flow_metrics.pending_resize_updates_replaced,
@@ -206,7 +212,8 @@ fn floating_resize_coalesces_geometry_until_frame_flush() {
         ))
     );
     assert!(state.backend_commands.is_empty());
-    assert!(state.has_pending_frame_prepare_work());
+    assert!(!state.has_pending_frame_prepare_work());
+    assert!(state.has_pending_interactive_visual_work());
     assert!(state.flush_pending_floating_interaction_geometry());
     assert_eq!(state.resize_flow_metrics.resize_updates_applied, 1);
     assert_eq!(
@@ -218,7 +225,10 @@ fn floating_resize_coalesces_geometry_until_frame_flush() {
         ))
     );
 
-    assert!(state.update_window_interaction_by_id(interaction.id, 150.0, 160.0));
+    assert_eq!(
+        state.update_window_interaction_by_id_for_input(interaction.id, 150.0, 160.0),
+        InteractionUpdateOutcome::QueuedNewVisualWork
+    );
     assert_eq!(state.resize_flow_metrics.resize_updates_applied, 1);
     assert!(state.end_window_interaction_by_id_with_reason(
         interaction.id,

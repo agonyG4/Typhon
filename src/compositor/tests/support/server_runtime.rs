@@ -206,6 +206,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ClearPointerEnterTracking,
     Barrier(Sender<()>),
     PrepareFrame,
+    AdmitInteractiveVisualState {
+        render_ahead: bool,
+    },
     CaptureLegacyPreparedFrame,
     CaptureAndFinishLegacyPreparedFrame,
     CaptureAndCompleteRenderedLegacyPreparedFrame,
@@ -815,6 +818,11 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::Barrier(reply) => barriers.push(reply),
                     ServerCommand::PrepareFrame => {
                         server.prepare_frame();
+                    }
+                    ServerCommand::AdmitInteractiveVisualState { render_ahead } => {
+                        let _ = server.flush_pending_interactive_visual_state_for_render_admission(
+                            render_ahead,
+                        );
                     }
                     ServerCommand::CaptureLegacyPreparedFrame => {
                         server.capture_frame_callbacks_for_render();

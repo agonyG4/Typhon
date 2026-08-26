@@ -866,37 +866,65 @@ impl CompositorState {
         self.update_window_interaction_by_id(interaction_id, x, y)
     }
 
+    pub(in crate::compositor) fn update_window_interaction_for_input(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> InteractionUpdateOutcome {
+        let Some(interaction_id) = self.active_window_interaction_id() else {
+            return InteractionUpdateOutcome::NoChange;
+        };
+        self.update_window_interaction_by_id_for_input(interaction_id, x, y)
+    }
+
     pub(in crate::compositor) fn update_window_interaction_by_id(
         &mut self,
         interaction_id: WindowInteractionId,
         x: f64,
         y: f64,
     ) -> bool {
+        self.update_window_interaction_by_id_for_input(interaction_id, x, y)
+            .changed()
+    }
+
+    pub(in crate::compositor) fn update_window_interaction_by_id_for_input(
+        &mut self,
+        interaction_id: WindowInteractionId,
+        x: f64,
+        y: f64,
+    ) -> InteractionUpdateOutcome {
         let Some(interaction) = self.window_interaction else {
-            return false;
+            return InteractionUpdateOutcome::NoChange;
         };
         if interaction.id != interaction_id {
-            return false;
+            return InteractionUpdateOutcome::NoChange;
+        }
+        if self.has_pending_interactive_visual_work() {
+            self.resize_flow_metrics
+                .interactive_input_cycles_while_pending = self
+                .resize_flow_metrics
+                .interactive_input_cycles_while_pending
+                .saturating_add(1);
         }
         if matches!(interaction.kind, WindowInteractionKind::Move) {
             self.resize_flow_metrics.raw_pointer_move_updates = self
                 .resize_flow_metrics
                 .raw_pointer_move_updates
                 .saturating_add(1);
-            if self
+            let replaced = self
                 .pending_window_interaction_pointer
                 .replace((interaction_id, x, y))
-                .is_some()
-            {
+                .is_some();
+            if replaced {
                 self.resize_flow_metrics.pending_move_updates_replaced = self
                     .resize_flow_metrics
                     .pending_move_updates_replaced
                     .saturating_add(1);
             }
-            return true;
+            return self.interaction_update_outcome(replaced);
         }
         let Some(interaction) = self.window_interaction else {
-            return false;
+            return InteractionUpdateOutcome::NoChange;
         };
         let dx = (x - interaction.start_pointer_x).round() as i32;
         let dy = (y - interaction.start_pointer_y).round() as i32;
@@ -904,10 +932,14 @@ impl CompositorState {
             unreachable!("move interaction was handled above");
         };
         if interaction.tiled_resize {
-            return self.apply_window_interaction_by_id(interaction_id, x, y);
+            let replaced = self.pending_tiled_resize.is_some();
+            if !self.apply_window_interaction_by_id(interaction_id, x, y) {
+                return InteractionUpdateOutcome::NoChange;
+            }
+            return self.interaction_update_outcome(replaced);
         }
         if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {
-            return false;
+            return InteractionUpdateOutcome::NoChange;
         }
         let mut interaction = interaction;
         interaction.drag_committed = true;
@@ -939,9 +971,10 @@ impl CompositorState {
                 .resize_flow_metrics
                 .resize_updates_skipped_unchanged
                 .saturating_add(1);
-            return false;
+            return InteractionUpdateOutcome::NoChange;
         }
-        if self.pending_floating_resize.is_some() {
+        let replaced = self.pending_floating_resize.is_some();
+        if replaced {
             self.resize_flow_metrics.pending_resize_updates_replaced = self
                 .resize_flow_metrics
                 .pending_resize_updates_replaced
@@ -969,7 +1002,20 @@ impl CompositorState {
                 target.placement.root_mode,
             )
         });
-        true
+        self.interaction_update_outcome(replaced)
+    }
+
+    fn interaction_update_outcome(&mut self, replaced: bool) -> InteractionUpdateOutcome {
+        if replaced {
+            InteractionUpdateOutcome::ReplacedPending
+        } else {
+            self.resize_flow_metrics
+                .interactive_visual_work_queued_edges = self
+                .resize_flow_metrics
+                .interactive_visual_work_queued_edges
+                .saturating_add(1);
+            InteractionUpdateOutcome::QueuedNewVisualWork
+        }
     }
 
     fn apply_window_interaction_by_id(

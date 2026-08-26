@@ -3,6 +3,7 @@ use super::*;
 use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
+use oblivion_one::compositor::InteractionUpdateOutcome;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -1488,7 +1489,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
     assert!(server.client_cursor_request_active());
     assert!(server.client_cursor_render_state().is_none());
     assert_eq!(server.last_pointer_position(), (x, y));
-    server.prepare_frame();
+    server.flush_pending_interactive_visual_state_for_render_admission(false);
     client_commands.send(ClientCommand::CaptureActive).unwrap();
     let active = pump_native_input_server_until(&mut server, &client_events);
     assert_eq!(
@@ -1903,6 +1904,30 @@ fn active_window_interaction_motion_updates_pointer_before_interaction() {
         assert_eq!(changed, expected_changed);
         assert_eq!(*order.borrow(), ["pointer", "interaction"]);
     }
+}
+
+#[test]
+fn active_interaction_primary_redraw_is_cursor_aware_and_edge_triggered() {
+    assert!(interaction_primary_redraw_requested(
+        NativeCursorRenderMode::Hardware,
+        false,
+        InteractionUpdateOutcome::QueuedNewVisualWork,
+    ));
+    assert!(!interaction_primary_redraw_requested(
+        NativeCursorRenderMode::Hardware,
+        true,
+        InteractionUpdateOutcome::ReplacedPending,
+    ));
+    assert!(interaction_primary_redraw_requested(
+        NativeCursorRenderMode::Software,
+        true,
+        InteractionUpdateOutcome::ReplacedPending,
+    ));
+    assert!(!interaction_primary_redraw_requested(
+        NativeCursorRenderMode::Software,
+        false,
+        InteractionUpdateOutcome::ReplacedPending,
+    ));
 }
 
 #[test]

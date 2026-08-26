@@ -1103,7 +1103,7 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     commands.send(ServerCommand::UpdateInteractionResult { x, y, reply })?;
     let interaction_update_applied = receiver.recv_timeout(Duration::from_secs(1))?;
     wait_for_server_commands(commands);
-    commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::PresentFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     let interaction = capture_cursor_motion_state(&state, commands, false);
@@ -1222,7 +1222,7 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_window_interaction
         x: update_x,
         y: update_y,
     })?;
-    commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::PresentFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 

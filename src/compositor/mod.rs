@@ -214,9 +214,9 @@ use interaction::{
     window_frame_action_for_local_point,
 };
 pub use interaction::{
-    ResizeInteractionId, TriggerReleaseDelivery, WindowInteractionButtonRelease,
-    WindowInteractionDebugSnapshot, WindowInteractionId, WindowInteractionKind,
-    WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
+    InteractionUpdateOutcome, ResizeInteractionId, TriggerReleaseDelivery,
+    WindowInteractionButtonRelease, WindowInteractionDebugSnapshot, WindowInteractionId,
+    WindowInteractionKind, WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
     WindowInteractionReleaseMetrics,
 };
 use layer_shell::{Layer, LayerSurfaceRole};

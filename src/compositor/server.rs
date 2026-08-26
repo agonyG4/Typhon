@@ -62,8 +62,8 @@ use super::{
     DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
     FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
-    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
-    PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
+    InputProtocolCapabilities, InteractionUpdateOutcome, OutputRect, PendingProcessLaunch,
+    PointerAxisFrame, PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
     SurfacePacingMetrics, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
@@ -1071,6 +1071,14 @@ impl OwnCompositorServer {
         self.state.has_pending_frame_prepare_work()
     }
 
+    pub fn has_pending_interactive_visual_work(&self) -> bool {
+        self.state.has_pending_interactive_visual_work()
+    }
+
+    pub fn record_interactive_scheduler_decision(&mut self) {
+        self.state.record_interactive_scheduler_decision();
+    }
+
     pub fn has_pending_explicit_sync_work(&self) -> bool {
         self.state.has_pending_explicit_sync_work()
     }
@@ -1286,6 +1294,16 @@ impl OwnCompositorServer {
         updated
     }
 
+    pub fn update_window_interaction_for_input(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> InteractionUpdateOutcome {
+        let outcome = self.state.update_window_interaction_for_input(x, y);
+        let _ = self.display.flush_clients();
+        outcome
+    }
+
     pub fn end_window_interaction(&mut self) {
         self.state.end_window_interaction();
         let _ = self.display.flush_clients();
@@ -1348,9 +1366,24 @@ impl OwnCompositorServer {
     pub fn prepare_frame(&mut self) {
         self.state.commit_ready_explicit_sync_buffers();
         color::flush_pending_color_info(&mut self.state);
-        let _ = self.state.flush_pending_floating_interaction_geometry();
         self.state.flush_pending_resize_configure();
         let _ = self.display.flush_clients();
+    }
+
+    pub fn flush_pending_interactive_visual_state_for_render_admission(
+        &mut self,
+        render_ahead: bool,
+    ) -> bool {
+        let pending = self.state.has_pending_interactive_visual_work();
+        let tiled = self.state.flush_pending_tiled_resize();
+        let floating = self.state.flush_pending_floating_interaction_geometry();
+        let applied = tiled || floating;
+        if pending && applied {
+            self.state.record_interactive_render_admission(render_ahead);
+        }
+        self.state.flush_pending_resize_configure();
+        let _ = self.display.flush_clients();
+        applied
     }
 
     #[doc(hidden)]
@@ -1469,6 +1502,7 @@ impl OwnCompositorServer {
 
     pub fn present_frame(&mut self) {
         self.prepare_frame();
+        let _ = self.flush_pending_interactive_visual_state_for_render_admission(false);
         self.finish_frame();
     }
 

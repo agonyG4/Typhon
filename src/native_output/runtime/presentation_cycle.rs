@@ -11,7 +11,8 @@ use super::planner::{
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
-    DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
+    DirectPresentationInputs, inspect_direct_presentation,
+    interactive_visual_render_admission_allowed, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
 };
 use super::presentation_metrics::{
@@ -320,7 +321,8 @@ impl NativeRuntime {
             scheduler_now,
             predicted_total_cost,
         );
-        #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
+        #[rustfmt::skip] let (render_generation, _scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
+        let pending_interactive_visual_work = server.has_pending_interactive_visual_work();
         *scheduled_presentation_target = plan_visual_target_for_budget(
             presentation_deadline,
             render_ahead_allowed,
@@ -478,18 +480,22 @@ impl NativeRuntime {
             last_direct_candidate_key,
             scene_changed,
             pending_frame_work,
+            pending_interactive_visual_work,
             primary_redraw_requested,
             direct_active: presented_planes
                 .primary
-                .is_some_and(|assignment| assignment.is_direct()),
+                .is_some_and(|assignment| assignment.is_direct())
+                && !pending_interactive_visual_work,
             plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
         });
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
         let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
         let direct_candidate_changed = direct_inspection.direct_candidate_changed;
         let direct_candidate_eligible = direct_inspection.direct_candidate_eligible;
-        let primary_visual_work_pending = direct_inspection.primary_visual_work_pending;
-        let composition_required = direct_inspection.composition_required;
+        let primary_visual_work_pending =
+            direct_inspection.primary_visual_work_pending || pending_interactive_visual_work;
+        let composition_required =
+            direct_inspection.composition_required || pending_interactive_visual_work;
         if scanout.ready_frame_queued()
             && direct_scanout_preference.enabled()
             && cursor_direct_compatible
@@ -530,7 +536,8 @@ impl NativeRuntime {
         let presentation_path = plan_native_presentation_path(NativePresentationPlanInput {
             direct_active: presented_planes
                 .primary
-                .is_some_and(|assignment| assignment.is_direct()),
+                .is_some_and(|assignment| assignment.is_direct())
+                && !pending_interactive_visual_work,
             direct_candidate_changed,
             direct_candidate_eligible,
             primary_visual_work_pending: primary_visual_work_pending && !sidecar_opportunity,
@@ -633,6 +640,9 @@ impl NativeRuntime {
             atomic_commit_arbiter.atomic_commit_pending(),
             can_queue_worker_next,
         );
+        if pending_interactive_visual_work {
+            server.record_interactive_scheduler_decision();
+        }
         if matches!(
             scheduler_decision,
             SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
@@ -715,6 +725,56 @@ impl NativeRuntime {
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
             let mut direct_submitted = false;
             let mut direct_suppressed = false;
+            let preadmitted_explicit_render = if pending_interactive_visual_work && explicit_output
+            {
+                let frame_target = scheduled_presentation_target
+                    .take()
+                    .or_else(|| {
+                        reactive_or_commit_timing_target(
+                            presentation_deadline,
+                            None,
+                            pending_target,
+                            MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                            predicted_total_cost,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        io::Error::other(
+                            "explicit Atomic render started without a presentation target",
+                        )
+                    })?;
+                let submit_window = match presentation_timing.submit_window(
+                    frame_target.presentation_time.get(),
+                    frame_target.submit_not_before().get(),
+                    prediction.kms_dispatch_budget_ns,
+                ) {
+                    Ok(window) => window,
+                    Err(_) => {
+                        presentation_timing.record_unreachable_target();
+                        presentation_deadline.clear_scheduled_target();
+                        *queued_redraw_requested = true;
+                        return Ok(());
+                    }
+                };
+                let frozen_cursor = freeze_cursor_assignment_for_render(
+                    effective_cursor.as_ref(),
+                    cursor_epoch,
+                    atomic_cursor.as_ref(),
+                )?;
+                Some((frame_target, submit_window, frozen_cursor))
+            } else {
+                None
+            };
+            let interactive_visual_applied = if pending_interactive_visual_work
+                && interactive_visual_render_admission_allowed(
+                    scheduler_decision,
+                    presentation_path,
+                ) {
+                server.flush_pending_interactive_visual_state_for_render_admission(render_ahead)
+            } else {
+                false
+            };
+            #[rustfmt::skip] let (render_generation, scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
             if !render_ahead
                 && direct_scanout_preference.enabled()
                 && (!cursor_visible || *cursor_render_mode == NativeCursorRenderMode::Hardware)
@@ -723,6 +783,7 @@ impl NativeRuntime {
                 && !scanout.ready_frame_queued()
                 && !scanout.output_render_in_progress()
                 && !scanout.direct_scanout_inhibited()
+                && !pending_interactive_visual_work
                 && direct_candidate_changed
             {
                 let direct_target = scheduled_presentation_target.or_else(|| {
@@ -898,14 +959,17 @@ impl NativeRuntime {
                 let (resolved_scene, output_damage) = resolve_scene_and_damage(
                     presented_planes
                         .primary
-                        .is_some_and(|assignment| assignment.is_direct()),
+                        .is_some_and(|assignment| assignment.is_direct())
+                        && !pending_interactive_visual_work,
                     target.width,
                     target.height,
                     scene_history,
                     &*server,
                     (current_client_cursor_damage, current_software_cursor_damage),
                 );
-                let no_primary_work = output_damage.is_empty() && !effective_redraw_requested;
+                let no_primary_work = output_damage.is_empty()
+                    && !effective_redraw_requested
+                    && !interactive_visual_applied;
                 if no_primary_work {
                     drop(resolved_scene);
                     finish_no_primary_work(
@@ -936,22 +1000,51 @@ impl NativeRuntime {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let expected_scene_signature = resolved_scene.scene_identity_signature();
                         drop(resolved_scene);
-                        let frame_target = scheduled_presentation_target
-                            .take()
-                            .or_else(|| {
-                                reactive_or_commit_timing_target(
-                                    presentation_deadline,
-                                    None,
-                                    pending_target,
-                                    MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                                    predicted_total_cost,
-                                )
-                            })
-                            .ok_or_else(|| {
-                                io::Error::other(
-                                    "explicit Atomic render started without a presentation target",
-                                )
-                            })?;
+                        let (frame_target, submit_window, frozen_cursor) = if let Some((
+                            frame_target,
+                            submit_window,
+                            frozen_cursor,
+                        )) =
+                            preadmitted_explicit_render
+                        {
+                            (frame_target, submit_window, frozen_cursor)
+                        } else {
+                            let frame_target = scheduled_presentation_target
+                                .take()
+                                .or_else(|| {
+                                    reactive_or_commit_timing_target(
+                                        presentation_deadline,
+                                        None,
+                                        pending_target,
+                                        MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                                        predicted_total_cost,
+                                    )
+                                })
+                                .ok_or_else(|| {
+                                    io::Error::other(
+                                        "explicit Atomic render started without a presentation target",
+                                    )
+                                })?;
+                            let submit_window = match presentation_timing.submit_window(
+                                frame_target.presentation_time.get(),
+                                frame_target.submit_not_before().get(),
+                                prediction.kms_dispatch_budget_ns,
+                            ) {
+                                Ok(window) => window,
+                                Err(_) => {
+                                    presentation_timing.record_unreachable_target();
+                                    presentation_deadline.clear_scheduled_target();
+                                    *queued_redraw_requested = true;
+                                    return Ok(());
+                                }
+                            };
+                            let frozen_cursor = freeze_cursor_assignment_for_render(
+                                effective_cursor.as_ref(),
+                                cursor_epoch,
+                                atomic_cursor.as_ref(),
+                            )?;
+                            (frame_target, submit_window, frozen_cursor)
+                        };
                         let o1_admission = Some(admission_observation_for_frame(
                             frame_target,
                             desired_credit,
@@ -961,26 +1054,8 @@ impl NativeRuntime {
                             o1_demand.overlap_required_ns,
                             scheduler_decision == SchedulerDecision::RenderAhead,
                         ));
-                        let submit_window = match presentation_timing.submit_window(
-                            frame_target.presentation_time.get(),
-                            frame_target.submit_not_before().get(),
-                            prediction.kms_dispatch_budget_ns,
-                        ) {
-                            Ok(window) => window,
-                            Err(_) => {
-                                presentation_timing.record_unreachable_target();
-                                presentation_deadline.clear_scheduled_target();
-                                *queued_redraw_requested = true;
-                                return Ok(());
-                            }
-                        };
                         presentation_deadline.clear_scheduled_target();
-                        let (cursor_assignment, frozen_cursor_plane_owner) =
-                            freeze_cursor_assignment_for_render(
-                                effective_cursor.as_ref(),
-                                cursor_epoch,
-                                atomic_cursor.as_ref(),
-                            )?;
+                        let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,

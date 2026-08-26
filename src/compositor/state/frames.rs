@@ -80,7 +80,6 @@ impl CompositorState {
             .keys()
             .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id))
             || self.pending_resize_configure_is_flushable()
-            || self.has_pending_floating_interaction_geometry()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 self.surface_is_visible_in_active_workspace(commit.surface_id)
                     && (!self.external_acquire_readiness
@@ -98,6 +97,34 @@ impl CompositorState {
             || !self.pending_color_info.is_empty()
     }
 
+    pub(in crate::compositor) fn has_pending_interactive_visual_work(&self) -> bool {
+        self.pending_tiled_resize.is_some() || self.has_pending_floating_interaction_geometry()
+    }
+
+    pub(in crate::compositor) fn record_interactive_render_admission(
+        &mut self,
+        render_ahead: bool,
+    ) {
+        self.resize_flow_metrics.interactive_render_admissions = self
+            .resize_flow_metrics
+            .interactive_render_admissions
+            .saturating_add(1);
+        if render_ahead {
+            self.resize_flow_metrics.interactive_render_ahead_admissions = self
+                .resize_flow_metrics
+                .interactive_render_ahead_admissions
+                .saturating_add(1);
+        }
+    }
+
+    pub(in crate::compositor) fn record_interactive_scheduler_decision(&mut self) {
+        self.resize_flow_metrics
+            .interactive_scheduler_decisions_while_pending = self
+            .resize_flow_metrics
+            .interactive_scheduler_decisions_while_pending
+            .saturating_add(1);
+    }
+
     pub(in crate::compositor) fn has_pending_explicit_sync_work(&self) -> bool {
         !self.pending_explicit_sync_commits.is_empty()
             || !self.pending_surface_tree_transactions.is_empty()
@@ -105,6 +132,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
         self.has_pending_frame_prepare_work()
+            || self.has_pending_interactive_visual_work()
             || self.has_unowned_frame_callbacks()
             || self.has_visible_pending_presentation_feedbacks()
     }

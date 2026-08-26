@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::compositor::InteractionUpdateOutcome;
 
 pub(crate) enum NativeInputEventFds<'a> {
     Libinput(Option<RawFd>),
@@ -999,6 +1000,14 @@ pub(crate) fn apply_active_window_interaction_motion(
     update_pointer_position(x, y) | update_interaction(x, y)
 }
 
+pub(crate) const fn interaction_primary_redraw_requested(
+    cursor_mode: NativeCursorRenderMode,
+    pointer_changed: bool,
+    interaction_outcome: InteractionUpdateOutcome,
+) -> bool {
+    (cursor_mode.is_software() && pointer_changed) || interaction_outcome.queued_new_visual_work()
+}
+
 pub(crate) fn apply_native_input_effect(
     mut effect: NativeInputEffect,
     context: NativeInputApplyContext<'_>,
@@ -1023,18 +1032,22 @@ pub(crate) fn apply_native_input_effect(
             let pointer_changed = context
                 .server
                 .update_pointer_position_without_client_dispatch(x, y);
-            let interaction_changed = apply_native_window_action(
+            let interaction_outcome = context.server.update_window_interaction_for_input(x, y);
+            context.resize_perf.observe_action(
                 NativeWindowAction::UpdateInteraction { x, y },
-                context.server,
+                interaction_outcome.changed(),
                 context.perf,
-                context.resize_perf,
             );
             let _ = context.server.send_window_interaction_pointer_motion(
                 effect.pointer_motion_usec.unwrap_or(0),
                 x,
                 y,
             );
-            application.redraw_requested |= pointer_changed || interaction_changed;
+            application.redraw_requested |= interaction_primary_redraw_requested(
+                context.cursor_mode,
+                pointer_changed,
+                interaction_outcome,
+            );
         }
     } else if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
         context

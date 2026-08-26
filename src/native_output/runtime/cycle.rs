@@ -19,11 +19,25 @@ pub fn run(
     runtime.run()
 }
 impl NativeRuntime {
+    fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
+        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
+        let scheduled_target_deadline =
+            super::planner::visual_target_deadline_for_target(self.scheduled_presentation_target);
+        let scheduled_target_due =
+            scheduled_target_deadline.is_some_and(|deadline| deadline <= now_ns);
+        if self.frame_scheduler.visual_work_queued() {
+            scheduler_deadline.is_some_and(|deadline| deadline <= now_ns)
+                || scheduled_target_due
+                || (scheduler_deadline.is_none() && scheduled_target_deadline.is_none())
+        } else {
+            self.queued_redraw_requested
+        }
+    }
+
     fn native_runtime_state(&self, cycle: &NativeCycleState, now_ns: u64) -> NativeRuntimeState {
         NativeRuntimeState {
-            scene_dirty: cycle.redraw_requested
-                || self.queued_redraw_requested
-                || self.server.has_pending_frame_prepare_work(),
+            scene_dirty: cycle.redraw_requested || self.server.has_pending_frame_prepare_work(),
+            visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
             explicit_sync_pending: self.server.has_pending_explicit_sync_work(),

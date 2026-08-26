@@ -914,7 +914,7 @@ fn unmapping_resized_window_clears_queued_resize_configure() {
 }
 
 #[test]
-fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
+fn prepare_frame_flushes_queued_resize_configure_without_consuming_interaction_visuals() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -929,7 +929,7 @@ fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert!(before_prepare);
-    assert!(!after_prepare);
+    assert!(after_prepare);
 }
 
 #[test]
@@ -954,6 +954,11 @@ fn resize_drag_updates_visual_target_before_client_commit() {
         })
         .unwrap();
     commands.send(ServerCommand::PrepareFrame).unwrap();
+    commands
+        .send(ServerCommand::AdmitInteractiveVisualState {
+            render_ahead: false,
+        })
+        .unwrap();
     wait_for_server_commands(&commands);
     let server = stop_controllable_test_server(commands, server_thread);
 

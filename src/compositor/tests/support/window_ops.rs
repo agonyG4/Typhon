@@ -578,7 +578,10 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_coalesced_resi
         x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 344.0,
         y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
     })?;
-    commands.send(ServerCommand::PresentFrame)?;
+    commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::AdmitInteractiveVisualState {
+        render_ahead: false,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::EndInteraction)?;
@@ -616,6 +619,9 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_active_resize_
         y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
     })?;
     commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::AdmitInteractiveVisualState {
+        render_ahead: false,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -650,6 +656,9 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag_wi
         y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
     })?;
     commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::AdmitInteractiveVisualState {
+        render_ahead: false,
+    })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
@@ -657,7 +666,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag_wi
         x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 384.0,
         y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 264.0,
     })?;
-    commands.send(ServerCommand::PrepareFrame)?;
+    commands.send(ServerCommand::PresentFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -767,8 +776,10 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_prepare_queued
     })?;
     wait_for_server_commands(commands);
     let before_prepare = capture_pending_frame_work(commands);
-    commands.send(ServerCommand::PrepareFrame)?;
-    wait_for_server_commands(commands);
+    for _ in 0..4 {
+        commands.send(ServerCommand::PrepareFrame)?;
+        wait_for_server_commands(commands);
+    }
     let after_prepare = capture_pending_frame_work(commands);
     commands.send(ServerCommand::EndInteraction)?;
     wait_for_server_commands(commands);

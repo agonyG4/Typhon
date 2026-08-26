@@ -31,9 +31,23 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) last_direct_candidate_key: &'a mut Option<DirectScanoutCandidateKey>,
     pub(super) scene_changed: bool,
     pub(super) pending_frame_work: bool,
+    pub(super) pending_interactive_visual_work: bool,
     pub(super) primary_redraw_requested: bool,
     pub(super) direct_active: bool,
     pub(super) plane_decision: Option<&'a PlaneSchedulingDecision>,
+}
+
+pub(super) const fn interactive_visual_render_admission_allowed(
+    scheduler_decision: SchedulerDecision,
+    presentation_path: NativePresentationPath,
+) -> bool {
+    matches!(
+        scheduler_decision,
+        SchedulerDecision::Render | SchedulerDecision::RenderAhead
+    ) && matches!(
+        presentation_path,
+        NativePresentationPath::CompositedPrimary | NativePresentationPath::IdleComposited
+    )
 }
 
 fn direct_candidate_changed(
@@ -76,18 +90,24 @@ pub(super) fn inspect_direct_presentation(
     };
     let atomic_primary_commit_pending = inputs.page_flip_pending || inputs.atomic_commit_pending;
     let direct_candidate = inputs.server.direct_scanout_scene_candidate().ok();
-    let direct_candidate_eligible = direct_candidate.is_some();
-    let direct_candidate_key = direct_candidate.as_ref().and_then(|candidate| {
-        DirectScanoutCandidateKey::from_candidate(
-            candidate,
-            inputs.drm_file_generation,
-            super::scanout::direct_cursor_content_key(
-                inputs.effective_cursor,
-                cursor_direct_compatible,
-            ),
-            0,
-        )
-    });
+    let direct_candidate_eligible =
+        direct_candidate.is_some() && !inputs.pending_interactive_visual_work;
+    let direct_candidate_key = direct_candidate
+        .as_ref()
+        .and_then(|candidate| {
+            (!inputs.pending_interactive_visual_work).then(|| {
+                DirectScanoutCandidateKey::from_candidate(
+                    candidate,
+                    inputs.drm_file_generation,
+                    super::scanout::direct_cursor_content_key(
+                        inputs.effective_cursor,
+                        cursor_direct_compatible,
+                    ),
+                    0,
+                )
+            })
+        })
+        .flatten();
     let direct_candidate_changed = direct_candidate_changed(
         direct_candidate_key,
         *inputs.last_direct_candidate_key,
@@ -113,6 +133,7 @@ pub(super) fn inspect_direct_presentation(
             )
         })
         || !cursor_direct_compatible
+        || inputs.pending_interactive_visual_work
         || (inputs.direct_active && !direct_candidate_eligible);
     DirectPresentationInspection {
         cursor_direct_compatible,
@@ -247,6 +268,41 @@ mod tests {
             false,
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn interactive_admission_requires_a_composited_render_decision() {
+        for decision in [
+            SchedulerDecision::Idle,
+            SchedulerDecision::SubmitReady,
+            SchedulerDecision::SubmitReadyLate,
+            SchedulerDecision::CompleteProtocolOnly,
+            SchedulerDecision::WaitForRefresh,
+            SchedulerDecision::WaitForBuffer,
+            SchedulerDecision::WaitForPageFlip,
+            SchedulerDecision::WaitForWorkerQueue,
+        ] {
+            assert!(!interactive_visual_render_admission_allowed(
+                decision,
+                NativePresentationPath::CompositedPrimary,
+            ));
+        }
+        assert!(interactive_visual_render_admission_allowed(
+            SchedulerDecision::Render,
+            NativePresentationPath::CompositedPrimary,
+        ));
+        assert!(interactive_visual_render_admission_allowed(
+            SchedulerDecision::RenderAhead,
+            NativePresentationPath::IdleComposited,
+        ));
+        assert!(!interactive_visual_render_admission_allowed(
+            SchedulerDecision::Render,
+            NativePresentationPath::DirectPrimary,
+        ));
+        assert!(!interactive_visual_render_admission_allowed(
+            SchedulerDecision::RenderAhead,
+            NativePresentationPath::PlaneDelta,
         ));
     }
 }
