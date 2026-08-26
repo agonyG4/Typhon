@@ -212,37 +212,39 @@ impl CompositorState {
         let selected_recipient_count = self.locked_relative_recipient_cache.recipients.len();
 
         if self.relative_motion_debug.should_log_route_snapshot() {
-            let relative_sources = self
-                .relative_pointer_resources
-                .iter()
-                .map(|relative_pointer| {
-                    format!(
-                        "relative={} source_pointer={} source_client={} source_seat=untracked",
-                        relative_pointer.resource.id().protocol_id(),
-                        relative_pointer.source_pointer.id().protocol_id(),
-                        wayland_resource_client_label(&relative_pointer.source_pointer)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            pointer_debug_log(format!(
-                "relative route snapshot constraint={} generation={} surface={} surface_client={} lock_pointer={} lock_client={} lock_seat=single exact_source_pointer_count={} same_client_count={} same_seat_count={} selected_recipient_count={} pointer_entered={} live_relative_count={} stale_count={} cross_client_count={} [{}]",
-                active.constraint_id,
-                active.generation,
-                compositor_surface_id(&active.surface),
-                wayland_resource_client_label(&active.surface),
-                active.pointer.id().protocol_id(),
-                wayland_resource_client_label(&active.pointer),
-                exact_source_pointer_count,
-                same_client_count,
-                same_seat_count,
-                selected_recipient_count,
-                pointer_entered,
-                live_relative_count,
-                stale_count,
-                cross_client_count,
-                relative_sources
-            ));
+            pointer_debug_log_lazy(|| {
+                let relative_sources = self
+                    .relative_pointer_resources
+                    .iter()
+                    .map(|relative_pointer| {
+                        format!(
+                            "relative={} source_pointer={} source_client={} source_seat=untracked",
+                            relative_pointer.resource.id().protocol_id(),
+                            relative_pointer.source_pointer.id().protocol_id(),
+                            wayland_resource_client_label(&relative_pointer.source_pointer)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "relative route snapshot constraint={} generation={} surface={} surface_client={} lock_pointer={} lock_client={} lock_seat=single exact_source_pointer_count={} same_client_count={} same_seat_count={} selected_recipient_count={} pointer_entered={} live_relative_count={} stale_count={} cross_client_count={} [{}]",
+                    active.constraint_id,
+                    active.generation,
+                    compositor_surface_id(&active.surface),
+                    wayland_resource_client_label(&active.surface),
+                    active.pointer.id().protocol_id(),
+                    wayland_resource_client_label(&active.pointer),
+                    exact_source_pointer_count,
+                    same_client_count,
+                    same_seat_count,
+                    selected_recipient_count,
+                    pointer_entered,
+                    live_relative_count,
+                    stale_count,
+                    cross_client_count,
+                    relative_sources
+                )
+            });
         }
 
         pointer_debug_log_lazy(|| {
@@ -732,17 +734,70 @@ impl CompositorState {
         y: f64,
     ) -> Option<PointerTarget> {
         let surface_id = compositor_surface_id(surface);
+        if let Some(index) = self.active_scene_surface_index(surface_id)
+            && let Some(origin) = self.active_scene_surface_origins().get(index).copied()
+        {
+            self.pointer_hit_metrics.grabbed_target_active_scene_hits = self
+                .pointer_hit_metrics
+                .grabbed_target_active_scene_hits
+                .saturating_add(1);
+            let (origin_x, origin_y) =
+                self.grabbed_surface_origin_with_pending_resize(surface_id, origin);
+            return Some(PointerTarget {
+                surface: surface.clone(),
+                surface_x: x - f64::from(origin_x),
+                surface_y: y - f64::from(origin_y),
+            });
+        }
+        self.pointer_hit_metrics.grabbed_target_global_fallbacks = self
+            .pointer_hit_metrics
+            .grabbed_target_global_fallbacks
+            .saturating_add(1);
         self.refresh_surface_origin_cache();
         let index = self
             .renderable_surfaces
             .iter()
             .position(|renderable| renderable.surface_id == surface_id)?;
         let origin = self.surface_origin_cache.get(index).copied()?;
+        let (origin_x, origin_y) =
+            self.grabbed_surface_origin_with_pending_resize(surface_id, origin);
         Some(PointerTarget {
             surface: surface.clone(),
-            surface_x: x - f64::from(origin.0),
-            surface_y: y - f64::from(origin.1),
+            surface_x: x - f64::from(origin_x),
+            surface_y: y - f64::from(origin_y),
         })
+    }
+
+    fn grabbed_surface_origin_with_pending_resize(
+        &self,
+        surface_id: u32,
+        origin: (i32, i32),
+    ) -> (i32, i32) {
+        let Some(pending) = self.pending_floating_resize else {
+            return origin;
+        };
+        if self.root_surface_id_for_surface(surface_id) != pending.surface_id {
+            return origin;
+        }
+        let Some(current) = self.current_visual_root_window_geometry(pending.surface_id) else {
+            return origin;
+        };
+        (
+            origin.0.saturating_add(
+                pending
+                    .geometry
+                    .placement
+                    .local_x
+                    .saturating_sub(current.placement.local_x),
+            ),
+            origin.1.saturating_add(
+                pending
+                    .geometry
+                    .placement
+                    .local_y
+                    .saturating_sub(current.placement.local_y),
+            ),
+        )
     }
 
     pub(in crate::compositor) fn send_implicit_pointer_grab_motion(
@@ -759,14 +814,16 @@ impl CompositorState {
             self.refresh_pointer_focus_at_last_position();
             return true;
         };
-        pointer_debug_log(format!(
-            "implicit grab motion surface={} output=({},{}) local=({},{})",
-            compositor_surface_id(&surface),
-            x,
-            y,
-            target.surface_x,
-            target.surface_y
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "implicit grab motion surface={} output=({},{}) local=({},{})",
+                compositor_surface_id(&surface),
+                x,
+                y,
+                target.surface_x,
+                target.surface_y
+            )
+        });
         let time = wayland_event_time();
         for pointer in self
             .pointer_resources

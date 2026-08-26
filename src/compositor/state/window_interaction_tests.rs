@@ -163,12 +163,112 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
 }
 
 #[test]
+fn floating_resize_coalesces_geometry_until_frame_flush() {
+    let surface_id = 42;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
+    let mut interaction = test_window_interaction(
+        43,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+        None,
+    );
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 120.0));
+    for pointer_x in 130..=1127 {
+        assert!(
+            state.update_window_interaction_by_id(interaction.id, f64::from(pointer_x), 150.0,)
+        );
+    }
+    assert!(state.update_window_interaction_by_id(interaction.id, 140.0, 150.0));
+    assert_eq!(state.resize_flow_metrics.raw_pointer_resize_updates, 1_000);
+    assert_eq!(
+        state.resize_flow_metrics.pending_resize_updates_replaced,
+        999
+    );
+    assert_eq!(state.resize_flow_metrics.resize_updates_applied, 0);
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(10, 20),
+            300,
+            200,
+        ))
+    );
+    assert!(state.backend_commands.is_empty());
+    assert!(state.has_pending_frame_prepare_work());
+    assert!(state.flush_pending_floating_interaction_geometry());
+    assert_eq!(state.resize_flow_metrics.resize_updates_applied, 1);
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(10, 20),
+            340,
+            250,
+        ))
+    );
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 150.0, 160.0));
+    assert_eq!(state.resize_flow_metrics.resize_updates_applied, 1);
+    assert!(state.end_window_interaction_by_id_with_reason(
+        interaction.id,
+        WindowInteractionEndReason::ExplicitEnd,
+    ));
+    assert_eq!(state.resize_flow_metrics.resize_updates_applied, 2);
+    assert_eq!(
+        state.resize_flow_metrics.floating_geometry_terminal_flushes,
+        1
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(10, 20),
+            350,
+            260,
+        ))
+    );
+}
+#[test]
 fn failed_begin_does_not_capture_native_input() {
     let mut state = CompositorState::default();
 
     assert!(!state.begin_window_resize_at_with_trigger(100.0, 100.0, 0x111));
 
     assert!(!state.window_interaction_active());
+}
+
+#[test]
+fn floating_resize_cancellation_discards_pending_geometry() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            44,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            None,
+        )),
+        ..Default::default()
+    };
+    let interaction_id = WindowInteractionId::new(44);
+
+    assert!(state.update_window_interaction_by_id(interaction_id, 160.0, 170.0));
+    assert!(state.pending_floating_resize.is_some());
+    assert!(state.end_window_interaction_by_id_with_reason(
+        interaction_id,
+        WindowInteractionEndReason::ExplicitCancel,
+    ));
+
+    assert!(state.pending_floating_resize.is_none());
+    assert_eq!(state.resize_flow_metrics.resize_updates_applied, 0);
+    assert_eq!(state.resize_flow_metrics.floating_geometry_stale_drops, 0);
 }
 
 #[test]
@@ -784,6 +884,7 @@ fn absolute_x11_move_preserves_root_placement_mode() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
+    assert!(state.flush_pending_floating_interaction_geometry());
 
     let expected = SurfacePlacement::absolute_root_at(35, 55);
     assert_eq!(state.surface_placement(surface_id), expected);
@@ -815,6 +916,7 @@ fn absolute_xdg_move_updates_scene_without_queued_backend_position_command() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
+    assert!(state.flush_pending_floating_interaction_geometry());
 
     assert_eq!(
         state.surface_placement(surface_id),
@@ -841,14 +943,13 @@ fn interactive_move_keeps_latest_pointer_target_until_terminal_flush() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
-    state.last_window_interaction_geometry_apply = Some(Instant::now());
-    assert!(!state.update_window_interaction_by_id(interaction.id, 180.0, 190.0));
+    assert!(state.update_window_interaction_by_id(interaction.id, 180.0, 190.0));
     assert_eq!(
         state.surface_placement(surface_id),
-        SurfacePlacement::absolute_root_at(35, 55)
+        SurfacePlacement::absolute_root_at(10, 20)
     );
     assert!(state.pending_window_interaction_pointer.is_some());
-    assert_eq!(state.resize_flow_metrics.pending_move_updates_replaced, 0);
+    assert_eq!(state.resize_flow_metrics.pending_move_updates_replaced, 1);
 
     assert!(state.end_window_interaction_by_id_with_reason(
         interaction.id,
@@ -859,7 +960,7 @@ fn interactive_move_keeps_latest_pointer_target_until_terminal_flush() {
         SurfacePlacement::absolute_root_at(90, 110)
     );
     assert_eq!(state.resize_flow_metrics.raw_pointer_move_updates, 2);
-    assert_eq!(state.resize_flow_metrics.move_updates_applied, 2);
+    assert_eq!(state.resize_flow_metrics.move_updates_applied, 1);
 }
 
 #[test]
@@ -885,6 +986,7 @@ fn absolute_x11_resize_preserves_root_placement_mode() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 130.0));
+    assert!(state.flush_pending_floating_interaction_geometry());
 
     let expected = SurfacePlacement::absolute_root_at(30, 50);
     assert_eq!(
@@ -923,6 +1025,7 @@ fn interactive_resize_updates_visual_geometry_before_frame_prepare() {
     state.window_interaction = Some(interaction);
 
     assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 130.0));
+    assert!(state.flush_pending_floating_interaction_geometry());
 
     assert_eq!(
         state.current_visual_root_window_geometry(surface_id),

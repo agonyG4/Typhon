@@ -1488,6 +1488,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
     assert!(server.client_cursor_request_active());
     assert!(server.client_cursor_render_state().is_none());
     assert_eq!(server.last_pointer_position(), (x, y));
+    server.prepare_frame();
     client_commands.send(ClientCommand::CaptureActive).unwrap();
     let active = pump_native_input_server_until(&mut server, &client_events);
     assert_eq!(
@@ -1500,7 +1501,6 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             pointer_leave_count,
         }
     );
-    server.prepare_frame();
     assert_eq!(
         server.resize_flow_metrics().resize_updates_applied,
         updates_before + 1

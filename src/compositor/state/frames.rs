@@ -80,6 +80,7 @@ impl CompositorState {
             .keys()
             .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id))
             || self.pending_resize_configure_is_flushable()
+            || self.has_pending_floating_interaction_geometry()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 self.surface_is_visible_in_active_workspace(commit.surface_id)
                     && (!self.external_acquire_readiness

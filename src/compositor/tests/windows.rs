@@ -841,8 +841,9 @@ fn resize_drag_sends_latest_geometry_without_serializing_pointer_updates() {
     assert!(metrics.max_in_flight_configures <= 3);
     assert!(metrics.maximum_retained_configures <= 4);
     assert_eq!(metrics.raw_pointer_resize_updates, 3);
-    assert_eq!(metrics.pending_resize_updates_replaced, 0);
-    assert_eq!(metrics.resize_updates_applied, 3);
+    assert_eq!(metrics.pending_resize_updates_replaced, 2);
+    assert_eq!(metrics.resize_updates_applied, 1);
+    assert_eq!(metrics.floating_geometry_frame_flushes, 1);
 }
 
 #[test]
@@ -894,7 +895,7 @@ fn resize_update_flushes_configure_before_pending_frame_work_query() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(!pending);
+    assert!(pending);
 }
 
 #[test]
@@ -927,7 +928,7 @@ fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(!before_prepare);
+    assert!(before_prepare);
     assert!(!after_prepare);
 }
 

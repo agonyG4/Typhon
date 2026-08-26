@@ -168,6 +168,12 @@ impl NativePaintStats {
                 NativePerfField::usize("repair_damage_rects", repaint.repair_damage_rects),
                 NativePerfField::u64("repair_damage_pixels", repaint.repair_damage_pixels),
                 NativePerfField::usize("scissor_passes", repaint.scissor_passes),
+                NativePerfField::usize("planner_passes", repaint.planner_passes),
+                NativePerfField::usize(
+                    "planner_commands_visited",
+                    repaint.planner_commands_visited,
+                ),
+                NativePerfField::usize("commands_drawable", repaint.commands_drawable),
                 NativePerfField::usize("draw_command_replays", repaint.draw_command_replays),
                 NativePerfField::usize("commands_considered", repaint.commands_considered),
                 NativePerfField::usize("commands_executed", repaint.commands_executed),
@@ -176,9 +182,26 @@ impl NativePaintStats {
                     repaint.commands_rejected_outside_damage,
                 ),
                 NativePerfField::usize(
+                    "commands_rejected_outside_remaining",
+                    repaint.commands_rejected_outside_remaining,
+                ),
+                NativePerfField::usize(
                     "commands_rejected_occluded",
                     repaint.commands_rejected_occluded,
                 ),
+                NativePerfField::usize(
+                    "opaque_rectangles_subtracted",
+                    repaint.opaque_rectangles_subtracted,
+                ),
+                NativePerfField::usize(
+                    "planner_early_terminations",
+                    repaint.planner_early_terminations,
+                ),
+                NativePerfField::usize(
+                    "region_fragmentation_overflow_fallbacks",
+                    repaint.region_fragmentation_overflow_fallbacks,
+                ),
+                NativePerfField::usize("peak_region_piece_count", repaint.peak_region_piece_count),
                 NativePerfField::usize("texture_binds", repaint.texture_binds),
                 NativePerfField::usize("draw_calls", repaint.draw_calls),
                 NativePerfField::usize("scene_vbo_uploads", repaint.scene_vbo_uploads),

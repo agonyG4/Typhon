@@ -1348,6 +1348,7 @@ impl OwnCompositorServer {
     pub fn prepare_frame(&mut self) {
         self.state.commit_ready_explicit_sync_buffers();
         color::flush_pending_color_info(&mut self.state);
+        let _ = self.state.flush_pending_floating_interaction_geometry();
         self.state.flush_pending_resize_configure();
         let _ = self.display.flush_clients();
     }

@@ -52,32 +52,144 @@ impl EglRect {
 }
 
 const MAX_OPAQUE_COVERAGE_PIECES: usize = 32;
+const MAX_VISIBLE_REGION_PIECES: usize = MAX_OPAQUE_COVERAGE_PIECES;
 
-pub(super) fn opaque_regions_cover_rect(regions: &[EglRect], target: EglRect) -> bool {
-    let mut remaining = [None; MAX_OPAQUE_COVERAGE_PIECES];
-    remaining[0] = Some(target);
-    let mut remaining_len = 1;
-    for region in regions {
-        let mut next = [None; MAX_OPAQUE_COVERAGE_PIECES];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EglVisibilityDecision {
+    Drawable,
+    OutsideRemaining,
+    Occluded,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EglVisibilityPlanStats {
+    pub(super) commands_visited: usize,
+    pub(super) commands_drawable: usize,
+    pub(super) commands_rejected_outside_remaining: usize,
+    pub(super) commands_rejected_occluded: usize,
+    pub(super) opaque_rectangles_subtracted: usize,
+    pub(super) overflow_fallback: bool,
+    pub(super) early_terminated: bool,
+    pub(super) peak_region_pieces: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EglVisibleRegion {
+    pieces: [Option<EglRect>; MAX_VISIBLE_REGION_PIECES],
+    len: usize,
+    occlusion_disabled: bool,
+}
+
+impl EglVisibleRegion {
+    fn new(rect: EglRect) -> Self {
+        let mut region = Self {
+            pieces: [None; MAX_VISIBLE_REGION_PIECES],
+            len: 0,
+            occlusion_disabled: false,
+        };
+        if rect.width > 0.0 && rect.height > 0.0 {
+            region.pieces[0] = Some(rect);
+            region.len = 1;
+        }
+        region
+    }
+
+    fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    fn intersects(self, rect: EglRect) -> bool {
+        self.pieces
+            .iter()
+            .take(self.len)
+            .flatten()
+            .any(|piece| piece.intersection(rect).is_some())
+    }
+
+    fn subtract(&mut self, excluded: EglRect) -> bool {
+        if self.occlusion_disabled {
+            return true;
+        }
+        let mut next = [None; MAX_VISIBLE_REGION_PIECES];
         let mut next_len = 0;
-        for piece in remaining.iter().take(remaining_len).flatten() {
-            let mut pieces = [None; 4];
-            let piece_count = subtract_rect(*piece, *region, &mut pieces);
-            for residual in pieces.iter().take(piece_count).flatten() {
-                if next_len == MAX_OPAQUE_COVERAGE_PIECES {
+        for piece in self.pieces.iter().take(self.len).flatten() {
+            let mut residuals = [None; 4];
+            let residual_count = subtract_rect(*piece, excluded, &mut residuals);
+            for residual in residuals.iter().take(residual_count).flatten() {
+                if next_len == MAX_VISIBLE_REGION_PIECES {
                     return false;
                 }
                 next[next_len] = Some(*residual);
                 next_len += 1;
             }
         }
-        remaining = next;
-        remaining_len = next_len;
-        if remaining_len == 0 {
-            return true;
+        self.pieces = next;
+        self.len = next_len;
+        true
+    }
+
+    fn disable_occlusion(&mut self, repair: EglRect) {
+        self.occlusion_disabled = true;
+        self.pieces = [None; MAX_VISIBLE_REGION_PIECES];
+        self.len = 0;
+        if repair.width > 0.0 && repair.height > 0.0 {
+            self.pieces[0] = Some(repair);
+            self.len = 1;
         }
     }
-    false
+}
+
+pub(super) fn plan_visibility(
+    commands: &[EglDrawCommand],
+    repair: EglRect,
+    decisions: &mut Vec<EglVisibilityDecision>,
+) -> EglVisibilityPlanStats {
+    decisions.clear();
+    decisions.resize(commands.len(), EglVisibilityDecision::Occluded);
+    let mut stats = EglVisibilityPlanStats::default();
+    let mut remaining = EglVisibleRegion::new(repair);
+    stats.peak_region_pieces = remaining.len;
+
+    for index in (0..commands.len()).rev() {
+        stats.commands_visited += 1;
+        if remaining.is_empty() {
+            stats.early_terminated = true;
+            break;
+        }
+        let command = &commands[index];
+        if !remaining.intersects(command.bounds) {
+            decisions[index] = EglVisibilityDecision::OutsideRemaining;
+            stats.commands_rejected_outside_remaining += 1;
+            continue;
+        }
+
+        decisions[index] = EglVisibilityDecision::Drawable;
+        stats.commands_drawable += 1;
+        if remaining.occlusion_disabled {
+            continue;
+        }
+        for opaque_region in &command.opaque_regions {
+            stats.opaque_rectangles_subtracted += 1;
+            if !remaining.subtract(*opaque_region) {
+                stats.overflow_fallback = true;
+                remaining.disable_occlusion(repair);
+                break;
+            }
+            stats.peak_region_pieces = stats.peak_region_pieces.max(remaining.len);
+            if remaining.is_empty() {
+                stats.early_terminated = true;
+                break;
+            }
+        }
+        if stats.early_terminated {
+            break;
+        }
+    }
+    stats.commands_rejected_occluded = decisions
+        .iter()
+        .filter(|decision| **decision == EglVisibilityDecision::Occluded)
+        .count();
+    stats
 }
 
 fn subtract_rect(source: EglRect, excluded: EglRect, pieces: &mut [Option<EglRect>; 4]) -> usize {
@@ -439,24 +551,145 @@ mod tests {
         assert!(!command.intersects_output_rect(OutputRect::new(0, 0, 19, 29)));
     }
 
+    fn test_command(bounds: EglRect, opaque_regions: Vec<EglRect>) -> EglDrawCommand {
+        EglDrawCommand {
+            layer: EglDrawLayer::Solid(ServerFrameColor::OutputBackground),
+            bounds,
+            opaque_regions,
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ScaledLinear,
+        }
+    }
+
     #[test]
-    fn opaque_coverage_respects_partial_regions_and_holes() {
-        let target = EglRect::new(0.0, 0.0, 10.0, 10.0);
-        let ring = [
-            EglRect::new(0.0, 0.0, 10.0, 4.0),
-            EglRect::new(0.0, 6.0, 10.0, 4.0),
-            EglRect::new(0.0, 4.0, 4.0, 2.0),
-            EglRect::new(6.0, 4.0, 4.0, 2.0),
+    fn visibility_planner_accumulates_opaque_repair_coverage() {
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(
+                EglRect::new(0.0, 0.0, 50.0, 100.0),
+                vec![EglRect::new(0.0, 0.0, 50.0, 100.0)],
+            ),
+            test_command(
+                EglRect::new(50.0, 0.0, 50.0, 100.0),
+                vec![EglRect::new(50.0, 0.0, 50.0, 100.0)],
+            ),
         ];
-        assert!(opaque_regions_cover_rect(
-            &ring,
-            EglRect::new(0.0, 0.0, 4.0, 4.0)
-        ));
-        assert!(!opaque_regions_cover_rect(&ring, target));
-        assert!(!opaque_regions_cover_rect(
-            &ring,
-            EglRect::new(4.0, 4.0, 2.0, 2.0)
-        ));
+        let mut decisions = Vec::new();
+
+        let stats = plan_visibility(
+            &commands,
+            EglRect::new(10.0, 10.0, 80.0, 80.0),
+            &mut decisions,
+        );
+
+        assert_eq!(
+            decisions,
+            vec![
+                EglVisibilityDecision::Occluded,
+                EglVisibilityDecision::Drawable,
+                EglVisibilityDecision::Drawable,
+            ]
+        );
+        assert_eq!(stats.commands_visited, 2);
+        assert_eq!(stats.commands_drawable, 2);
+        assert_eq!(stats.commands_rejected_occluded, 1);
+        assert!(stats.early_terminated);
+    }
+
+    #[test]
+    fn visibility_planner_uses_only_the_repaired_part_of_large_commands() {
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(
+                EglRect::new(20.0, 20.0, 10.0, 10.0),
+                vec![EglRect::new(20.0, 20.0, 10.0, 10.0)],
+            ),
+        ];
+        let mut decisions = Vec::new();
+
+        let _ = plan_visibility(
+            &commands,
+            EglRect::new(20.0, 20.0, 10.0, 10.0),
+            &mut decisions,
+        );
+
+        assert_eq!(
+            decisions,
+            vec![
+                EglVisibilityDecision::Occluded,
+                EglVisibilityDecision::Drawable,
+            ]
+        );
+    }
+
+    #[test]
+    fn visibility_planner_keeps_lower_content_for_transparent_upper_commands() {
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+        ];
+        let mut decisions = Vec::new();
+
+        let _ = plan_visibility(
+            &commands,
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            &mut decisions,
+        );
+
+        assert_eq!(
+            decisions,
+            vec![
+                EglVisibilityDecision::Drawable,
+                EglVisibilityDecision::Drawable
+            ]
+        );
+    }
+
+    #[test]
+    fn visibility_planner_falls_back_to_overdraw_on_region_fragmentation() {
+        let mut opaque_regions = Vec::new();
+        for row in 0..6 {
+            for column in 0..6 {
+                opaque_regions.push(EglRect::new(
+                    column as f32 * 16.0,
+                    row as f32 * 16.0,
+                    8.0,
+                    8.0,
+                ));
+            }
+        }
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), opaque_regions),
+        ];
+        let mut decisions = Vec::new();
+
+        let stats = plan_visibility(
+            &commands,
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            &mut decisions,
+        );
+
+        assert!(stats.overflow_fallback);
+        assert_eq!(decisions, vec![EglVisibilityDecision::Drawable; 2]);
+    }
+
+    #[test]
+    fn visibility_planner_visits_each_command_once() {
+        let commands = (0..100)
+            .map(|index| test_command(EglRect::new(index as f32, 0.0, 1.0, 1.0), Vec::new()))
+            .collect::<Vec<_>>();
+        let mut decisions = Vec::new();
+
+        let stats = plan_visibility(
+            &commands,
+            EglRect::new(0.0, 0.0, 100.0, 1.0),
+            &mut decisions,
+        );
+
+        assert_eq!(stats.commands_visited, commands.len());
+        assert_eq!(stats.commands_drawable, commands.len());
     }
 
     #[test]

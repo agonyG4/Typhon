@@ -246,6 +246,8 @@ fn native_binding_move_activates_rear_xdg_window_before_moving_it() {
         })
         .unwrap();
     wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
     let after_update = root_snapshots(&capture_renderable_surface_snapshot(&commands));
     assert_ne!(
         surface_geometry(&after_update, target_surface_id),

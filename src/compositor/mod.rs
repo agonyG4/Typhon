@@ -206,11 +206,12 @@ pub use input::{
 };
 pub use interaction::X11MoveResizeBeginResult;
 use interaction::{
-    InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
-    PointerTarget, ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges,
-    RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionEndReason,
-    WindowInteractionSource, interactive_resize_geometry, resize_drag_threshold_reached,
-    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
+    InteractionCursorOverride, InteractionCursorShape, PendingFloatingResize,
+    PendingResizeConfigure, PointerPress, PointerTarget, ResizeAckDecision, ResizeCommitSnapshot,
+    ResizeConfigureFlow, ResizeEdges, RootSurfaceHit, WindowFrameHit, WindowInteraction,
+    WindowInteractionEndReason, WindowInteractionSource, interactive_resize_geometry,
+    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
+    window_frame_action_for_local_point,
 };
 pub use interaction::{
     ResizeInteractionId, TriggerReleaseDelivery, WindowInteractionButtonRelease,
@@ -341,6 +342,9 @@ pub struct ResizeFlowMetrics {
     pub pending_resize_updates_replaced: u64,
     pub resize_updates_applied: u64,
     pub resize_updates_skipped_unchanged: u64,
+    pub floating_geometry_frame_flushes: u64,
+    pub floating_geometry_terminal_flushes: u64,
+    pub floating_geometry_stale_drops: u64,
     pub duplicate_configure_sizes_skipped: u64,
     pub maximum_retained_configures: usize,
     pub max_preview_age_ms: u64,
@@ -616,7 +620,7 @@ pub struct CompositorState {
     last_pointer_y: f64,
     last_pointer_motion_usec: Option<u64>,
     pending_window_interaction_pointer: Option<(WindowInteractionId, f64, f64)>,
-    last_window_interaction_geometry_apply: Option<Instant>,
+    pending_floating_resize: Option<PendingFloatingResize>,
     last_relative_pointer_motion: Option<RelativePointerMotion>,
     last_pointer_press: Option<PointerPress>,
     held_pointer_buttons: Vec<PointerPress>,

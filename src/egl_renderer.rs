@@ -36,8 +36,8 @@ use damage::{
     RenderExecution, RepaintPlan,
 };
 use geometry::{
-    EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
-    SurfaceSampling, VERTEX_STRIDE, opaque_regions_cover_rect, push_draw_command,
+    EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
+    MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_visibility, push_draw_command,
     push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use program::create_texture_program;
@@ -87,11 +87,19 @@ pub(crate) struct GlesSceneFrameStats {
     pub repair_damage_rects: usize,
     pub repair_damage_pixels: u64,
     pub scissor_passes: usize,
+    pub planner_passes: usize,
+    pub planner_commands_visited: usize,
+    pub commands_drawable: usize,
     pub draw_command_replays: usize,
     pub commands_considered: usize,
     pub commands_executed: usize,
     pub commands_rejected_outside_damage: usize,
+    pub commands_rejected_outside_remaining: usize,
     pub commands_rejected_occluded: usize,
+    pub opaque_rectangles_subtracted: usize,
+    pub planner_early_terminations: usize,
+    pub region_fragmentation_overflow_fallbacks: usize,
+    pub peak_region_piece_count: usize,
     pub texture_binds: usize,
     pub draw_calls: usize,
     pub scene_vbo_uploads: usize,
@@ -207,6 +215,7 @@ pub(crate) struct GlesSceneRenderer {
     commands: Vec<EglDrawCommand>,
     cursor_vertices: Vec<EglTexturedVertex>,
     cursor_commands: Vec<EglDrawCommand>,
+    scene_visibility_plan: Vec<EglVisibilityDecision>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
     cursor_resource: Option<EglImageResource>,
@@ -327,6 +336,7 @@ impl GlesSceneRenderer {
             commands: Vec::new(),
             cursor_vertices: Vec::new(),
             cursor_commands: Vec::new(),
+            scene_visibility_plan: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
             cursor_resource: None,
@@ -1349,6 +1359,9 @@ impl GlesSceneRenderer {
         scene: bool,
         scissor: Option<OutputRect>,
     ) -> RendererResult<()> {
+        if scene {
+            self.plan_scene_visibility(scissor);
+        }
         let (vertices, commands) = if scene {
             (&self.vertices, &self.commands)
         } else {
@@ -1414,7 +1427,6 @@ impl GlesSceneRenderer {
         let mut commands_considered = 0;
         let mut commands_executed = 0;
         let mut commands_rejected_outside_damage = 0;
-        let mut commands_rejected_occluded = 0;
         let mut texture_binds = 0;
         let mut draw_calls = 0;
         for (command_index, command) in commands.iter().enumerate() {
@@ -1423,13 +1435,13 @@ impl GlesSceneRenderer {
                 commands_rejected_outside_damage += 1;
                 continue;
             }
-            if scene
-                && commands[command_index + 1..].iter().any(|occluder| {
-                    opaque_regions_cover_rect(&occluder.opaque_regions, command.bounds)
-                })
-            {
-                commands_rejected_occluded += 1;
-                continue;
+            if scene {
+                match self.scene_visibility_plan[command_index] {
+                    EglVisibilityDecision::Drawable => {}
+                    EglVisibilityDecision::OutsideRemaining | EglVisibilityDecision::Occluded => {
+                        continue;
+                    }
+                }
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
                 continue;
@@ -1469,10 +1481,6 @@ impl GlesSceneRenderer {
             .frame_stats
             .commands_rejected_outside_damage
             .saturating_add(commands_rejected_outside_damage);
-        self.frame_stats.commands_rejected_occluded = self
-            .frame_stats
-            .commands_rejected_occluded
-            .saturating_add(commands_rejected_occluded);
         self.frame_stats.texture_binds =
             self.frame_stats.texture_binds.saturating_add(texture_binds);
         self.frame_stats.draw_calls = self.frame_stats.draw_calls.saturating_add(draw_calls);
@@ -1498,6 +1506,64 @@ impl GlesSceneRenderer {
             }
         }
         Ok(())
+    }
+
+    fn plan_scene_visibility(&mut self, scissor: Option<OutputRect>) {
+        let repair = scissor
+            .map(|rect| {
+                EglRect::new(
+                    rect.x as f32,
+                    rect.y as f32,
+                    rect.width as f32,
+                    rect.height as f32,
+                )
+            })
+            .unwrap_or_else(|| {
+                EglRect::new(
+                    0.0,
+                    0.0,
+                    self.current_size.0 as f32,
+                    self.current_size.1 as f32,
+                )
+            });
+        let stats = plan_visibility(&self.commands, repair, &mut self.scene_visibility_plan);
+        self.frame_stats.planner_passes = self.frame_stats.planner_passes.saturating_add(1);
+        self.frame_stats.planner_commands_visited = self
+            .frame_stats
+            .planner_commands_visited
+            .saturating_add(stats.commands_visited);
+        self.frame_stats.commands_drawable = self
+            .frame_stats
+            .commands_drawable
+            .saturating_add(stats.commands_drawable);
+        self.frame_stats.commands_rejected_outside_remaining = self
+            .frame_stats
+            .commands_rejected_outside_remaining
+            .saturating_add(stats.commands_rejected_outside_remaining);
+        self.frame_stats.commands_rejected_occluded = self
+            .frame_stats
+            .commands_rejected_occluded
+            .saturating_add(stats.commands_rejected_occluded);
+        self.frame_stats.opaque_rectangles_subtracted = self
+            .frame_stats
+            .opaque_rectangles_subtracted
+            .saturating_add(stats.opaque_rectangles_subtracted);
+        if stats.early_terminated {
+            self.frame_stats.planner_early_terminations = self
+                .frame_stats
+                .planner_early_terminations
+                .saturating_add(1);
+        }
+        if stats.overflow_fallback {
+            self.frame_stats.region_fragmentation_overflow_fallbacks = self
+                .frame_stats
+                .region_fragmentation_overflow_fallbacks
+                .saturating_add(1);
+        }
+        self.frame_stats.peak_region_piece_count = self
+            .frame_stats
+            .peak_region_piece_count
+            .max(stats.peak_region_pieces);
     }
 
     fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<GlTexture> {

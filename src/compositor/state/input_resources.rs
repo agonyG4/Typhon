@@ -469,11 +469,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_motion(&mut self, x: f64, y: f64) {
+        self.pointer_hit_metrics.raw_pointer_motion_samples = self
+            .pointer_hit_metrics
+            .raw_pointer_motion_samples
+            .saturating_add(1);
         if let Some(active) = self.active_locked_pointer_binding() {
-            pointer_debug_log(format!(
-                "pointer.motion locked=true absolute_suppressed=true requested_output=({},{}) anchor_output=({},{})",
-                x, y, active.activation_anchor.x, active.activation_anchor.y
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.motion locked=true absolute_suppressed=true requested_output=({},{}) anchor_output=({},{})",
+                    x, y, active.activation_anchor.x, active.activation_anchor.y
+                )
+            });
             self.pin_locked_pointer_focus(&active);
             return;
         }
@@ -545,67 +551,77 @@ impl CompositorState {
             return 0;
         };
         let Some(surface_id) = pointer_motion_surface_id else {
-            pointer_debug_log(format!(
-                "pointer.interaction_motion interaction={} target=none dispatched=0 relative_suppressed=true",
-                interaction_id.get(),
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.interaction_motion interaction={} target=none dispatched=0 relative_suppressed=true",
+                    interaction_id.get(),
+                )
+            });
             return 0;
         };
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
-            pointer_debug_log(format!(
-                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-missing relative_suppressed=true",
-                interaction_id.get(),
-                surface_id,
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-missing relative_suppressed=true",
+                    interaction_id.get(),
+                    surface_id,
+                )
+            });
             return 0;
         };
         if !surface.is_alive() || self.root_surface_id_for_surface(surface_id) != root_surface_id {
-            pointer_debug_log(format!(
-                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=target-not-owned relative_suppressed=true",
-                interaction_id.get(),
-                surface_id,
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.interaction_motion interaction={} target={} dispatched=0 reason=target-not-owned relative_suppressed=true",
+                    interaction_id.get(),
+                    surface_id,
+                )
+            });
             return 0;
         }
         let Some(target) = self.pointer_target_for_grabbed_surface_at_output(&surface, x, y) else {
-            pointer_debug_log(format!(
-                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-not-renderable relative_suppressed=true",
-                interaction_id.get(),
-                surface_id,
-            ));
+            pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-not-renderable relative_suppressed=true",
+                    interaction_id.get(),
+                    surface_id,
+                )
+            });
             return 0;
         };
 
         self.last_pointer_motion_usec = Some(timestamp_usec);
         let time = wayland_event_time();
         self.pointer_resources.retain(Resource::is_alive);
-        let pointers = self
-            .pointer_resources
-            .iter()
-            .filter(|pointer| {
-                resource_belongs_to_surface_client(*pointer, &target.surface)
-                    && self.pointer_resource_entered_surface(pointer, &target.surface)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let dispatched = pointers.len();
-        for pointer in pointers {
+        let mut dispatched = 0;
+        for pointer in self.pointer_resources.iter().filter(|pointer| {
+            resource_belongs_to_surface_client(*pointer, &target.surface)
+                && self.pointer_resource_entered_surface(pointer, &target.surface)
+        }) {
             let _ = pointer.send_event(wl_pointer::Event::Motion {
                 time,
                 surface_x: target.surface_x,
                 surface_y: target.surface_y,
             });
-            send_pointer_frame_if_supported(&pointer);
+            send_pointer_frame_if_supported(pointer);
+            dispatched += 1;
         }
-        pointer_debug_log(format!(
-            "pointer.interaction_motion interaction={} root={} target={} output=({x},{y}) local=({},{}) dispatched={} relative_suppressed=true",
-            interaction_id.get(),
-            root_surface_id,
-            surface_id,
-            target.surface_x,
-            target.surface_y,
-            dispatched,
-        ));
+        self.pointer_hit_metrics
+            .interaction_pointer_resource_iterations = self
+            .pointer_hit_metrics
+            .interaction_pointer_resource_iterations
+            .saturating_add(dispatched as u64);
+        pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.interaction_motion interaction={} root={} target={} output=({x},{y}) local=({},{}) dispatched={} relative_suppressed=true",
+                interaction_id.get(),
+                root_surface_id,
+                surface_id,
+                target.surface_x,
+                target.surface_y,
+                dispatched,
+            )
+        });
         dispatched
     }
 
@@ -657,10 +673,12 @@ impl CompositorState {
             if locked_surface_id.is_none() {
                 self.send_pointer_motion(position.x, position.y);
             } else if let Some(surface_id) = locked_surface_id {
-                pointer_debug_log(format!(
-                    "pointer.motion locked=true absolute_suppressed=true output=({},{}) surface={}",
-                    position.x, position.y, surface_id
-                ));
+                pointer_debug_log_lazy(|| {
+                    format!(
+                        "pointer.motion locked=true absolute_suppressed=true output=({},{}) surface={}",
+                        position.x, position.y, surface_id
+                    )
+                });
             }
         }
     }

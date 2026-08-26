@@ -243,6 +243,12 @@ fn rapid_resize_visual_box_tracks_latest_pointer_while_content_is_throttled() {
                 .state
                 .update_window_interaction(pointer_x, 0.0)
         );
+        assert!(
+            fixture
+                .server
+                .state
+                .flush_pending_floating_interaction_geometry()
+        );
         let expected_width = (i64::from(root.width) - pointer_x as i64)
             .max(160)
             .try_into()

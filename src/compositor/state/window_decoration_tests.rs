@@ -288,6 +288,34 @@ fn pointer_scene_hit_owner_locality_reuses_scene_owner_for_nearby_decoration_poi
     assert_eq!(second_hit, DecorationHit::Titlebar);
     assert_eq!(state.pointer_hit_metrics.full_scene_hit_scans, 1);
     assert_eq!(state.pointer_hit_metrics.owner_locality_fast_hits, 1);
+    assert_eq!(state.pointer_hit_metrics.active_scene_index_hits, 1);
+}
+
+#[test]
+fn content_only_pointer_hit_does_not_refresh_global_origin_cache() {
+    let mut state = xdg_state(
+        test_surface(42),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.refresh_surface_origin_cache();
+    let cached_generation = state.surface_origin_cache_generation;
+    let origin = state.active_scene_surface_origins()[0];
+
+    let _ = state.pointer_scene_hit_at(f64::from(origin.0 + 40), f64::from(origin.1 - 13));
+    state.render_generation = state.render_generation.saturating_add(1);
+    let hit = state.pointer_scene_hit_at(
+        f64::from(origin.0 + 41) + 0.25,
+        f64::from(origin.1 - 13) + 0.5,
+    );
+
+    assert!(matches!(hit, PointerSceneHit::Decoration { .. }));
+    assert_eq!(state.surface_origin_cache_generation, cached_generation);
+    assert_eq!(state.pointer_hit_metrics.global_origin_cache_recomputes, 1);
+    let PointerSceneHit::Decoration { hit, .. } = hit else {
+        panic!("content-only pointer motion should retain the same owner");
+    };
+    assert_eq!(hit, DecorationHit::Titlebar);
 }
 
 #[test]

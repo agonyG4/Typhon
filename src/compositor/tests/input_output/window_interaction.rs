@@ -284,6 +284,8 @@ fn overlapping_server_decoration_does_not_focus_window_underneath() {
         })
         .unwrap();
     wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
     let drag_owner = capture_window_interaction_debug_snapshot(&commands)
         .expect("titlebar drag must remain captured");
     assert_eq!(drag_owner.window_id, a_window_id.get());
@@ -829,6 +831,8 @@ fn run_resize_motion_coordinate_regression(
         .unwrap();
     wait_for_server_commands(&commands);
     assert!(update_receiver.recv().unwrap());
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
     let (reply, receiver) = mpsc::channel();
     commands
         .send(ServerCommand::SendWindowInteractionPointerMotion {

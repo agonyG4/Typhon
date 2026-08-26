@@ -3,7 +3,7 @@ use std::{collections::VecDeque, time::Instant};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{WEnum, protocol::wl_surface};
 
-use super::{SurfacePlacement, WindowId, XdgWindowGeometry, render};
+use super::{SurfacePlacement, WindowGeometry, WindowId, XdgWindowGeometry, render};
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
@@ -295,6 +295,14 @@ impl WindowInteraction {
             start_pointer_y: self.start_pointer_y,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingFloatingResize {
+    pub(super) interaction_id: WindowInteractionId,
+    pub(super) surface_id: u32,
+    pub(super) geometry: WindowGeometry,
+    pub(super) edges: ResizeEdges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

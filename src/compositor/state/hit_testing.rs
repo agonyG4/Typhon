@@ -36,6 +36,13 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) pointer_scene_hit_surfaces_inspected: u64,
     pub(in crate::compositor) pointer_scene_hit_origin_cache_clones: u64,
     pub(in crate::compositor) pointer_scene_hit_root_linear_searches: u64,
+    pub(in crate::compositor) global_origin_cache_recomputes: u64,
+    pub(in crate::compositor) active_scene_index_hits: u64,
+    pub(in crate::compositor) grabbed_target_active_scene_hits: u64,
+    pub(in crate::compositor) grabbed_target_global_fallbacks: u64,
+    pub(in crate::compositor) raw_pointer_motion_samples: u64,
+    pub(in crate::compositor) interaction_pointer_resource_iterations: u64,
+    pub(in crate::compositor) interaction_pointer_temporary_vectors: u64,
     pub(in crate::compositor) pointer_scene_hit_cpu_nanos: u64,
     pub(in crate::compositor) desktop_focus_pipeline_invocations: u64,
     pub(in crate::compositor) desktop_focus_same_window_noops: u64,
@@ -208,7 +215,6 @@ impl CompositorState {
         if instrumentation_enabled {
             self.pointer_hit_metrics.pointer_scene_hit_calls += 1;
         }
-        self.refresh_surface_origin_cache();
         if let Some(cache) = self.pointer_scene_hit_cache.as_ref()
             && cache.pointer_hit_generation == self.pointer_hit_generation
             && cache.x == x
@@ -360,7 +366,7 @@ impl CompositorState {
         (PointerSceneHit::None, groups_inspected, surfaces_inspected)
     }
 
-    fn pointer_scene_hit_locality_at(&self, x: f64, y: f64) -> Option<PointerSceneHit> {
+    fn pointer_scene_hit_locality_at(&mut self, x: f64, y: f64) -> Option<PointerSceneHit> {
         let cache = self.pointer_scene_hit_cache.as_ref()?;
         if cache.pointer_hit_generation != self.pointer_hit_generation {
             return None;
@@ -379,6 +385,10 @@ impl CompositorState {
                     return None;
                 }
                 let index = self.active_scene_surface_index(surface_id)?;
+                self.pointer_hit_metrics.active_scene_index_hits = self
+                    .pointer_hit_metrics
+                    .active_scene_index_hits
+                    .saturating_add(1);
                 let renderable = self.active_scene_surfaces().get(index)?;
                 let origin = self.active_scene_surface_origins().get(index).copied()?;
                 let (surface_x, surface_y) =
@@ -405,6 +415,10 @@ impl CompositorState {
                     return None;
                 }
                 let index = self.active_scene_surface_index(*root_surface_id)?;
+                self.pointer_hit_metrics.active_scene_index_hits = self
+                    .pointer_hit_metrics
+                    .active_scene_index_hits
+                    .saturating_add(1);
                 let origin = self.active_scene_surface_origins().get(index).copied()?;
                 (self.decoration_hit_for_root_at(*root_surface_id, origin, x, y) == Some(*hit))
                     .then_some(PointerSceneHit::Decoration {

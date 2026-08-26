@@ -1457,6 +1457,10 @@ impl CompositorState {
         {
             self.surface_origin_cache = render::surface_origins(&self.renderable_surfaces);
             self.surface_origin_cache_generation = Some(self.render_generation);
+            self.pointer_hit_metrics.global_origin_cache_recomputes = self
+                .pointer_hit_metrics
+                .global_origin_cache_recomputes
+                .saturating_add(1);
         }
     }
 

@@ -1,7 +1,6 @@
 use super::super::decoration::types::DecorationHit;
 use super::*;
 use crate::wm::LayoutMembership;
-use std::time::Duration;
 
 const MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS: usize = 64;
 
@@ -620,7 +619,7 @@ impl CompositorState {
         let id = self.allocate_window_interaction_id();
         let tiled_resize = tiled_resize_data.is_some();
         self.pending_window_interaction_pointer = None;
-        self.last_window_interaction_geometry_apply = None;
+        self.pending_floating_resize = None;
         self.window_interaction = Some(WindowInteraction {
             id,
             window_id,
@@ -711,7 +710,7 @@ impl CompositorState {
         reason: WindowInteractionEndReason,
     ) -> bool {
         self.pending_window_interaction_pointer = None;
-        self.last_window_interaction_geometry_apply = None;
+        self.pending_floating_resize = None;
         let interaction = self.window_interaction;
         let snapshot = interaction.map(WindowInteraction::debug_snapshot);
         let root_surface_id = snapshot.map(|snapshot| snapshot.root_surface_id);
@@ -894,34 +893,83 @@ impl CompositorState {
                     .pending_move_updates_replaced
                     .saturating_add(1);
             }
-            let interval =
-                Duration::from_nanos(u64::from(self.output_refresh.presentation_refresh_nsec()));
-            if self
-                .last_window_interaction_geometry_apply
-                .is_some_and(|applied_at| applied_at.elapsed() < interval)
-            {
-                return false;
-            }
-            let (_, desired_x, desired_y) = self
-                .pending_window_interaction_pointer
-                .take()
-                .expect("move pointer sample was just queued");
-            let applied = self.apply_window_interaction_by_id(interaction_id, desired_x, desired_y);
-            self.last_window_interaction_geometry_apply = Some(Instant::now());
-            if applied {
-                self.resize_flow_metrics.move_updates_applied = self
-                    .resize_flow_metrics
-                    .move_updates_applied
-                    .saturating_add(1);
-            } else {
-                self.resize_flow_metrics.move_updates_skipped_unchanged = self
-                    .resize_flow_metrics
-                    .move_updates_skipped_unchanged
-                    .saturating_add(1);
-            }
-            return applied;
+            return true;
         }
-        self.apply_window_interaction_by_id(interaction_id, x, y)
+        let Some(interaction) = self.window_interaction else {
+            return false;
+        };
+        let dx = (x - interaction.start_pointer_x).round() as i32;
+        let dy = (y - interaction.start_pointer_y).round() as i32;
+        let WindowInteractionKind::Resize(edges) = interaction.kind else {
+            unreachable!("move interaction was handled above");
+        };
+        if interaction.tiled_resize {
+            return self.apply_window_interaction_by_id(interaction_id, x, y);
+        }
+        if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {
+            return false;
+        }
+        let mut interaction = interaction;
+        interaction.drag_committed = true;
+        self.window_interaction = Some(interaction);
+
+        let resize = interactive_resize_geometry(interaction, edges, dx, dy);
+        let placement = SurfacePlacement {
+            local_x: resize.x,
+            local_y: resize.y,
+            ..interaction.start_placement
+        };
+        let target = self.clamp_resize_geometry(
+            interaction.root_surface_id,
+            WindowGeometry::new(placement, resize.width, resize.height),
+            edges,
+        );
+        self.resize_flow_metrics.raw_pointer_resize_updates = self
+            .resize_flow_metrics
+            .raw_pointer_resize_updates
+            .saturating_add(1);
+        if self
+            .pending_floating_resize
+            .is_some_and(|pending| pending.geometry == target)
+            || (self.pending_floating_resize.is_none()
+                && self.current_visual_root_window_geometry(interaction.root_surface_id)
+                    == Some(target))
+        {
+            self.resize_flow_metrics.resize_updates_skipped_unchanged = self
+                .resize_flow_metrics
+                .resize_updates_skipped_unchanged
+                .saturating_add(1);
+            return false;
+        }
+        if self.pending_floating_resize.is_some() {
+            self.resize_flow_metrics.pending_resize_updates_replaced = self
+                .resize_flow_metrics
+                .pending_resize_updates_replaced
+                .saturating_add(1);
+        }
+        self.pending_floating_resize = Some(PendingFloatingResize {
+            interaction_id,
+            surface_id: interaction.root_surface_id,
+            geometry: target,
+            edges,
+        });
+        resize_debug_log(|| {
+            let timestamp_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
+            format!(
+                "timestamp_ns={timestamp_ns} input_hardware_timestamp_usec={} event=update interaction_id={} root={} pointer=({x},{y}) delta=({dx},{dy}) drag_committed={} visual_applied=false target_geometry=({},{},{},{},{:?}) pending_frame_flush=true",
+                self.last_pointer_motion_usec
+                    .map_or_else(|| "none".to_string(), |timestamp| timestamp.to_string()),
+                interaction.id.get(),
+                interaction.root_surface_id,
+                interaction.drag_committed,
+                target.placement.local_x,
+                target.placement.local_y,
+                target.width,
+                target.height,
+                target.placement.root_mode,
+            )
+        });
+        true
     }
 
     fn apply_window_interaction_by_id(
@@ -979,97 +1027,44 @@ impl CompositorState {
                 }
                 moved
             }
-            WindowInteractionKind::Resize(edges) => {
-                if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {
-                    return false;
-                }
-                interaction.drag_committed = true;
-                self.window_interaction = Some(interaction);
-
-                let resize = interactive_resize_geometry(interaction, edges, dx, dy);
-                let placement = SurfacePlacement {
-                    local_x: resize.x,
-                    local_y: resize.y,
-                    ..interaction.start_placement
-                };
-                let interaction_id = interaction
-                    .resize_interaction_id
-                    .expect("resize interaction has an ID");
-                let target = self.clamp_resize_geometry(
-                    interaction.root_surface_id,
-                    WindowGeometry::new(placement, resize.width, resize.height),
-                    edges,
-                );
-                self.resize_flow_metrics.raw_pointer_resize_updates = self
-                    .resize_flow_metrics
-                    .raw_pointer_resize_updates
-                    .saturating_add(1);
-                if self.current_visual_root_window_geometry(interaction.root_surface_id)
-                    == Some(target)
-                {
-                    self.resize_flow_metrics.resize_updates_skipped_unchanged = self
-                        .resize_flow_metrics
-                        .resize_updates_skipped_unchanged
-                        .saturating_add(1);
-                    return false;
-                }
-                let applied = self.queue_resize_root_window_to(
-                    interaction.root_surface_id,
-                    target.width,
-                    target.height,
-                    target.placement,
-                    edges,
-                    interaction_id,
-                );
-                if applied {
-                    self.resize_flow_metrics.resize_updates_applied = self
-                        .resize_flow_metrics
-                        .resize_updates_applied
-                        .saturating_add(1);
-                    self.flush_pending_resize_configure();
-                } else {
-                    self.resize_flow_metrics.resize_updates_skipped_unchanged = self
-                        .resize_flow_metrics
-                        .resize_updates_skipped_unchanged
-                        .saturating_add(1);
-                }
-                resize_debug_log(|| {
-                    let timestamp_ns =
-                        crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
-                    format!(
-                        "timestamp_ns={timestamp_ns} input_hardware_timestamp_usec={} event=update interaction_id={} root={} pointer=({x},{y}) delta=({dx},{dy}) drag_committed={} visual_applied={} target_geometry=({},{},{},{},{:?})",
-                        self.last_pointer_motion_usec
-                            .map_or_else(|| "none".to_string(), |timestamp| timestamp.to_string()),
-                        interaction.id.get(),
-                        interaction.root_surface_id,
-                        interaction.drag_committed,
-                        applied,
-                        target.placement.local_x,
-                        target.placement.local_y,
-                        target.width,
-                        target.height,
-                        target.placement.root_mode,
-                    )
-                });
-                applied
+            WindowInteractionKind::Resize(_) => {
+                unreachable!("floating resize geometry is applied during frame preparation")
             }
         }
     }
 
-    fn flush_pending_window_interaction(&mut self) -> bool {
+    fn flush_pending_window_interaction(&mut self, terminal: bool) -> bool {
         let Some((interaction_id, x, y)) = self.pending_window_interaction_pointer.take() else {
             return false;
         };
         let Some(interaction) = self.window_interaction else {
+            self.resize_flow_metrics.floating_geometry_stale_drops = self
+                .resize_flow_metrics
+                .floating_geometry_stale_drops
+                .saturating_add(1);
             return false;
         };
         if interaction.id != interaction_id
             || !matches!(interaction.kind, WindowInteractionKind::Move)
         {
+            self.resize_flow_metrics.floating_geometry_stale_drops = self
+                .resize_flow_metrics
+                .floating_geometry_stale_drops
+                .saturating_add(1);
             return false;
         }
+        if terminal {
+            self.resize_flow_metrics.floating_geometry_terminal_flushes = self
+                .resize_flow_metrics
+                .floating_geometry_terminal_flushes
+                .saturating_add(1);
+        } else {
+            self.resize_flow_metrics.floating_geometry_frame_flushes = self
+                .resize_flow_metrics
+                .floating_geometry_frame_flushes
+                .saturating_add(1);
+        }
         let applied = self.apply_window_interaction_by_id(interaction_id, x, y);
-        self.last_window_interaction_geometry_apply = Some(Instant::now());
         if applied {
             self.resize_flow_metrics.move_updates_applied = self
                 .resize_flow_metrics
@@ -1082,6 +1077,77 @@ impl CompositorState {
                 .saturating_add(1);
         }
         applied
+    }
+
+    pub(in crate::compositor) fn has_pending_floating_interaction_geometry(&self) -> bool {
+        self.pending_window_interaction_pointer.is_some() || self.pending_floating_resize.is_some()
+    }
+
+    fn flush_pending_floating_resize(&mut self, terminal: bool) -> bool {
+        let Some(pending) = self.pending_floating_resize.take() else {
+            return false;
+        };
+        let Some(interaction) = self.window_interaction else {
+            self.resize_flow_metrics.floating_geometry_stale_drops = self
+                .resize_flow_metrics
+                .floating_geometry_stale_drops
+                .saturating_add(1);
+            return false;
+        };
+        if interaction.id != pending.interaction_id
+            || interaction.root_surface_id != pending.surface_id
+            || interaction.tiled_resize
+            || !matches!(interaction.kind, WindowInteractionKind::Resize(_))
+        {
+            self.resize_flow_metrics.floating_geometry_stale_drops = self
+                .resize_flow_metrics
+                .floating_geometry_stale_drops
+                .saturating_add(1);
+            return false;
+        }
+        if terminal {
+            self.resize_flow_metrics.floating_geometry_terminal_flushes = self
+                .resize_flow_metrics
+                .floating_geometry_terminal_flushes
+                .saturating_add(1);
+        } else {
+            self.resize_flow_metrics.floating_geometry_frame_flushes = self
+                .resize_flow_metrics
+                .floating_geometry_frame_flushes
+                .saturating_add(1);
+        }
+        let applied = self.queue_resize_root_window_to(
+            pending.surface_id,
+            pending.geometry.width,
+            pending.geometry.height,
+            pending.geometry.placement,
+            pending.edges,
+            interaction
+                .resize_interaction_id
+                .expect("resize interaction has an ID"),
+        );
+        if applied {
+            self.resize_flow_metrics.resize_updates_applied = self
+                .resize_flow_metrics
+                .resize_updates_applied
+                .saturating_add(1);
+        } else {
+            self.resize_flow_metrics.resize_updates_skipped_unchanged = self
+                .resize_flow_metrics
+                .resize_updates_skipped_unchanged
+                .saturating_add(1);
+        }
+        applied
+    }
+
+    fn flush_pending_floating_interaction_geometry_with_context(&mut self, terminal: bool) -> bool {
+        let moved = self.flush_pending_window_interaction(terminal);
+        let resized = self.flush_pending_floating_resize(terminal);
+        moved || resized
+    }
+
+    pub(in crate::compositor) fn flush_pending_floating_interaction_geometry(&mut self) -> bool {
+        self.flush_pending_floating_interaction_geometry_with_context(false)
     }
 
     pub(in crate::compositor) fn end_window_interaction(&mut self) {
@@ -1144,7 +1210,7 @@ impl CompositorState {
             let _ = self.flush_pending_tiled_resize();
         }
         if user_final {
-            let _ = self.flush_pending_window_interaction();
+            let _ = self.flush_pending_floating_interaction_geometry_with_context(true);
         }
         if let Some(interaction) = interaction
             && interaction.drag_committed
