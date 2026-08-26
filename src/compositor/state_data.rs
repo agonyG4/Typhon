@@ -11,7 +11,10 @@ use wayland_server::{
 };
 
 use crate::compositor::state::PendingSurfacePacingState;
-use crate::compositor::{DragSessionPhase, SurfacePresentationState, XdgAssociationReservation};
+use crate::compositor::{
+    DragSessionPhase, SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfacePresentationState,
+    XdgAssociationReservation,
+};
 use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
 };
@@ -29,6 +32,12 @@ pub struct CoreComplianceMetrics {
     pub xdg_reassociation_blocked_stale_unpublished_work: u64,
     pub surface_enter_events: u64,
     pub surface_leave_events: u64,
+    pub broad_membership_reconciliations: u64,
+    pub affected_root_membership_reconciliations: u64,
+    pub membership_surfaces_inspected: u64,
+    pub membership_noops: u64,
+    pub active_root_scene_refreshes: u64,
+    pub prevented_duplicate_root_refreshes: u64,
     pub preferred_scale_events: u64,
     pub preferred_transform_events: u64,
     pub dnd_sessions_started: u64,
@@ -352,6 +361,7 @@ impl SurfaceData {
                         resize_commit: None,
                         resize_capture_finalized: false,
                         buffer_transform: wl_output::Transform::Normal,
+                        opaque_region: SurfaceOpaqueRegion::None,
                     }))
                 } else {
                     resource.data::<DmabufBufferData>().cloned().map(|data| {
@@ -369,6 +379,7 @@ impl SurfaceData {
                             resize_commit: None,
                             resize_capture_finalized: false,
                             buffer_transform: wl_output::Transform::Normal,
+                            opaque_region: SurfaceOpaqueRegion::None,
                         })
                     })
                 }
@@ -640,6 +651,35 @@ impl SurfaceData {
         let changed = state.committed != pending;
         state.committed = pending;
         changed
+    }
+
+    pub(super) fn opaque_region_for_surface_size(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> SurfaceOpaqueRegion {
+        let Ok(state) = self.opaque_region.lock() else {
+            return SurfaceOpaqueRegion::None;
+        };
+        let SurfaceInputRegion::Custom(ops) = &state.committed else {
+            return SurfaceOpaqueRegion::None;
+        };
+        let mut rects = Vec::new();
+        for op in ops {
+            let Some(rect) = clip_opaque_region_rect(op.rect(), width, height) else {
+                continue;
+            };
+            match op {
+                InputRegionOp::Add(_) => rects.push(rect),
+                InputRegionOp::Subtract(_) => {
+                    rects = rects
+                        .into_iter()
+                        .flat_map(|existing| subtract_opaque_rect(existing, rect))
+                        .collect();
+                }
+            }
+        }
+        SurfaceOpaqueRegion::from_rects(rects, width, height)
     }
 
     pub(super) fn take_pending_input_region(&self) -> Option<SurfaceInputRegion> {
@@ -1096,6 +1136,14 @@ pub(super) enum InputRegionOp {
     Subtract(InputRegionRect),
 }
 
+impl InputRegionOp {
+    const fn rect(self) -> InputRegionRect {
+        match self {
+            Self::Add(rect) | Self::Subtract(rect) => rect,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct InputRegionRect {
     x: i32,
@@ -1125,6 +1173,87 @@ impl InputRegionRect {
     }
 }
 
+fn clip_opaque_region_rect(
+    rect: InputRegionRect,
+    surface_width: u32,
+    surface_height: u32,
+) -> Option<SurfaceOpaqueRect> {
+    let left = i64::from(rect.x).max(0);
+    let top = i64::from(rect.y).max(0);
+    let right = i64::from(rect.x)
+        .saturating_add(i64::from(rect.width))
+        .min(i64::from(surface_width));
+    let bottom = i64::from(rect.y)
+        .saturating_add(i64::from(rect.height))
+        .min(i64::from(surface_height));
+    let width = u32::try_from(right.saturating_sub(left)).ok()?;
+    let height = u32::try_from(bottom.saturating_sub(top)).ok()?;
+    SurfaceOpaqueRect::new(
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        width,
+        height,
+    )
+}
+
+fn subtract_opaque_rect(
+    source: SurfaceOpaqueRect,
+    excluded: SurfaceOpaqueRect,
+) -> Vec<SurfaceOpaqueRect> {
+    let source_left = i64::from(source.x);
+    let source_top = i64::from(source.y);
+    let source_right = source_left.saturating_add(i64::from(source.width));
+    let source_bottom = source_top.saturating_add(i64::from(source.height));
+    let excluded_left = i64::from(excluded.x);
+    let excluded_top = i64::from(excluded.y);
+    let excluded_right = excluded_left.saturating_add(i64::from(excluded.width));
+    let excluded_bottom = excluded_top.saturating_add(i64::from(excluded.height));
+    let left = source_left.max(excluded_left);
+    let top = source_top.max(excluded_top);
+    let right = source_right.min(excluded_right);
+    let bottom = source_bottom.min(excluded_bottom);
+    if right <= left || bottom <= top {
+        return vec![source];
+    }
+
+    let mut pieces = Vec::with_capacity(4);
+    push_opaque_rect(&mut pieces, source_left, source_top, source_right, top);
+    push_opaque_rect(
+        &mut pieces,
+        source_left,
+        bottom,
+        source_right,
+        source_bottom,
+    );
+    push_opaque_rect(&mut pieces, source_left, top, left, bottom);
+    push_opaque_rect(&mut pieces, right, top, source_right, bottom);
+    pieces
+}
+
+fn push_opaque_rect(
+    pieces: &mut Vec<SurfaceOpaqueRect>,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+) {
+    if right <= left || bottom <= top {
+        return;
+    }
+    let Ok(width) = u32::try_from(right.saturating_sub(left)) else {
+        return;
+    };
+    let Ok(height) = u32::try_from(bottom.saturating_sub(top)) else {
+        return;
+    };
+    let (Ok(x), Ok(y)) = (i32::try_from(left), i32::try_from(top)) else {
+        return;
+    };
+    if let Some(rect) = SurfaceOpaqueRect::new(x, y, width, height) {
+        pieces.push(rect);
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum PendingSurfaceAttachment {
@@ -1147,6 +1276,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
     pub(super) resize_capture_finalized: bool,
     pub(super) buffer_transform: wl_output::Transform,
+    pub(super) opaque_region: SurfaceOpaqueRegion,
 }
 
 impl PendingSurfaceBuffer {
@@ -1240,6 +1370,8 @@ impl PendingSurfaceBuffer {
             buffer_transform: self.buffer_transform,
             viewport_source: self.viewport_source,
             viewport_destination: self.viewport_destination,
+            #[cfg(not(test))]
+            opaque_region: self.opaque_region.clone(),
             damage,
         })
     }
@@ -1428,6 +1560,40 @@ mod surface_region_tests {
         )]);
         surface.set_pending_opaque_region(region.clone());
         assert_eq!(surface.take_pending_opaque_region(), Some(region));
+    }
+
+    #[test]
+    fn opaque_region_default_is_not_treated_as_full_surface() {
+        let surface = SurfaceData::new(1);
+        assert_eq!(
+            surface.opaque_region_for_surface_size(10, 10),
+            SurfaceOpaqueRegion::None
+        );
+
+        let full = SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+            InputRegionRect::new(0, 0, 10, 10).expect("full opaque rect"),
+        )]);
+        assert!(surface.apply_opaque_region_change(Some(full)));
+        assert_eq!(
+            surface.opaque_region_for_surface_size(10, 10),
+            SurfaceOpaqueRegion::Full
+        );
+    }
+
+    #[test]
+    fn opaque_region_subtract_preserves_a_conservative_hole() {
+        let surface = SurfaceData::new(1);
+        let region = SurfaceInputRegion::Custom(vec![
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 10).unwrap()),
+            InputRegionOp::Subtract(InputRegionRect::new(4, 4, 2, 2).unwrap()),
+        ]);
+        assert!(surface.apply_opaque_region_change(Some(region)));
+        let opaque = surface.opaque_region_for_surface_size(10, 10);
+        let SurfaceOpaqueRegion::Partial(rects) = opaque else {
+            panic!("subtracted opaque region should remain partial");
+        };
+        assert_eq!(rects.len(), 4);
+        assert!(rects.iter().all(|rect| rect.width > 0 && rect.height > 0));
     }
 
     #[test]

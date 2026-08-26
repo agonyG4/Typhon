@@ -22,6 +22,111 @@ impl EglRect {
             height,
         }
     }
+
+    pub(super) fn intersects_output_rect(self, rect: super::OutputRect) -> bool {
+        let left = f64::from(self.x);
+        let top = f64::from(self.y);
+        let right = left + f64::from(self.width);
+        let bottom = top + f64::from(self.height);
+        let rect_left = f64::from(rect.x);
+        let rect_top = f64::from(rect.y);
+        let rect_right = rect_left + f64::from(rect.width);
+        let rect_bottom = rect_top + f64::from(rect.height);
+        self.width > 0.0
+            && self.height > 0.0
+            && rect.width > 0
+            && rect.height > 0
+            && right > rect_left
+            && rect_right > left
+            && bottom > rect_top
+            && rect_bottom > top
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > left && bottom > top).then_some(Self::new(left, top, right - left, bottom - top))
+    }
+}
+
+const MAX_OPAQUE_COVERAGE_PIECES: usize = 32;
+
+pub(super) fn opaque_regions_cover_rect(regions: &[EglRect], target: EglRect) -> bool {
+    let mut remaining = [None; MAX_OPAQUE_COVERAGE_PIECES];
+    remaining[0] = Some(target);
+    let mut remaining_len = 1;
+    for region in regions {
+        let mut next = [None; MAX_OPAQUE_COVERAGE_PIECES];
+        let mut next_len = 0;
+        for piece in remaining.iter().take(remaining_len).flatten() {
+            let mut pieces = [None; 4];
+            let piece_count = subtract_rect(*piece, *region, &mut pieces);
+            for residual in pieces.iter().take(piece_count).flatten() {
+                if next_len == MAX_OPAQUE_COVERAGE_PIECES {
+                    return false;
+                }
+                next[next_len] = Some(*residual);
+                next_len += 1;
+            }
+        }
+        remaining = next;
+        remaining_len = next_len;
+        if remaining_len == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn subtract_rect(source: EglRect, excluded: EglRect, pieces: &mut [Option<EglRect>; 4]) -> usize {
+    let Some(intersection) = source.intersection(excluded) else {
+        pieces[0] = Some(source);
+        return 1;
+    };
+    let source_right = source.x + source.width;
+    let source_bottom = source.y + source.height;
+    let intersection_right = intersection.x + intersection.width;
+    let intersection_bottom = intersection.y + intersection.height;
+    let mut count = 0;
+    if source.y < intersection.y {
+        pieces[count] = Some(EglRect::new(
+            source.x,
+            source.y,
+            source.width,
+            intersection.y - source.y,
+        ));
+        count += 1;
+    }
+    if intersection_bottom < source_bottom {
+        pieces[count] = Some(EglRect::new(
+            source.x,
+            intersection_bottom,
+            source.width,
+            source_bottom - intersection_bottom,
+        ));
+        count += 1;
+    }
+    if source.x < intersection.x {
+        pieces[count] = Some(EglRect::new(
+            source.x,
+            intersection.y,
+            intersection.x - source.x,
+            intersection.height,
+        ));
+        count += 1;
+    }
+    if intersection_right < source_right {
+        pieces[count] = Some(EglRect::new(
+            intersection_right,
+            intersection.y,
+            source_right - intersection_right,
+            intersection.height,
+        ));
+        count += 1;
+    }
+    count
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,9 +170,11 @@ pub(super) enum SurfaceSampling {
     ScaledLinear,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct EglDrawCommand {
     pub(super) layer: EglDrawLayer,
+    pub(super) bounds: EglRect,
+    pub(super) opaque_regions: Vec<EglRect>,
     pub(super) vertex_start: u32,
     pub(super) vertex_count: u32,
     pub(super) sampling: SurfaceSampling,
@@ -130,6 +237,8 @@ pub(super) fn push_draw_command_with_uv(
     if vertex_count > 0 {
         commands.push(EglDrawCommand {
             layer,
+            bounds: rect,
+            opaque_regions: Vec::new(),
             vertex_start,
             vertex_count,
             sampling,
@@ -225,7 +334,7 @@ fn push_textured_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egl_renderer::OutputFramebufferOrigin;
+    use crate::egl_renderer::{OutputFramebufferOrigin, OutputRect};
 
     fn quad_vertices(rect: EglRect, origin: OutputFramebufferOrigin) -> Vec<EglTexturedVertex> {
         let mut vertices = Vec::new();
@@ -321,6 +430,33 @@ mod tests {
             ),
             SurfaceSampling::ScaledLinear
         );
+    }
+
+    #[test]
+    fn draw_command_bounds_intersect_only_repaired_output_area() {
+        let command = EglRect::new(20.0, 30.0, 40.0, 50.0);
+        assert!(command.intersects_output_rect(OutputRect::new(0, 0, 25, 40)));
+        assert!(!command.intersects_output_rect(OutputRect::new(0, 0, 19, 29)));
+    }
+
+    #[test]
+    fn opaque_coverage_respects_partial_regions_and_holes() {
+        let target = EglRect::new(0.0, 0.0, 10.0, 10.0);
+        let ring = [
+            EglRect::new(0.0, 0.0, 10.0, 4.0),
+            EglRect::new(0.0, 6.0, 10.0, 4.0),
+            EglRect::new(0.0, 4.0, 4.0, 2.0),
+            EglRect::new(6.0, 4.0, 4.0, 2.0),
+        ];
+        assert!(opaque_regions_cover_rect(
+            &ring,
+            EglRect::new(0.0, 0.0, 4.0, 4.0)
+        ));
+        assert!(!opaque_regions_cover_rect(&ring, target));
+        assert!(!opaque_regions_cover_rect(
+            &ring,
+            EglRect::new(4.0, 4.0, 2.0, 2.0)
+        ));
     }
 
     #[test]

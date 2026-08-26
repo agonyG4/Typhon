@@ -798,6 +798,71 @@ fn absolute_x11_move_preserves_root_placement_mode() {
 }
 
 #[test]
+fn absolute_xdg_move_updates_scene_without_queued_backend_position_command() {
+    let surface_id = 42;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("XDG desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
+    let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
+
+    assert_eq!(
+        state.surface_placement(surface_id),
+        SurfacePlacement::absolute_root_at(35, 55)
+    );
+    assert!(state.backend_commands.is_empty());
+}
+
+#[test]
+fn interactive_move_keeps_latest_pointer_target_until_terminal_flush() {
+    let surface_id = 42;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("XDG desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
+    let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
+    state.last_window_interaction_geometry_apply = Some(Instant::now());
+    assert!(!state.update_window_interaction_by_id(interaction.id, 180.0, 190.0));
+    assert_eq!(
+        state.surface_placement(surface_id),
+        SurfacePlacement::absolute_root_at(35, 55)
+    );
+    assert!(state.pending_window_interaction_pointer.is_some());
+    assert_eq!(state.resize_flow_metrics.pending_move_updates_replaced, 0);
+
+    assert!(state.end_window_interaction_by_id_with_reason(
+        interaction.id,
+        WindowInteractionEndReason::ExplicitEnd,
+    ));
+    assert_eq!(
+        state.surface_placement(surface_id),
+        SurfacePlacement::absolute_root_at(90, 110)
+    );
+    assert_eq!(state.resize_flow_metrics.raw_pointer_move_updates, 2);
+    assert_eq!(state.resize_flow_metrics.move_updates_applied, 2);
+}
+
+#[test]
 fn absolute_x11_resize_preserves_root_placement_mode() {
     let surface_id = 42;
     let snapshot = test_x11_snapshot(surface_id);

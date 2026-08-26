@@ -397,7 +397,7 @@ impl CompositorState {
             }
             self.invalidate_surface_origin_cache();
             self.refresh_active_scene_surface_tree(root_surface_id);
-            self.reconcile_all_surface_output_memberships();
+            self.reconcile_surface_tree_output_memberships(root_surface_id);
             return;
         };
         if visual_width == 0 || visual_height == 0 {
@@ -447,7 +447,7 @@ impl CompositorState {
         }
         self.invalidate_surface_origin_cache();
         self.refresh_active_scene_surface_tree(root_surface_id);
-        self.reconcile_all_surface_output_memberships();
+        self.reconcile_surface_tree_output_memberships(root_surface_id);
     }
 
     pub(in crate::compositor) fn install_toplevel_visual_geometry(

@@ -18,6 +18,7 @@ pub(in crate::compositor) enum PointerSceneHit {
 pub(in crate::compositor) struct PointerSceneHitCache {
     x: f64,
     y: f64,
+    #[allow(dead_code)]
     scene_render_generation: u64,
     pointer_hit_generation: u64,
     hit: PointerSceneHit,
@@ -209,7 +210,6 @@ impl CompositorState {
         }
         self.refresh_surface_origin_cache();
         if let Some(cache) = self.pointer_scene_hit_cache.as_ref()
-            && cache.scene_render_generation == self.scene_render_generation
             && cache.pointer_hit_generation == self.pointer_hit_generation
             && cache.x == x
             && cache.y == y
@@ -224,6 +224,29 @@ impl CompositorState {
                     as u64;
             }
             return cache.hit.clone();
+        }
+
+        if let Some(hit) = self.pointer_scene_hit_locality_at(x, y) {
+            if instrumentation_enabled {
+                self.pointer_hit_metrics.owner_locality_fast_hits = self
+                    .pointer_hit_metrics
+                    .owner_locality_fast_hits
+                    .saturating_add(1);
+                self.pointer_hit_metrics.pointer_scene_hit_cpu_nanos += started_at
+                    .expect("instrumented hit-test has a start time")
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX))
+                    as u64;
+            }
+            self.pointer_scene_hit_cache = Some(PointerSceneHitCache {
+                x,
+                y,
+                scene_render_generation: self.scene_render_generation,
+                pointer_hit_generation: self.pointer_hit_generation,
+                hit: hit.clone(),
+            });
+            return hit;
         }
 
         if instrumentation_enabled {
@@ -337,6 +360,132 @@ impl CompositorState {
         (PointerSceneHit::None, groups_inspected, surfaces_inspected)
     }
 
+    fn pointer_scene_hit_locality_at(&self, x: f64, y: f64) -> Option<PointerSceneHit> {
+        let cache = self.pointer_scene_hit_cache.as_ref()?;
+        if cache.pointer_hit_generation != self.pointer_hit_generation {
+            return None;
+        }
+        match &cache.hit {
+            PointerSceneHit::Client { target } => {
+                let surface_id = compositor_surface_id(&target.surface);
+                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                if !self.pointer_scene_owner_is_frontmost(
+                    root_surface_id,
+                    Some(surface_id),
+                    None,
+                    x,
+                    y,
+                ) {
+                    return None;
+                }
+                let index = self.active_scene_surface_index(surface_id)?;
+                let renderable = self.active_scene_surfaces().get(index)?;
+                let origin = self.active_scene_surface_origins().get(index).copied()?;
+                let (surface_x, surface_y) =
+                    render::surface_local_point_at_origin(renderable, origin, x, y)?;
+                if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
+                    return None;
+                }
+                let surface = self.surface_resource_by_id(surface_id)?;
+                Some(PointerSceneHit::Client {
+                    target: PointerTarget {
+                        surface,
+                        surface_x,
+                        surface_y,
+                    },
+                })
+            }
+            PointerSceneHit::Decoration {
+                window_id,
+                root_surface_id,
+                hit,
+            } => {
+                if !self.pointer_scene_owner_is_frontmost(*root_surface_id, None, Some(*hit), x, y)
+                {
+                    return None;
+                }
+                let index = self.active_scene_surface_index(*root_surface_id)?;
+                let origin = self.active_scene_surface_origins().get(index).copied()?;
+                (self.decoration_hit_for_root_at(*root_surface_id, origin, x, y) == Some(*hit))
+                    .then_some(PointerSceneHit::Decoration {
+                        window_id: *window_id,
+                        root_surface_id: *root_surface_id,
+                        hit: *hit,
+                    })
+            }
+            PointerSceneHit::None => None,
+        }
+    }
+
+    fn pointer_scene_owner_is_frontmost(
+        &self,
+        owner_root_surface_id: u32,
+        owner_surface_id: Option<u32>,
+        owner_decoration: Option<DecorationHit>,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        for group in self.visual_stack_groups_cache.iter().rev() {
+            let Some(root_index) = self.active_scene_surface_index(group.root_surface_id()) else {
+                continue;
+            };
+            let Some(root_origin) = self.active_scene_surface_origins().get(root_index).copied()
+            else {
+                continue;
+            };
+            let decoration_hit = (!group.is_popup())
+                .then(|| {
+                    self.decoration_hit_for_root_at(group.root_surface_id(), root_origin, x, y)
+                })
+                .flatten()
+                .filter(|hit| {
+                    !self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+                        || (matches!(hit, DecorationHit::Resize(_))
+                            && self
+                                .window_id_for_surface(group.root_surface_id())
+                                .and_then(|window_id| self.window(window_id))
+                                .and_then(|window| window.management)
+                                .is_some_and(|management| {
+                                    management.layout() == crate::wm::LayoutMembership::Tiled
+                                        && management.chrome_policy()
+                                            == crate::wm::WindowChromePolicy::Minimal
+                                }))
+                });
+            let hit = decoration_hit
+                .map(|hit| (group.root_surface_id(), Some(hit)))
+                .or_else(|| {
+                    group
+                        .surface_indices()
+                        .iter()
+                        .rev()
+                        .filter_map(|index| {
+                            let renderable = self.active_scene_surfaces().get(*index)?;
+                            let origin =
+                                self.active_scene_surface_origins().get(*index).copied()?;
+                            let (surface_x, surface_y) =
+                                render::surface_local_point_at_origin(renderable, origin, x, y)?;
+                            self.surface_accepts_input_at(renderable, surface_x, surface_y)
+                                .then_some((renderable.surface_id, None))
+                        })
+                        .find(|(surface_id, _)| self.surface_resource_by_id(*surface_id).is_some())
+                });
+            let Some((surface_id, decoration)) = hit else {
+                continue;
+            };
+            if group.root_surface_id() != owner_root_surface_id {
+                return false;
+            }
+            return match (owner_surface_id, owner_decoration, decoration) {
+                (Some(owner_surface_id), None, None) => surface_id == owner_surface_id,
+                (None, Some(owner_decoration), Some(decoration)) => {
+                    surface_id == owner_root_surface_id && decoration == owner_decoration
+                }
+                _ => false,
+            };
+        }
+        false
+    }
+
     fn root_surface_accepts_input_at(
         &self,
         root_index: usize,
@@ -356,14 +505,14 @@ impl CompositorState {
     }
 
     fn refresh_visual_stack_groups_cache(&mut self) {
-        if self.visual_stack_groups_cache_generation == Some(self.scene_render_generation) {
+        if self.visual_stack_groups_cache_generation == Some(self.pointer_hit_generation) {
             return;
         }
         self.visual_stack_groups_cache = render::visual_stack_groups(
             self.active_scene_surfaces(),
             self.active_scene_popup_surface_ids(),
         );
-        self.visual_stack_groups_cache_generation = Some(self.scene_render_generation);
+        self.visual_stack_groups_cache_generation = Some(self.pointer_hit_generation);
     }
 
     fn pointer_target_at_visual_root_window(

@@ -507,12 +507,12 @@ impl CompositorState {
         generation: u64,
         cause: RenderGenerationCause,
     ) {
-        let scene_effect = self.surface_is_visible_in_active_workspace(surface_id);
+        let scene_effect = self.surface_is_visible_in_active_scene(surface_id);
         self.set_render_generation_with_scene_effect(generation, cause, scene_effect);
         if scene_effect {
             let root_surface_id = self.root_surface_id_for_surface(surface_id);
             if root_surface_id == surface_id {
-                self.refresh_active_scene_surface_tree(root_surface_id);
+                self.refresh_active_scene_surface(root_surface_id);
             } else {
                 self.refresh_active_scene_surface(surface_id);
             }

@@ -199,7 +199,24 @@ impl CompositorState {
             .or_else(|| viewport.source.and_then(ViewportSourceRect::logical_size));
         let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
         let _committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
-        let _opaque_region_changed = data.apply_opaque_region_change(opaque_region);
+        let opaque_region_changed = data.apply_opaque_region_change(opaque_region);
+        let (opaque_width, opaque_height) = surface_size
+            .map(|size| (size.width, size.height))
+            .or_else(|| {
+                self.renderable_surfaces
+                    .iter()
+                    .find(|surface| surface.surface_id == surface_id)
+                    .map(|surface| (surface.width, surface.height))
+            })
+            .unwrap_or((0, 0));
+        let opaque_region = data.opaque_region_for_surface_size(opaque_width, opaque_height);
+        if let Some(renderable) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+        {
+            renderable.set_opaque_region(opaque_region.clone());
+        }
         let input_region_changed = data.apply_input_region_change(input_region);
         if input_region_changed {
             self.advance_pointer_hit_generation();
@@ -207,8 +224,10 @@ impl CompositorState {
         let damage = damage.or(window_geometry
             .is_some()
             .then_some(RenderableSurfaceDamage::Full));
+        let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
+                pending.opaque_region = opaque_region;
                 if let Some((x, y)) = offset {
                     pending.x = x;
                     pending.y = y;

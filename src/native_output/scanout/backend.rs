@@ -169,6 +169,25 @@ impl NativePaintStats {
                 NativePerfField::u64("repair_damage_pixels", repaint.repair_damage_pixels),
                 NativePerfField::usize("scissor_passes", repaint.scissor_passes),
                 NativePerfField::usize("draw_command_replays", repaint.draw_command_replays),
+                NativePerfField::usize("commands_considered", repaint.commands_considered),
+                NativePerfField::usize("commands_executed", repaint.commands_executed),
+                NativePerfField::usize(
+                    "commands_rejected_outside_damage",
+                    repaint.commands_rejected_outside_damage,
+                ),
+                NativePerfField::usize(
+                    "commands_rejected_occluded",
+                    repaint.commands_rejected_occluded,
+                ),
+                NativePerfField::usize("texture_binds", repaint.texture_binds),
+                NativePerfField::usize("draw_calls", repaint.draw_calls),
+                NativePerfField::usize("scene_vbo_uploads", repaint.scene_vbo_uploads),
+                NativePerfField::usize("scene_vbo_upload_bytes", repaint.scene_vbo_upload_bytes),
+                NativePerfField::usize("overlay_vbo_uploads", repaint.overlay_vbo_uploads),
+                NativePerfField::usize(
+                    "overlay_vbo_upload_bytes",
+                    repaint.overlay_vbo_upload_bytes,
+                ),
                 NativePerfField::usize("damage_history_depth", repaint.history_depth),
                 NativePerfField::u64(
                     "output_pixels_avoided",

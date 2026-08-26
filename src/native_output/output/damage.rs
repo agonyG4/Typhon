@@ -256,6 +256,7 @@ pub(crate) struct NativeSceneSnapshot {
     pub(crate) popup_surface_ids: Vec<u32>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) visibility_signature: u64,
+    pub(crate) surface_order_signature: u64,
 }
 
 impl NativeSceneSnapshot {
@@ -264,7 +265,7 @@ impl NativeSceneSnapshot {
         decorations: Vec<DecorationSceneSnapshot>,
     ) -> Self {
         let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
-        let surfaces = elements
+        let surfaces: Vec<NativeSceneSurfaceSnapshot> = elements
             .iter()
             .zip(surfaces)
             .map(|(element, surface)| {
@@ -285,12 +286,15 @@ impl NativeSceneSnapshot {
                 }
             })
             .collect();
+        let surface_order_signature =
+            surface_order_signature(surfaces.iter().map(|surface| surface.surface_id));
         Self {
             surfaces,
             decorations,
             popup_surface_ids: Vec::new(),
             external_overlay_surface_ids: Vec::new(),
             visibility_signature: 0,
+            surface_order_signature,
         }
     }
 
@@ -342,8 +346,17 @@ impl NativeSceneSnapshot {
             mix(u64::from(*surface_id));
         }
         mix(self.visibility_signature);
+        mix(self.surface_order_signature);
         signature
     }
+}
+
+fn surface_order_signature(surface_ids: impl IntoIterator<Item = u32>) -> u64 {
+    surface_ids
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |signature, surface_id| {
+            (signature ^ u64::from(surface_id)).wrapping_mul(0x1000_0000_01b3)
+        })
 }
 
 impl NativeDamageRect {
@@ -943,6 +956,7 @@ pub(crate) fn native_output_damage_for_scene_snapshots(
     if previous.popup_surface_ids != current.popup_surface_ids
         || previous.external_overlay_surface_ids != current.external_overlay_surface_ids
         || previous.visibility_signature != current.visibility_signature
+        || previous.surface_order_signature != current.surface_order_signature
     {
         return NativeOutputDamage::full_output(width, height);
     }
@@ -1001,8 +1015,13 @@ fn native_scene_surface_transition_damage(
             continue;
         };
 
-        let visual_changed = previous_surface.bounds != current_surface.bounds
-            || previous_surface.content_generation != current_surface.content_generation
+        // Content identity is deliberately not a footprint authority. A
+        // known non-empty damage journal remains local, but an identity-only
+        // retry with no journal damage is not proof that the old buffer's
+        // pixels are still valid; repaint the current footprint in that case.
+        let visual_changed = previous_surface.bounds != current_surface.bounds;
+        let content_identity_changed = previous_surface.content_generation
+            != current_surface.content_generation
             || previous_surface.commit_sequence != current_surface.commit_sequence;
         if visual_changed {
             push_clipped_scene_rect(
@@ -1032,6 +1051,13 @@ fn native_scene_surface_transition_damage(
                     &current_surface.damage,
                 );
             }
+        } else if content_identity_changed && current_surface.damage.is_empty() {
+            push_clipped_scene_rect(
+                &mut accumulator,
+                output_width,
+                output_height,
+                current_surface.bounds,
+            );
         } else {
             push_clipped_scene_damage(
                 &mut accumulator,

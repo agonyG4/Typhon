@@ -11,7 +11,8 @@ use khronos_egl as egl;
 use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
-        DesktopVisualState, RenderableSurface, SurfaceDamageRect,
+        DesktopVisualState, RenderableSurface, SurfaceDamageRect, SurfaceOpaqueRect,
+        SurfaceOpaqueRegion,
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
@@ -36,8 +37,8 @@ use damage::{
 };
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
-    SurfaceSampling, VERTEX_STRIDE, push_draw_command, push_draw_command_with_uv,
-    surface_sampling_for_plan,
+    SurfaceSampling, VERTEX_STRIDE, opaque_regions_cover_rect, push_draw_command,
+    push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use program::create_texture_program;
 
@@ -87,6 +88,16 @@ pub(crate) struct GlesSceneFrameStats {
     pub repair_damage_pixels: u64,
     pub scissor_passes: usize,
     pub draw_command_replays: usize,
+    pub commands_considered: usize,
+    pub commands_executed: usize,
+    pub commands_rejected_outside_damage: usize,
+    pub commands_rejected_occluded: usize,
+    pub texture_binds: usize,
+    pub draw_calls: usize,
+    pub scene_vbo_uploads: usize,
+    pub scene_vbo_upload_bytes: usize,
+    pub overlay_vbo_uploads: usize,
+    pub overlay_vbo_upload_bytes: usize,
     pub history_depth: usize,
     pub fallback_reason: Option<FullRepaintReason>,
     pub partial_repaint_enabled: bool,
@@ -182,9 +193,14 @@ pub(crate) struct GlesSceneRenderer {
     cursor_image: std::sync::Arc<CompositorCursorImage>,
     gl: glow::Context,
     program: GlProgram,
-    vertex_array: GlVertexArray,
-    vertex_buffer: GlBuffer,
-    vertex_buffer_capacity: usize,
+    scene_vertex_array: GlVertexArray,
+    scene_vertex_buffer: GlBuffer,
+    scene_vertex_buffer_capacity: usize,
+    scene_geometry_dirty: bool,
+    overlay_vertex_array: GlVertexArray,
+    overlay_vertex_buffer: GlBuffer,
+    overlay_vertex_buffer_capacity: usize,
+    overlay_geometry_dirty: bool,
     current_size: (u32, u32),
     texture_upload_rgba: Vec<u8>,
     vertices: Vec<EglTexturedVertex>,
@@ -255,20 +271,27 @@ impl GlesSceneRenderer {
             })
         };
         let program = create_texture_program(&gl)?;
-        let vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
-        let vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
+        let scene_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
+        let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
+        let overlay_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
+        let overlay_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         unsafe {
-            gl.bind_vertex_array(Some(vertex_array));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
-            gl.buffer_data_size(
-                glow::ARRAY_BUFFER,
-                MIN_VERTEX_BUFFER_BYTES as i32,
-                glow::DYNAMIC_DRAW,
-            );
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, VERTEX_STRIDE, 0);
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, VERTEX_STRIDE, 8);
+            for (vertex_array, vertex_buffer) in [
+                (scene_vertex_array, scene_vertex_buffer),
+                (overlay_vertex_array, overlay_vertex_buffer),
+            ] {
+                gl.bind_vertex_array(Some(vertex_array));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+                gl.buffer_data_size(
+                    glow::ARRAY_BUFFER,
+                    MIN_VERTEX_BUFFER_BYTES as i32,
+                    glow::DYNAMIC_DRAW,
+                );
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, VERTEX_STRIDE, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, VERTEX_STRIDE, 8);
+            }
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
             gl.use_program(Some(program));
@@ -289,9 +312,14 @@ impl GlesSceneRenderer {
         Ok(Self {
             gl,
             program,
-            vertex_array,
-            vertex_buffer,
-            vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            scene_vertex_array,
+            scene_vertex_buffer,
+            scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            scene_geometry_dirty: true,
+            overlay_vertex_array,
+            overlay_vertex_buffer,
+            overlay_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            overlay_geometry_dirty: true,
             cursor_image: cursor_image.clone(),
             current_size: (width, height),
             texture_upload_rgba: Vec::new(),
@@ -1085,6 +1113,7 @@ impl GlesSceneRenderer {
             compositor::WindowVisualGroup::orphan_decoration_count(surfaces, decoration_instances);
         self.vertices.clear();
         self.commands.clear();
+        self.scene_geometry_dirty = true;
         self.vertices.reserve((1 + surfaces.len()) * 6);
         self.commands.reserve(1 + surfaces.len());
 
@@ -1163,6 +1192,7 @@ impl GlesSceneRenderer {
     ) {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
+        self.overlay_geometry_dirty = true;
 
         let render_assignments =
             compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
@@ -1254,15 +1284,10 @@ impl GlesSceneRenderer {
         plan: &RepaintPlan,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<()> {
-        let command_count = self
-            .commands
-            .len()
-            .saturating_add(self.cursor_commands.len());
         unsafe {
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             self.gl.use_program(Some(self.program));
             self.gl.active_texture(glow::TEXTURE0);
-            self.gl.bind_vertex_array(Some(self.vertex_array));
         }
 
         let execution = plan
@@ -1274,9 +1299,8 @@ impl GlesSceneRenderer {
                     self.gl.disable(glow::SCISSOR_TEST);
                     self.gl.clear(glow::COLOR_BUFFER_BIT);
                 }
-                self.draw_command_batch(true)?;
-                self.draw_command_batch(false)?;
-                self.frame_stats.draw_command_replays = command_count;
+                self.draw_command_batch(true, None)?;
+                self.draw_command_batch(false, None)?;
             }
             RenderExecution::Scissored {
                 scissors,
@@ -1291,9 +1315,14 @@ impl GlesSceneRenderer {
                         self.gl.scissor(*x, *y, *width, *height);
                         self.gl.clear(glow::COLOR_BUFFER_BIT);
                     }
+                    let output_rect = gl_scissor_to_output_rect(
+                        [*x, *y, *width, *height],
+                        self.current_size.1,
+                        framebuffer_origin,
+                    );
                     draw_result = self
-                        .draw_command_batch(true)
-                        .and_then(|()| self.draw_command_batch(false));
+                        .draw_command_batch(true, output_rect)
+                        .and_then(|()| self.draw_command_batch(false, output_rect));
                     if draw_result.is_err() {
                         break;
                     }
@@ -1305,20 +1334,21 @@ impl GlesSceneRenderer {
                 }
                 draw_result?;
                 self.frame_stats.scissor_passes = scissors.len();
-                self.frame_stats.draw_command_replays =
-                    command_count.saturating_mul(scissors.len());
             }
         }
 
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
-            self.gl.bind_vertex_array(None);
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
         Ok(())
     }
 
-    fn draw_command_batch(&mut self, scene: bool) -> RendererResult<()> {
+    fn draw_command_batch(
+        &mut self,
+        scene: bool,
+        scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
         let (vertices, commands) = if scene {
             (&self.vertices, &self.commands)
         } else {
@@ -1328,29 +1358,85 @@ impl GlesSceneRenderer {
             return Ok(());
         }
 
-        ensure_vertex_buffer_capacity(
-            &self.gl,
-            self.vertex_buffer,
-            &mut self.vertex_buffer_capacity,
-            vertices.len() * std::mem::size_of::<EglTexturedVertex>(),
-        );
-        unsafe {
-            self.gl
-                .bind_buffer(glow::ARRAY_BUFFER, Some(self.vertex_buffer));
-            self.gl.buffer_sub_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                0,
-                bytemuck::cast_slice(vertices.as_slice()),
+        let required_size = vertices.len() * std::mem::size_of::<EglTexturedVertex>();
+        let mut upload_bytes = 0;
+        let mut uploaded = false;
+        let vertex_array = if scene {
+            ensure_vertex_buffer_capacity(
+                &self.gl,
+                self.scene_vertex_buffer,
+                &mut self.scene_vertex_buffer_capacity,
+                required_size,
             );
+            if self.scene_geometry_dirty {
+                upload_bytes = required_size;
+                unsafe {
+                    self.gl
+                        .bind_buffer(glow::ARRAY_BUFFER, Some(self.scene_vertex_buffer));
+                    self.gl.buffer_sub_data_u8_slice(
+                        glow::ARRAY_BUFFER,
+                        0,
+                        bytemuck::cast_slice(vertices.as_slice()),
+                    );
+                }
+                self.scene_geometry_dirty = false;
+                uploaded = true;
+            }
+            self.scene_vertex_array
+        } else {
+            ensure_vertex_buffer_capacity(
+                &self.gl,
+                self.overlay_vertex_buffer,
+                &mut self.overlay_vertex_buffer_capacity,
+                required_size,
+            );
+            if self.overlay_geometry_dirty {
+                upload_bytes = required_size;
+                unsafe {
+                    self.gl
+                        .bind_buffer(glow::ARRAY_BUFFER, Some(self.overlay_vertex_buffer));
+                    self.gl.buffer_sub_data_u8_slice(
+                        glow::ARRAY_BUFFER,
+                        0,
+                        bytemuck::cast_slice(vertices.as_slice()),
+                    );
+                }
+                self.overlay_geometry_dirty = false;
+                uploaded = true;
+            }
+            self.overlay_vertex_array
+        };
+        unsafe {
+            self.gl.bind_vertex_array(Some(vertex_array));
         }
 
         let mut current_sampling = None;
-        for command in commands {
+        let mut commands_considered = 0;
+        let mut commands_executed = 0;
+        let mut commands_rejected_outside_damage = 0;
+        let mut commands_rejected_occluded = 0;
+        let mut texture_binds = 0;
+        let mut draw_calls = 0;
+        for (command_index, command) in commands.iter().enumerate() {
+            commands_considered += 1;
+            if scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
+                commands_rejected_outside_damage += 1;
+                continue;
+            }
+            if scene
+                && commands[command_index + 1..].iter().any(|occluder| {
+                    opaque_regions_cover_rect(&occluder.opaque_regions, command.bounds)
+                })
+            {
+                commands_rejected_occluded += 1;
+                continue;
+            }
             let Some(texture) = self.texture_for_layer(command.layer) else {
                 continue;
             };
             unsafe {
                 self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                texture_binds += 1;
                 if current_sampling != Some(command.sampling) {
                     let filter = match command.sampling {
                         SurfaceSampling::ExactNearest => glow::NEAREST,
@@ -1367,6 +1453,48 @@ impl GlesSceneRenderer {
                     command.vertex_start as i32,
                     command.vertex_count as i32,
                 );
+            }
+            commands_executed += 1;
+            draw_calls += 1;
+        }
+        self.frame_stats.commands_considered = self
+            .frame_stats
+            .commands_considered
+            .saturating_add(commands_considered);
+        self.frame_stats.commands_executed = self
+            .frame_stats
+            .commands_executed
+            .saturating_add(commands_executed);
+        self.frame_stats.commands_rejected_outside_damage = self
+            .frame_stats
+            .commands_rejected_outside_damage
+            .saturating_add(commands_rejected_outside_damage);
+        self.frame_stats.commands_rejected_occluded = self
+            .frame_stats
+            .commands_rejected_occluded
+            .saturating_add(commands_rejected_occluded);
+        self.frame_stats.texture_binds =
+            self.frame_stats.texture_binds.saturating_add(texture_binds);
+        self.frame_stats.draw_calls = self.frame_stats.draw_calls.saturating_add(draw_calls);
+        self.frame_stats.draw_command_replays = self
+            .frame_stats
+            .draw_command_replays
+            .saturating_add(commands_executed);
+        if uploaded {
+            if scene {
+                self.frame_stats.scene_vbo_uploads =
+                    self.frame_stats.scene_vbo_uploads.saturating_add(1);
+                self.frame_stats.scene_vbo_upload_bytes = self
+                    .frame_stats
+                    .scene_vbo_upload_bytes
+                    .saturating_add(upload_bytes);
+            } else {
+                self.frame_stats.overlay_vbo_uploads =
+                    self.frame_stats.overlay_vbo_uploads.saturating_add(1);
+                self.frame_stats.overlay_vbo_upload_bytes = self
+                    .frame_stats
+                    .overlay_vbo_upload_bytes
+                    .saturating_add(upload_bytes);
             }
         }
         Ok(())
@@ -1415,8 +1543,10 @@ impl GlesSceneRenderer {
         }
 
         unsafe {
-            self.gl.delete_buffer(self.vertex_buffer);
-            self.gl.delete_vertex_array(self.vertex_array);
+            self.gl.delete_buffer(self.scene_vertex_buffer);
+            self.gl.delete_vertex_array(self.scene_vertex_array);
+            self.gl.delete_buffer(self.overlay_vertex_buffer);
+            self.gl.delete_vertex_array(self.overlay_vertex_array);
             self.gl.delete_program(self.program);
         }
     }
@@ -1749,7 +1879,7 @@ impl EglSceneCacheKey {
         self,
         width: u32,
         height: u32,
-        content_generation: u64,
+        _content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
@@ -1758,7 +1888,6 @@ impl EglSceneCacheKey {
     ) -> bool {
         self.width == width
             && self.height == height
-            && self.content_generation == content_generation
             && self.output_scale_key == output_scale_key
             && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
             && self.decoration_signature_hash == egl_decoration_signature_hash(decoration_instances)
@@ -1772,7 +1901,7 @@ impl EglSceneCacheKey {
         self,
         width: u32,
         height: u32,
-        content_generation: u64,
+        _content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_snapshots: &[DecorationSceneSnapshot],
@@ -1780,7 +1909,6 @@ impl EglSceneCacheKey {
     ) -> bool {
         self.width == width
             && self.height == height
-            && self.content_generation == content_generation
             && self.output_scale_key == output_scale_key
             && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
             && self.decoration_signature_hash
@@ -1805,6 +1933,10 @@ struct EglSceneSurfaceSignature {
     surface_id: u32,
     commit_sequence: u64,
     buffer_id: u64,
+    buffer_width: u32,
+    buffer_height: u32,
+    buffer_scale: u32,
+    buffer_transform: wayland_server::protocol::wl_output::Transform,
     x: i32,
     y: i32,
     width: u32,
@@ -1919,6 +2051,66 @@ fn push_egl_render_plan(
         height,
         framebuffer_origin,
     );
+    if let Some(command) = commands.last_mut()
+        && command.layer == EglDrawLayer::Surface(surface.surface_id)
+    {
+        command.opaque_regions = opaque_region_output_rects(surface, render_plan);
+    }
+}
+
+fn opaque_region_output_rects(
+    surface: &RenderableSurface,
+    render_plan: compositor::SurfaceRenderPlan,
+) -> Vec<EglRect> {
+    match surface.opaque_region() {
+        SurfaceOpaqueRegion::None => Vec::new(),
+        SurfaceOpaqueRegion::Full => vec![egl_rect_from_target(render_plan.content_target)],
+        SurfaceOpaqueRegion::Partial(rects) => rects
+            .iter()
+            .filter_map(|rect| map_opaque_rect_to_output(surface, render_plan, *rect))
+            .collect(),
+    }
+}
+
+fn egl_rect_from_target(target: compositor::SurfaceTargetRect) -> EglRect {
+    EglRect::new(
+        target.x() as f32,
+        target.y() as f32,
+        target.width() as f32,
+        target.height() as f32,
+    )
+}
+
+fn map_opaque_rect_to_output(
+    surface: &RenderableSurface,
+    render_plan: compositor::SurfaceRenderPlan,
+    opaque: SurfaceOpaqueRect,
+) -> Option<EglRect> {
+    if surface.width == 0 || surface.height == 0 {
+        return None;
+    }
+    let visual = render_plan.visual_target;
+    let logical_x = f64::from(opaque.x());
+    let logical_y = f64::from(opaque.y());
+    let logical_right = logical_x + f64::from(opaque.width());
+    let logical_bottom = logical_y + f64::from(opaque.height());
+    let scale_x = f64::from(visual.width()) / f64::from(surface.width);
+    let scale_y = f64::from(visual.height()) / f64::from(surface.height);
+    let left = f64::from(visual.x()) + logical_x * scale_x;
+    let top = f64::from(visual.y()) + logical_y * scale_y;
+    let right = f64::from(visual.x()) + logical_right * scale_x;
+    let bottom = f64::from(visual.y()) + logical_bottom * scale_y;
+    let clip = render_plan.content_target;
+    let clipped_left = left.max(f64::from(clip.x()));
+    let clipped_top = top.max(f64::from(clip.y()));
+    let clipped_right = right.min(f64::from(clip.x()) + f64::from(clip.width()));
+    let clipped_bottom = bottom.min(f64::from(clip.y()) + f64::from(clip.height()));
+    (clipped_right > clipped_left && clipped_bottom > clipped_top).then_some(EglRect::new(
+        clipped_left as f32,
+        clipped_top as f32,
+        (clipped_right - clipped_left) as f32,
+        (clipped_bottom - clipped_top) as f32,
+    ))
 }
 
 fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneSurfaceSignature> {
@@ -1931,6 +2123,10 @@ fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneS
                 surface_id: surface.surface_id,
                 commit_sequence: surface.commit_sequence.get(),
                 buffer_id: surface.buffer_id().get(),
+                buffer_width: surface.buffer_size().width,
+                buffer_height: surface.buffer_size().height,
+                buffer_scale: surface.buffer_scale,
+                buffer_transform: surface.buffer_transform,
                 x: surface.x,
                 y: surface.y,
                 width: surface.width,
@@ -1951,8 +2147,10 @@ fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> 
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for signature in signatures {
         hash = fnv1a_u64(hash, u64::from(signature.surface_id));
-        hash = fnv1a_u64(hash, signature.commit_sequence);
-        hash = fnv1a_u64(hash, signature.buffer_id);
+        hash = fnv1a_u64(hash, u64::from(signature.buffer_width));
+        hash = fnv1a_u64(hash, u64::from(signature.buffer_height));
+        hash = fnv1a_u64(hash, u64::from(signature.buffer_scale));
+        hash = fnv1a_u64(hash, signature.buffer_transform as u32 as u64);
         hash = fnv1a_u64(hash, signature.x as u32 as u64);
         hash = fnv1a_u64(hash, signature.y as u32 as u64);
         hash = fnv1a_u64(hash, u64::from(signature.width));
@@ -1963,7 +2161,6 @@ fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> 
         hash = fnv1a_u64(hash, signature.clip_y as u32 as u64);
         hash = fnv1a_u64(hash, u64::from(signature.clip_width));
         hash = fnv1a_u64(hash, u64::from(signature.clip_height));
-        hash = fnv1a_u64(hash, signature.generation);
     }
     hash
 }
@@ -2335,6 +2532,20 @@ fn ensure_vertex_buffer_capacity(
         gl.buffer_data_size(glow::ARRAY_BUFFER, capacity as i32, glow::DYNAMIC_DRAW);
     }
     *current_capacity = capacity;
+}
+
+fn gl_scissor_to_output_rect(
+    [x, y, width, height]: [i32; 4],
+    output_height: u32,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Option<OutputRect> {
+    let top = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => i32::try_from(output_height)
+            .ok()?
+            .checked_sub(y.checked_add(height)?)?,
+        OutputFramebufferOrigin::TopLeftScanout => y,
+    };
+    (width > 0 && height > 0).then_some(OutputRect::new(x, top, width as u32, height as u32))
 }
 
 pub(crate) fn choose_native_egl_config(
@@ -3070,6 +3281,10 @@ mod tests {
             surface_id: 7,
             commit_sequence: 1,
             buffer_id: 11,
+            buffer_width: 800,
+            buffer_height: 600,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
             x: 10,
             y: 20,
             width: 800,
@@ -3120,6 +3335,10 @@ mod tests {
             surface_id: 7,
             commit_sequence: 1,
             buffer_id: 11,
+            buffer_width: 800,
+            buffer_height: 600,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
             x: 10,
             y: 20,
             width: 800,
@@ -3196,11 +3415,15 @@ mod tests {
     }
 
     #[test]
-    fn scene_cache_key_invalidates_when_visible_buffer_identity_changes() {
+    fn scene_cache_key_reuses_geometry_when_visible_buffer_identity_changes() {
         let initial = EglSceneSurfaceSignature {
             surface_id: 7,
             commit_sequence: 1,
             buffer_id: 11,
+            buffer_width: 800,
+            buffer_height: 600,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
             x: 10,
             y: 20,
             width: 800,
@@ -3226,7 +3449,7 @@ mod tests {
             OutputFramebufferOrigin::BottomLeft,
         );
 
-        assert!(!key.is_current(
+        assert!(key.is_current(
             1280,
             800,
             9,
@@ -3237,11 +3460,61 @@ mod tests {
     }
 
     #[test]
+    fn scene_cache_key_reuses_geometry_when_content_generation_changes() {
+        let signature = EglSceneSurfaceSignature {
+            surface_id: 7,
+            commit_sequence: 1,
+            buffer_id: 11,
+            buffer_width: 800,
+            buffer_height: 600,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            render_x: 0,
+            render_y: 0,
+            clip_x: 0,
+            clip_y: 0,
+            clip_width: 0,
+            clip_height: 0,
+            generation: 1,
+        };
+        let key = EglSceneCacheKey::new(
+            1280,
+            800,
+            9,
+            120,
+            &[signature],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(key.is_current(
+            1280,
+            800,
+            10,
+            120,
+            &[EglSceneSurfaceSignature {
+                commit_sequence: 2,
+                buffer_id: 12,
+                generation: 2,
+                ..signature
+            }],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+    }
+
+    #[test]
     fn scene_cache_key_invalidates_when_framebuffer_origin_changes() {
         let signature = EglSceneSurfaceSignature {
             surface_id: 7,
             commit_sequence: 1,
             buffer_id: 11,
+            buffer_width: 800,
+            buffer_height: 600,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
             x: 10,
             y: 20,
             width: 800,

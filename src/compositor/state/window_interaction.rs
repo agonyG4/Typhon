@@ -1,5 +1,7 @@
 use super::super::decoration::types::DecorationHit;
 use super::*;
+use crate::wm::LayoutMembership;
+use std::time::Duration;
 
 const MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS: usize = 64;
 
@@ -616,6 +618,9 @@ impl CompositorState {
             self.focus_surface(root_resource);
         }
         let id = self.allocate_window_interaction_id();
+        let tiled_resize = tiled_resize_data.is_some();
+        self.pending_window_interaction_pointer = None;
+        self.last_window_interaction_geometry_apply = None;
         self.window_interaction = Some(WindowInteraction {
             id,
             window_id,
@@ -705,6 +710,8 @@ impl CompositorState {
         &mut self,
         reason: WindowInteractionEndReason,
     ) -> bool {
+        self.pending_window_interaction_pointer = None;
+        self.last_window_interaction_geometry_apply = None;
         let interaction = self.window_interaction;
         let snapshot = interaction.map(WindowInteraction::debug_snapshot);
         let root_surface_id = snapshot.map(|snapshot| snapshot.root_surface_id);
@@ -866,6 +873,63 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> bool {
+        let Some(interaction) = self.window_interaction else {
+            return false;
+        };
+        if interaction.id != interaction_id {
+            return false;
+        }
+        if matches!(interaction.kind, WindowInteractionKind::Move) {
+            self.resize_flow_metrics.raw_pointer_move_updates = self
+                .resize_flow_metrics
+                .raw_pointer_move_updates
+                .saturating_add(1);
+            if self
+                .pending_window_interaction_pointer
+                .replace((interaction_id, x, y))
+                .is_some()
+            {
+                self.resize_flow_metrics.pending_move_updates_replaced = self
+                    .resize_flow_metrics
+                    .pending_move_updates_replaced
+                    .saturating_add(1);
+            }
+            let interval =
+                Duration::from_nanos(u64::from(self.output_refresh.presentation_refresh_nsec()));
+            if self
+                .last_window_interaction_geometry_apply
+                .is_some_and(|applied_at| applied_at.elapsed() < interval)
+            {
+                return false;
+            }
+            let (_, desired_x, desired_y) = self
+                .pending_window_interaction_pointer
+                .take()
+                .expect("move pointer sample was just queued");
+            let applied = self.apply_window_interaction_by_id(interaction_id, desired_x, desired_y);
+            self.last_window_interaction_geometry_apply = Some(Instant::now());
+            if applied {
+                self.resize_flow_metrics.move_updates_applied = self
+                    .resize_flow_metrics
+                    .move_updates_applied
+                    .saturating_add(1);
+            } else {
+                self.resize_flow_metrics.move_updates_skipped_unchanged = self
+                    .resize_flow_metrics
+                    .move_updates_skipped_unchanged
+                    .saturating_add(1);
+            }
+            return applied;
+        }
+        self.apply_window_interaction_by_id(interaction_id, x, y)
+    }
+
+    fn apply_window_interaction_by_id(
+        &mut self,
+        interaction_id: WindowInteractionId,
+        x: f64,
+        y: f64,
+    ) -> bool {
         let Some(mut interaction) = self.window_interaction else {
             return false;
         };
@@ -887,7 +951,11 @@ impl CompositorState {
                     placement,
                     RenderGenerationCause::WindowMove,
                 );
-                if moved {
+                if moved
+                    && self
+                        .window(interaction.window_id)
+                        .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+                {
                     self.set_x11_frame_geometry(
                         interaction.window_id,
                         WindowGeometry::new(
@@ -988,6 +1056,34 @@ impl CompositorState {
         }
     }
 
+    fn flush_pending_window_interaction(&mut self) -> bool {
+        let Some((interaction_id, x, y)) = self.pending_window_interaction_pointer.take() else {
+            return false;
+        };
+        let Some(interaction) = self.window_interaction else {
+            return false;
+        };
+        if interaction.id != interaction_id
+            || !matches!(interaction.kind, WindowInteractionKind::Move)
+        {
+            return false;
+        }
+        let applied = self.apply_window_interaction_by_id(interaction_id, x, y);
+        self.last_window_interaction_geometry_apply = Some(Instant::now());
+        if applied {
+            self.resize_flow_metrics.move_updates_applied = self
+                .resize_flow_metrics
+                .move_updates_applied
+                .saturating_add(1);
+        } else {
+            self.resize_flow_metrics.move_updates_skipped_unchanged = self
+                .resize_flow_metrics
+                .move_updates_skipped_unchanged
+                .saturating_add(1);
+        }
+        applied
+    }
+
     pub(in crate::compositor) fn end_window_interaction(&mut self) {
         let Some(interaction_id) = self.active_window_interaction_id() else {
             return;
@@ -1038,6 +1134,17 @@ impl CompositorState {
         let interaction = self.window_interaction;
         if interaction.is_none_or(|interaction| interaction.id != interaction_id) {
             return false;
+        }
+        let user_final = matches!(
+            reason,
+            WindowInteractionEndReason::TriggerButtonRelease
+                | WindowInteractionEndReason::ExplicitEnd
+        );
+        if user_final && interaction.is_some_and(|interaction| interaction.tiled_resize) {
+            let _ = self.flush_pending_tiled_resize();
+        }
+        if user_final {
+            let _ = self.flush_pending_window_interaction();
         }
         if let Some(interaction) = interaction
             && interaction.drag_committed

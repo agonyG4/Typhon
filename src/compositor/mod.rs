@@ -267,7 +267,7 @@ use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransacti
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
-    SurfacePlacement, SurfaceRenderBackend,
+    SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCallbackTime(u32);
@@ -333,6 +333,10 @@ pub struct ResizeFlowMetrics {
     pub resize_interactions_completed: u64,
     pub resize_interactions_canceled: u64,
     pub visual_geometry_resize_starts: u64,
+    pub raw_pointer_move_updates: u64,
+    pub pending_move_updates_replaced: u64,
+    pub move_updates_applied: u64,
+    pub move_updates_skipped_unchanged: u64,
     pub raw_pointer_resize_updates: u64,
     pub pending_resize_updates_replaced: u64,
     pub resize_updates_applied: u64,
@@ -611,6 +615,8 @@ pub struct CompositorState {
     last_pointer_x: f64,
     last_pointer_y: f64,
     last_pointer_motion_usec: Option<u64>,
+    pending_window_interaction_pointer: Option<(WindowInteractionId, f64, f64)>,
+    last_window_interaction_geometry_apply: Option<Instant>,
     last_relative_pointer_motion: Option<RelativePointerMotion>,
     last_pointer_press: Option<PointerPress>,
     held_pointer_buttons: Vec<PointerPress>,

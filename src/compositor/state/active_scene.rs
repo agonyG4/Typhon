@@ -162,7 +162,11 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
-        if self.active_scene_view.workspace != Some(self.active_workspace()) {
+        self.compliance_metrics.active_root_scene_refreshes = self
+            .compliance_metrics
+            .active_root_scene_refreshes
+            .saturating_add(1);
+        if self.active_scene_view.selection != Some(self.active_scene_selection()) {
             self.rebuild_active_scene_view();
             return;
         }
@@ -238,15 +242,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn active_scene_surface_origins(&self) -> &[(i32, i32)] {
-        if self.active_scene_view.workspace.is_none()
-            || (cfg!(test)
-                && self.active_scene_view.surfaces.is_empty()
-                && !self.renderable_surfaces.is_empty())
-        {
-            &self.surface_origin_cache
-        } else {
-            self.active_scene_view.surface_origins()
-        }
+        self.active_scene_view.surface_origins()
+    }
+
+    pub(in crate::compositor) fn active_scene_surface_index(
+        &self,
+        surface_id: u32,
+    ) -> Option<usize> {
+        self.active_scene_view
+            .surface_indices
+            .get(&surface_id)
+            .copied()
     }
 
     #[cfg(test)]

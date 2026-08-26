@@ -132,12 +132,20 @@ impl CompositorState {
         &mut self,
         surface: &wl_surface::WlSurface,
     ) {
+        self.compliance_metrics.membership_surfaces_inspected = self
+            .compliance_metrics
+            .membership_surfaces_inspected
+            .saturating_add(1);
         let surface_id = compositor_surface_id(surface);
         let overlaps = self.surface_overlaps_native_output(surface_id);
         let membership = self
             .surface_output_memberships
             .entry(surface_id)
             .or_default();
+        let was_overlapping = membership
+            .physical_outputs
+            .contains(&NATIVE_PHYSICAL_OUTPUT);
+        let mut membership_changed = was_overlapping != overlaps;
 
         if overlaps {
             membership.physical_outputs.insert(NATIVE_PHYSICAL_OUTPUT);
@@ -155,12 +163,17 @@ impl CompositorState {
             for output in output_resources {
                 let output_id = output.id().protocol_id();
                 if membership.entered_resources.remove(&output_id) && surface.is_alive() {
+                    membership_changed = true;
                     let _ = surface.send_event(wl_surface::Event::Leave { output });
                     self.compliance_metrics.surface_leave_events = self
                         .compliance_metrics
                         .surface_leave_events
                         .saturating_add(1);
                 }
+            }
+            if !membership_changed {
+                self.compliance_metrics.membership_noops =
+                    self.compliance_metrics.membership_noops.saturating_add(1);
             }
             self.scrub_empty_surface_output_memberships();
             return;
@@ -169,6 +182,7 @@ impl CompositorState {
         for output in output_resources {
             let output_id = output.id().protocol_id();
             if membership.entered_resources.insert(output_id) && surface.is_alive() {
+                membership_changed = true;
                 let _ = surface.send_event(wl_surface::Event::Enter {
                     output: output.clone(),
                 });
@@ -178,15 +192,48 @@ impl CompositorState {
                     .saturating_add(1);
             }
         }
+        if !membership_changed {
+            self.compliance_metrics.membership_noops =
+                self.compliance_metrics.membership_noops.saturating_add(1);
+        }
         self.send_preferred_buffer_preferences(surface.clone());
     }
 
     pub(in crate::compositor) fn reconcile_all_surface_output_memberships(&mut self) {
+        self.compliance_metrics.broad_membership_reconciliations = self
+            .compliance_metrics
+            .broad_membership_reconciliations
+            .saturating_add(1);
         let surfaces = self.surface_resources.values().cloned().collect::<Vec<_>>();
         for surface in surfaces {
             self.reconcile_surface_output_membership(&surface);
         }
         self.reconcile_idle_inhibition();
+    }
+
+    pub(in crate::compositor) fn reconcile_surface_tree_output_memberships(
+        &mut self,
+        root_surface_id: u32,
+    ) {
+        self.compliance_metrics
+            .affected_root_membership_reconciliations = self
+            .compliance_metrics
+            .affected_root_membership_reconciliations
+            .saturating_add(1);
+        let surface_ids = self
+            .renderable_surfaces
+            .iter()
+            .filter(|surface| {
+                self.root_surface_id_for_surface(surface.surface_id) == root_surface_id
+            })
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        for surface_id in surface_ids {
+            let Some(surface) = self.surface_resource_by_id(surface_id) else {
+                continue;
+            };
+            self.reconcile_surface_output_membership(&surface);
+        }
     }
 
     pub(in crate::compositor) fn scrub_surface_output_membership(&mut self, surface_id: u32) {

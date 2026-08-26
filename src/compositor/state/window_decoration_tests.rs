@@ -60,6 +60,7 @@ fn xdg_state(
         .xdg_decoration_states
         .insert(surface.surface_id, decoration_state);
     state.renderable_surfaces.push(surface);
+    state.rebuild_active_scene_view();
     state
 }
 
@@ -75,6 +76,7 @@ fn x11_state(surface: RenderableSurface) -> CompositorState {
         .insert_desktop_window(window)
         .expect("insert XWayland window");
     state.renderable_surfaces.push(surface);
+    state.rebuild_active_scene_view();
     state
 }
 
@@ -136,6 +138,7 @@ fn pointer_scene_hit_returns_top_window_decoration_before_lower_client() {
         .insert(front.surface_id, front_decoration);
     state.renderable_surfaces = vec![rear, front];
     state.window_stacking = vec![rear_id, front_id];
+    state.rebuild_active_scene_view();
 
     let origins = render::surface_origins(&state.renderable_surfaces);
     let front_origin = origins[1];
@@ -174,6 +177,7 @@ fn pointer_scene_hit_keeps_ssd_above_an_ordinary_subsurface() {
     let mut child = test_surface(43);
     child.placement = SurfacePlacement::subsurface(42, 10, -20);
     state.renderable_surfaces.push(child);
+    state.rebuild_active_scene_view();
 
     let root_origin = render::surface_origins(&state.renderable_surfaces)[0];
     let point = (f64::from(root_origin.0 + 20), f64::from(root_origin.1 - 13));
@@ -253,6 +257,37 @@ fn pointer_scene_hit_metrics_cover_repeated_positions_without_hot_path_clones() 
     assert_eq!(metrics.pointer_scene_hit_root_linear_searches, 0);
     assert!(metrics.pointer_scene_hit_cpu_nanos > 0);
     assert!(state.pointer_scene_hit_cache.is_some());
+}
+
+#[test]
+fn pointer_scene_hit_owner_locality_reuses_scene_owner_for_nearby_decoration_points() {
+    let mut state = xdg_state(
+        test_surface(42),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.pointer_hit_instrumentation_enabled = true;
+    let origin = render::surface_origins(&state.renderable_surfaces)[0];
+
+    let first = state.pointer_scene_hit_at(f64::from(origin.0 + 100), f64::from(origin.1 - 13));
+    let second = state.pointer_scene_hit_at(
+        f64::from(origin.0 + 101) + 0.25,
+        f64::from(origin.1 - 13) + 0.5,
+    );
+
+    let PointerSceneHit::Decoration { hit: first_hit, .. } = first else {
+        panic!("expected decoration hit for first point");
+    };
+    let PointerSceneHit::Decoration {
+        hit: second_hit, ..
+    } = second
+    else {
+        panic!("expected decoration hit for second point");
+    };
+    assert_eq!(first_hit, DecorationHit::Titlebar);
+    assert_eq!(second_hit, DecorationHit::Titlebar);
+    assert_eq!(state.pointer_hit_metrics.full_scene_hit_scans, 1);
+    assert_eq!(state.pointer_hit_metrics.owner_locality_fast_hits, 1);
 }
 
 #[test]

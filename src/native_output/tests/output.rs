@@ -1995,6 +1995,40 @@ pub(super) fn test_renderable_surface(
         viewport_destination: None,
         buffer_scale: 1,
         buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+        opaque_region: oblivion_one::compositor::SurfaceOpaqueRegion::None,
         damage,
     }
+}
+
+#[test]
+fn stable_geometry_content_damage_does_not_escalate_to_full_bounds() {
+    const WIDTH: u32 = 800;
+    const HEIGHT: u32 = 600;
+    let mut previous =
+        test_renderable_surface(197, 100, 80, 400, 300, RenderableSurfaceDamage::Empty);
+    previous.generation = 10;
+    previous.commit_sequence = SurfaceCommitSequence(20);
+    let mut current = previous.clone();
+    current.generation = 11;
+    current.commit_sequence = SurfaceCommitSequence(21);
+    current.damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 10,
+        y: 20,
+        width: 5,
+        height: 6,
+    }]);
+
+    let previous_scene = NativeSceneSnapshot::from_surfaces(&[previous], Vec::new());
+    let current_scene = NativeSceneSnapshot::from_surfaces(&[current], Vec::new());
+    let damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        &previous_scene,
+        &current_scene,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_eq!(damage.rects.len(), 1);
+    assert_eq!(damage.rects[0].width, 5);
+    assert_eq!(damage.rects[0].height, 6);
 }

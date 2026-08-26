@@ -1426,17 +1426,24 @@ impl CompositorState {
             .find(|surface| surface.surface_id == surface_id)
         {
             surface.placement = placement;
-            if self
+            let refreshed_by_visual_assignment = self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
-                || self.toplevel_surfaces.contains_key(&root_surface_id)
-            {
+                || self.toplevel_surfaces.contains_key(&root_surface_id);
+            if refreshed_by_visual_assignment {
                 self.update_toplevel_visual_render_assignment(root_surface_id);
+            } else {
+                self.refresh_active_scene_surface_tree(root_surface_id);
             }
-            self.refresh_active_scene_surface_tree(root_surface_id);
+            if refreshed_by_visual_assignment {
+                self.compliance_metrics.prevented_duplicate_root_refreshes = self
+                    .compliance_metrics
+                    .prevented_duplicate_root_refreshes
+                    .saturating_add(1);
+            }
             self.advance_render_generation_with_scene_effect(
                 cause,
-                self.surface_is_visible_in_active_workspace(root_surface_id),
+                self.surface_is_visible_in_active_scene(root_surface_id),
             );
             return true;
         }

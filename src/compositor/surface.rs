@@ -112,6 +112,84 @@ pub enum SurfaceRenderBackend {
     Xwayland,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceOpaqueRegion {
+    None,
+    Full,
+    Partial(Vec<SurfaceOpaqueRect>),
+}
+
+impl Default for SurfaceOpaqueRegion {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceOpaqueRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl SurfaceOpaqueRect {
+    pub(crate) const fn new(x: i32, y: i32, width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 {
+            None
+        } else {
+            Some(Self {
+                x,
+                y,
+                width,
+                height,
+            })
+        }
+    }
+
+    pub const fn x(self) -> i32 {
+        self.x
+    }
+
+    pub const fn y(self) -> i32 {
+        self.y
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
+impl SurfaceOpaqueRegion {
+    pub(crate) fn from_rects(
+        mut rects: Vec<SurfaceOpaqueRect>,
+        surface_width: u32,
+        surface_height: u32,
+    ) -> Self {
+        rects.retain(|rect| rect.width > 0 && rect.height > 0);
+        if rects.is_empty() {
+            return Self::None;
+        }
+        if rects.len() == 1 {
+            let rect = rects[0];
+            let right = i64::from(rect.x).saturating_add(i64::from(rect.width));
+            let bottom = i64::from(rect.y).saturating_add(i64::from(rect.height));
+            if rect.x <= 0
+                && rect.y <= 0
+                && right >= i64::from(surface_width)
+                && bottom >= i64::from(surface_height)
+            {
+                return Self::Full;
+            }
+        }
+        Self::Partial(rects)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderableSurface {
     pub surface_id: u32,
@@ -138,10 +216,33 @@ pub struct RenderableSurface {
     pub buffer_transform: wayland_server::protocol::wl_output::Transform,
     pub viewport_source: Option<ViewportSourceRect>,
     pub viewport_destination: Option<BufferSize>,
+    #[cfg(not(test))]
+    pub opaque_region: SurfaceOpaqueRegion,
     pub damage: RenderableSurfaceDamage,
 }
 
 impl RenderableSurface {
+    #[allow(dead_code)]
+    pub fn opaque_region(&self) -> SurfaceOpaqueRegion {
+        #[cfg(not(test))]
+        {
+            self.opaque_region.clone()
+        }
+        #[cfg(test)]
+        {
+            SurfaceOpaqueRegion::None
+        }
+    }
+
+    pub(crate) fn set_opaque_region(&mut self, region: SurfaceOpaqueRegion) {
+        #[cfg(not(test))]
+        {
+            self.opaque_region = region;
+        }
+        #[cfg(test)]
+        let _ = region;
+    }
+
     pub(crate) fn mark_xwayland(&mut self) {
         self.render_backend = SurfaceRenderBackend::Xwayland;
     }
