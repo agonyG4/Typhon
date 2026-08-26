@@ -279,6 +279,7 @@ pub(crate) struct NativeCursorOutputArbitration {
     deadline_ns: Option<u64>,
     desired_epoch: u64,
     primary_response_window_open: bool,
+    hardware_cursor_pending: bool,
     software_overlay_pending: bool,
     pub(crate) response_windows_opened: u64,
     pub(crate) changes_coalesced: u64,
@@ -292,6 +293,20 @@ pub(crate) struct NativeCursorOutputArbitration {
 
 impl NativeCursorOutputArbitration {
     pub(crate) fn request(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
+        self.request_with_source(epoch, now_ns, deadline_ns, false);
+    }
+
+    pub(crate) fn request_hardware(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
+        self.request_with_source(epoch, now_ns, deadline_ns, true);
+    }
+
+    fn request_with_source(
+        &mut self,
+        epoch: u64,
+        now_ns: u64,
+        deadline_ns: u64,
+        hardware_cursor: bool,
+    ) {
         if self.pending_since_ns.is_none() {
             self.pending_since_ns = Some(now_ns);
             self.deadline_ns = Some(deadline_ns);
@@ -301,6 +316,7 @@ impl NativeCursorOutputArbitration {
             self.changes_coalesced = self.changes_coalesced.saturating_add(1);
         }
         self.desired_epoch = epoch;
+        self.hardware_cursor_pending |= hardware_cursor;
     }
 
     pub(crate) const fn deadline_ns(&self) -> Option<u64> {
@@ -322,6 +338,17 @@ impl NativeCursorOutputArbitration {
 
     pub(crate) fn set_software_overlay_pending(&mut self, pending: bool) {
         self.software_overlay_pending = pending;
+    }
+
+    pub(crate) fn reconcile_hardware_cursor_liveness(&mut self, needed: bool) {
+        if needed {
+            self.hardware_cursor_pending = true;
+        } else if self.hardware_cursor_pending {
+            self.hardware_cursor_pending = false;
+            if !self.software_overlay_pending {
+                self.clear_pending();
+            }
+        }
     }
 
     pub(crate) fn note_disposition(&mut self, disposition: NativeCursorOutputDisposition) {
@@ -445,6 +472,7 @@ impl NativeCursorOutputArbitration {
         self.deadline_ns = None;
         self.desired_epoch = 0;
         self.primary_response_window_open = false;
+        self.hardware_cursor_pending = false;
         self.software_overlay_pending = false;
     }
 }
@@ -463,10 +491,11 @@ pub(crate) fn update_cursor_output_arbitration(
         hardware_cursor_work_pending && cursor_epoch != last_submitted_cursor_epoch;
     let output_cursor_work_changed = hardware_cursor_changed || software_overlay_pending;
     if output_cursor_work_changed {
-        arbitration.request(
+        arbitration.request_with_source(
             cursor_epoch,
             now_ns,
             frame_scheduler.next_refresh_deadline_ns(now_ns),
+            hardware_cursor_changed,
         );
     }
     let deadline_due = arbitration.due(now_ns);

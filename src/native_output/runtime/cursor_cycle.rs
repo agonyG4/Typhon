@@ -1,5 +1,27 @@
 use super::*;
 
+pub(crate) fn observe_atomic_cursor_output_liveness(
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    arbitration: &mut NativeCursorOutputArbitration,
+    frame_scheduler: &NativeFrameScheduler,
+    now_ns: u64,
+) -> bool {
+    let Some(cursor) = atomic_cursor else {
+        return false;
+    };
+    let needed = cursor.needs_output_liveness();
+    arbitration.reconcile_hardware_cursor_liveness(needed);
+    if !needed {
+        return false;
+    }
+    arbitration.request_hardware(
+        cursor.desired_epoch(),
+        now_ns,
+        frame_scheduler.next_refresh_deadline_ns(now_ns),
+    );
+    true
+}
+
 pub(crate) fn defer_cursor_after_busy(
     arbitration: &mut NativeCursorOutputArbitration,
     scheduler: &mut NativeFrameScheduler,

@@ -72,7 +72,8 @@ pub(super) use atomic_commit::{
 };
 pub(super) use cursor_cycle::{
     atomic_cursor_visibility_policy, effective_atomic_cursor_state, log_client_cursor_path,
-    resolve_client_cursor_path, synchronize_cursor_state_for_server,
+    observe_atomic_cursor_output_liveness, resolve_client_cursor_path,
+    synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
 #[cfg(test)]

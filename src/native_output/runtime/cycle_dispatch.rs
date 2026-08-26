@@ -748,6 +748,7 @@ impl NativeRuntime {
             parked_acquire_watches: _,
             event_loop,
             drm_reactor_token: _,
+            cursor_output_arbitration,
             frame_scheduler,
             effective_app_gpu_policy,
             scene_history: _,
@@ -978,6 +979,12 @@ impl NativeRuntime {
             let _ = server.end_native_input_batch();
             return Err(error.into());
         }
+        let _ = observe_atomic_cursor_output_liveness(
+            atomic_cursor.as_ref(),
+            cursor_output_arbitration,
+            frame_scheduler,
+            monotonic_now_ns()?,
+        );
         let client_flush = server.end_native_input_batch()?;
         if client_flush {
             render_telemetry.resource_efficiency.record_client_flush();

@@ -1,7 +1,8 @@
 use super::*;
 use crate::native_output::OutputTransactionId;
 use crate::native_output::runtime::{
-    NativeCursorOutputArbitration, update_cursor_output_arbitration,
+    NativeCursorOutputArbitration, observe_atomic_cursor_output_liveness,
+    update_cursor_output_arbitration,
 };
 use oblivion_one::native::kms::{
     AtomicPlaneProperties, DrmFormatModifierPair, PlanePropertyId, PropertyId,
@@ -243,6 +244,68 @@ fn cursor_output_liveness_survives_a_newer_state_during_inflight_submission() {
     cursor.set_position(0, 0);
 
     assert!(cursor.needs_output_liveness());
+}
+
+#[test]
+fn input_boundary_observer_arms_one_scheduler_derived_cursor_window() {
+    let mut cursor = test_cursor();
+    cursor.set_visible(true);
+    cursor.current = cursor.desired.clone();
+    cursor.set_position(100, 200);
+    let scheduler = NativeFrameScheduler::new(165, 0);
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    let scene_redraw_requested = false;
+
+    assert!(observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_000,
+    ));
+    assert!(arbitration.pending());
+    assert_eq!(
+        arbitration.deadline_ns(),
+        Some(scheduler.next_refresh_deadline_ns(1_000))
+    );
+    assert!(!scene_redraw_requested);
+
+    let first_deadline = arbitration.deadline_ns();
+    cursor.set_position(120, 220);
+    assert!(observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_001,
+    ));
+    assert_eq!(arbitration.deadline_ns(), first_deadline);
+    assert_eq!(arbitration.response_windows_opened(), 1);
+    assert_eq!(arbitration.changes_coalesced(), 1);
+}
+
+#[test]
+fn input_boundary_observer_cancels_stale_atomic_debt_before_submission() {
+    let mut cursor = test_cursor();
+    cursor.set_visible(true);
+    cursor.current = cursor.desired.clone();
+    cursor.set_position(100, 200);
+    let scheduler = NativeFrameScheduler::new(165, 0);
+    let mut arbitration = NativeCursorOutputArbitration::default();
+
+    assert!(observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_000,
+    ));
+    cursor.set_position(0, 0);
+
+    assert!(!observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_001,
+    ));
+    assert!(!arbitration.pending());
 }
 
 #[test]
