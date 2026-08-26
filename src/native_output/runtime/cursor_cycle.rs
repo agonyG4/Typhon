@@ -5,11 +5,27 @@ pub(crate) fn observe_atomic_cursor_output_liveness(
     arbitration: &mut NativeCursorOutputArbitration,
     frame_scheduler: &NativeFrameScheduler,
     now_ns: u64,
+    cursor_render_mode: NativeCursorRenderMode,
+    input_visible: bool,
 ) -> bool {
     let Some(cursor) = atomic_cursor else {
         return false;
     };
-    let needed = cursor.needs_output_liveness();
+    let desired = matches!(
+        atomic_cursor_visibility_policy(
+            cursor.desired().visible,
+            cursor.capability_quarantined(),
+            cursor_render_mode,
+            input_visible,
+        ),
+        AtomicCursorVisibilityPolicy::HardwareVisible
+    )
+    .then_some(cursor.desired());
+    let needed = if desired.is_some() {
+        cursor.needs_output_liveness()
+    } else {
+        cursor.needs_output_liveness_for(None)
+    };
     arbitration.reconcile_hardware_cursor_liveness(needed);
     if !needed {
         return false;

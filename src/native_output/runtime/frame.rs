@@ -511,6 +511,21 @@ mod tests {
     use super::NativeCursorOutputArbitration;
 
     #[test]
+    fn stale_atomic_cursor_debt_is_cleared_without_clearing_software_work() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        arbitration.request_hardware(7, 1_000, 2_000);
+        arbitration.set_software_overlay_pending(true);
+        arbitration.reconcile_hardware_cursor_liveness(false);
+
+        assert!(arbitration.pending());
+        assert_eq!(
+            arbitration.disposition(2_000, false, false),
+            super::NativeCursorOutputDisposition::SoftwareOverlay
+        );
+    }
+
+    #[test]
     fn cursor_submit_consumes_only_exact_queued_epoch() {
         let mut arbitration = NativeCursorOutputArbitration::default();
         arbitration.request(10, 1, 100);

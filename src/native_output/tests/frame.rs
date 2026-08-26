@@ -1061,6 +1061,31 @@ fn one_thousand_pointer_updates_coalesce_before_the_primary_deadline() {
 }
 
 #[test]
+fn one_thousand_hardware_cursor_updates_keep_one_scheduler_window() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    let scheduler = NativeFrameScheduler::new(165, 0);
+    let first_deadline = scheduler.next_refresh_deadline_ns(1_000);
+
+    arbitration.request_hardware(1, 1_001, first_deadline);
+    for epoch in 2..=1_000 {
+        arbitration.request_hardware(epoch, 1_000 + epoch, first_deadline.saturating_add(10_000));
+    }
+
+    assert_eq!(arbitration.deadline_ns(), Some(first_deadline));
+    assert_eq!(arbitration.desired_epoch(), 1_000);
+    assert_eq!(arbitration.response_windows_opened(), 1);
+    assert_eq!(arbitration.changes_coalesced(), 999);
+    assert_eq!(
+        arbitration.disposition(first_deadline.saturating_sub(1), false, true),
+        NativeCursorOutputDisposition::DeferForPrimary
+    );
+    assert_eq!(
+        arbitration.disposition(first_deadline, false, true),
+        NativeCursorOutputDisposition::SubmitPlaneDelta
+    );
+}
+
+#[test]
 fn one_hundred_cursor_changes_produce_one_plane_delta_plan() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     for epoch in 1..=100 {

@@ -213,13 +213,26 @@ impl NativeAtomicCursor {
     }
 
     pub(crate) fn needs_output_liveness(&self) -> bool {
+        self.needs_output_liveness_for(Some(&self.desired))
+    }
+
+    pub(crate) fn needs_output_liveness_for(
+        &self,
+        desired: Option<&AtomicCursorVisualState>,
+    ) -> bool {
+        let hidden = AtomicCursorVisualState {
+            visible: false,
+            framebuffer_id: None,
+            ..self.desired.clone()
+        };
+        let desired = desired.unwrap_or(&hidden);
         let future_output = self
             .worker_queued
             .as_ref()
             .map(|queued| &queued.visual_state)
             .or_else(|| self.pending_token.as_ref().map(|_| &self.submitted))
             .unwrap_or(&self.current);
-        !self.desired.kms_equivalent(future_output)
+        !desired.kms_equivalent(future_output)
     }
 
     pub(crate) fn presented_plane_state(

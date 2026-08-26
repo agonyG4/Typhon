@@ -1,7 +1,7 @@
 use super::*;
 use crate::native_output::OutputTransactionId;
 use crate::native_output::runtime::{
-    NativeCursorOutputArbitration, observe_atomic_cursor_output_liveness,
+    NativeCursorOutputArbitration, NativeCursorRenderMode, observe_atomic_cursor_output_liveness,
     update_cursor_output_arbitration,
 };
 use oblivion_one::native::kms::{
@@ -261,6 +261,8 @@ fn input_boundary_observer_arms_one_scheduler_derived_cursor_window() {
         &mut arbitration,
         &scheduler,
         1_000,
+        NativeCursorRenderMode::Hardware,
+        true,
     ));
     assert!(arbitration.pending());
     assert_eq!(
@@ -276,6 +278,8 @@ fn input_boundary_observer_arms_one_scheduler_derived_cursor_window() {
         &mut arbitration,
         &scheduler,
         1_001,
+        NativeCursorRenderMode::Hardware,
+        true,
     ));
     assert_eq!(arbitration.deadline_ns(), first_deadline);
     assert_eq!(arbitration.response_windows_opened(), 1);
@@ -296,6 +300,8 @@ fn input_boundary_observer_cancels_stale_atomic_debt_before_submission() {
         &mut arbitration,
         &scheduler,
         1_000,
+        NativeCursorRenderMode::Hardware,
+        true,
     ));
     cursor.set_position(0, 0);
 
@@ -304,8 +310,88 @@ fn input_boundary_observer_cancels_stale_atomic_debt_before_submission() {
         &mut arbitration,
         &scheduler,
         1_001,
+        NativeCursorRenderMode::Hardware,
+        true,
     ));
     assert!(!arbitration.pending());
+}
+
+#[test]
+fn software_cursor_only_arms_atomic_liveness_to_clear_a_visible_plane() {
+    let mut cursor = test_cursor();
+    cursor.current.visible = true;
+    cursor.desired.visible = true;
+    let scheduler = NativeFrameScheduler::new(165, 0);
+    let mut arbitration = NativeCursorOutputArbitration::default();
+
+    assert!(observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_000,
+        NativeCursorRenderMode::Software,
+        true,
+    ));
+    assert!(arbitration.pending());
+
+    arbitration.clear_pending();
+    cursor.current.visible = false;
+    assert!(!observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_001,
+        NativeCursorRenderMode::Software,
+        true,
+    ));
+    assert!(!arbitration.pending());
+}
+
+#[test]
+fn input_boundary_liveness_rearms_after_an_older_inflight_cursor_completes() {
+    let mut cursor = test_cursor();
+    cursor.current.visible = true;
+    cursor.desired.visible = true;
+    cursor.set_position(100, 200);
+    let submitted_epoch = cursor.desired_epoch();
+    let submitted_state = cursor.desired().clone();
+    let submitted_revision = cursor.desired_revision();
+    let token = PageFlipToken::new(83).unwrap();
+
+    cursor.begin_submission_at_revision_with_capability_key(
+        token,
+        submitted_state,
+        submitted_epoch,
+        submitted_revision,
+        None,
+    );
+    cursor.set_position(0, 0);
+    let newer_epoch = cursor.desired_epoch();
+    let scheduler = NativeFrameScheduler::new(165, 0);
+    let mut arbitration = NativeCursorOutputArbitration::default();
+
+    assert!(observe_atomic_cursor_output_liveness(
+        Some(&cursor),
+        &mut arbitration,
+        &scheduler,
+        1_000,
+        NativeCursorRenderMode::Hardware,
+        true,
+    ));
+    assert_eq!(arbitration.desired_epoch(), newer_epoch);
+
+    cursor
+        .complete_submission(token, cursor.generation)
+        .expect("the older cursor submission completes");
+    arbitration.consume_submitted_epoch(
+        submitted_epoch,
+        2_000,
+        scheduler.next_refresh_deadline_ns(2_000),
+    );
+
+    assert!(arbitration.pending());
+    assert_eq!(arbitration.desired_epoch(), newer_epoch);
+    assert!(arbitration.deadline_ns().is_some());
 }
 
 #[test]

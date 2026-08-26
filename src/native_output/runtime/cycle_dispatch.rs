@@ -984,6 +984,8 @@ impl NativeRuntime {
             cursor_output_arbitration,
             frame_scheduler,
             monotonic_now_ns()?,
+            *cursor_render_mode,
+            input_state.cursor_visible(),
         );
         let client_flush = server.end_native_input_batch()?;
         if client_flush {
