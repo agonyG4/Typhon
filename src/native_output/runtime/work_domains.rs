@@ -11,7 +11,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) scene_dirty: bool,
     pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
-    pub(super) explicit_sync_pending: bool,
+    pub(super) explicit_sync_service_due: bool,
     pub(super) astrea_publication_due: bool,
     pub(super) commit_timing_planning_due: bool,
     pub(super) pacing_active: bool,
@@ -44,6 +44,20 @@ pub(crate) struct NativeWorkDomains {
 pub(crate) struct NativeCycleOperationPlan {
     pub(super) service_input: bool,
     pub(super) dispatch_wayland_read_side: bool,
+    pub(super) service_acquire_and_prepare: bool,
+    pub(super) explicit_sync_service: bool,
+    pub(super) presentation_due: bool,
+}
+
+impl NativeCycleOperationPlan {
+    pub(super) const fn presentation_admitted(
+        self,
+        redraw_requested: bool,
+        frame_completed: bool,
+        visual_work_created: bool,
+    ) -> bool {
+        self.presentation_due || redraw_requested || frame_completed || visual_work_created
+    }
 }
 
 impl NativeWorkDomains {
@@ -72,6 +86,9 @@ impl NativeWorkDomains {
         NativeCycleOperationPlan {
             service_input: self.input,
             dispatch_wayland_read_side: self.wayland_dispatch,
+            service_acquire_and_prepare: self.scene || self.explicit_sync,
+            explicit_sync_service: self.explicit_sync,
+            presentation_due: self.presentation,
         }
     }
 
@@ -97,7 +114,7 @@ impl NativeWorkDomains {
             || state.xwayland_generation_changed;
         let explicit_sync = reasons.explicit_sync_acquire()
             || !wakeup.explicit_sync_acquire_tokens.is_empty()
-            || state.explicit_sync_pending;
+            || state.explicit_sync_service_due;
         let astrea_publication = state.astrea_publication_due;
         let commit_timing_planning = state.commit_timing_planning_due;
         let cursor = reasons.cursor_io_worker()
@@ -110,6 +127,7 @@ impl NativeWorkDomains {
             || reasons.kms_commit_worker()
             || reasons.output_render_fence()
             || state.visual_work_deadline_due
+            || state.cursor_only_due
             || state.recovery_required;
 
         Self {
@@ -234,12 +252,99 @@ mod tests {
     }
 
     #[test]
+    fn one_thousand_independent_input_cycles_use_production_service_gates() {
+        // This is the native cycle's stable-state service plan: a future
+        // Commit Timing transaction is intentionally represented by no due
+        // domain because its deadline/candidate service is not ready.
+        let stable_future_transaction = state();
+        let mut input_services = 0;
+        let mut wayland_read_dispatches = 0;
+        let mut explicit_sync_services = 0;
+        let mut acquire_prepare_services = 0;
+        let mut pacing_services = 0;
+        let mut presentation_plans = 0;
+        let mut commit_timing_plans = 0;
+
+        for _ in 0..1_000 {
+            let domains = NativeWorkDomains::classify(&wakeup(INPUT), &stable_future_transaction);
+            let plan = domains.operation_plan();
+            input_services += u64::from(plan.service_input);
+            wayland_read_dispatches += u64::from(plan.dispatch_wayland_read_side);
+            explicit_sync_services += u64::from(plan.explicit_sync_service);
+            acquire_prepare_services += u64::from(plan.service_acquire_and_prepare);
+            pacing_services += u64::from(domains.should_service_surface_pacing());
+            presentation_plans += u64::from(plan.presentation_admitted(false, false, false));
+            commit_timing_plans += u64::from(domains.commit_timing_planning);
+        }
+
+        assert_eq!(input_services, 1_000);
+        assert_eq!(wayland_read_dispatches, 0);
+        assert_eq!(explicit_sync_services, 0);
+        assert_eq!(acquire_prepare_services, 0);
+        assert_eq!(pacing_services, 0);
+        assert_eq!(presentation_plans, 0);
+        assert_eq!(commit_timing_plans, 0);
+    }
+
+    #[test]
+    fn explicit_sync_notifier_readiness_is_serviceable_without_pending_state_scan() {
+        let plan =
+            NativeWorkDomains::classify(&wakeup(EXPLICIT_SYNC_ACQUIRE), &state()).operation_plan();
+
+        assert!(plan.explicit_sync_service);
+        assert!(plan.service_acquire_and_prepare);
+    }
+
+    #[test]
     fn input_with_explicit_sync_requires_acquire_service() {
         let decision =
             NativeWorkDomains::from_wakeup(&wakeup(INPUT | EXPLICIT_SYNC_ACQUIRE), &state());
 
         assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
         assert!(decision.service_explicit_sync_acquire);
+    }
+
+    #[test]
+    fn acquire_service_without_output_work_does_not_admit_presentation() {
+        let plan = NativeWorkDomains::classify(
+            &wakeup(EXPLICIT_SYNC_ACQUIRE),
+            &NativeRuntimeState {
+                explicit_sync_service_due: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+
+        assert!(plan.service_acquire_and_prepare);
+        assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn cursor_only_output_does_not_admit_acquire_service() {
+        let plan = NativeWorkDomains::classify(
+            &wakeup(TIMER),
+            &NativeRuntimeState {
+                cursor_only_due: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+
+        assert!(!plan.service_acquire_and_prepare);
+        assert!(plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn pending_ordered_transaction_does_not_masquerade_as_explicit_sync_service() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                scene_dirty: true,
+                ..state()
+            },
+        );
+
+        assert!(!domains.explicit_sync);
     }
 
     #[test]

@@ -18,6 +18,15 @@ pub fn run(
     })?;
     runtime.run()
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AcquirePrepareOutcome {
+    acquire_service_ran: bool,
+    acquire_state_changed: bool,
+    frame_prepare_ran: bool,
+    visual_work_created: bool,
+}
+
 impl NativeRuntime {
     fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
         let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
@@ -40,7 +49,14 @@ impl NativeRuntime {
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
-            explicit_sync_pending: self.server.has_pending_explicit_sync_work(),
+            explicit_sync_service_due: cycle.wakeup.reasons.explicit_sync_acquire()
+                || !cycle.wakeup.explicit_sync_acquire_tokens.is_empty()
+                || self.server.has_pending_acquire_watch_changes()
+                || (cycle.wakeup.reasons.timer()
+                    && self
+                        .acquire_watches
+                        .next_fallback_deadline_ns()
+                        .is_some_and(|deadline| deadline <= now_ns)),
             astrea_publication_due: cycle.wakeup.reasons.timer()
                 && self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning_due: cycle.wakeup.reasons.timer()
@@ -82,13 +98,6 @@ impl NativeRuntime {
             MonotonicTimestampNs::new(now_ns),
             predicted_total_cost,
         );
-    }
-
-    pub(super) fn should_process_acquire_and_prepare(&self, cycle: &NativeCycleState) -> bool {
-        let now_ns = monotonic_now_ns().unwrap_or_default();
-        let state = self.native_runtime_state(cycle, now_ns);
-        let domains = NativeWorkDomains::classify(&cycle.wakeup, &state);
-        domains.scene || domains.cursor || domains.explicit_sync
     }
 
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
@@ -164,7 +173,11 @@ impl NativeRuntime {
                 self.dispatch_suspended_sources(&cycle)?;
             }
             work_domains.service_surface_pacing_if_due(|| -> NativeResult<bool> {
-                Ok(self.server.progress_surface_pacing(monotonic_now_ns()?))
+                self.resource_efficiency_mut()
+                    .record_surface_pacing_service_run();
+                self.server
+                    .progress_surface_pacing(monotonic_now_ns()?)
+                    .map_err(Into::into)
             })?;
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
@@ -204,7 +217,9 @@ impl NativeRuntime {
         let pacing_visual_work = if work_domains
             .should_service_surface_pacing_after_wayland(wayland_pacing_readiness_changed)
         {
-            self.server.progress_surface_pacing(monotonic_now_ns()?)
+            self.resource_efficiency_mut()
+                .record_surface_pacing_service_run();
+            self.server.progress_surface_pacing(monotonic_now_ns()?)?
         } else {
             false
         };
@@ -252,25 +267,54 @@ impl NativeRuntime {
                 Some(self.cursor_manager.desired_configuration()),
             );
         }
-        let commit_timing_planning_pending_before_prepare =
-            self.server.has_pending_commit_timing_planning();
-        let prepare_work = self.should_process_acquire_and_prepare(&cycle);
-        if prepare_work {
+        let commit_timing_planning_generation_before_prepare =
+            self.server.commit_timing_planning_generation();
+        let prepare_operation_plan = NativeWorkDomains::classify(
+            &cycle.wakeup,
+            &self.native_runtime_state(&cycle, monotonic_now_ns()?),
+        )
+        .operation_plan();
+        let prepare_outcome = if prepare_operation_plan.service_acquire_and_prepare {
+            self.resource_efficiency_mut().record_acquire_prepare_run();
+            if prepare_operation_plan.explicit_sync_service {
+                self.resource_efficiency_mut()
+                    .record_explicit_sync_service_run();
+            }
             let prepare_started = Instant::now();
-            self.process_acquire_and_prepare(&cycle)?;
+            let outcome = self.process_acquire_and_prepare(
+                &cycle,
+                prepare_operation_plan.explicit_sync_service,
+            )?;
             self.note_timing_scope("prepare_frame", prepare_started.elapsed());
+            outcome
         } else {
             self.resource_efficiency_mut().record_acquire_prepare_skip();
+            AcquirePrepareOutcome::default()
+        };
+        if prepare_outcome.frame_prepare_ran {
+            self.resource_efficiency_mut().record_frame_prepare_run();
         }
-        if !commit_timing_planning_pending_before_prepare
+        if self.server.commit_timing_planning_generation()
+            != commit_timing_planning_generation_before_prepare
             && self.server.has_pending_commit_timing_planning()
         {
+            self.resource_efficiency_mut()
+                .record_commit_timing_planning_replan();
             self.plan_pending_commit_timing(monotonic_now_ns()?);
         }
         if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
-        let presentation_work = prepare_work || cycle.frame_completed;
+        let presentation_operation_plan = NativeWorkDomains::classify(
+            &cycle.wakeup,
+            &self.native_runtime_state(&cycle, monotonic_now_ns()?),
+        )
+        .operation_plan();
+        let presentation_work = presentation_operation_plan.presentation_admitted(
+            cycle.redraw_requested,
+            cycle.frame_completed,
+            prepare_outcome.visual_work_created,
+        );
         if presentation_work {
             let render_started = Instant::now();
             self.resource_efficiency_mut()
@@ -300,7 +344,7 @@ impl NativeRuntime {
         if !presentation_work {
             self.arm_runtime_deadline()?;
         }
-        cycle.fast_path_completed = !prepare_work && !presentation_work;
+        cycle.fast_path_completed = !prepare_outcome.acquire_service_ran && !presentation_work;
         self.flush_presentation_trace()?;
         Ok(())
     }
@@ -592,9 +636,19 @@ impl NativeRuntime {
         });
     }
     #[allow(unused_variables)]
-    fn process_acquire_and_prepare(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+    fn process_acquire_and_prepare(
+        &mut self,
+        cycle: &NativeCycleState,
+        service_explicit_sync: bool,
+    ) -> NativeResult<AcquirePrepareOutcome> {
         let wakeup = &cycle.wakeup;
-        NativeSessionIo::observe(self, NativeIoOperation::ExplicitSyncNotifier);
+        let mut outcome = AcquirePrepareOutcome {
+            acquire_service_ran: service_explicit_sync,
+            ..AcquirePrepareOutcome::default()
+        };
+        if service_explicit_sync {
+            NativeSessionIo::observe(self, NativeIoOperation::ExplicitSyncNotifier);
+        }
         let perf = self.perf;
         let Self {
             server,
@@ -638,9 +692,15 @@ impl NativeRuntime {
             session: _,
             ..
         } = self;
-        let acquire_changes = server.take_acquire_watch_changes();
+        let acquire_changes = service_explicit_sync
+            .then(|| server.take_acquire_watch_changes())
+            .unwrap_or_default();
         let acquire_change_count = acquire_changes.len();
-        let acquire_ready_token_count = wakeup.explicit_sync_acquire_tokens.len();
+        let acquire_ready_token_count = if service_explicit_sync {
+            wakeup.explicit_sync_acquire_tokens.len()
+        } else {
+            0
+        };
         let mut acquire_ready_count = 0usize;
         for change in acquire_changes {
             match change {
@@ -673,35 +733,40 @@ impl NativeRuntime {
                 }
             }
         }
-        for token in wakeup.explicit_sync_acquire_tokens.iter().copied() {
-            match acquire_watches.handle_ready(
-                token,
-                event_loop,
-                *drm_file_generation,
-                acquire_notifier,
-            )? {
-                AcquireReadyResult::Ready(request) => {
-                    if server.mark_acquire_commit_ready(
-                        request.commit_id,
-                        request.surface_id,
-                        &request.acquire,
-                    ) {
-                        acquire_ready_count = acquire_ready_count.saturating_add(1);
+        if service_explicit_sync {
+            for token in wakeup.explicit_sync_acquire_tokens.iter().copied() {
+                match acquire_watches.handle_ready(
+                    token,
+                    event_loop,
+                    *drm_file_generation,
+                    acquire_notifier,
+                )? {
+                    AcquireReadyResult::Ready(request) => {
+                        if server.mark_acquire_commit_ready(
+                            request.commit_id,
+                            request.surface_id,
+                            &request.acquire,
+                        ) {
+                            acquire_ready_count = acquire_ready_count.saturating_add(1);
+                        }
                     }
+                    AcquireReadyResult::BackendMismatch(_) => {}
+                    AcquireReadyResult::Pending | AcquireReadyResult::Stale => {}
                 }
-                AcquireReadyResult::BackendMismatch(_) => {}
-                AcquireReadyResult::Pending | AcquireReadyResult::Stale => {}
             }
         }
-        for request in acquire_watches.retry_fallback(monotonic_now_ns()?, acquire_notifier) {
-            if server.mark_acquire_commit_ready(
-                request.commit_id,
-                request.surface_id,
-                &request.acquire,
-            ) {
-                acquire_ready_count = acquire_ready_count.saturating_add(1);
+        if service_explicit_sync {
+            for request in acquire_watches.retry_fallback(monotonic_now_ns()?, acquire_notifier) {
+                if server.mark_acquire_commit_ready(
+                    request.commit_id,
+                    request.surface_id,
+                    &request.acquire,
+                ) {
+                    acquire_ready_count = acquire_ready_count.saturating_add(1);
+                }
             }
         }
+        outcome.acquire_state_changed = acquire_change_count > 0 || acquire_ready_count > 0;
         if acquire_change_count > 0 || acquire_ready_token_count > 0 || acquire_ready_count > 0 {
             if acquire_ready_count > 0 {
                 *last_acquire_ready_at_ns = Some(monotonic_now_ns()?);
@@ -773,9 +838,13 @@ impl NativeRuntime {
             });
         }
         if server.has_pending_frame_prepare_work() {
+            outcome.frame_prepare_ran = true;
             let prepare_frame_start = Instant::now();
+            let before_scene_generation = server.scene_render_generation();
             let before_generation = server.render_generation();
             server.prepare_frame();
+            let after_scene_generation = server.scene_render_generation();
+            outcome.visual_work_created = after_scene_generation != before_scene_generation;
             let after_generation = server.render_generation();
             let resize = server.resize_flow_metrics();
             let subsurface = server.subsurface_transaction_metrics();
@@ -976,6 +1045,6 @@ impl NativeRuntime {
                 ]
             });
         }
-        Ok(())
+        Ok(outcome)
     }
 }

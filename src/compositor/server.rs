@@ -87,6 +87,8 @@ pub struct OwnCompositorServer {
     shutdown_releases_armed: bool,
     pub(super) native_input_batch_active: bool,
     pub(super) native_input_batch_flush_pending: bool,
+    #[cfg(test)]
+    pub(super) wayland_flush_count: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
@@ -372,6 +374,8 @@ impl OwnCompositorServer {
             shutdown_releases_armed: true,
             native_input_batch_active: false,
             native_input_batch_flush_pending: false,
+            #[cfg(test)]
+            wayland_flush_count: 0,
         })
     }
 
@@ -1083,8 +1087,8 @@ impl OwnCompositorServer {
         self.state.record_interactive_scheduler_decision();
     }
 
-    pub fn has_pending_explicit_sync_work(&self) -> bool {
-        self.state.has_pending_explicit_sync_work()
+    pub fn has_pending_acquire_watch_changes(&self) -> bool {
+        self.state.has_pending_acquire_watch_changes()
     }
 
     pub fn has_unowned_frame_work(&self) -> bool {
@@ -1569,9 +1573,8 @@ impl OwnCompositorServer {
 
     pub fn tick_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
         let (accepted, _) = self.dispatch_wayland_with_outcome()?;
-        let pacing_visual_work = self
-            .state
-            .progress_surface_pacing(super::pacing::client_pacing_now_ns());
+        let pacing_visual_work =
+            self.progress_surface_pacing(super::pacing::client_pacing_now_ns())?;
         Ok((accepted, pacing_visual_work))
     }
 

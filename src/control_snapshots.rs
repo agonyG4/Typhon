@@ -594,6 +594,7 @@ pub struct KmsPerformanceSnapshot {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceEfficiencyPerformanceSnapshot {
     pub native_cycles: u64,
@@ -621,6 +622,10 @@ pub struct ResourceEfficiencyPerformanceSnapshot {
     pub pacing_progressions: u64,
     pub acquire_prepare_runs: u64,
     pub acquire_prepare_skips: u64,
+    pub explicit_sync_service_runs: u64,
+    pub frame_prepare_runs: u64,
+    pub surface_pacing_service_runs: u64,
+    pub commit_timing_planning_replans: u64,
     pub presentation_planning_runs: u64,
     pub presentation_planning_skips: u64,
 }
@@ -869,6 +874,10 @@ mod tests {
                 "pacingProgressions": 0,
                 "acquirePrepareRuns": 0,
                 "acquirePrepareSkips": 0,
+                "explicitSyncServiceRuns": 0,
+                "framePrepareRuns": 0,
+                "surfacePacingServiceRuns": 0,
+                "commitTimingPlanningReplans": 0,
                 "presentationPlanningRuns": 0,
                 "presentationPlanningSkips": 0,
             },

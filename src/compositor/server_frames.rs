@@ -66,6 +66,11 @@ impl OwnCompositorServer {
         self.state.has_pending_commit_timing_planning()
     }
 
+    #[doc(hidden)]
+    pub fn commit_timing_planning_generation(&self) -> u64 {
+        self.state.commit_timing_planning_generation()
+    }
+
     /// Earliest monotonic Commit Timing lower bound still held by an ordered
     /// surface transaction.  Native output uses this to select a refresh
     /// target before the transaction becomes publishable.
@@ -128,8 +133,10 @@ impl OwnCompositorServer {
     /// or submit anything itself.  The return value reports an active-scene
     /// visual handoff for the native scheduler.
     #[doc(hidden)]
-    pub fn progress_surface_pacing(&mut self, now_ns: u64) -> bool {
-        self.state.progress_surface_pacing(now_ns)
+    pub fn progress_surface_pacing(&mut self, now_ns: u64) -> Result<bool, CompositorError> {
+        let visual_work = self.state.progress_surface_pacing(now_ns);
+        self.flush_wayland_clients()?;
+        Ok(visual_work)
     }
 
     #[doc(hidden)]
@@ -345,5 +352,24 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
         self.state.take_frame_batch_for_render(frame_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_pacing_service_flushes_at_its_write_side_boundary() {
+        let mut server = OwnCompositorServer::bind(format!(
+            "typhon-surface-pacing-flush-{}",
+            std::process::id()
+        ))
+        .expect("surface pacing test Wayland socket");
+        let before = server.wayland_flush_count_for_tests();
+
+        assert!(!server.progress_surface_pacing(0).unwrap());
+
+        assert_eq!(server.wayland_flush_count_for_tests(), before + 1);
     }
 }

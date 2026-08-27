@@ -209,6 +209,164 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn future_commit_timing_is_not_explicit_sync_service_work() {
+        let mut state = CompositorState::new(None);
+        let requested =
+            CommitTimingConstraint::from_protocol(client_pacing_now_ns() / 1_000_000_000 + 60, 0)
+                .expect("valid commit timing");
+        let mut commit = empty_cached_subsurface_commit();
+        commit.pacing.commit_timing = Some(requested);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(11),
+                root_surface_id: 12,
+                nodes: vec![(12, commit)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+
+        assert!(!state.has_pending_acquire_watch_changes());
+    }
+
+    #[test]
+    fn fifo_only_transaction_is_not_explicit_sync_service_work() {
+        let mut state = CompositorState::new(None);
+        let mut commit = empty_cached_subsurface_commit();
+        commit.pacing.fifo_set_barrier = true;
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(17),
+                root_surface_id: 18,
+                nodes: vec![(18, commit)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+
+        assert!(!state.has_pending_acquire_watch_changes());
+    }
+
+    #[test]
+    fn unreadable_external_acquire_is_passive_explicit_sync_state() {
+        let mut state = CompositorState::new(None);
+        state.external_acquire_readiness = true;
+        let acquire = ExplicitSyncPoint::for_tests(19, 1);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(20),
+                root_surface_id: 21,
+                nodes: vec![(21, empty_cached_subsurface_commit())],
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(22),
+                    commit_id: AcquireCommitId::for_tests(23),
+                    surface_id: 21,
+                    buffer_id: 24,
+                    acquire,
+                    state: PendingAcquireState::EventfdBacked,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+
+        assert!(!state.has_pending_acquire_watch_changes());
+    }
+
+    #[test]
+    fn acquire_watch_mutation_is_explicit_sync_service_work() {
+        let mut state = CompositorState::new(None);
+        state
+            .pending_acquire_watch_changes
+            .push(AcquireWatchChange::Cancel {
+                commit_id: AcquireCommitId::for_tests(25),
+                reason: AcquireWatchCancelReason::Superseded,
+            });
+
+        assert!(state.has_pending_acquire_watch_changes());
+    }
+
+    #[test]
+    fn commit_timing_planning_generation_tracks_candidate_set_not_pending_boolean() {
+        let mut state = CompositorState::new(None);
+        let requested =
+            CommitTimingConstraint::from_protocol(client_pacing_now_ns() / 1_000_000_000 + 60, 0)
+                .expect("valid commit timing");
+        let mut first = empty_cached_subsurface_commit();
+        first.pacing.commit_timing = Some(requested);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(26),
+                root_surface_id: 27,
+                nodes: vec![(27, first)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+        let first_generation = state.commit_timing_planning_generation();
+        assert!(state.has_pending_commit_timing_planning());
+
+        let mut second = empty_cached_subsurface_commit();
+        second.pacing.commit_timing = Some(requested);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(28),
+                root_surface_id: 29,
+                nodes: vec![(29, second)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+
+        assert!(state.has_pending_commit_timing_planning());
+        assert_ne!(state.commit_timing_planning_generation(), first_generation);
+        let second_generation = state.commit_timing_planning_generation();
+        state.rebuild_scene_work_index();
+        assert_eq!(state.commit_timing_planning_generation(), second_generation);
+    }
+
+    #[test]
+    fn ordinary_acquire_ready_does_not_create_surface_pacing_debt() {
+        let mut state = CompositorState::new(None);
+        let acquire = ExplicitSyncPoint::for_tests(12, 1);
+        let commit_id = AcquireCommitId::for_tests(13);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(14),
+                root_surface_id: 15,
+                nodes: vec![(15, empty_cached_subsurface_commit())],
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(16),
+                    commit_id,
+                    surface_id: 15,
+                    buffer_id: 17,
+                    acquire: acquire.clone(),
+                    state: PendingAcquireState::EventfdBacked,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+        let pacing_generation = state.surface_pacing_readiness_generation();
+
+        assert!(state.mark_acquire_commit_ready(commit_id, 15, &acquire));
+        assert_eq!(
+            state.surface_pacing_readiness_generation(),
+            pacing_generation
+        );
+    }
+
+    #[test]
     fn callback_only_ignores_hidden_prepare_work_but_rejects_visible_prepare_work() {
         let mut state = CompositorState::new(None);
         state.visible_pending_frame_callback_count = 1;

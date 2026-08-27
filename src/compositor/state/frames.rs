@@ -125,9 +125,8 @@ impl CompositorState {
             .saturating_add(1);
     }
 
-    pub(in crate::compositor) fn has_pending_explicit_sync_work(&self) -> bool {
-        !self.pending_explicit_sync_commits.is_empty()
-            || !self.pending_surface_tree_transactions.is_empty()
+    pub(in crate::compositor) fn has_pending_acquire_watch_changes(&self) -> bool {
+        !self.pending_acquire_watch_changes.is_empty()
     }
 
     pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
@@ -1235,7 +1234,6 @@ impl CompositorState {
                 ],
             );
             self.rebuild_scene_work_index();
-            self.note_surface_pacing_readiness_transition();
         }
         ready
     }

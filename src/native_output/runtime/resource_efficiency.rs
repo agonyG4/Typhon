@@ -27,6 +27,10 @@ pub(crate) struct ResourceEfficiencyMetrics {
     pub(super) pacing_progressions: u64,
     pub(super) acquire_prepare_runs: u64,
     pub(super) acquire_prepare_skips: u64,
+    pub(super) explicit_sync_service_runs: u64,
+    pub(super) frame_prepare_runs: u64,
+    pub(super) surface_pacing_service_runs: u64,
+    pub(super) commit_timing_planning_replans: u64,
     pub(super) presentation_planning_runs: u64,
     pub(super) presentation_planning_skips: u64,
 }
@@ -59,6 +63,10 @@ impl ResourceEfficiencyMetrics {
             pacing_progressions: self.pacing_progressions,
             acquire_prepare_runs: self.acquire_prepare_runs,
             acquire_prepare_skips: self.acquire_prepare_skips,
+            explicit_sync_service_runs: self.explicit_sync_service_runs,
+            frame_prepare_runs: self.frame_prepare_runs,
+            surface_pacing_service_runs: self.surface_pacing_service_runs,
+            commit_timing_planning_replans: self.commit_timing_planning_replans,
             presentation_planning_runs: self.presentation_planning_runs,
             presentation_planning_skips: self.presentation_planning_skips,
         }
@@ -191,6 +199,26 @@ impl ResourceEfficiencyMetrics {
     }
 
     #[inline]
+    pub(super) fn record_explicit_sync_service_run(&mut self) {
+        self.explicit_sync_service_runs = self.explicit_sync_service_runs.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_frame_prepare_run(&mut self) {
+        self.frame_prepare_runs = self.frame_prepare_runs.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_surface_pacing_service_run(&mut self) {
+        self.surface_pacing_service_runs = self.surface_pacing_service_runs.saturating_add(1);
+    }
+
+    #[inline]
+    pub(super) fn record_commit_timing_planning_replan(&mut self) {
+        self.commit_timing_planning_replans = self.commit_timing_planning_replans.saturating_add(1);
+    }
+
+    #[inline]
     pub(super) fn record_presentation_planning_run(&mut self) {
         self.presentation_planning_runs = self.presentation_planning_runs.saturating_add(1);
     }
@@ -212,9 +240,6 @@ impl ResourceEfficiencyMetrics {
         }
         if decision.service_pacing {
             self.record_pacing_progression();
-        }
-        if decision.service_explicit_sync_acquire {
-            self.record_acquire_prepare_run();
         }
     }
 }
@@ -343,6 +368,10 @@ mod tests {
         metrics.record_pacing_progression();
         metrics.record_acquire_prepare_run();
         metrics.record_acquire_prepare_skip();
+        metrics.record_explicit_sync_service_run();
+        metrics.record_frame_prepare_run();
+        metrics.record_surface_pacing_service_run();
+        metrics.record_commit_timing_planning_replan();
         metrics.record_presentation_planning_run();
         metrics.record_presentation_planning_skip();
 
@@ -374,6 +403,10 @@ mod tests {
                 pacing_progressions: 1,
                 acquire_prepare_runs: 1,
                 acquire_prepare_skips: 1,
+                explicit_sync_service_runs: 1,
+                frame_prepare_runs: 1,
+                surface_pacing_service_runs: 1,
+                commit_timing_planning_replans: 1,
                 presentation_planning_runs: 1,
                 presentation_planning_skips: 1,
             }

@@ -107,6 +107,10 @@ pub(in crate::compositor) fn timestamp_as_nanos_u128(timestamp: PresentationTime
 }
 
 impl CompositorState {
+    pub(in crate::compositor) const fn commit_timing_planning_generation(&self) -> u64 {
+        self.commit_timing_planning_generation
+    }
+
     pub(super) fn current_commit_timing_clock_sample(&self) -> Option<CommitTimingClockSample> {
         let monotonic_before =
             PresentationTimestamp::from_clock(PresentationClock::Monotonic).ok()?;

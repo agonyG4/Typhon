@@ -81,6 +81,10 @@ impl OwnCompositorServer {
         self.native_input_batch_active = false;
         let flush_pending = std::mem::take(&mut self.native_input_batch_flush_pending);
         if flush_pending {
+            #[cfg(test)]
+            {
+                self.wayland_flush_count = self.wayland_flush_count.saturating_add(1);
+            }
             self.display.flush_clients()?;
         }
         Ok(flush_pending)
@@ -91,8 +95,17 @@ impl OwnCompositorServer {
             self.native_input_batch_flush_pending = true;
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            self.wayland_flush_count = self.wayland_flush_count.saturating_add(1);
+        }
         self.display.flush_clients()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wayland_flush_count_for_tests(&self) -> u64 {
+        self.wayland_flush_count
     }
 
     pub fn has_pending_astrea_toplevel_publication(&self) -> bool {
@@ -105,6 +118,9 @@ impl OwnCompositorServer {
     }
 
     pub fn service_pending_astrea_toplevel_updates(&mut self) {
+        if !self.has_pending_astrea_toplevel_publication() {
+            return;
+        }
         self.publish_astrea_toplevel_updates();
     }
 
