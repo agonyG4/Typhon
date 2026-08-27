@@ -183,6 +183,10 @@ impl CompositorState {
         self.surface_pacing_readiness_generation != self.surface_pacing_serviced_generation
     }
 
+    pub(in crate::compositor) const fn surface_pacing_readiness_generation(&self) -> u64 {
+        self.surface_pacing_readiness_generation
+    }
+
     pub(in crate::compositor) fn invalidate_surface_pacing_deadline_cache(&self) {
         self.surface_pacing_deadline_cache_valid.set(false);
     }
@@ -313,6 +317,7 @@ impl CompositorState {
             ),
         };
         self.active_fifo_barriers.insert(surface_id, active);
+        self.invalidate_surface_pacing_deadline_cache();
         self.rebuild_scene_work_index();
         self.surface_pacing_metrics.barriers_activated = self
             .surface_pacing_metrics
@@ -489,6 +494,7 @@ impl CompositorState {
             return;
         }
         self.active_fifo_barriers.remove(&claim.surface_id);
+        self.invalidate_surface_pacing_deadline_cache();
         self.rebuild_scene_work_index();
         if reason != FifoBarrierClearReason::ForwardProgressFallback {
             self.note_surface_pacing_readiness_transition();
@@ -576,6 +582,17 @@ mod tests {
 
         assert!(state.arm_commit_timing_target(readiness));
         assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        assert_eq!(
+            state.next_surface_pacing_deadline_ns(),
+            Some(readiness.release_for_render_at.get())
+        );
+        let recomputations = state.surface_pacing_deadline_recomputations();
+        state.invalidate_pending_commit_timing_targets();
+        assert_eq!(state.next_surface_pacing_deadline_ns(), None);
+        assert_eq!(
+            state.surface_pacing_deadline_recomputations(),
+            recomputations + 1
+        );
         state.arm_commit_timing_target(CommitTimingReadiness {
             release_for_render_at: MonotonicTimestampNs::new(0),
             ..readiness
@@ -1246,6 +1263,63 @@ mod tests {
             state
                 .next_surface_pacing_deadline_ns()
                 .is_some_and(|deadline| deadline <= client_pacing_now_ns())
+        );
+    }
+
+    #[test]
+    fn unrelated_scene_work_rebuild_does_not_invalidate_pacing_deadline_cache() {
+        let mut state = CompositorState::default();
+        state.active_fifo_barriers.insert(
+            11,
+            ActiveFifoBarrier {
+                surface_generation: 1,
+                fifo_barrier_generation: FifoBarrierGeneration::new(1),
+                commit_sequence: SurfaceCommitSequence::initial(),
+                fallback_deadline_ns: 123,
+            },
+        );
+        state.rebuild_scene_work_index();
+
+        assert_eq!(state.next_surface_pacing_deadline_ns(), Some(123));
+        let recomputations = state.surface_pacing_deadline_recomputations();
+
+        state.rebuild_scene_work_index();
+
+        assert_eq!(state.next_surface_pacing_deadline_ns(), Some(123));
+        assert_eq!(
+            state.surface_pacing_deadline_recomputations(),
+            recomputations
+        );
+    }
+
+    #[test]
+    fn clearing_a_fifo_barrier_invalidates_the_pacing_deadline_cache() {
+        let mut state = CompositorState::default();
+        let claim = FifoBarrierClaim {
+            surface_id: 11,
+            surface_generation: 1,
+            fifo_barrier_generation: FifoBarrierGeneration::new(1),
+            commit_sequence: SurfaceCommitSequence::initial(),
+        };
+        state.active_fifo_barriers.insert(
+            claim.surface_id,
+            ActiveFifoBarrier {
+                surface_generation: claim.surface_generation,
+                fifo_barrier_generation: claim.fifo_barrier_generation,
+                commit_sequence: claim.commit_sequence,
+                fallback_deadline_ns: 123,
+            },
+        );
+        state.rebuild_scene_work_index();
+
+        assert_eq!(state.next_surface_pacing_deadline_ns(), Some(123));
+        let recomputations = state.surface_pacing_deadline_recomputations();
+        state.clear_fifo_barrier_claim(claim, FifoBarrierClearReason::ForwardProgressFallback);
+
+        assert_eq!(state.next_surface_pacing_deadline_ns(), None);
+        assert_eq!(
+            state.surface_pacing_deadline_recomputations(),
+            recomputations + 1
         );
     }
 

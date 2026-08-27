@@ -248,6 +248,7 @@ impl CompositorState {
         self.pending_explicit_sync_commits = retained_explicit;
 
         let mut retained_trees = Vec::new();
+        let mut pacing_deadline_changed = false;
         for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
             let supersedes = transaction.nodes.iter().any(|(node_surface_id, commit)| {
                 *node_surface_id == surface_id
@@ -263,6 +264,7 @@ impl CompositorState {
                     retained_trees.push(transaction);
                     continue;
                 }
+                pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
                 let root_surface_id = transaction.root_surface_id;
                 let replacement = SurfaceCommitId::from_sequence(new_sequence);
                 let acquire_state = if self.transaction_is_ready(&transaction) {
@@ -303,6 +305,9 @@ impl CompositorState {
             }
         }
         self.pending_surface_tree_transactions = retained_trees;
+        if pacing_deadline_changed {
+            self.invalidate_surface_pacing_deadline_cache();
+        }
         callbacks
     }
     pub(in crate::compositor) fn capture_surface_damage_presentation(
@@ -570,6 +575,7 @@ impl CompositorState {
         }
 
         self.output_refresh = output_refresh;
+        self.invalidate_surface_pacing_deadline_cache();
         self.send_output_mode_to_bound_outputs();
         true
     }

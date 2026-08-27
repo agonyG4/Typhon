@@ -16,6 +16,14 @@ use oblivion_one::cursor_manager::{
 use oblivion_one::native::event_loop::NativeWakeup;
 use serde::Deserialize;
 
+#[inline]
+fn input_requires_full_server_progression(
+    dispatch_wayland: bool,
+    may_change_pointer_constraints: bool,
+) -> bool {
+    may_change_pointer_constraints && !dispatch_wayland
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyCursorArgs {}
@@ -717,7 +725,7 @@ impl NativeRuntime {
         &mut self,
         cycle: &mut NativeCycleState,
         dispatch_wayland: bool,
-    ) -> NativeResult<()> {
+    ) -> NativeResult<bool> {
         if cycle.wakeup.reasons.input() {
             NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
         }
@@ -771,14 +779,15 @@ impl NativeRuntime {
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
-        let (accepted, tick_us, tick_visual_work) = if dispatch_wayland {
-            render_telemetry
-                .resource_efficiency
-                .record_server_tick_call();
+        let (accepted, tick_us, pacing_readiness_changed) = if dispatch_wayland {
             let tick_start = Instant::now();
-            let (accepted, pacing_visual_work) = server.tick_with_outcome()?;
+            let (accepted, pacing_readiness_changed) = server.dispatch_wayland_with_outcome()?;
             render_telemetry.resource_efficiency.record_client_flush();
-            (accepted, elapsed_micros(tick_start), pacing_visual_work)
+            (
+                accepted,
+                elapsed_micros(tick_start),
+                pacing_readiness_changed,
+            )
         } else {
             (0, 0, false)
         };
@@ -788,7 +797,6 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
         )?;
-        redraw_requested |= tick_visual_work;
         synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
@@ -929,7 +937,10 @@ impl NativeRuntime {
             // read-side dispatch. Native-only key/button input retains the
             // narrow follow-up for pointer-constraint state, but combined
             // readiness must not turn into a duplicate full tick.
-            if may_change_pointer_constraints && !dispatch_wayland {
+            if input_requires_full_server_progression(
+                dispatch_wayland,
+                may_change_pointer_constraints,
+            ) {
                 render_telemetry
                     .resource_efficiency
                     .record_server_tick_call();
@@ -1018,7 +1029,26 @@ impl NativeRuntime {
         cycle.input_drain_us = input_drain_us;
         cycle.raw_input_events = raw_input_events;
         cycle.coalesced_input_events = coalesced_input_events;
-        Ok(())
+        Ok(pacing_readiness_changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_requires_full_server_progression;
+
+    #[test]
+    fn ordinary_pointer_motion_never_enters_full_server_progression() {
+        for _ in 0..1_000 {
+            assert!(!input_requires_full_server_progression(false, false));
+            assert!(!input_requires_full_server_progression(true, false));
+        }
+    }
+
+    #[test]
+    fn constraint_sensitive_input_keeps_its_narrow_follow_up() {
+        assert!(input_requires_full_server_progression(false, true));
+        assert!(!input_requires_full_server_progression(true, true));
     }
 }
 

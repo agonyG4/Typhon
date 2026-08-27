@@ -40,6 +40,12 @@ pub(crate) struct NativeWorkDomains {
     pub(super) shutdown: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeCycleOperationPlan {
+    pub(super) service_input: bool,
+    pub(super) dispatch_wayland_read_side: bool,
+}
+
 impl NativeWorkDomains {
     pub(super) const fn should_service_surface_pacing(self) -> bool {
         self.surface_pacing && !self.wayland_dispatch
@@ -53,6 +59,20 @@ impl NativeWorkDomains {
             return Ok(false);
         }
         service()
+    }
+
+    pub(super) const fn should_service_surface_pacing_after_wayland(
+        self,
+        pacing_readiness_changed: bool,
+    ) -> bool {
+        self.surface_pacing || pacing_readiness_changed
+    }
+
+    pub(super) const fn operation_plan(self) -> NativeCycleOperationPlan {
+        NativeCycleOperationPlan {
+            service_input: self.input,
+            dispatch_wayland_read_side: self.wayland_dispatch,
+        }
     }
 
     pub(super) fn from_wakeup(
@@ -203,9 +223,10 @@ mod tests {
         let mut wayland_read_dispatches = 0;
 
         for _ in 0..1_000 {
-            let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
-            input_cycles += u64::from(domains.input);
-            wayland_read_dispatches += u64::from(domains.wayland_dispatch);
+            let operation_plan =
+                NativeWorkDomains::classify(&wakeup(INPUT), &state()).operation_plan();
+            input_cycles += u64::from(operation_plan.service_input);
+            wayland_read_dispatches += u64::from(operation_plan.dispatch_wayland_read_side);
         }
 
         assert_eq!(input_cycles, 1_000);
@@ -233,6 +254,21 @@ mod tests {
 
         assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
         assert!(decision.service_pacing);
+    }
+
+    #[test]
+    fn astrea_publication_deadline_is_protocol_only() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(TIMER),
+            &NativeRuntimeState {
+                astrea_publication_due: true,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_astrea_publication);
+        assert!(!decision.service_primary_scene);
     }
 
     #[test]
@@ -301,6 +337,21 @@ mod tests {
         );
 
         assert!(!domains.surface_pacing);
+    }
+
+    #[test]
+    fn wayland_dispatch_services_only_new_pacing_readiness() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(WAYLAND_CLIENTS),
+            &NativeRuntimeState {
+                pacing_active: true,
+                pacing_due: false,
+                ..state()
+            },
+        );
+
+        assert!(!domains.should_service_surface_pacing_after_wayland(false));
+        assert!(domains.should_service_surface_pacing_after_wayland(true));
     }
 
     #[test]

@@ -185,6 +185,7 @@ impl CompositorState {
             .realtime_forward_jump_already_due_releases
             .saturating_add(forward_jump_releases);
         if backward_jump_replans > 0 {
+            self.invalidate_surface_pacing_deadline_cache();
             self.rebuild_scene_work_index();
         }
     }
@@ -410,13 +411,18 @@ impl CompositorState {
             .surface_pacing_metrics
             .commit_timing_candidates_planned
             .saturating_add(1);
+        self.invalidate_surface_pacing_deadline_cache();
         self.rebuild_scene_work_index();
         true
     }
 
     pub(in crate::compositor) fn invalidate_pending_commit_timing_targets(&mut self) {
+        let mut changed = false;
         for transaction in &mut self.pending_surface_tree_transactions {
-            transaction.commit_timing_readiness = None;
+            changed |= transaction.commit_timing_readiness.take().is_some();
+        }
+        if changed {
+            self.invalidate_surface_pacing_deadline_cache();
         }
         self.rebuild_scene_work_index();
     }

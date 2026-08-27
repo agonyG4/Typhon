@@ -104,6 +104,7 @@ impl NativeRuntime {
         let now_ns = monotonic_now_ns()?;
         let runtime_state = self.native_runtime_state(&cycle, now_ns);
         let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
+        let operation_plan = work_domains.operation_plan();
         let wayland_client_work = work_domains.wayland_protocol;
         let xwayland_work = work_domains.xwayland;
         let work_decision = NativeWorkDomains::from_wakeup(&cycle.wakeup, &runtime_state);
@@ -115,10 +116,10 @@ impl NativeRuntime {
                 metrics.record_input_ready();
             }
             metrics.record_work_decision(work_decision);
-            if work_domains.input && !work_domains.wayland_protocol {
+            if operation_plan.service_input && !operation_plan.dispatch_wayland_read_side {
                 metrics.record_input_only_cycle();
             }
-            if work_domains.wayland_dispatch {
+            if operation_plan.dispatch_wayland_read_side {
                 metrics.record_wayland_read_dispatch_cycle();
             }
         }
@@ -183,9 +184,13 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        if work_domains.wayland_dispatch || work_domains.input {
-            self.dispatch_wayland_and_input(&mut cycle, work_domains.wayland_dispatch)?;
-        }
+        let wayland_pacing_readiness_changed = if operation_plan.dispatch_wayland_read_side
+            || operation_plan.service_input
+        {
+            self.dispatch_wayland_and_input(&mut cycle, operation_plan.dispatch_wayland_read_side)?
+        } else {
+            false
+        };
         if work_domains.commit_timing_planning
             || (work_domains.wayland_dispatch && self.server.has_pending_commit_timing_planning())
         {
@@ -196,10 +201,13 @@ impl NativeRuntime {
             self.server.flush_wayland_clients()?;
             self.resource_efficiency_mut().record_client_flush();
         }
-        let pacing_visual_work =
-            work_domains.service_surface_pacing_if_due(|| -> NativeResult<bool> {
-                Ok(self.server.progress_surface_pacing(monotonic_now_ns()?))
-            })?;
+        let pacing_visual_work = if work_domains
+            .should_service_surface_pacing_after_wayland(wayland_pacing_readiness_changed)
+        {
+            self.server.progress_surface_pacing(monotonic_now_ns()?)
+        } else {
+            false
+        };
         cycle.redraw_requested |= pacing_visual_work;
         let post_service_state = self.native_runtime_state(&cycle, monotonic_now_ns()?);
         cycle.work_class =
@@ -244,6 +252,8 @@ impl NativeRuntime {
                 Some(self.cursor_manager.desired_configuration()),
             );
         }
+        let commit_timing_planning_pending_before_prepare =
+            self.server.has_pending_commit_timing_planning();
         let prepare_work = self.should_process_acquire_and_prepare(&cycle);
         if prepare_work {
             let prepare_started = Instant::now();
@@ -251,6 +261,11 @@ impl NativeRuntime {
             self.note_timing_scope("prepare_frame", prepare_started.elapsed());
         } else {
             self.resource_efficiency_mut().record_acquire_prepare_skip();
+        }
+        if !commit_timing_planning_pending_before_prepare
+            && self.server.has_pending_commit_timing_planning()
+        {
+            self.plan_pending_commit_timing(monotonic_now_ns()?);
         }
         if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());

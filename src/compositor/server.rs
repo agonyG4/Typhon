@@ -1522,7 +1522,16 @@ impl OwnCompositorServer {
         self.tick_with_outcome().map(|(accepted, _)| accepted)
     }
 
-    pub fn tick_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
+    /// Dispatch readable Wayland work and flush the resulting protocol output.
+    ///
+    /// This deliberately excludes surface-pacing progression. Native input
+    /// and Wayland-readiness service this boundary independently; the boolean
+    /// reports a pacing-readiness generation transition created while
+    /// dispatching readable clients so the native runtime can service it
+    /// explicitly in its pacing domain.
+    #[doc(hidden)]
+    pub fn dispatch_wayland_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
+        let pacing_generation_before = self.state.surface_pacing_readiness_generation();
         let mut accepted = 0;
         while let Some(stream) = self.socket.accept()? {
             let mut handle = self.display.handle();
@@ -1551,11 +1560,18 @@ impl OwnCompositorServer {
         self.publish_astrea_toplevel_updates();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
+        let pacing_readiness_changed =
+            pacing_generation_before != self.state.surface_pacing_readiness_generation();
+        self.flush_wayland_clients()?;
+        dispatch_result?;
+        Ok((accepted, pacing_readiness_changed))
+    }
+
+    pub fn tick_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
+        let (accepted, _) = self.dispatch_wayland_with_outcome()?;
         let pacing_visual_work = self
             .state
             .progress_surface_pacing(super::pacing::client_pacing_now_ns());
-        self.flush_wayland_clients()?;
-        dispatch_result?;
         Ok((accepted, pacing_visual_work))
     }
 

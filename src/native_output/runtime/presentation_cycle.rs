@@ -312,15 +312,8 @@ impl NativeRuntime {
             observe_current_o1_opportunity(adaptive_buffering, pending_target, overlap_required_ns);
         let desired_credit = o1_demand.desired_credit_after;
         let render_ahead_allowed = desired_credit > 1;
-        *scheduled_presentation_target = prepare_presentation_target(
-            explicit_output,
-            presentation_deadline,
-            server,
-            frame_scheduler,
-            *scheduled_presentation_target,
-            scheduler_now,
-            predicted_total_cost,
-        );
+        *scheduled_presentation_target =
+            prepare_presentation_target(*scheduled_presentation_target);
         #[rustfmt::skip] let (render_generation, _scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         let pending_interactive_visual_work = server.has_pending_interactive_visual_work();
         *scheduled_presentation_target = plan_visual_target_for_budget(

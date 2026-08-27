@@ -57,6 +57,11 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn surface_pacing_readiness_generation(&self) -> u64 {
+        self.state.surface_pacing_readiness_generation()
+    }
+
+    #[doc(hidden)]
     pub fn has_pending_commit_timing_planning(&self) -> bool {
         self.state.has_pending_commit_timing_planning()
     }

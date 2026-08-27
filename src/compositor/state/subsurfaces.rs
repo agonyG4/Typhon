@@ -276,6 +276,7 @@ impl CompositorState {
         }
 
         let mut transaction = self.pending_surface_tree_transactions.remove(target_index);
+        let pacing_deadline_changed = transaction.commit_timing_readiness.is_some();
         let stats = self.merge_surface_tree_nodes_into_transaction(
             root_surface_id,
             &mut transaction,
@@ -310,6 +311,9 @@ impl CompositorState {
             );
         }
         self.pending_surface_tree_transactions.push(transaction);
+        if pacing_deadline_changed {
+            self.invalidate_surface_pacing_deadline_cache();
+        }
         self.update_surface_tree_slot_metrics(root_surface_id);
         if ready_after_merge || !incoming_has_attachment_change {
             self.commit_ready_surface_tree_transactions();
@@ -641,6 +645,9 @@ impl CompositorState {
                 return;
             };
             let superseded = self.pending_surface_tree_transactions.remove(remove_index);
+            if superseded.commit_timing_readiness.is_some() {
+                self.invalidate_surface_pacing_deadline_cache();
+            }
             let released = self.release_pending_surface_tree_transaction(
                 superseded,
                 AcquireWatchCancelReason::Superseded,
@@ -771,12 +778,14 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) -> ReleasedSurfaceTreeState {
         let mut retained = Vec::new();
+        let mut pacing_deadline_changed = false;
         let mut released = ReleasedSurfaceTreeState {
             callbacks: Vec::new(),
             resize_commit: None,
         };
         for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
             if transaction.root_surface_id == root_surface_id {
+                pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
                 let transaction =
                     self.release_pending_surface_tree_transaction(transaction, reason);
                 self.subsurface_transaction_metrics.root_wide_supersessions = self
@@ -794,6 +803,9 @@ impl CompositorState {
             }
         }
         self.pending_surface_tree_transactions = retained;
+        if pacing_deadline_changed {
+            self.invalidate_surface_pacing_deadline_cache();
+        }
         released
     }
 
@@ -803,6 +815,7 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) {
         let mut retained = Vec::new();
+        let mut pacing_deadline_changed = false;
         let mut callbacks = Vec::new();
         for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
             if transaction
@@ -810,6 +823,7 @@ impl CompositorState {
                 .iter()
                 .any(|(node_surface_id, _)| *node_surface_id == surface_id)
             {
+                pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
                 let root_surface_id = transaction.root_surface_id;
                 let released = self.release_pending_surface_tree_transaction(transaction, reason);
                 callbacks.extend(released.callbacks);
@@ -821,6 +835,9 @@ impl CompositorState {
             }
         }
         self.pending_surface_tree_transactions = retained;
+        if pacing_deadline_changed {
+            self.invalidate_surface_pacing_deadline_cache();
+        }
         self.complete_frame_callbacks(callbacks);
     }
 

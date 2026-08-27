@@ -45,6 +45,7 @@ impl CompositorState {
         }
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut superseded_resize_commits: HashMap<u32, ResizeCommitSnapshot> = HashMap::new();
+        let mut pacing_deadline_changed = false;
         loop {
             let root_heads = transactions
                 .iter()
@@ -94,6 +95,7 @@ impl CompositorState {
                 break;
             };
             let transaction = transactions.remove(index);
+            pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
             if supersede {
                 let root_id = transaction.root_surface_id;
                 let replacement = replacement.expect("supersession has a replacement");
@@ -176,6 +178,9 @@ impl CompositorState {
             self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
         }
         self.pending_surface_tree_transactions = transactions;
+        if pacing_deadline_changed {
+            self.invalidate_surface_pacing_deadline_cache();
+        }
         self.rebuild_scene_work_index();
         for (root_surface_id, resize_commit) in superseded_resize_commits {
             self.release_detached_resize_capture(root_surface_id, resize_commit);

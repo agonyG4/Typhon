@@ -70,29 +70,11 @@ pub(super) fn plan_commit_timing_target(
         .or(Some(earliest))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Preserve the already-owned target while keeping generic output planning
+/// side-effect free with respect to compositor surface publication.
 pub(super) fn prepare_presentation_target(
-    explicit_output: bool,
-    planner: &mut PresentationDeadlinePlanner,
-    server: &mut OwnCompositorServer,
-    frame_scheduler: &NativeFrameScheduler,
     scheduled: Option<PresentationTarget>,
-    now: MonotonicTimestampNs,
-    predicted_total_cost: Duration,
 ) -> Option<PresentationTarget> {
-    let scheduled = if explicit_output {
-        plan_commit_timing_target(
-            planner,
-            server,
-            frame_scheduler,
-            scheduled,
-            now,
-            predicted_total_cost,
-        )
-    } else {
-        scheduled
-    };
-    let _ = server.progress_surface_pacing(now.get());
     scheduled
 }
 
@@ -417,6 +399,9 @@ mod tests {
     use oblivion_one::native::kms::{
         AtomicKmsError, AtomicKmsErrorKind, KmsBackendKind, KmsPolicy,
     };
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    };
 
     use super::*;
 
@@ -425,6 +410,28 @@ mod tests {
             AtomicKmsErrorKind::MissingProperty,
             "missing Atomic property",
         )
+    }
+
+    fn scheduled_target() -> PresentationTarget {
+        let now = MonotonicTimestampNs::new(10);
+        PresentationTarget {
+            sequence: 1,
+            presentation_time: now,
+            submit_not_before: MonotonicTimestampNs::new(8),
+            render_start_deadline: MonotonicTimestampNs::new(6),
+            refresh_interval: std::time::Duration::from_nanos(10),
+            reason: PresentationTargetReason::ForcedValidation,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        }
+    }
+
+    #[test]
+    fn generic_presentation_target_preparation_only_returns_owned_target() {
+        let scheduled = Some(scheduled_target());
+
+        assert_eq!(prepare_presentation_target(scheduled), scheduled);
     }
 
     #[test]
