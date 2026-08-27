@@ -42,8 +42,19 @@ impl TestShmBuffer {
     }
 
     fn attach(&self, surface: &client_wl_surface::WlSurface, width: usize, height: usize) {
+        self.attach_with_damage(surface, 0, 0, width, height);
+    }
+
+    fn attach_with_damage(
+        &self,
+        surface: &client_wl_surface::WlSurface,
+        x: i32,
+        y: i32,
+        width: usize,
+        height: usize,
+    ) {
         surface.attach(Some(&self.buffer), 0, 0);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
+        surface.damage_buffer(x, y, width as i32, height as i32);
     }
 }
 
@@ -1171,6 +1182,154 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_shm_then_dmabuf_
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
+    Ok(())
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_rotating_shm_buffers(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    initial_commit_has_damage: bool,
+    rotate_buffers: bool,
+    final_commit_has_damage: bool,
+    additional_content_commits: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let buffers = [
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+    ];
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    xdg_surface.set_window_geometry(0, 0, 4, 4);
+    if initial_commit_has_damage {
+        buffers[0].attach(&surface, 4, 4);
+    } else {
+        surface.attach(Some(&buffers[0].buffer), 0, 0);
+    }
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    if !rotate_buffers {
+        retain_live_test_connection(connection);
+        return Ok(());
+    }
+
+    commands.send(ServerCommand::MarkRenderDamagePresented)?;
+    wait_for_server_commands(commands);
+
+    xdg_surface.set_window_geometry(0, 0, 4, 4);
+    buffers[1].attach_with_damage(&surface, 0, 0, 1, 1);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commands.send(ServerCommand::MarkRenderDamagePresented)?;
+    wait_for_server_commands(commands);
+
+    xdg_surface.set_window_geometry(0, 0, 4, 4);
+    buffers[2].attach_with_damage(&surface, 0, 0, 1, 1);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commands.send(ServerCommand::MarkRenderDamagePresented)?;
+    wait_for_server_commands(commands);
+
+    xdg_surface.set_window_geometry(0, 0, 4, 4);
+    surface.attach(Some(&buffers[0].buffer), 0, 0);
+    if final_commit_has_damage {
+        surface.damage_buffer(0, 0, 1, 1);
+    }
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    for index in 0..additional_content_commits {
+        xdg_surface.set_window_geometry(0, 0, 4, 4);
+        buffers[index % buffers.len()].attach_with_damage(&surface, 0, 0, 1, 1);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+        commands.send(ServerCommand::MarkRenderDamagePresented)?;
+        wait_for_server_commands(commands);
+    }
+    retain_live_test_connection(connection);
+    Ok(())
+}
+
+pub(in crate::compositor::tests) fn create_client_popup_with_rotating_shm_buffers(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    content_commits: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut state = RegistryTestState::default();
+
+    let parent = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+    parent_xdg_surface.set_window_geometry(0, 0, 120, 90);
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let parent_buffer = TestShmBuffer::new(&shm, &qh, 120, 90)?;
+    parent_buffer.attach(&parent, 120, 90);
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::MarkRenderDamagePresented)?;
+    wait_for_server_commands(commands);
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(40, 30);
+    positioner.set_anchor_rect(10, 20, 1, 1);
+    positioner.set_anchor(client_xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
+    let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+    popup_surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    popup_xdg_surface.set_window_geometry(0, 0, 40, 30);
+
+    let buffers = [
+        TestShmBuffer::new(&shm, &qh, 40, 30)?,
+        TestShmBuffer::new(&shm, &qh, 40, 30)?,
+        TestShmBuffer::new(&shm, &qh, 40, 30)?,
+    ];
+    buffers[0].attach(&popup_surface, 40, 30);
+    popup_surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::MarkRenderDamagePresented)?;
+    wait_for_server_commands(commands);
+
+    for index in 0..content_commits {
+        popup_xdg_surface.set_window_geometry(0, 0, 40, 30);
+        buffers[index % buffers.len()].attach_with_damage(&popup_surface, 0, 0, 1, 1);
+        popup_surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut state)?;
+        commands.send(ServerCommand::MarkRenderDamagePresented)?;
+        wait_for_server_commands(commands);
+    }
+    retain_live_test_connection(connection);
     Ok(())
 }
 

@@ -947,8 +947,9 @@ impl CompositorState {
         let geometry = popup_surface.positioner.constrained_geometry(
             self.popup_constraint_target(&popup_surface, popup_surface.positioner),
         );
-        self.store_popup_surface_placement(surface_id, &popup_surface, geometry);
-        true
+        let previous_placement = self.surface_placement(surface_id);
+        let placement = self.store_popup_surface_placement(surface_id, &popup_surface, geometry);
+        previous_placement != placement
     }
 
     fn store_popup_surface_placement(

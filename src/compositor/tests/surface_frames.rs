@@ -644,6 +644,112 @@ fn wayland_surface_damage_only_commit_updates_existing_shm_snapshot() {
 }
 
 #[test]
+fn wayland_same_size_buffer_rotation_preserves_partial_damage() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_toplevel_with_rotating_shm_buffers(&socket_path, &commands, true, true, true, 0)
+        .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    let surface = &server.renderable_surfaces()[0];
+    assert_eq!(
+        surface.damage,
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }])
+    );
+}
+
+#[test]
+fn wayland_same_size_buffer_rotation_preserves_authoritative_empty_damage() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_toplevel_with_rotating_shm_buffers(&socket_path, &commands, true, true, false, 0)
+        .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        server.renderable_surfaces()[0].damage,
+        RenderableSurfaceDamage::Empty
+    );
+}
+
+#[test]
+fn wayland_first_map_without_explicit_damage_stays_visually_live() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_toplevel_with_rotating_shm_buffers(
+        &socket_path,
+        &commands,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    assert_eq!(
+        server.renderable_surfaces()[0].damage,
+        RenderableSurfaceDamage::Full
+    );
+}
+
+#[test]
+fn wayland_content_commits_skip_global_stack_reorder() {
+    const CONTENT_COMMITS: usize = 1_000;
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_toplevel_with_rotating_shm_buffers(
+        &socket_path,
+        &commands,
+        true,
+        true,
+        true,
+        CONTENT_COMMITS,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.core_compliance_metrics();
+
+    assert_eq!(metrics.surface_commit_stack_reorders, 1);
+    assert_eq!(metrics.surface_commit_buffer_rotations, 1_002);
+    assert_eq!(
+        metrics.surface_commit_stack_reorder_skips,
+        (CONTENT_COMMITS + 3) as u64
+    );
+    assert_eq!(metrics.surface_commit_mapping_full_promotions, 1);
+    assert_eq!(
+        metrics.surface_commit_partial_damage_preserved,
+        (CONTENT_COMMITS + 3) as u64
+    );
+    assert_eq!(metrics.surface_commit_empty_damage_preserved, 0);
+    assert_eq!(
+        metrics.surface_commit_geometry_noops,
+        (CONTENT_COMMITS + 3) as u64
+    );
+    assert_eq!(metrics.surface_commit_popup_topology_updates, 0);
+    assert_eq!(metrics.surface_commit_popup_pointer_refreshes, 0);
+    assert_eq!(metrics.active_root_scene_refreshes, 1);
+}
+
+#[test]
 fn wayland_viewport_destination_sets_renderable_surface_logical_size() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

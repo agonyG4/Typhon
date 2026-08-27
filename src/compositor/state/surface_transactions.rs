@@ -221,9 +221,10 @@ impl CompositorState {
         if input_region_changed {
             self.advance_pointer_hit_generation();
         }
-        let damage = damage.or(window_geometry
-            .is_some()
-            .then_some(RenderableSurfaceDamage::Full));
+        let window_geometry_changed = window_geometry.is_some_and(|geometry| {
+            self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
+        });
+        let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {

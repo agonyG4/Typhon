@@ -517,7 +517,8 @@ impl GlesSceneRenderer {
                 height,
             )
         });
-        let mut output_damage = self.damage_tracker.damage_for_frame(
+        let damage_authority_available = current_damage.is_some();
+        let output_damage = self.damage_tracker.damage_for_frame(
             width,
             height,
             scene_changed,
@@ -525,10 +526,12 @@ impl GlesSceneRenderer {
             scaled_visual_state,
             client_cursor_damage,
         );
-        if scene_changed && output_damage == OutputDamage::Empty {
-            self.frame_stats.contradictory_empty_damage = true;
-            output_damage = OutputDamage::Full;
-        }
+        let (output_damage, contradictory_empty_damage) = resolve_scene_damage_authority(
+            scene_changed,
+            damage_authority_available,
+            output_damage,
+        );
+        self.frame_stats.contradictory_empty_damage = contradictory_empty_damage;
         let damage_state = EglOutputDamageTracker::candidate_state(
             width,
             height,
@@ -1615,6 +1618,18 @@ impl GlesSceneRenderer {
             self.gl.delete_vertex_array(self.overlay_vertex_array);
             self.gl.delete_program(self.program);
         }
+    }
+}
+
+fn resolve_scene_damage_authority(
+    scene_changed: bool,
+    damage_authority_available: bool,
+    output_damage: OutputDamage,
+) -> (OutputDamage, bool) {
+    if scene_changed && !damage_authority_available && output_damage == OutputDamage::Empty {
+        (OutputDamage::Full, true)
+    } else {
+        (output_damage, false)
     }
 }
 
@@ -3105,6 +3120,22 @@ mod tests {
                 None,
             ),
             precise
+        );
+    }
+
+    #[test]
+    fn scene_damage_authority_preserves_explicit_empty_damage() {
+        assert_eq!(
+            resolve_scene_damage_authority(true, true, OutputDamage::Empty),
+            (OutputDamage::Empty, false)
+        );
+    }
+
+    #[test]
+    fn scene_damage_authority_falls_back_when_damage_is_missing() {
+        assert_eq!(
+            resolve_scene_damage_authority(true, false, OutputDamage::Empty),
+            (OutputDamage::Full, true)
         );
     }
 

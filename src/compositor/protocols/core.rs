@@ -150,9 +150,6 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     data.viewport_for_change(viewport_change),
                 );
                 let damage = match attachment {
-                    Some(PendingSurfaceAttachment::Buffer(_)) if damage.damage.is_empty() => {
-                        Some(RenderableSurfaceDamage::Full)
-                    }
                     Some(PendingSurfaceAttachment::Buffer(_)) => Some(damage.damage),
                     _ => damage.explicit(),
                 };

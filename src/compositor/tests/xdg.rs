@@ -1293,6 +1293,32 @@ fn xdg_popup_set_window_geometry_does_not_reconfigure_non_reactive_popup() {
 }
 
 #[test]
+fn wayland_popup_content_commits_skip_popup_topology_maintenance() {
+    const CONTENT_COMMITS: usize = 1_000;
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_popup_with_rotating_shm_buffers(&socket_path, &commands, CONTENT_COMMITS)
+        .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.core_compliance_metrics();
+
+    assert_eq!(metrics.surface_commit_popup_topology_updates, 1);
+    assert_eq!(metrics.surface_commit_popup_pointer_refreshes, 1);
+    assert_eq!(metrics.surface_commit_stack_reorders, 2);
+    assert_eq!(
+        metrics.surface_commit_stack_reorder_skips,
+        CONTENT_COMMITS as u64
+    );
+    assert_eq!(
+        metrics.surface_commit_geometry_noops,
+        CONTENT_COMMITS as u64
+    );
+}
+
+#[test]
 fn xdg_popup_grab_retargets_button_release_to_popup_under_cursor() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

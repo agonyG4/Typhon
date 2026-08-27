@@ -253,6 +253,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         reason: FrameBatchDiscardReason,
     },
     PresentFrame,
+    MarkRenderDamagePresented,
     Stop,
 }
 
@@ -909,6 +910,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::PresentFrame => {
                         server.present_frame();
+                    }
+                    ServerCommand::MarkRenderDamagePresented => {
+                        server.mark_render_damage_presented();
                     }
                     ServerCommand::Stop => running = false,
                 }

@@ -21,7 +21,9 @@ impl CompositorState {
             SurfaceCommitId::from_sequence(commit_sequence),
             generation,
         );
-        self.apply_committed_window_geometry(surface_id, window_geometry);
+        let previous_placement = self.surface_placement(surface_id);
+        let window_geometry_changed =
+            self.apply_committed_window_geometry(surface_id, window_geometry);
         let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
         {
             Ok(placement) => placement,
@@ -70,6 +72,35 @@ impl CompositorState {
         let surface_size = pending.surface_size.unwrap_or(buffer_size);
         let width = surface_size.width;
         let height = surface_size.height;
+        let surface_was_renderable = self
+            .renderable_surfaces
+            .iter()
+            .any(|surface| surface.surface_id == surface_id);
+        let buffer_identity_changed = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .is_some_and(|surface| surface.buffer_id() != pending.data.buffer_id());
+        let visual_mapping_changed = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .is_none_or(|surface| {
+                surface.buffer_size() != buffer_size
+                    || surface.x != pending.x
+                    || surface.y != pending.y
+                    || surface.width != width
+                    || surface.height != height
+                    || surface.placement != placement
+                    || surface.buffer_scale != pending.buffer_scale
+                    || surface.buffer_transform != pending.buffer_transform
+                    || surface.viewport_source != pending.viewport_source
+                    || surface.viewport_destination != pending.viewport_destination
+            });
+        if buffer_identity_changed {
+            self.compliance_metrics
+                .note_surface_commit_buffer_rotation();
+        }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: commit surface={surface_id} wl_buffer={} buffer_id={} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} dmabuf_layout={:?} commit_resize_serial={:?} pending_resize={:?} window_geometry={:?}",
@@ -154,18 +185,26 @@ impl CompositorState {
             }
             return;
         }
+        let committed_damage = if !visual_mapping_changed {
+            let damage = damage.normalized_for_surface(buffer_width, buffer_height);
+            if damage.is_empty() {
+                self.compliance_metrics
+                    .note_surface_commit_empty_damage_preserved();
+            } else if matches!(damage, RenderableSurfaceDamage::Partial(_)) {
+                self.compliance_metrics
+                    .note_surface_commit_partial_damage_preserved();
+            }
+            damage
+        } else {
+            self.compliance_metrics
+                .note_surface_commit_mapping_full_promotion();
+            RenderableSurfaceDamage::Full
+        };
         if let Some(existing) = self
             .renderable_surfaces
             .iter_mut()
             .find(|surface| surface.surface_id == surface_id)
         {
-            let damage = if existing.buffer_size() == buffer_size
-                && existing.buffer_id() == pending.data.buffer_id()
-            {
-                damage.normalized_for_surface(buffer_width, buffer_height)
-            } else {
-                RenderableSurfaceDamage::Full
-            };
             if update_renderable_surface_buffer(
                 existing,
                 &pending,
@@ -175,7 +214,7 @@ impl CompositorState {
                 placement,
                 generation,
                 resize_commit,
-                damage,
+                committed_damage,
             )
             .is_err()
             {
@@ -192,42 +231,52 @@ impl CompositorState {
                 };
             self.renderable_surfaces.push(surface);
         }
-        if window_geometry.is_some()
-            && self.update_popup_surface_placement_from_committed_state(surface_id)
-        {
-            let placement = self.surface_placement(surface_id);
-            if let Some(surface) = self
-                .renderable_surfaces
-                .iter_mut()
-                .find(|surface| surface.surface_id == surface_id)
-            {
-                surface.placement = placement;
-            }
-            self.invalidate_surface_origin_cache();
-        }
-        self.reorder_renderable_surfaces_by_committed_stack();
-        if self
-            .surface_window_geometries
-            .contains_key(&root_surface_id)
-            || self
-                .toplevel_visual_geometries
+        let placement_changed = previous_placement != placement;
+        let visual_state_changed = visual_mapping_changed || window_geometry_changed;
+        if visual_state_changed
+            && (self
+                .surface_window_geometries
                 .contains_key(&root_surface_id)
+                || self
+                    .toplevel_visual_geometries
+                    .contains_key(&root_surface_id))
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
+        let stack_reorder_needed = !surface_was_renderable || placement_changed;
+        if stack_reorder_needed {
+            self.compliance_metrics.note_surface_commit_stack_reorder();
+            self.reorder_renderable_surfaces_by_committed_stack();
+        } else {
+            self.compliance_metrics
+                .note_surface_commit_stack_reorder_skip();
+        }
         let committed_popup = self.popup_surfaces.contains_key(&surface_id);
+        let popup_was_mapped = self
+            .popup_nodes
+            .get(&surface_id)
+            .is_some_and(|node| node.mapped);
+        let popup_mapping_changed = committed_popup && !popup_was_mapped;
         if committed_popup {
             if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
                 node.mapped = true;
             }
-            self.refresh_active_scene_popup_view();
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: popup surface {surface_id} committed {width}x{height} at buffer offset {},{}",
                     pending.x, pending.y
                 );
             }
-            self.raise_renderable_surface_tree(surface_id);
+            let popup_stack_changed = popup_mapping_changed || placement_changed;
+            if popup_stack_changed {
+                self.compliance_metrics
+                    .note_surface_commit_popup_topology_update();
+                self.refresh_active_scene_popup_view();
+                self.raise_renderable_surface_tree(surface_id);
+            }
+            if visual_state_changed {
+                self.refresh_active_scene_surface_tree(root_surface_id);
+            }
         }
         self.track_committed_buffer_lifetime(surface_id, &pending);
         let published_buffer_id = pending.data.buffer_id();
@@ -257,10 +306,12 @@ impl CompositorState {
         if let Some(resize_commit) = resize_commit {
             self.complete_applied_resize_transaction(surface_id, resize_commit);
         }
-        if committed_popup {
+        if committed_popup && (popup_mapping_changed || placement_changed || visual_state_changed) {
+            self.compliance_metrics
+                .note_surface_commit_popup_pointer_refresh();
             self.refresh_pointer_focus_at_last_position();
         }
-        if let Some(surface) = self.surface_resource_by_id(surface_id) {
+        if visual_state_changed && let Some(surface) = self.surface_resource_by_id(surface_id) {
             self.reconcile_surface_output_membership(&surface);
         }
     }
@@ -364,7 +415,9 @@ impl CompositorState {
                 ("source", "damage_only".to_string()),
             ],
         );
-        self.apply_committed_window_geometry(surface_id, window_geometry);
+        let window_geometry_changed =
+            self.apply_committed_window_geometry(surface_id, window_geometry);
+        let placement = self.surface_placement(surface_id);
         let Some(existing) = self
             .renderable_surfaces
             .iter_mut()
@@ -412,6 +465,15 @@ impl CompositorState {
             requested_surface_size,
             resize_pending,
         );
+        let visual_mapping_changed = existing.x != current.x
+            || existing.y != current.y
+            || existing.width != surface_size.width
+            || existing.height != surface_size.height
+            || existing.placement != placement
+            || existing.buffer_scale != buffer_scale
+            || existing.buffer_transform != current.buffer_transform
+            || existing.viewport_source != current.viewport_source
+            || existing.viewport_destination != current.viewport_destination;
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: damage-only commit surface {surface_id} buffer={}x{} requested_surface={}x{} applied_surface={}x{} shm={} dmabuf={} pending_resize={:?}",
@@ -432,6 +494,7 @@ impl CompositorState {
         existing.y = current.y;
         existing.width = surface_size.width;
         existing.height = surface_size.height;
+        existing.placement = placement;
         existing.generation = generation;
         existing.commit_sequence = commit_sequence;
         existing.buffer_scale = buffer_scale;
@@ -452,12 +515,13 @@ impl CompositorState {
             journal_size.height,
         );
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        if self
-            .surface_window_geometries
-            .contains_key(&root_surface_id)
-            || self
-                .toplevel_visual_geometries
+        if (visual_mapping_changed || window_geometry_changed)
+            && (self
+                .surface_window_geometries
                 .contains_key(&root_surface_id)
+                || self
+                    .toplevel_visual_geometries
+                    .contains_key(&root_surface_id))
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
@@ -489,8 +553,9 @@ impl CompositorState {
             .surface_window_geometries
             .insert(surface_id, window_geometry)
             != Some(window_geometry);
-        if self.toplevel_surfaces.contains_key(&surface_id) {
-            self.update_toplevel_visual_render_assignment(surface_id);
+        if !changed {
+            self.compliance_metrics.note_surface_commit_geometry_noop();
+            return false;
         }
         self.update_popup_surface_placement_from_committed_state(surface_id);
         if let Some(positioner) = self
@@ -828,6 +893,7 @@ impl CompositorState {
                 });
             *snapshot = snapshot.with_committed_size(committed_size.width, committed_size.height);
         }
+        let has_current_buffer = self.current_surface_buffers.contains_key(&surface_id);
         let viewport_size_changed = surface_size.is_some_and(|surface_size| {
             self.renderable_surfaces
                 .iter()
@@ -836,13 +902,18 @@ impl CompositorState {
                     surface.width != surface_size.width || surface.height != surface_size.height
                 })
         });
-        self.apply_committed_window_geometry(surface_id, window_geometry);
-        if let Some(damage) = damage
-            .or(viewport_size_changed.then_some(RenderableSurfaceDamage::Full))
-            .or(window_geometry
-                .is_some()
-                .then_some(RenderableSurfaceDamage::Full))
-        {
+        let window_geometry_changed = window_geometry.is_some_and(|geometry| {
+            self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
+        });
+        if !has_current_buffer {
+            self.apply_committed_window_geometry(surface_id, window_geometry);
+        }
+        let damage = if viewport_size_changed || window_geometry_changed {
+            Some(RenderableSurfaceDamage::Full)
+        } else {
+            damage
+        };
+        if has_current_buffer && let Some(damage) = damage {
             self.commit_surface_damage_only(
                 surface_id,
                 commit_sequence,

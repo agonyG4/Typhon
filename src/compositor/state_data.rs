@@ -51,6 +51,15 @@ pub struct CoreComplianceMetrics {
     pub dnd_source_action_events: u64,
     pub(in crate::compositor) dnd_last_terminal_phase: Option<DragSessionPhase>,
     pub pointer_axis_frames: u64,
+    pub surface_commit_buffer_rotations: u64,
+    pub surface_commit_partial_damage_preserved: u64,
+    pub surface_commit_empty_damage_preserved: u64,
+    pub surface_commit_mapping_full_promotions: u64,
+    pub surface_commit_stack_reorders: u64,
+    pub surface_commit_stack_reorder_skips: u64,
+    pub surface_commit_geometry_noops: u64,
+    pub surface_commit_popup_topology_updates: u64,
+    pub surface_commit_popup_pointer_refreshes: u64,
 }
 
 #[allow(dead_code)]
@@ -85,6 +94,52 @@ impl CoreComplianceMetrics {
     pub(in crate::compositor) fn note_unhandled_supported_request(&mut self) {
         self.supported_request_unhandled_total =
             self.supported_request_unhandled_total.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_buffer_rotation(&mut self) {
+        self.surface_commit_buffer_rotations =
+            self.surface_commit_buffer_rotations.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_partial_damage_preserved(&mut self) {
+        self.surface_commit_partial_damage_preserved = self
+            .surface_commit_partial_damage_preserved
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_empty_damage_preserved(&mut self) {
+        self.surface_commit_empty_damage_preserved =
+            self.surface_commit_empty_damage_preserved.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_mapping_full_promotion(&mut self) {
+        self.surface_commit_mapping_full_promotions = self
+            .surface_commit_mapping_full_promotions
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_stack_reorder(&mut self) {
+        self.surface_commit_stack_reorders = self.surface_commit_stack_reorders.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_stack_reorder_skip(&mut self) {
+        self.surface_commit_stack_reorder_skips =
+            self.surface_commit_stack_reorder_skips.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_geometry_noop(&mut self) {
+        self.surface_commit_geometry_noops = self.surface_commit_geometry_noops.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_popup_topology_update(&mut self) {
+        self.surface_commit_popup_topology_updates =
+            self.surface_commit_popup_topology_updates.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_surface_commit_popup_pointer_refresh(&mut self) {
+        self.surface_commit_popup_pointer_refreshes = self
+            .surface_commit_popup_pointer_refreshes
+            .saturating_add(1);
     }
 
     pub(in crate::compositor) fn note_xdg_same_role_reassociation(&mut self) {
