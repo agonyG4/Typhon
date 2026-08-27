@@ -1519,6 +1519,10 @@ impl OwnCompositorServer {
     }
 
     pub fn tick(&mut self) -> Result<usize, CompositorError> {
+        self.tick_with_outcome().map(|(accepted, _)| accepted)
+    }
+
+    pub fn tick_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
         let mut accepted = 0;
         while let Some(stream) = self.socket.accept()? {
             let mut handle = self.display.handle();
@@ -1547,11 +1551,12 @@ impl OwnCompositorServer {
         self.publish_astrea_toplevel_updates();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
-        self.state
+        let pacing_visual_work = self
+            .state
             .progress_surface_pacing(super::pacing::client_pacing_now_ns());
         self.flush_wayland_clients()?;
         dispatch_result?;
-        Ok(accepted)
+        Ok((accepted, pacing_visual_work))
     }
 
     fn teardown_disconnected_clients(&mut self) {

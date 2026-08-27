@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 
 #[cfg(test)]
 mod frame_consumption_tests {
@@ -119,6 +120,112 @@ mod frame_consumption_tests {
 
         assert_eq!(state.active_fifo_barriers.get(&9), Some(&current));
         assert_eq!(state.surface_pacing_metrics.stale_barrier_clear_attempts, 1);
+    }
+
+    #[test]
+    fn scene_work_index_tracks_hidden_prepare_work_by_typed_owner() {
+        let mut state = CompositorState::new(None);
+        let window_id = state.allocate_window_id().expect("window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, 907))
+            .expect("window");
+        state.window_mut(window_id).expect("window").management = Some(WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Regular(WorkspaceId::new(2).expect("workspace two")),
+        ));
+        state.active_fifo_barriers.insert(
+            907,
+            ActiveFifoBarrier {
+                surface_generation: 1,
+                fifo_barrier_generation: FifoBarrierGeneration::new(1),
+                commit_sequence: SurfaceCommitSequence::initial(),
+                fallback_deadline_ns: u64::MAX,
+            },
+        );
+        state.rebuild_active_scene_view();
+
+        assert_eq!(
+            state.scene_work_prepare_count(crate::wm::WorkspaceLocation::Regular(
+                WorkspaceId::new(2).unwrap(),
+            )),
+            1
+        );
+        assert!(!state.has_pending_frame_prepare_work());
+    }
+
+    #[test]
+    fn frame_owned_fifo_barrier_is_not_perpetual_prepare_work() {
+        let mut state = CompositorState::new(None);
+        let claim = FifoBarrierClaim {
+            surface_id: 907,
+            surface_generation: 1,
+            fifo_barrier_generation: FifoBarrierGeneration::new(1),
+            commit_sequence: SurfaceCommitSequence::initial(),
+        };
+        state.active_fifo_barriers.insert(
+            claim.surface_id,
+            ActiveFifoBarrier {
+                surface_generation: claim.surface_generation,
+                fifo_barrier_generation: claim.fifo_barrier_generation,
+                commit_sequence: claim.commit_sequence,
+                fallback_deadline_ns: u64::MAX,
+            },
+        );
+        let batch = state.take_frame_batch_for_render(1);
+        state
+            .frame_batches
+            .get_mut(&batch)
+            .expect("frame batch")
+            .fifo_barrier_claims
+            .push(claim);
+        state.rebuild_active_scene_view();
+
+        assert!(!state.has_pending_frame_prepare_work());
+    }
+
+    #[test]
+    fn future_commit_timing_is_planning_work_not_scene_prepare_work() {
+        let mut state = CompositorState::new(None);
+        let requested =
+            CommitTimingConstraint::from_protocol(client_pacing_now_ns() / 1_000_000_000 + 60, 0)
+                .expect("valid commit timing");
+        let mut commit = empty_cached_subsurface_commit();
+        commit.pacing.commit_timing = Some(requested);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
+                root_surface_id: 8,
+                nodes: vec![(8, commit)],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state.rebuild_scene_work_index();
+
+        assert!(!state.has_pending_frame_prepare_work());
+        assert!(state.has_pending_commit_timing_planning());
+        assert!(state.next_commit_timing_planning_deadline_ns().is_some());
+        assert!(state.next_surface_pacing_deadline_ns().is_none());
+    }
+
+    #[test]
+    fn callback_only_ignores_hidden_prepare_work_but_rejects_visible_prepare_work() {
+        let mut state = CompositorState::new(None);
+        state.visible_pending_frame_callback_count = 1;
+        state
+            .scene_work_index
+            .add_prepare_work(SceneWorkOwner::Location(WorkspaceLocation::Regular(
+                WorkspaceId::new(2).expect("workspace two"),
+            )));
+
+        assert!(state.has_only_pending_surface_frame_callbacks());
+
+        state
+            .scene_work_index
+            .add_prepare_work(SceneWorkOwner::Location(WorkspaceLocation::Regular(
+                WorkspaceId::new(1).expect("active workspace"),
+            )));
+        assert!(!state.has_only_pending_surface_frame_callbacks());
     }
 
     #[test]

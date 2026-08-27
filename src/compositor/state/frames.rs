@@ -333,6 +333,7 @@ impl CompositorState {
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
+        self.rebuild_scene_work_index();
         batch_id
     }
 
@@ -366,6 +367,7 @@ impl CompositorState {
         self.pending_dmabuf_buffer_releases = batch.dmabuf_releases_to_complete_on_present;
         self.note_buffer_releases_restored(batch_id, restored_shm + restored_dmabuf);
         self.clear_legacy_batch_reference(batch_id);
+        self.rebuild_scene_work_index();
     }
 
     pub(in crate::compositor) fn discard_frame_batch(
@@ -406,6 +408,7 @@ impl CompositorState {
         let release_count =
             batch.shm_buffer_releases.len() + batch.dmabuf_releases_to_complete_on_present.len();
         self.retired_frame_batches.insert(batch_id, batch);
+        self.rebuild_scene_work_index();
         client_pacing_log(
             "buffer_releases_retired",
             &[
@@ -448,6 +451,7 @@ impl CompositorState {
         }
         self.complete_frame_callbacks(batch.callbacks);
         self.clear_legacy_batch_reference(batch_id);
+        self.rebuild_scene_work_index();
         client_pacing_log(
             "buffer_releases_completed_after_abandonment",
             &[
@@ -946,6 +950,7 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained;
+        self.rebuild_scene_work_index();
         for commit_sequence in canceled_resize_captures {
             self.release_resize_capture(surface_id, commit_sequence);
         }
@@ -987,6 +992,7 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained;
+        self.rebuild_scene_work_index();
         for commit_sequence in released_captures {
             self.release_resize_capture(surface_id, commit_sequence);
         }
@@ -1063,6 +1069,7 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained;
+        self.rebuild_scene_work_index();
         for (surface_id, commit_sequence) in released_captures {
             self.release_resize_capture(surface_id, commit_sequence);
         }
@@ -1123,6 +1130,7 @@ impl CompositorState {
                     }));
             }
         }
+        self.rebuild_scene_work_index();
     }
 
     pub(in crate::compositor) fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
@@ -1226,6 +1234,8 @@ impl CompositorState {
                     ("acquire_commit_id", commit_id.get().to_string()),
                 ],
             );
+            self.rebuild_scene_work_index();
+            self.note_surface_pacing_readiness_transition();
         }
         ready
     }

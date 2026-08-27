@@ -39,6 +39,7 @@ struct ShortcutInhibitor {
 pub(in crate::compositor) struct ShortcutInhibitionRegistry {
     next_id: u64,
     effective_generation: u64,
+    effective_count: usize,
     inhibitors: HashMap<ShortcutInhibitorId, ShortcutInhibitor>,
     metrics: KeyboardShortcutInhibitionMetrics,
 }
@@ -88,6 +89,7 @@ impl ShortcutInhibitionRegistry {
         };
         self.metrics.destroyed = self.metrics.destroyed.saturating_add(1);
         if inhibitor.effective {
+            self.effective_count = self.effective_count.saturating_sub(1);
             self.bump_generation();
         }
         true
@@ -193,6 +195,11 @@ impl ShortcutInhibitionRegistry {
             if was_effective == effective {
                 continue;
             }
+            if effective {
+                self.effective_count = self.effective_count.saturating_add(1);
+            } else {
+                self.effective_count = self.effective_count.saturating_sub(1);
+            }
             self.bump_generation();
             if effective {
                 self.metrics.effective_activations =
@@ -222,9 +229,7 @@ impl ShortcutInhibitionRegistry {
     }
 
     pub(in crate::compositor) fn has_effective_inhibitor(&self) -> bool {
-        self.inhibitors
-            .values()
-            .any(|inhibitor| inhibitor.effective)
+        self.effective_count > 0
     }
 
     pub(in crate::compositor) const fn metrics(&self) -> KeyboardShortcutInhibitionMetrics {

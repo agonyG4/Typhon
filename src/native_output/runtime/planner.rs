@@ -92,7 +92,7 @@ pub(super) fn prepare_presentation_target(
     } else {
         scheduled
     };
-    server.progress_surface_pacing(now.get());
+    let _ = server.progress_surface_pacing(now.get());
     scheduled
 }
 

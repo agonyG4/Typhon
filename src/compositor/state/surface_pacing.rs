@@ -174,6 +174,24 @@ pub(in crate::compositor) fn fifo_forward_progress_deadline(now_ns: u64, refresh
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn note_surface_pacing_readiness_transition(&mut self) {
+        self.surface_pacing_readiness_generation =
+            advance_nonzero_serial(self.surface_pacing_readiness_generation);
+    }
+
+    pub(in crate::compositor) fn surface_pacing_readiness_pending(&self) -> bool {
+        self.surface_pacing_readiness_generation != self.surface_pacing_serviced_generation
+    }
+
+    pub(in crate::compositor) fn invalidate_surface_pacing_deadline_cache(&self) {
+        self.surface_pacing_deadline_cache_valid.set(false);
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn surface_pacing_deadline_recomputations(&self) -> u64 {
+        self.surface_pacing_deadline_recomputations.get()
+    }
+
     pub(in crate::compositor) fn set_pending_fifo_barrier(&mut self, surface_id: u32) {
         if let Some(surface) = self.surface_resource_by_id(surface_id)
             && let Some(data) = surface.data::<SurfaceData>()
@@ -295,6 +313,7 @@ impl CompositorState {
             ),
         };
         self.active_fifo_barriers.insert(surface_id, active);
+        self.rebuild_scene_work_index();
         self.surface_pacing_metrics.barriers_activated = self
             .surface_pacing_metrics
             .barriers_activated
@@ -366,21 +385,46 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn next_surface_pacing_deadline_ns(&self) -> Option<u64> {
-        let mut deadline = self
-            .active_fifo_barriers
-            .values()
-            .map(|barrier| barrier.fallback_deadline_ns)
-            .min();
-        let timing_deadline = self.next_commit_timing_deadline_ns();
-        if let Some(target) = timing_deadline {
-            deadline = Some(deadline.map_or(target, |current| current.min(target)));
+        if !self.surface_pacing_deadline_cache_valid.get() {
+            let mut deadline = self
+                .active_fifo_barriers
+                .values()
+                .map(|barrier| barrier.fallback_deadline_ns)
+                .min();
+            let timing_deadline = self.next_commit_timing_release_deadline_ns();
+            if let Some(target) = timing_deadline {
+                deadline = Some(deadline.map_or(target, |current| current.min(target)));
+            }
+            self.surface_pacing_deadline_cache.set(deadline);
+            self.surface_pacing_deadline_cache_valid.set(true);
+            self.surface_pacing_deadline_recomputations.set(
+                self.surface_pacing_deadline_recomputations
+                    .get()
+                    .saturating_add(1),
+            );
         }
-        deadline
+        let deadline = self.surface_pacing_deadline_cache.get();
+        if self.surface_pacing_readiness_pending() {
+            let now = client_pacing_now_ns();
+            Some(deadline.map_or(now, |deadline| deadline.min(now)))
+        } else {
+            deadline
+        }
+    }
+
+    pub(in crate::compositor) fn next_commit_timing_planning_deadline_ns(&self) -> Option<u64> {
+        self.commit_timing_planning_pending
+            .then_some(client_pacing_now_ns())
     }
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn progress_surface_pacing(&mut self, now_ns: u64) {
+    /// Progress ordered surface pacing and report whether it made the active
+    /// scene visually newer.  The native scheduler uses this handoff to admit
+    /// a render after blocked scene-work entries have been removed.
+    pub(in crate::compositor) fn progress_surface_pacing(&mut self, now_ns: u64) -> bool {
+        let scene_generation_before = self.scene_render_generation;
+        let serviced_generation = self.surface_pacing_readiness_generation;
         let expired = self
             .active_fifo_barriers
             .iter()
@@ -402,6 +446,8 @@ impl CompositorState {
         if !expired.is_empty() || !self.pending_surface_tree_transactions.is_empty() {
             self.commit_ready_surface_tree_transactions();
         }
+        self.surface_pacing_serviced_generation = serviced_generation;
+        self.scene_render_generation != scene_generation_before
     }
 
     pub(in crate::compositor) fn fifo_claims_for_frame(
@@ -443,6 +489,10 @@ impl CompositorState {
             return;
         }
         self.active_fifo_barriers.remove(&claim.surface_id);
+        self.rebuild_scene_work_index();
+        if reason != FifoBarrierClearReason::ForwardProgressFallback {
+            self.note_surface_pacing_readiness_transition();
+        }
         match reason {
             FifoBarrierClearReason::Presented => {
                 self.surface_pacing_metrics.barriers_cleared_by_presentation = self
@@ -1171,6 +1221,32 @@ mod tests {
     fn fallback_is_refresh_aware_but_finite() {
         assert_eq!(fifo_forward_progress_deadline(10, 60_000_000), 75_000_010);
         assert_eq!(fifo_forward_progress_deadline(10, 6_060_606), 34_000_010);
+    }
+
+    #[test]
+    fn stable_surface_pacing_deadline_queries_use_the_cached_minimum() {
+        let mut state = CompositorState::default();
+        state.active_fifo_barriers.insert(
+            11,
+            ActiveFifoBarrier {
+                surface_generation: 1,
+                fifo_barrier_generation: FifoBarrierGeneration::new(1),
+                commit_sequence: SurfaceCommitSequence::initial(),
+                fallback_deadline_ns: 123,
+            },
+        );
+        state.rebuild_scene_work_index();
+
+        assert_eq!(state.next_surface_pacing_deadline_ns(), Some(123));
+        assert_eq!(state.next_surface_pacing_deadline_ns(), Some(123));
+        assert_eq!(state.surface_pacing_deadline_recomputations(), 1);
+
+        state.note_surface_pacing_readiness_transition();
+        assert!(
+            state
+                .next_surface_pacing_deadline_ns()
+                .is_some_and(|deadline| deadline <= client_pacing_now_ns())
+        );
     }
 
     #[test]

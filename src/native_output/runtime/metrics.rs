@@ -428,7 +428,10 @@ impl NativeRuntime {
                                 self.server
                                     .has_pending_astrea_toplevel_publication()
                                     .then_some(now_ns),
-                                self.server.next_surface_pacing_deadline_ns(),
+                                earliest_native_deadline(
+                                    self.server.next_surface_pacing_deadline_ns(),
+                                    self.server.next_commit_timing_planning_deadline_ns(),
+                                ),
                             ),
                         ),
                     ),

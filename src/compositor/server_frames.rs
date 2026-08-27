@@ -46,6 +46,21 @@ impl OwnCompositorServer {
         self.state.next_surface_pacing_deadline_ns()
     }
 
+    #[doc(hidden)]
+    pub fn next_commit_timing_planning_deadline_ns(&self) -> Option<u64> {
+        self.state.next_commit_timing_planning_deadline_ns()
+    }
+
+    #[doc(hidden)]
+    pub fn has_surface_pacing_readiness_pending(&self) -> bool {
+        self.state.surface_pacing_readiness_pending()
+    }
+
+    #[doc(hidden)]
+    pub fn has_pending_commit_timing_planning(&self) -> bool {
+        self.state.has_pending_commit_timing_planning()
+    }
+
     /// Earliest monotonic Commit Timing lower bound still held by an ordered
     /// surface transaction.  Native output uses this to select a refresh
     /// target before the transaction becomes publishable.
@@ -105,10 +120,11 @@ impl OwnCompositorServer {
 
     /// Re-evaluate ordered FIFO/timing constraints after a native wake.  This
     /// publishes work through the normal surface-tree path; it does not render
-    /// or submit anything itself.
+    /// or submit anything itself.  The return value reports an active-scene
+    /// visual handoff for the native scheduler.
     #[doc(hidden)]
-    pub fn progress_surface_pacing(&mut self, now_ns: u64) {
-        self.state.progress_surface_pacing(now_ns);
+    pub fn progress_surface_pacing(&mut self, now_ns: u64) -> bool {
+        self.state.progress_surface_pacing(now_ns)
     }
 
     #[doc(hidden)]

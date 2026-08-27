@@ -771,16 +771,16 @@ impl NativeRuntime {
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
-        let (accepted, tick_us) = if dispatch_wayland {
+        let (accepted, tick_us, tick_visual_work) = if dispatch_wayland {
             render_telemetry
                 .resource_efficiency
                 .record_server_tick_call();
             let tick_start = Instant::now();
-            let accepted = server.tick()?;
+            let (accepted, pacing_visual_work) = server.tick_with_outcome()?;
             render_telemetry.resource_efficiency.record_client_flush();
-            (accepted, elapsed_micros(tick_start))
+            (accepted, elapsed_micros(tick_start), pacing_visual_work)
         } else {
-            (0, 0)
+            (0, 0, false)
         };
         let mut redraw_requested = process_native_pointer_constraint_backend_requests(
             server,
@@ -788,6 +788,7 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
         )?;
+        redraw_requested |= tick_visual_work;
         synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
@@ -921,7 +922,7 @@ impl NativeRuntime {
             let interaction_reconciled = reconcile_trigger_liveness(
                 server,
                 input_state,
-                &format!("event_index={event_index}"),
+                TriggerLivenessPoint::Event(event_index),
             );
             redraw_requested |= interaction_reconciled;
             // A readable Wayland wake already paid for this cycle's one
@@ -932,10 +933,14 @@ impl NativeRuntime {
                 render_telemetry
                     .resource_efficiency
                     .record_server_tick_call();
-                if let Err(error) = server.tick() {
-                    let _ = server.end_native_input_batch();
-                    return Err(error.into());
-                }
+                let (_, pacing_visual_work) = match server.tick_with_outcome() {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let _ = server.end_native_input_batch();
+                        return Err(error.into());
+                    }
+                };
+                redraw_requested |= pacing_visual_work;
                 redraw_requested |= match process_native_pointer_constraint_backend_requests(
                     server,
                     pointer_constraint_backend,
@@ -959,7 +964,8 @@ impl NativeRuntime {
                 }
             }
         }
-        let interaction_reconciled = reconcile_trigger_liveness(server, input_state, "batch_end");
+        let interaction_reconciled =
+            reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
         redraw_requested |= interaction_reconciled;
         redraw_requested |= match process_native_pointer_constraint_backend_requests(
             server,
@@ -1190,10 +1196,16 @@ impl NativeRuntime {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TriggerLivenessPoint {
+    Event(usize),
+    BatchEnd,
+}
+
 fn reconcile_trigger_liveness(
     server: &mut OwnCompositorServer,
     input_state: &NativeInputState,
-    after_event: &str,
+    point: TriggerLivenessPoint,
 ) -> bool {
     let Some(snapshot) = server.window_interaction_debug_snapshot() else {
         return false;
@@ -1205,6 +1217,10 @@ fn reconcile_trigger_liveness(
         && !trigger_pressed
     {
         resize_debug_log(|| {
+            let after_event = match point {
+                TriggerLivenessPoint::Event(event_index) => format!("event_index={event_index}"),
+                TriggerLivenessPoint::BatchEnd => "batch_end".to_string(),
+            };
             format!(
                 "event=trigger_mismatch interaction_id={} trigger_button={} physical_pressed=false pressed_buttons={:?} after_event={after_event}",
                 snapshot.interaction_id,

@@ -506,7 +506,10 @@ impl NativeRuntime {
                 xwayland.next_deadline_ns(),
                 earliest_native_deadline(
                     control_server.next_deadline_ns(),
-                    server.next_surface_pacing_deadline_ns(),
+                    earliest_native_deadline(
+                        server.next_surface_pacing_deadline_ns(),
+                        server.next_commit_timing_planning_deadline_ns(),
+                    ),
                 ),
             ),
         ))?;

@@ -476,7 +476,10 @@ impl NativeSessionIo for NativeRuntime {
                     self.control_server.next_deadline_ns(),
                     earliest_native_deadline(
                         publication_deadline,
-                        self.server.next_surface_pacing_deadline_ns(),
+                        earliest_native_deadline(
+                            self.server.next_surface_pacing_deadline_ns(),
+                            self.server.next_commit_timing_planning_deadline_ns(),
+                        ),
                     ),
                 ),
             ),

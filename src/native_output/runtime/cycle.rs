@@ -43,6 +43,8 @@ impl NativeRuntime {
             explicit_sync_pending: self.server.has_pending_explicit_sync_work(),
             astrea_publication_due: cycle.wakeup.reasons.timer()
                 && self.server.has_pending_astrea_toplevel_publication(),
+            commit_timing_planning_due: cycle.wakeup.reasons.timer()
+                && self.server.has_pending_commit_timing_planning(),
             pacing_active: self.server.has_surface_pacing_work(),
             pacing_due: self.should_progress_surface_pacing(now_ns),
             xwayland_generation_changed: self.xwayland.reactor_registration_generation()
@@ -53,11 +55,33 @@ impl NativeRuntime {
     }
 
     pub(super) fn should_progress_surface_pacing(&self, now_ns: u64) -> bool {
-        self.server.has_surface_pacing_work()
+        self.server.has_surface_pacing_readiness_pending()
             || self
                 .server
                 .next_surface_pacing_deadline_ns()
                 .is_some_and(|deadline| deadline <= now_ns)
+    }
+
+    fn plan_pending_commit_timing(&mut self, now_ns: u64) {
+        if !self.server.has_pending_commit_timing_planning() {
+            return;
+        }
+        let predicted_total_cost = Duration::from_nanos(
+            self.render_journal
+                .prediction_with_kms_guard(
+                    Duration::from_nanos(self.presentation_timing.mode().refresh_interval_ns()),
+                    self.presentation_timing.apply_guard_ns(),
+                )
+                .total_cost_ns,
+        );
+        self.scheduled_presentation_target = super::planner::plan_commit_timing_target(
+            &mut self.presentation_deadline,
+            &mut self.server,
+            &self.frame_scheduler,
+            self.scheduled_presentation_target,
+            MonotonicTimestampNs::new(now_ns),
+            predicted_total_cost,
+        );
     }
 
     pub(super) fn should_process_acquire_and_prepare(&self, cycle: &NativeCycleState) -> bool {
@@ -138,9 +162,9 @@ impl NativeRuntime {
             {
                 self.dispatch_suspended_sources(&cycle)?;
             }
-            if work_domains.surface_pacing {
-                self.server.progress_surface_pacing(monotonic_now_ns()?);
-            }
+            work_domains.service_surface_pacing_if_due(|| -> NativeResult<bool> {
+                Ok(self.server.progress_surface_pacing(monotonic_now_ns()?))
+            })?;
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
                 return Ok(());
@@ -162,14 +186,24 @@ impl NativeRuntime {
         if work_domains.wayland_dispatch || work_domains.input {
             self.dispatch_wayland_and_input(&mut cycle, work_domains.wayland_dispatch)?;
         }
+        if work_domains.commit_timing_planning
+            || (work_domains.wayland_dispatch && self.server.has_pending_commit_timing_planning())
+        {
+            self.plan_pending_commit_timing(now_ns);
+        }
         if work_domains.astrea_publication && !work_domains.wayland_dispatch {
             self.server.service_pending_astrea_toplevel_updates();
             self.server.flush_wayland_clients()?;
             self.resource_efficiency_mut().record_client_flush();
         }
-        if work_domains.surface_pacing {
-            self.server.progress_surface_pacing(monotonic_now_ns()?);
-        }
+        let pacing_visual_work =
+            work_domains.service_surface_pacing_if_due(|| -> NativeResult<bool> {
+                Ok(self.server.progress_surface_pacing(monotonic_now_ns()?))
+            })?;
+        cycle.redraw_requested |= pacing_visual_work;
+        let post_service_state = self.native_runtime_state(&cycle, monotonic_now_ns()?);
+        cycle.work_class =
+            NativeWorkDomains::from_wakeup(&cycle.wakeup, &post_service_state).work_class;
         if work_domains.wayland_dispatch {
             self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
         } else if work_domains.input {

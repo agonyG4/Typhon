@@ -176,6 +176,7 @@ impl CompositorState {
             self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
         }
         self.pending_surface_tree_transactions = transactions;
+        self.rebuild_scene_work_index();
         for (root_surface_id, resize_commit) in superseded_resize_commits {
             self.release_detached_resize_capture(root_surface_id, resize_commit);
         }

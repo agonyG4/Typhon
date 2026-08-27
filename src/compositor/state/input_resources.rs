@@ -489,7 +489,7 @@ impl CompositorState {
         }
         if self.window_interaction_active() {
             self.update_window_interaction(x, y);
-            self.update_pointer_position(x, y);
+            self.update_interaction_pointer_position_without_client_dispatch(x, y);
             let _ = self.send_window_interaction_pointer_motion(
                 u64::from(wayland_event_time()).saturating_mul(1_000),
                 x,

@@ -13,6 +13,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) cursor_only_due: bool,
     pub(super) explicit_sync_pending: bool,
     pub(super) astrea_publication_due: bool,
+    pub(super) commit_timing_planning_due: bool,
     pub(super) pacing_active: bool,
     pub(super) pacing_due: bool,
     pub(super) xwayland_generation_changed: bool,
@@ -25,6 +26,7 @@ pub(crate) struct NativeWorkDomains {
     pub(super) input: bool,
     pub(super) wayland_protocol: bool,
     pub(super) astrea_publication: bool,
+    pub(super) commit_timing_planning: bool,
     pub(super) wayland_dispatch: bool,
     pub(super) scene: bool,
     pub(super) cursor: bool,
@@ -39,6 +41,20 @@ pub(crate) struct NativeWorkDomains {
 }
 
 impl NativeWorkDomains {
+    pub(super) const fn should_service_surface_pacing(self) -> bool {
+        self.surface_pacing && !self.wayland_dispatch
+    }
+
+    pub(super) fn service_surface_pacing_if_due<E>(
+        self,
+        service: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        if !self.should_service_surface_pacing() {
+            return Ok(false);
+        }
+        service()
+    }
+
     pub(super) fn from_wakeup(
         wakeup: &NativeWakeup,
         state: &NativeRuntimeState,
@@ -63,17 +79,12 @@ impl NativeWorkDomains {
             || !wakeup.explicit_sync_acquire_tokens.is_empty()
             || state.explicit_sync_pending;
         let astrea_publication = state.astrea_publication_due;
+        let commit_timing_planning = state.commit_timing_planning_due;
         let cursor = reasons.cursor_io_worker()
             || !wakeup.cursor_io_events.is_empty()
             || state.cursor_only_due;
         let wayland_dispatch = wayland_protocol;
-        let surface_pacing = state.pacing_due
-            || (state.pacing_active
-                && (reasons.timer()
-                    || wayland_protocol
-                    || control
-                    || explicit_sync
-                    || state.scene_dirty));
+        let surface_pacing = state.pacing_due;
         let scene = state.scene_dirty || state.visual_work_deadline_due || state.recovery_required;
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
@@ -85,6 +96,7 @@ impl NativeWorkDomains {
             input,
             wayland_protocol,
             astrea_publication,
+            commit_timing_planning,
             wayland_dispatch,
             scene,
             cursor,
@@ -102,6 +114,7 @@ impl NativeWorkDomains {
     pub(super) const fn decision(self) -> NativeWorkDecision {
         let protocol_work = self.wayland_protocol
             || self.astrea_publication
+            || self.commit_timing_planning
             || self.xwayland
             || self.explicit_sync
             || self.surface_pacing
@@ -114,6 +127,7 @@ impl NativeWorkDomains {
             self.surface_pacing,
             self.explicit_sync,
             self.astrea_publication,
+            self.commit_timing_planning,
             self.scene,
             self.control,
             self.children,
@@ -130,6 +144,7 @@ mod tests {
 
     const INPUT: u32 = 1 << 3;
     const TIMER: u32 = 1 << 4;
+    const WAYLAND_CLIENTS: u32 = 1 << 2;
     const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
     const CHILD_SIGNAL: u32 = 1 << 6;
     const SEAT: u32 = 1 << 7;
@@ -174,6 +189,15 @@ mod tests {
     }
 
     #[test]
+    fn combined_input_and_wayland_readiness_keeps_both_domains_once() {
+        let domains = NativeWorkDomains::classify(&wakeup(INPUT | WAYLAND_CLIENTS), &state());
+
+        assert!(domains.input);
+        assert!(domains.wayland_dispatch);
+        assert!(!domains.should_service_surface_pacing());
+    }
+
+    #[test]
     fn one_thousand_independent_input_wakes_do_not_count_as_wayland_ticks() {
         let mut input_cycles = 0;
         let mut wayland_read_dispatches = 0;
@@ -209,6 +233,87 @@ mod tests {
 
         assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
         assert!(decision.service_pacing);
+    }
+
+    #[test]
+    fn commit_timing_planning_is_protocol_only_and_independent_of_scene_work() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                commit_timing_planning_due: true,
+                scene_dirty: false,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_commit_timing_planning);
+        assert!(!decision.service_primary_scene);
+    }
+
+    #[test]
+    fn one_thousand_future_pacing_input_cycles_do_not_service_pacing() {
+        let mut pacing_services = 0;
+        let state = NativeRuntimeState {
+            pacing_active: true,
+            pacing_due: false,
+            ..state()
+        };
+        for _ in 0..1_000 {
+            let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state);
+            domains
+                .service_surface_pacing_if_due(|| {
+                    pacing_services += 1;
+                    Ok::<bool, ()>(false)
+                })
+                .unwrap();
+        }
+
+        assert_eq!(pacing_services, 0);
+    }
+
+    #[test]
+    fn due_pacing_service_returns_the_visual_handoff() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(TIMER),
+            &NativeRuntimeState {
+                pacing_due: true,
+                ..state()
+            },
+        );
+
+        assert!(
+            domains
+                .service_surface_pacing_if_due(|| Ok::<bool, ()>(true))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_future_pacing_does_not_promote_an_unrelated_timer() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(TIMER),
+            &NativeRuntimeState {
+                pacing_active: true,
+                pacing_due: false,
+                ..state()
+            },
+        );
+
+        assert!(!domains.surface_pacing);
+    }
+
+    #[test]
+    fn input_does_not_service_an_older_commit_timing_plan() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(INPUT),
+            &NativeRuntimeState {
+                commit_timing_planning_due: false,
+                ..state()
+            },
+        );
+
+        assert!(!domains.commit_timing_planning);
     }
 
     #[test]

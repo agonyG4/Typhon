@@ -184,6 +184,9 @@ impl CompositorState {
             .surface_pacing_metrics
             .realtime_forward_jump_already_due_releases
             .saturating_add(forward_jump_releases);
+        if backward_jump_replans > 0 {
+            self.rebuild_scene_work_index();
+        }
     }
 
     pub(in crate::compositor) fn next_commit_timing_deadline_ns(&self) -> Option<u64> {
@@ -216,6 +219,24 @@ impl CompositorState {
         }
         let candidate_deadline = candidate_deadline?;
         Some(candidate_deadline.max(now))
+    }
+
+    pub(in crate::compositor) fn next_commit_timing_release_deadline_ns(&self) -> Option<u64> {
+        self.pending_surface_tree_transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, transaction)| {
+                if self.pending_surface_tree_transactions[..index]
+                    .iter()
+                    .any(|previous| previous.root_surface_id == transaction.root_surface_id)
+                {
+                    return None;
+                }
+                transaction
+                    .commit_timing_readiness
+                    .map(|readiness| readiness.release_for_render_at.get())
+            })
+            .min()
     }
 
     pub(in crate::compositor) fn commit_timing_planning_candidates(
@@ -389,6 +410,7 @@ impl CompositorState {
             .surface_pacing_metrics
             .commit_timing_candidates_planned
             .saturating_add(1);
+        self.rebuild_scene_work_index();
         true
     }
 
@@ -396,6 +418,7 @@ impl CompositorState {
         for transaction in &mut self.pending_surface_tree_transactions {
             transaction.commit_timing_readiness = None;
         }
+        self.rebuild_scene_work_index();
     }
 
     pub(in crate::compositor) fn commit_timing_claims_for_frame(
