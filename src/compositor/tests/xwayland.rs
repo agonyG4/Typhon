@@ -1,5 +1,6 @@
 use std::{fs::File, num::NonZeroU64, os::fd::AsFd, path::PathBuf};
 
+use crate::compositor::FrameCallbackAdmission;
 use crate::compositor::{
     DesktopWindowKind, LiveRoleInstance, PermanentSurfaceRole, RenderGenerationCause,
     ResizeInteractionId, SurfacePlacement, SurfacePublicationSource, SurfaceRoleLifecycle,
@@ -1914,9 +1915,14 @@ fn mapped_xwayland_frame_callback_completes_after_output_sample_before_present()
         "a lone frame callback must not be reported as visual work"
     );
     fixture.server.capture_frame_callbacks_for_render();
+    fixture.server.mark_frame_callbacks_rendered_for_prepared();
+    let batch_id = fixture
+        .server
+        .prepared_frame_batch_id()
+        .expect("XWayland sample must own a prepared batch");
     fixture
         .server
-        .complete_rendered_frame_callbacks_for_prepared();
+        .complete_frame_callbacks_after_admission(batch_id, FrameCallbackAdmission::Immediate);
     assert!(
         !fixture.server.has_pending_frame_callbacks(),
         "a sampled output frame must release wl_surface.frame before pageflip"
@@ -1924,7 +1930,7 @@ fn mapped_xwayland_frame_callback_completes_after_output_sample_before_present()
     let metrics = fixture.server.frame_callback_metrics();
     assert_eq!(metrics.callbacks_requested, 1);
     assert_eq!(metrics.callbacks_captured, 1);
-    assert_eq!(metrics.callbacks_completed_after_render, 1);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 1);
     assert_eq!(metrics.callbacks_found_at_pageflip, 0);
 
     fixture.server.finish_frame();

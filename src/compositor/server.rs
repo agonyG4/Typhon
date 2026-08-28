@@ -14,6 +14,7 @@ use super::protocols::versions;
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
+use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::{ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics};
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1587,7 +1588,11 @@ impl OwnCompositorServer {
             return;
         };
         if let Some(batch_id) = self.state.legacy_prepared_frame_batch {
-            self.state.complete_rendered_frame_callbacks(batch_id);
+            self.state.mark_frame_callbacks_rendered(batch_id);
+            self.state.complete_frame_callbacks_after_admission(
+                batch_id,
+                FrameCallbackAdmission::Immediate,
+            );
         }
         self.finish_frame_with_presentation(presentation);
     }

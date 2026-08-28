@@ -248,7 +248,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
     },
-    CompleteRenderedFrameCallbacks(CompositorFrameBatchId),
+    MarkFrameCallbacksRendered(CompositorFrameBatchId),
+    CompleteFrameCallbacksAfterAdmission {
+        batch_id: CompositorFrameBatchId,
+        admission: FrameCallbackAdmission,
+    },
+    NoteFrameCallbacksDeferredReady(CompositorFrameBatchId),
+    NoteFrameCallbackAdmissionFailure(CompositorFrameBatchId),
     RestoreFrameBatchAfterRenderFailure(CompositorFrameBatchId),
     CompleteNoVisualChangeFrameBatch(CompositorFrameBatchId),
     CompleteDirectFrameBatch {
@@ -881,7 +887,6 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureAndCompleteRenderedLegacyPreparedFrame => {
                         server.capture_frame_callbacks_for_render();
-                        server.complete_rendered_frame_callbacks_for_prepared();
                         server.finish_prepared_frame();
                     }
                     ServerCommand::CaptureLegacySubmittedAndPreparedFrames => {
@@ -937,8 +942,20 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .expect("test presentation clock should be usable");
                         server.complete_presented_frame_batch(frame_id, batch_id, presentation);
                     }
-                    ServerCommand::CompleteRenderedFrameCallbacks(batch_id) => {
-                        server.complete_rendered_frame_callbacks(batch_id);
+                    ServerCommand::MarkFrameCallbacksRendered(batch_id) => {
+                        server.mark_frame_callbacks_rendered(batch_id);
+                    }
+                    ServerCommand::CompleteFrameCallbacksAfterAdmission {
+                        batch_id,
+                        admission,
+                    } => {
+                        server.complete_frame_callbacks_after_admission(batch_id, admission);
+                    }
+                    ServerCommand::NoteFrameCallbacksDeferredReady(batch_id) => {
+                        server.note_frame_callbacks_deferred_ready(batch_id);
+                    }
+                    ServerCommand::NoteFrameCallbackAdmissionFailure(batch_id) => {
+                        server.note_frame_callback_admission_failure(batch_id);
                     }
                     ServerCommand::RestoreFrameBatchAfterRenderFailure(batch_id) => {
                         server.restore_frame_batch_after_render_failure(batch_id);

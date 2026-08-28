@@ -1,6 +1,7 @@
 use std::num::NonZeroU64;
 
 use super::*;
+use crate::compositor::frame_batch::FrameCallbackPacingState;
 
 impl CompositorState {
     pub(in crate::compositor) const fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
@@ -337,6 +338,8 @@ impl CompositorState {
                 callbacks,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
+                callback_admission_ns: None,
+                callback_pacing_state: FrameCallbackPacingState::Captured,
                 callback_settlement: FrameCallbackSettlement::new(callback_count),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks,
@@ -386,6 +389,7 @@ impl CompositorState {
             .remove(&batch_id)
             .expect("missing compositor frame batch on discard");
         let mut batch = batch;
+        batch.callback_pacing_state = FrameCallbackPacingState::Completed;
         for claim in &batch.commit_timing_target_claims {
             self.discard_commit_timing_claim(*claim);
         }
@@ -436,6 +440,8 @@ impl CompositorState {
             .remove(&batch_id)
             .or_else(|| self.retired_frame_batches.remove(&batch_id))
             .expect("missing compositor frame batch after safe abandonment");
+        let mut batch = batch;
+        batch.callback_pacing_state = FrameCallbackPacingState::Completed;
         for claim in &batch.commit_timing_target_claims {
             self.discard_commit_timing_claim(*claim);
         }
@@ -472,8 +478,13 @@ impl CompositorState {
         presentation: FramePresentation,
     ) {
         self.assert_frame_batch_identity(frame_id, batch_id);
-        let _ = self
-            .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
+        let (render_completed_ns, callbacks_remaining) = self
+            .frame_batches
+            .get(&batch_id)
+            .map(|batch| (batch.callback_render_completed_ns, batch.callbacks.len()))
+            .expect("missing compositor frame batch at presentation");
+        self.note_frame_callbacks_at_pageflip(batch_id, render_completed_ns, callbacks_remaining);
+        self.complete_frame_callbacks_at_presentation_fallback(batch_id);
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
         if !matches!(presentation.kind, PresentationKind::Tearing) {
             for claim in &batch.fifo_barrier_claims {
@@ -483,7 +494,6 @@ impl CompositorState {
         for claim in &batch.commit_timing_target_claims {
             self.complete_commit_timing_claim(*claim, presentation);
         }
-        self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let surface_damage = batch.surface_damage.clone();
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         if let Some(surface_damage) = surface_damage {

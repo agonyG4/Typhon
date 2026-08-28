@@ -234,7 +234,9 @@ impl OwnCompositorServer {
             let _ = self.display.flush_clients();
             return;
         };
-        self.state.complete_rendered_frame_callbacks(batch_id);
+        self.state.mark_frame_callbacks_rendered(batch_id);
+        self.state
+            .complete_frame_callbacks_after_admission(batch_id, FrameCallbackAdmission::Immediate);
         let frame_id = self
             .state
             .frame_batches
@@ -278,7 +280,9 @@ impl OwnCompositorServer {
                 return Err(error);
             }
         };
-        self.state.complete_rendered_frame_callbacks(batch_id);
+        self.state.mark_frame_callbacks_rendered(batch_id);
+        self.state
+            .complete_frame_callbacks_after_admission(batch_id, FrameCallbackAdmission::Immediate);
         let frame_id = self
             .state
             .frame_batches
@@ -320,8 +324,38 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn complete_rendered_frame_callbacks(&mut self, batch_id: CompositorFrameBatchId) {
-        self.state.complete_rendered_frame_callbacks(batch_id);
+    pub fn mark_frame_callbacks_rendered(&mut self, batch_id: CompositorFrameBatchId) {
+        self.state.mark_frame_callbacks_rendered(batch_id);
+        let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
+    pub fn complete_frame_callbacks_after_admission(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        admission: FrameCallbackAdmission,
+    ) {
+        self.state
+            .complete_frame_callbacks_after_admission(batch_id, admission);
+        let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
+    pub fn note_frame_callback_admission_failure(&mut self, batch_id: CompositorFrameBatchId) {
+        self.state.note_frame_callback_admission_failure(batch_id);
+    }
+
+    pub fn note_frame_callbacks_deferred_ready(&mut self, batch_id: CompositorFrameBatchId) {
+        self.state.note_frame_callbacks_deferred_ready(batch_id);
+    }
+
+    #[doc(hidden)]
+    pub fn complete_direct_frame_callbacks_after_admission(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+    ) {
+        self.state
+            .complete_direct_frame_callbacks_after_admission(batch_id);
         let _ = self.display.flush_clients();
     }
 
@@ -346,12 +380,12 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn complete_rendered_frame_callbacks_for_prepared(&mut self) {
+    pub fn mark_frame_callbacks_rendered_for_prepared(&mut self) {
         let batch_id = self
             .state
             .legacy_prepared_frame_batch
             .expect("no prepared compositor frame batch exists");
-        self.complete_rendered_frame_callbacks(batch_id);
+        self.mark_frame_callbacks_rendered(batch_id);
     }
 
     #[doc(hidden)]

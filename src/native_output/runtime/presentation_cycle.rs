@@ -37,6 +37,7 @@ use super::presentation_transactions::{
 use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
+use oblivion_one::compositor::FrameCallbackAdmission;
 use oblivion_one::native::buffering::PipelineServiceEstimate;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
@@ -1186,7 +1187,7 @@ impl NativeRuntime {
                                 });
                             }
                             #[rustfmt::skip]
-                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot } => {
+                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot } => {
                                 if o1_admission.is_some_and(|admission| admission.used_extra_credit) {
                                     frame_pacing.note_o1_credit2_extra_credit_consumed();
                                 }
@@ -1228,10 +1229,12 @@ impl NativeRuntime {
                                     can_queue_worker_next,
                                 );
                                 if waits_for_target {
+                                    server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
                                     #[rustfmt::skip] let async_render_fence_ready = super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)?;
                                     if !async_render_fence_ready {
+                                        server.note_frame_callback_admission_failure(protocol_batch_id);
                                         *queued_redraw_requested = true;
                                         return Ok(());
                                     }
@@ -1263,6 +1266,7 @@ impl NativeRuntime {
                                         false,
                                     )?
                                     else {
+                                        server.note_frame_callback_admission_failure(protocol_batch_id);
                                         *queued_redraw_requested = true;
                                         return Ok(());
                                     };
@@ -1321,6 +1325,10 @@ impl NativeRuntime {
                                                 NativeEventSource::OutputRenderFence,
                                             )?);
                                     }
+                                    server.complete_frame_callbacks_after_admission(
+                                        protocol_batch_id,
+                                        FrameCallbackAdmission::Immediate,
+                                    );
                                     frame_submitted = true;
                                     *frame_index = frame_index.saturating_add(1);
                                 }
@@ -1449,7 +1457,13 @@ impl NativeRuntime {
                             frame_rendered = true;
                             #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
                             drop(resolved_scene);
-                            server.complete_rendered_frame_callbacks_for_prepared();
+                            let protocol_batch_id = server
+                                .prepared_frame_batch_id()
+                                .expect("rendered compatibility frame lost its protocol batch");
+                            server.mark_frame_callbacks_rendered(protocol_batch_id);
+                            if render_ahead {
+                                server.note_frame_callbacks_deferred_ready(protocol_batch_id);
+                            }
                             let mut ready_fields = vec![
                                 frame_id_field(frame_pacing.active),
                                 PacingField::u64("render_generation", render_generation),
@@ -1537,6 +1551,10 @@ impl NativeRuntime {
                                         monotonic_now_ns()?,
                                         false,
                                         pacing_mode,
+                                    );
+                                    server.complete_frame_callbacks_after_admission(
+                                        protocol_batch_id,
+                                        FrameCallbackAdmission::Immediate,
                                     );
                                     frame_submitted = true;
                                 }

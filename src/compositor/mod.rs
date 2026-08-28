@@ -146,7 +146,9 @@ use explicit_sync::{
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub(crate) use frame_batch::FrameCallbackSettlement;
-pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
+pub use frame_batch::{
+    BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackAdmission, FrameCallbackMetrics,
+};
 pub(in crate::compositor) use state_data::CurrentSurfaceBuffer;
 pub use state_data::ShmBufferLifetimeMetrics;
 #[allow(unused_imports)]

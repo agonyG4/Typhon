@@ -46,7 +46,7 @@ fn server_reports_pending_frame_callbacks_until_present_frame() {
 }
 
 #[test]
-fn render_completed_callback_is_resolved_at_direct_pageflip() {
+fn render_ahead_ready_callback_stays_owned_until_admission() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -54,34 +54,149 @@ fn render_completed_callback_is_resolved_at_direct_pageflip() {
 
     let batch_id = capture_live_frame_batch(&socket_path, &commands, 1);
     commands
-        .send(ServerCommand::CompleteRenderedFrameCallbacks(batch_id))
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::NoteFrameCallbacksDeferredReady(batch_id))
         .unwrap();
     wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_callbacks(&commands));
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_marked_rendered, 1);
+    assert_eq!(metrics.callbacks_deferred_ready, 1);
+
     commands
-        .send(ServerCommand::CompleteRenderedFrameCallbacks(batch_id))
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Ready,
+        })
         .unwrap();
     wait_for_server_commands(&commands);
-    let (ownership_reply, ownership_receiver) = std::sync::mpsc::channel();
+    assert!(!capture_pending_frame_callbacks(&commands));
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 1);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn accepted_immediate_admission_completes_callback_before_pageflip() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 2);
     commands
-        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_callbacks(&commands));
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
             batch_id,
-            disposition: TerminalCallbackDisposition::Presented,
-            reply: ownership_reply,
+            admission: FrameCallbackAdmission::Immediate,
         })
         .unwrap();
-    let first = ownership_receiver.recv().unwrap();
-    let (ownership_reply, ownership_receiver) = std::sync::mpsc::channel();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 1);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn only_the_exact_ready_batch_completes_at_ready_admission() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let first = capture_live_frame_batch(&socket_path, &commands, 3);
+    let second = capture_live_frame_batch(&socket_path, &commands, 4);
+    assert_ne!(first, second);
     commands
-        .send(ServerCommand::PrepareTerminalCallbackOwnership {
-            batch_id,
-            disposition: TerminalCallbackDisposition::Presented,
-            reply: ownership_reply,
+        .send(ServerCommand::MarkFrameCallbacksRendered(first))
+        .unwrap();
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(second))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id: second,
+            admission: FrameCallbackAdmission::Ready,
         })
         .unwrap();
-    let second = ownership_receiver.recv().unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_callbacks(&commands));
+
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id: first,
+            admission: FrameCallbackAdmission::Ready,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 2);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 0);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn failed_admission_retains_callback_for_a_later_retry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 5);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::NoteFrameCallbackAdmissionFailure(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_callbacks(&commands));
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 0);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 0);
+    assert_eq!(metrics.callbacks_retained_after_failed_admission, 1);
+
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Immediate,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn render_completed_callback_is_resolved_at_direct_pageflip() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 6);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
     commands
         .send(ServerCommand::CompleteDirectFrameBatch {
-            frame_id: 1,
+            frame_id: 6,
             batch_id,
             direct_surface_id: 1,
             presentation: FramePresentation::synchronized_zero_copy(
@@ -96,14 +211,186 @@ fn render_completed_callback_is_resolved_at_direct_pageflip() {
     wait_for_server_commands(&commands);
     let server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(first, TerminalCallbackOwnership::Resolved { completed: 1 });
-    assert_eq!(second, TerminalCallbackOwnership::None);
+    assert_eq!(
+        server.frame_callback_metrics().callbacks_found_at_pageflip,
+        1
+    );
     assert_eq!(
         server
             .frame_callback_metrics()
-            .callbacks_completed_after_render,
+            .callbacks_completed_at_presentation_fallback,
         1
     );
+}
+
+#[test]
+fn presentation_fallback_sends_deferred_callback_exactly_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 7);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 7,
+            batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_completed_at_presentation_fallback, 1);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 0);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 0);
+}
+
+#[test]
+fn invalidated_ready_batch_cancels_callback_without_admission() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 8);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::DiscardFrameBatch {
+            batch_id,
+            reason: FrameBatchDiscardReason::OutputDestroyed,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 0);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 0);
+    assert_eq!(metrics.callbacks_completed_after_abandonment, 1);
+    assert_eq!(metrics.callbacks_in_discarded_rendered_batches, 1);
+}
+
+#[test]
+fn render_failure_requeues_callback_for_one_later_admission() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let failed_batch = capture_live_frame_batch(&socket_path, &commands, 9);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(failed_batch))
+        .unwrap();
+    commands
+        .send(ServerCommand::RestoreFrameBatchAfterRenderFailure(
+            failed_batch,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_callbacks(&commands));
+
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 10,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let retry_batch = batch_receiver.recv().unwrap();
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(retry_batch))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id: retry_batch,
+            admission: FrameCallbackAdmission::Immediate,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 1);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 0);
+    assert_eq!(metrics.callbacks_completed_after_abandonment, 0);
+}
+
+#[test]
+fn chromium_like_o1_virtual_oracle_sustains_one_refresh_callbacks_with_two_buffers() {
+    const REFRESH_NS: u64 = 6_060_606;
+    const CLIENT_REACTION_NS: u64 = 500_000;
+    const FRAMES: usize = 180;
+
+    #[derive(Debug, Clone, Copy)]
+    struct VirtualFrame {
+        buffer: usize,
+    }
+
+    let mut available = [true, true];
+    let mut next_buffer = 0usize;
+    let mut ready = std::collections::VecDeque::new();
+    let mut callback_times = Vec::new();
+    let mut render_ahead_successes = 0usize;
+    let mut now_ns = 0u64;
+
+    for _frame_number in 0..FRAMES {
+        let buffer = (0..available.len())
+            .map(|offset| (next_buffer + offset) % available.len())
+            .find(|buffer| available[*buffer])
+            .expect("two-buffer client must have a released buffer");
+        available[buffer] = false;
+        next_buffer = (buffer + 1) % available.len();
+        let mut frame = VirtualFrame { buffer };
+
+        // The client buffer is released at materialization, independently of
+        // whether this output frame is still READY or already admitted.
+        available[buffer] = true;
+        ready.push_back(frame);
+
+        // O1 may keep one frame in the output lane while rendering another
+        // future frame.  The callback belongs to the exact ready frame and is
+        // sent only when that frame crosses admission.
+        if ready.len() > 1 {
+            let admitted = ready.pop_front().expect("ready frame exists");
+            frame = admitted;
+            callback_times.push(now_ns);
+            render_ahead_successes += 1;
+            available[frame.buffer] = true;
+            assert!(now_ns.saturating_add(CLIENT_REACTION_NS) <= now_ns + REFRESH_NS);
+        }
+
+        now_ns = now_ns.saturating_add(REFRESH_NS);
+    }
+
+    while let Some(frame) = ready.pop_front() {
+        callback_times.push(now_ns);
+        available[frame.buffer] = true;
+        assert!(now_ns.saturating_add(CLIENT_REACTION_NS) <= now_ns + REFRESH_NS);
+        now_ns = now_ns.saturating_add(REFRESH_NS);
+    }
+
+    let callback_intervals = callback_times
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect::<Vec<_>>();
+    assert!(render_ahead_successes > 0);
+    assert_eq!(callback_times.len(), FRAMES);
+    assert!(
+        callback_intervals
+            .iter()
+            .all(|interval| *interval == REFRESH_NS)
+    );
+    assert!(available.into_iter().all(|released| released));
 }
 
 #[test]
@@ -164,7 +451,7 @@ fn no_visual_change_resolves_live_callback_without_feedback() {
     assert_eq!(
         server
             .frame_callback_metrics()
-            .callbacks_completed_after_render,
+            .callbacks_completed_after_immediate_admission,
         0
     );
 }
@@ -419,7 +706,7 @@ fn legacy_skipped_frame_completes_a_captured_callback_once() {
     let server = stop_controllable_test_server(commands, server_thread);
     let metrics = server.frame_callback_metrics();
     assert_eq!(metrics.callbacks_captured, 1);
-    assert_eq!(metrics.callbacks_completed_after_render, 1);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 1);
     assert_eq!(metrics.callbacks_completed_after_abandonment, 0);
 }
 
@@ -437,7 +724,10 @@ fn callback_committed_after_skipped_batch_is_captured_by_the_next_frame() {
     assert_eq!(before_first_settlement.callbacks_captured, 0);
     assert_eq!(after_first_settlement.callbacks_captured, 0);
     assert_eq!(after_second_settlement.callbacks_captured, 1);
-    assert_eq!(after_second_settlement.callbacks_completed_after_render, 1);
+    assert_eq!(
+        after_second_settlement.callbacks_completed_after_immediate_admission,
+        1
+    );
 }
 
 #[test]

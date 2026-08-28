@@ -1058,10 +1058,11 @@ impl AtomicEglGbmScanout {
                 output_transactions
                     .mark_ready(transaction_id, rendered_at)
                     .map_err(io::Error::other)?;
-                server.complete_rendered_frame_callbacks(protocol_batch_id);
+                server.mark_frame_callbacks_rendered(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,
                     transaction_id,
+                    protocol_batch_id,
                     render_us,
                     repaint_stats,
                     resolved_snapshot,
@@ -1317,6 +1318,7 @@ pub(crate) enum AtomicFrameRenderOutcome {
     Rendered {
         frame_id: u64,
         transaction_id: OutputTransactionId,
+        protocol_batch_id: CompositorFrameBatchId,
         render_us: u64,
         repaint_stats: GlesSceneFrameStats,
         resolved_snapshot: NativeSceneSnapshot,

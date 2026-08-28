@@ -1036,7 +1036,7 @@ impl NativeRuntime {
                             .record_direct_validation_success(validation_key);
                     }
                     self.server
-                        .complete_rendered_frame_callbacks(protocol_batch_id);
+                        .complete_direct_frame_callbacks_after_admission(protocol_batch_id);
                 } else if has_out_fence {
                     return Err(io::Error::other(
                         "cursor-only worker submission unexpectedly returned an out-fence",

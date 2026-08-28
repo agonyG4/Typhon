@@ -9,6 +9,7 @@ use super::presentation_worker::{
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
+use oblivion_one::compositor::FrameCallbackAdmission;
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;
 
@@ -77,18 +78,6 @@ pub(super) fn submit_ready_frame(
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
-    let Some(validation_base) =
-        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id)
-    else {
-        return Ok(ReadySubmissionResult::Unavailable);
-    };
-    let primary_cursor_presentation = freeze_primary_cursor_presentation(
-        presented_planes.cursor.delivery,
-        cursor_delivery,
-        cursor,
-        atomic_cursor.as_ref(),
-        cursor_epoch,
-    );
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let guard = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
         explicit
@@ -98,6 +87,22 @@ pub(super) fn submit_ready_frame(
     } else {
         server.prepared_frame_batch_id().zip(compatibility_target)
     };
+    let callback_batch_id = guard.map(|(batch_id, _)| batch_id);
+    let Some(validation_base) =
+        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id)
+    else {
+        if let Some(batch_id) = callback_batch_id {
+            server.note_frame_callback_admission_failure(batch_id);
+        }
+        return Ok(ReadySubmissionResult::Unavailable);
+    };
+    let primary_cursor_presentation = freeze_primary_cursor_presentation(
+        presented_planes.cursor.delivery,
+        cursor_delivery,
+        cursor,
+        atomic_cursor.as_ref(),
+        cursor_epoch,
+    );
     if let Some((batch_id, guard_target)) = guard
         && !server.commit_timing_submission_is_safe_for_batch(
             batch_id,
@@ -105,6 +110,7 @@ pub(super) fn submit_ready_frame(
             guard_target.clock_generation,
         )
     {
+        server.note_frame_callback_admission_failure(batch_id);
         return Ok(ReadySubmissionResult::Unavailable);
     }
     let (present_result, compatibility_transaction_id) =
@@ -129,6 +135,9 @@ pub(super) fn submit_ready_frame(
                     event_loop,
                 )?
             {
+                if let Some(batch_id) = callback_batch_id {
+                    server.note_frame_callback_admission_failure(batch_id);
+                }
                 return Ok(ReadySubmissionResult::Unavailable);
             }
             let Some((token, framebuffer_id, transaction_id, _worker_queued)) =
@@ -154,6 +163,9 @@ pub(super) fn submit_ready_frame(
                     true,
                 )?
             else {
+                if let Some(batch_id) = callback_batch_id {
+                    server.note_frame_callback_admission_failure(batch_id);
+                }
                 return Ok(ReadySubmissionResult::Unavailable);
             };
             // The explicit Atomic path owns the KMS presentation token. Move
@@ -199,6 +211,9 @@ pub(super) fn submit_ready_frame(
                 },
             );
             let Some(compatibility_submit_window) = compatibility_submit_window else {
+                if let Some(batch_id) = callback_batch_id {
+                    server.note_frame_callback_admission_failure(batch_id);
+                }
                 return Ok(ReadySubmissionResult::Unavailable);
             };
             let result = match queue_compatibility_for_presentation(
@@ -245,6 +260,9 @@ pub(super) fn submit_ready_frame(
                 }
             };
             let Some(result) = result else {
+                if let Some(batch_id) = callback_batch_id {
+                    server.note_frame_callback_admission_failure(batch_id);
+                }
                 if pacing_frame_id.is_some()
                     && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
                 {
@@ -360,6 +378,12 @@ pub(super) fn submit_ready_frame(
                 if atomic_primary_registered {
                     frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
                 }
+            }
+            if let Some(batch_id) = callback_batch_id {
+                server.complete_frame_callbacks_after_admission(
+                    batch_id,
+                    FrameCallbackAdmission::Ready,
+                );
             }
             if !worker_mode {
                 frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);

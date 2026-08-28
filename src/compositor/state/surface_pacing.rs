@@ -520,6 +520,7 @@ impl CompositorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::frame_batch::FrameCallbackPacingState;
     use crate::native::presentation_deadline::MonotonicTimestampNs;
 
     #[test]
@@ -1010,6 +1011,8 @@ mod tests {
             callbacks: Vec::new(),
             callback_commit_ns: None,
             callback_render_completed_ns: None,
+            callback_admission_ns: None,
+            callback_pacing_state: FrameCallbackPacingState::Captured,
             callback_settlement: FrameCallbackSettlement::default(),
             callback_terminal_ownership_checked: false,
             presentation_feedbacks: Vec::new(),
@@ -1070,6 +1073,8 @@ mod tests {
                 callbacks: Vec::new(),
                 callback_commit_ns: None,
                 callback_render_completed_ns: None,
+                callback_admission_ns: None,
+                callback_pacing_state: FrameCallbackPacingState::Captured,
                 callback_settlement: FrameCallbackSettlement::default(),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks: Vec::new(),
@@ -1124,6 +1129,8 @@ mod tests {
                 callbacks: Vec::new(),
                 callback_commit_ns: None,
                 callback_render_completed_ns: None,
+                callback_admission_ns: None,
+                callback_pacing_state: FrameCallbackPacingState::Captured,
                 callback_settlement: FrameCallbackSettlement::default(),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks: Vec::new(),
