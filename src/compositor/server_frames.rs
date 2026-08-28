@@ -401,6 +401,22 @@ impl OwnCompositorServer {
     pub fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
         self.state.take_frame_batch_for_render(frame_id)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_frame_callback_pacing_is_completed(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> bool {
+        self.state
+            .frame_batches
+            .get(&batch_id)
+            .is_some_and(|batch| {
+                matches!(
+                    batch.callback_pacing_state,
+                    crate::compositor::frame_batch::FrameCallbackPacingState::Completed
+                )
+            })
+    }
 }
 
 #[cfg(test)]

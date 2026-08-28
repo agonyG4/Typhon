@@ -338,16 +338,11 @@ impl CompositorState {
                 .frame_batches
                 .get_mut(&batch_id)
                 .expect("missing compositor frame batch at render completion");
-            if batch.callbacks.is_empty() {
-                batch.callback_pacing_state = FrameCallbackPacingState::RenderedAwaitingAdmission;
+            if batch.callback_pacing_state != FrameCallbackPacingState::Captured {
                 return;
             }
-            debug_assert_eq!(
-                batch.callback_pacing_state,
-                FrameCallbackPacingState::Captured,
-                "frame callbacks were rendered more than once"
-            );
-            if batch.callback_pacing_state != FrameCallbackPacingState::Captured {
+            if batch.callbacks.is_empty() {
+                batch.callback_pacing_state = FrameCallbackPacingState::RenderedAwaitingAdmission;
                 return;
             }
             batch.callback_pacing_state = FrameCallbackPacingState::RenderedAwaitingAdmission;

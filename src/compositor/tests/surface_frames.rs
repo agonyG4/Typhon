@@ -46,6 +46,167 @@ fn server_reports_pending_frame_callbacks_until_present_frame() {
 }
 
 #[test]
+fn compatibility_legacy_double_render_mark_is_idempotent() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_live_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::CaptureLegacyPreparedFrame)
+        .unwrap();
+    commands
+        .send(ServerCommand::MarkPreparedFrameCallbacksRendered)
+        .unwrap();
+    commands.send(ServerCommand::FinishPreparedFrame).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_callbacks(&commands));
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_marked_rendered, 1);
+    assert_eq!(metrics.callbacks_completed_after_immediate_admission, 1);
+    assert_eq!(metrics.callbacks_completed_at_presentation_fallback, 0);
+    assert_eq!(metrics.callbacks_completed_after_abandonment, 0);
+}
+
+#[test]
+fn completed_callback_batch_cannot_regress_on_duplicate_render_mark() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 11);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Immediate,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_frame_callback_pacing_is_completed(
+        &commands, batch_id
+    ));
+    let before = capture_frame_callback_metrics(&commands);
+
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_frame_callback_pacing_is_completed(
+        &commands, batch_id
+    ));
+    let after = capture_frame_callback_metrics(&commands);
+
+    assert_eq!(after.callbacks_marked_rendered, 1);
+    assert_eq!(
+        after.callbacks_marked_rendered,
+        before.callbacks_marked_rendered
+    );
+    assert_eq!(
+        after.last_callback_render_completed_ns,
+        before.last_callback_render_completed_ns
+    );
+    assert_eq!(
+        after.last_callback_commit_to_render_ns,
+        before.last_callback_commit_to_render_ns
+    );
+    assert_eq!(after.callbacks_completed_after_immediate_admission, 1);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn duplicate_render_mark_before_admission_is_idempotent() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 12);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let before = capture_frame_callback_metrics(&commands);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let after = capture_frame_callback_metrics(&commands);
+
+    assert!(capture_pending_frame_callbacks(&commands));
+    assert_eq!(after.callbacks_marked_rendered, 1);
+    assert_eq!(
+        after.callbacks_marked_rendered,
+        before.callbacks_marked_rendered
+    );
+    assert_eq!(
+        after.last_callback_render_completed_ns,
+        before.last_callback_render_completed_ns
+    );
+    assert_eq!(
+        after.last_callback_commit_to_render_ns,
+        before.last_callback_commit_to_render_ns
+    );
+
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Ready,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(
+        server
+            .frame_callback_metrics()
+            .callbacks_completed_after_ready_admission,
+        1
+    );
+}
+
+#[test]
+fn empty_completed_callback_batch_remains_terminal_after_render_mark() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 13);
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Immediate,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_frame_callback_pacing_is_completed(
+        &commands, batch_id
+    ));
+
+    commands
+        .send(ServerCommand::MarkFrameCallbacksRendered(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_frame_callback_pacing_is_completed(
+        &commands, batch_id
+    ));
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.frame_callback_metrics().callbacks_marked_rendered, 1);
+}
+
+#[test]
 fn render_ahead_ready_callback_stays_owned_until_admission() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -501,6 +662,17 @@ fn capture_live_frame_batch(
         })
         .unwrap();
     batch_receiver.recv().unwrap()
+}
+
+fn capture_frame_callback_pacing_is_completed(
+    commands: &std::sync::mpsc::Sender<ServerCommand>,
+    batch_id: CompositorFrameBatchId,
+) -> bool {
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameCallbackPacingCompleted { batch_id, reply })
+        .unwrap();
+    receiver.recv_timeout(Duration::from_secs(1)).unwrap()
 }
 
 #[test]

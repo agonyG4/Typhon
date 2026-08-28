@@ -215,6 +215,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         render_ahead: bool,
     },
     CaptureLegacyPreparedFrame,
+    MarkPreparedFrameCallbacksRendered,
     CaptureAndFinishLegacyPreparedFrame,
     CaptureAndCompleteRenderedLegacyPreparedFrame,
     CaptureLegacySubmittedAndPreparedFrames,
@@ -233,6 +234,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureFrameBatchSurfaceIds {
         batch_id: CompositorFrameBatchId,
         reply: Sender<Vec<u32>>,
+    },
+    CaptureFrameCallbackPacingCompleted {
+        batch_id: CompositorFrameBatchId,
+        reply: Sender<bool>,
     },
     PrepareTerminalCallbackOwnership {
         batch_id: CompositorFrameBatchId,
@@ -881,6 +886,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureLegacyPreparedFrame => {
                         server.capture_frame_callbacks_for_render();
                     }
+                    ServerCommand::MarkPreparedFrameCallbacksRendered => {
+                        server.mark_frame_callbacks_rendered_for_prepared();
+                    }
                     ServerCommand::CaptureAndFinishLegacyPreparedFrame => {
                         server.capture_frame_callbacks_for_render();
                         server.finish_prepared_frame();
@@ -919,6 +927,10 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureFrameBatchSurfaceIds { batch_id, reply } => {
                         let _ =
                             reply.send(server.test_frame_batch_presentation_surface_ids(batch_id));
+                    }
+                    ServerCommand::CaptureFrameCallbackPacingCompleted { batch_id, reply } => {
+                        let _ =
+                            reply.send(server.test_frame_callback_pacing_is_completed(batch_id));
                     }
                     ServerCommand::PrepareTerminalCallbackOwnership {
                         batch_id,
