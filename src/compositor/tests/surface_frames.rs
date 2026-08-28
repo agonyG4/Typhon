@@ -518,7 +518,7 @@ fn wayland_client_frame_done_reports_elapsed_millisecond_time() {
 }
 
 #[test]
-fn wayland_client_buffer_release_for_buffer_commit_waits_for_present() {
+fn wayland_client_shm_release_happens_after_materialization_before_present() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -621,7 +621,7 @@ fn wayland_client_surface_commit_creates_renderable_shm_snapshot() {
 }
 
 #[test]
-fn wayland_surface_damage_only_commit_updates_existing_shm_snapshot() {
+fn wayland_surface_damage_only_commit_keeps_owned_shm_snapshot() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);

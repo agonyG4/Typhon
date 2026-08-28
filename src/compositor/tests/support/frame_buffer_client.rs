@@ -16,7 +16,7 @@ pub(in crate::compositor::tests) struct TestShmBuffer {
 }
 
 impl TestShmBuffer {
-    fn new(
+    pub(in crate::compositor::tests) fn new(
         shm: &client_wl_shm::WlShm,
         qh: &QueueHandle<RegistryTestState>,
         width: usize,
@@ -41,7 +41,12 @@ impl TestShmBuffer {
         })
     }
 
-    fn attach(&self, surface: &client_wl_surface::WlSurface, width: usize, height: usize) {
+    pub(in crate::compositor::tests) fn attach(
+        &self,
+        surface: &client_wl_surface::WlSurface,
+        width: usize,
+        height: usize,
+    ) {
         self.attach_with_damage(surface, 0, 0, width, height);
     }
 
@@ -55,6 +60,18 @@ impl TestShmBuffer {
     ) {
         surface.attach(Some(&self.buffer), 0, 0);
         surface.damage_buffer(x, y, width as i32, height as i32);
+    }
+
+    pub(in crate::compositor::tests) fn write_pixels(
+        &mut self,
+        pixels: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self._file.seek(SeekFrom::Start(0))?;
+        for pixel in pixels {
+            self._file.write_all(&pixel.to_ne_bytes())?;
+        }
+        self._file.flush()?;
+        Ok(())
     }
 }
 
@@ -492,10 +509,11 @@ pub(in crate::compositor::tests) fn create_surface_with_buffer_release(
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    assert_eq!(state.buffer_release_count, 0);
+    assert_eq!(state.buffer_release_count, 1);
 
     commands.send(ServerCommand::PresentFrame)?;
     queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
     Ok(state)
 }
 
