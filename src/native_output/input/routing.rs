@@ -134,6 +134,7 @@ impl NativeInputBackend {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut batch = NativeInputBatch::default();
         self.drain_events_into(&mut batch);
@@ -243,12 +244,6 @@ impl LibinputInputBackend {
             return;
         }
         self.drain_events_unconditionally(events);
-    }
-
-    pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
-        let mut events = Vec::new();
-        self.drain_events_into(&mut events);
-        events
     }
 
     fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
@@ -736,7 +731,7 @@ fn wheel_axis_component<F>(
 where
     F: FnOnce() -> f64,
 {
-    let raw_value120 = has_axis.then(|| read_v120());
+    let raw_value120 = has_axis.then(read_v120);
     PointerAxisComponent {
         continuous: has_axis.then_some(value),
         value120: raw_value120.and_then(scroll_v120_i32),
@@ -763,6 +758,7 @@ pub(crate) enum PendingPointerMotion {
     Sample(PointerMotionSample),
 }
 
+#[cfg(test)]
 pub(crate) fn coalesce_pointer_motion_events(
     events: Vec<NativeHardwareInputEvent>,
 ) -> Vec<NativeHardwareInputEvent> {
@@ -877,6 +873,7 @@ impl NativeInputDevices {
         self.drain_events_unconditionally(events);
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
         self.drain_events_into(&mut events);

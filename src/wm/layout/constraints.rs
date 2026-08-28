@@ -2,7 +2,7 @@ use super::exact_aspect::{ExactAspectRatio, largest_exact_aspect_pair};
 use super::geometry::LayoutRect;
 use super::lattice::LegalDimensionLattice;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LayoutConstraints {
     pub min_width: Option<u32>,
     pub min_height: Option<u32>,
@@ -14,23 +14,6 @@ pub struct LayoutConstraints {
     pub height_increment: Option<u32>,
     pub min_aspect: Option<f64>,
     pub max_aspect: Option<f64>,
-}
-
-impl Default for LayoutConstraints {
-    fn default() -> Self {
-        Self {
-            min_width: None,
-            min_height: None,
-            max_width: None,
-            max_height: None,
-            base_width: None,
-            base_height: None,
-            width_increment: None,
-            height_increment: None,
-            min_aspect: None,
-            max_aspect: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +701,6 @@ mod tests {
             height_increment: Some(2),
             min_aspect: Some(1.0),
             max_aspect: Some(1.0),
-            ..LayoutConstraints::default()
         };
         let tile = tile(u32::MAX - 294, u32::MAX - 295);
         let mut stats = super::ClientResolutionStats::default();
@@ -745,7 +727,6 @@ mod tests {
             height_increment: Some(2),
             min_aspect: Some(1.0),
             max_aspect: Some(1.0),
-            ..LayoutConstraints::default()
         };
         let mut stats = super::ClientResolutionStats::default();
         let resolved = resolve_client_rect_within_tile_with_stats(

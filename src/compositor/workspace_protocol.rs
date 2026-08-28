@@ -64,7 +64,6 @@ pub(crate) struct WorkspaceManagerResourceData {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceGroupResourceData {
     pub(crate) manager_id: ObjectId,
-    pub(crate) client_id: ClientId,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +90,7 @@ struct WorkspaceManagerBinding {
     resource: ext_workspace_manager_v1::ExtWorkspaceManagerV1,
     client_id: ClientId,
     group: WorkspaceGroupBinding,
-    handles: HashMap<ObjectId, WorkspaceHandleBinding>,
+    handles: Vec<WorkspaceHandleBinding>,
     transaction: WorkspaceRequestTransaction,
 }
 
@@ -137,7 +136,6 @@ impl WorkspaceProtocolState {
             manager.version(),
             WorkspaceGroupResourceData {
                 manager_id: manager_id.clone(),
-                client_id: client_id.clone(),
             },
         ) else {
             return;
@@ -151,7 +149,7 @@ impl WorkspaceProtocolState {
             capabilities: WEnum::Value(ext_workspace_group_handle_v1::GroupCapabilities::empty()),
         });
 
-        let mut handles = HashMap::new();
+        let mut handles = Vec::new();
         for item in &snapshot.workspaces {
             let Some(workspace) = item
                 .id
@@ -208,13 +206,10 @@ impl WorkspaceProtocolState {
             let _ = group.send_event(ext_workspace_group_handle_v1::Event::WorkspaceEnter {
                 workspace: handle.clone(),
             });
-            handles.insert(
-                Resource::id(&handle),
-                WorkspaceHandleBinding {
-                    resource: handle,
-                    workspace,
-                },
-            );
+            handles.push(WorkspaceHandleBinding {
+                resource: handle,
+                workspace,
+            });
         }
 
         let mut group_binding = WorkspaceGroupBinding {
@@ -278,7 +273,7 @@ impl WorkspaceProtocolState {
         self.managers.get(manager_id).is_some_and(|binding| {
             binding
                 .handles
-                .values()
+                .iter()
                 .any(|handle| handle.workspace == workspace)
         })
     }
@@ -287,10 +282,8 @@ impl WorkspaceProtocolState {
         self.managers
             .retain(|_, binding| binding.resource.is_alive());
         for binding in self.managers.values_mut() {
-            binding
-                .handles
-                .retain(|_, handle| handle.resource.is_alive());
-            for handle in binding.handles.values() {
+            binding.handles.retain(|handle| handle.resource.is_alive());
+            for handle in &binding.handles {
                 let state = if handle.workspace == active {
                     ext_workspace_handle_v1::State::Active
                 } else {
@@ -379,7 +372,9 @@ impl WorkspaceProtocolState {
 
     pub(crate) fn remove_handle(&mut self, manager_id: &ObjectId, handle_id: &ObjectId) {
         if let Some(binding) = self.managers.get_mut(manager_id) {
-            binding.handles.remove(handle_id);
+            binding
+                .handles
+                .retain(|handle| Resource::id(&handle.resource) != *handle_id);
         }
     }
 

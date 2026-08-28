@@ -66,16 +66,13 @@ impl Dispatch<ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1, Workspac
 {
     fn request(
         _state: &mut Self,
-        client: &Client,
+        _client: &Client,
         _resource: &ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
         _request: ext_workspace_group_handle_v1::Request,
-        data: &WorkspaceGroupResourceData,
+        _data: &WorkspaceGroupResourceData,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        if data.client_id != client.id() {
-            return;
-        }
         // Typhon intentionally advertises no group mutation capability.
         // Unsupported requests are protocol no-ops as required by ext-workspace-v1.
     }

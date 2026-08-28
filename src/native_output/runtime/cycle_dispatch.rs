@@ -906,13 +906,13 @@ impl NativeRuntime {
                     app_gpu_policy: *effective_app_gpu_policy,
                     seat_session: seat_session.as_ref(),
                     process_supervisor,
-                    xwayland: xwayland_app_environment.clone(),
+                    xwayland: xwayland_app_environment,
                 },
             ) {
                 Ok(application) => application,
                 Err(error) => {
                     let _ = server.end_native_input_batch();
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             if application.exit_requested {

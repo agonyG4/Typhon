@@ -188,21 +188,21 @@ impl TiledResizeHandle {
                 }
                 _ => None,
             };
-            if let Some(slot) = candidate {
-                if slot.is_none() {
-                    // The interaction-start geometry is supplied by the compositor in the
-                    // full session. The pure handle keeps the root as a deterministic
-                    // fallback parent until the solved start rect is installed.
-                    let parent_rect = root;
-                    let boundary = parent_rect.split_boundary(axis, ratio);
-                    *slot = Some(TiledResizeAxis {
-                        split: parent,
-                        axis,
-                        start_ratio: ratio,
-                        parent_rect,
-                        start_boundary: boundary,
-                    });
-                }
+            if let Some(slot) = candidate
+                && slot.is_none()
+            {
+                // The interaction-start geometry is supplied by the compositor in the
+                // full session. The pure handle keeps the root as a deterministic
+                // fallback parent until the solved start rect is installed.
+                let parent_rect = root;
+                let boundary = parent_rect.split_boundary(axis, ratio);
+                *slot = Some(TiledResizeAxis {
+                    split: parent,
+                    axis,
+                    start_ratio: ratio,
+                    parent_rect,
+                    start_boundary: boundary,
+                });
             }
             current = parent;
         }

@@ -364,9 +364,7 @@ impl CompositorState {
             {
                 continue;
             }
-            let Some(source) = candidate_trees.get_mut(previous) else {
-                return None;
-            };
+            let source = candidate_trees.get_mut(previous)?;
             if source.remove(*window_id).is_err() {
                 return None;
             }
@@ -382,24 +380,20 @@ impl CompositorState {
         let mut fallback_windows = Vec::new();
         for location in affected.iter().copied() {
             loop {
-                let Some(tree) = candidate_trees.get(&location) else {
-                    return None;
-                };
+                let tree = candidate_trees.get(&location)?;
                 let snapshots = self.candidate_layout_snapshots_for_tree(tree);
                 let feasible =
                     TiledLayoutManager::calculate_tree(tree, location, root, &snapshots).is_ok();
                 if feasible {
                     break;
                 }
-                let Some(window_id) = incoming_by_location.get(&location).and_then(|windows| {
+                let window_id = incoming_by_location.get(&location).and_then(|windows| {
                     windows.iter().rev().copied().find(|window_id| {
                         candidate_trees
                             .get(&location)
                             .is_some_and(|tree| tree.contains_window(*window_id))
                     })
-                }) else {
-                    return None;
-                };
+                })?;
                 if candidate_trees
                     .get_mut(&location)
                     .is_none_or(|tree| tree.remove(window_id).is_err())
@@ -411,9 +405,7 @@ impl CompositorState {
         }
         let mut final_solutions = HashMap::new();
         for location in affected.iter().copied() {
-            let Some(tree) = candidate_trees.get(&location) else {
-                return None;
-            };
+            let tree = candidate_trees.get(&location)?;
             let snapshots = self.candidate_layout_snapshots_for_tree(tree);
             let Ok(solution) = TiledLayoutManager::calculate_tree(tree, location, root, &snapshots)
             else {
@@ -671,15 +663,12 @@ impl CompositorState {
                     });
                 }
                 Err(LayoutError::ConstraintInfeasible(witness)) => {
-                    let Some(window_id) = candidate_tree
+                    let window_id = candidate_tree
                         .leaves()
                         .into_iter()
                         .rev()
                         .map(|(window_id, _)| window_id)
-                        .find(|window_id| witness.windows.contains(window_id))
-                    else {
-                        return None;
-                    };
+                        .find(|window_id| witness.windows.contains(window_id))?;
                     if candidate_tree.remove(window_id).is_err() {
                         return None;
                     }
@@ -907,9 +896,7 @@ impl CompositorState {
             self.apply_layout_geometry(window_id, window.backend, geometry);
             changed = true;
         }
-        if changed {
-            self.tiled_layout_dirty.remove(&location);
-        } else if self.tiled_layout.tree(location).is_none() {
+        if changed || self.tiled_layout.tree(location).is_none() {
             self.tiled_layout_dirty.remove(&location);
         }
         changed

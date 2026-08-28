@@ -292,6 +292,7 @@ pub(crate) struct NativeCursorOutputArbitration {
 }
 
 impl NativeCursorOutputArbitration {
+    #[cfg(test)]
     pub(crate) fn request(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
         self.request_with_source(epoch, now_ns, deadline_ns, false);
     }

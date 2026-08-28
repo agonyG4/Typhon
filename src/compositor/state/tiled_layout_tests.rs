@@ -396,6 +396,12 @@ fn active_tiled_resize_migration_commits_inside_one_outer_layout_batch() {
     )
     .expect("resize handle");
     let interaction_id = WindowInteractionId::new(900);
+    let preparation = TiledResizePreparation {
+        location: source,
+        edges,
+        handle,
+        solution,
+    };
     state.window_interaction = Some(WindowInteraction {
         id: interaction_id,
         window_id: first,
@@ -418,10 +424,7 @@ fn active_tiled_resize_migration_commits_inside_one_outer_layout_batch() {
         interaction_id,
         ResizeInteractionId::new(900),
         first,
-        source,
-        edges,
-        handle,
-        &solution,
+        &preparation,
     );
     state.pending_tiled_resize = Some(PendingTiledResize {
         interaction_id,

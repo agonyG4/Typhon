@@ -17,6 +17,10 @@ use crate::native_output::presentation::plane::{
 };
 use oblivion_one::native::kms::FramebufferId;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "presentation trace fields map one-to-one to the scene identity event"
+)]
 pub(super) fn record_composited_scene_identity(
     presentation_trace: &mut PresentationTransactionTraceRing,
     transaction_id: OutputTransactionId,
@@ -64,6 +68,10 @@ pub(super) fn replace_atomic_ready_scene(
     });
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rendered-scene bookkeeping keeps the trace and scene-history fields explicit"
+)]
 pub(super) fn record_atomic_rendered_scene(
     scene_history: &mut NativeSceneHistory,
     presentation_trace: &mut PresentationTransactionTraceRing,

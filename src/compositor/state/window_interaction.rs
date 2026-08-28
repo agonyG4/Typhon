@@ -660,18 +660,12 @@ impl CompositorState {
             resize_interaction_id,
             tiled_resize,
         });
-        if let Some((location, handle, solution)) = tiled_resize_data.as_ref() {
+        if let Some(preparation) = tiled_resize_data.as_ref() {
             self.install_tiled_resize_session(
                 id,
                 resize_interaction_id.expect("tiled resize has a resize interaction id"),
                 window_id,
-                *location,
-                match kind {
-                    WindowInteractionKind::Resize(edges) => edges,
-                    WindowInteractionKind::Move => unreachable!("tiled resize cannot be move"),
-                },
-                *handle,
-                solution,
+                preparation,
             );
         }
         if self.pointer_surface.is_none()
@@ -682,8 +676,8 @@ impl CompositorState {
             self.ensure_pointer_focus(&surface);
             self.send_pointer_enter_if_needed(&target);
         }
-        let cursor_kind = tiled_resize_data.as_ref().map_or(kind, |(_, handle, _)| {
-            self.tiled_resize_cursor_kind(*handle, kind)
+        let cursor_kind = tiled_resize_data.as_ref().map_or(kind, |preparation| {
+            self.tiled_resize_cursor_kind(preparation.handle, kind)
         });
         self.set_interaction_cursor_override(cursor_kind);
         let snapshot = self

@@ -1262,7 +1262,7 @@ mod tests {
         PoolGeneration,
         PresentationSerial,
         OutputGeneration,
-        CRTC,
+        Crtc,
         Bundle,
     }
 
@@ -1331,7 +1331,7 @@ mod tests {
                     presentation_serial,
                     "output_generation",
                 ),
-                ComposedMismatch::CRTC => (
+                ComposedMismatch::Crtc => (
                     crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
                         token, 1, 8,
                     ),
@@ -1379,7 +1379,7 @@ mod tests {
             ComposedMismatch::PoolGeneration,
             ComposedMismatch::PresentationSerial,
             ComposedMismatch::OutputGeneration,
-            ComposedMismatch::CRTC,
+            ComposedMismatch::Crtc,
             ComposedMismatch::Bundle,
         ] {
             let (invalid, field) = composed_mismatch(current, mismatch);

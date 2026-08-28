@@ -692,9 +692,11 @@ impl NativeRuntime {
             session: _,
             ..
         } = self;
-        let acquire_changes = service_explicit_sync
-            .then(|| server.take_acquire_watch_changes())
-            .unwrap_or_default();
+        let acquire_changes = if service_explicit_sync {
+            server.take_acquire_watch_changes()
+        } else {
+            Default::default()
+        };
         let acquire_change_count = acquire_changes.len();
         let acquire_ready_token_count = if service_explicit_sync {
             wakeup.explicit_sync_acquire_tokens.len()

@@ -520,21 +520,21 @@ impl CompositorState {
             && owner_root_surface_id.is_none_or(|owner| {
                 !self.has_visible_application_content_outside_fullscreen_owner(owner)
             });
-        let culled_surface_count = solitary_tree_active
-            .then(|| {
-                owner_root_surface_id
-                    .map(|owner| {
-                        self.active_scene_surfaces()
-                            .iter()
-                            .filter(|surface| {
-                                self.root_surface_id_for_surface(surface.surface_id) != owner
-                            })
-                            .count()
-                            .saturating_sub(visible_overlay_count)
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        let culled_surface_count = if solitary_tree_active {
+            owner_root_surface_id
+                .map(|owner| {
+                    self.active_scene_surfaces()
+                        .iter()
+                        .filter(|surface| {
+                            self.root_surface_id_for_surface(surface.surface_id) != owner
+                        })
+                        .count()
+                        .saturating_sub(visible_overlay_count)
+                })
+                .unwrap_or_default()
+        } else {
+            0
+        };
         FullscreenRenderPlanMetrics {
             fullscreen_active: owner_root_surface_id.is_some(),
             owner_root_surface_id,

@@ -153,11 +153,13 @@ impl ResourceEfficiencyMetrics {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn record_hit_test_locality(&mut self) {
         self.hit_test_locality = self.hit_test_locality.saturating_add(1);
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn record_hit_test_full_scan(&mut self) {
         self.hit_test_full_scans = self.hit_test_full_scans.saturating_add(1);
     }
@@ -286,6 +288,10 @@ pub(crate) struct NativeWorkDecision {
 }
 
 impl NativeWorkDecision {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each service lane is an independent decision bit"
+    )]
     pub(super) const fn new(
         work_class: NativeWorkClass,
         service_xwayland: bool,

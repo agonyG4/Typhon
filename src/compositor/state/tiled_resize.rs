@@ -28,12 +28,20 @@ pub(in crate::compositor) struct PendingTiledResize {
     pub(in crate::compositor) vertical_requested_ratio: Option<f64>,
 }
 
+#[derive(Debug)]
+pub(in crate::compositor) struct TiledResizePreparation {
+    pub(in crate::compositor) location: WorkspaceLocation,
+    pub(in crate::compositor) edges: ResizeEdges,
+    pub(in crate::compositor) handle: TiledResizeHandle,
+    pub(in crate::compositor) solution: TiledLayoutSolution,
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn prepare_tiled_resize(
         &self,
         window_id: WindowId,
         edges: ResizeEdges,
-    ) -> Option<(WorkspaceLocation, TiledResizeHandle, TiledLayoutSolution)> {
+    ) -> Option<TiledResizePreparation> {
         let location = self
             .window(window_id)
             .and_then(|window| window.management)
@@ -53,7 +61,12 @@ impl CompositorState {
             .ok()?;
         let layout_edges = LayoutResizeEdges::new(edges.top, edges.bottom, edges.left, edges.right);
         let handle = TiledResizeHandle::from_solution(tree, &solution, window_id, layout_edges)?;
-        Some((location, handle, solution))
+        Some(TiledResizePreparation {
+            location,
+            edges,
+            handle,
+            solution,
+        })
     }
 
     pub(in crate::compositor) fn install_tiled_resize_session(
@@ -61,24 +74,25 @@ impl CompositorState {
         interaction_id: WindowInteractionId,
         resize_interaction_id: ResizeInteractionId,
         window_id: WindowId,
-        location: WorkspaceLocation,
-        edges: ResizeEdges,
-        handle: TiledResizeHandle,
-        solution: &TiledLayoutSolution,
+        preparation: &TiledResizePreparation,
     ) {
-        let last_horizontal = handle
+        let last_horizontal = preparation
+            .handle
             .horizontal()
             .and_then(|axis| {
-                solution
+                preparation
+                    .solution
                     .splits()
                     .iter()
                     .find(|split| split.node() == axis.split())
             })
             .map(|split| split.effective_ratio());
-        let last_vertical = handle
+        let last_vertical = preparation
+            .handle
             .vertical()
             .and_then(|axis| {
-                solution
+                preparation
+                    .solution
                     .splits()
                     .iter()
                     .find(|split| split.node() == axis.split())
@@ -86,16 +100,16 @@ impl CompositorState {
             .map(|split| split.effective_ratio());
         let topology_generation = self
             .tiled_layout
-            .tree(location)
+            .tree(preparation.location)
             .map(|tree| tree.topology_generation())
             .unwrap_or_default();
         self.tiled_resize_session = Some(TiledResizeSession {
             interaction_id,
             resize_interaction_id,
             window_id,
-            location,
-            edges,
-            handle,
+            location: preparation.location,
+            edges: preparation.edges,
+            handle: preparation.handle,
             topology_generation,
             last_horizontal,
             last_vertical,
@@ -236,29 +250,25 @@ impl CompositorState {
         }
         if let Some(axis) = session.handle.horizontal()
             && let Some(ratio) = horizontal
-        {
-            if self
+            && self
                 .tiled_layout
                 .tree_mut(session.location)
                 .set_split_ratio(axis.split(), ratio.value())
                 .is_err()
-            {
-                self.cancel_tiled_resize_after_invalid_pending(session.interaction_id);
-                return false;
-            }
+        {
+            self.cancel_tiled_resize_after_invalid_pending(session.interaction_id);
+            return false;
         }
         if let Some(axis) = session.handle.vertical()
             && let Some(ratio) = vertical
-        {
-            if self
+            && self
                 .tiled_layout
                 .tree_mut(session.location)
                 .set_split_ratio(axis.split(), ratio.value())
                 .is_err()
-            {
-                self.cancel_tiled_resize_after_invalid_pending(session.interaction_id);
-                return false;
-            }
+        {
+            self.cancel_tiled_resize_after_invalid_pending(session.interaction_id);
+            return false;
         }
         if horizontal != pending.horizontal_requested_ratio.and_then(SplitRatio::new) {
             self.resize_flow_metrics.tiled_resize_ratio_clamps = self
@@ -307,9 +317,9 @@ impl CompositorState {
         location: WorkspaceLocation,
         reason: WindowInteractionEndReason,
     ) {
-        if !self
+        if self
             .tiled_resize_session
-            .is_some_and(|session| session.location == location)
+            .is_none_or(|session| session.location != location)
         {
             return;
         }

@@ -1424,10 +1424,13 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_dmabuf_then_shm_
     Ok(state)
 }
 
+type TwoBufferShmExerciseResult =
+    Result<(RegistryTestState, (usize, usize, usize)), Box<dyn std::error::Error>>;
+
 pub(in crate::compositor::tests) fn exercise_two_buffer_shm_with_pending_and_ready_batches(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<(RegistryTestState, (usize, usize, usize)), Box<dyn std::error::Error>> {
+) -> TwoBufferShmExerciseResult {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;

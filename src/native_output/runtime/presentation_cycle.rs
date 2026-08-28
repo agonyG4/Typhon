@@ -1063,9 +1063,8 @@ impl NativeRuntime {
                     );
                     debug_assert_eq!(logical_scene_completed, scene_changed);
                     debug_assert_eq!(terminal_work_completed, terminal_work_expected);
-                    debug_assert_eq!(
-                        logical_scene_changed(*last_rendered_scene_generation, scene_generation),
-                        false,
+                    debug_assert!(
+                        !logical_scene_changed(*last_rendered_scene_generation, scene_generation),
                         "terminal NoVisualChange must retire the logical scene baseline"
                     );
                     frame_completed = terminal_work_completed;

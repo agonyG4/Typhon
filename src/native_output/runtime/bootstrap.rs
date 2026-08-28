@@ -543,7 +543,7 @@ impl NativeRuntime {
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::ExternalShell,
-                xwayland_app_environment.clone(),
+                xwayland_app_environment,
                 Some(child_cursor_configuration.clone()),
             )
             .map_err(|error| {
@@ -1074,7 +1074,7 @@ impl NativeRuntime {
                     )
                 });
             let hardware_cursor_commit = (cursor_render_mode == NativeCursorRenderMode::Hardware)
-                .then(|| pre_kms_atomic_cursor.as_ref())
+                .then_some(pre_kms_atomic_cursor.as_ref())
                 .flatten()
                 .and_then(NativeAtomicCursor::client_source_key)
                 .map(|source_key| {

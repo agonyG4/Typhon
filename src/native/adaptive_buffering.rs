@@ -589,16 +589,15 @@ impl AdaptiveBufferingController {
         if self.policy == AdaptiveTripleBufferPolicy::Auto
             && self.capability == TripleCapability::Capable
             && let Some(miss) = proven_miss
-        {
-            if matches!(
+            && matches!(
                 miss,
                 ProvenDeadlineMiss::ExactRender | ProvenDeadlineMiss::GuardedApproximateRender
-            ) {
-                let before = self.o1_credit.effective();
-                self.o1_credit.observe_render_readiness_miss();
-                if before == 1 && self.o1_credit.effective() == 2 {
-                    self.entry_reason = Some(TripleEntryReason::ProvenReadinessMiss);
-                }
+            )
+        {
+            let before = self.o1_credit.effective();
+            self.o1_credit.observe_render_readiness_miss();
+            if before == 1 && self.o1_credit.effective() == 2 {
+                self.entry_reason = Some(TripleEntryReason::ProvenReadinessMiss);
             }
         }
         self.sync_o1_mode();

@@ -992,9 +992,9 @@ mod tests {
                     let index = usize::try_from(step).unwrap_or_default() % live.len();
                     let id = live.swap_remove(index);
                     manager.remove(location, id).expect("live removal");
-                    manager
-                        .tree(location)
-                        .map(|tree| tree.debug_validate().unwrap());
+                    if let Some(tree) = manager.tree(location) {
+                        tree.debug_validate().unwrap();
+                    }
                 }
                 5 => {
                     if let Some(root) = manager.tree(location).and_then(|tree| tree.root()) {

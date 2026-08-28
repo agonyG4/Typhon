@@ -1309,6 +1309,10 @@ pub(crate) enum AtomicSlotRenderOutcome {
     },
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the rendered result carries the complete scene identity and repaint evidence"
+)]
 pub(crate) enum AtomicFrameRenderOutcome {
     Rendered {
         frame_id: u64,

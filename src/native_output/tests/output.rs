@@ -1486,6 +1486,10 @@ fn presented_scene_damage_repairs_all_resize_edges() {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test raster helper keeps geometry and damage inputs explicit"
+)]
 fn paint_oversized_ssd_scene(
     frame: &mut [u32],
     width: u32,
@@ -1511,6 +1515,10 @@ fn paint_oversized_ssd_scene(
     );
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test raster helper keeps geometry and damage inputs explicit"
+)]
 fn paint_ssd_scene_with_height(
     frame: &mut [u32],
     width: u32,
@@ -1569,6 +1577,10 @@ fn paint_ssd_scene_with_height(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test raster helper keeps geometry and damage inputs explicit"
+)]
 fn paint_client_scene(
     frame: &mut [u32],
     width: u32,
@@ -1605,6 +1617,10 @@ fn paint_client_scene(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test raster helper keeps geometry and damage inputs explicit"
+)]
 fn paint_ssd_scene(
     frame: &mut [u32],
     width: u32,

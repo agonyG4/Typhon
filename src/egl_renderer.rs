@@ -1080,6 +1080,10 @@ impl GlesSceneRenderer {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "scene-cache validation compares each render-state component explicitly"
+    )]
     fn scene_cache_is_current(
         &self,
         width: u32,
@@ -1888,6 +1892,10 @@ impl EglSceneCacheKey {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache-key construction keeps each render-state component explicit"
+    )]
     fn new_with_decorations(
         width: u32,
         height: u32,
@@ -1956,6 +1964,10 @@ impl EglSceneCacheKey {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache-key validation keeps each render-state component explicit"
+    )]
     fn is_current_with_decorations(
         self,
         width: u32,
@@ -1978,6 +1990,10 @@ impl EglSceneCacheKey {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test cache-key validation mirrors the production state comparison"
+    )]
     fn is_current_with_decoration_snapshots(
         self,
         width: u32,
@@ -2044,10 +2060,6 @@ fn split_external_overlay_surfaces(
         .partition(|surface| !external_overlay_surface_ids.contains(&surface.surface_id))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "EGL command emission keeps draw target, surface, and placement data explicit"
-)]
 fn push_egl_surface_commands(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,

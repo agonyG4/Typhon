@@ -376,14 +376,17 @@ fn tiled_resize_coalesces_pointer_updates_and_flushes_latest_value_once() {
         )
         .expect("solution");
     let resize_interaction_id = ResizeInteractionId::new(41);
+    let preparation = TiledResizePreparation {
+        location,
+        edges: ResizeEdges::new(false, false, false, true),
+        handle,
+        solution,
+    };
     state.install_tiled_resize_session(
         WindowInteractionId::new(41),
         resize_interaction_id,
         window_id,
-        location,
-        ResizeEdges::new(false, false, false, true),
-        handle,
-        &solution,
+        &preparation,
     );
 
     assert_eq!(
@@ -442,19 +445,21 @@ fn tiled_resize_cancellation_discards_pending_pointer_value() {
                 .tree(location)
                 .expect("tree")
                 .windows()
-                .into_iter()
                 .map(crate::wm::layout::LayoutWindowSnapshot::new)
                 .collect::<Vec<_>>(),
         )
         .expect("solution");
+    let preparation = TiledResizePreparation {
+        location,
+        edges: ResizeEdges::new(false, false, false, true),
+        handle,
+        solution,
+    };
     state.install_tiled_resize_session(
         interaction_id,
         ResizeInteractionId::new(42),
         window_id,
-        location,
-        ResizeEdges::new(false, false, false, true),
-        handle,
-        &solution,
+        &preparation,
     );
     assert!(state.update_window_interaction_by_id(interaction_id, 260.0, 100.0));
     state.end_window_interaction_by_id_with_reason(

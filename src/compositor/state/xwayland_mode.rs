@@ -42,18 +42,17 @@ impl CompositorState {
             window.state.capture_restore_geometry(restore_geometry);
         }
 
-        if mode_changed || minimized_changed {
-            if let Some(location) = self
+        if (mode_changed || minimized_changed)
+            && let Some(location) = self
                 .window(window_id)
                 .and_then(|window| window.management)
                 .filter(|management| management.layout() == LayoutMembership::Tiled)
                 .map(|management| management.location())
-            {
-                self.cancel_tiled_resize_for_location(
-                    location,
-                    WindowInteractionEndReason::ModeTransition,
-                );
-            }
+        {
+            self.cancel_tiled_resize_for_location(
+                location,
+                WindowInteractionEndReason::ModeTransition,
+            );
         }
         if mode_changed {
             self.clear_resize_state_for_surfaces_with_reason(

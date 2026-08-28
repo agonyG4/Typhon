@@ -922,11 +922,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .submit_duration_ns_max
                         .fetch_max(submit_duration_ns, std::sync::atomic::Ordering::Relaxed);
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
-                    let submit_wake_lateness_ns = wait_armed
-                        .then(|| {
-                            actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at)
-                        })
-                        .unwrap_or(0);
+                    let submit_wake_lateness_ns = if wait_armed {
+                        actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at)
+                    } else {
+                        0
+                    };
                     let pre_submit_duration_ns =
                         pre_submit_completed_at.saturating_sub(pre_submit_started_at);
                     let dispatch_duration_ns =

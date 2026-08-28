@@ -13,9 +13,12 @@ pub(crate) fn log(message: impl AsRef<str>) {
 }
 
 pub(crate) fn log_lazy(message: impl FnOnce() -> String) {
-    log_lazy_if(enabled(), message);
+    if enabled() {
+        log(message());
+    }
 }
 
+#[cfg(test)]
 fn log_lazy_if(enabled: bool, message: impl FnOnce() -> String) {
     if enabled {
         eprintln!("typhon pointer: {}", message());

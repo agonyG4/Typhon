@@ -881,6 +881,10 @@ pub(crate) fn native_output_damage_for_scene_and_cursor(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "damage test helper mirrors the independent scene and decoration inputs"
+)]
 pub(crate) fn native_output_damage_for_scene_and_cursor_with_decorations(
     width: u32,
     height: u32,

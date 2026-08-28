@@ -145,17 +145,12 @@ pub enum SurfaceRenderBackend {
     Xwayland,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SurfaceOpaqueRegion {
+    #[default]
     None,
     Full,
     Partial(Vec<SurfaceOpaqueRect>),
-}
-
-impl Default for SurfaceOpaqueRegion {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
