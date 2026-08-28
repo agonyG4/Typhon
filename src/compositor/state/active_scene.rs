@@ -1,5 +1,23 @@
 use super::*;
-use crate::wm::WorkspaceId;
+use crate::wm::{SpecialWorkspaceId, WorkspaceId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct ActiveSceneSelection {
+    pub(in crate::compositor) regular: WorkspaceId,
+    pub(in crate::compositor) special: Option<SpecialWorkspaceId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::compositor) enum SceneWorkOwner {
+    Global,
+    Location(crate::wm::WorkspaceLocation),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::compositor) struct ActiveSceneUpdate {
+    pub(in crate::compositor) selection_changed: bool,
+    pub(in crate::compositor) visual_scene_changed: bool,
+}
 
 #[derive(Debug, Default)]
 pub(in crate::compositor) struct ActiveSceneView {
@@ -7,7 +25,7 @@ pub(in crate::compositor) struct ActiveSceneView {
     surface_indices: HashMap<u32, usize>,
     surface_origins: Vec<(i32, i32)>,
     popup_surface_ids: Vec<u32>,
-    workspace: Option<WorkspaceId>,
+    selection: Option<ActiveSceneSelection>,
     rebuild_count: u64,
     incremental_surface_update_count: u64,
 }
@@ -37,14 +55,26 @@ impl ActiveSceneView {
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn rebuild_active_scene_view(&mut self) {
-        let workspace = self.active_workspace();
-        let surfaces: Vec<RenderableSurface> = self
+    fn active_scene_renderable_surfaces(&self) -> Vec<RenderableSurface> {
+        let mut surfaces = self
             .renderable_surfaces
             .iter()
-            .filter(|surface| self.surface_is_visible_in_active_workspace(surface.surface_id))
-            .cloned()
-            .collect();
+            .enumerate()
+            .filter(|(_, surface)| self.surface_is_visible_in_active_scene(surface.surface_id))
+            .map(|(position, surface)| (position, surface.clone()))
+            .collect::<Vec<_>>();
+        surfaces.sort_by_key(|(position, surface)| {
+            self.renderable_root_stack_key(
+                self.root_surface_id_for_surface(surface.surface_id),
+                *position,
+            )
+        });
+        surfaces.into_iter().map(|(_, surface)| surface).collect()
+    }
+
+    pub(in crate::compositor) fn rebuild_active_scene_view(&mut self) -> ActiveSceneUpdate {
+        let selection = self.active_scene_selection();
+        let surfaces = self.active_scene_renderable_surfaces();
         let surface_indices = surfaces
             .iter()
             .enumerate()
@@ -52,15 +82,34 @@ impl CompositorState {
             .collect();
         let popup_surface_ids = self.active_popup_surface_ids_from_state();
         let surface_origins = render::surface_origins(&surfaces);
+        let previous_selection = self.active_scene_view.selection;
+        let previous_surface_ids = self
+            .active_scene_view
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let surface_ids = surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let update = ActiveSceneUpdate {
+            selection_changed: previous_selection != Some(selection),
+            visual_scene_changed: previous_surface_ids != surface_ids
+                || self.active_scene_view.popup_surface_ids != popup_surface_ids
+                || self.active_scene_view.surface_origins != surface_origins,
+        };
         self.active_scene_view.surfaces = surfaces;
         self.active_scene_view.surface_indices = surface_indices;
         self.active_scene_view.surface_origins = surface_origins;
         self.active_scene_view.popup_surface_ids = popup_surface_ids;
-        self.active_scene_view.workspace = Some(workspace);
+        self.active_scene_view.selection = Some(selection);
         self.active_scene_view.rebuild_count =
             self.active_scene_view.rebuild_count.saturating_add(1);
         self.advance_pointer_hit_generation();
         self.refresh_frame_work_visibility();
+        self.rebuild_scene_work_index();
+        update
     }
 
     fn active_popup_surface_ids_from_state(&self) -> Vec<u32> {
@@ -72,7 +121,7 @@ impl CompositorState {
                 self.popup_nodes.get(surface_id).is_some_and(|node| {
                     node.lifecycle == PopupLifecycle::Alive
                         && node.mapped
-                        && self.surface_is_visible_in_active_workspace(*surface_id)
+                        && self.surface_is_visible_in_active_scene(*surface_id)
                 })
             })
             .collect::<Vec<_>>();
@@ -89,12 +138,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn refresh_active_scene_surface_order(&mut self) {
-        let mut visible_ids = Vec::new();
-        for surface in &self.renderable_surfaces {
-            if self.surface_is_visible_in_active_workspace(surface.surface_id) {
-                visible_ids.push(surface.surface_id);
-            }
-        }
+        let visible_ids = self
+            .active_scene_renderable_surfaces()
+            .into_iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
         let cached_ids = self
             .active_scene_view
             .surfaces
@@ -107,12 +155,12 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn refresh_active_scene_surface(&mut self, surface_id: u32) {
-        if self.active_scene_view.workspace != Some(self.active_workspace()) {
+        if self.active_scene_view.selection != Some(self.active_scene_selection()) {
             self.rebuild_active_scene_view();
             return;
         }
 
-        let visible = self.surface_is_visible_in_active_workspace(surface_id);
+        let visible = self.surface_is_visible_in_active_scene(surface_id);
         let cached_index = self
             .active_scene_view
             .surface_indices
@@ -125,12 +173,7 @@ impl CompositorState {
             return;
         }
 
-        let Some(updated) = self
-            .renderable_surfaces
-            .iter()
-            .find(|surface| surface.surface_id == surface_id)
-            .cloned()
-        else {
+        let Some(updated) = self.renderable_surface(surface_id).cloned() else {
             if cached_index.is_some() {
                 self.rebuild_active_scene_view();
             }
@@ -182,7 +225,7 @@ impl CompositorState {
         let mut membership_changed = false;
         let mut origins_changed = false;
         for surface_id in affected {
-            let visible = self.surface_is_visible_in_active_workspace(surface_id);
+            let visible = self.surface_is_visible_in_active_scene(surface_id);
             let cached_index = self
                 .active_scene_view
                 .surface_indices
@@ -226,15 +269,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn active_scene_surfaces(&self) -> &[RenderableSurface] {
-        if self.active_scene_view.workspace.is_none()
-            || (cfg!(test)
-                && self.active_scene_view.surfaces.is_empty()
-                && !self.renderable_surfaces.is_empty())
-        {
-            &self.renderable_surfaces
-        } else {
-            self.active_scene_view.surfaces()
-        }
+        self.active_scene_view.surfaces()
     }
 
     pub(in crate::compositor) fn active_scene_popup_surface_ids(&self) -> &[u32] {

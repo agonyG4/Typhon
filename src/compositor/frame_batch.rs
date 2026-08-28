@@ -1,9 +1,10 @@
 use std::num::NonZeroU64;
 
-use wayland_server::protocol::{wl_buffer, wl_callback};
+use wayland_server::protocol::wl_callback;
 
 use super::{
     CommitTimingTargetClaim, FifoBarrierClaim, PendingPresentationFeedback, SurfaceBufferRelease,
+    SurfaceDamagePresentation,
 };
 
 #[doc(hidden)]
@@ -62,10 +63,10 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) callback_settlement: FrameCallbackSettlement,
     pub(super) callback_terminal_ownership_checked: bool,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    pub(super) shm_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pub(super) dmabuf_releases_to_complete_on_present: Vec<SurfaceBufferRelease>,
     pub(super) fifo_barrier_claims: Vec<FifoBarrierClaim>,
     pub(super) commit_timing_target_claims: Vec<CommitTimingTargetClaim>,
+    pub(super) surface_damage: Option<SurfaceDamagePresentation>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

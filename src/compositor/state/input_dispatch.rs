@@ -64,7 +64,7 @@ impl CompositorState {
             return false;
         }
         let root_surface_id = self.root_surface_id_for_surface(target_surface_id);
-        if !self.surface_is_visible_in_active_workspace(root_surface_id)
+        if !self.surface_is_visible_in_active_scene(root_surface_id)
             && !self.layer_surfaces.contains_key(&root_surface_id)
         {
             return false;

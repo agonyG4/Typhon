@@ -56,6 +56,12 @@ impl WindowState {
             .find(|surface| surface.surface_id == surface_id)
     }
 
+    pub(super) fn minimized_surface(&self, surface_id: u32) -> Option<&RenderableSurface> {
+        self.minimized_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+    }
+
     pub(super) fn push_minimized_surface(&mut self, surface: RenderableSurface) {
         self.minimized = true;
         self.minimized_surfaces.push(surface);
@@ -110,7 +116,7 @@ impl ToplevelMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct WindowGeometry {
+pub(crate) struct WindowGeometry {
     pub(super) placement: SurfacePlacement,
     pub(super) width: u32,
     pub(super) height: u32,

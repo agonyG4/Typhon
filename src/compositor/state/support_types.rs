@@ -123,6 +123,7 @@ pub(in crate::compositor) fn pointer_debug_enabled() -> bool {
     crate::pointer_debug::enabled()
 }
 
+#[cfg(test)]
 fn pointer_debug_message<T>(enabled: bool, message: impl FnOnce() -> T) -> Option<T> {
     enabled.then(message)
 }
@@ -131,6 +132,7 @@ pub(in crate::compositor) fn pointer_debug_log_lazy(message: impl FnOnce() -> St
     crate::pointer_debug::log_lazy(message);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::compositor) fn cursor_geometry_debug_message(
     event: &str,
     client: &str,

@@ -7,7 +7,8 @@ use crate::render_backend::buffer::{
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::wm::WorkspaceManager;
+use crate::wm::layout::{LayoutGeneration, TiledLayoutManager};
+use crate::wm::{WorkspaceLocation, WorkspaceManager};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
@@ -15,6 +16,7 @@ pub use clipboard_bridge::{
 };
 use gpu_protocol_capabilities::GpuProtocolCapabilities;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io,
@@ -113,7 +115,6 @@ mod toplevel_publication_state;
 mod window_backend;
 mod window_state;
 mod workspace_protocol;
-use workspace_protocol::WorkspaceProtocolState;
 pub use crate::core::WindowId;
 use commit_debug::*;
 pub use desktop_window::{
@@ -146,8 +147,11 @@ use explicit_sync::{
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
+pub(in crate::compositor) use state_data::CurrentSurfaceBuffer;
+pub use state_data::ShmBufferLifetimeMetrics;
 #[allow(unused_imports)]
 pub(in crate::compositor) use toplevel_publication::*;
+use workspace_protocol::WorkspaceProtocolState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackDisposition {
     Presented,
@@ -336,6 +340,12 @@ pub struct ResizeFlowMetrics {
     pub visual_geometry_resize_starts: u64,
     pub raw_pointer_move_updates: u64,
     pub pending_move_updates_replaced: u64,
+    pub interactive_visual_work_queued_edges: u64,
+    pub interactive_input_cycles_while_pending: u64,
+    pub interactive_scheduler_decisions_while_pending: u64,
+    pub interactive_render_admissions: u64,
+    pub interactive_render_ahead_admissions: u64,
+    pub interactive_non_render_admission_attempts: u64,
     pub move_updates_applied: u64,
     pub move_updates_skipped_unchanged: u64,
     pub raw_pointer_resize_updates: u64,
@@ -361,6 +371,18 @@ pub struct ResizeFlowMetrics {
     pub x11_moveresize_no_pressed_button: u64,
     pub x11_moveresize_button_mismatch: u64,
     pub x11_moveresize_stale_request: u64,
+    pub tiled_resize_interactions_started: u64,
+    pub tiled_resize_raw_updates: u64,
+    pub tiled_resize_pending_replaced: u64,
+    pub tiled_resize_frame_flushes: u64,
+    pub tiled_resize_ratio_clamps: u64,
+    pub tiled_resize_unchanged_flushes: u64,
+    pub tiled_resize_frame_snapshot_windows: u64,
+    pub tiled_resize_frame_node_visits: u64,
+    pub tiled_constraint_reflows: u64,
+    pub tiled_constraint_auto_floats: u64,
+    pub tiled_migration_fallbacks: u64,
+    pub tiled_work_area_reflows: u64,
 }
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubsurfaceTransactionMetrics {
@@ -432,6 +454,7 @@ pub enum RenderGenerationCause {
     WindowMove,
     WindowResize,
     WindowMode,
+    LayoutReflow,
     WindowMinimize,
     WindowRestore,
     WindowStack,
@@ -454,6 +477,7 @@ impl RenderGenerationCause {
             Self::WindowMove => "window_move",
             Self::WindowResize => "window_resize",
             Self::WindowMode => "window_mode",
+            Self::LayoutReflow => "layout_reflow",
             Self::WindowMinimize => "window_minimize",
             Self::WindowRestore => "window_restore",
             Self::WindowStack => "window_stack",
@@ -478,6 +502,26 @@ pub struct ClientCursorRenderState<'a> {
     pub hotspot_x: i32,
     pub hotspot_y: i32,
 }
+
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceLocalityMetrics {
+    pub global_renderable_index_rebuilds: u64,
+    pub global_indexed_lookups: u64,
+    pub content_indexed_lookups: u64,
+    pub presentation_sampled_entries: u64,
+    pub presentation_journal_lookups: u64,
+    pub presentation_settlement_entries: u64,
+    pub presentation_settlement_journal_lookups: u64,
+    pub presentation_global_scans: u64,
+    pub surface_damage_settlement_presented: u64,
+    pub surface_damage_settlement_no_visual_change: u64,
+    pub xwayland_content_replacements: u64,
+    pub xwayland_topology_reorders: u64,
+    pub xwayland_full_visual_reassignments: u64,
+    pub cursor_surface_samples_software: u64,
+    pub cursor_surface_samples_hardware: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(in crate::compositor) enum SurfaceTeardownReason {
@@ -499,7 +543,18 @@ pub struct CompositorState {
     pub xdg_popups: usize,
     pub last_app_id: Option<String>,
     pub renderable_surfaces: Vec<RenderableSurface>,
+    renderable_surface_indices: HashMap<u32, usize>,
+    locality_metrics: Cell<SurfaceLocalityMetrics>,
     active_scene_view: ActiveSceneView,
+    scene_work_index: SceneWorkIndex,
+    pub(in crate::compositor) tiled_layout: TiledLayoutManager,
+    pub(in crate::compositor) tiled_resize_session: Option<TiledResizeSession>,
+    pub(in crate::compositor) pending_tiled_resize: Option<PendingTiledResize>,
+    pub(in crate::compositor) layout_generation: LayoutGeneration,
+    layout_batch_depth: u8,
+    layout_batch_scene_effect: bool,
+    tiled_layout_dirty: HashSet<WorkspaceLocation>,
+    tiled_floating_restores: HashMap<WindowId, WindowGeometry>,
     next_surface_id: u32,
     buffer_ids: BufferIdAllocator,
     surface_resources: HashMap<u32, wl_surface::WlSurface>,
@@ -511,6 +566,14 @@ pub struct CompositorState {
     active_commit_timing_targets:
         HashMap<u32, Vec<(u64, SurfaceCommitSequence, CommitTimingReadiness)>>,
     next_fifo_barrier_generation: u64,
+    surface_pacing_readiness_generation: u64,
+    surface_pacing_serviced_generation: u64,
+    surface_pacing_deadline_cache: Cell<Option<u64>>,
+    surface_pacing_deadline_cache_valid: Cell<bool>,
+    surface_pacing_deadline_recomputations: Cell<u64>,
+    commit_timing_planning_pending: bool,
+    commit_timing_planning_generation: u64,
+    commit_timing_planning_signature: u64,
     surface_pacing_metrics: SurfacePacingMetrics,
     output_resources: Vec<wl_output::WlOutput>,
     workspace_protocol: WorkspaceProtocolState,
@@ -567,6 +630,8 @@ pub struct CompositorState {
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
     xwayland: XwaylandCompositorState,
     surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,
+    // Monotonic damage-accounting baseline. NoVisualChange may advance it
+    // without asserting that a physical output presentation occurred.
     presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
     surface_presentation_generations: HashMap<u32, u64>,
     next_surface_presentation_generation: u64,
@@ -576,7 +641,7 @@ pub struct CompositorState {
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
     subsurface_transactions: SubsurfaceTransactionState,
     subsurface_transaction_metrics: SubsurfaceTransactionMetrics,
-    current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
+    current_surface_buffers: HashMap<u32, CurrentSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     pending_surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     surface_output_memberships: HashMap<u32, SurfaceOutputMembership>,
@@ -609,6 +674,7 @@ pub struct CompositorState {
     window_interaction_release_metrics: WindowInteractionReleaseMetrics,
     window_interaction_terminal_refresh_pending: bool,
     window_interaction_terminal_refresh_root_surface_id: Option<u32>,
+    workspace_scene_transition_active: bool,
     window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
@@ -627,9 +693,9 @@ pub struct CompositorState {
     implicit_pointer_grab: Option<ImplicitPointerGrab>,
     recent_input_serials: Vec<InputSerial>,
     active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
-    pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     buffer_release_metrics: BufferReleaseMetrics,
+    shm_buffer_lifetime_metrics: ShmBufferLifetimeMetrics,
     frame_callback_metrics: FrameCallbackMetrics,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
     pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
@@ -637,9 +703,11 @@ pub struct CompositorState {
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
+    visible_pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     pending_frame_callback_surfaces: HashMap<ObjectId, u32>,
     visible_pending_frame_callback_count: usize,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
+    visible_pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
     visible_pending_presentation_feedback_count: usize,
     frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     retired_frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
@@ -716,10 +784,37 @@ pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceDamageSettlement {
+    Presented,
+    NoVisualChange,
+}
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceDamagePresentation {
     sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
+}
+
+impl SurfaceDamagePresentation {
+    pub const fn is_empty(&self) -> bool {
+        self.sampled_commits.is_empty()
+    }
+
+    pub fn contains_surface_id(&self, surface_id: u32) -> bool {
+        self.sampled_commits
+            .iter()
+            .any(|(key, _)| key.surface_id == surface_id)
+    }
+}
+
+#[cfg(test)]
+impl SurfaceDamagePresentation {
+    pub(crate) fn sampled_surface_ids_for_test(&self) -> Vec<u32> {
+        self.sampled_commits
+            .iter()
+            .map(|(key, _)| key.surface_id)
+            .collect()
+    }
 }
 #[derive(Debug, Clone)]
 pub struct PendingProcessLaunch {

@@ -9,7 +9,6 @@ use std::{
     },
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
@@ -32,12 +31,8 @@ struct TestRuntime(PathBuf);
 impl TestRuntime {
     fn new() -> Self {
         let sequence = TEST_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         let path = PathBuf::from(format!(
-            "/tmp/typhon-control-test-{}-{nonce}-{sequence}",
+            "/tmp/typhon-control-test-{}-{sequence}",
             std::process::id(),
         ));
         fs::create_dir(&path).unwrap();

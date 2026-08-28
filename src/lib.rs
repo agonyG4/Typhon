@@ -129,9 +129,9 @@ mod tests {
     #[test]
     fn window_management_state_defaults_to_active_floating_membership() {
         let workspace = wm::WorkspaceId::new(3).unwrap();
-        let state = wm::WindowManagementState::new(workspace);
+        let state = wm::WindowManagementState::new(wm::WorkspaceLocation::Regular(workspace));
 
-        assert_eq!(state.workspace(), workspace);
+        assert_eq!(state.regular_workspace(), Some(workspace));
         assert_eq!(state.layout(), wm::LayoutMembership::Floating);
         assert_eq!(
             state.with_layout(wm::LayoutMembership::Tiled).layout(),
@@ -144,14 +144,15 @@ mod tests {
         let first = wm::WorkspaceId::new(1).unwrap();
         let second = wm::WorkspaceId::new(5).unwrap();
 
-        let floating = wm::WindowManagementState::new(first).with_workspace(second);
-        assert_eq!(floating.workspace(), second);
+        let floating = wm::WindowManagementState::new(wm::WorkspaceLocation::Regular(first))
+            .with_location(wm::WorkspaceLocation::Regular(second));
+        assert_eq!(floating.regular_workspace(), Some(second));
         assert_eq!(floating.layout(), wm::LayoutMembership::Floating);
 
-        let tiled = wm::WindowManagementState::new(first)
+        let tiled = wm::WindowManagementState::new(wm::WorkspaceLocation::Regular(first))
             .with_layout(wm::LayoutMembership::Tiled)
-            .with_workspace(second);
-        assert_eq!(tiled.workspace(), second);
+            .with_location(wm::WorkspaceLocation::Regular(second));
+        assert_eq!(tiled.regular_workspace(), Some(second));
         assert_eq!(tiled.layout(), wm::LayoutMembership::Tiled);
     }
 
@@ -166,6 +167,97 @@ mod tests {
         assert_eq!(extensible.get(), 11);
         assert_eq!(extensible.to_ewmh(), 10);
         assert_eq!(wm::WorkspaceId::from_ewmh(u32::MAX), None);
+    }
+
+    #[test]
+    fn special_workspace_ids_are_typed_nonzero_and_orderable() {
+        let default = wm::SpecialWorkspaceId::DEFAULT;
+        let second = wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+
+        assert_eq!(default.get(), 1);
+        assert!(wm::SpecialWorkspaceId::new(0).is_none());
+        assert!(default < second);
+        assert_eq!(default, wm::SpecialWorkspaceId::DEFAULT);
+    }
+
+    #[test]
+    fn window_management_location_is_orthogonal_to_layout() {
+        let regular = wm::WorkspaceId::new(3).expect("regular workspace");
+        let special = wm::SpecialWorkspaceId::DEFAULT;
+        let state = wm::WindowManagementState::new(wm::WorkspaceLocation::Regular(regular))
+            .with_layout(wm::LayoutMembership::Tiled)
+            .with_location(wm::WorkspaceLocation::Special(special));
+
+        assert_eq!(state.location(), wm::WorkspaceLocation::Special(special));
+        assert_eq!(state.regular_workspace(), None);
+        assert_eq!(state.special_workspace(), Some(special));
+        assert_eq!(state.layout(), wm::LayoutMembership::Tiled);
+    }
+
+    #[test]
+    fn window_chrome_policy_is_derived_only_from_layout_membership() {
+        let regular = wm::WorkspaceId::new(1).expect("regular workspace");
+        let special = wm::SpecialWorkspaceId::DEFAULT;
+
+        let regular_floating =
+            wm::WindowManagementState::new(wm::WorkspaceLocation::Regular(regular));
+        let special_floating =
+            wm::WindowManagementState::new(wm::WorkspaceLocation::Special(special));
+        let regular_tiled = regular_floating.with_layout(wm::LayoutMembership::Tiled);
+        let special_tiled = special_floating.with_layout(wm::LayoutMembership::Tiled);
+
+        assert_eq!(
+            regular_floating.chrome_policy(),
+            wm::WindowChromePolicy::Full
+        );
+        assert_eq!(
+            special_floating.chrome_policy(),
+            wm::WindowChromePolicy::Full
+        );
+        assert_eq!(
+            regular_tiled.chrome_policy(),
+            wm::WindowChromePolicy::Minimal
+        );
+        assert_eq!(
+            special_tiled.chrome_policy(),
+            wm::WindowChromePolicy::Minimal
+        );
+        assert_eq!(regular_tiled.location(), regular_floating.location());
+        assert_eq!(special_tiled.location(), special_floating.location());
+    }
+
+    #[test]
+    fn special_toggle_is_separate_from_regular_workspace_selection() {
+        let mut manager = wm::WorkspaceManager::default();
+        let regular_two = wm::WorkspaceId::new(2).expect("regular workspace");
+        let special = wm::SpecialWorkspaceId::DEFAULT;
+
+        assert_eq!(manager.visible_special_workspace(), None);
+        let unknown = wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+        assert_eq!(
+            manager.toggle_special_workspace(unknown),
+            wm::SpecialWorkspaceToggleOutcome::UnknownSpecial { id: unknown }
+        );
+        assert_eq!(
+            manager.toggle_special_workspace(special),
+            wm::SpecialWorkspaceToggleOutcome::Opened { id: special }
+        );
+        assert_eq!(manager.visible_special_workspace(), Some(special));
+        assert_eq!(manager.active_workspace(), wm::WorkspaceId::new(1).unwrap());
+        assert_eq!(
+            manager.activate(regular_two),
+            wm::WorkspaceSwitchOutcome::Changed {
+                previous: wm::WorkspaceId::new(1).unwrap(),
+                current: regular_two,
+            }
+        );
+        assert_eq!(manager.visible_special_workspace(), Some(special));
+        assert_eq!(
+            manager.toggle_special_workspace(special),
+            wm::SpecialWorkspaceToggleOutcome::Closed { id: special }
+        );
+        assert_eq!(manager.visible_special_workspace(), None);
+        assert_eq!(manager.workspaces().count(), 10);
     }
 
     #[test]

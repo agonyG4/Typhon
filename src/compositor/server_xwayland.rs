@@ -184,7 +184,7 @@ impl OwnCompositorServer {
         self.state
             .current_surface_buffers
             .get(&surface_id)
-            .map(|pending| pending.data.buffer_id())
+            .map(|buffer| buffer.buffer_id())
     }
 
     pub(crate) fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {

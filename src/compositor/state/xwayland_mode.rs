@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::wm::LayoutMembership;
+
 impl CompositorState {
     pub(in crate::compositor) fn transition_x11_window_mode(
         &mut self,
@@ -40,6 +42,19 @@ impl CompositorState {
             window.state.capture_restore_geometry(restore_geometry);
         }
 
+        if mode_changed || minimized_changed {
+            if let Some(location) = self
+                .window(window_id)
+                .and_then(|window| window.management)
+                .filter(|management| management.layout() == LayoutMembership::Tiled)
+                .map(|management| management.location())
+            {
+                self.cancel_tiled_resize_for_location(
+                    location,
+                    WindowInteractionEndReason::ModeTransition,
+                );
+            }
+        }
         if mode_changed {
             self.clear_resize_state_for_surfaces_with_reason(
                 &[root_surface_id],
@@ -51,8 +66,11 @@ impl CompositorState {
         }
 
         let target_geometry = if mode == ToplevelMode::Normal && mode_changed {
-            self.window_mut(window_id)
-                .and_then(|window| window.state.take_restore_geometry())
+            self.current_tiled_geometry(window_id)
+                .or_else(|| {
+                    self.window_mut(window_id)
+                        .and_then(|window| window.state.take_restore_geometry())
+                })
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
                 .or(current_geometry)
                 .unwrap_or_else(|| {

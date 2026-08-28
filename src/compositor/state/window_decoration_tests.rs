@@ -59,7 +59,7 @@ fn xdg_state(
     state
         .xdg_decoration_states
         .insert(surface.surface_id, decoration_state);
-    state.renderable_surfaces.push(surface);
+    state.append_renderable_surface(surface);
     state.rebuild_active_scene_view();
     state
 }
@@ -75,7 +75,7 @@ fn x11_state(surface: RenderableSurface) -> CompositorState {
     state
         .insert_desktop_window(window)
         .expect("insert XWayland window");
-    state.renderable_surfaces.push(surface);
+    state.append_renderable_surface(surface);
     state.rebuild_active_scene_view();
     state
 }
@@ -97,7 +97,8 @@ fn renderable_surface_order_follows_authoritative_window_stacking() {
     state
         .insert_desktop_window(DesktopWindow::new_xdg(second_id, second_surface.surface_id))
         .expect("second window");
-    state.renderable_surfaces = vec![first_surface, second_surface];
+    state.append_renderable_surface(first_surface);
+    state.append_renderable_surface(second_surface);
     state.window_stacking = vec![second_id, first_id];
 
     assert!(state.normalize_window_stacking());
@@ -136,7 +137,8 @@ fn pointer_scene_hit_returns_top_window_decoration_before_lower_client() {
     state
         .xdg_decoration_states
         .insert(front.surface_id, front_decoration);
-    state.renderable_surfaces = vec![rear, front];
+    state.append_renderable_surface(rear);
+    state.append_renderable_surface(front);
     state.window_stacking = vec![rear_id, front_id];
     state.rebuild_active_scene_view();
 
@@ -176,7 +178,7 @@ fn pointer_scene_hit_keeps_ssd_above_an_ordinary_subsurface() {
     );
     let mut child = test_surface(43);
     child.placement = SurfacePlacement::subsurface(42, 10, -20);
-    state.renderable_surfaces.push(child);
+    state.append_renderable_surface(child);
     state.rebuild_active_scene_view();
 
     let root_origin = render::surface_origins(&state.renderable_surfaces)[0];
@@ -350,7 +352,7 @@ fn pointer_scene_hit_cache_does_not_survive_destroyed_window() {
     ));
 
     state.remove_desktop_window(window_id);
-    state.renderable_surfaces.clear();
+    state.retain_renderable_surfaces(|_| false);
     state.invalidate_surface_origin_cache();
 
     assert!(matches!(

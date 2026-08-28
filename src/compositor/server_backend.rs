@@ -274,6 +274,13 @@ impl OwnCompositorServer {
                         workspace,
                     })
                 }
+                crate::compositor::window_backend::WindowBackendCommand::ClearWorkspace { window } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::ClearWorkspace { window: handle })
+                }
                 crate::compositor::window_backend::WindowBackendCommand::PublishWorkspaceState {
                     workspace_count,
                     current_workspace,

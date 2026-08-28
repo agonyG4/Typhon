@@ -7,6 +7,12 @@ impl CompositorState {
         self.buffer_release_metrics
     }
 
+    pub(in crate::compositor) const fn shm_buffer_lifetime_metrics(
+        &self,
+    ) -> ShmBufferLifetimeMetrics {
+        self.shm_buffer_lifetime_metrics
+    }
+
     pub(in crate::compositor) fn record_surface_tree_merge_metrics(
         &mut self,
         stats: &SurfaceTreeMergeStats,
@@ -76,24 +82,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
-        self.active_fifo_barriers
-            .keys()
-            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id))
+        self.scene_work_index
+            .has_visible_prepare_work(self.active_scene_selection())
             || self.pending_resize_configure_is_flushable()
-            || self.pending_explicit_sync_commits.iter().any(|commit| {
-                self.surface_is_visible_in_active_workspace(commit.surface_id)
-                    && (!self.external_acquire_readiness
-                        || commit.acquire_state == PendingAcquireState::Ready)
-            })
-            || self
-                .pending_surface_tree_transactions
-                .iter()
-                .any(|transaction| {
-                    self.surface_is_visible_in_active_workspace(transaction.root_surface_id)
-                        && (transaction.commit_timing_request().is_some()
-                            || !self.external_acquire_readiness
-                            || self.transaction_is_ready(transaction))
-                })
             || !self.pending_color_info.is_empty()
     }
 
@@ -134,6 +125,33 @@ impl CompositorState {
             || self.has_pending_interactive_visual_work()
             || self.has_unowned_frame_callbacks()
             || self.has_visible_pending_presentation_feedbacks()
+            || !self.pending_dmabuf_buffer_releases.is_empty()
+    }
+
+    pub(in crate::compositor) fn settle_no_visual_change_work(
+        &mut self,
+        surface_damage: Option<SurfaceDamagePresentation>,
+        owns_frame_batch: bool,
+    ) -> bool {
+        let completed_work = owns_frame_batch || surface_damage.is_some();
+        if owns_frame_batch {
+            if self.legacy_prepared_frame_batch.is_none() {
+                self.capture_frame_callbacks_for_render();
+            }
+            if let Some(surface_damage) = surface_damage {
+                let batch_id = self
+                    .legacy_prepared_frame_batch
+                    .expect("no prepared frame batch for surface damage ownership");
+                self.set_frame_batch_surface_damage(batch_id, surface_damage);
+            }
+            let batch_id = self
+                .legacy_prepared_frame_batch
+                .expect("no prepared frame batch for no-visual-change settlement");
+            self.complete_no_visual_change_frame_batch(batch_id);
+        } else if let Some(surface_damage) = surface_damage {
+            self.commit_surface_damage_no_visual_change(surface_damage);
+        }
+        completed_work
     }
 
     pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
@@ -256,7 +274,6 @@ impl CompositorState {
             NonZeroU64::new(self.next_frame_batch_id)
                 .expect("compositor frame batch IDs start at one"),
         );
-        let shm_buffer_releases = std::mem::take(&mut self.pending_buffer_releases);
         let dmabuf_releases_to_complete_on_present =
             std::mem::take(&mut self.pending_dmabuf_buffer_releases);
         let callbacks = self.take_visible_pending_frame_callbacks();
@@ -285,8 +302,7 @@ impl CompositorState {
                 ],
             );
         }
-        let captured_releases =
-            shm_buffer_releases.len() + dmabuf_releases_to_complete_on_present.len();
+        let captured_releases = dmabuf_releases_to_complete_on_present.len();
         let active_scene_surface_ids = self
             .active_scene_surfaces()
             .iter()
@@ -308,7 +324,6 @@ impl CompositorState {
                 ("frame_batch_id", batch_id.get().to_string()),
                 ("frame_id", frame_id.to_string()),
                 ("count", captured_releases.to_string()),
-                ("shm_count", shm_buffer_releases.len().to_string()),
                 (
                     "dmabuf_count",
                     dmabuf_releases_to_complete_on_present.len().to_string(),
@@ -325,10 +340,10 @@ impl CompositorState {
                 callback_settlement: FrameCallbackSettlement::new(callback_count),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks,
-                shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,
                 fifo_barrier_claims,
                 commit_timing_target_claims,
+                surface_damage: None,
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
@@ -347,24 +362,14 @@ impl CompositorState {
             .frame_batches
             .remove(&batch_id)
             .expect("missing compositor frame batch on render failure");
-        batch.callbacks.append(&mut self.pending_frame_callbacks);
-        self.pending_frame_callbacks = batch.callbacks;
-        batch
-            .presentation_feedbacks
-            .append(&mut self.pending_presentation_feedbacks);
-        self.pending_presentation_feedbacks = batch.presentation_feedbacks;
-        self.refresh_frame_work_visibility();
-        let restored_shm = batch.shm_buffer_releases.len();
-        batch
-            .shm_buffer_releases
-            .append(&mut self.pending_buffer_releases);
-        self.pending_buffer_releases = batch.shm_buffer_releases;
+        self.requeue_frame_callbacks_after_restore(batch.callbacks);
+        self.requeue_presentation_feedbacks_after_restore(batch.presentation_feedbacks);
         let restored_dmabuf = batch.dmabuf_releases_to_complete_on_present.len();
         batch
             .dmabuf_releases_to_complete_on_present
             .append(&mut self.pending_dmabuf_buffer_releases);
         self.pending_dmabuf_buffer_releases = batch.dmabuf_releases_to_complete_on_present;
-        self.note_buffer_releases_restored(batch_id, restored_shm + restored_dmabuf);
+        self.note_buffer_releases_restored(batch_id, restored_dmabuf);
         self.clear_legacy_batch_reference(batch_id);
         self.rebuild_scene_work_index();
     }
@@ -404,8 +409,7 @@ impl CompositorState {
         }
         self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
         let frame_id = batch.frame_id;
-        let release_count =
-            batch.shm_buffer_releases.len() + batch.dmabuf_releases_to_complete_on_present.len();
+        let release_count = batch.dmabuf_releases_to_complete_on_present.len();
         self.retired_frame_batches.insert(batch_id, batch);
         self.rebuild_scene_work_index();
         client_pacing_log(
@@ -480,9 +484,29 @@ impl CompositorState {
             self.complete_commit_timing_claim(*claim, presentation);
         }
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
+        let surface_damage = batch.surface_damage.clone();
         let batch = self.complete_frame_batch_releases(batch_id, batch);
+        if let Some(surface_damage) = surface_damage {
+            self.commit_surface_damage_presented(surface_damage);
+        }
         self.clear_legacy_batch_reference(batch_id);
         self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
+    }
+
+    pub(in crate::compositor) fn set_frame_batch_surface_damage(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        surface_damage: SurfaceDamagePresentation,
+    ) {
+        let batch = self
+            .frame_batches
+            .get_mut(&batch_id)
+            .expect("missing compositor frame batch for surface damage ownership");
+        assert!(
+            batch.surface_damage.is_none(),
+            "compositor frame batch surface damage ownership was replaced"
+        );
+        batch.surface_damage = Some(surface_damage);
     }
 
     pub(in crate::compositor) fn assert_frame_batch_identity(
@@ -555,18 +579,24 @@ impl CompositorState {
                 }
             });
         }
-        let before = self.pending_presentation_feedbacks.len();
+        let before = self.visible_pending_presentation_feedbacks.len();
+        discard_surface(&mut self.visible_pending_presentation_feedbacks, surface_id);
         discard_surface(&mut self.pending_presentation_feedbacks, surface_id);
         self.visible_pending_presentation_feedback_count = self
             .visible_pending_presentation_feedback_count
-            .saturating_sub(before.saturating_sub(self.pending_presentation_feedbacks.len()));
+            .saturating_sub(
+                before.saturating_sub(self.visible_pending_presentation_feedbacks.len()),
+            );
         for batch in self.frame_batches.values_mut() {
             discard_surface(&mut batch.presentation_feedbacks, surface_id);
         }
     }
 
     pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
-        for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
+        for pending in std::mem::take(&mut self.visible_pending_presentation_feedbacks)
+            .into_iter()
+            .chain(std::mem::take(&mut self.pending_presentation_feedbacks))
+        {
             pending.feedback.discarded();
         }
         self.visible_pending_presentation_feedback_count = 0;
@@ -590,10 +620,6 @@ impl CompositorState {
         mut batch: CompositorFrameBatch,
     ) -> CompositorFrameBatch {
         let frame_id = batch.frame_id;
-        for buffer in batch.shm_buffer_releases.drain(..) {
-            self.complete_wl_buffer_release(batch_id, frame_id, buffer);
-        }
-
         let dmabuf_releases = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
         client_pacing_log(
             "buffer_releases_completed_on_present",
@@ -609,12 +635,11 @@ impl CompositorState {
         batch
     }
 
-    fn complete_wl_buffer_release(
+    pub(in crate::compositor) fn complete_materialized_shm_release(
         &mut self,
-        batch_id: CompositorFrameBatchId,
-        frame_id: u64,
-        buffer: wl_buffer::WlBuffer,
+        release: SafeShmRelease,
     ) {
+        let buffer = release.into_buffer();
         if !buffer.is_alive() {
             self.buffer_release_metrics.buffer_releases_discarded = self
                 .buffer_release_metrics
@@ -623,8 +648,6 @@ impl CompositorState {
             client_pacing_log(
                 "buffer_release_scrubbed",
                 &[
-                    ("frame_batch_id", batch_id.get().to_string()),
-                    ("frame_id", frame_id.to_string()),
                     ("buffer", format!("{:?}", buffer.id())),
                     ("outcome", "dead_resource".to_string()),
                 ],
@@ -640,8 +663,6 @@ impl CompositorState {
                 client_pacing_log(
                     "buffer_release_completed",
                     &[
-                        ("frame_batch_id", batch_id.get().to_string()),
-                        ("frame_id", frame_id.to_string()),
                         ("buffer", format!("{:?}", buffer.id())),
                         ("kind", "shm".to_string()),
                     ],
@@ -655,8 +676,6 @@ impl CompositorState {
                 client_pacing_log(
                     "buffer_release_scrubbed",
                     &[
-                        ("frame_batch_id", batch_id.get().to_string()),
-                        ("frame_id", frame_id.to_string()),
                         ("buffer", format!("{:?}", buffer.id())),
                         ("outcome", "send_failed".to_string()),
                     ],
@@ -723,12 +742,25 @@ impl CompositorState {
         self.legacy_prepared_frame_batch = None;
         self.legacy_submitted_frame_batch = None;
 
-        let pending_shm = std::mem::take(&mut self.pending_buffer_releases);
         let pending_dmabuf = std::mem::take(&mut self.pending_dmabuf_buffer_releases);
-        for buffer in pending_shm {
-            self.complete_wl_buffer_release(CompositorFrameBatchId::for_shutdown(), 0, buffer);
-        }
         for release in pending_dmabuf {
+            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+        }
+
+        let mut active_dmabuf = std::mem::take(&mut self.active_dmabuf_buffers);
+        for (surface_id, current) in std::mem::take(&mut self.current_surface_buffers) {
+            let CurrentSurfaceBuffer::Unmaterialized(pending) = current else {
+                continue;
+            };
+            if pending.data.is_shm() {
+                self.release_unmaterialized_pending_buffer(pending, false);
+            } else if let Some(release) = active_dmabuf.remove(&surface_id) {
+                self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+            } else {
+                self.release_surface_buffer_direct(pending.release_target());
+            }
+        }
+        for (_, release) in active_dmabuf {
             self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
         }
     }
@@ -756,32 +788,18 @@ impl CompositorState {
         candidate: &SurfaceBufferRelease,
     ) -> bool {
         let same = |release: &SurfaceBufferRelease| release.same_release_token(candidate);
-        (match candidate {
-            SurfaceBufferRelease::WlBuffer(_buffer) => self
-                .pending_buffer_releases
-                .iter()
-                .any(|existing| same(&SurfaceBufferRelease::WlBuffer(existing.clone()))),
-            SurfaceBufferRelease::ExplicitSync(_) => false,
-        }) || self.pending_dmabuf_buffer_releases.iter().any(same)
+        self.pending_dmabuf_buffer_releases.iter().any(same)
             || self.frame_batches.values().any(|batch| {
                 batch
-                    .shm_buffer_releases
+                    .dmabuf_releases_to_complete_on_present
                     .iter()
-                    .any(|buffer| same(&SurfaceBufferRelease::WlBuffer(buffer.clone())))
-                    || batch
-                        .dmabuf_releases_to_complete_on_present
-                        .iter()
-                        .any(same)
+                    .any(same)
             })
             || self.retired_frame_batches.values().any(|batch| {
                 batch
-                    .shm_buffer_releases
+                    .dmabuf_releases_to_complete_on_present
                     .iter()
-                    .any(|buffer| same(&SurfaceBufferRelease::WlBuffer(buffer.clone())))
-                    || batch
-                        .dmabuf_releases_to_complete_on_present
-                        .iter()
-                        .any(same)
+                    .any(same)
             })
     }
 
@@ -799,13 +817,6 @@ impl CompositorState {
 
     pub(in crate::compositor) fn scrub_dead_buffer_releases(&mut self) {
         let mut discarded = 0u64;
-        self.pending_buffer_releases.retain(|buffer| {
-            let alive = buffer.is_alive();
-            if !alive {
-                discarded = discarded.saturating_add(1);
-            }
-            alive
-        });
         self.pending_dmabuf_buffer_releases.retain(|release| {
             let alive = match release {
                 SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
@@ -817,13 +828,6 @@ impl CompositorState {
             alive
         });
         for batch in self.frame_batches.values_mut() {
-            batch.shm_buffer_releases.retain(|buffer| {
-                let alive = buffer.is_alive();
-                if !alive {
-                    discarded = discarded.saturating_add(1);
-                }
-                alive
-            });
             batch
                 .dmabuf_releases_to_complete_on_present
                 .retain(|release| {
@@ -838,13 +842,6 @@ impl CompositorState {
                 });
         }
         for batch in self.retired_frame_batches.values_mut() {
-            batch.shm_buffer_releases.retain(|buffer| {
-                let alive = buffer.is_alive();
-                if !alive {
-                    discarded = discarded.saturating_add(1);
-                }
-                alive
-            });
             batch
                 .dmabuf_releases_to_complete_on_present
                 .retain(|release| {

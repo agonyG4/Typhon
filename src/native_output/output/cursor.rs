@@ -711,6 +711,13 @@ impl NativeAtomicCursor {
         matches!(self.source_key, NativeCursorSourceKey::Theme)
     }
 
+    pub(crate) const fn client_source_key(&self) -> Option<NativeCursorImageKey> {
+        match self.source_key {
+            NativeCursorSourceKey::Theme => None,
+            NativeCursorSourceKey::Client(key) => Some(key),
+        }
+    }
+
     pub(crate) fn client_image_matches(&self, key: NativeCursorImageKey) -> bool {
         self.source_key == NativeCursorSourceKey::Client(key)
     }

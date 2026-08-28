@@ -752,6 +752,7 @@ pub(super) fn build_cursor_transaction(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
     desired: Option<&AtomicCursorVisualState>,
+    surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
 ) -> NativeResult<OutputTransactionId> {
     let transaction_id = output_transactions
         .allocate_id()
@@ -767,6 +768,11 @@ pub(super) fn build_cursor_transaction(
         OutputReleasePlan::Pageflip,
     )
     .map_err(io::Error::other)?;
+    let transaction = if let Some(surface_damage) = surface_damage {
+        transaction.with_surface_damage(surface_damage)
+    } else {
+        transaction
+    };
     output_transactions
         .insert(transaction)
         .map_err(io::Error::other)?;
@@ -802,6 +808,7 @@ pub(super) fn submit_plane_delta(
     last_software_cursor_damage: &mut Option<NativeDamageRect>,
     current_client_cursor_damage: Option<NativeClientCursorDamageState>,
     current_software_cursor_damage: Option<NativeDamageRect>,
+    cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
 ) -> NativeResult<SchedulerDecision> {
     let cursor_capability_key = desired
         .as_ref()
@@ -816,6 +823,7 @@ pub(super) fn submit_plane_delta(
                 pacing_mode,
                 cursor_epoch,
                 desired.as_ref(),
+                cursor_surface_damage,
             )?;
             let token = PageFlipToken::new(allocate_native_page_flip_token())
                 .expect("allocated native pageflip token is nonzero");

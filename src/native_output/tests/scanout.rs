@@ -311,6 +311,7 @@ fn ready_frame_retains_and_transfers_its_frozen_cursor_pin() {
     let lease = Arc::new(());
     let owner = FrozenCursorPlaneOwner {
         revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        client_source_key: None,
         capability_key: None,
         pin: Some(CursorFramebufferPin::for_test(101, Arc::clone(&lease))),
     };
@@ -352,6 +353,64 @@ fn ready_frame_retains_and_transfers_its_frozen_cursor_pin() {
 }
 
 #[test]
+fn ready_frame_retains_and_transfers_frozen_hardware_client_source_key() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        1,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let source_key = crate::native_output::output::NativeCursorImageKey {
+        surface_id: 77,
+        buffer_id: 11,
+        commit_sequence: 100,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        width: 64,
+        height: 64,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    };
+    let owner = FrozenCursorPlaneOwner {
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        client_source_key: Some(source_key),
+        capability_key: None,
+        pin: None,
+    };
+    swapchain
+        .prepare_ready_for_test(
+            slot,
+            test_render_fence(),
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+                delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+                primary_presentation:
+                    crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy:
+                    crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+            },
+            Some(owner),
+        )
+        .unwrap();
+
+    assert_eq!(
+        swapchain
+            .ready_cursor_plane_owner()
+            .unwrap()
+            .client_source_key,
+        Some(source_key)
+    );
+    let (_, transferred) = swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(46).unwrap(),
+            MonotonicTimestampNs::new(1),
+        )
+        .unwrap();
+    assert_eq!(transferred.unwrap().client_source_key, Some(source_key));
+}
+
+#[test]
 fn ready_frame_cursor_owner_round_trips_through_replan_and_second_admission() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),
@@ -365,6 +424,7 @@ fn ready_frame_cursor_owner_round_trips_through_replan_and_second_admission() {
         crate::native_output::presentation::plane::CursorRevision::initial().advance_image();
     let owner = FrozenCursorPlaneOwner {
         revision,
+        client_source_key: None,
         capability_key: Some(test_cursor_capability_key()),
         pin: Some(CursorFramebufferPin::for_test(103, Arc::clone(&lease))),
     };
@@ -461,6 +521,7 @@ fn failed_ready_cursor_owner_replan_keeps_owner_with_caller() {
             },
             Some(FrozenCursorPlaneOwner {
                 revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+                client_source_key: None,
                 capability_key: None,
                 pin: Some(CursorFramebufferPin::for_test(104, Arc::clone(&lease))),
             }),
@@ -495,6 +556,7 @@ fn ready_frame_cursor_pin_drops_when_suspended_frame_is_abandoned() {
     let lease = Arc::new(());
     let owner = FrozenCursorPlaneOwner {
         revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        client_source_key: None,
         capability_key: None,
         pin: Some(CursorFramebufferPin::for_test(102, Arc::clone(&lease))),
     };

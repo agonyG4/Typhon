@@ -575,6 +575,7 @@ pub(super) fn queue_plane_delta_for_presentation(
     attachable_primary: Option<crate::native_output::kms_worker::AttachablePrimary>,
     cursor_action: crate::native_output::presentation::plane_policy::CursorPlaneAction,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
 ) -> NativeResult<SchedulerDecision> {
     match queue_plane_delta(
         worker,
@@ -594,6 +595,7 @@ pub(super) fn queue_plane_delta_for_presentation(
         attachable_primary,
         cursor_action,
         cursor_delivery,
+        cursor_surface_damage,
     )? {
         WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
             Ok(SchedulerDecision::WaitForPageFlip)
@@ -629,6 +631,7 @@ pub(super) fn present_cursor_for_presentation(
     perf: NativePerfLogger,
     client_cursor_active: bool,
     cursor_render_mode: &mut NativeCursorRenderMode,
+    server: &OwnCompositorServer,
     effective_cursor: &mut Option<AtomicCursorVisualState>,
     queued_redraw_requested: &mut bool,
     last_client_cursor_damage: &mut Option<NativeClientCursorDamageState>,
@@ -637,6 +640,21 @@ pub(super) fn present_cursor_for_presentation(
     current_software_cursor_damage: Option<NativeDamageRect>,
     plane_plan: Option<&RuntimePlanePlan>,
 ) -> NativeResult<Option<SchedulerDecision>> {
+    let cursor_surface_damage = desired
+        .as_ref()
+        .filter(|state| state.visible)
+        .and_then(|_| cursor.client_source_key())
+        .map(|source_key| {
+            let surface_damage = server.capture_surface_damage_presentation_for_surface_commit(
+                source_key.surface_id,
+                oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
+            );
+            if !surface_damage.is_empty() {
+                server.note_client_cursor_surface_sample(true);
+            }
+            surface_damage
+        })
+        .filter(|surface_damage| !surface_damage.is_empty());
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
@@ -660,6 +678,7 @@ pub(super) fn present_cursor_for_presentation(
                 |plan| plan.decision.cursor_action,
             ),
             cursor_delivery,
+            cursor_surface_damage,
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }
@@ -687,6 +706,7 @@ pub(super) fn present_cursor_for_presentation(
         last_software_cursor_damage,
         current_client_cursor_damage,
         current_software_cursor_damage,
+        cursor_surface_damage,
     )?;
     if decision == SchedulerDecision::WaitForPageFlip {
         *last_submitted_cursor_epoch = cursor_epoch;

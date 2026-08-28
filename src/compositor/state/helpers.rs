@@ -47,7 +47,7 @@ pub(in crate::compositor) fn normalize_selection_mime_types(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::compositor) fn update_renderable_surface_buffer(
     surface: &mut RenderableSurface,
-    pending: &PendingSurfaceBuffer,
+    materialized: &MaterializedSurfaceBuffer,
     buffer_size: BufferSize,
     width: u32,
     height: u32,
@@ -56,26 +56,19 @@ pub(in crate::compositor) fn update_renderable_surface_buffer(
     resize_commit: Option<ResizeCommitSnapshot>,
     damage: RenderableSurfaceDamage,
 ) -> io::Result<()> {
-    if pending.data.is_shm()
-        && surface.buffer_size() == buffer_size
-        && surface.buffer_id() == pending.data.buffer_id()
-        && let Some(pixels) = surface.shm_pixels_mut()
-    {
-        pending.data.read_pixels_into_with_damage(pixels, &damage)?;
-    } else {
-        surface.buffer = pending.data.to_committed_buffer_for_size(buffer_size)?;
-    }
-    surface.x = pending.x;
-    surface.y = pending.y;
+    debug_assert_eq!(materialized.data.size(), buffer_size);
+    surface.buffer = materialized.data.clone();
+    surface.x = materialized.x;
+    surface.y = materialized.y;
     surface.width = width;
     surface.height = height;
     surface.placement = placement;
     surface.generation = generation;
-    surface.commit_sequence = pending.commit_sequence;
-    surface.buffer_scale = pending.buffer_scale;
-    surface.buffer_transform = pending.buffer_transform;
-    surface.viewport_source = pending.viewport_source;
-    surface.viewport_destination = pending.viewport_destination;
+    surface.commit_sequence = materialized.commit_sequence;
+    surface.buffer_scale = materialized.buffer_scale;
+    surface.buffer_transform = materialized.buffer_transform;
+    surface.viewport_source = materialized.viewport_source;
+    surface.viewport_destination = materialized.viewport_destination;
     surface.damage = surface
         .damage
         .clone()

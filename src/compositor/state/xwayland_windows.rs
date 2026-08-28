@@ -47,11 +47,7 @@ impl CompositorState {
                 &[retired_id],
                 WindowInteractionEndReason::SurfaceDestroyed,
             );
-            if let Some(current) = self.current_surface_buffers.remove(&retired_id)
-                && current.data.is_shm()
-            {
-                self.queue_buffer_release(current.resource);
-            }
+            self.remove_current_surface_buffer(retired_id);
             if let Some(release) = self.active_dmabuf_buffers.remove(&retired_id) {
                 self.queue_dmabuf_buffer_release(release);
             }
@@ -94,9 +90,8 @@ impl CompositorState {
         if !withdrawn_ids.is_empty() {
             let scene_effect = withdrawn_ids
                 .iter()
-                .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
-            self.renderable_surfaces
-                .retain(|surface| !withdrawn_ids.contains(&surface.surface_id));
+                .any(|surface_id| self.surface_is_visible_in_active_scene(*surface_id));
+            self.retain_renderable_surfaces(|surface| !withdrawn_ids.contains(&surface.surface_id));
             if scene_effect {
                 self.rebuild_active_scene_view();
             } else {
@@ -162,11 +157,7 @@ impl CompositorState {
             .toplevel_visual_geometries
             .get(&root_surface_id)
             .copied()
-            .zip(
-                self.renderable_surfaces
-                    .iter()
-                    .find(|surface| surface.surface_id == root_surface_id),
-            )
+            .zip(self.renderable_surface(root_surface_id))
             .is_some_and(|(visual, surface)| {
                 surface.width == visual.width && surface.height == visual.height
             });
@@ -192,11 +183,7 @@ impl CompositorState {
             .toplevel_visual_geometries
             .get(&root_surface_id)
             .copied()
-            .zip(
-                self.renderable_surfaces
-                    .iter()
-                    .find(|surface| surface.surface_id == root_surface_id),
-            )
+            .zip(self.renderable_surface(root_surface_id))
             .is_some_and(|(visual, surface)| {
                 surface.width == visual.width && surface.height == visual.height
             });
@@ -246,25 +233,53 @@ impl CompositorState {
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
         };
+        let (materialized, shm_release, copy_to_release_us) = match current {
+            CurrentSurfaceBuffer::Materialized(materialized) => (materialized, None, 0),
+            CurrentSurfaceBuffer::Unmaterialized(pending) => {
+                let copy_started = std::time::Instant::now();
+                let materialized = match pending
+                    .materialize_for_publication(None, &RenderableSurfaceDamage::Full)
+                {
+                    Ok(materialized) => materialized,
+                    Err(_) => {
+                        self.note_shm_materialization_failure(&pending);
+                        return false;
+                    }
+                };
+                (
+                    materialized.0,
+                    materialized.1,
+                    copy_started.elapsed().as_micros() as u64,
+                )
+            }
+        };
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(surface_id);
-        let Ok(mut surface) = current.to_renderable_surface(
+        let mut surface = materialized.to_renderable_surface(
             surface_id,
             placement,
             generation,
             RenderableSurfaceDamage::Full,
-        ) else {
-            return false;
-        };
+        );
         surface.mark_xwayland();
         let buffer_size = surface.buffer_size();
 
-        self.renderable_surfaces
-            .retain(|existing| existing.surface_id != surface_id);
-        self.renderable_surfaces.push(surface);
+        if self.renderable_surface_index(surface_id).is_some() {
+            self.replace_renderable_surface(surface_id, surface);
+        } else {
+            self.append_renderable_surface(surface);
+        }
         self.clear_pending_xwayland_visual_content_if_matching(surface_id);
-        self.record_surface_damage_commit(
+        self.current_surface_buffers
+            .insert(surface_id, CurrentSurfaceBuffer::Materialized(materialized));
+        if let Some(release) = shm_release {
+            self.release_materialized_shm(release, copy_to_release_us);
+        }
+        self.record_surface_damage_commit_at(
             surface_id,
+            self.current_surface_buffers
+                .get(&surface_id)
+                .map(CurrentSurfaceBuffer::commit_sequence),
             RenderableSurfaceDamage::Full,
             buffer_size.width,
             buffer_size.height,
@@ -282,18 +297,25 @@ impl CompositorState {
     pub(in crate::compositor) fn commit_xwayland_surface_buffer(
         &mut self,
         surface_id: u32,
-        pending: PendingSurfaceBuffer,
+        current: impl Into<CurrentSurfaceBuffer>,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
     ) {
+        let current = current.into();
         if self.xwayland.retired_surface_ids.contains(&surface_id) {
-            pending.release_target().release();
+            if let CurrentSurfaceBuffer::Unmaterialized(pending) = current {
+                self.release_unmaterialized_pending_buffer(pending, false);
+            }
             self.complete_frame_callbacks(frame_callbacks);
             return;
         }
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if self.window_id_for_surface(root_surface_id).is_none() {
-            self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+            if let CurrentSurfaceBuffer::Unmaterialized(pending) = current {
+                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+            } else {
+                self.complete_frame_callbacks(frame_callbacks);
+            }
             return;
         }
         let x11_window_minimized = self
@@ -302,8 +324,31 @@ impl CompositorState {
             .is_some_and(|window| {
                 matches!(window.backend, WindowBackend::X11(_)) && window.state.is_minimized()
             });
-        let commit_sequence = pending.commit_sequence;
-        let buffer_id = pending.data.buffer_id();
+        let (pending, materialized, shm_release, copy_to_release_us) = match current {
+            CurrentSurfaceBuffer::Materialized(materialized) => (None, materialized, None, 0),
+            CurrentSurfaceBuffer::Unmaterialized(pending) => {
+                let copy_started = std::time::Instant::now();
+                let materialized = match pending
+                    .materialize_for_publication(None, &RenderableSurfaceDamage::Full)
+                {
+                    Ok(materialized) => materialized,
+                    Err(_) => {
+                        self.note_shm_materialization_failure(&pending);
+                        self.release_unmaterialized_pending_buffer(pending, false);
+                        self.complete_frame_callbacks(frame_callbacks);
+                        return;
+                    }
+                };
+                (
+                    Some(pending),
+                    materialized.0,
+                    materialized.1,
+                    copy_started.elapsed().as_micros() as u64,
+                )
+            }
+        };
+        let commit_sequence = materialized.commit_sequence;
+        let buffer_id = materialized.buffer_id();
         let association_serial = self
             .xwayland
             .associations
@@ -311,27 +356,24 @@ impl CompositorState {
             .map(|(_, serial)| serial.get());
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(root_surface_id);
-        let Ok(mut surface) = pending.to_renderable_surface(
+        let mut surface = materialized.to_renderable_surface(
             surface_id,
             placement,
             generation,
             RenderableSurfaceDamage::Full,
-        ) else {
-            pending.release_target().release();
-            self.complete_frame_callbacks(frame_callbacks);
-            return;
-        };
+        );
         surface.mark_xwayland();
-        let old_render_placement = self
-            .renderable_surfaces
-            .iter()
-            .find(|existing| existing.surface_id == surface_id)
-            .and_then(|existing| existing.render_placement);
-        let old_visual_clip = self
-            .renderable_surfaces
-            .iter()
-            .find(|existing| existing.surface_id == surface_id)
-            .and_then(|existing| existing.visual_clip.clone());
+        let renderable_index = self.content_renderable_surface_index(surface_id);
+        let existing_surface =
+            renderable_index.and_then(|index| self.renderable_surfaces.get(index));
+        let old_render_placement = existing_surface.and_then(|existing| existing.render_placement);
+        let old_visual_clip = existing_surface.and_then(|existing| existing.visual_clip.clone());
+        let content_replacement_in_place = !x11_window_minimized
+            && existing_surface.is_some_and(|existing| existing.placement == placement);
+        if content_replacement_in_place {
+            surface.render_placement = old_render_placement;
+            surface.visual_clip = old_visual_clip.clone();
+        }
         let visual_geometry = self
             .toplevel_visual_geometries
             .get(&root_surface_id)
@@ -340,6 +382,7 @@ impl CompositorState {
         let content_pending = self
             .pending_xwayland_visual_content
             .contains(&root_surface_id);
+        let reapply_visual_assignment = !content_replacement_in_place || content_pending;
         let xid = self
             .window_id_for_surface(root_surface_id)
             .and_then(|window_id| self.window(window_id))
@@ -370,8 +413,14 @@ impl CompositorState {
                     format!("{fresh_visual_clip_before_reapply:?}"),
                 )
         });
-        self.track_committed_buffer_lifetime(surface_id, &pending);
-        self.current_surface_buffers.insert(surface_id, pending);
+        if let Some(pending) = pending.as_ref() {
+            self.track_committed_buffer_lifetime(surface_id, pending);
+        }
+        self.current_surface_buffers
+            .insert(surface_id, CurrentSurfaceBuffer::Materialized(materialized));
+        if let Some(release) = shm_release {
+            self.release_materialized_shm(release, copy_to_release_us);
+        }
         trace::emit("xwayland_commit_observed", || {
             TraceFields::new()
                 .field("source", "wayland")
@@ -383,10 +432,18 @@ impl CompositorState {
                 .optional("association_serial", association_serial)
                 .field("buffer_ready_level", true)
         });
-        self.renderable_surfaces
-            .retain(|existing| existing.surface_id != surface_id);
-        if !x11_window_minimized {
-            self.renderable_surfaces.push(surface);
+        if content_replacement_in_place {
+            self.replace_renderable_surface(surface_id, surface);
+            let mut metrics = self.locality_metrics.get();
+            metrics.xwayland_content_replacements =
+                metrics.xwayland_content_replacements.saturating_add(1);
+            self.locality_metrics.set(metrics);
+            self.clear_pending_xwayland_visual_content_if_matching(root_surface_id);
+        } else {
+            self.retain_renderable_surfaces(|existing| existing.surface_id != surface_id);
+            if !x11_window_minimized {
+                self.append_renderable_surface(surface);
+            }
             self.clear_pending_xwayland_visual_content_if_matching(root_surface_id);
         }
         self.record_surface_publication(
@@ -397,24 +454,35 @@ impl CompositorState {
             source,
             None,
         );
-        self.record_surface_damage_commit(
+        self.record_surface_damage_commit_at(
             surface_id,
+            Some(commit_sequence),
             RenderableSurfaceDamage::Full,
             buffer_size.width,
             buffer_size.height,
         );
         if !x11_window_minimized {
-            self.reorder_renderable_surfaces_by_committed_stack();
-            self.reapply_root_visual_assignment_after_surface_publication(root_surface_id);
+            if reapply_visual_assignment {
+                if !content_replacement_in_place {
+                    let reordered = self.reorder_renderable_surfaces_by_committed_stack();
+                    if reordered {
+                        let mut metrics = self.locality_metrics.get();
+                        metrics.xwayland_topology_reorders =
+                            metrics.xwayland_topology_reorders.saturating_add(1);
+                        self.locality_metrics.set(metrics);
+                    }
+                }
+                self.reapply_root_visual_assignment_after_surface_publication(root_surface_id);
+                let mut metrics = self.locality_metrics.get();
+                metrics.xwayland_full_visual_reassignments =
+                    metrics.xwayland_full_visual_reassignments.saturating_add(1);
+                self.locality_metrics.set(metrics);
+            }
             let render_placement_after_reapply = self
-                .renderable_surfaces
-                .iter()
-                .find(|existing| existing.surface_id == surface_id)
+                .renderable_surface(surface_id)
                 .and_then(|existing| existing.render_placement);
             let visual_clip_after_reapply = self
-                .renderable_surfaces
-                .iter()
-                .find(|existing| existing.surface_id == surface_id)
+                .renderable_surface(surface_id)
                 .and_then(|existing| existing.visual_clip.clone());
             let content_pending_after_reapply = self
                 .pending_xwayland_visual_content
@@ -507,10 +575,8 @@ mod tests {
         let mut state = CompositorState::default();
         let root_id = 42;
         let child_id = 43;
-        state
-            .renderable_surfaces
-            .push(test_surface(root_id, 10, 10));
-        state.renderable_surfaces.push(test_surface(child_id, 1, 1));
+        state.append_renderable_surface(test_surface(root_id, 10, 10));
+        state.append_renderable_surface(test_surface(child_id, 1, 1));
         assert!(state.set_surface_placement(root_id, SurfacePlacement::absolute_root_at(10, 10),));
         assert!(
             state.set_surface_placement(child_id, SurfacePlacement::subsurface(root_id, 1, 1),)

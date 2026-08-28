@@ -16,7 +16,7 @@ use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
 use crate::native_output::OutputTransactionId;
-use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::output::{CursorFramebufferPin, NativeCursorImageKey};
 use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::presentation::{
     kms_timing::KmsSubmitWindow, plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
@@ -186,6 +186,7 @@ pub(crate) struct RenderedOutputFrame {
 #[derive(Debug)]
 pub(crate) struct FrozenCursorPlaneOwner {
     pub(crate) revision: CursorRevision,
+    pub(crate) client_source_key: Option<NativeCursorImageKey>,
     pub(crate) capability_key: Option<CursorCapabilityKey>,
     pub(crate) pin: Option<CursorFramebufferPin>,
 }
@@ -402,7 +403,6 @@ impl AtomicOutputSwapchain {
         let mut server = oblivion_one::compositor::OwnCompositorServer::bind(socket)
             .expect("test frame ownership server should bind");
         let protocol_batch_id = server.take_frame_batch_for_render(self.next_frame_id);
-        let surface_damage = server.capture_surface_damage_presentation();
         self.finish_render_owned(RenderedOutputFrame {
             id: self.next_frame_id,
             transaction_id: OutputTransactionId::new(
@@ -422,7 +422,7 @@ impl AtomicOutputSwapchain {
             .expect("test output frame has a reachable submit window"),
             render_fence,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
-            surface_damage,
+            surface_damage: SurfaceDamagePresentation::default(),
             protocol_batch_id,
             composite_started_at: now,
             fence_exported_at: now,

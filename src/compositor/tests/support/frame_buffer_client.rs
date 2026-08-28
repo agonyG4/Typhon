@@ -73,6 +73,13 @@ impl TestShmBuffer {
         self._file.flush()?;
         Ok(())
     }
+
+    pub(in crate::compositor::tests) fn truncate_backing(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self._file.set_len(0)?;
+        Ok(())
+    }
 }
 
 impl Drop for TestShmBuffer {
@@ -502,6 +509,8 @@ pub(in crate::compositor::tests) fn create_surface_with_buffer_release(
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
@@ -1000,6 +1009,125 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_shm_buffer(
 pub(in crate::compositor::tests) fn create_client_toplevel_with_shm_damage_only_update(
     socket_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    create_client_toplevel_with_repeated_shm_damage_only_updates(socket_path, 1)
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_reused_shm_buffer(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
+
+    buffer.write_pixels(&[0xffaa_0000, 0xff00_aa00, 0xff00_00aa, 0xffaa_aa00])?;
+    buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_invalid_shm_buffer(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    buffer.truncate_backing()?;
+    buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_unassigned_shm_surface_then_adopt_toplevel(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let parent = compositor.create_surface(&qh, ());
+    let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
+    commit_initial_xdg_handshake(&parent, &connection, &mut queue)?;
+
+    let buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
+    let surface = compositor.create_surface(&qh, ());
+
+    buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 0);
+
+    let _subsurface = subcompositor.get_subsurface(&surface, &parent, &qh, ());
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
+    drop(buffer);
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_unassigned_shm_surface_for_shutdown(
+    socket_path: &PathBuf,
+) -> Result<(Connection, TestShmBuffer), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
+    let surface = compositor.create_surface(&qh, ());
+
+    buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    Ok((connection, buffer))
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_repeated_shm_damage_only_updates(
+    socket_path: &PathBuf,
+    repeats: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -1023,15 +1151,54 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_shm_damage_only_
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
 
-    file.seek(SeekFrom::Start(0))?;
-    for pixel in [0xffaa_0000_u32, 0xff00_aa00, 0xff00_00aa, 0xffaa_aa00] {
-        file.write_all(&pixel.to_ne_bytes())?;
+    for _ in 0..repeats {
+        file.seek(SeekFrom::Start(0))?;
+        for pixel in [0xffaa_0000_u32, 0xff00_aa00, 0xff00_00aa, 0xffaa_aa00] {
+            file.write_all(&pixel.to_ne_bytes())?;
+        }
+        file.flush()?;
+        surface.damage_buffer(0, 0, 2, 2);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
     }
-    file.flush()?;
-    surface.damage_buffer(0, 0, 2, 2);
+    Ok(())
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_repeated_shm_buffer_commits(
+    socket_path: &PathBuf,
+    repeats: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let buffers = [
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+        TestShmBuffer::new(&shm, &qh, 4, 4)?,
+    ];
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    xdg_surface.set_window_geometry(0, 0, 4, 4);
+    buffers[0].attach_with_damage(&surface, 0, 0, 1, 1);
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
+
+    for index in 0..repeats {
+        xdg_surface.set_window_geometry(0, 0, 4, 4);
+        buffers[index % buffers.len()].attach_with_damage(&surface, 0, 0, 1, 1);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut RegistryTestState::default())?;
+    }
     Ok(())
 }
 
@@ -1201,6 +1368,123 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_shm_then_dmabuf_
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
     Ok(())
+}
+
+pub(in crate::compositor::tests) fn create_client_toplevel_with_dmabuf_then_shm_and_remove(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ())?;
+    let mut shm_buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
+    let dmabuf_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff55_6677)?;
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    shm_buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
+
+    surface.attach(Some(&dmabuf_buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
+
+    shm_buffer.write_pixels(&[0xff11_2233, 0xff22_3344, 0xff33_4455, 0xff44_5566])?;
+    shm_buffer.attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::PresentFrame)?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 3);
+
+    surface.attach(None, 0, 0);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 3);
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn exercise_two_buffer_shm_with_pending_and_ready_batches(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, (usize, usize, usize)), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut buffers = [
+        TestShmBuffer::new(&shm, &qh, 2, 2)?,
+        TestShmBuffer::new(&shm, &qh, 2, 2)?,
+    ];
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+
+    buffers[0].attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 1);
+
+    wait_for_server_commands(commands);
+    let (first_reply, first_receiver) = mpsc::channel();
+    commands.send(ServerCommand::CaptureFrameBatch {
+        frame_id: 1,
+        reply: first_reply,
+    })?;
+    let _pending_batch = first_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    buffers[1].write_pixels(&[0xff11_2233, 0xff22_3344, 0xff33_4455, 0xff44_5566])?;
+    buffers[1].attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 2);
+
+    wait_for_server_commands(commands);
+    let (second_reply, second_receiver) = mpsc::channel();
+    commands.send(ServerCommand::CaptureFrameBatch {
+        frame_id: 2,
+        reply: second_reply,
+    })?;
+    let _ready_batch = second_receiver.recv_timeout(Duration::from_secs(1))?;
+    let resource_counts = capture_shm_resource_counts(commands);
+    assert_eq!(resource_counts.2, 2);
+
+    buffers[0].write_pixels(&[0xffaa_0000, 0xff00_aa00, 0xff00_00aa, 0xffaa_aa00])?;
+    buffers[0].attach(&surface, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 3);
+
+    Ok((state, resource_counts))
 }
 
 pub(in crate::compositor::tests) fn create_client_toplevel_with_rotating_shm_buffers(
@@ -1750,6 +2034,7 @@ pub(in crate::compositor::tests) fn capture_multiple_synchronized_child_commits(
     connection.flush()?;
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
+    let initial_buffer_release_count = state.buffer_release_count;
 
     let child_update_a = attach_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
     child.commit();
@@ -1758,7 +2043,9 @@ pub(in crate::compositor::tests) fn capture_multiple_synchronized_child_commits(
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     let before_parent = capture_renderable_surface_snapshot(commands);
-    let superseded_buffer_releases = state.buffer_release_count;
+    let superseded_buffer_releases = state
+        .buffer_release_count
+        .saturating_sub(initial_buffer_release_count);
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;

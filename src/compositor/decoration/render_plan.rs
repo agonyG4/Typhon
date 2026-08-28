@@ -147,23 +147,7 @@ pub(crate) fn build_render_plan(
     output_scale: f64,
 ) -> DecorationRenderPlan {
     let mut primitives = Vec::new();
-    if layout.titlebar.height == 0 {
-        return DecorationRenderPlan {
-            layout: layout.clone(),
-            primitives,
-            theme_generation: theme.generation(),
-        };
-    }
-
     let colors = theme.colors();
-    primitives.push(DecorationRenderPrimitive::SolidRect {
-        rect: layout.titlebar,
-        color: if state.active {
-            colors.active_background
-        } else {
-            colors.inactive_background
-        },
-    });
     primitives.extend(layout.visible_border.iter().copied().map(|rect| {
         DecorationRenderPrimitive::SolidRect {
             rect,
@@ -174,6 +158,26 @@ pub(crate) fn build_render_plan(
             },
         }
     }));
+
+    if layout.titlebar.height == 0 {
+        return DecorationRenderPlan {
+            layout: layout.clone(),
+            primitives,
+            theme_generation: theme.generation(),
+        };
+    }
+
+    primitives.insert(
+        0,
+        DecorationRenderPrimitive::SolidRect {
+            rect: layout.titlebar,
+            color: if state.active {
+                colors.active_background
+            } else {
+                colors.inactive_background
+            },
+        },
+    );
 
     for button in &layout.buttons {
         let selected_state = if state.pressed == Some(button.kind) {

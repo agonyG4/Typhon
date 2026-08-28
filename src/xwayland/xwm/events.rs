@@ -1413,17 +1413,15 @@ mod tests {
             .expect("reserved desktop request is ignored");
         assert!(xwm.take_events().next().is_none());
 
-        for index in [u32::MAX] {
-            let invalid = xproto::ClientMessageEvent::new(
-                32,
-                xwm.root,
-                xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
-                xproto::ClientMessageData::from([index, 0, 0, 0, 0]),
-            );
-            normalize(&mut xwm, Event::ClientMessage(invalid))
-                .expect("invalid desktop request is ignored");
-            assert!(xwm.take_events().next().is_none());
-        }
+        let invalid = xproto::ClientMessageEvent::new(
+            32,
+            xwm.root,
+            xwm.atoms.get(XwmAtomName::NetCurrentDesktop),
+            xproto::ClientMessageData::from([u32::MAX, 0, 0, 0, 0]),
+        );
+        normalize(&mut xwm, Event::ClientMessage(invalid))
+            .expect("invalid desktop request is ignored");
+        assert!(xwm.take_events().next().is_none());
 
         let window_request = xproto::ClientMessageEvent::new(
             32,

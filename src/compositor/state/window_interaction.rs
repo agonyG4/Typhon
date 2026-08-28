@@ -512,6 +512,28 @@ impl CompositorState {
             log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
+        let tiled_resize_data = if self.window(window_id).is_some_and(|window| {
+            window.state.mode() == ToplevelMode::Normal
+                && window
+                    .management
+                    .is_some_and(|management| management.layout() == LayoutMembership::Tiled)
+        }) {
+            match kind {
+                WindowInteractionKind::Move => {
+                    log_begin_rejection(self, begin, "tiled_window_move_forbidden");
+                    return false;
+                }
+                WindowInteractionKind::Resize(edges) => {
+                    let Some(data) = self.prepare_tiled_resize(window_id, edges) else {
+                        log_begin_rejection(self, begin, "tiled_window_resize_not_adjustable");
+                        return false;
+                    };
+                    Some(data)
+                }
+            }
+        } else {
+            None
+        };
         if self
             .window(window_id)
             .is_some_and(|window| !window_interaction_allowed_for_mode(window.state.mode(), kind))
@@ -636,7 +658,22 @@ impl CompositorState {
             start_height,
             drag_committed: false,
             resize_interaction_id,
+            tiled_resize,
         });
+        if let Some((location, handle, solution)) = tiled_resize_data.as_ref() {
+            self.install_tiled_resize_session(
+                id,
+                resize_interaction_id.expect("tiled resize has a resize interaction id"),
+                window_id,
+                *location,
+                match kind {
+                    WindowInteractionKind::Resize(edges) => edges,
+                    WindowInteractionKind::Move => unreachable!("tiled resize cannot be move"),
+                },
+                *handle,
+                solution,
+            );
+        }
         if self.pointer_surface.is_none()
             && let Some(pointer_motion_surface_id) = pointer_motion_surface_id
             && let Some(surface) = self.surface_resource_by_id(pointer_motion_surface_id)
@@ -645,7 +682,10 @@ impl CompositorState {
             self.ensure_pointer_focus(&surface);
             self.send_pointer_enter_if_needed(&target);
         }
-        self.set_interaction_cursor_override(kind);
+        let cursor_kind = tiled_resize_data.as_ref().map_or(kind, |(_, handle, _)| {
+            self.tiled_resize_cursor_kind(*handle, kind)
+        });
+        self.set_interaction_cursor_override(cursor_kind);
         let snapshot = self
             .window_interaction
             .expect("window interaction was just installed")
@@ -755,9 +795,14 @@ impl CompositorState {
             )
         });
         let had_interaction = self.window_interaction.take().is_some();
+        self.clear_tiled_resize_state();
         let had_cursor_override = self.interaction_cursor_override.take().is_some();
         if had_cursor_override {
-            if !matches!(reason, WindowInteractionEndReason::WorkspaceSwitch) {
+            if !matches!(
+                reason,
+                WindowInteractionEndReason::WorkspaceSwitch
+                    | WindowInteractionEndReason::WorkAreaChange
+            ) {
                 self.advance_render_generation(RenderGenerationCause::CursorState);
             }
             self.sync_cursor_visibility_request();
@@ -1072,6 +1117,14 @@ impl CompositorState {
                     );
                 }
                 moved
+            }
+            WindowInteractionKind::Resize(edges) if interaction.tiled_resize => {
+                if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {
+                    return false;
+                }
+                interaction.drag_committed = true;
+                self.window_interaction = Some(interaction);
+                self.update_pending_tiled_resize(interaction, x, y)
             }
             WindowInteractionKind::Resize(_) => {
                 unreachable!("floating resize geometry is applied during frame preparation")

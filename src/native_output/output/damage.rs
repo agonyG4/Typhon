@@ -1015,14 +1015,11 @@ fn native_scene_surface_transition_damage(
             continue;
         };
 
-        // Content identity is deliberately not a footprint authority. A
-        // known non-empty damage journal remains local, but an identity-only
-        // retry with no journal damage is not proof that the old buffer's
-        // pixels are still valid; repaint the current footprint in that case.
+        // Content identity is deliberately not a footprint authority. An
+        // authoritative Empty journal entry means that this same-geometry
+        // surface contributes no logical output damage. Output-buffer repair
+        // is owned by the target buffer's age/history, not by this identity.
         let visual_changed = previous_surface.bounds != current_surface.bounds;
-        let content_identity_changed = previous_surface.content_generation
-            != current_surface.content_generation
-            || previous_surface.commit_sequence != current_surface.commit_sequence;
         if visual_changed {
             push_clipped_scene_rect(
                 &mut accumulator,
@@ -1051,13 +1048,6 @@ fn native_scene_surface_transition_damage(
                     &current_surface.damage,
                 );
             }
-        } else if content_identity_changed && current_surface.damage.is_empty() {
-            push_clipped_scene_rect(
-                &mut accumulator,
-                output_width,
-                output_height,
-                current_surface.bounds,
-            );
         } else {
             push_clipped_scene_damage(
                 &mut accumulator,

@@ -17,8 +17,10 @@ pub(crate) const KEY_0: u16 = 11;
 pub(crate) const KEY_TAB: u16 = 15;
 pub(crate) const KEY_Q: u16 = 16;
 pub(crate) const KEY_P: u16 = 25;
+pub(crate) const KEY_S: u16 = 31;
 pub(crate) const KEY_LEFTCTRL: u16 = 29;
 pub(crate) const KEY_F: u16 = 33;
+pub(crate) const KEY_V: u16 = 47;
 pub(crate) const KEY_LEFTSHIFT: u16 = 42;
 #[cfg(test)]
 pub(crate) const KEY_Z: u16 = 44;
@@ -203,8 +205,11 @@ pub(crate) enum NativeWindowAction {
     EndInteraction,
     CloseActiveWindow,
     ToggleFullscreen,
+    ToggleFocusedWindowLayout,
     SwitchWorkspace(WorkspaceId),
     MoveFocusedWindowToWorkspace(WorkspaceId),
+    ToggleDefaultSpecialWorkspace,
+    MoveFocusedWindowToOrFromSpecialWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -56,8 +56,7 @@ impl CompositorState {
         let old_window_id = self.focused_window_id;
         let new_window_id =
             self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
-        if new_window_id
-            .is_some_and(|window_id| !self.window_is_visible_in_active_workspace(window_id))
+        if new_window_id.is_some_and(|window_id| !self.window_is_visible_in_active_scene(window_id))
         {
             return;
         }

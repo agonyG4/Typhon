@@ -3,6 +3,7 @@
 use super::transaction::{OutputTransaction, OutputTransactionContent, OutputTransactionId};
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::OutputPresentationMode;
+use oblivion_one::compositor::SurfaceDamagePresentation;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::collections::{HashMap, VecDeque};
@@ -812,6 +813,15 @@ impl OutputTransactionLedger {
 
     pub(crate) fn transaction(&self, id: OutputTransactionId) -> Option<&OutputTransactionRecord> {
         self.active.get(&id)
+    }
+
+    pub(crate) fn surface_damage(
+        &self,
+        id: OutputTransactionId,
+    ) -> Option<SurfaceDamagePresentation> {
+        self.active
+            .get(&id)
+            .and_then(|record| record.descriptor.surface_damage().cloned())
     }
 
     pub(crate) fn downgrade_presentation_to_vsync(

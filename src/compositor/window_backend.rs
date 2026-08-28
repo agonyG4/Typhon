@@ -38,6 +38,9 @@ pub(crate) enum WindowBackendCommand {
         window: WindowId,
         workspace: u32,
     },
+    ClearWorkspace {
+        window: WindowId,
+    },
     PublishWorkspaceState {
         workspace_count: u32,
         current_workspace: u32,

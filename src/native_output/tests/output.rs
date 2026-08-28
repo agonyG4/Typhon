@@ -1076,89 +1076,43 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
 }
 
 #[test]
-fn rejected_content_only_retry_repaints_same_geometry() {
-    const WIDTH: u32 = 960;
-    const HEIGHT: u32 = 640;
-    const ROOT_X: i32 = 180;
-    const ROOT_Y: i32 = 100;
-    let mut presented_surface = test_renderable_surface(
-        94,
-        ROOT_X - 72,
-        ROOT_Y - 72,
-        500,
-        300,
-        RenderableSurfaceDamage::Empty,
-    );
-    presented_surface.generation = 60;
-    let mut retry_surface = presented_surface.clone();
-    retry_surface.generation = 61;
-    let presented_scene =
-        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&presented_surface), Vec::new());
-    let retry_scene =
-        NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&retry_surface), Vec::new());
-    let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
-        frame_id: 1,
-        render_generation: 1,
-        scene: presented_scene,
-        cursor_damage: NativeCursorDamageBounds::default(),
-    });
-    history.replace_ready(NativeFrameSceneSnapshot {
-        frame_id: 2,
-        render_generation: 46,
-        scene: retry_scene.clone(),
-        cursor_damage: NativeCursorDamageBounds::default(),
-    });
-    assert!(history.queue_submission(240));
-    assert!(history.discard_submission(240));
-    history.replace_ready(NativeFrameSceneSnapshot {
-        frame_id: 3,
-        render_generation: 46,
-        scene: retry_scene.clone(),
-        cursor_damage: NativeCursorDamageBounds::default(),
-    });
+fn identity_only_generation_change_with_empty_damage_stays_empty() {
+    let previous = test_renderable_surface(94, 180, 100, 500, 300, RenderableSurfaceDamage::Empty);
+    let mut current = previous.clone();
+    current.generation = previous.generation.saturating_add(1);
+    let previous_scene = NativeSceneSnapshot::from_surfaces(&[previous], Vec::new());
+    let current_scene = NativeSceneSnapshot::from_surfaces(&[current], Vec::new());
+
     let damage = native_output_damage_for_scene_snapshots(
-        WIDTH,
-        HEIGHT,
-        history.presented_scene(),
-        &retry_scene,
+        960,
+        640,
+        &previous_scene,
+        &current_scene,
         NativeCursorDamageBounds::default(),
     );
-    let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
-    paint_client_scene(
-        &mut partial,
-        WIDTH,
-        HEIGHT,
-        ROOT_X,
-        ROOT_Y,
-        500,
-        300,
-        0xff4c_7890,
-        None,
+
+    assert!(damage.is_empty());
+}
+
+#[test]
+fn identity_only_commit_sequence_change_with_empty_damage_stays_empty() {
+    let mut previous =
+        test_renderable_surface(95, 180, 100, 500, 300, RenderableSurfaceDamage::Empty);
+    previous.commit_sequence = SurfaceCommitSequence(40);
+    let mut current = previous.clone();
+    current.commit_sequence = SurfaceCommitSequence(41);
+    let previous_scene = NativeSceneSnapshot::from_surfaces(&[previous], Vec::new());
+    let current_scene = NativeSceneSnapshot::from_surfaces(&[current], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous_scene,
+        &current_scene,
+        NativeCursorDamageBounds::default(),
     );
-    paint_client_scene(
-        &mut partial,
-        WIDTH,
-        HEIGHT,
-        ROOT_X,
-        ROOT_Y,
-        500,
-        300,
-        0xffc0_7850,
-        Some(&damage.rects),
-    );
-    let mut reference = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
-    paint_client_scene(
-        &mut reference,
-        WIDTH,
-        HEIGHT,
-        ROOT_X,
-        ROOT_Y,
-        500,
-        300,
-        0xffc0_7850,
-        None,
-    );
-    assert_eq!(partial, reference);
+
+    assert!(damage.is_empty());
 }
 
 #[test]

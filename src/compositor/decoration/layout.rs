@@ -2,8 +2,10 @@
 mod tests {
     use super::super::types::{
         DecorationButtonKind, DecorationHit, DecorationMetrics, DecorationMode,
+        DecorationResizeEdge,
     };
     use super::DecorationLayout;
+    use crate::wm::WindowChromePolicy;
 
     #[test]
     fn mac_tahoe_layout_keeps_buttons_on_right_in_product_order() {
@@ -138,6 +140,29 @@ mod tests {
     }
 
     #[test]
+    fn minimal_server_chrome_has_no_titlebar_or_rendered_resize_target() {
+        let layout = DecorationLayout::for_window_with_chrome_policy(
+            640,
+            480,
+            DecorationMode::ServerSide,
+            false,
+            false,
+            WindowChromePolicy::Minimal,
+            DecorationMetrics::mac_tahoe(),
+        )
+        .expect("minimal layout");
+
+        assert_eq!(layout.titlebar.height, 0);
+        assert!(layout.buttons.is_empty());
+        assert_eq!(layout.extents.top, 0);
+        assert_eq!(layout.hit_test(2.0, 2.0), None);
+        assert_eq!(
+            layout.logical_resize_edge_at(2.0, 2.0),
+            Some(DecorationResizeEdge::TopLeft)
+        );
+    }
+
+    #[test]
     fn button_input_wins_over_overlapping_top_resize_region() {
         let layout = DecorationLayout::for_window(
             640,
@@ -184,6 +209,7 @@ pub(crate) struct DecorationLayout {
 }
 
 impl DecorationLayout {
+    #[cfg(test)]
     pub(crate) fn for_window(
         client_width: u32,
         client_height: u32,
@@ -192,12 +218,33 @@ impl DecorationLayout {
         fullscreen: bool,
         metrics: DecorationMetrics,
     ) -> Option<Self> {
+        Self::for_window_with_chrome_policy(
+            client_width,
+            client_height,
+            mode,
+            maximized,
+            fullscreen,
+            crate::wm::WindowChromePolicy::Full,
+            metrics,
+        )
+    }
+
+    pub(crate) fn for_window_with_chrome_policy(
+        client_width: u32,
+        client_height: u32,
+        mode: DecorationMode,
+        maximized: bool,
+        fullscreen: bool,
+        chrome_policy: crate::wm::WindowChromePolicy,
+        metrics: DecorationMetrics,
+    ) -> Option<Self> {
         if !metrics.validate() || client_width == 0 || client_height == 0 {
             return None;
         }
 
-        let visible = mode == DecorationMode::ServerSide && !fullscreen;
-        let border = if visible && !maximized {
+        let server_side = mode == DecorationMode::ServerSide && !fullscreen;
+        let visible = server_side && chrome_policy == crate::wm::WindowChromePolicy::Full;
+        let border = if server_side && !maximized {
             metrics.border_width
         } else {
             0
@@ -341,6 +388,29 @@ impl DecorationLayout {
         self.titlebar
             .contains(x, y)
             .then_some(DecorationHit::Titlebar)
+    }
+
+    pub(crate) fn logical_resize_edge_at(&self, x: f64, y: f64) -> Option<DecorationResizeEdge> {
+        const LOGICAL_EDGE_WIDTH: f64 = 6.0;
+
+        if !self.outer.contains(x, y) {
+            return None;
+        }
+        let left = x < f64::from(self.outer.x) + LOGICAL_EDGE_WIDTH;
+        let right = x >= f64::from(self.outer.right()) - LOGICAL_EDGE_WIDTH;
+        let top = y < f64::from(self.outer.y) + LOGICAL_EDGE_WIDTH;
+        let bottom = y >= f64::from(self.outer.bottom()) - LOGICAL_EDGE_WIDTH;
+        Some(match (top, right, bottom, left) {
+            (true, true, false, false) => DecorationResizeEdge::TopRight,
+            (false, true, true, false) => DecorationResizeEdge::BottomRight,
+            (false, false, true, true) => DecorationResizeEdge::BottomLeft,
+            (true, false, false, true) => DecorationResizeEdge::TopLeft,
+            (true, _, _, _) => DecorationResizeEdge::Top,
+            (_, true, _, _) => DecorationResizeEdge::Right,
+            (_, _, true, _) => DecorationResizeEdge::Bottom,
+            (_, _, _, true) => DecorationResizeEdge::Left,
+            _ => return None,
+        })
     }
 
     fn resize_edge_at(&self, x: f64, y: f64) -> Option<DecorationResizeEdge> {

@@ -1,6 +1,12 @@
+pub mod layout;
+
+mod special_workspace;
 mod window;
 mod workspace;
 
 pub use crate::core::WindowId;
-pub use window::{LayoutMembership, WindowManagementState};
-pub use workspace::{WorkspaceId, WorkspaceManager, WorkspaceSwitchOutcome};
+pub use special_workspace::{SpecialWorkspaceId, WorkspaceLocation};
+pub use window::{LayoutMembership, WindowChromePolicy, WindowManagementState};
+pub use workspace::{
+    SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceManager, WorkspaceSwitchOutcome,
+};

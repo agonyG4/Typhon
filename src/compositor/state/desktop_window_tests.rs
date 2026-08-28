@@ -1,5 +1,7 @@
 use super::*;
-use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceSwitchOutcome};
+use crate::wm::{
+    LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation, WorkspaceSwitchOutcome,
+};
 use crate::xwayland::xwm::{
     X11Geometry, X11MetadataDelta, X11PublishedState, X11StackMode, X11WindowSnapshot,
     X11WindowType, X11WindowTypes,
@@ -69,7 +71,7 @@ fn xdg_toplevel_creation_builds_one_role_and_one_desktop_window() {
     assert_eq!(
         state.window(id).expect("window").management,
         Some(crate::wm::WindowManagementState::new(
-            crate::wm::WorkspaceId::new(1).unwrap()
+            crate::wm::WorkspaceLocation::Regular(crate::wm::WorkspaceId::new(1).unwrap()),
         ))
     );
     assert_eq!(
@@ -94,8 +96,59 @@ fn managed_x11_toplevel_joins_the_active_workspace_as_floating() {
         .expect("window")
         .management
         .expect("managed X11 window has management state");
-    assert_eq!(management.workspace().get(), 1);
+    assert_eq!(management.regular_workspace().unwrap().get(), 1);
     assert_eq!(management.layout(), LayoutMembership::Floating);
+}
+
+#[test]
+fn restoring_a_tiled_x11_window_uses_the_layout_plan_instead_of_floating_geometry() {
+    let mut state = CompositorState::new(None);
+    let snapshot = x11_snapshot(
+        XwaylandGeneration::new(NonZeroU64::new(9).expect("generation")),
+        253,
+        253,
+    );
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))
+        .expect("window");
+    state.focused_window_id = Some(id);
+    let floating = WindowGeometry::new(SurfacePlacement::absolute_root_at(37, 49), 640, 480);
+    state.install_x11_visual_geometry(253, floating);
+
+    assert!(state.toggle_focused_window_layout());
+    let location = state
+        .window(id)
+        .expect("window")
+        .management
+        .expect("management")
+        .location();
+    let expected = state
+        .tiled_layout
+        .calculate(
+            location,
+            state.layout_root_rect(),
+            &[crate::wm::layout::LayoutWindowSnapshot::new(id)],
+        )
+        .expect("layout plan")
+        .target_for_window(id)
+        .expect("tiled target");
+    let expected = WindowGeometry::new(
+        SurfacePlacement::absolute_root_at(expected.tile().x(), expected.tile().y()),
+        expected.tile().width(),
+        expected.tile().height(),
+    );
+
+    assert!(state.set_root_window_mode(253, ToplevelMode::Fullscreen));
+    assert!(state.restore_normal_root_window(253));
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Normal
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(253),
+        Some(expected)
+    );
 }
 
 #[test]
@@ -110,11 +163,12 @@ fn workspace_visibility_keeps_inactive_window_mapped_and_unminimized() {
         .insert_desktop_window(DesktopWindow::new_xdg(second, 402))
         .expect("second window");
     let workspace_two = WorkspaceId::new(2).expect("workspace two");
-    state.window_mut(second).expect("second window").management =
-        Some(WindowManagementState::new(workspace_two));
+    state.window_mut(second).expect("second window").management = Some(WindowManagementState::new(
+        WorkspaceLocation::Regular(workspace_two),
+    ));
 
-    assert!(state.window_is_visible_in_active_workspace(first));
-    assert!(!state.window_is_visible_in_active_workspace(second));
+    assert!(state.window_is_visible_in_active_scene(first));
+    assert!(!state.window_is_visible_in_active_scene(second));
     assert!(
         !state
             .window(second)
@@ -134,8 +188,8 @@ fn workspace_visibility_keeps_inactive_window_mapped_and_unminimized() {
             current: workspace_two,
         }
     );
-    assert!(!state.window_is_visible_in_active_workspace(first));
-    assert!(state.window_is_visible_in_active_workspace(second));
+    assert!(!state.window_is_visible_in_active_scene(first));
+    assert!(state.window_is_visible_in_active_scene(second));
 }
 
 #[test]
@@ -176,11 +230,11 @@ fn moving_window_family_preserves_layout_and_keeps_active_workspace() {
         .insert_desktop_window(child_window)
         .expect("child window");
     state.window_mut(parent).unwrap().management = Some(
-        WindowManagementState::new(WorkspaceId::new(1).unwrap())
+        WindowManagementState::new(WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap()))
             .with_layout(LayoutMembership::Tiled),
     );
     state.window_mut(child).unwrap().management = Some(
-        WindowManagementState::new(WorkspaceId::new(1).unwrap())
+        WindowManagementState::new(WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap()))
             .with_layout(LayoutMembership::Floating),
     );
 
@@ -198,12 +252,17 @@ fn moving_window_family_preserves_layout_and_keeps_active_workspace() {
             .unwrap()
             .management
             .unwrap()
-            .workspace(),
-        workspace_two
+            .regular_workspace(),
+        Some(workspace_two)
     );
     assert_eq!(
-        state.window(child).unwrap().management.unwrap().workspace(),
-        workspace_two
+        state
+            .window(child)
+            .unwrap()
+            .management
+            .unwrap()
+            .regular_workspace(),
+        Some(workspace_two)
     );
     assert_eq!(
         state.window(parent).unwrap().management.unwrap().layout(),
@@ -212,6 +271,42 @@ fn moving_window_family_preserves_layout_and_keeps_active_workspace() {
     assert_eq!(
         state.window(child).unwrap().management.unwrap().layout(),
         LayoutMembership::Floating
+    );
+}
+
+#[test]
+fn moving_a_tiled_window_migrates_its_tree_to_the_destination_location() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 413))
+        .expect("window");
+    state.focused_window_id = Some(id);
+    assert!(state.toggle_focused_window_layout());
+
+    let source = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("source workspace"));
+    let destination = WorkspaceId::new(2).expect("destination workspace");
+    assert!(state.move_window_family_to_workspace(id, destination));
+    assert!(
+        !state
+            .tiled_layout
+            .tree(source)
+            .is_some_and(|tree| tree.contains_window(id))
+    );
+    assert!(
+        state
+            .tiled_layout
+            .tree(WorkspaceLocation::Regular(destination))
+            .is_some_and(|tree| tree.contains_window(id))
+    );
+    assert_eq!(
+        state
+            .window(id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Tiled
     );
 }
 
@@ -229,13 +324,18 @@ fn removing_parent_preserves_child_workspace_membership() {
         .insert_desktop_window(child_window)
         .expect("child window");
     let workspace_two = WorkspaceId::new(2).unwrap();
-    state.window_mut(child).unwrap().management =
-        Some(WindowManagementState::new(workspace_two).with_layout(LayoutMembership::Tiled));
+    state.window_mut(child).unwrap().management = Some(
+        WindowManagementState::new(WorkspaceLocation::Regular(workspace_two))
+            .with_layout(LayoutMembership::Tiled),
+    );
 
     state.remove_desktop_window(parent).expect("removed parent");
     let child_window = state.window(child).expect("child remains");
     assert_eq!(child_window.relationships.parent, None);
-    assert_eq!(child_window.management.unwrap().workspace(), workspace_two);
+    assert_eq!(
+        child_window.management.unwrap().regular_workspace(),
+        Some(workspace_two)
+    );
     assert_eq!(
         child_window.management.unwrap().layout(),
         LayoutMembership::Tiled
@@ -251,6 +351,292 @@ fn auxiliary_x11_window_has_no_independent_workspace_membership() {
     let id = insert_x11(&mut state, snapshot);
 
     assert_eq!(state.window(id).expect("window").management, None);
+}
+
+#[test]
+fn auxiliary_x11_scene_band_inherits_canonical_special_or_regular_owner() {
+    let mut state = CompositorState::new(None);
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 204))
+        .expect("special window");
+    state
+        .window_mut(special)
+        .expect("special window")
+        .management = Some(
+        WindowManagementState::new(WorkspaceLocation::Special(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
+        .with_layout(LayoutMembership::Tiled),
+    );
+    let special_aux = insert_x11(
+        &mut state,
+        x11_snapshot(
+            XwaylandGeneration::new(NonZeroU64::new(3).unwrap()),
+            205,
+            206,
+        ),
+    );
+    state
+        .window_mut(special_aux)
+        .expect("special auxiliary")
+        .relationships
+        .parent = Some(special);
+
+    let regular = state.allocate_window_id().expect("regular window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 207))
+        .expect("regular window");
+    let regular_aux = insert_x11(
+        &mut state,
+        x11_snapshot(
+            XwaylandGeneration::new(NonZeroU64::new(4).unwrap()),
+            208,
+            209,
+        ),
+    );
+    state
+        .window_mut(regular_aux)
+        .expect("regular auxiliary")
+        .relationships
+        .parent = Some(regular);
+
+    assert_eq!(
+        state.scene_work_owner_for_window(special_aux),
+        SceneWorkOwner::Location(WorkspaceLocation::Special(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
+    );
+    assert_eq!(
+        state
+            .renderable_root_stack_key(
+                state
+                    .window(special_aux)
+                    .expect("special auxiliary")
+                    .root_surface_id,
+                0,
+            )
+            .0,
+        4
+    );
+    assert_eq!(
+        state
+            .renderable_root_stack_key(
+                state
+                    .window(regular_aux)
+                    .expect("regular auxiliary")
+                    .root_surface_id,
+                0,
+            )
+            .0,
+        3
+    );
+}
+
+#[test]
+fn scene_work_index_migrates_auxiliary_owner_when_canonical_parent_changes() {
+    let mut state = CompositorState::new(None);
+    let regular = state.allocate_window_id().expect("regular window id");
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 214))
+        .expect("regular window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 215))
+        .expect("special window");
+    state
+        .window_mut(special)
+        .expect("special window")
+        .management = Some(WindowManagementState::new(WorkspaceLocation::Special(
+        crate::wm::SpecialWorkspaceId::DEFAULT,
+    )));
+    let mut auxiliary_snapshot = x11_snapshot(
+        XwaylandGeneration::new(NonZeroU64::new(5).unwrap()),
+        216,
+        217,
+    );
+    auxiliary_snapshot.kind = DesktopWindowKind::OverrideRedirect;
+    let auxiliary = insert_x11(&mut state, auxiliary_snapshot);
+    state
+        .window_mut(auxiliary)
+        .expect("auxiliary window")
+        .relationships
+        .parent = Some(regular);
+    state.active_fifo_barriers.insert(
+        217,
+        ActiveFifoBarrier {
+            surface_generation: 1,
+            fifo_barrier_generation: FifoBarrierGeneration::new(1),
+            commit_sequence: SurfaceCommitSequence::initial(),
+            fallback_deadline_ns: u64::MAX,
+        },
+    );
+
+    state.reconcile_workspace_inheritance();
+    assert_eq!(
+        state.scene_work_prepare_count(WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap(),)),
+        1
+    );
+    assert_eq!(
+        state.scene_work_prepare_count(WorkspaceLocation::Special(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        )),
+        0
+    );
+    assert_eq!(state.window(auxiliary).unwrap().management, None);
+
+    state
+        .window_mut(auxiliary)
+        .expect("auxiliary window")
+        .relationships
+        .parent = Some(special);
+    state.reconcile_workspace_inheritance();
+
+    assert_eq!(
+        state.scene_work_prepare_count(WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap(),)),
+        0
+    );
+    assert_eq!(
+        state.scene_work_prepare_count(WorkspaceLocation::Special(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        )),
+        1
+    );
+    assert_eq!(state.window(auxiliary).unwrap().management, None);
+}
+
+#[test]
+fn default_special_toggle_preserves_regular_selection_and_updates_scene() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 431))
+        .expect("window");
+    state.window_mut(id).expect("window").management = Some(WindowManagementState::new(
+        WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+    ));
+    let regular = state.active_workspace();
+    let backend_commands_before = state.backend_commands.len();
+    assert_eq!(
+        state.toggle_default_special_workspace(),
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened {
+            id: crate::wm::SpecialWorkspaceId::DEFAULT,
+        }
+    );
+    assert_eq!(state.active_workspace(), regular);
+    assert!(state.active_scene_surfaces().is_empty());
+    assert_eq!(state.backend_commands.len(), backend_commands_before);
+    assert_eq!(
+        state.toggle_default_special_workspace(),
+        crate::wm::SpecialWorkspaceToggleOutcome::Closed {
+            id: crate::wm::SpecialWorkspaceId::DEFAULT,
+        }
+    );
+    assert!(state.active_scene_surfaces().is_empty());
+    assert_eq!(state.backend_commands.len(), backend_commands_before);
+}
+
+#[test]
+fn focused_family_moves_between_special_and_current_regular_without_geometry_change() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 432))
+        .expect("window");
+    assert!(state.window(id).unwrap().is_workspace_managed());
+    assert!(state.window(id).unwrap().management.is_some());
+    state.focused_window_id = Some(id);
+    assert_eq!(state.focused_window_id, Some(id));
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap())
+    );
+    let before_commands = state.backend_commands.len();
+
+    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT)
+    );
+    assert_eq!(
+        state.workspace_manager.visible_special_workspace(),
+        None,
+        "moving to Special is silent while the overlay is hidden"
+    );
+    assert_eq!(state.backend_commands.len(), before_commands);
+
+    state
+        .workspace_manager
+        .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+    state.focused_window_id = Some(id);
+    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap())
+    );
+}
+
+#[test]
+fn moving_x11_family_to_special_queues_typed_clear_workspace() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(2).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 240, 241));
+    state.focused_window_id = Some(id);
+
+    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(matches!(
+        state.backend_commands.last(),
+        Some(crate::compositor::window_backend::WindowBackendCommand::ClearWorkspace {
+            window
+        }) if *window == id
+    ));
+}
+
+#[test]
+fn special_overlay_focus_wins_over_regular_application_focus() {
+    let mut state = CompositorState::new(None);
+    let regular = state.allocate_window_id().expect("regular window id");
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 451))
+        .expect("regular window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 452))
+        .expect("special window");
+    state.window_mut(special).unwrap().management = Some(WindowManagementState::new(
+        WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+    ));
+    state.window_mut(regular).unwrap().last_focus_serial = 100;
+    state.window_mut(special).unwrap().last_focus_serial = 1;
+    state
+        .workspace_manager
+        .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+
+    assert_eq!(state.topmost_renderable_toplevel_window_id(), Some(special));
+}
+
+#[test]
+fn closing_special_restores_the_best_visible_regular_focus_candidate() {
+    let mut state = CompositorState::new(None);
+    let regular = state.allocate_window_id().expect("regular window id");
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 461))
+        .expect("regular window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 462))
+        .expect("special window");
+    state.window_mut(special).unwrap().management = Some(WindowManagementState::new(
+        WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+    ));
+    state.focused_window_id = Some(special);
+    state
+        .workspace_manager
+        .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+
+    let _ = state.toggle_default_special_workspace();
+
+    assert_eq!(state.topmost_renderable_toplevel_window_id(), Some(regular));
 }
 
 #[test]

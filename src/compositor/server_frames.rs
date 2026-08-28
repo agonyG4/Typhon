@@ -331,6 +331,20 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn settle_no_visual_change_work(
+        &mut self,
+        surface_damage: Option<SurfaceDamagePresentation>,
+        owns_frame_batch: bool,
+    ) -> bool {
+        let completed = self
+            .state
+            .settle_no_visual_change_work(surface_damage, owns_frame_batch);
+        if completed {
+            let _ = self.display.flush_clients();
+        }
+        completed
+    }
+
     #[doc(hidden)]
     pub fn complete_rendered_frame_callbacks_for_prepared(&mut self) {
         let batch_id = self

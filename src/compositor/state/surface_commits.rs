@@ -27,7 +27,10 @@ impl CompositorState {
         let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
         {
             Ok(placement) => placement,
-            Err(_) => return,
+            Err(_) => {
+                self.release_unmaterialized_pending_buffer(pending, false);
+                return;
+            }
         };
         let mut placement = resize_placement.unwrap_or_else(|| self.surface_placement(surface_id));
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
@@ -60,43 +63,43 @@ impl CompositorState {
         self.store_surface_placement(surface_id, placement);
         let buffer_width = match pending.data.width() {
             Ok(width) => width,
-            Err(_) => return,
+            Err(_) => {
+                self.release_unmaterialized_pending_buffer(pending, false);
+                return;
+            }
         };
         let buffer_height = match pending.data.height() {
             Ok(height) => height,
-            Err(_) => return,
+            Err(_) => {
+                self.release_unmaterialized_pending_buffer(pending, false);
+                return;
+            }
         };
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
+            self.release_unmaterialized_pending_buffer(pending, false);
             return;
         };
         let surface_size = pending.surface_size.unwrap_or(buffer_size);
         let width = surface_size.width;
         let height = surface_size.height;
-        let surface_was_renderable = self
-            .renderable_surfaces
-            .iter()
-            .any(|surface| surface.surface_id == surface_id);
-        let buffer_identity_changed = self
-            .renderable_surfaces
-            .iter()
-            .find(|surface| surface.surface_id == surface_id)
-            .is_some_and(|surface| surface.buffer_id() != pending.data.buffer_id());
-        let visual_mapping_changed = self
-            .renderable_surfaces
-            .iter()
-            .find(|surface| surface.surface_id == surface_id)
-            .is_none_or(|surface| {
-                surface.buffer_size() != buffer_size
-                    || surface.x != pending.x
-                    || surface.y != pending.y
-                    || surface.width != width
-                    || surface.height != height
-                    || surface.placement != placement
-                    || surface.buffer_scale != pending.buffer_scale
-                    || surface.buffer_transform != pending.buffer_transform
-                    || surface.viewport_source != pending.viewport_source
-                    || surface.viewport_destination != pending.viewport_destination
-            });
+        let renderable_index = self.content_renderable_surface_index(surface_id);
+        let existing_surface =
+            renderable_index.and_then(|index| self.renderable_surfaces.get(index));
+        let surface_was_renderable = existing_surface.is_some();
+        let buffer_identity_changed =
+            existing_surface.is_some_and(|surface| surface.buffer_id() != pending.data.buffer_id());
+        let visual_mapping_changed = existing_surface.is_none_or(|surface| {
+            surface.buffer_size() != buffer_size
+                || surface.x != pending.x
+                || surface.y != pending.y
+                || surface.width != width
+                || surface.height != height
+                || surface.placement != placement
+                || surface.buffer_scale != pending.buffer_scale
+                || surface.buffer_transform != pending.buffer_transform
+                || surface.viewport_source != pending.viewport_source
+                || surface.viewport_destination != pending.viewport_destination
+        });
         if buffer_identity_changed {
             self.compliance_metrics
                 .note_surface_commit_buffer_rotation();
@@ -123,7 +126,7 @@ impl CompositorState {
             );
         }
         if self.popup_surfaces.contains_key(&surface_id) && !self.popup_node_is_alive(surface_id) {
-            pending.release_target().release();
+            self.release_unmaterialized_pending_buffer(pending, false);
             self.record_surface_publication(
                 surface_id,
                 root_surface_id,
@@ -136,11 +139,26 @@ impl CompositorState {
         }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
+            let previous_content = self
+                .toplevel_window_state(root_surface_id)
+                .and_then(|window| window.minimized_surface(surface_id))
+                .map(|surface| surface.buffer.clone());
+            let copy_started = std::time::Instant::now();
+            let (materialized, shm_release) =
+                match pending.materialize_for_publication(previous_content.as_ref(), &damage) {
+                    Ok(materialized) => materialized,
+                    Err(_) => {
+                        self.note_shm_materialization_failure(&pending);
+                        self.release_unmaterialized_pending_buffer(pending, false);
+                        return;
+                    }
+                };
+            let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
             if self
                 .commit_minimized_surface_buffer(
                     root_surface_id,
                     surface_id,
-                    &pending,
+                    &materialized,
                     buffer_size,
                     width,
                     height,
@@ -150,20 +168,30 @@ impl CompositorState {
                 )
                 .is_err()
             {
+                if let Some(release) = shm_release {
+                    self.release_materialized_shm(release, copy_to_release_us);
+                }
                 return;
             }
             self.track_committed_buffer_lifetime(surface_id, &pending);
-            self.current_surface_buffers.insert(surface_id, pending);
+            self.replace_current_surface_buffer(
+                surface_id,
+                CurrentSurfaceBuffer::Materialized(materialized),
+            );
+            if let Some(release) = shm_release {
+                self.release_materialized_shm(release, copy_to_release_us);
+            }
             self.record_surface_publication(
                 surface_id,
                 root_surface_id,
                 commit_sequence,
-                Some(self.current_surface_buffers[&surface_id].data.buffer_id()),
+                Some(self.current_surface_buffers[&surface_id].buffer_id()),
                 source,
                 Some(BufferSize { width, height }),
             );
-            self.record_surface_damage_commit(
+            self.record_surface_damage_commit_at(
                 surface_id,
+                Some(commit_sequence),
                 damage,
                 buffer_size.width,
                 buffer_size.height,
@@ -200,37 +228,61 @@ impl CompositorState {
                 .note_surface_commit_mapping_full_promotion();
             RenderableSurfaceDamage::Full
         };
-        if let Some(existing) = self
-            .renderable_surfaces
-            .iter_mut()
-            .find(|surface| surface.surface_id == surface_id)
+        let previous_content = existing_surface.map(|surface| surface.buffer.clone());
+        let copy_started = std::time::Instant::now();
+        let (materialized, shm_release) = match pending
+            .materialize_for_publication(previous_content.as_ref(), &committed_damage)
         {
-            if update_renderable_surface_buffer(
-                existing,
-                &pending,
-                buffer_size,
-                width,
-                height,
-                placement,
-                generation,
-                resize_commit,
-                committed_damage,
-            )
-            .is_err()
-            {
+            Ok(materialized) => materialized,
+            Err(_) => {
+                self.note_shm_materialization_failure(&pending);
+                self.release_unmaterialized_pending_buffer(pending, false);
                 return;
             }
-            let visual_placement = existing.placement;
+        };
+        let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
+        let updated_surface_index = if let Some(index) = renderable_index {
+            let visual_placement = {
+                let Some(existing) = self.renderable_surfaces.get_mut(index) else {
+                    return;
+                };
+                if update_renderable_surface_buffer(
+                    existing,
+                    &materialized,
+                    buffer_size,
+                    width,
+                    height,
+                    placement,
+                    generation,
+                    resize_commit,
+                    committed_damage,
+                )
+                .is_err()
+                {
+                    if let Some(release) = shm_release {
+                        self.release_materialized_shm(release, copy_to_release_us);
+                    }
+                    return;
+                }
+                existing.placement
+            };
             self.store_surface_placement(surface_id, visual_placement);
+            index
         } else {
             let damage = RenderableSurfaceDamage::Full;
             let surface =
-                match pending.to_renderable_surface(surface_id, placement, generation, damage) {
-                    Ok(surface) => surface,
-                    Err(_) => return,
-                };
-            self.renderable_surfaces.push(surface);
-        }
+                materialized.to_renderable_surface(surface_id, placement, generation, damage);
+            self.append_renderable_surface(surface);
+            self.renderable_surfaces.len().saturating_sub(1)
+        };
+        let journal_damage = self
+            .renderable_surfaces
+            .get(updated_surface_index)
+            .map(|surface| surface.damage.clone());
+        let journal_size = self
+            .renderable_surfaces
+            .get(updated_surface_index)
+            .map(RenderableSurface::buffer_size);
         let placement_changed = previous_placement != placement;
         let visual_state_changed = visual_mapping_changed || window_geometry_changed;
         if visual_state_changed
@@ -279,16 +331,22 @@ impl CompositorState {
             }
         }
         self.track_committed_buffer_lifetime(surface_id, &pending);
-        let published_buffer_id = pending.data.buffer_id();
-        self.current_surface_buffers.insert(surface_id, pending);
-        if let Some(surface) = self
-            .renderable_surfaces
-            .iter()
-            .find(|surface| surface.surface_id == surface_id)
-        {
-            let damage = surface.damage.clone();
-            let size = surface.buffer_size();
-            self.record_surface_damage_commit(surface_id, damage, size.width, size.height);
+        let published_buffer_id = materialized.buffer_id();
+        self.replace_current_surface_buffer(
+            surface_id,
+            CurrentSurfaceBuffer::Materialized(materialized),
+        );
+        if let Some(release) = shm_release {
+            self.release_materialized_shm(release, copy_to_release_us);
+        }
+        if let Some((damage, size)) = journal_damage.zip(journal_size) {
+            self.record_surface_damage_commit_at(
+                surface_id,
+                Some(commit_sequence),
+                damage,
+                size.width,
+                size.height,
+            );
         }
         self.publish_surface_generation(
             surface_id,
@@ -329,7 +387,7 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
         surface_id: u32,
-        pending: &PendingSurfaceBuffer,
+        materialized: &MaterializedSurfaceBuffer,
         buffer_size: BufferSize,
         width: u32,
         height: u32,
@@ -337,10 +395,7 @@ impl CompositorState {
         generation: u64,
         damage: RenderableSurfaceDamage,
     ) -> io::Result<()> {
-        let renderable_count = self.renderable_surfaces.len();
-        self.renderable_surfaces
-            .retain(|surface| surface.surface_id != surface_id);
-        if self.renderable_surfaces.len() != renderable_count {
+        if self.remove_renderable_surface(surface_id).is_some() {
             self.invalidate_surface_origin_cache();
         }
         if self.toplevel_window_state(root_surface_id).is_none() {
@@ -352,7 +407,7 @@ impl CompositorState {
         {
             update_renderable_surface_buffer(
                 existing,
-                pending,
+                materialized,
                 buffer_size,
                 width,
                 height,
@@ -363,7 +418,7 @@ impl CompositorState {
             )?;
         } else {
             let surface =
-                pending.to_renderable_surface(surface_id, placement, generation, damage)?;
+                materialized.to_renderable_surface(surface_id, placement, generation, damage);
             if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
                 window.push_minimized_surface(surface);
             }
@@ -385,10 +440,10 @@ impl CompositorState {
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
         };
-        let Ok(buffer_width) = current.data.width() else {
+        let Ok(buffer_width) = current.width() else {
             return false;
         };
-        let Ok(buffer_height) = current.data.height() else {
+        let Ok(buffer_height) = current.height() else {
             return false;
         };
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
@@ -408,8 +463,8 @@ impl CompositorState {
                     format!("{:?}", self.surface_client_ids.get(&surface_id)),
                 ),
                 ("commit_sequence", commit_sequence.0.to_string()),
-                ("buffer", format!("{:?}", current.resource.id())),
-                ("buffer_id", current.data.buffer_id().get().to_string()),
+                ("buffer", format!("{:?}", current.resource().id())),
+                ("buffer_id", current.buffer_id().get().to_string()),
                 ("damage", (!damage.is_empty()).to_string()),
                 ("render_generation", generation.to_string()),
                 ("source", "damage_only".to_string()),
@@ -418,11 +473,10 @@ impl CompositorState {
         let window_geometry_changed =
             self.apply_committed_window_geometry(surface_id, window_geometry);
         let placement = self.surface_placement(surface_id);
-        let Some(existing) = self
-            .renderable_surfaces
-            .iter_mut()
-            .find(|surface| surface.surface_id == surface_id)
-        else {
+        let Some(renderable_index) = self.content_renderable_surface_index(surface_id) else {
+            return false;
+        };
+        let Some(existing) = self.renderable_surfaces.get_mut(renderable_index) else {
             return false;
         };
 
@@ -431,24 +485,13 @@ impl CompositorState {
         } else {
             RenderableSurfaceDamage::Full
         };
-        if current.data.is_shm()
-            && existing.buffer_size() == buffer_size
-            && let Some(pixels) = existing.shm_pixels_mut()
-            && current
-                .data
-                .read_pixels_into_with_damage(pixels, &damage)
-                .is_err()
-        {
-            return false;
-        }
-
         let requested_surface_size = match current.surface_size_for_state(
             SurfaceViewportCommit {
-                source: current.viewport_source,
+                source: current.viewport_source(),
                 destination: surface_size,
             },
             buffer_scale,
-            current.buffer_transform,
+            current.buffer_transform(),
         ) {
             Ok(surface_size) => surface_size,
             Err(_) => buffer_size,
@@ -465,15 +508,15 @@ impl CompositorState {
             requested_surface_size,
             resize_pending,
         );
-        let visual_mapping_changed = existing.x != current.x
-            || existing.y != current.y
+        let visual_mapping_changed = existing.x != current.x()
+            || existing.y != current.y()
             || existing.width != surface_size.width
             || existing.height != surface_size.height
             || existing.placement != placement
             || existing.buffer_scale != buffer_scale
-            || existing.buffer_transform != current.buffer_transform
-            || existing.viewport_source != current.viewport_source
-            || existing.viewport_destination != current.viewport_destination;
+            || existing.buffer_transform != current.buffer_transform()
+            || existing.viewport_source != current.viewport_source()
+            || existing.viewport_destination != current.viewport_destination();
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: damage-only commit surface {surface_id} buffer={}x{} requested_surface={}x{} applied_surface={}x{} shm={} dmabuf={} pending_resize={:?}",
@@ -483,24 +526,24 @@ impl CompositorState {
                 requested_surface_size.height,
                 surface_size.width,
                 surface_size.height,
-                current.data.is_shm(),
-                current.data.is_dmabuf(),
+                current.is_shm(),
+                current.is_dmabuf(),
                 self.resize_configure_flows
                     .get(&surface_id)
                     .and_then(ResizeConfigureFlow::in_flight_serial),
             );
         }
-        existing.x = current.x;
-        existing.y = current.y;
+        existing.x = current.x();
+        existing.y = current.y();
         existing.width = surface_size.width;
         existing.height = surface_size.height;
         existing.placement = placement;
         existing.generation = generation;
         existing.commit_sequence = commit_sequence;
         existing.buffer_scale = buffer_scale;
-        existing.buffer_transform = current.buffer_transform;
-        existing.viewport_source = current.viewport_source;
-        existing.viewport_destination = current.viewport_destination;
+        existing.buffer_transform = current.buffer_transform();
+        existing.viewport_source = current.viewport_source();
+        existing.viewport_destination = current.viewport_destination();
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,
@@ -508,8 +551,9 @@ impl CompositorState {
         );
         let journal_damage = existing.damage.clone();
         let journal_size = existing.buffer_size();
-        self.record_surface_damage_commit(
+        self.record_surface_damage_commit_at(
             surface_id,
+            Some(commit_sequence),
             journal_damage,
             journal_size.width,
             journal_size.height,
@@ -534,7 +578,7 @@ impl CompositorState {
             self.note_xwayland_commit_observed(
                 surface_id,
                 commit_sequence,
-                Some(current.data.buffer_id()),
+                Some(current.buffer_id()),
                 Some(buffer_size),
             );
         }
@@ -779,6 +823,7 @@ impl CompositorState {
                 acquire: acquire.clone(),
                 acquire_state: PendingAcquireState::RegistrationPending,
             });
+        self.rebuild_scene_work_index();
         debug_assert!(
             self.pending_explicit_sync_commits
                 .iter()
@@ -842,7 +887,6 @@ impl CompositorState {
             resize_capture_finalized,
             window_geometry,
         } = state;
-        let _ = commit_sequence;
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
             if acquire.is_some() || release.is_some() {
@@ -859,6 +903,7 @@ impl CompositorState {
             if let Some(damage) = damage {
                 self.commit_cursor_surface_damage_only(
                     surface_id,
+                    commit_sequence,
                     damage,
                     surface_size,
                     buffer_scale,
@@ -895,12 +940,9 @@ impl CompositorState {
         }
         let has_current_buffer = self.current_surface_buffers.contains_key(&surface_id);
         let viewport_size_changed = surface_size.is_some_and(|surface_size| {
-            self.renderable_surfaces
-                .iter()
-                .find(|surface| surface.surface_id == surface_id)
-                .is_some_and(|surface| {
-                    surface.width != surface_size.width || surface.height != surface_size.height
-                })
+            self.renderable_surface(surface_id).is_some_and(|surface| {
+                surface.width != surface_size.width || surface.height != surface_size.height
+            })
         });
         let window_geometry_changed = window_geometry.is_some_and(|geometry| {
             self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
@@ -985,7 +1027,7 @@ impl CompositorState {
             self.store_surface_placement(surface_id, placement);
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::WindowResize,
-                self.surface_is_visible_in_active_workspace(surface_id),
+                self.surface_is_visible_in_active_scene(surface_id),
             );
         }
         self.complete_applied_resize_transaction(surface_id, resize);
@@ -1068,16 +1110,17 @@ impl CompositorState {
         }
 
         for removed_surface_id in &removed_surface_ids {
-            self.current_surface_buffers.remove(removed_surface_id);
+            self.remove_current_surface_buffer(*removed_surface_id);
             if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
                 self.queue_dmabuf_buffer_release(buffer);
             }
         }
-        self.renderable_surfaces
-            .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        self.retain_renderable_surfaces(|surface| {
+            !removed_surface_ids.contains(&surface.surface_id)
+        });
         let scene_effect = removed_surface_ids
             .iter()
-            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
+            .any(|surface_id| self.surface_is_visible_in_active_scene(*surface_id));
         self.clear_resize_state_for_surfaces_with_reason(
             &removed_surface_ids,
             WindowInteractionEndReason::SurfaceUnmapped,
@@ -1146,14 +1189,15 @@ impl CompositorState {
         removed_surface_ids.dedup();
 
         for removed_surface_id in &removed_surface_ids {
-            self.current_surface_buffers.remove(removed_surface_id);
+            self.remove_current_surface_buffer(*removed_surface_id);
             if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
                 self.queue_dmabuf_buffer_release(buffer);
             }
         }
         let previous_renderable_count = self.renderable_surfaces.len();
-        self.renderable_surfaces
-            .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        self.retain_renderable_surfaces(|surface| {
+            !removed_surface_ids.contains(&surface.surface_id)
+        });
         for removed_surface_id in &removed_surface_ids {
             if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
                 self.reconcile_surface_output_membership(&surface);
@@ -1200,7 +1244,7 @@ impl CompositorState {
 
         let scene_effect = removed_surface_ids
             .iter()
-            .any(|surface_id| self.surface_is_visible_in_active_workspace(*surface_id));
+            .any(|surface_id| self.surface_is_visible_in_active_scene(*surface_id));
         if scene_effect {
             self.rebuild_active_scene_view();
         } else {
@@ -1282,6 +1326,116 @@ impl CompositorState {
                 .saturating_add(1);
         }
     }
+    pub(in crate::compositor) fn note_shm_materialization_failure(
+        &mut self,
+        pending: &PendingSurfaceBuffer,
+    ) {
+        if pending.data.is_shm() {
+            self.shm_buffer_lifetime_metrics
+                .shm_materialization_failures_total = self
+                .shm_buffer_lifetime_metrics
+                .shm_materialization_failures_total
+                .saturating_add(1);
+        }
+    }
+
+    pub(in crate::compositor) fn release_unmaterialized_pending_buffer(
+        &mut self,
+        pending: PendingSurfaceBuffer,
+        superseded: bool,
+    ) {
+        if pending.data.is_shm() {
+            if superseded {
+                self.shm_buffer_lifetime_metrics
+                    .shm_releases_superseded_without_read_total = self
+                    .shm_buffer_lifetime_metrics
+                    .shm_releases_superseded_without_read_total
+                    .saturating_add(1);
+            } else {
+                self.shm_buffer_lifetime_metrics
+                    .shm_releases_deferred_unmaterialized_total = self
+                    .shm_buffer_lifetime_metrics
+                    .shm_releases_deferred_unmaterialized_total
+                    .saturating_add(1);
+            }
+        }
+        self.release_surface_buffer_direct(pending.release_target());
+    }
+
+    pub(in crate::compositor) fn release_surface_buffer_direct(
+        &mut self,
+        release: SurfaceBufferRelease,
+    ) {
+        match release {
+            SurfaceBufferRelease::WlBuffer(buffer) => {
+                if !buffer.is_alive() {
+                    self.buffer_release_metrics.buffer_releases_discarded = self
+                        .buffer_release_metrics
+                        .buffer_releases_discarded
+                        .saturating_add(1);
+                    return;
+                }
+                if buffer.send_event(wl_buffer::Event::Release).is_ok() {
+                    self.buffer_release_metrics.buffer_releases_completed = self
+                        .buffer_release_metrics
+                        .buffer_releases_completed
+                        .saturating_add(1);
+                } else {
+                    self.buffer_release_metrics.buffer_releases_discarded = self
+                        .buffer_release_metrics
+                        .buffer_releases_discarded
+                        .saturating_add(1);
+                }
+            }
+            SurfaceBufferRelease::ExplicitSync(point) => point.signal(),
+        }
+    }
+
+    pub(in crate::compositor) fn release_materialized_shm(
+        &mut self,
+        release: SafeShmRelease,
+        copy_to_release_us: u64,
+    ) {
+        self.complete_materialized_shm_release(release);
+        self.shm_buffer_lifetime_metrics.shm_materializations_total = self
+            .shm_buffer_lifetime_metrics
+            .shm_materializations_total
+            .saturating_add(1);
+        self.shm_buffer_lifetime_metrics
+            .shm_releases_after_materialization_total = self
+            .shm_buffer_lifetime_metrics
+            .shm_releases_after_materialization_total
+            .saturating_add(1);
+        self.shm_buffer_lifetime_metrics.shm_copy_to_release_us = self
+            .shm_buffer_lifetime_metrics
+            .shm_copy_to_release_us
+            .saturating_add(copy_to_release_us);
+    }
+
+    pub(in crate::compositor) fn replace_current_surface_buffer(
+        &mut self,
+        surface_id: u32,
+        current: CurrentSurfaceBuffer,
+    ) {
+        if let Some(CurrentSurfaceBuffer::Unmaterialized(pending)) =
+            self.current_surface_buffers.insert(surface_id, current)
+            && pending.data.is_shm()
+        {
+            self.release_unmaterialized_pending_buffer(pending, true);
+        }
+    }
+
+    pub(in crate::compositor) fn remove_current_surface_buffer(&mut self, surface_id: u32) {
+        let Some(previous) = self.current_surface_buffers.remove(&surface_id) else {
+            return;
+        };
+        if let CurrentSurfaceBuffer::Unmaterialized(pending) = previous
+            && pending.data.is_shm()
+        {
+            self.release_unmaterialized_pending_buffer(pending, false);
+        }
+    }
+
     pub(in crate::compositor) fn track_committed_buffer_lifetime(
         &mut self,
         surface_id: u32,
@@ -1291,7 +1445,6 @@ impl CompositorState {
             if let Some(release) = self.active_dmabuf_buffers.remove(&surface_id) {
                 self.queue_dmabuf_buffer_release(release);
             }
-            self.queue_buffer_release(pending.resource.clone());
             return;
         }
 
@@ -1303,15 +1456,6 @@ impl CompositorState {
         {
             self.queue_dmabuf_buffer_release(previous);
         }
-    }
-
-    pub(in crate::compositor) fn queue_buffer_release(&mut self, buffer: wl_buffer::WlBuffer) {
-        let candidate = SurfaceBufferRelease::WlBuffer(buffer.clone());
-        if self.buffer_release_is_owned(&candidate) {
-            self.note_buffer_release_duplicate_attempt();
-            return;
-        }
-        self.pending_buffer_releases.push(buffer);
     }
 
     pub(in crate::compositor) fn queue_dmabuf_buffer_release(
@@ -1351,10 +1495,12 @@ impl CompositorState {
                 buffer_id.get()
             );
         }
-        self.renderable_surfaces
-            .retain(|surface| surface.surface_id != surface_id);
+        self.retain_renderable_surfaces(|surface| surface.surface_id != surface_id);
         self.track_committed_buffer_lifetime(surface_id, &pending);
-        self.current_surface_buffers.insert(surface_id, pending);
+        self.replace_current_surface_buffer(
+            surface_id,
+            CurrentSurfaceBuffer::Unmaterialized(pending),
+        );
         self.note_xwayland_buffer_ready(surface_id);
         self.note_xwayland_commit_observed(
             surface_id,
@@ -1383,42 +1529,62 @@ impl CompositorState {
         ) {
             return false;
         }
-        if self
-            .renderable_surfaces
-            .iter()
-            .any(|surface| surface.surface_id == surface_id)
-        {
+        if let Some(renderable_index) = self.renderable_surface_index(surface_id) {
             debug_assert!(
                 !matches!(
                     self.surface_role(surface_id),
                     SurfaceRole::Subsurface { .. }
-                ) || self
-                    .renderable_surfaces
-                    .iter()
-                    .find(|surface| surface.surface_id == surface_id)
-                    .is_some_and(|surface| surface.placement.parent_surface_id.is_some())
+                ) || self.renderable_surfaces[renderable_index]
+                    .placement
+                    .parent_surface_id
+                    .is_some()
             );
             return false;
         }
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
         };
+        let (materialized, shm_release, copy_to_release_us) = match current {
+            CurrentSurfaceBuffer::Materialized(materialized) => (materialized, None, 0),
+            CurrentSurfaceBuffer::Unmaterialized(pending) => {
+                let copy_started = std::time::Instant::now();
+                let materialized = match pending
+                    .materialize_for_publication(None, &RenderableSurfaceDamage::Full)
+                {
+                    Ok(materialized) => materialized,
+                    Err(_) => {
+                        self.note_shm_materialization_failure(&pending);
+                        return false;
+                    }
+                };
+                (
+                    materialized.0,
+                    materialized.1,
+                    copy_started.elapsed().as_micros() as u64,
+                )
+            }
+        };
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(surface_id);
-        let Ok(surface) = current.to_renderable_surface(
+        let surface = materialized.to_renderable_surface(
             surface_id,
             placement,
             generation,
             RenderableSurfaceDamage::Full,
-        ) else {
-            return false;
-        };
+        );
         let buffer_size = surface.buffer_size();
-        self.renderable_surfaces
-            .retain(|surface| surface.surface_id != surface_id);
-        self.renderable_surfaces.push(surface);
-        self.record_surface_damage_commit(
+        self.retain_renderable_surfaces(|existing| existing.surface_id != surface_id);
+        self.append_renderable_surface(surface);
+        self.current_surface_buffers
+            .insert(surface_id, CurrentSurfaceBuffer::Materialized(materialized));
+        if let Some(release) = shm_release {
+            self.release_materialized_shm(release, copy_to_release_us);
+        }
+        self.record_surface_damage_commit_at(
             surface_id,
+            self.current_surface_buffers
+                .get(&surface_id)
+                .map(CurrentSurfaceBuffer::commit_sequence),
             RenderableSurfaceDamage::Full,
             buffer_size.width,
             buffer_size.height,

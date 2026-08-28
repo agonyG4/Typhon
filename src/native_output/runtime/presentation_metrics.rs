@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::compositor::SurfaceDamagePresentation;
 use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, RenderPrediction};
 
 #[allow(clippy::too_many_arguments)]
@@ -97,8 +98,9 @@ pub(super) fn finish_no_primary_work(
     drm_file_generation: u64,
     render_generation: u64,
     render_cause: &'static str,
-    pending_frame_work: bool,
-) {
+    surface_damage: Option<SurfaceDamagePresentation>,
+    owns_frame_batch: bool,
+) -> bool {
     perf.log("native.frame_skip", || {
         let mut fields = output_damage.fields().to_vec();
         fields.extend([
@@ -120,23 +122,24 @@ pub(super) fn finish_no_primary_work(
             NativePerfField::u64("backend_generation", drm_file_generation),
             NativePerfField::u64("render_generation", render_generation),
             NativePerfField::str("render_cause", render_cause),
-            NativePerfField::bool("pending_frame_work", pending_frame_work),
+            NativePerfField::bool("pending_frame_work", owns_frame_batch),
         ]);
         fields
     });
-    if pending_frame_work {
-        let finish_frame_start = Instant::now();
-        server.finish_frame();
-        perf.log("native.finish_frame", || {
+    let completed_work = server.settle_no_visual_change_work(surface_damage, owns_frame_batch);
+    if completed_work {
+        let no_visual_change_start = Instant::now();
+        perf.log("native.no_visual_change", || {
             vec![
-                NativePerfField::str("reason", "empty_visible_damage"),
-                NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
+                NativePerfField::str("reason", "no_visual_change"),
+                NativePerfField::u64("elapsed_us", elapsed_micros(no_visual_change_start)),
                 NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
                 NativePerfField::u64("render_generation", server.render_generation()),
             ]
         });
+        frame_scheduler.note_immediate_completion();
     }
-    frame_scheduler.note_immediate_completion();
+    completed_work
 }
 
 #[allow(clippy::too_many_arguments)]

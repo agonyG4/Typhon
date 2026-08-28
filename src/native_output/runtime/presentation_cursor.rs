@@ -316,6 +316,7 @@ pub(super) fn freeze_cursor_plane_owner(
         .transpose()?;
     Ok(Some(FrozenCursorPlaneOwner {
         revision: cursor.desired_revision(),
+        client_source_key: cursor.client_source_key(),
         capability_key: state.and_then(|state| cursor.capability_key_for(state)),
         pin,
     }))

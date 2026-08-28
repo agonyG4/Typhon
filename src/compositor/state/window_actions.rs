@@ -8,6 +8,10 @@ pub(crate) enum WindowActionOutcome {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn toggle_focused_window_layout(&mut self) -> bool {
+        self.toggle_focused_tiled_layout()
+    }
+
     pub(in crate::compositor) fn activate_desktop_window_action(
         &mut self,
         window_id: WindowId,

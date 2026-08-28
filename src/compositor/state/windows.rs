@@ -1,6 +1,6 @@
 use super::hit_testing::PointerSceneHit;
 use super::*;
-use crate::wm::WorkspaceSwitchOutcome;
+use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
 impl CompositorState {
     pub(in crate::compositor) fn x11_window_wants_initial_focus(
@@ -25,7 +25,7 @@ impl CompositorState {
         if window.kind != DesktopWindowKind::Managed
             || window.state.is_minimized()
             || !window.is_normal_x11_role()
-            || !self.window_is_visible_in_active_workspace(window_id)
+            || !self.window_is_visible_in_active_scene(window_id)
         {
             return WindowFocusOutcome::Unavailable;
         }
@@ -65,10 +65,11 @@ impl CompositorState {
         window_id: WindowId,
         reason: WindowFocusReason,
     ) -> WindowActivationOutcome {
-        let Some(target_workspace) = self
-            .window(window_id)
-            .and_then(|window| window.management.map(|management| management.workspace()))
-        else {
+        let Some(target_workspace) = self.window(window_id).and_then(|window| {
+            window
+                .management
+                .and_then(|management| management.regular_workspace())
+        }) else {
             return WindowActivationOutcome::Unavailable;
         };
         if target_workspace != self.active_workspace()
@@ -313,11 +314,9 @@ impl CompositorState {
             return;
         };
         if let Some(window) = self.window_mut(window_id) {
-            window.constraints.min_width = pending.min_width;
-            window.constraints.min_height = pending.min_height;
-            window.constraints.max_width = pending.max_width;
-            window.constraints.max_height = pending.max_height;
+            window.constraints = pending;
         }
+        let _ = self.reconcile_tiled_constraints(window_id);
     }
 
     pub(in crate::compositor) fn set_toplevel_parent(
@@ -1201,7 +1200,12 @@ impl CompositorState {
         else {
             return false;
         };
-        let scene_effect = self.window_is_visible_in_active_workspace(window_id);
+        let scene_effect = self.window_is_visible_in_active_scene(window_id);
+        let tiled_location = self
+            .window(window_id)
+            .and_then(|window| window.management)
+            .filter(|management| management.layout() == LayoutMembership::Tiled)
+            .map(|management| management.location());
         if self
             .window(window_id)
             .is_some_and(|window| window.state.is_minimized())
@@ -1212,6 +1216,12 @@ impl CompositorState {
             &[root_surface_id],
             WindowInteractionEndReason::ExplicitCancel,
         );
+        if let Some(location) = tiled_location {
+            self.cancel_tiled_resize_for_location(
+                location,
+                WindowInteractionEndReason::ExplicitCancel,
+            );
+        }
         self.clear_fullscreen_presentation_owner(root_surface_id);
 
         let surface_placements = &self.surface_placements;
@@ -1227,10 +1237,16 @@ impl CompositorState {
             }
         }
         self.renderable_surfaces = visible_surfaces;
+        self.rebuild_renderable_surface_index();
 
         if minimized_surfaces.is_empty() {
             self.reconcile_idle_inhibition();
             return false;
+        }
+
+        let layout_batch = scene_effect && tiled_location.is_some();
+        if layout_batch {
+            self.begin_layout_reflow_batch();
         }
 
         if let Some(window) = self.window_mut(window_id) {
@@ -1251,10 +1267,16 @@ impl CompositorState {
         self.queue_backend_state(window_id);
         self.focus_topmost_renderable_toplevel();
         self.reconcile_idle_inhibition();
+        if let Some(location) = tiled_location {
+            let _ = self.reflow_tiled_location(location);
+        }
         self.advance_render_generation_with_scene_effect(
             RenderGenerationCause::WindowMinimize,
             scene_effect,
         );
+        if layout_batch {
+            let _ = self.finish_layout_reflow_batch();
+        }
         true
     }
 
@@ -1287,7 +1309,9 @@ impl CompositorState {
             return false;
         };
 
-        self.renderable_surfaces.extend(minimized_surfaces);
+        for surface in minimized_surfaces {
+            self.append_renderable_surface(surface);
+        }
         self.refresh_active_scene_surface_order();
         if let Some(surface_id) = x11_surface_id {
             let _ = self.adopt_current_xwayland_surface_content(surface_id);
@@ -1295,11 +1319,26 @@ impl CompositorState {
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
         self.reconcile_idle_inhibition();
-        let scene_effect = self.window_is_visible_in_active_workspace(window_id);
+        let scene_effect = self.window_is_visible_in_active_scene(window_id);
+        let tiled_location = self
+            .window(window_id)
+            .and_then(|window| window.management)
+            .filter(|management| management.layout() == LayoutMembership::Tiled)
+            .map(|management| management.location());
+        let layout_batch = scene_effect && tiled_location.is_some();
+        if layout_batch {
+            self.begin_layout_reflow_batch();
+        }
+        if let Some(location) = tiled_location {
+            let _ = self.reflow_tiled_location(location);
+        }
         self.advance_render_generation_with_scene_effect(
             RenderGenerationCause::WindowRestore,
             scene_effect,
         );
+        if layout_batch {
+            let _ = self.finish_layout_reflow_batch();
+        }
         true
     }
 
@@ -1350,6 +1389,19 @@ impl CompositorState {
             .is_some_and(|window| !window.is_normal_x11_role())
         {
             return false;
+        }
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && mode != ToplevelMode::Normal
+            && let Some(location) = self
+                .window(window_id)
+                .and_then(|window| window.management)
+                .filter(|management| management.layout() == LayoutMembership::Tiled)
+                .map(|management| management.location())
+        {
+            self.cancel_tiled_resize_for_location(
+                location,
+                WindowInteractionEndReason::ModeTransition,
+            );
         }
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && matches!(
@@ -1417,10 +1469,22 @@ impl CompositorState {
         {
             return self.transition_x11_window_mode(window_id, ToplevelMode::Normal, false);
         }
+        let tiled_location = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .and_then(|window| window.management)
+            .filter(|management| management.layout() == LayoutMembership::Tiled)
+            .map(|management| management.location());
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,
         );
+        if let Some(location) = tiled_location {
+            self.cancel_tiled_resize_for_location(
+                location,
+                WindowInteractionEndReason::ModeTransition,
+            );
+        }
         self.clear_fullscreen_presentation_owner(surface_id);
         let window_id = self.window_id_for_surface(surface_id);
         let restore_geometry = {
@@ -1432,6 +1496,10 @@ impl CompositorState {
         };
         if let Some(window_id) = window_id {
             self.mark_astrea_toplevel_dirty(window_id);
+        }
+        if let Some(location) = tiled_location {
+            let _ = self.reflow_tiled_location(location);
+            return true;
         }
         let restore_geometry = restore_geometry
             .or_else(|| self.current_root_window_geometry(surface_id))
@@ -1521,33 +1589,53 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
-        let Some((_, surface_id)) = self
+        let Some(window_id) = self.topmost_renderable_toplevel_window_id() else {
+            return false;
+        };
+        let Some(surface) = self
+            .window(window_id)
+            .filter(|window| {
+                self.renderable_surfaces
+                    .iter()
+                    .any(|surface| surface.surface_id == window.root_surface_id)
+            })
+            .and_then(|window| self.surface_resource_by_id(window.root_surface_id))
+        else {
+            return false;
+        };
+        self.focus_surface(surface);
+        true
+    }
+
+    pub(in crate::compositor) fn topmost_renderable_toplevel_window_id(&self) -> Option<WindowId> {
+        let special_visible = self.workspace_manager.visible_special_workspace().is_some();
+        let candidates = self
             .window_stacking
             .iter()
             .enumerate()
             .filter_map(|(stack_index, window_id)| {
                 let window = self.window(*window_id)?;
                 if !window.is_workspace_managed()
-                    || !self.window_is_visible_in_active_workspace(*window_id)
+                    || !self.window_is_visible_in_active_scene(*window_id)
                 {
                     return None;
                 }
-                let root_surface_id = window.root_surface_id;
-                self.renderable_surfaces
-                    .iter()
-                    .any(|surface| surface.surface_id == root_surface_id)
-                    .then_some((stack_index, root_surface_id, window.last_focus_serial))
+                Some((
+                    stack_index,
+                    *window_id,
+                    window.last_focus_serial,
+                    window
+                        .management
+                        .is_some_and(|management| management.special_workspace().is_some()),
+                ))
             })
-            .max_by_key(|(stack_index, _, focus_serial)| (*focus_serial, *stack_index))
-            .map(|(stack_index, root_surface_id, _)| (stack_index, root_surface_id))
-        else {
-            return false;
-        };
-        let Some(surface) = self.surface_resource_by_id(surface_id) else {
-            return false;
-        };
-        self.focus_surface(surface);
-        true
+            .collect::<Vec<_>>();
+        let prefer_special = special_visible && candidates.iter().any(|candidate| candidate.3);
+        candidates
+            .into_iter()
+            .filter(|candidate| !prefer_special || candidate.3)
+            .max_by_key(|(stack_index, _, focus_serial, _)| (*focus_serial, *stack_index))
+            .map(|(_, window_id, _, _)| window_id)
     }
 
     pub(in crate::compositor) fn raise_root_window(&mut self, surface_id: u32) -> bool {
@@ -1561,7 +1649,7 @@ impl CompositorState {
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
             let _ = self.raise_window_id(window_id);
         }
-        let scene_effect = self.surface_is_visible_in_active_workspace(surface_id);
+        let scene_effect = self.surface_is_visible_in_active_scene(surface_id);
         let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
@@ -1576,10 +1664,12 @@ impl CompositorState {
         }
         if raised_surfaces.is_empty() {
             self.renderable_surfaces = lower_surfaces;
+            self.rebuild_renderable_surface_index();
             return false;
         }
         lower_surfaces.extend(raised_surfaces);
         self.renderable_surfaces = lower_surfaces;
+        self.rebuild_renderable_surface_index();
         self.refresh_active_scene_surface_order();
         self.advance_render_generation_with_scene_effect(
             RenderGenerationCause::WindowStack,

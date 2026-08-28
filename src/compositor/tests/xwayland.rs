@@ -34,6 +34,8 @@ mod xwayland_pointer_batch;
 mod xwayland_resize_visual;
 #[path = "xwayland_root_stack.rs"]
 mod xwayland_root_stack;
+#[path = "xwayland_tiled.rs"]
+mod xwayland_tiled;
 
 struct FirstBufferFixture {
     server: super::OwnCompositorServer,
@@ -1698,7 +1700,6 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
             } && fields.x
     ));
 }
-
 #[test]
 fn x11_client_configure_left_resize_preserves_right_edge() {
     let mut fixture = first_buffer_fixture();
@@ -1787,7 +1788,6 @@ fn x11_client_configure_left_resize_preserves_right_edge() {
         "an Xwayland publication must keep stale content at its committed extent"
     );
 }
-
 #[test]
 fn x11_configure_notify_does_not_mutate_committed_buffer_extent() {
     let mut fixture = first_buffer_fixture();

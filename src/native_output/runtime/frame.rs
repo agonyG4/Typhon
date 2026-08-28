@@ -589,10 +589,6 @@ pub(crate) struct NativePointerConstraintBackend {
     pub(crate) cursor_visible: bool,
 }
 
-pub(crate) fn native_pointer_debug_log(message: impl AsRef<str>) {
-    crate::pointer_debug::log(message);
-}
-
 pub(crate) fn native_pointer_debug_log_lazy(message: impl FnOnce() -> String) {
     crate::pointer_debug::log_lazy(message);
 }

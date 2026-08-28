@@ -101,7 +101,10 @@ impl OwnCompositorServer {
 }
 
 fn control_workspace_label(management: Option<WindowManagementState>) -> Option<String> {
-    management.map(|management| management.workspace().to_string())
+    management.map(|management| match management.location() {
+        crate::wm::WorkspaceLocation::Regular(workspace) => workspace.to_string(),
+        crate::wm::WorkspaceLocation::Special(_) => "special".to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -113,10 +116,20 @@ mod tests {
     fn control_snapshot_publishes_numeric_workspace_or_none() {
         assert_eq!(
             control_workspace_label(Some(WindowManagementState::new(
-                WorkspaceId::new(1).unwrap()
+                crate::wm::WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap()),
             ))),
             Some("1".to_string())
         );
         assert_eq!(control_workspace_label(None), None);
+    }
+
+    #[test]
+    fn control_snapshot_labels_special_without_reinterpreting_it_as_regular() {
+        assert_eq!(
+            control_workspace_label(Some(WindowManagementState::new(
+                crate::wm::WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+            ))),
+            Some("special".to_string())
+        );
     }
 }

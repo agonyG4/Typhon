@@ -540,6 +540,7 @@ fn load_shape_image(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_alias_image(
     theme: &CursorTheme,
     theme_name: &str,

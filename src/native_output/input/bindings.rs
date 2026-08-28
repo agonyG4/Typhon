@@ -43,8 +43,11 @@ pub(crate) enum BindingAction {
     ExitCompositor,
     CloseActiveWindow,
     ToggleFullscreen,
+    ToggleFocusedWindowLayout,
     SwitchWorkspace(WorkspaceId),
     MoveFocusedWindowToWorkspace(WorkspaceId),
+    ToggleDefaultSpecialWorkspace,
+    MoveFocusedWindowToOrFromSpecialWorkspace,
     LaunchCommand(Vec<String>),
     LaunchSessionCommand(u8),
     BeginMove,
@@ -246,6 +249,24 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
         Binding {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_S),
+            action: BindingAction::ToggleDefaultSpecialWorkspace,
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        Binding {
+            modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_S),
+            action: BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace,
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        Binding {
+            modifiers: ModifierMask::SUPER,
+            trigger: BindingTrigger::Press,
             input: BindingInput::Key(KEY_C),
             action: BindingAction::CloseActiveWindow,
             repeat: RepeatPolicy::Disabled,
@@ -257,6 +278,15 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             trigger: BindingTrigger::Press,
             input: BindingInput::Key(KEY_F),
             action: BindingAction::ToggleFullscreen,
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        Binding {
+            modifiers: ModifierMask::SUPER,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_V),
+            action: BindingAction::ToggleFocusedWindowLayout,
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
@@ -441,6 +471,43 @@ mod tests {
                 action: BindingAction::LaunchSessionCommand(1),
                 phase: AstreaShortcutPhase::Pressed,
             }
+        );
+    }
+
+    #[test]
+    fn special_workspace_bindings_are_press_only_exact_and_inhibition_aware() {
+        let mut manager = AstreaBindingManager::default();
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, false),
+            AstreaBindingMatch::Consumed {
+                action: BindingAction::ToggleDefaultSpecialWorkspace,
+                phase: AstreaShortcutPhase::Pressed,
+            }
+        );
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_S, true, true, false),
+            AstreaBindingMatch::Pass
+        );
+        assert_eq!(
+            manager.handle_key(
+                ModifierMask::SUPER | ModifierMask::SHIFT,
+                KEY_S,
+                true,
+                false,
+                false
+            ),
+            AstreaBindingMatch::Consumed {
+                action: BindingAction::MoveFocusedWindowToOrFromSpecialWorkspace,
+                phase: AstreaShortcutPhase::Pressed,
+            }
+        );
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, true),
+            AstreaBindingMatch::Pass
+        );
+        assert_eq!(
+            manager.handle_key(ModifierMask::SUPER, KEY_S, false, false, false),
+            AstreaBindingMatch::Pass
         );
     }
 }

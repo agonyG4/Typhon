@@ -20,6 +20,8 @@ mod override_redirect_stack;
 mod pointer_constraints;
 mod resize;
 mod roles;
+mod scene_order;
+mod scene_work;
 mod selection_runtime;
 mod shortcut_inhibition;
 mod shortcuts;
@@ -34,6 +36,8 @@ mod surface_pacing;
 mod surface_transactions;
 mod surface_tree_readiness;
 mod surfaces;
+mod tiled_layout;
+mod tiled_resize;
 mod window_actions;
 mod window_decoration;
 mod window_interaction;
@@ -100,6 +104,10 @@ pub(in crate::compositor) use pointer_constraints::*;
 pub(in crate::compositor) use resize::*;
 pub(in crate::compositor) use roles::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use scene_order::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use scene_work::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use selection_runtime::*;
 pub(in crate::compositor) use shortcut_inhibition::*;
 pub use shortcuts::AstreaShortcutPhase;
@@ -136,6 +144,8 @@ pub(in crate::compositor) use surface_transactions::{
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use tiled_resize::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use window_actions::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use window_decoration::*;
@@ -162,6 +172,8 @@ mod desktop_window_tests;
 mod frame_tests;
 #[cfg(test)]
 mod task_05_8_tests;
+#[cfg(test)]
+mod tiled_layout_tests;
 #[cfg(test)]
 mod window_decoration_tests;
 #[cfg(test)]

@@ -209,6 +209,7 @@ pub(in crate::compositor) enum WindowInteractionEndReason {
     ExplicitEnd,
     ExplicitCancel,
     WorkspaceSwitch,
+    WorkAreaChange,
     ModeTransition,
     SurfaceDestroyed,
     SurfaceUnmapped,
@@ -274,6 +275,7 @@ pub(super) struct WindowInteraction {
     pub(super) start_height: u32,
     pub(super) drag_committed: bool,
     pub(super) resize_interaction_id: Option<ResizeInteractionId>,
+    pub(super) tiled_resize: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -958,6 +960,7 @@ mod tests {
             start_height: 200,
             drag_committed: true,
             resize_interaction_id: Some(ResizeInteractionId::new(1)),
+            tiled_resize: false,
         }
     }
 

@@ -910,7 +910,7 @@ impl CompositorState {
     ) {
         self.arrange_layer_surfaces(cause);
         if self.reserved_usable_geometry() != previous_usable {
-            self.reconfigure_stateful_windows_for_output_size();
+            let _ = self.reflow_usable_output_geometry();
         }
     }
 
@@ -1023,7 +1023,7 @@ impl CompositorState {
                         && self.window(window_id).is_some_and(|window| {
                             window.is_workspace_managed()
                                 && !window.state.is_minimized()
-                                && self.window_is_visible_in_active_workspace(window_id)
+                                && self.window_is_visible_in_active_scene(window_id)
                         })
                 });
             if let Some(previous) = previous {
@@ -1097,7 +1097,7 @@ impl CompositorState {
     pub(in crate::compositor) fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.renderable_surfaces
             .iter()
-            .filter(|surface| self.surface_is_visible_in_active_workspace(surface.surface_id))
+            .filter(|surface| self.surface_is_visible_in_active_scene(surface.surface_id))
             .filter_map(|surface| {
                 let root_id = self.root_surface_id_for_surface(surface.surface_id);
                 self.layer_surfaces

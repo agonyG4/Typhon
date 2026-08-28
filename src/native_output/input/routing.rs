@@ -1465,6 +1465,7 @@ pub(crate) fn apply_native_window_action(
         }
         NativeWindowAction::CloseActiveWindow => server.close_focused_window(),
         NativeWindowAction::ToggleFullscreen => server.toggle_fullscreen_focused_window(),
+        NativeWindowAction::ToggleFocusedWindowLayout => server.toggle_focused_window_layout(),
         NativeWindowAction::SwitchWorkspace(workspace) => {
             matches!(
                 server.activate_workspace(workspace),
@@ -1473,6 +1474,13 @@ pub(crate) fn apply_native_window_action(
         }
         NativeWindowAction::MoveFocusedWindowToWorkspace(workspace) => {
             server.move_focused_window_to_workspace(workspace)
+        }
+        NativeWindowAction::ToggleDefaultSpecialWorkspace => {
+            server.toggle_default_special_workspace();
+            true
+        }
+        NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace => {
+            server.move_focused_window_to_or_from_special_workspace()
         }
     };
     resize_perf.observe_action(action, changed, perf);

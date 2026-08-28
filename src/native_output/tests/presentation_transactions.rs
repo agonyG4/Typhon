@@ -8,8 +8,11 @@ use crate::native_output::presentation::qualification::{DirectReleaseMode, Direc
 use crate::native_output::presentation::trace::{
     PresentationTransactionEvent, PresentationTransactionTraceRing,
 };
+use crate::native_output::runtime::settle_no_visual_change_output_transaction;
 use crate::native_output::{ExplicitOutputCounters, OutputPresentationMode};
-use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::compositor::{
+    CompositorFrameBatchId, SurfaceDamagePresentation as CompositorSurfaceDamagePresentation,
+};
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
@@ -1321,6 +1324,90 @@ fn cursor_pageflip_rejection_terminalizes_nothing() {
 }
 
 #[test]
+fn cursor_only_plane_delta_owns_its_exact_surface_damage_token() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let token = CompositorSurfaceDamagePresentation::default();
+    let transaction = super::OutputTransaction::cursor_plane_delta(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        115,
+        Some(cursor_state(93)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_surface_damage(token.clone());
+    ledger.insert(transaction).unwrap();
+
+    assert_eq!(ledger.surface_damage(id), Some(token));
+    assert_eq!(
+        ledger
+            .transaction(id)
+            .unwrap()
+            .descriptor()
+            .obligations()
+            .frame_batch_id(),
+        None
+    );
+}
+
+#[test]
+fn superseded_cursor_only_plane_delta_does_not_retain_or_settle_old_token() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let first_id = ledger.allocate_id().unwrap();
+    let first_token = CompositorSurfaceDamagePresentation::default();
+    let first = super::OutputTransaction::cursor_plane_delta(
+        first_id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        115,
+        Some(cursor_state(93)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_surface_damage(first_token);
+    ledger.insert(first).expect("first cursor transaction");
+    ledger
+        .mark_ready(first_id, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    let second_id = ledger.allocate_id().unwrap();
+    let second_token = CompositorSurfaceDamagePresentation::default();
+    let second = super::OutputTransaction::cursor_plane_delta(
+        second_id,
+        1,
+        MonotonicTimestampNs::new(30),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        116,
+        Some(cursor_state(94)),
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap()
+    .with_surface_damage(second_token.clone());
+    ledger
+        .insert(second)
+        .expect("replacement cursor transaction");
+
+    ledger
+        .mark_superseded(
+            first_id,
+            Some(second_id),
+            super::OutputTransactionSupersedeReason::NewerTransaction,
+            MonotonicTimestampNs::new(40),
+        )
+        .unwrap();
+
+    assert_eq!(ledger.surface_damage(first_id), None);
+    assert_eq!(ledger.surface_damage(second_id), Some(second_token));
+}
+
+#[test]
 fn one_frame_batch_cannot_be_owned_by_two_transactions() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let first = test_composited_transaction(&mut ledger, test_batch(1), 1);
@@ -1463,6 +1550,59 @@ fn no_visual_change_callbacks_follow_existing_refresh_contract() {
             id,
             super::OutputTransactionDropReason::NoVisualChange,
             MonotonicTimestampNs::new(75),
+        ),
+        Err(super::OutputTransactionError::UnknownTransaction)
+    );
+}
+
+#[test]
+fn dedicated_no_visual_change_settlement_is_exactly_once_terminal() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(75), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+
+    settle_no_visual_change_output_transaction(
+        &mut ledger,
+        id,
+        MonotonicTimestampNs::new(76),
+        |_| Ok(()),
+    )
+    .expect("dedicated no-visual-change settlement");
+
+    assert!(matches!(
+        ledger
+            .recent_terminal()
+            .back()
+            .expect("terminal record")
+            .state(),
+        super::OutputTransactionState::Terminal(super::OutputTransactionTerminal::Dropped {
+            reason: super::OutputTransactionDropReason::NoVisualChange,
+            ..
+        })
+    ));
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.counters().presented, 0);
+    assert_eq!(ledger.counters().dropped, 1);
+    assert_eq!(
+        ledger.mark_no_visual_change(id, MonotonicTimestampNs::new(77)),
+        Err(super::OutputTransactionError::UnknownTransaction)
+    );
+    assert_eq!(
+        ledger.mark_submitted(
+            id,
+            super::PageFlipToken::new(78).unwrap(),
+            MonotonicTimestampNs::new(78),
+        ),
+        Err(super::OutputTransactionError::UnknownTransaction)
+    );
+    assert_eq!(
+        ledger.mark_presented(
+            id,
+            super::PageFlipToken::new(78).unwrap(),
+            1,
+            MonotonicTimestampNs::new(78),
+            None,
         ),
         Err(super::OutputTransactionError::UnknownTransaction)
     );

@@ -14,6 +14,7 @@ use super::protocols::versions;
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
+use crate::compositor::{ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics};
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
@@ -46,7 +47,7 @@ use wayland_server::{
 mod control_api;
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
-use crate::wm::{WorkspaceId, WorkspaceSwitchOutcome};
+use crate::wm::{SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceSwitchOutcome};
 use crate::xwayland::xwm::{ConfigureSource, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_globals.rs"]
@@ -140,6 +141,11 @@ impl OwnCompositorServer {
 
     pub fn core_compliance_metrics(&self) -> CoreComplianceMetrics {
         self.state.compliance_metrics
+    }
+
+    #[doc(hidden)]
+    pub fn surface_locality_metrics(&self) -> SurfaceLocalityMetrics {
+        self.state.locality_metrics.get()
     }
 
     pub fn finish_commit_debug_for_shutdown(&mut self) {
@@ -622,7 +628,21 @@ impl OwnCompositorServer {
                     .map(|window| window.constraints)
                     .unwrap_or_default();
                 let current_authoritative = self.state.x11_authoritative_geometry(window);
-                let geometry = self.x11_configure_request_geometry(window, request, constraints);
+                let tiled_authority = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .and_then(|window_id| self.state.window(window_id))
+                    .is_some_and(|window| {
+                        window.state.mode() == super::ToplevelMode::Normal
+                            && window.management.is_some_and(|management| {
+                                management.layout() == crate::wm::LayoutMembership::Tiled
+                            })
+                    });
+                let geometry = if tiled_authority {
+                    current_authoritative.unwrap_or(request.requested)
+                } else {
+                    self.x11_configure_request_geometry(window, request, constraints)
+                };
                 self.trace_x11_configure_request_normalized(
                     window,
                     request,
@@ -632,10 +652,11 @@ impl OwnCompositorServer {
                 let border_width = self
                     .state
                     .effective_managed_x11_border_width(window, request.border_width);
-                if request.fields.x
-                    || request.fields.y
-                    || request.fields.width
-                    || request.fields.height
+                if !tiled_authority
+                    && (request.fields.x
+                        || request.fields.y
+                        || request.fields.width
+                        || request.fields.height)
                 {
                     let _ = self.state.set_x11_geometry(window, geometry);
                 }
@@ -938,6 +959,24 @@ impl OwnCompositorServer {
         self.state.move_focused_window_to_workspace(workspace)
     }
 
+    pub fn toggle_default_special_workspace(&mut self) -> SpecialWorkspaceToggleOutcome {
+        self.state.toggle_default_special_workspace()
+    }
+
+    pub fn move_focused_window_to_or_from_special_workspace(&mut self) -> bool {
+        self.state
+            .move_focused_window_to_or_from_special_workspace()
+    }
+
+    pub fn toggle_focused_window_layout(&mut self) -> bool {
+        let changed = self.state.toggle_focused_window_layout();
+        if changed {
+            self.publish_astrea_toplevel_updates();
+            let _ = self.flush_wayland_clients();
+        }
+        changed
+    }
+
     pub fn mark_render_damage_presented(&mut self) {
         self.state.mark_render_damage_presented();
     }
@@ -957,8 +996,69 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn capture_surface_damage_presentation_for_surface_ids(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+    ) -> SurfaceDamagePresentation {
+        self.state
+            .capture_surface_damage_presentation_for_surface_ids(surface_ids)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_surface_damage_presentation_for_surface_ids_and_commit(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+        exact_surface_commit: Option<(u32, SurfaceCommitSequence)>,
+    ) -> SurfaceDamagePresentation {
+        self.state
+            .capture_surface_damage_presentation_for_surface_ids_and_commit(
+                surface_ids,
+                exact_surface_commit,
+            )
+    }
+
+    #[doc(hidden)]
+    pub fn capture_surface_damage_presentation_for_surface_commit(
+        &self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> SurfaceDamagePresentation {
+        self.state
+            .capture_surface_damage_presentation_for_surface_commit(surface_id, commit_sequence)
+    }
+
+    #[doc(hidden)]
+    pub fn set_frame_batch_surface_damage(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        surface_damage: SurfaceDamagePresentation,
+    ) {
+        self.state
+            .set_frame_batch_surface_damage(batch_id, surface_damage);
+    }
+
+    #[doc(hidden)]
+    pub fn set_prepared_frame_surface_damage(&mut self, surface_damage: SurfaceDamagePresentation) {
+        let batch_id = self
+            .state
+            .legacy_prepared_frame_batch
+            .expect("no prepared compositor frame batch for surface damage ownership");
+        self.state
+            .set_frame_batch_surface_damage(batch_id, surface_damage);
+    }
+
+    #[doc(hidden)]
     pub fn commit_surface_damage_presented(&mut self, token: SurfaceDamagePresentation) {
         self.state.commit_surface_damage_presented(token);
+    }
+
+    #[doc(hidden)]
+    pub fn commit_surface_damage_no_visual_change(&mut self, token: SurfaceDamagePresentation) {
+        self.state.commit_surface_damage_no_visual_change(token);
+    }
+
+    pub fn note_client_cursor_surface_sample(&self, hardware: bool) {
+        self.state.note_client_cursor_surface_sample(hardware);
     }
 
     pub fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {
@@ -1504,6 +1604,11 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
         self.state.buffer_release_metrics()
+    }
+
+    #[doc(hidden)]
+    pub fn shm_buffer_lifetime_metrics(&self) -> ShmBufferLifetimeMetrics {
+        self.state.shm_buffer_lifetime_metrics()
     }
 
     #[doc(hidden)]

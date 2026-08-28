@@ -83,6 +83,7 @@ fn take_embedded_cursor_owner(
             }
             Ok(Some(FrozenCursorPlaneOwner {
                 revision: owner.revision,
+                client_source_key: None,
                 capability_key: owner.capability_key,
                 pin: job.cursor_pin.take(),
             }))
@@ -114,6 +115,7 @@ fn take_embedded_cursor_owner(
             }
             Ok(Some(FrozenCursorPlaneOwner {
                 revision: owner.revision,
+                client_source_key: None,
                 capability_key: owner.capability_key,
                 pin: None,
             }))

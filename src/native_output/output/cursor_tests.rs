@@ -773,6 +773,56 @@ fn client_cursor_image_key_changes_for_output_scale() {
 }
 
 #[test]
+fn hardware_client_cursor_replacement_uses_new_commit_key_with_cached_buffer() {
+    let mut cursor = test_cursor();
+    let old_source_key = NativeCursorImageKey {
+        surface_id: 7,
+        buffer_id: 11,
+        commit_sequence: 100,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        width: 64,
+        height: 64,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    };
+    let source_key = NativeCursorImageKey {
+        surface_id: 7,
+        buffer_id: 11,
+        commit_sequence: 101,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        width: 64,
+        height: 64,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    };
+    cursor.source_key = NativeCursorSourceKey::Client(old_source_key);
+    let cached_buffer = cursor
+        .resources
+        .current
+        .take()
+        .expect("test cursor owns a cached buffer");
+    cursor.resources.client_cache = Some((source_key, cached_buffer));
+
+    let image = Arc::new(
+        CompositorCursorImage::from_argb8888(vec![0xff00_ff00; 64 * 64], 64, 64, 0, 0)
+            .expect("test cursor image is valid"),
+    );
+    let file = std::fs::File::open("/dev/null").expect("test file is available");
+    cursor
+        .replace_image(&file, image.clone(), source_key)
+        .expect("cached hardware cursor replacement succeeds");
+
+    assert_eq!(cursor.client_source_key(), Some(source_key));
+    assert!(Arc::ptr_eq(&cursor.image, &image));
+    assert_eq!(cursor.counters.image_cache_hits, 1);
+    assert_eq!(cursor.counters.client_image_uploads, 0);
+}
+
+#[test]
 fn hidden_cursor_image_changes_do_not_need_submission() {
     let mut cursor = test_cursor();
     cursor.desired.framebuffer_id = Some(99);

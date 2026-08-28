@@ -138,7 +138,7 @@ impl CompositorState {
             .filter(|window| {
                 Some(window.id) != excluded
                     && !window.state.is_minimized()
-                    && self.window_is_visible_in_active_workspace(window.id)
+                    && self.window_is_visible_in_active_scene(window.id)
             })
             .filter_map(|window| self.desktop_window_frame(window.id))
             .collect::<Vec<_>>();
@@ -224,6 +224,7 @@ impl CompositorState {
         &mut self,
         id: WindowId,
     ) -> Option<DesktopWindow> {
+        let _ = self.remove_tiled_window_from_layout(id);
         let window = self.desktop_windows.remove(&id)?;
         for child in self.desktop_windows.values_mut() {
             if child.relationships.parent == Some(id) {
@@ -497,6 +498,10 @@ impl CompositorState {
             .filter(|parent| !self.x11_transient_would_cycle(window_id, Some(*parent)));
         let transient_parent_id =
             accepted_transient_handle.and_then(|parent| self.window_id_for_x11_handle(parent));
+        let constraints_changed = matches!(
+            delta,
+            crate::xwayland::xwm::X11MetadataDelta::Constraints(_)
+        );
         let structure_dirty = matches!(
             delta,
             crate::xwayland::xwm::X11MetadataDelta::TransientFor(_)
@@ -506,9 +511,9 @@ impl CompositorState {
         let old_policy = self
             .window(window_id)
             .and_then(|window| window.x11_placement_policy);
-        let old_scene_visibility = self.window(window_id).is_some_and(|window| {
-            self.surface_is_visible_in_active_workspace(window.root_surface_id)
-        });
+        let old_scene_visibility = self
+            .window(window_id)
+            .is_some_and(|window| self.surface_is_visible_in_active_scene(window.root_surface_id));
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -585,9 +590,9 @@ impl CompositorState {
         }
         self.rebuild_x11_transient_relationships();
         self.reconcile_workspace_inheritance();
-        let new_scene_visibility = self.window(window_id).is_some_and(|window| {
-            self.surface_is_visible_in_active_workspace(window.root_surface_id)
-        });
+        let new_scene_visibility = self
+            .window(window_id)
+            .is_some_and(|window| self.surface_is_visible_in_active_scene(window.root_surface_id));
         if old_scene_visibility != new_scene_visibility {
             self.rebuild_active_scene_view();
             self.reconcile_idle_inhibition();
@@ -604,6 +609,9 @@ impl CompositorState {
             .and_then(|window| window.x11_placement_policy);
         if old_policy != new_policy {
             self.migrate_x11_placement_policy(window_id, old_policy, new_policy);
+        }
+        if constraints_changed {
+            let _ = self.reconcile_tiled_constraints(window_id);
         }
         true
     }

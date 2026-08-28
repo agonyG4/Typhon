@@ -78,11 +78,12 @@ mod task_05_8_tests {
         state
             .insert_desktop_window(DesktopWindow::new_xdg(second, 802))
             .expect("second window");
-        state.window_mut(second).expect("second window").management = Some(
-            WindowManagementState::new(WorkspaceId::new(2).expect("workspace two")),
-        );
-        state.renderable_surfaces.push(test_surface(801, 16, 16));
-        state.renderable_surfaces.push(test_surface(802, 16, 16));
+        state.window_mut(second).expect("second window").management =
+            Some(WindowManagementState::new(
+                crate::wm::WorkspaceLocation::Regular(WorkspaceId::new(2).expect("workspace two")),
+            ));
+        state.append_renderable_surface(test_surface(801, 16, 16));
+        state.append_renderable_surface(test_surface(802, 16, 16));
         state.rebuild_active_scene_view();
         let rebuilds = state.active_scene_rebuild_count();
 
@@ -102,6 +103,161 @@ mod task_05_8_tests {
     }
 
     #[test]
+    fn renderable_surface_index_survives_content_and_topology_mutations() {
+        let mut state = CompositorState::new(None);
+        state.append_renderable_surface(test_surface(801, 16, 16));
+        state.append_renderable_surface(test_surface(802, 16, 16));
+        state.assert_renderable_surface_index_invariant_for_test();
+
+        let mut replacement = test_surface(801, 32, 32);
+        replacement.generation = 2;
+        state.replace_renderable_surface(801, replacement);
+        state.assert_renderable_surface_index_invariant_for_test();
+
+        state.remove_renderable_surface(802);
+        state.assert_renderable_surface_index_invariant_for_test();
+
+        state.append_renderable_surface(test_surface(803, 16, 16));
+        state.renderable_surfaces.swap(0, 1);
+        state.rebuild_renderable_surface_index();
+        state.assert_renderable_surface_index_invariant_for_test();
+
+        assert_eq!(
+            state.renderable_surface(801).map(|surface| surface.width),
+            Some(32)
+        );
+        assert_eq!(state.renderable_surface_index(803), Some(0));
+    }
+
+    #[test]
+    fn active_scene_does_not_fallback_to_unindexed_renderables_when_empty() {
+        let mut state = CompositorState::new(None);
+        state.append_renderable_surface(test_surface(899, 16, 16));
+
+        assert!(state.active_scene_surfaces().is_empty());
+    }
+
+    #[test]
+    fn visible_special_workspace_is_an_overlay_selection_not_a_regular_workspace() {
+        let mut state = CompositorState::new(None);
+        let regular = state.allocate_window_id().expect("regular window id");
+        let special = state.allocate_window_id().expect("special window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(regular, 901))
+            .expect("regular window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(special, 902))
+            .expect("special window");
+        let special_id = crate::wm::SpecialWorkspaceId::DEFAULT;
+        state
+            .window_mut(special)
+            .expect("special window")
+            .management = Some(WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Special(special_id),
+        ));
+        state.append_renderable_surface(test_surface(902, 16, 16));
+        state.append_renderable_surface(test_surface(901, 16, 16));
+        state.workspace_manager.toggle_special_workspace(special_id);
+        state.rebuild_active_scene_view();
+
+        assert_eq!(state.active_workspace(), WorkspaceId::new(1).unwrap());
+        assert_eq!(
+            state
+                .active_scene_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [901, 902]
+        );
+    }
+
+    #[test]
+    fn visible_special_application_blocks_solitary_fullscreen_culling() {
+        let mut state = CompositorState::new(None);
+        let regular = state.allocate_window_id().expect("regular window id");
+        let special = state.allocate_window_id().expect("special window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(regular, 903))
+            .expect("regular window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(special, 904))
+            .expect("special window");
+        state
+            .window_mut(special)
+            .expect("special window")
+            .management = Some(WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+        ));
+        state.append_renderable_surface(test_surface(903, 16, 16));
+        state.append_renderable_surface(test_surface(904, 16, 16));
+
+        state.toggle_default_special_workspace();
+        assert!(state.has_visible_application_content_outside_fullscreen_owner(903));
+        assert_eq!(
+            state
+                .active_scene_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [903, 904]
+        );
+
+        state.toggle_default_special_workspace();
+        assert!(!state.has_visible_application_content_outside_fullscreen_owner(903));
+    }
+
+    #[test]
+    fn empty_special_selection_change_does_not_advance_scene_generation() {
+        let mut state = CompositorState::new(None);
+        let before_open = state.scene_render_generation;
+
+        state.toggle_default_special_workspace();
+        assert_eq!(state.scene_render_generation, before_open);
+
+        state.toggle_default_special_workspace();
+        assert_eq!(state.scene_render_generation, before_open);
+    }
+
+    #[test]
+    fn populated_special_selection_changes_scene_generation_once_each_direction() {
+        let mut state = CompositorState::new(None);
+        let special = state.allocate_window_id().expect("special window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(special, 905))
+            .expect("special window");
+        state
+            .window_mut(special)
+            .expect("special window")
+            .management = Some(WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+        ));
+        state.append_renderable_surface(test_surface(905, 16, 16));
+
+        let before_open = state.scene_render_generation;
+        state.toggle_default_special_workspace();
+        assert_eq!(state.scene_render_generation, before_open + 1);
+
+        let before_close = state.scene_render_generation;
+        state.toggle_default_special_workspace();
+        assert_eq!(state.scene_render_generation, before_close + 1);
+    }
+
+    #[test]
+    fn active_scene_update_separates_selection_from_visual_change() {
+        let mut state = CompositorState::new(None);
+        let initial = state.rebuild_active_scene_view();
+        assert!(!initial.selection_changed);
+        assert!(!initial.visual_scene_changed);
+
+        state
+            .workspace_manager
+            .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+        let empty_special = state.rebuild_active_scene_view();
+        assert!(empty_special.selection_changed);
+        assert!(!empty_special.visual_scene_changed);
+    }
+
+    #[test]
     fn hidden_surface_publication_advances_global_but_not_active_scene_generation() {
         let mut state = CompositorState::new(None);
         let first = state.allocate_window_id().expect("first window id");
@@ -112,11 +268,12 @@ mod task_05_8_tests {
         state
             .insert_desktop_window(DesktopWindow::new_xdg(second, 812))
             .expect("second window");
-        state.window_mut(second).expect("second window").management = Some(
-            WindowManagementState::new(WorkspaceId::new(2).expect("workspace two")),
-        );
-        state.renderable_surfaces.push(test_surface(811, 16, 16));
-        state.renderable_surfaces.push(test_surface(812, 16, 16));
+        state.window_mut(second).expect("second window").management =
+            Some(WindowManagementState::new(
+                crate::wm::WorkspaceLocation::Regular(WorkspaceId::new(2).expect("workspace two")),
+            ));
+        state.append_renderable_surface(test_surface(811, 16, 16));
+        state.append_renderable_surface(test_surface(812, 16, 16));
         state.rebuild_active_scene_view();
         let scene_before = state.scene_render_generation;
         let render_before = state.render_generation;
@@ -129,11 +286,7 @@ mod task_05_8_tests {
                 .expect("hidden surface");
             surface.generation = generation;
             surface.commit_sequence = SurfaceCommitSequence(generation);
-            state.publish_surface_generation(
-                812,
-                generation as u64,
-                RenderGenerationCause::SurfaceCommit,
-            );
+            state.publish_surface_generation(812, generation, RenderGenerationCause::SurfaceCommit);
         }
 
         assert!(state.render_generation > render_before);
@@ -148,6 +301,52 @@ mod task_05_8_tests {
         assert_eq!(state.scene_render_generation, scene_before + 1);
         assert_eq!(state.active_scene_surfaces()[0].surface_id, 812);
         assert_eq!(state.active_scene_surfaces()[0].generation, 4);
+    }
+
+    #[test]
+    fn hidden_only_window_stack_reorder_does_not_advance_active_scene_generation() {
+        let mut state = CompositorState::new(None);
+        let active = state.allocate_window_id().expect("active window id");
+        let hidden_first = state.allocate_window_id().expect("hidden window id");
+        let hidden_second = state.allocate_window_id().expect("hidden window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(active, 921))
+            .expect("active window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(hidden_first, 922))
+            .expect("hidden window");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(hidden_second, 923))
+            .expect("hidden window");
+        for window_id in [hidden_first, hidden_second] {
+            state
+                .window_mut(window_id)
+                .expect("hidden window")
+                .management = Some(WindowManagementState::new(
+                crate::wm::WorkspaceLocation::Regular(WorkspaceId::new(2).unwrap()),
+            ));
+        }
+        for surface in [
+            test_surface(921, 16, 16),
+            test_surface(922, 16, 16),
+            test_surface(923, 16, 16),
+        ] {
+            state.append_renderable_surface(surface);
+        }
+        state.window_stacking = vec![hidden_second, hidden_first, active];
+        state.rebuild_active_scene_view();
+        let scene_before = state.scene_render_generation;
+
+        assert!(state.reorder_renderable_surfaces_by_window_stack());
+        assert_eq!(state.scene_render_generation, scene_before);
+        assert_eq!(
+            state
+                .active_scene_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [921]
+        );
     }
 
     fn install_captured_snapshot(
@@ -178,9 +377,7 @@ mod task_05_8_tests {
         let mut state = CompositorState::default();
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
+        state.append_renderable_surface(test_surface(surface_id, 944, 502));
 
         assert!(state.preview_resize_root_window_to(
             surface_id,
@@ -213,15 +410,13 @@ mod task_05_8_tests {
         let mut state = CompositorState::default();
         let root_id = 42;
         let titlebar_id = 43;
-        state
-            .renderable_surfaces
-            .push(test_surface(root_id, 944, 502));
+        state.append_renderable_surface(test_surface(root_id, 944, 502));
         let mut titlebar = test_surface(titlebar_id, 944, 24);
         titlebar.placement = SurfacePlacement::subsurface(root_id, 0, -24);
         state
             .surface_placements
             .insert(titlebar_id, titlebar.placement);
-        state.renderable_surfaces.push(titlebar);
+        state.append_renderable_surface(titlebar);
         state
             .surface_window_geometries
             .insert(root_id, XdgWindowGeometry::new(0, -24, 944, 526));
@@ -534,9 +729,7 @@ mod task_05_8_tests {
         let mut state = CompositorState::default();
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
+        state.append_renderable_surface(test_surface(surface_id, 944, 502));
         state.toplevel_visual_geometries.insert(
             surface_id,
             ToplevelVisualGeometry {
@@ -581,9 +774,7 @@ mod task_05_8_tests {
     {
         let mut state = CompositorState::default();
         let surface_id = 42;
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
+        state.append_renderable_surface(test_surface(surface_id, 944, 502));
         state.toplevel_visual_geometries.insert(
             surface_id,
             ToplevelVisualGeometry {
@@ -615,9 +806,7 @@ mod task_05_8_tests {
     pub(in crate::compositor) fn inactive_visual_geometry_does_not_install_preview_clip() {
         let mut state = CompositorState::default();
         let surface_id = 42;
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
+        state.append_renderable_surface(test_surface(surface_id, 944, 502));
         state.toplevel_visual_geometries.insert(
             surface_id,
             ToplevelVisualGeometry {
@@ -644,9 +833,7 @@ mod task_05_8_tests {
         let mut state = CompositorState::default();
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
+        state.append_renderable_surface(test_surface(surface_id, 944, 502));
         state
             .surface_window_geometries
             .insert(surface_id, XdgWindowGeometry::new(16, 10, 944, 502));
@@ -685,13 +872,11 @@ mod task_05_8_tests {
         let root_id = 42;
         let child_id = 43;
         let interaction_id = ResizeInteractionId::new(1);
-        state
-            .renderable_surfaces
-            .push(test_surface(root_id, 944, 502));
+        state.append_renderable_surface(test_surface(root_id, 944, 502));
         let mut child = test_surface(child_id, 100, 40);
         child.placement = SurfacePlacement::subsurface(root_id, 12, 8);
         state.surface_placements.insert(child_id, child.placement);
-        state.renderable_surfaces.push(child);
+        state.append_renderable_surface(child);
         assert!(state.preview_resize_root_window_to(
             root_id,
             1000,

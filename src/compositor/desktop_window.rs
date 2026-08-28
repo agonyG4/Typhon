@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::core::WindowId;
-use crate::wm::{WindowManagementState, WorkspaceId};
+use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes};
 
@@ -114,6 +114,7 @@ pub struct DesktopWindow {
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
     pub(crate) management: Option<WindowManagementState>,
+    pub(crate) floating_geometry: Option<WindowGeometry>,
     pub state: WindowState,
     pub(crate) last_focus_serial: u64,
 }
@@ -131,7 +132,9 @@ impl DesktopWindow {
     pub(crate) fn refresh_workspace_membership(&mut self, workspace: WorkspaceId) {
         if self.is_workspace_managed() {
             if self.management.is_none() {
-                self.management = Some(WindowManagementState::new(workspace));
+                self.management = Some(WindowManagementState::new(WorkspaceLocation::Regular(
+                    workspace,
+                )));
             }
         } else {
             self.management = None;
@@ -180,6 +183,7 @@ impl DesktopWindow {
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
             management: None,
+            floating_geometry: None,
             state: WindowState::default(),
             last_focus_serial: 0,
         }
@@ -217,6 +221,7 @@ impl DesktopWindow {
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
             management: None,
+            floating_geometry: None,
             state: WindowState::default(),
             last_focus_serial: 0,
         }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::compositor::{WindowInteractionKind, WindowInteractionSource};
+use crate::compositor::{CurrentSurfaceBuffer, WindowInteractionKind, WindowInteractionSource};
 use crate::render_backend::buffer::BufferSize;
 
 #[test]
@@ -210,6 +210,97 @@ fn xwayland_repeated_intermediate_commits_preserve_visual_box() {
 }
 
 #[test]
+fn mapped_xwayland_content_commits_do_not_touch_global_topology() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 100, 100);
+
+    // Establish a settled same-geometry baseline. The fixture's default X11
+    // geometry is intentionally larger than its 2x2 test buffer, which is a
+    // pending visual-content state rather than the steady-state path tested
+    // here.
+    if let Some(visual) = fixture
+        .server
+        .state
+        .toplevel_visual_geometries
+        .get_mut(&fixture.surface_id)
+    {
+        visual.width = 2;
+        visual.height = 2;
+    }
+    fixture
+        .server
+        .state
+        .clear_pending_xwayland_visual_content_if_matching(fixture.surface_id);
+
+    let template = fixture
+        .server
+        .state
+        .renderable_surfaces
+        .first()
+        .cloned()
+        .expect("mapped XWayland surface");
+    for surface_id in 10_000..11_000 {
+        let mut unrelated = template.clone();
+        unrelated.surface_id = surface_id;
+        fixture.server.state.append_renderable_surface(unrelated);
+    }
+    let order_before = fixture
+        .server
+        .renderable_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let metrics_before = fixture.server.surface_locality_metrics();
+
+    for _ in 0..1_000 {
+        let pending = fixture
+            .server
+            .state
+            .current_surface_buffers
+            .get(&fixture.surface_id)
+            .cloned()
+            .expect("current XWayland buffer");
+        fixture.server.state.commit_xwayland_surface_buffer(
+            fixture.surface_id,
+            pending,
+            Vec::new(),
+            SurfacePublicationSource::Immediate,
+        );
+    }
+
+    let metrics_after = fixture.server.surface_locality_metrics();
+    let order_after = fixture
+        .server
+        .renderable_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_eq!(order_after, order_before);
+    assert_eq!(
+        metrics_after.xwayland_content_replacements - metrics_before.xwayland_content_replacements,
+        1_000
+    );
+    assert_eq!(
+        metrics_after.xwayland_topology_reorders - metrics_before.xwayland_topology_reorders,
+        0
+    );
+    assert_eq!(
+        metrics_after.xwayland_full_visual_reassignments
+            - metrics_before.xwayland_full_visual_reassignments,
+        0
+    );
+    assert_eq!(
+        metrics_after.global_renderable_index_rebuilds
+            - metrics_before.global_renderable_index_rebuilds,
+        0
+    );
+    assert_eq!(
+        metrics_after.content_indexed_lookups - metrics_before.content_indexed_lookups,
+        1_000
+    );
+}
+
+#[test]
 fn rapid_resize_visual_box_tracks_latest_pointer_while_content_is_throttled() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 100, 100);
@@ -381,7 +472,14 @@ fn xwayland_final_resize_keeps_backing_until_matching_content_commit() {
         .get(&fixture.surface_id)
         .cloned()
         .expect("current XWayland buffer after stale publication");
-    matching_pending.surface_size = Some(BufferSize::new(620, 480).expect("matching content"));
+    match &mut matching_pending {
+        CurrentSurfaceBuffer::Unmaterialized(pending) => {
+            pending.surface_size = Some(BufferSize::new(620, 480).expect("matching content"));
+        }
+        CurrentSurfaceBuffer::Materialized(materialized) => {
+            materialized.surface_size = Some(BufferSize::new(620, 480).expect("matching content"));
+        }
+    }
     fixture.server.state.commit_xwayland_surface_buffer(
         fixture.surface_id,
         matching_pending,

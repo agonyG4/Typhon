@@ -31,8 +31,8 @@ use crate::egl_renderer::{
 };
 use crate::native_output::runtime::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
-    direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
-    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
+    settle_no_visual_change_output_transaction,
 };
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
@@ -792,7 +792,6 @@ impl AtomicEglGbmScanout {
             }
         };
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
-        let surface_damage = server.capture_surface_damage_presentation();
         let transaction_id = match output_transactions.allocate_id() {
             Ok(transaction_id) => transaction_id,
             Err(error) => {
@@ -851,6 +850,7 @@ impl AtomicEglGbmScanout {
             resolved_snapshot,
             resolved_scene_signature,
             resolved_render_generation,
+            surface_damage,
         ) = {
             let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
             let resolved_snapshot = resolved_scene.snapshot();
@@ -883,6 +883,62 @@ impl AtomicEglGbmScanout {
                 resolved_scene_signature, expected_scene_signature,
                 "atomic damage and render must consume the same resolved native frame scene"
             );
+            let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
+            let exact_cursor_commit = cursor_mode
+                .is_software()
+                .then(|| server.client_cursor_render_state())
+                .flatten()
+                .map(|client_cursor| {
+                    (
+                        client_cursor.surface.surface_id,
+                        client_cursor.surface.commit_sequence,
+                    )
+                });
+            if frozen_cursor_plan.delivery
+                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+                && let Some(source_key) = frozen_cursor_plane_owner
+                    .as_ref()
+                    .and_then(|owner| owner.client_source_key)
+            {
+                sampled_surface_ids.push(source_key.surface_id);
+            }
+            let surface_damage = server
+                .capture_surface_damage_presentation_for_surface_ids_and_commit(
+                    sampled_surface_ids,
+                    exact_cursor_commit.or_else(|| {
+                        frozen_cursor_plane_owner
+                            .as_ref()
+                            .and_then(|owner| owner.client_source_key)
+                            .map(|source_key| {
+                                (
+                                    source_key.surface_id,
+                                    oblivion_one::compositor::SurfaceCommitSequence(
+                                        source_key.commit_sequence,
+                                    ),
+                                )
+                            })
+                    }),
+                );
+            let cursor_surface_id = match frozen_cursor_plan.delivery {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Software => {
+                    exact_cursor_commit.map(|(surface_id, _)| surface_id)
+                }
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
+                    frozen_cursor_plane_owner
+                        .as_ref()
+                        .and_then(|owner| owner.client_source_key)
+                        .map(|source_key| source_key.surface_id)
+                }
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
+            };
+            if let Some(surface_id) = cursor_surface_id
+                && surface_damage.contains_surface_id(surface_id)
+            {
+                server.note_client_cursor_surface_sample(
+                    frozen_cursor_plan.delivery
+                        == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+                );
+            }
             let outcome = self.render_to_slot(
                 slot,
                 renderer,
@@ -898,6 +954,7 @@ impl AtomicEglGbmScanout {
                 resolved_snapshot,
                 resolved_scene_signature,
                 resolved_scene.render_generation,
+                surface_damage,
             )
         };
         let parts = match render_outcome {
@@ -907,17 +964,17 @@ impl AtomicEglGbmScanout {
                 reason,
                 render_us,
             }) => {
-                settle_dropped_output_transaction(
+                settle_no_visual_change_output_transaction(
                     output_transactions,
                     transaction_id,
-                    OutputTransactionDropReason::NoVisualChange,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                     |obligations| {
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("skipped render transaction has no frame batch")
                         })?;
-                        server.restore_frame_batch_after_render_failure(batch_id);
                         self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        server.set_frame_batch_surface_damage(batch_id, surface_damage);
+                        server.complete_no_visual_change_frame_batch(batch_id);
                         Ok(())
                     },
                 )

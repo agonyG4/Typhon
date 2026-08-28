@@ -135,17 +135,36 @@ impl super::super::CompositorState {
             } else {
                 return None;
             };
-        let layout = DecorationLayout::for_window(
+        let chrome_policy = window
+            .management
+            .map_or(crate::wm::WindowChromePolicy::Full, |management| {
+                management.chrome_policy()
+            });
+        let layout = DecorationLayout::for_window_with_chrome_policy(
             visual_geometry.width,
             visual_geometry.height,
             decoration_mode,
             mode == ToplevelMode::Maximized,
             fullscreen,
+            chrome_policy,
             self.decoration_theme.metrics(),
         )?;
         let local_x = x - f64::from(root_origin.0) + f64::from(layout.client.x);
         let local_y = y - f64::from(root_origin.1) + f64::from(layout.client.y);
-        layout.hit_test(local_x, local_y)
+        layout.hit_test(local_x, local_y).or_else(|| {
+            let tiled_minimal = chrome_policy == crate::wm::WindowChromePolicy::Minimal
+                && window.management.is_some_and(|management| {
+                    management.layout() == crate::wm::LayoutMembership::Tiled
+                });
+            if !tiled_minimal {
+                return None;
+            }
+            let edge = layout.logical_resize_edge_at(local_x, local_y)?;
+            let edges = resize_edges_for_decoration_edge(edge);
+            self.prepare_tiled_resize(window_id, edges)
+                .is_some()
+                .then_some(DecorationHit::Resize(edge))
+        })
     }
 
     pub(in crate::compositor) fn decoration_theme_status(
@@ -414,12 +433,18 @@ impl super::super::CompositorState {
                 }
                 let visual_geometry =
                     self.current_visual_root_window_geometry(surface.surface_id)?;
-                let layout = DecorationLayout::for_window(
+                let chrome_policy = window
+                    .management
+                    .map_or(crate::wm::WindowChromePolicy::Full, |management| {
+                        management.chrome_policy()
+                    });
+                let layout = DecorationLayout::for_window_with_chrome_policy(
                     visual_geometry.width,
                     visual_geometry.height,
                     decoration_mode,
                     mode == ToplevelMode::Maximized,
                     fullscreen,
+                    chrome_policy,
                     metrics,
                 )?;
                 let (root_origin_x, root_origin_y) = origins.get(index).copied()?;
@@ -481,7 +506,12 @@ impl super::super::CompositorState {
             return [0; 4];
         }
         let mode = window.state.mode();
-        let Some(layout) = DecorationLayout::for_window(
+        let chrome_policy = window
+            .management
+            .map_or(crate::wm::WindowChromePolicy::Full, |management| {
+                management.chrome_policy()
+            });
+        let Some(layout) = DecorationLayout::for_window_with_chrome_policy(
             1,
             1,
             if mode == ToplevelMode::Fullscreen {
@@ -491,6 +521,7 @@ impl super::super::CompositorState {
             },
             mode == ToplevelMode::Maximized,
             mode == ToplevelMode::Fullscreen,
+            chrome_policy,
             self.decoration_theme.metrics(),
         ) else {
             return [0; 4];

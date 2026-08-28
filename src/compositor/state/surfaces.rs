@@ -1,6 +1,150 @@
 use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
+    pub(in crate::compositor) fn renderable_surface_index(&self, surface_id: u32) -> Option<usize> {
+        let mut metrics = self.locality_metrics.get();
+        metrics.global_indexed_lookups = metrics.global_indexed_lookups.saturating_add(1);
+        self.locality_metrics.set(metrics);
+        self.renderable_surface_indices.get(&surface_id).copied()
+    }
+
+    pub(in crate::compositor) fn content_renderable_surface_index(
+        &self,
+        surface_id: u32,
+    ) -> Option<usize> {
+        let mut metrics = self.locality_metrics.get();
+        metrics.content_indexed_lookups = metrics.content_indexed_lookups.saturating_add(1);
+        self.locality_metrics.set(metrics);
+        self.renderable_surface_index(surface_id)
+    }
+
+    pub(in crate::compositor) fn renderable_surface(
+        &self,
+        surface_id: u32,
+    ) -> Option<&RenderableSurface> {
+        self.renderable_surface_index(surface_id)
+            .and_then(|index| self.renderable_surfaces.get(index))
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::compositor) fn renderable_surface_mut(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<&mut RenderableSurface> {
+        let index = self.renderable_surface_index(surface_id)?;
+        self.renderable_surfaces.get_mut(index)
+    }
+
+    pub(in crate::compositor) fn append_renderable_surface(&mut self, surface: RenderableSurface) {
+        assert!(
+            !self
+                .renderable_surface_indices
+                .contains_key(&surface.surface_id),
+            "duplicate RenderableSurface ID appended"
+        );
+        let index = self.renderable_surfaces.len();
+        let surface_id = surface.surface_id;
+        self.renderable_surfaces.push(surface);
+        self.renderable_surface_indices.insert(surface_id, index);
+    }
+
+    pub(in crate::compositor) fn replace_renderable_surface(
+        &mut self,
+        surface_id: u32,
+        surface: RenderableSurface,
+    ) -> Option<RenderableSurface> {
+        assert_eq!(surface.surface_id, surface_id);
+        let index = self.renderable_surface_indices.get(&surface_id).copied()?;
+        Some(std::mem::replace(
+            &mut self.renderable_surfaces[index],
+            surface,
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::compositor) fn remove_renderable_surface(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<RenderableSurface> {
+        let index = self.renderable_surface_indices.get(&surface_id).copied()?;
+        let removed = self.renderable_surfaces.remove(index);
+        self.rebuild_renderable_surface_index();
+        Some(removed)
+    }
+
+    pub(in crate::compositor) fn retain_renderable_surfaces(
+        &mut self,
+        mut keep: impl FnMut(&RenderableSurface) -> bool,
+    ) -> bool {
+        let previous_len = self.renderable_surfaces.len();
+        self.renderable_surfaces.retain(|surface| keep(surface));
+        let changed = previous_len != self.renderable_surfaces.len();
+        if changed {
+            self.rebuild_renderable_surface_index();
+        }
+        changed
+    }
+
+    pub(in crate::compositor) fn rebuild_renderable_surface_index(&mut self) {
+        self.renderable_surface_indices = self
+            .renderable_surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| (surface.surface_id, index))
+            .collect();
+        let mut metrics = self.locality_metrics.get();
+        metrics.global_renderable_index_rebuilds =
+            metrics.global_renderable_index_rebuilds.saturating_add(1);
+        self.locality_metrics.set(metrics);
+        #[cfg(any(test, debug_assertions))]
+        self.assert_renderable_surface_index_invariant();
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_renderable_surface_index_invariant(&self) {
+        assert_eq!(
+            self.renderable_surface_indices.len(),
+            self.renderable_surfaces.len(),
+            "global RenderableSurface index length mismatch"
+        );
+        for (index, surface) in self.renderable_surfaces.iter().enumerate() {
+            assert_eq!(
+                self.renderable_surface_indices.get(&surface.surface_id),
+                Some(&index),
+                "global RenderableSurface index points at the wrong position"
+            );
+        }
+        for (surface_id, index) in &self.renderable_surface_indices {
+            assert_eq!(
+                self.renderable_surfaces
+                    .get(*index)
+                    .map(|surface| surface.surface_id),
+                Some(*surface_id),
+                "global RenderableSurface index contains a stale entry"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn assert_renderable_surface_index_invariant_for_test(&self) {
+        self.assert_renderable_surface_index_invariant();
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn presentation_global_scan_count_for_test(&self) -> u64 {
+        self.locality_metrics.get().presentation_global_scans
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn presentation_sampled_entry_count_for_test(&self) -> u64 {
+        self.locality_metrics.get().presentation_sampled_entries
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn presentation_journal_lookup_count_for_test(&self) -> u64 {
+        self.locality_metrics.get().presentation_journal_lookups
+    }
+
     pub(in crate::compositor) const fn output_dimensions(&self) -> (u32, u32) {
         (self.output_size.width, self.output_size.height)
     }
@@ -30,9 +174,9 @@ impl CompositorState {
         if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
             let current = self.current_surface_buffers.get(&surface_id);
             let buffer_size =
-                current.and_then(|buffer| buffer.data.width().ok().zip(buffer.data.height().ok()));
+                current.and_then(|buffer| buffer.width().ok().zip(buffer.height().ok()));
             let buffer_id = (!has_attachment_change)
-                .then(|| current.map(|buffer| buffer.data.buffer_id().get()))
+                .then(|| current.map(|buffer| buffer.buffer_id().get()))
                 .flatten();
             let association_serial = self
                 .xwayland
@@ -313,6 +457,9 @@ impl CompositorState {
     pub(in crate::compositor) fn capture_surface_damage_presentation(
         &self,
     ) -> SurfaceDamagePresentation {
+        let mut metrics = self.locality_metrics.get();
+        metrics.presentation_global_scans = metrics.presentation_global_scans.saturating_add(1);
+        self.locality_metrics.set(metrics);
         let mut sampled_commits = Vec::new();
         for surface_id in self
             .renderable_surfaces
@@ -348,39 +495,153 @@ impl CompositorState {
         &self,
         surface_id: u32,
     ) -> SurfaceDamagePresentation {
+        self.capture_surface_damage_presentation_for_surface_ids([surface_id])
+    }
+
+    pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface_ids(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+    ) -> SurfaceDamagePresentation {
+        let mut sampled = HashSet::new();
+        let mut sampled_commits = Vec::new();
+        for surface_id in surface_ids {
+            self.append_surface_damage_sample(surface_id, None, &mut sampled, &mut sampled_commits);
+        }
+        SurfaceDamagePresentation { sampled_commits }
+    }
+
+    pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface_ids_and_commit(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+        exact_surface_commit: Option<(u32, SurfaceCommitSequence)>,
+    ) -> SurfaceDamagePresentation {
+        let mut sampled = HashSet::new();
+        let mut sampled_commits = Vec::new();
+        // An exact commit is a frozen render-time identity. Give it precedence
+        // over the current journal entry if a caller includes the same surface
+        // in the primary scene list as well.
+        if let Some((surface_id, commit_sequence)) = exact_surface_commit {
+            self.append_surface_damage_sample(
+                surface_id,
+                Some(commit_sequence),
+                &mut sampled,
+                &mut sampled_commits,
+            );
+        }
+        for surface_id in surface_ids {
+            self.append_surface_damage_sample(surface_id, None, &mut sampled, &mut sampled_commits);
+        }
+        SurfaceDamagePresentation { sampled_commits }
+    }
+
+    fn append_surface_damage_sample(
+        &self,
+        surface_id: u32,
+        commit_sequence: Option<SurfaceCommitSequence>,
+        sampled: &mut HashSet<u32>,
+        sampled_commits: &mut Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
+    ) {
+        if !sampled.insert(surface_id) {
+            return;
+        }
         let Some(generation) = self
             .surface_presentation_generations
             .get(&surface_id)
             .copied()
         else {
-            return SurfaceDamagePresentation {
-                sampled_commits: Vec::new(),
-            };
+            return;
         };
-        let Some(commit) = self
-            .surface_damage_journals
-            .get(&surface_id)
-            .map(SurfaceDamageJournal::current_commit)
-        else {
-            return SurfaceDamagePresentation {
-                sampled_commits: Vec::new(),
-            };
+        let Some(journal) = self.surface_damage_journals.get(&surface_id) else {
+            return;
         };
-        SurfaceDamagePresentation {
-            sampled_commits: vec![(
-                SurfacePresentationKey {
-                    surface_id,
-                    generation,
-                },
-                commit,
-            )],
+        let commit = match commit_sequence {
+            Some(commit_sequence) => journal.commit_counter_for_sequence(commit_sequence),
+            None => Some(journal.current_commit()),
+        };
+        let Some(commit) = commit else {
+            return;
+        };
+        let mut metrics = self.locality_metrics.get();
+        metrics.presentation_journal_lookups =
+            metrics.presentation_journal_lookups.saturating_add(1);
+        metrics.presentation_sampled_entries =
+            metrics.presentation_sampled_entries.saturating_add(1);
+        self.locality_metrics.set(metrics);
+        sampled_commits.push((
+            SurfacePresentationKey {
+                surface_id,
+                generation,
+            },
+            commit,
+        ));
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn surface_locality_metrics_for_test(
+        &self,
+    ) -> SurfaceLocalityMetrics {
+        self.locality_metrics.get()
+    }
+
+    pub(in crate::compositor) fn note_client_cursor_surface_sample(&self, hardware: bool) {
+        let mut metrics = self.locality_metrics.get();
+        if hardware {
+            metrics.cursor_surface_samples_hardware =
+                metrics.cursor_surface_samples_hardware.saturating_add(1);
+        } else {
+            metrics.cursor_surface_samples_software =
+                metrics.cursor_surface_samples_software.saturating_add(1);
         }
+        self.locality_metrics.set(metrics);
+    }
+
+    pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface_commit(
+        &self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> SurfaceDamagePresentation {
+        self.capture_surface_damage_presentation_for_surface_ids_and_commit(
+            [],
+            Some((surface_id, commit_sequence)),
+        )
     }
     pub(in crate::compositor) fn commit_surface_damage_presented(
         &mut self,
         token: SurfaceDamagePresentation,
     ) {
+        self.settle_surface_damage(token, SurfaceDamageSettlement::Presented);
+    }
+    pub(in crate::compositor) fn commit_surface_damage_no_visual_change(
+        &mut self,
+        token: SurfaceDamagePresentation,
+    ) {
+        self.settle_surface_damage(token, SurfaceDamageSettlement::NoVisualChange);
+    }
+    fn settle_surface_damage(
+        &mut self,
+        token: SurfaceDamagePresentation,
+        settlement: SurfaceDamageSettlement,
+    ) {
+        let sampled_entries = token.sampled_commits.len() as u64;
+        let mut metrics = self.locality_metrics.get();
+        match settlement {
+            SurfaceDamageSettlement::Presented => {
+                metrics.surface_damage_settlement_presented = metrics
+                    .surface_damage_settlement_presented
+                    .saturating_add(sampled_entries);
+            }
+            SurfaceDamageSettlement::NoVisualChange => {
+                metrics.surface_damage_settlement_no_visual_change = metrics
+                    .surface_damage_settlement_no_visual_change
+                    .saturating_add(sampled_entries);
+            }
+        }
+        self.locality_metrics.set(metrics);
         for (key, sampled_commit) in token.sampled_commits {
+            let mut metrics = self.locality_metrics.get();
+            metrics.presentation_settlement_entries =
+                metrics.presentation_settlement_entries.saturating_add(1);
+            self.locality_metrics.set(metrics);
             if self
                 .surface_presentation_generations
                 .get(&key.surface_id)
@@ -389,21 +650,40 @@ impl CompositorState {
             {
                 continue;
             }
-            self.presented_surface_commits
-                .insert(key.surface_id, sampled_commit);
             let Some(journal) = self.surface_damage_journals.get(&key.surface_id) else {
                 continue;
             };
-            for surface in self
-                .renderable_surfaces
-                .iter_mut()
-                .filter(|surface| surface.surface_id == key.surface_id)
-                .chain(
-                    self.client_cursor_surfaces
-                        .values_mut()
-                        .filter(|surface| surface.surface_id == key.surface_id),
-                )
+            if self
+                .presented_surface_commits
+                .get(&key.surface_id)
+                .is_some_and(|presented| sampled_commit < *presented)
             {
+                continue;
+            }
+            self.presented_surface_commits
+                .insert(key.surface_id, sampled_commit);
+            let mut metrics = self.locality_metrics.get();
+            metrics.presentation_settlement_journal_lookups = metrics
+                .presentation_settlement_journal_lookups
+                .saturating_add(1);
+            self.locality_metrics.set(metrics);
+            if let Some(index) = self
+                .renderable_surface_indices
+                .get(&key.surface_id)
+                .copied()
+            {
+                if let Some(surface) = self.renderable_surfaces.get_mut(index) {
+                    surface.damage = match journal.damage_since(
+                        sampled_commit,
+                        surface.buffer_size().width,
+                        surface.buffer_size().height,
+                    ) {
+                        DamageSince::Empty => RenderableSurfaceDamage::Empty,
+                        DamageSince::Known(damage) => damage,
+                        DamageSince::HistoryLost => RenderableSurfaceDamage::Full,
+                    };
+                }
+            } else if let Some(surface) = self.client_cursor_surfaces.get_mut(&key.surface_id) {
                 surface.damage = match journal.damage_since(
                     sampled_commit,
                     surface.buffer_size().width,
@@ -420,6 +700,7 @@ impl CompositorState {
         let token = self.capture_surface_damage_presentation();
         self.commit_surface_damage_presented(token);
     }
+    #[allow(dead_code)]
     pub(in crate::compositor) fn record_surface_damage_commit(
         &mut self,
         surface_id: u32,
@@ -427,10 +708,21 @@ impl CompositorState {
         width: u32,
         height: u32,
     ) {
+        self.record_surface_damage_commit_at(surface_id, None, damage, width, height);
+    }
+
+    pub(in crate::compositor) fn record_surface_damage_commit_at(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: Option<SurfaceCommitSequence>,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) {
         self.surface_damage_journals
             .entry(surface_id)
             .or_insert_with(|| SurfaceDamageJournal::new(64))
-            .record(damage, width, height);
+            .record_with_sequence(commit_sequence, damage, width, height);
     }
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
         let mut state = Self {
@@ -536,10 +828,39 @@ impl CompositorState {
         cause: RenderGenerationCause,
         scene_effect: bool,
     ) -> u64 {
+        if self.layout_batch_depth > 0 {
+            self.layout_batch_scene_effect |= scene_effect;
+            return self.next_render_generation_value();
+        }
         let generation = self.next_render_generation_value();
         self.set_render_generation_with_scene_effect(generation, cause, scene_effect);
         self.update_all_active_confined_pointer_regions(cause.as_str());
         generation
+    }
+
+    pub(in crate::compositor) fn begin_layout_reflow_batch(&mut self) {
+        self.layout_batch_depth = self.layout_batch_depth.saturating_add(1);
+        if self.layout_batch_depth == 1 {
+            self.layout_batch_scene_effect = false;
+        }
+    }
+
+    pub(in crate::compositor) fn finish_layout_reflow_batch(&mut self) -> bool {
+        debug_assert!(self.layout_batch_depth > 0);
+        self.layout_batch_depth = self.layout_batch_depth.saturating_sub(1);
+        if self.layout_batch_depth > 0 {
+            return false;
+        }
+        let scene_effect = self.layout_batch_scene_effect;
+        self.layout_batch_scene_effect = false;
+        if scene_effect {
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::LayoutReflow,
+                true,
+            );
+            self.layout_generation = self.layout_generation.next();
+        }
+        scene_effect
     }
 
     pub(in crate::compositor) fn render_generation_cause(&self) -> RenderGenerationCause {
@@ -564,7 +885,7 @@ impl CompositorState {
         self.output_size = output_size;
         self.send_output_mode_to_bound_outputs();
         self.reconfigure_layer_surfaces_for_output_change();
-        self.reconfigure_stateful_windows_for_output_size();
+        let _ = self.reflow_usable_output_geometry();
         true
     }
 
@@ -792,10 +1113,7 @@ impl CompositorState {
         reason: SurfaceTeardownReason,
     ) -> SurfaceTeardownResult {
         let resource_known = self.surface_resources.contains_key(&surface_id)
-            || self
-                .renderable_surfaces
-                .iter()
-                .any(|surface| surface.surface_id == surface_id);
+            || self.renderable_surface_index(surface_id).is_some();
         let before = self.renderable_surfaces.len();
         self.unregister_surface_resource_with_reason(surface_id, reason);
         let removed = before.saturating_sub(self.renderable_surfaces.len());
@@ -899,7 +1217,7 @@ impl CompositorState {
         self.unregister_fractional_scale_resources_for_surface(surface_id);
         self.surface_placements.remove(&surface_id);
         self.xwayland.retired_surface_ids.remove(&surface_id);
-        self.current_surface_buffers.remove(&surface_id);
+        self.remove_current_surface_buffer(surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
         self.xdg_surface_resources.remove(&surface_id);
@@ -937,7 +1255,7 @@ impl CompositorState {
             }
         }
         let previous_renderable_count = self.renderable_surfaces.len();
-        self.renderable_surfaces.retain(|surface| {
+        self.retain_renderable_surfaces(|surface| {
             surface.surface_id != surface_id
                 && surface.placement.parent_surface_id != Some(surface_id)
         });
@@ -989,6 +1307,40 @@ impl CompositorState {
 #[cfg(test)]
 mod ordered_publication_tests {
     use super::*;
+    use crate::render_backend::buffer::CommittedSurfaceBuffer;
+
+    fn test_cursor_surface(
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> RenderableSurface {
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("cursor buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence,
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(2, 2).expect("cursor size"),
+                vec![0; 4],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
 
     #[test]
     fn ordered_ready_commit_ignores_newer_received_attachment() {
@@ -1103,6 +1455,230 @@ mod ordered_publication_tests {
     }
 
     #[test]
+    fn exact_surface_commit_capture_does_not_consume_a_newer_commit() {
+        let mut state = CompositorState::default();
+        state.surface_presentation_generations.insert(7, 1);
+        let mut journal = SurfaceDamageJournal::new(8);
+        let sampled = journal.record_for_surface_commit(
+            SurfaceCommitSequence(41),
+            RenderableSurfaceDamage::Full,
+            100,
+            80,
+        );
+        let newer = journal.record_for_surface_commit(
+            SurfaceCommitSequence(42),
+            RenderableSurfaceDamage::Full,
+            100,
+            80,
+        );
+        state.surface_damage_journals.insert(7, journal);
+
+        let token = state
+            .capture_surface_damage_presentation_for_surface_commit(7, SurfaceCommitSequence(41));
+        assert_eq!(token.sampled_commits[0].1, sampled);
+        state.commit_surface_damage_presented(token);
+
+        assert_eq!(state.presented_surface_commits.get(&7), Some(&sampled));
+        assert!(matches!(
+            state.surface_damage_journals[&7].damage_since(sampled, 100, 80),
+            DamageSince::Known(RenderableSurfaceDamage::Full)
+        ));
+        assert_ne!(sampled, newer);
+    }
+
+    #[test]
+    fn older_pageflip_cannot_regress_presented_surface_commit() {
+        let mut state = CompositorState::default();
+        state.surface_presentation_generations.insert(7, 1);
+        let mut journal = SurfaceDamageJournal::new(8);
+        let old = journal.record_for_surface_commit(
+            SurfaceCommitSequence(41),
+            RenderableSurfaceDamage::Full,
+            100,
+            80,
+        );
+        let new = journal.record_for_surface_commit(
+            SurfaceCommitSequence(42),
+            RenderableSurfaceDamage::Full,
+            100,
+            80,
+        );
+        state.surface_damage_journals.insert(7, journal);
+
+        let new_token = state
+            .capture_surface_damage_presentation_for_surface_commit(7, SurfaceCommitSequence(42));
+        state.commit_surface_damage_presented(new_token);
+        let old_token = state
+            .capture_surface_damage_presentation_for_surface_commit(7, SurfaceCommitSequence(41));
+        state.commit_surface_damage_presented(old_token);
+
+        assert_eq!(state.presented_surface_commits.get(&7), Some(&new));
+        assert_ne!(old, new);
+    }
+
+    #[test]
+    fn exact_cursor_commit_settles_only_the_frozen_cursor_content() {
+        let mut state = CompositorState::default();
+        let surface_id = 77;
+        state.surface_presentation_generations.insert(surface_id, 1);
+        state.client_cursor_surfaces.insert(
+            surface_id,
+            test_cursor_surface(surface_id, SurfaceCommitSequence(41)),
+        );
+        let mut journal = SurfaceDamageJournal::new(8);
+        let sampled = journal.record_for_surface_commit(
+            SurfaceCommitSequence(41),
+            RenderableSurfaceDamage::Full,
+            2,
+            2,
+        );
+        journal.record_for_surface_commit(
+            SurfaceCommitSequence(42),
+            RenderableSurfaceDamage::Full,
+            2,
+            2,
+        );
+        state.surface_damage_journals.insert(surface_id, journal);
+
+        let token = state.capture_surface_damage_presentation_for_surface_commit(
+            surface_id,
+            SurfaceCommitSequence(41),
+        );
+        state
+            .client_cursor_surfaces
+            .get_mut(&surface_id)
+            .unwrap()
+            .commit_sequence = SurfaceCommitSequence(42);
+        state.commit_surface_damage_presented(token);
+
+        assert_eq!(
+            state.presented_surface_commits.get(&surface_id),
+            Some(&sampled)
+        );
+        assert_eq!(
+            state.client_cursor_surfaces[&surface_id].commit_sequence,
+            SurfaceCommitSequence(42)
+        );
+        assert_eq!(
+            state.client_cursor_surfaces[&surface_id].damage,
+            RenderableSurfaceDamage::Full
+        );
+    }
+
+    #[test]
+    fn composed_frame_token_owns_exact_primary_and_client_cursor_commits() {
+        let mut state = CompositorState::default();
+        let primary_id = 11;
+        let cursor_id = 77;
+        state.surface_presentation_generations.insert(primary_id, 1);
+        state.surface_presentation_generations.insert(cursor_id, 1);
+        state.client_cursor_surfaces.insert(
+            cursor_id,
+            test_cursor_surface(cursor_id, SurfaceCommitSequence(41)),
+        );
+
+        let mut primary_journal = SurfaceDamageJournal::new(8);
+        let primary_commit = primary_journal.record_for_surface_commit(
+            SurfaceCommitSequence(9),
+            RenderableSurfaceDamage::Full,
+            100,
+            80,
+        );
+        state
+            .surface_damage_journals
+            .insert(primary_id, primary_journal);
+
+        let mut cursor_journal = SurfaceDamageJournal::new(8);
+        let cursor_commit = cursor_journal.record_for_surface_commit(
+            SurfaceCommitSequence(41),
+            RenderableSurfaceDamage::Full,
+            2,
+            2,
+        );
+        cursor_journal.record_for_surface_commit(
+            SurfaceCommitSequence(42),
+            RenderableSurfaceDamage::Full,
+            2,
+            2,
+        );
+        state
+            .surface_damage_journals
+            .insert(cursor_id, cursor_journal);
+
+        let token = state.capture_surface_damage_presentation_for_surface_ids_and_commit(
+            [primary_id],
+            Some((cursor_id, SurfaceCommitSequence(41))),
+        );
+        assert_eq!(
+            token.sampled_surface_ids_for_test(),
+            vec![cursor_id, primary_id]
+        );
+        assert_eq!(token.sampled_commits[0].1, cursor_commit);
+        assert_eq!(token.sampled_commits[1].1, primary_commit);
+
+        state
+            .client_cursor_surfaces
+            .get_mut(&cursor_id)
+            .expect("cursor surface remains mapped")
+            .commit_sequence = SurfaceCommitSequence(42);
+        state.commit_surface_damage_presented(token);
+
+        assert_eq!(
+            state.presented_surface_commits.get(&primary_id),
+            Some(&primary_commit)
+        );
+        assert_eq!(
+            state.presented_surface_commits.get(&cursor_id),
+            Some(&cursor_commit)
+        );
+        assert_eq!(
+            state.client_cursor_surfaces[&cursor_id].commit_sequence,
+            SurfaceCommitSequence(42)
+        );
+        assert_eq!(
+            state.client_cursor_surfaces[&cursor_id].damage,
+            RenderableSurfaceDamage::Full
+        );
+    }
+
+    #[test]
+    fn presentation_capture_and_settlement_scale_with_sample_count() {
+        let mut state = CompositorState::default();
+        for surface_id in 1..=1_000 {
+            state.surface_presentation_generations.insert(surface_id, 1);
+            let mut journal = SurfaceDamageJournal::new(4);
+            journal.record(RenderableSurfaceDamage::Full, 10, 10);
+            state.surface_damage_journals.insert(surface_id, journal);
+        }
+        let before = state.surface_locality_metrics_for_test();
+        let token = state.capture_surface_damage_presentation_for_surface_ids([7, 17, 27, 37]);
+        state.commit_surface_damage_presented(token);
+        let after = state.surface_locality_metrics_for_test();
+
+        assert_eq!(
+            after.presentation_sampled_entries - before.presentation_sampled_entries,
+            4
+        );
+        assert_eq!(
+            after.presentation_journal_lookups - before.presentation_journal_lookups,
+            4
+        );
+        assert_eq!(
+            after.presentation_settlement_entries - before.presentation_settlement_entries,
+            4
+        );
+        assert_eq!(
+            after.presentation_settlement_journal_lookups
+                - before.presentation_settlement_journal_lookups,
+            4
+        );
+        assert_eq!(
+            after.presentation_global_scans - before.presentation_global_scans,
+            0
+        );
+    }
+
+    #[test]
     fn abandoned_damage_capture_remains_unpresented_and_pending() {
         let mut state = CompositorState::default();
         state.surface_presentation_generations.insert(7, 1);
@@ -1149,6 +1725,47 @@ mod ordered_publication_tests {
             Some(&direct_commit)
         );
         assert!(!state.presented_surface_commits.contains_key(&8));
+    }
+
+    #[test]
+    fn filtered_surface_damage_capture_is_keyed_and_deduplicated() {
+        let mut state = CompositorState::default();
+        for surface_id in 1..=1_000 {
+            state.surface_presentation_generations.insert(surface_id, 1);
+            let mut journal = SurfaceDamageJournal::new(4);
+            journal.record(RenderableSurfaceDamage::Full, 10, 10);
+            state.surface_damage_journals.insert(surface_id, journal);
+        }
+
+        let token = state.capture_surface_damage_presentation_for_surface_ids([7, 7, 8, 9]);
+
+        assert_eq!(token.sampled_surface_ids_for_test(), vec![7, 8, 9]);
+        assert_eq!(state.presentation_global_scan_count_for_test(), 0);
+        assert_eq!(state.presentation_sampled_entry_count_for_test(), 3);
+        assert_eq!(state.presentation_journal_lookup_count_for_test(), 3);
+    }
+
+    #[test]
+    fn presentation_capture_follows_the_final_resolved_surface_set() {
+        let mut state = CompositorState::default();
+        for surface_id in 1..=1_000 {
+            state.surface_presentation_generations.insert(surface_id, 1);
+            let mut journal = SurfaceDamageJournal::new(4);
+            journal.record(RenderableSurfaceDamage::Full, 10, 10);
+            state.surface_damage_journals.insert(surface_id, journal);
+        }
+
+        // This is the final scene authority after workspace selection,
+        // fullscreen culling, and popup/subsurface expansion have completed.
+        let final_resolved_surface_ids = [7, 17, 27, 37, 47, 57];
+        let token =
+            state.capture_surface_damage_presentation_for_surface_ids(final_resolved_surface_ids);
+
+        assert_eq!(
+            token.sampled_surface_ids_for_test(),
+            final_resolved_surface_ids
+        );
+        assert_eq!(state.presentation_global_scan_count_for_test(), 0);
     }
 
     #[test]

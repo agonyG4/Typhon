@@ -499,6 +499,7 @@ impl NativeRuntime {
                 // Continue through protocol and input dispatch so a primary
                 // producer can be observed and scheduled immediately.
                 if let Some(transaction_id) = cursor_transaction_id {
+                    let cursor_surface_damage = output_transactions.surface_damage(transaction_id);
                     complete_presented_output_transaction(
                         output_transactions,
                         &mut self.presentation_trace,
@@ -510,6 +511,9 @@ impl NativeRuntime {
                         None,
                         |obligations| {
                             debug_assert!(obligations.frame_batch_id().is_none());
+                            if let Some(surface_damage) = cursor_surface_damage {
+                                server.commit_surface_damage_presented(surface_damage);
+                            }
                             let _ = complete_plane_delta_pageflip(
                                 atomic_cursor,
                                 pageflip.user_data,
@@ -1188,6 +1192,10 @@ impl NativeRuntime {
                         .and_then(|(_, cursor, _, _)| cursor.as_ref())
                         .filter(|(_, sidecar, _, _, _)| *sidecar)
                         .and_then(|(_, _, transaction_id, _, _)| *transaction_id);
+                    let sidecar_surface_damage =
+                        sidecar_transaction_id.and_then(|transaction_id| {
+                            output_transactions.surface_damage(transaction_id)
+                        });
                     let worker_identity = worker_promotion
                         .as_ref()
                         .map(|(_, _, _, identity)| *identity)
@@ -1213,6 +1221,9 @@ impl NativeRuntime {
                             |obligations| {
                                 debug_assert!(obligations.frame_batch_id().is_none());
                                 debug_assert!(obligations.direct_surface_id().is_none());
+                                if let Some(surface_damage) = sidecar_surface_damage {
+                                    server.commit_surface_damage_presented(surface_damage);
+                                }
                                 Ok(())
                             },
                         )?;

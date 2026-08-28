@@ -31,6 +31,7 @@ pub enum DamageSince {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SurfaceDamageEntry {
     commit: SurfaceCommitCounter,
+    commit_sequence: Option<SurfaceCommitSequence>,
     damage: RenderableSurfaceDamage,
 }
 
@@ -60,15 +61,47 @@ impl SurfaceDamageJournal {
         width: u32,
         height: u32,
     ) -> SurfaceCommitCounter {
+        self.record_with_sequence(None, damage, width, height)
+    }
+
+    pub fn record_for_surface_commit(
+        &mut self,
+        commit_sequence: SurfaceCommitSequence,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) -> SurfaceCommitCounter {
+        self.record_with_sequence(Some(commit_sequence), damage, width, height)
+    }
+
+    pub(crate) fn record_with_sequence(
+        &mut self,
+        commit_sequence: Option<SurfaceCommitSequence>,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) -> SurfaceCommitCounter {
         self.current_commit = SurfaceCommitCounter(self.current_commit.0.wrapping_add(1).max(1));
         self.entries.push_back(SurfaceDamageEntry {
             commit: self.current_commit,
+            commit_sequence,
             damage: damage.normalized_for_surface(width, height),
         });
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
         }
         self.current_commit
+    }
+
+    pub fn commit_counter_for_sequence(
+        &self,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> Option<SurfaceCommitCounter> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.commit_sequence == Some(commit_sequence))
+            .map(|entry| entry.commit)
     }
 
     pub fn damage_since(
@@ -269,10 +302,6 @@ impl RenderableSurface {
 
     pub const fn buffer_size(&self) -> BufferSize {
         self.buffer.size()
-    }
-
-    pub(super) fn shm_pixels_mut(&mut self) -> Option<&mut Vec<u32>> {
-        self.buffer.shm_pixels_mut()
     }
 }
 

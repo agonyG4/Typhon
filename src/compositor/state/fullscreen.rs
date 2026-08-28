@@ -156,7 +156,7 @@ impl CompositorState {
                 software_cursor_visible: false,
             };
         };
-        if !self.surface_is_visible_in_active_workspace(owner.owner_root_surface_id) {
+        if !self.surface_is_visible_in_active_scene(owner.owner_root_surface_id) {
             return FullscreenPresentationEligibility {
                 owner: Some(owner),
                 eligible: false,
@@ -260,7 +260,7 @@ impl CompositorState {
             .toplevel_surfaces
             .get(&owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerMissing)?;
-        if !self.surface_is_visible_in_active_workspace(owner.owner_root_surface_id) {
+        if !self.surface_is_visible_in_active_scene(owner.owner_root_surface_id) {
             return Err(DirectScanoutSceneRejection::OwnerMinimized);
         }
         if self
@@ -268,6 +268,10 @@ impl CompositorState {
             .is_some_and(WindowState::is_minimized)
         {
             return Err(DirectScanoutSceneRejection::OwnerMinimized);
+        }
+
+        if self.has_visible_special_application_content() {
+            return Err(DirectScanoutSceneRejection::OverlayVisible);
         }
 
         let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
@@ -406,6 +410,9 @@ impl CompositorState {
         {
             blockers.push(*reason);
         }
+        if self.has_visible_special_application_content() {
+            blockers.push(DirectScanoutSceneRejection::OverlayVisible);
+        }
 
         let geometry = self.current_visual_root_window_geometry(owner.owner_root_surface_id);
         if !geometry.is_some_and(|geometry| {
@@ -498,10 +505,10 @@ impl CompositorState {
         let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
         // This is the composited visibility policy, not Direct Scanout
         // admission.  A fullscreen owner with a non-scanout buffer still
-        // owns the fullscreen composition tree; only visible popups make the
-        // solitary tree invalid for the current native frame.
+        // owns the fullscreen composition tree; visible popups or application
+        // content ordered above that tree make it non-solitary.
         let owner_not_minimized = owner_root_surface_id.is_some_and(|owner| {
-            self.surface_is_visible_in_active_workspace(owner)
+            self.surface_is_visible_in_active_scene(owner)
                 && !self
                     .toplevel_window_state(owner)
                     .is_some_and(WindowState::is_minimized)
@@ -509,14 +516,23 @@ impl CompositorState {
         let solitary_tree_active = owner_root_surface_id.is_some()
             && eligibility.exactly_covers_output
             && owner_not_minimized
-            && !popup_visible;
-        let culled_surface_count = owner_root_surface_id
-            .map(|owner| {
-                self.active_scene_surfaces()
-                    .iter()
-                    .filter(|surface| self.root_surface_id_for_surface(surface.surface_id) != owner)
-                    .count()
-                    .saturating_sub(visible_overlay_count)
+            && !popup_visible
+            && owner_root_surface_id.is_none_or(|owner| {
+                !self.has_visible_application_content_outside_fullscreen_owner(owner)
+            });
+        let culled_surface_count = solitary_tree_active
+            .then(|| {
+                owner_root_surface_id
+                    .map(|owner| {
+                        self.active_scene_surfaces()
+                            .iter()
+                            .filter(|surface| {
+                                self.root_surface_id_for_surface(surface.surface_id) != owner
+                            })
+                            .count()
+                            .saturating_sub(visible_overlay_count)
+                    })
+                    .unwrap_or_default()
             })
             .unwrap_or_default();
         FullscreenRenderPlanMetrics {
@@ -528,6 +544,19 @@ impl CompositorState {
             visible_overlay_count,
             rejection: eligibility.rejection,
         }
+    }
+
+    fn has_visible_special_application_content(&self) -> bool {
+        self.active_scene_surfaces().iter().any(|surface| {
+            let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
+            self.window_id_for_surface(root_surface_id)
+                .is_some_and(|window_id| {
+                    matches!(
+                        self.scene_work_owner_for_window(window_id),
+                        SceneWorkOwner::Location(crate::wm::WorkspaceLocation::Special(_))
+                    )
+                })
+        })
     }
 
     pub(in crate::compositor) fn native_frame_renderable_surfaces(
@@ -553,6 +582,26 @@ impl CompositorState {
                 .cloned()
                 .collect(),
         )
+    }
+
+    pub(in crate::compositor) fn has_visible_application_content_outside_fullscreen_owner(
+        &self,
+        owner_root_surface_id: u32,
+    ) -> bool {
+        let surfaces = self.active_scene_surfaces();
+        let Some(owner_position) = surfaces.iter().position(|surface| {
+            self.root_surface_id_for_surface(surface.surface_id) == owner_root_surface_id
+        }) else {
+            return false;
+        };
+        surfaces
+            .iter()
+            .skip(owner_position.saturating_add(1))
+            .any(|surface| {
+                let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
+                !self.layer_surfaces.contains_key(&root_surface_id)
+                    && self.window_id_for_surface(root_surface_id).is_some()
+            })
     }
 
     fn visible_fullscreen_overlay_count(&self) -> usize {

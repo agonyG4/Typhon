@@ -1,4 +1,6 @@
 use super::*;
+use crate::wm::layout::TiledResizeHandle;
+use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation};
 use std::num::NonZeroU64;
 
 #[test]
@@ -41,6 +43,133 @@ fn initial_map_focus_does_not_override_client_owned_pointer_activity() {
     assert!(!state.map_focus_allowed());
 }
 
+#[test]
+fn closing_special_ends_departing_resize_through_terminal_lifecycle() {
+    let mut state = CompositorState::new(None);
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 100))
+        .expect("special window");
+    state
+        .window_mut(special)
+        .expect("special window")
+        .management = Some(WindowManagementState::new(WorkspaceLocation::Special(
+        crate::wm::SpecialWorkspaceId::DEFAULT,
+    )));
+    state.toplevel_visual_geometries.insert(
+        100,
+        ToplevelVisualGeometry {
+            placement: SurfacePlacement::root_at(20, 30),
+            width: 640,
+            height: 480,
+            active_resize: Some(ResizeInteractionId::new(1)),
+            mode_transition: false,
+        },
+    );
+    let mut interaction = test_window_interaction(
+        1,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+        None,
+    );
+    interaction.root_surface_id = 100;
+    interaction.drag_committed = true;
+    state.window_interaction = Some(interaction);
+
+    state.toggle_default_special_workspace();
+    assert!(state.window_interaction_active());
+
+    state.toggle_default_special_workspace();
+
+    assert!(!state.window_interaction_active());
+    assert_eq!(
+        state
+            .backend_commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
+                        window, ..
+                    } if *window == special
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
+}
+
+#[test]
+fn closing_special_does_not_cancel_unrelated_regular_interaction() {
+    let mut state = CompositorState::new(None);
+    let regular = state.allocate_window_id().expect("regular window id");
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 101))
+        .expect("regular window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 102))
+        .expect("special window");
+    state
+        .window_mut(special)
+        .expect("special window")
+        .management = Some(WindowManagementState::new(WorkspaceLocation::Special(
+        crate::wm::SpecialWorkspaceId::DEFAULT,
+    )));
+    let mut interaction = test_window_interaction(2, WindowInteractionKind::Move, None);
+    interaction.window_id = regular;
+    interaction.root_surface_id = 101;
+    state.window_interaction = Some(interaction);
+
+    state.toggle_default_special_workspace();
+    state.toggle_default_special_workspace();
+
+    assert_eq!(
+        state
+            .window_interaction
+            .map(|interaction| interaction.window_id),
+        Some(regular)
+    );
+}
+
+#[test]
+fn closing_special_move_defers_terminal_pointer_refresh_until_final_scene() {
+    let mut state = CompositorState::new(None);
+    let special = state.allocate_window_id().expect("special window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(special, 103))
+        .expect("special window");
+    state
+        .window_mut(special)
+        .expect("special window")
+        .management = Some(WindowManagementState::new(WorkspaceLocation::Special(
+        crate::wm::SpecialWorkspaceId::DEFAULT,
+    )));
+    let mut interaction = test_window_interaction(3, WindowInteractionKind::Move, None);
+    interaction.window_id = special;
+    interaction.root_surface_id = 103;
+    state.window_interaction = Some(interaction);
+
+    state.toggle_default_special_workspace();
+    let before_close = state
+        .window_interaction_release_metrics()
+        .window_interaction_post_terminal_pointer_refreshes;
+    state.toggle_default_special_workspace();
+
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        before_close + 1
+    );
+    assert!(!state.window_interaction_active());
+}
+
 fn test_window_interaction(
     id: u64,
     kind: WindowInteractionKind,
@@ -79,6 +208,7 @@ fn test_window_interaction_with_target(
         drag_committed: false,
         resize_interaction_id: matches!(kind, WindowInteractionKind::Resize(_))
             .then_some(ResizeInteractionId::new(id)),
+        tiled_resize: false,
     }
 }
 
@@ -162,6 +292,180 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
     }
 }
 
+fn tiled_resize_fixture() -> (
+    CompositorState,
+    WindowId,
+    WorkspaceLocation,
+    TiledResizeHandle,
+) {
+    let mut state = CompositorState::new(None);
+    let first = state.allocate_window_id().expect("first window id");
+    let second = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first, 700))
+        .expect("first window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second, 701))
+        .expect("second window");
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    for window_id in [first, second] {
+        state.window_mut(window_id).expect("window").management =
+            Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+        state
+            .tiled_layout
+            .insert(
+                location,
+                window_id,
+                crate::wm::layout::InsertHint::default(),
+            )
+            .expect("tiled insert");
+    }
+    let solution = state
+        .tiled_layout
+        .calculate(
+            location,
+            state.layout_root_rect(),
+            &[
+                crate::wm::layout::LayoutWindowSnapshot::new(first),
+                crate::wm::layout::LayoutWindowSnapshot::new(second),
+            ],
+        )
+        .expect("initial tiled solution");
+    let handle = TiledResizeHandle::from_solution(
+        state.tiled_layout.tree(location).expect("tiled tree"),
+        &solution,
+        first,
+        crate::wm::layout::ResizeEdges::new(false, false, false, true),
+    )
+    .expect("first leaf has an adjustable right split");
+    (state, first, location, handle)
+}
+
+#[test]
+fn tiled_resize_coalesces_pointer_updates_and_flushes_latest_value_once() {
+    let (mut state, window_id, location, handle) = tiled_resize_fixture();
+    let interaction = test_window_interaction(
+        41,
+        WindowInteractionKind::Resize(ResizeEdges::new(false, false, false, true)),
+        Some(0x111),
+    );
+    state.window_interaction = Some(WindowInteraction {
+        window_id,
+        root_surface_id: 700,
+        tiled_resize: true,
+        ..interaction
+    });
+    let solution = state
+        .tiled_layout
+        .calculate(
+            location,
+            state.layout_root_rect(),
+            &[
+                crate::wm::layout::LayoutWindowSnapshot::new(window_id),
+                crate::wm::layout::LayoutWindowSnapshot::new(
+                    state
+                        .tiled_layout
+                        .tree(location)
+                        .expect("tree")
+                        .windows()
+                        .into_iter()
+                        .find(|id| *id != window_id)
+                        .expect("sibling"),
+                ),
+            ],
+        )
+        .expect("solution");
+    let resize_interaction_id = ResizeInteractionId::new(41);
+    state.install_tiled_resize_session(
+        WindowInteractionId::new(41),
+        resize_interaction_id,
+        window_id,
+        location,
+        ResizeEdges::new(false, false, false, true),
+        handle,
+        &solution,
+    );
+
+    assert_eq!(
+        state.update_window_interaction_by_id_for_input(WindowInteractionId::new(41), 180.0, 100.0),
+        InteractionUpdateOutcome::QueuedNewVisualWork
+    );
+    for pointer_x in 181..=1178 {
+        assert!(state.update_window_interaction_by_id(
+            WindowInteractionId::new(41),
+            f64::from(pointer_x),
+            100.0,
+        ));
+    }
+    assert_eq!(
+        state.update_window_interaction_by_id_for_input(WindowInteractionId::new(41), 260.0, 100.0),
+        InteractionUpdateOutcome::ReplacedPending
+    );
+    assert_eq!(state.resize_flow_metrics.tiled_resize_raw_updates, 1_000);
+    assert_eq!(state.resize_flow_metrics.tiled_resize_pending_replaced, 999);
+    assert_eq!(state.resize_flow_metrics.tiled_resize_frame_flushes, 0);
+    assert!(state.pending_tiled_resize.is_some());
+    assert!(!state.has_pending_frame_prepare_work());
+    assert!(state.has_pending_interactive_visual_work());
+
+    assert!(state.flush_pending_tiled_resize());
+    assert_eq!(state.resize_flow_metrics.tiled_resize_frame_flushes, 1);
+    assert!(state.pending_tiled_resize.is_none());
+    assert!(state.tiled_resize_session.is_some());
+}
+
+#[test]
+fn tiled_resize_cancellation_discards_pending_pointer_value() {
+    let (mut state, window_id, location, handle) = tiled_resize_fixture();
+    let interaction_id = WindowInteractionId::new(42);
+    let interaction = WindowInteraction {
+        window_id,
+        root_surface_id: 700,
+        tiled_resize: true,
+        id: interaction_id,
+        kind: WindowInteractionKind::Resize(ResizeEdges::new(false, false, false, true)),
+        resize_interaction_id: Some(ResizeInteractionId::new(42)),
+        ..test_window_interaction(
+            42,
+            WindowInteractionKind::Resize(ResizeEdges::new(false, false, false, true)),
+            Some(0x111),
+        )
+    };
+    state.window_interaction = Some(interaction);
+    let solution = state
+        .tiled_layout
+        .calculate(
+            location,
+            state.layout_root_rect(),
+            &state
+                .tiled_layout
+                .tree(location)
+                .expect("tree")
+                .windows()
+                .into_iter()
+                .map(crate::wm::layout::LayoutWindowSnapshot::new)
+                .collect::<Vec<_>>(),
+        )
+        .expect("solution");
+    state.install_tiled_resize_session(
+        interaction_id,
+        ResizeInteractionId::new(42),
+        window_id,
+        location,
+        ResizeEdges::new(false, false, false, true),
+        handle,
+        &solution,
+    );
+    assert!(state.update_window_interaction_by_id(interaction_id, 260.0, 100.0));
+    state.end_window_interaction_by_id_with_reason(
+        interaction_id,
+        WindowInteractionEndReason::ExplicitCancel,
+    );
+    assert!(state.pending_tiled_resize.is_none());
+    assert!(state.tiled_resize_session.is_none());
+    assert_eq!(state.resize_flow_metrics.tiled_resize_frame_flushes, 0);
+}
+
 #[test]
 fn floating_resize_coalesces_geometry_until_frame_flush() {
     let surface_id = 42;
@@ -171,9 +475,7 @@ fn floating_resize_coalesces_geometry_until_frame_flush() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
     let mut interaction = test_window_interaction(
         43,
@@ -248,6 +550,7 @@ fn floating_resize_coalesces_geometry_until_frame_flush() {
         ))
     );
 }
+
 #[test]
 fn failed_begin_does_not_capture_native_input() {
     let mut state = CompositorState::default();
@@ -396,11 +699,119 @@ fn failed_begin_with_invalid_motion_target_does_not_capture_interaction() {
 }
 
 #[test]
+fn tiled_normal_window_rejects_move_and_resize_interactions() {
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, 42))
+        .expect("desktop window");
+    state
+        .window_mut(window_id)
+        .expect("desktop window")
+        .management = Some(
+        WindowManagementState::new(WorkspaceLocation::Regular(
+            WorkspaceId::new(1).expect("workspace"),
+        ))
+        .with_layout(LayoutMembership::Tiled),
+    );
+    state.append_renderable_surface(test_renderable_surface(42, 300, 200));
+
+    for kind in [
+        WindowInteractionKind::Move,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+    ] {
+        assert!(
+            !state.begin_window_interaction_for_root(BeginWindowInteraction::for_test(
+                Some(window_id),
+                42,
+                100.0,
+                100.0,
+                kind,
+                WindowInteractionSource::NativeBinding,
+                None,
+            ))
+        );
+        assert!(!state.window_interaction_active());
+    }
+}
+
+#[test]
+fn minimizing_and_restoring_a_tiled_window_reflows_the_surviving_leaf_atomically() {
+    let mut state = CompositorState::new(None);
+    let first = state.allocate_window_id().expect("first window id");
+    let second = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first, 52))
+        .expect("first window");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second, 53))
+        .expect("second window");
+    for surface in [
+        test_renderable_surface(52, 300, 200),
+        test_renderable_surface(53, 300, 200),
+    ] {
+        state.append_renderable_surface(surface);
+    }
+
+    state.focused_window_id = Some(first);
+    assert!(state.toggle_focused_window_layout());
+    state.focused_window_id = Some(second);
+    assert!(state.toggle_focused_window_layout());
+    let location = state
+        .window(first)
+        .expect("first window")
+        .management
+        .expect("management")
+        .location();
+
+    let before_minimize = state.render_generation;
+    assert!(state.minimize_desktop_window(first));
+    assert_eq!(state.render_generation, before_minimize + 1);
+    assert_eq!(
+        state.render_generation_cause,
+        RenderGenerationCause::LayoutReflow
+    );
+    let survivor = state
+        .tiled_layout
+        .calculate(
+            location,
+            state.layout_root_rect(),
+            &[
+                crate::wm::layout::LayoutWindowSnapshot::new(first).with_minimized(true),
+                crate::wm::layout::LayoutWindowSnapshot::new(second),
+            ],
+        )
+        .expect("layout plan")
+        .target_for_window(second)
+        .expect("surviving target");
+    assert_eq!(
+        state.current_visual_root_window_geometry(53),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(survivor.tile().x(), survivor.tile().y()),
+            survivor.tile().width(),
+            survivor.tile().height(),
+        ))
+    );
+
+    let before_restore = state.render_generation;
+    assert!(state.restore_minimized_desktop_window(first));
+    assert_eq!(state.render_generation, before_restore + 1);
+    assert_eq!(
+        state.render_generation_cause,
+        RenderGenerationCause::LayoutReflow
+    );
+    assert!(
+        state
+            .tiled_layout
+            .tree(location)
+            .is_some_and(|tree| tree.contains_window(first))
+    );
+}
+
+#[test]
 fn failed_begin_with_missing_resource_does_not_mutate_resize_flow() {
     let mut state = CompositorState::default();
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(42, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(42, 300, 200));
     let mut flow = ResizeConfigureFlow::default();
     flow.mark_sent(
         PendingResizeConfigure {
@@ -710,9 +1121,7 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::root_at(10, 20));
     state.toplevel_visual_geometries.insert(
         surface_id,
@@ -799,9 +1208,7 @@ fn active_x11_resize_keeps_stale_surface_at_committed_size() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.active_toplevel_resizes.insert(
         surface_id,
         ActiveToplevelResize {
@@ -844,9 +1251,7 @@ fn finished_x11_resize_keeps_stale_surface_at_one_to_one() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.active_toplevel_resizes.insert(
         surface_id,
         ActiveToplevelResize {
@@ -884,9 +1289,7 @@ fn absolute_x11_move_preserves_root_placement_mode() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
     let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
     interaction.window_id = window_id;
@@ -916,9 +1319,7 @@ fn absolute_xdg_move_updates_scene_without_queued_backend_position_command() {
     state
         .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
         .expect("XDG desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
     let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
     interaction.window_id = window_id;
@@ -943,9 +1344,7 @@ fn interactive_move_keeps_latest_pointer_target_until_terminal_flush() {
     state
         .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
         .expect("XDG desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
     let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
     interaction.window_id = window_id;
@@ -982,9 +1381,7 @@ fn absolute_x11_resize_preserves_root_placement_mode() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
     let mut interaction = test_window_interaction(
         1,
@@ -1022,9 +1419,7 @@ fn interactive_resize_updates_visual_geometry_before_frame_prepare() {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(surface_id, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
     let mut interaction = test_window_interaction(
         1,
         WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
@@ -1138,9 +1533,7 @@ fn run_m7_resize_crossing_stress(source: WindowInteractionSource) {
     state
         .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
         .expect("X11 desktop window");
-    state
-        .renderable_surfaces
-        .push(test_renderable_surface(42, 300, 200));
+    state.append_renderable_surface(test_renderable_surface(42, 300, 200));
     for cycle in 0..100 {
         let mut interaction = test_window_interaction_with_target(
             cycle + 1,

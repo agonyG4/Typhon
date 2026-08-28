@@ -126,6 +126,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ActivateRootWindow(u32),
     ToggleMaximizeFocused,
     ToggleFullscreenFocused,
+    ToggleDefaultSpecialWorkspace,
+    MoveFocusedWindowToOrFromSpecialWorkspace,
     SetFocusedRootVisualGeometry {
         placement: SurfacePlacement,
         width: u32,
@@ -138,12 +140,15 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerInputMetrics(Sender<PointerInputMetrics>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
+    CaptureNativeFrameSurfaceIds(Sender<Vec<u32>>),
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
+    CaptureFullscreenRenderPlanMetrics(Sender<FullscreenRenderPlanMetrics>),
+    CaptureConfigureSerial(Sender<u32>),
     CaptureSurfacePresentationMetadata {
         surface_id: u32,
         reply: Sender<Option<(SurfacePresentationMetadata, SurfacePresentationMetadata)>>,
@@ -214,6 +219,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureAndCompleteRenderedLegacyPreparedFrame,
     CaptureLegacySubmittedAndPreparedFrames,
     CapturePreparedFrame(Sender<bool>),
+    SettleNoVisualChangeWork {
+        owns_frame_batch: bool,
+        reply: Sender<bool>,
+    },
     FinishPreparedFrame,
     FinishFrame,
     FinishFrameWithPresentation(FramePresentation),
@@ -392,6 +401,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::ToggleFullscreenFocused => {
                         server.toggle_fullscreen_focused_window();
                     }
+                    ServerCommand::ToggleDefaultSpecialWorkspace => {
+                        server.toggle_default_special_workspace();
+                    }
+                    ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace => {
+                        server.move_focused_window_to_or_from_special_workspace();
+                    }
                     ServerCommand::SetFocusedRootVisualGeometry {
                         placement,
                         width,
@@ -453,13 +468,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureRenderableSurfaceCount(reply) => {
                         let _ = reply.send(server.renderable_surfaces().len());
                     }
+                    ServerCommand::CaptureNativeFrameSurfaceIds(reply) => {
+                        let _ = reply.send(
+                            server
+                                .native_frame_renderable_surfaces()
+                                .iter()
+                                .map(|surface| surface.surface_id)
+                                .collect(),
+                        );
+                    }
                     ServerCommand::CaptureSurfaceResourceCount(reply) => {
                         let _ = reply.send(server.state.surface_resources.len());
                     }
                     ServerCommand::CaptureShmResourceCounts(reply) => {
                         let _ = reply.send((
                             server.state.current_surface_buffers.len(),
-                            server.state.pending_buffer_releases.len(),
+                            0,
                             server.state.frame_batches.len()
                                 + server.state.retired_frame_batches.len(),
                         ));
@@ -530,6 +554,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
                         let _ = reply.send(server.state.fullscreen_presentation_eligibility());
                     }
+                    ServerCommand::CaptureFullscreenRenderPlanMetrics(reply) => {
+                        let _ = reply.send(server.fullscreen_render_plan_metrics());
+                    }
+                    ServerCommand::CaptureConfigureSerial(reply) => {
+                        let _ = reply.send(server.state.next_configure_serial);
+                    }
                     ServerCommand::CaptureSurfacePresentationMetadata { surface_id, reply } => {
                         let metadata = server
                             .state
@@ -560,8 +590,25 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
                         let snapshot = server.client_cursor_render_state().map(|cursor| {
+                            let surface_id = cursor.surface.surface_id;
+                            let commit_sequence = cursor.surface.commit_sequence;
                             ClientCursorSnapshot {
-                                surface_id: cursor.surface.surface_id,
+                                surface_id,
+                                buffer_id: cursor.surface.buffer_id().get(),
+                                commit_sequence: commit_sequence.get(),
+                                first_pixel: cursor
+                                    .surface
+                                    .cpu_pixels()
+                                    .and_then(|pixels| pixels.first().copied()),
+                                journal_contains_commit_sequence: server
+                                    .state
+                                    .surface_damage_journals
+                                    .get(&surface_id)
+                                    .is_some_and(|journal| {
+                                        journal
+                                            .commit_counter_for_sequence(commit_sequence)
+                                            .is_some()
+                                    }),
                                 logical_x: cursor.logical_x,
                                 logical_y: cursor.logical_y,
                                 width: cursor.surface.width,
@@ -845,6 +892,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePreparedFrame(reply) => {
                         let _ = reply.send(server.has_prepared_frame_batch());
                     }
+                    ServerCommand::SettleNoVisualChangeWork {
+                        owns_frame_batch,
+                        reply,
+                    } => {
+                        let _ =
+                            reply.send(server.settle_no_visual_change_work(None, owns_frame_batch));
+                    }
                     ServerCommand::FinishFrame => {
                         server.finish_frame();
                     }
@@ -1101,6 +1155,18 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
         .expect("server should report renderable surface snapshot")
 }
 
+pub(in crate::compositor::tests) fn capture_native_frame_surface_ids(
+    commands: &Sender<ServerCommand>,
+) -> Vec<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureNativeFrameSurfaceIds(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report native frame surface ids")
+}
+
 pub(in crate::compositor::tests) fn capture_focused_surface_id(
     commands: &Sender<ServerCommand>,
 ) -> Option<u32> {
@@ -1234,6 +1300,30 @@ pub(in crate::compositor::tests) fn capture_fullscreen_presentation_eligibility(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report fullscreen presentation eligibility")
+}
+
+pub(in crate::compositor::tests) fn capture_fullscreen_render_plan_metrics(
+    commands: &Sender<ServerCommand>,
+) -> FullscreenRenderPlanMetrics {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFullscreenRenderPlanMetrics(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report fullscreen render plan metrics")
+}
+
+pub(in crate::compositor::tests) fn capture_configure_serial(
+    commands: &Sender<ServerCommand>,
+) -> u32 {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureConfigureSerial(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report configure serial")
 }
 
 pub(in crate::compositor::tests) fn capture_direct_scanout_candidate(

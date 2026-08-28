@@ -131,6 +131,7 @@ fn promoted_independent_sidecar_uses_fresh_standalone_validation_base() {
         None,
         CursorPlaneAction::Independent,
         PresentedCursorDelivery::Hidden,
+        None,
     )
     .unwrap();
 

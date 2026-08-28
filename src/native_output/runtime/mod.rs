@@ -38,6 +38,8 @@ mod planner;
 mod presentation;
 mod presentation_cursor;
 mod presentation_cycle;
+#[cfg(test)]
+mod presentation_cycle_tests;
 mod presentation_direct;
 mod presentation_metrics;
 mod presentation_o1;
@@ -102,8 +104,8 @@ pub(crate) use planner::{
 pub(super) use presentation_pipeline::initial_presented;
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
-    direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
-    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
+    settle_no_visual_change_output_transaction,
 };
 pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
 #[cfg(test)]
@@ -334,6 +336,8 @@ pub(crate) struct NativeRuntime {
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
+    // Logical render/coalescing baseline only. This is not evidence that the
+    // corresponding scene was physically rendered or presented.
     last_rendered_scene_generation: u64,
     last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
     direct_fallback_tracker: Option<cycle::direct_fallback::DirectFallbackTracker>,

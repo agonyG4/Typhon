@@ -1,5 +1,7 @@
 use std::{fmt, num::NonZeroU32};
 
+use super::SpecialWorkspaceId;
+
 const DEFAULT_WORKSPACE_COUNT: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,6 +45,8 @@ impl fmt::Display for WorkspaceId {
 pub struct WorkspaceManager {
     active_workspace: WorkspaceId,
     workspaces: Vec<WorkspaceId>,
+    special_workspaces: Vec<SpecialWorkspaceId>,
+    visible_special_workspace: Option<SpecialWorkspaceId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,13 @@ pub enum WorkspaceSwitchOutcome {
     UnknownWorkspace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialWorkspaceToggleOutcome {
+    Opened { id: SpecialWorkspaceId },
+    Closed { id: SpecialWorkspaceId },
+    UnknownSpecial { id: SpecialWorkspaceId },
+}
+
 impl WorkspaceManager {
     pub fn new(workspace_count: u32) -> Option<Self> {
         let workspaces = (1..=workspace_count)
@@ -64,11 +75,48 @@ impl WorkspaceManager {
         Some(Self {
             active_workspace,
             workspaces,
+            special_workspaces: vec![SpecialWorkspaceId::DEFAULT],
+            visible_special_workspace: None,
         })
     }
 
     pub const fn active_workspace(&self) -> WorkspaceId {
         self.active_workspace
+    }
+
+    pub const fn visible_special_workspace(&self) -> Option<SpecialWorkspaceId> {
+        self.visible_special_workspace
+    }
+
+    pub fn contains_special_workspace(&self, id: SpecialWorkspaceId) -> bool {
+        self.special_workspaces.contains(&id)
+    }
+
+    pub fn toggle_special_workspace(
+        &mut self,
+        id: SpecialWorkspaceId,
+    ) -> SpecialWorkspaceToggleOutcome {
+        if !self.contains_special_workspace(id) {
+            return SpecialWorkspaceToggleOutcome::UnknownSpecial { id };
+        }
+        match self.visible_special_workspace {
+            Some(visible) if visible == id => {
+                self.visible_special_workspace = None;
+                SpecialWorkspaceToggleOutcome::Closed { id }
+            }
+            _ => {
+                self.visible_special_workspace = Some(id);
+                SpecialWorkspaceToggleOutcome::Opened { id }
+            }
+        }
+    }
+
+    pub fn set_visible_special_workspace(&mut self, id: Option<SpecialWorkspaceId>) -> bool {
+        if id.is_some_and(|id| !self.contains_special_workspace(id)) {
+            return false;
+        }
+        self.visible_special_workspace = id;
+        true
     }
 
     pub fn activate(&mut self, workspace: WorkspaceId) -> WorkspaceSwitchOutcome {

@@ -4,6 +4,7 @@ use std::{collections::HashMap, fmt, num::NonZeroU64};
 
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DrmContentType, OutputPresentationMode,
+    SurfaceDamagePresentation,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -294,6 +295,7 @@ pub(crate) struct OutputTransaction {
     planes: OutputPlanePlan,
     synchronization: OutputSynchronizationPlan,
     obligations: OutputProtocolObligations,
+    surface_damage: Option<SurfaceDamagePresentation>,
 }
 
 impl OutputTransaction {
@@ -616,6 +618,7 @@ impl OutputTransaction {
             planes,
             synchronization,
             obligations,
+            surface_damage: None,
         })
     }
 
@@ -666,6 +669,16 @@ impl OutputTransaction {
     ) -> Self {
         self.async_validation_key = key;
         self
+    }
+
+    pub(crate) fn with_surface_damage(mut self, surface_damage: SurfaceDamagePresentation) -> Self {
+        debug_assert!(self.surface_damage.is_none());
+        self.surface_damage = Some(surface_damage);
+        self
+    }
+
+    pub(crate) fn surface_damage(&self) -> Option<&SurfaceDamagePresentation> {
+        self.surface_damage.as_ref()
     }
 
     pub(crate) const fn async_validation_key(&self) -> Option<CompositedAsyncValidationKey> {

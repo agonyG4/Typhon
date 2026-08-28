@@ -19,6 +19,7 @@ pub enum X11AdmissionCancellationReason {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum XwmEvent {
     WindowMapRequested(X11WindowHandle),
     WindowReady(X11WindowSnapshot),

@@ -896,6 +896,58 @@ pub(in crate::compositor::tests) fn create_toplevel_then_set_and_commit_cursor_s
     })
 }
 
+pub(in crate::compositor::tests) fn exercise_same_buffer_cursor_damage_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(ClientCursorSnapshot, ClientCursorSnapshot), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
+    let cursor_surface = compositor.create_surface(&qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    let mut cursor_buffer = TestShmBuffer::new(&shm, &qh, 24, 24)?;
+    cursor_buffer.attach(&cursor_surface, 24, 24);
+    cursor_surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let initial = capture_client_cursor_snapshot(commands).ok_or("missing initial cursor")?;
+
+    cursor_buffer.write_pixels(&vec![0xff00_aa00; 24 * 24])?;
+    cursor_surface.damage_buffer(0, 0, 24, 24);
+    cursor_surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let updated = capture_client_cursor_snapshot(commands).ok_or("missing updated cursor")?;
+
+    Ok((initial, updated))
+}
+
 pub(in crate::compositor::tests) fn exercise_client_cursor_state_transitions(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

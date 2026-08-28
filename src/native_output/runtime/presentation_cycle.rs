@@ -1,4 +1,7 @@
-use super::commit_timing::{refreshed_published_state, reset_after_same_buffer};
+use super::commit_timing::{
+    logical_scene_changed, no_visual_change_completes_cycle, refreshed_published_state,
+    reset_after_same_buffer, retire_logical_scene_generation,
+};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
     NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
@@ -37,6 +40,36 @@ use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPoli
 use oblivion_one::native::buffering::PipelineServiceEstimate;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete_compatibility_no_visual_change(
+    paint_outcome: NativePaintOutcome,
+    server: &mut OwnCompositorServer,
+    frame_scheduler: &mut NativeFrameScheduler,
+    last_logical_scene_generation: &mut u64,
+    scene_generation: u64,
+    queued_redraw_requested: &mut bool,
+    last_client_cursor_damage: &mut Option<NativeClientCursorDamageState>,
+    last_software_cursor_damage: &mut Option<NativeDamageRect>,
+    current_client_cursor_damage: Option<NativeClientCursorDamageState>,
+    current_software_cursor_damage: Option<NativeDamageRect>,
+) -> bool {
+    if !matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
+        return false;
+    }
+
+    frame_scheduler.note_immediate_completion();
+    let batch_id = server
+        .prepared_frame_batch_id()
+        .expect("skipped native frame lost its prepared batch");
+    server.complete_no_visual_change_frame_batch(batch_id);
+    retire_logical_scene_generation(last_logical_scene_generation, scene_generation, true);
+    *queued_redraw_requested = false;
+    *last_client_cursor_damage = current_client_cursor_damage;
+    *last_software_cursor_damage = current_software_cursor_damage;
+    true
+}
+
 impl NativeRuntime {
     pub(super) fn render_present_and_update_metrics(
         &mut self,
@@ -234,6 +267,7 @@ impl NativeRuntime {
             client_cursor,
             perf,
         );
+        let _ = client_cursor;
         let (_cursor_epoch_changed, cursor_deadline_due, cursor_work_pending) =
             update_cursor_output_arbitration(
                 cursor_output_arbitration,
@@ -608,6 +642,7 @@ impl NativeRuntime {
                 perf,
                 client_cursor_active,
                 cursor_render_mode,
+                server,
                 &mut effective_cursor,
                 queued_redraw_requested,
                 last_client_cursor_damage,
@@ -803,6 +838,14 @@ impl NativeRuntime {
                         output_transactions,
                         direct_target,
                         effective_cursor.as_ref(),
+                        (planned_cursor_delivery
+                            == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware)
+                            .then(|| {
+                                atomic_cursor
+                                    .as_ref()
+                                    .and_then(NativeAtomicCursor::client_source_key)
+                            })
+                            .flatten(),
                         frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
                         pacing_mode,
@@ -919,7 +962,11 @@ impl NativeRuntime {
             } else if direct_suppressed {
                 frame_scheduler.note_immediate_completion();
                 frame_completed = true;
-                *last_rendered_scene_generation = scene_generation;
+                retire_logical_scene_generation(
+                    last_rendered_scene_generation,
+                    scene_generation,
+                    true,
+                );
                 *queued_redraw_requested = false;
             } else {
                 frame_pacing.note_render_started(pacing_mode, render_ahead);
@@ -945,10 +992,6 @@ impl NativeRuntime {
                     pending_frame_work,
                     effective_redraw_requested,
                 );
-                let atomic_backend = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-                if !atomic_backend {
-                    server.capture_frame_callbacks_for_render();
-                }
                 let (resolved_scene, output_damage) = resolve_scene_and_damage(
                     presented_planes
                         .primary
@@ -964,8 +1007,34 @@ impl NativeRuntime {
                     && !effective_redraw_requested
                     && !interactive_visual_applied;
                 if no_primary_work {
+                    let surface_damage = scene_changed.then(|| {
+                        let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
+                        let exact_cursor_commit = cursor_render_mode
+                            .is_software()
+                            .then(|| server.client_cursor_render_state())
+                            .flatten()
+                            .map(|client_cursor| {
+                                (
+                                    client_cursor.surface.surface_id,
+                                    client_cursor.surface.commit_sequence,
+                                )
+                            });
+                        let surface_damage = server
+                            .capture_surface_damage_presentation_for_surface_ids_and_commit(
+                                sampled_surface_ids,
+                                exact_cursor_commit,
+                            );
+                        if let Some((surface_id, _)) = exact_cursor_commit
+                            && surface_damage.contains_surface_id(surface_id)
+                        {
+                            server.note_client_cursor_surface_sample(false);
+                        }
+                        surface_damage
+                    });
                     drop(resolved_scene);
-                    finish_no_primary_work(
+                    let terminal_work_expected =
+                        no_visual_change_completes_cycle(scene_changed, pending_frame_work);
+                    let terminal_work_completed = finish_no_primary_work(
                         perf,
                         server,
                         frame_scheduler,
@@ -984,8 +1053,22 @@ impl NativeRuntime {
                         *drm_file_generation,
                         render_generation,
                         render_cause,
+                        surface_damage,
                         pending_frame_work,
                     );
+                    let logical_scene_completed = retire_logical_scene_generation(
+                        last_rendered_scene_generation,
+                        scene_generation,
+                        scene_changed,
+                    );
+                    debug_assert_eq!(logical_scene_completed, scene_changed);
+                    debug_assert_eq!(terminal_work_completed, terminal_work_expected);
+                    debug_assert_eq!(
+                        logical_scene_changed(*last_rendered_scene_generation, scene_generation),
+                        false,
+                        "terminal NoVisualChange must retire the logical scene baseline"
+                    );
+                    frame_completed = terminal_work_completed;
                     *queued_redraw_requested = false;
                     *last_software_cursor_damage = current_software_cursor_damage;
                 } else {
@@ -1079,6 +1162,12 @@ impl NativeRuntime {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
                                 render_telemetry.record_skipped(render_us);
                                 frame_scheduler.note_immediate_completion();
+                                frame_completed = true;
+                                retire_logical_scene_generation(
+                                    last_rendered_scene_generation,
+                                    scene_generation,
+                                    true,
+                                );
                                 presentation_deadline.clear_scheduled_target();
                                 *scheduled_presentation_target = None;
                                 *queued_redraw_requested = false;
@@ -1270,6 +1359,31 @@ impl NativeRuntime {
                             .enabled()
                             .then(NativeProcessCpuSample::read_current)
                             .flatten();
+                        let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
+                        let exact_cursor_commit = cursor_render_mode
+                            .is_software()
+                            .then(|| server.client_cursor_render_state())
+                            .flatten()
+                            .map(|client_cursor| {
+                                (
+                                    client_cursor.surface.surface_id,
+                                    client_cursor.surface.commit_sequence,
+                                )
+                            });
+                        let surface_damage = server
+                            .capture_surface_damage_presentation_for_surface_ids_and_commit(
+                                sampled_surface_ids,
+                                exact_cursor_commit,
+                            );
+                        if let Some((surface_id, _)) = exact_cursor_commit
+                            && surface_damage.contains_surface_id(surface_id)
+                        {
+                            server.note_client_cursor_surface_sample(false);
+                        }
+                        drop(resolved_scene);
+                        server.capture_frame_callbacks_for_render();
+                        server.set_prepared_frame_surface_damage(surface_damage);
+                        let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
                         let paint_outcome = match scanout.paint_server_frame(
                             frame_renderer,
                             &resolved_scene,
@@ -1299,25 +1413,39 @@ impl NativeRuntime {
                             ],
                         );
                         if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
-                            frame_scheduler.note_immediate_completion();
-                            server.finish_prepared_frame();
-                            frame_completed = true;
-                            perf.log("native.frame_skip", || {
-                                let mut fields = paint_stats.fields();
-                                fields.extend(output_damage.fields());
-                                fields.extend([
-                                    NativePerfField::str("reason", "renderer_no_logical_damage"),
-                                    NativePerfField::bool("egl_swap_attempted", false),
-                                    NativePerfField::bool("gbm_front_buffer_locked", false),
-                                    NativePerfField::bool("ready_frame_created", false),
-                                    NativePerfField::u64("render_generation", render_generation),
-                                ]);
-                                fields
-                            });
-                            *queued_redraw_requested = false;
-                            *last_software_cursor_damage = current_software_cursor_damage;
-                            *last_client_cursor_damage = current_client_cursor_damage;
-                            *last_software_cursor_damage = current_software_cursor_damage;
+                            drop(resolved_scene);
+                            if complete_compatibility_no_visual_change(
+                                paint_outcome,
+                                server,
+                                frame_scheduler,
+                                last_rendered_scene_generation,
+                                scene_generation,
+                                queued_redraw_requested,
+                                last_client_cursor_damage,
+                                last_software_cursor_damage,
+                                current_client_cursor_damage,
+                                current_software_cursor_damage,
+                            ) {
+                                frame_completed = true;
+                                perf.log("native.frame_skip", || {
+                                    let mut fields = paint_stats.fields();
+                                    fields.extend(output_damage.fields());
+                                    fields.extend([
+                                        NativePerfField::str(
+                                            "reason",
+                                            "renderer_no_logical_damage",
+                                        ),
+                                        NativePerfField::bool("egl_swap_attempted", false),
+                                        NativePerfField::bool("gbm_front_buffer_locked", false),
+                                        NativePerfField::bool("ready_frame_created", false),
+                                        NativePerfField::u64(
+                                            "render_generation",
+                                            render_generation,
+                                        ),
+                                    ]);
+                                    fields
+                                });
+                            }
                         } else {
                             frame_rendered = true;
                             #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
@@ -1464,7 +1592,6 @@ impl NativeRuntime {
                                 }
                             }
                             if !render_ahead {
-                                server.mark_render_damage_presented();
                                 *last_client_cursor_damage = current_client_cursor_damage;
                                 *last_software_cursor_damage = current_software_cursor_damage;
                             }

@@ -351,6 +351,10 @@ pub(in crate::compositor::tests) struct MultipleSynchronizedCommitSnapshots {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct ClientCursorSnapshot {
     pub(in crate::compositor::tests) surface_id: u32,
+    pub(in crate::compositor::tests) buffer_id: u64,
+    pub(in crate::compositor::tests) commit_sequence: u64,
+    pub(in crate::compositor::tests) first_pixel: Option<u32>,
+    pub(in crate::compositor::tests) journal_contains_commit_sequence: bool,
     pub(in crate::compositor::tests) logical_x: i32,
     pub(in crate::compositor::tests) logical_y: i32,
     pub(in crate::compositor::tests) width: u32,

@@ -673,7 +673,7 @@ fn client_owned_trigger_release_preserves_other_held_buttons() {
 fn client_owned_release_uses_live_original_surface_without_renderable_entry() {
     let (mut fixture, mut client_state, _parent_handle, _placement) =
         client_owned_x11_interaction_fixture();
-    fixture.server.state.renderable_surfaces.clear();
+    fixture.server.state.retain_renderable_surfaces(|_| false);
 
     let context = match fixture.server.end_window_interaction_for_button(0x110) {
         WindowInteractionButtonRelease::Ended {
@@ -708,7 +708,7 @@ fn client_owned_release_survives_xwayland_attachment_replacement() {
         client_owned_x11_interaction_fixture();
     let mut replacement = fixture.server.renderable_surfaces()[0].clone();
     replacement.surface_id = fixture.popup_surface_id;
-    fixture.server.state.renderable_surfaces.push(replacement);
+    fixture.server.state.append_renderable_surface(replacement);
     fixture.server.state.invalidate_surface_origin_cache();
     fixture
         .server

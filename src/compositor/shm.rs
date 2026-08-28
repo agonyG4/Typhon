@@ -354,10 +354,3 @@ fn xbgr2101010_to_argb8888(pixel: u32) -> u32 {
 pub(super) fn invalid_shm_buffer() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid wl_shm buffer")
 }
-
-pub(super) fn invalid_buffer_for_cpu_read() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "linux-dmabuf buffers do not expose CPU pixels",
-    )
-}

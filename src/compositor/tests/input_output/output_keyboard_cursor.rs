@@ -679,6 +679,24 @@ fn valid_cursor_surface_commit_exposes_hotspot_adjusted_overlay_snapshot() {
 }
 
 #[test]
+fn same_buffer_cursor_damage_commit_preserves_owned_content_identity() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = exercise_same_buffer_cursor_damage_commit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let (initial, updated) = result.unwrap();
+    assert_eq!(initial.surface_id, updated.surface_id);
+    assert_eq!(initial.buffer_id, updated.buffer_id);
+    assert_eq!(initial.commit_sequence + 1, updated.commit_sequence);
+    assert_eq!(initial.first_pixel, updated.first_pixel);
+    assert!(updated.journal_contains_commit_sequence);
+}
+
+#[test]
 fn cursor_surface_null_attachment_removes_overlay_without_mapping_client_content() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

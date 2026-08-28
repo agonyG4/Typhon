@@ -192,6 +192,18 @@ impl CoreComplianceMetrics {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ShmBufferLifetimeMetrics {
+    pub shm_materializations_total: u64,
+    pub shm_materialization_failures_total: u64,
+    pub shm_releases_after_materialization_total: u64,
+    pub shm_releases_deferred_unmaterialized_total: u64,
+    pub shm_releases_superseded_without_read_total: u64,
+    pub shm_copy_to_release_us: u64,
+    pub presentation_bound_shm_release_total: u64,
+    pub released_shm_backing_read_attempts_total: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportSourceRect {
     pub x: f64,
@@ -234,7 +246,7 @@ use super::{
     interaction::ResizeCommitSnapshot,
     popup::XdgPositionerState,
     same_buffer_resource,
-    shm::{ShmBufferData, invalid_buffer_for_cpu_read, invalid_shm_buffer},
+    shm::{ShmBufferData, invalid_shm_buffer},
 };
 use crate::compositor::{WindowConstraints, WindowId};
 use crate::cursor_geometry::logical_size;
@@ -1334,6 +1346,139 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) opaque_region: SurfaceOpaqueRegion,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::compositor) struct MaterializedSurfaceBuffer {
+    pub(super) resource: wl_buffer::WlBuffer,
+    pub(super) data: CommittedSurfaceBuffer,
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) surface_size: Option<BufferSize>,
+    pub(super) viewport_source: Option<ViewportSourceRect>,
+    pub(super) viewport_destination: Option<BufferSize>,
+    pub(super) buffer_scale: u32,
+    pub(super) commit_sequence: SurfaceCommitSequence,
+    pub(super) buffer_transform: wl_output::Transform,
+    #[cfg(not(test))]
+    pub(super) opaque_region: SurfaceOpaqueRegion,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::compositor) enum CurrentSurfaceBuffer {
+    Unmaterialized(PendingSurfaceBuffer),
+    Materialized(MaterializedSurfaceBuffer),
+}
+
+impl CurrentSurfaceBuffer {
+    pub(super) fn buffer_id(&self) -> BufferId {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.data.buffer_id(),
+            Self::Materialized(buffer) => buffer.data.buffer_id(),
+        }
+    }
+
+    pub(super) fn resource(&self) -> &wl_buffer::WlBuffer {
+        match self {
+            Self::Unmaterialized(buffer) => &buffer.resource,
+            Self::Materialized(buffer) => &buffer.resource,
+        }
+    }
+
+    pub(super) fn width(&self) -> io::Result<u32> {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.data.width(),
+            Self::Materialized(buffer) => Ok(buffer.data.size().width),
+        }
+    }
+
+    pub(super) fn height(&self) -> io::Result<u32> {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.data.height(),
+            Self::Materialized(buffer) => Ok(buffer.data.size().height),
+        }
+    }
+
+    pub(super) const fn is_shm(&self) -> bool {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.data.is_shm(),
+            Self::Materialized(buffer) => matches!(
+                buffer.data.source(),
+                crate::render_backend::buffer::SurfaceBufferSource::Shm
+            ),
+        }
+    }
+
+    pub(super) const fn is_dmabuf(&self) -> bool {
+        !self.is_shm()
+    }
+
+    pub(super) fn x(&self) -> i32 {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.x,
+            Self::Materialized(buffer) => buffer.x,
+        }
+    }
+
+    pub(super) fn y(&self) -> i32 {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.y,
+            Self::Materialized(buffer) => buffer.y,
+        }
+    }
+
+    pub(super) fn commit_sequence(&self) -> SurfaceCommitSequence {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.commit_sequence,
+            Self::Materialized(buffer) => buffer.commit_sequence,
+        }
+    }
+
+    pub(super) fn viewport_source(&self) -> Option<ViewportSourceRect> {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.viewport_source,
+            Self::Materialized(buffer) => buffer.viewport_source,
+        }
+    }
+
+    pub(super) fn viewport_destination(&self) -> Option<BufferSize> {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.viewport_destination,
+            Self::Materialized(buffer) => buffer.viewport_destination,
+        }
+    }
+
+    pub(super) fn buffer_transform(&self) -> wl_output::Transform {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.buffer_transform,
+            Self::Materialized(buffer) => buffer.buffer_transform,
+        }
+    }
+
+    pub(super) fn surface_size_for_state(
+        &self,
+        viewport: SurfaceViewportCommit,
+        buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
+    ) -> io::Result<BufferSize> {
+        let size = BufferSize::new(self.width()?, self.height()?).ok_or_else(invalid_shm_buffer)?;
+        surface_size_for_state_with_buffer_size(size, viewport, buffer_scale, buffer_transform)
+    }
+}
+
+impl From<PendingSurfaceBuffer> for CurrentSurfaceBuffer {
+    fn from(buffer: PendingSurfaceBuffer) -> Self {
+        Self::Unmaterialized(buffer)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SafeShmRelease(wl_buffer::WlBuffer);
+
+impl SafeShmRelease {
+    pub(super) fn into_buffer(self) -> wl_buffer::WlBuffer {
+        self.0
+    }
+}
+
 impl PendingSurfaceBuffer {
     pub(super) fn apply_committed_surface_state(
         &mut self,
@@ -1357,13 +1502,13 @@ impl PendingSurfaceBuffer {
         buffer_transform: wl_output::Transform,
     ) -> io::Result<BufferSize> {
         self.validate_viewport_source(viewport.source)?;
-        if let Some(destination) = viewport.destination {
-            return Ok(destination);
-        }
-        if let Some(source) = viewport.source.and_then(ViewportSourceRect::logical_size) {
-            return Ok(source);
-        }
-        self.surface_size_for_buffer_scale(buffer_scale, buffer_transform)
+        surface_size_for_state_with_buffer_size(
+            BufferSize::new(self.data.width()?, self.data.height()?)
+                .ok_or_else(invalid_shm_buffer)?,
+            viewport,
+            buffer_scale,
+            buffer_transform,
+        )
     }
 
     fn validate_viewport_source(&self, source: Option<ViewportSourceRect>) -> io::Result<()> {
@@ -1381,19 +1526,77 @@ impl PendingSurfaceBuffer {
         Ok(())
     }
 
-    pub(super) fn surface_size_for_buffer_scale(
+    pub(super) fn materialize_for_publication(
         &self,
-        buffer_scale: u32,
-        buffer_transform: wl_output::Transform,
-    ) -> io::Result<BufferSize> {
-        let size = logical_size(
-            self.data.width()?,
-            self.data.height()?,
-            buffer_scale,
-            buffer_transform,
-        )
-        .map_err(|_| invalid_shm_buffer())?;
-        BufferSize::new(size.width, size.height).ok_or_else(invalid_shm_buffer)
+        previous: Option<&CommittedSurfaceBuffer>,
+        damage: &RenderableSurfaceDamage,
+    ) -> io::Result<(MaterializedSurfaceBuffer, Option<SafeShmRelease>)> {
+        let width = self.data.width()?;
+        let height = self.data.height()?;
+        let size = BufferSize::new(width, height).ok_or_else(invalid_shm_buffer)?;
+        let (data, shm_release) = match &self.data {
+            PendingBufferData::Shm(shm) => {
+                let (mut committed, update_damage) = match previous {
+                    Some(previous)
+                        if previous.source()
+                            == crate::render_backend::buffer::SurfaceBufferSource::Shm
+                            && previous.buffer_id() == shm.identity.id()
+                            && previous.size() == size =>
+                    {
+                        (previous.clone(), Some(damage))
+                    }
+                    _ => (
+                        CommittedSurfaceBuffer::shm_snapshot(
+                            shm.identity.clone(),
+                            size,
+                            shm.read_pixels()?,
+                        ),
+                        None,
+                    ),
+                };
+                if let Some(damage) = update_damage
+                    && let Some(pixels) = committed.shm_pixels_mut()
+                {
+                    shm.read_pixels_into_with_damage(pixels, damage)?;
+                }
+                (committed, Some(SafeShmRelease(self.resource.clone())))
+            }
+            PendingBufferData::Dmabuf(data) => (
+                CommittedSurfaceBuffer::dmabuf_handle(data.identity.clone(), data.handle.clone()),
+                None,
+            ),
+        };
+        Ok((
+            MaterializedSurfaceBuffer {
+                resource: self.resource.clone(),
+                data,
+                x: self.x,
+                y: self.y,
+                surface_size: self.surface_size,
+                viewport_source: self.viewport_source,
+                viewport_destination: self.viewport_destination,
+                buffer_scale: self.buffer_scale,
+                commit_sequence: self.commit_sequence,
+                buffer_transform: self.buffer_transform,
+                #[cfg(not(test))]
+                opaque_region: self.opaque_region.clone(),
+            },
+            shm_release,
+        ))
+    }
+
+    pub(super) fn release_target(&self) -> SurfaceBufferRelease {
+        if let Some(point) = self.explicit_release.clone() {
+            SurfaceBufferRelease::ExplicitSync(point)
+        } else {
+            SurfaceBufferRelease::WlBuffer(self.resource.clone())
+        }
+    }
+}
+
+impl MaterializedSurfaceBuffer {
+    pub(super) fn buffer_id(&self) -> BufferId {
+        self.data.buffer_id()
     }
 
     pub(super) fn to_renderable_surface(
@@ -1402,12 +1605,10 @@ impl PendingSurfaceBuffer {
         placement: SurfacePlacement,
         generation: u64,
         damage: RenderableSurfaceDamage,
-    ) -> io::Result<RenderableSurface> {
-        let width = self.data.width()?;
-        let height = self.data.height()?;
-        let size = BufferSize::new(width, height).ok_or_else(invalid_shm_buffer)?;
-        let surface_size = self.surface_size.unwrap_or(size);
-        Ok(RenderableSurface {
+    ) -> RenderableSurface {
+        let buffer_size = self.data.size();
+        let surface_size = self.surface_size.unwrap_or(buffer_size);
+        RenderableSurface {
             surface_id,
             x: self.x,
             y: self.y,
@@ -1420,7 +1621,7 @@ impl PendingSurfaceBuffer {
             render_target_size: None,
             generation,
             commit_sequence: self.commit_sequence,
-            buffer: self.data.to_committed_buffer_for_size(size)?,
+            buffer: self.data.clone(),
             buffer_scale: self.buffer_scale,
             buffer_transform: self.buffer_transform,
             viewport_source: self.viewport_source,
@@ -1428,16 +1629,30 @@ impl PendingSurfaceBuffer {
             #[cfg(not(test))]
             opaque_region: self.opaque_region.clone(),
             damage,
-        })
-    }
-
-    pub(super) fn release_target(&self) -> SurfaceBufferRelease {
-        if let Some(point) = self.explicit_release.clone() {
-            SurfaceBufferRelease::ExplicitSync(point)
-        } else {
-            SurfaceBufferRelease::WlBuffer(self.resource.clone())
         }
     }
+}
+
+fn surface_size_for_state_with_buffer_size(
+    buffer_size: BufferSize,
+    viewport: SurfaceViewportCommit,
+    buffer_scale: u32,
+    buffer_transform: wl_output::Transform,
+) -> io::Result<BufferSize> {
+    if let Some(destination) = viewport.destination {
+        return Ok(destination);
+    }
+    if let Some(source) = viewport.source.and_then(ViewportSourceRect::logical_size) {
+        return Ok(source);
+    }
+    let size = logical_size(
+        buffer_size.width,
+        buffer_size.height,
+        buffer_scale,
+        buffer_transform,
+    )
+    .map_err(|_| invalid_shm_buffer())?;
+    BufferSize::new(size.width, size.height).ok_or_else(invalid_shm_buffer)
 }
 
 #[derive(Debug, Clone)]
@@ -1480,34 +1695,6 @@ impl PendingBufferData {
         match self {
             Self::Shm(data) => data.height(),
             Self::Dmabuf(data) => Ok(data.height()),
-        }
-    }
-
-    pub(super) fn read_pixels_into_with_damage(
-        &self,
-        pixels: &mut Vec<u32>,
-        damage: &RenderableSurfaceDamage,
-    ) -> io::Result<()> {
-        match self {
-            Self::Shm(data) => data.read_pixels_into_with_damage(pixels, damage),
-            Self::Dmabuf(_) => Err(invalid_buffer_for_cpu_read()),
-        }
-    }
-
-    pub(super) fn to_committed_buffer_for_size(
-        &self,
-        size: BufferSize,
-    ) -> io::Result<CommittedSurfaceBuffer> {
-        match self {
-            Self::Shm(data) => Ok(CommittedSurfaceBuffer::shm_snapshot(
-                data.identity.clone(),
-                size,
-                data.read_pixels()?,
-            )),
-            Self::Dmabuf(data) => Ok(CommittedSurfaceBuffer::dmabuf_handle(
-                data.identity.clone(),
-                data.handle.clone(),
-            )),
         }
     }
 }

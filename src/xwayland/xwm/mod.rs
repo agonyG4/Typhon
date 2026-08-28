@@ -247,6 +247,9 @@ pub enum XwmCommand {
         window: X11WindowHandle,
         workspace: u32,
     },
+    ClearWorkspace {
+        window: X11WindowHandle,
+    },
     PublishDesktopState {
         workspace_count: u32,
         current_workspace: u32,

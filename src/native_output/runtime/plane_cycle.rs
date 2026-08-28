@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use oblivion_one::compositor::SurfaceDamagePresentation;
+
 use super::*;
 use crate::native_output::kms_worker::{
     AttachablePrimary, CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob,
@@ -78,6 +80,7 @@ pub(super) fn queue_plane_delta(
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
+    cursor_surface_damage: Option<SurfaceDamagePresentation>,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -94,6 +97,7 @@ pub(super) fn queue_plane_delta(
         attachable_primary,
         cursor_action,
         cursor_delivery,
+        cursor_surface_damage,
     )?;
     let (
         transaction_id,
@@ -326,6 +330,7 @@ pub(super) fn prepare_plane_delta(
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
+    cursor_surface_damage: Option<SurfaceDamagePresentation>,
 ) -> NativeResult<PlaneDeltaPreparation> {
     if matches!(
         cursor_action,
@@ -384,6 +389,11 @@ pub(super) fn prepare_plane_delta(
         OutputReleasePlan::Pageflip,
     )
     .map_err(io::Error::other)?;
+    let transaction = if let Some(surface_damage) = cursor_surface_damage {
+        transaction.with_surface_damage(surface_damage)
+    } else {
+        transaction
+    };
     output_transactions
         .insert(transaction)
         .map_err(io::Error::other)?;

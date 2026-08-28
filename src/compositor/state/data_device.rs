@@ -121,7 +121,7 @@ impl CompositorState {
         let identity = self
             .allocate_buffer_identity()
             .expect("test buffer identity");
-        self.renderable_surfaces.push(RenderableSurface {
+        self.append_renderable_surface(RenderableSurface {
             surface_id,
             x: 0,
             y: 0,

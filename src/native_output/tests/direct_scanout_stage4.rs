@@ -143,6 +143,21 @@ fn same_content_matching_queued_or_submitted_job_is_not_admitted_twice() {
 }
 
 #[test]
+fn identical_direct_candidate_key_proves_the_visual_content_epoch_is_unchanged() {
+    let candidate = test_direct_key(3);
+
+    assert_eq!(
+        classify_direct_content(candidate, Some(candidate), None),
+        DirectContentDisposition::MatchesPresented
+    );
+    assert_eq!(
+        classify_direct_content(candidate, None, Some(candidate)),
+        DirectContentDisposition::MatchesQueuedOrSubmitted
+    );
+    assert_eq!(candidate.content.content_epoch.get(), 3);
+}
+
+#[test]
 fn new_content_epoch_can_reuse_validation_key_but_still_submits() {
     let first = test_direct_key(3);
     let second = test_direct_key(4);

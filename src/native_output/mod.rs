@@ -123,7 +123,7 @@ pub(crate) use presentation::trace::*;
 pub(crate) use presentation::transaction::*;
 pub(crate) use runtime::{
     NativeCursorRenderMode, NativeFrameRenderer, NativePointerConstraintBackend,
-    ResolvedNativeFrameScene, native_pointer_debug_log, native_pointer_debug_log_lazy, run,
+    ResolvedNativeFrameScene, native_pointer_debug_log_lazy, run,
 };
 #[cfg(test)]
 pub(crate) use runtime::{NativeFrameSceneSnapshot, NativeSceneHistory};

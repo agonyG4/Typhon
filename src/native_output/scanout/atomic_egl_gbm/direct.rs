@@ -120,6 +120,7 @@ impl AtomicEglGbmScanout {
         output_transactions: &mut OutputTransactionLedger,
         target: PresentationTarget,
         cursor: Option<&AtomicCursorVisualState>,
+        cursor_source_key: Option<NativeCursorImageKey>,
         cursor_revision: Option<CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
@@ -388,8 +389,24 @@ impl AtomicEglGbmScanout {
 
         let frame_id = self.swapchain()?.next_frame_id();
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
-        let surface_damage =
-            server.capture_surface_damage_presentation_for_surface(candidate.surface_id);
+        let mut sampled_surface_ids = vec![candidate.surface_id];
+        if let Some(cursor_source_key) = cursor_source_key {
+            sampled_surface_ids.push(cursor_source_key.surface_id);
+        }
+        let surface_damage = server.capture_surface_damage_presentation_for_surface_ids_and_commit(
+            sampled_surface_ids,
+            cursor_source_key.map(|source_key| {
+                (
+                    source_key.surface_id,
+                    oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
+                )
+            }),
+        );
+        if let Some(source_key) = cursor_source_key
+            && surface_damage.contains_surface_id(source_key.surface_id)
+        {
+            server.note_client_cursor_surface_sample(true);
+        }
         if !server.commit_timing_submission_is_safe_for_batch(
             protocol_batch_id,
             target.presentation_time,

@@ -374,9 +374,6 @@ pub(super) fn submit_ready_frame(
                     Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
             }
             *frame_submitted = true;
-            if !explicit_submission {
-                server.mark_render_damage_presented();
-            }
             *frame_index = frame_index.saturating_add(1);
             perf.log("native.frame", || {
                 vec![

@@ -1013,10 +1013,10 @@ mod tests {
             callback_settlement: FrameCallbackSettlement::default(),
             callback_terminal_ownership_checked: false,
             presentation_feedbacks: Vec::new(),
-            shm_buffer_releases: Vec::new(),
             dmabuf_releases_to_complete_on_present: Vec::new(),
             fifo_barrier_claims: Vec::new(),
             commit_timing_target_claims: claims,
+            surface_damage: None,
         };
         state
             .frame_batches
@@ -1073,10 +1073,10 @@ mod tests {
                 callback_settlement: FrameCallbackSettlement::default(),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks: Vec::new(),
-                shm_buffer_releases: Vec::new(),
                 dmabuf_releases_to_complete_on_present: Vec::new(),
                 fifo_barrier_claims: Vec::new(),
                 commit_timing_target_claims: Vec::new(),
+                surface_damage: None,
             },
         );
 
@@ -1127,10 +1127,10 @@ mod tests {
                 callback_settlement: FrameCallbackSettlement::default(),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks: Vec::new(),
-                shm_buffer_releases: Vec::new(),
                 dmabuf_releases_to_complete_on_present: Vec::new(),
                 fifo_barrier_claims: Vec::new(),
                 commit_timing_target_claims: vec![claim],
+                surface_damage: None,
             },
         );
 

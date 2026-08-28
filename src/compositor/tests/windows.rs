@@ -357,6 +357,85 @@ fn fullscreen_origin_is_independent_of_raise_and_focus_order() {
 }
 
 #[test]
+fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleFullscreenFocused,
+        false,
+    )
+    .unwrap();
+
+    focus_root_window(&commands, surface_ids[1]);
+    commands
+        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace)
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let hidden_metrics = capture_fullscreen_render_plan_metrics(&commands);
+    assert_eq!(hidden_metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(hidden_metrics.solitary_tree_active);
+    assert_eq!(
+        capture_native_frame_surface_ids(&commands),
+        vec![surface_ids[2]]
+    );
+
+    commands
+        .send(ServerCommand::SetPointerHitInstrumentationEnabled(true))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let pointer_hits_before_open = capture_pointer_input_metrics(&commands).pointer_scene_hit_calls;
+    let configure_serial_before_open = capture_configure_serial(&commands);
+    commands
+        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let opened_metrics = capture_fullscreen_render_plan_metrics(&commands);
+    let opened_native_ids = capture_native_frame_surface_ids(&commands);
+    assert_eq!(opened_metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(!opened_metrics.solitary_tree_active);
+    assert!(opened_native_ids.contains(&surface_ids[1]));
+    assert!(opened_native_ids.contains(&surface_ids[2]));
+    assert_eq!(
+        capture_configure_serial(&commands),
+        configure_serial_before_open
+    );
+    assert_eq!(
+        capture_pointer_input_metrics(&commands).pointer_scene_hit_calls,
+        pointer_hits_before_open + 1
+    );
+    assert_eq!(
+        capture_direct_scanout_candidate(&commands),
+        Err(DirectScanoutSceneRejection::OverlayVisible)
+    );
+
+    let pointer_hits_before_close =
+        capture_pointer_input_metrics(&commands).pointer_scene_hit_calls;
+    commands
+        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(capture_fullscreen_render_plan_metrics(&commands).solitary_tree_active);
+    assert_eq!(
+        capture_native_frame_surface_ids(&commands),
+        vec![surface_ids[2]]
+    );
+    assert_eq!(capture_focused_surface_id(&commands), Some(surface_ids[2]));
+    assert_eq!(
+        capture_pointer_input_metrics(&commands).pointer_scene_hit_calls,
+        pointer_hits_before_close + 1
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn fullscreen_client_request_uses_absolute_output_origin() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -1011,7 +1090,7 @@ fn state_with_preview_resize(
         interaction_id: desired.interaction_id,
     };
 
-    state.renderable_surfaces.push(RenderableSurface {
+    state.append_renderable_surface(RenderableSurface {
         surface_id,
         x: 0,
         y: 0,

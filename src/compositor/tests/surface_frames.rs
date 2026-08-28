@@ -307,6 +307,101 @@ fn legacy_prepared_batch_is_settled_after_a_skipped_frame_without_unowned_work()
 }
 
 #[test]
+fn compatibility_no_visual_change_without_protocol_work_keeps_batch_unowned() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::SettleNoVisualChangeWork {
+            owns_frame_batch: false,
+            reply,
+        })
+        .unwrap();
+    assert!(!receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+
+    let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePreparedFrame(prepared_reply))
+        .unwrap();
+    assert!(
+        !prepared_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn compatibility_no_visual_change_with_callback_owns_one_terminal_batch() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_live_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::SettleNoVisualChangeWork {
+            owns_frame_batch: true,
+            reply,
+        })
+        .unwrap();
+    assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert!(!capture_pending_frame_work(&commands));
+
+    let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePreparedFrame(prepared_reply))
+        .unwrap();
+    assert!(
+        !prepared_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn compatibility_no_visual_change_with_presentation_feedback_owns_one_terminal_batch() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = create_surface_with_unpresented_presentation_feedback(&socket_path).unwrap();
+    retain_live_test_connection(connection);
+    wait_for_server_commands(&commands);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::SettleNoVisualChangeWork {
+            owns_frame_batch: true,
+            reply,
+        })
+        .unwrap();
+    assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+    assert!(!capture_pending_frame_work(&commands));
+
+    let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePreparedFrame(prepared_reply))
+        .unwrap();
+    assert!(
+        !prepared_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn legacy_skipped_frame_completes_a_captured_callback_once() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -376,7 +471,7 @@ fn legacy_immediate_present_settles_feedback_and_release_once_without_new_work()
             .iter()
             .filter(|event| **event == "buffer_release")
             .count(),
-        1
+        0
     );
     assert!(!server.has_prepared_frame_batch());
     assert_eq!(server.frame_batch_count(), 0);
@@ -525,9 +620,13 @@ fn wayland_client_shm_release_happens_after_materialization_before_present() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     let state = create_surface_with_buffer_release(&socket_path, &commands);
-    let _server = stop_controllable_test_server(commands, server_thread);
+    let server = stop_controllable_test_server(commands, server_thread);
 
     assert_eq!(state.unwrap().buffer_release_count, 1);
+    let metrics = server.shm_buffer_lifetime_metrics();
+    assert!(metrics.shm_materializations_total >= 1);
+    assert!(metrics.shm_releases_after_materialization_total >= 1);
+    assert_eq!(metrics.presentation_bound_shm_release_total, 0);
 }
 
 #[test]
@@ -542,7 +641,7 @@ fn explicit_frame_batch_does_not_release_a_late_commit() {
 
     let ((buffer_a, buffer_b, _buffer_c), after_frame_a, after_frame_b) = result.unwrap();
     assert_eq!(after_frame_a, vec![buffer_a, buffer_b]);
-    assert_eq!(after_frame_b, vec![buffer_a, buffer_b, _buffer_c]);
+    assert_eq!(after_frame_b, vec![buffer_a, buffer_b]);
 }
 
 #[test]
@@ -556,7 +655,7 @@ fn destroyed_clients_scrub_pending_captured_and_retired_releases() {
     let server = stop_controllable_test_server(commands, server_thread);
     let metrics = server.buffer_release_metrics();
 
-    assert_eq!(metrics.buffer_releases_completed, 0);
+    assert!(metrics.buffer_releases_completed >= 3);
     assert!(metrics.buffer_releases_discarded >= 3);
     assert_eq!(metrics.buffer_release_duplicate_attempts, 0);
 }
@@ -639,8 +738,130 @@ fn wayland_surface_damage_only_commit_keeps_owned_shm_snapshot() {
     );
     assert_eq!(
         surface.cpu_pixels(),
+        Some(vec![0xff11_1111, 0xff22_2222, 0xff33_3333, 0xff44_4444].as_slice())
+    );
+}
+
+#[test]
+fn wayland_same_buffer_object_reuse_materializes_new_content_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let client_state = create_client_toplevel_with_reused_shm_buffer(&socket_path).unwrap();
+    let server = stop_test_server(running, server_thread);
+
+    assert_eq!(client_state.buffer_release_count, 2);
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    assert_eq!(
+        server.renderable_surfaces()[0].cpu_pixels(),
         Some(vec![0xffaa_0000, 0xff00_aa00, 0xff00_00aa, 0xffaa_aa00].as_slice())
     );
+}
+
+#[test]
+fn two_buffer_shm_client_rotates_with_pending_and_ready_output_batches() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = exercise_two_buffer_shm_with_pending_and_ready_batches(&socket_path, &commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+    let (state, resource_counts) = result.unwrap();
+
+    assert_eq!(state.buffer_release_count, 3);
+    assert_eq!(resource_counts.1, 0);
+    assert_eq!(resource_counts.2, 2);
+    let metrics = server.shm_buffer_lifetime_metrics();
+    assert_eq!(metrics.shm_releases_after_materialization_total, 3);
+    assert_eq!(metrics.presentation_bound_shm_release_total, 0);
+}
+
+#[test]
+fn failed_shm_materialization_releases_without_false_materialization_proof() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let client_state = create_client_toplevel_with_invalid_shm_buffer(&socket_path).unwrap();
+    let server = stop_test_server(running, server_thread);
+    let metrics = server.shm_buffer_lifetime_metrics();
+
+    assert_eq!(client_state.buffer_release_count, 1);
+    assert_eq!(server.renderable_surfaces().len(), 0);
+    assert_eq!(metrics.shm_materializations_total, 0);
+    assert_eq!(metrics.shm_materialization_failures_total, 1);
+    assert_eq!(metrics.shm_releases_after_materialization_total, 0);
+    assert_eq!(metrics.shm_releases_deferred_unmaterialized_total, 1);
+}
+
+#[test]
+fn unassigned_shm_is_retained_until_role_adoption_materializes_it() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let client_state = create_unassigned_shm_surface_then_adopt_toplevel(&socket_path).unwrap();
+    let server = stop_test_server(running, server_thread);
+    let metrics = server.shm_buffer_lifetime_metrics();
+
+    assert_eq!(client_state.buffer_release_count, 1);
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    assert_eq!(metrics.shm_releases_after_materialization_total, 1);
+    assert_eq!(metrics.shm_releases_superseded_without_read_total, 0);
+}
+
+#[test]
+fn shutdown_releases_retained_unmaterialized_shm_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (connection, buffer) = create_unassigned_shm_surface_for_shutdown(&socket_path).unwrap();
+    let mut server = stop_controllable_test_server(commands, server_thread);
+    server.finish_commit_debug_for_shutdown();
+    let metrics = server.shm_buffer_lifetime_metrics();
+
+    assert_eq!(metrics.shm_releases_deferred_unmaterialized_total, 1);
+    assert_eq!(metrics.shm_releases_superseded_without_read_total, 0);
+    assert_eq!(metrics.shm_releases_after_materialization_total, 0);
+    drop(buffer);
+    drop(connection);
+}
+
+#[test]
+fn repeated_wayland_buffer_commits_use_indexed_surface_access() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    create_client_toplevel_with_repeated_shm_buffer_commits(&socket_path, 1_000).unwrap();
+    let server = stop_test_server(running, server_thread);
+    let metrics = server.surface_locality_metrics();
+
+    assert_eq!(metrics.content_indexed_lookups, 1_001);
+    assert_eq!(metrics.global_renderable_index_rebuilds, 0);
+}
+
+#[test]
+fn repeated_wayland_damage_only_commits_use_indexed_surface_access() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    create_client_toplevel_with_repeated_shm_damage_only_updates(&socket_path, 1_000).unwrap();
+    let server = stop_test_server(running, server_thread);
+    let metrics = server.surface_locality_metrics();
+
+    assert_eq!(metrics.content_indexed_lookups, 1_001);
+    assert_eq!(metrics.global_renderable_index_rebuilds, 0);
 }
 
 #[test]
@@ -824,6 +1045,23 @@ fn wayland_surface_can_switch_from_shm_snapshot_to_dmabuf_handle() {
     assert_eq!(surface.generation, 2);
     assert_eq!(surface.buffer_source(), SurfaceBufferSource::Dmabuf);
     assert!(surface.cpu_pixels().is_none());
+}
+
+#[test]
+fn wayland_surface_can_switch_from_dmabuf_to_shm_then_remove_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_client_toplevel_with_dmabuf_then_shm_and_remove(&socket_path, &commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(result.unwrap().buffer_release_count, 3);
+    assert_eq!(server.renderable_surfaces().len(), 0);
+    let metrics = server.shm_buffer_lifetime_metrics();
+    assert_eq!(metrics.shm_releases_after_materialization_total, 2);
+    assert_eq!(metrics.presentation_bound_shm_release_total, 0);
 }
 
 #[test]

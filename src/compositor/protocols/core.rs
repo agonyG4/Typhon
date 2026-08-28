@@ -137,10 +137,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                         .get(&surface_id)
                         .and_then(|buffer| {
                             buffer
-                                .data
                                 .width()
                                 .ok()
-                                .zip(buffer.data.height().ok())
+                                .zip(buffer.height().ok())
                                 .and_then(|(width, height)| BufferSize::new(width, height))
                         }),
                 };

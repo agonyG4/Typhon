@@ -205,6 +205,30 @@ impl CompositorState {
         }
 
         if self.toplevel_surfaces.contains_key(&surface_id) {
+            if let Some(window_id) = self.window_id_for_surface(surface_id)
+                && let Some(owner_id) = self.workspace_owner_window_id(window_id)
+                && let Some(special) = self
+                    .window(owner_id)
+                    .and_then(|window| window.management)
+                    .and_then(|management| management.special_workspace())
+                && self.workspace_manager.visible_special_workspace() != Some(special)
+            {
+                if !self
+                    .workspace_manager
+                    .set_visible_special_workspace(Some(special))
+                {
+                    activation_debug_log(|| {
+                        format!(
+                            "activation_reject token={token} target={surface_id} reason=unknown_special generation={}",
+                            token_state.generation
+                        )
+                    });
+                    return false;
+                }
+                self.rebuild_active_scene_view();
+                self.mark_astrea_toplevel_structure_dirty();
+                self.advance_render_generation(RenderGenerationCause::WorkspaceSwitch);
+            }
             self.raise_renderable_surface_tree(surface_id);
             self.focus_surface(surface);
             activation_debug_log(|| {

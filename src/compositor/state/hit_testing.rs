@@ -316,7 +316,17 @@ impl CompositorState {
             if !group.is_popup()
                 && let Some(hit) =
                     self.decoration_hit_for_root_at(group.root_surface_id(), root_origin, x, y)
-                && !self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+                && (!self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+                    || (matches!(hit, DecorationHit::Resize(_))
+                        && self
+                            .window_id_for_surface(group.root_surface_id())
+                            .and_then(|window_id| self.window(window_id))
+                            .and_then(|window| window.management)
+                            .is_some_and(|management| {
+                                management.layout() == crate::wm::LayoutMembership::Tiled
+                                    && management.chrome_policy()
+                                        == crate::wm::WindowChromePolicy::Minimal
+                            })))
             {
                 let Some(window_id) = self.window_id_for_surface(group.root_surface_id()) else {
                     continue;
@@ -610,6 +620,9 @@ impl CompositorState {
         &mut self,
         visual_root_surface_id: Option<u32>,
     ) {
+        if self.workspace_scene_transition_active {
+            return;
+        }
         if self.defer_pointer_focus_refresh() {
             return;
         }

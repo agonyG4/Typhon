@@ -1062,7 +1062,43 @@ impl NativeRuntime {
                 framebuffer,
                 initial_cursor_state.as_ref(),
             )?;
-            initial_surface_damage = Some(server.capture_surface_damage_presentation());
+            let initial_surface_ids = initial_resolved_scene.surface_ids().collect::<Vec<_>>();
+            let software_cursor_commit = cursor_render_mode
+                .is_software()
+                .then(|| server.client_cursor_render_state())
+                .flatten()
+                .map(|client_cursor| {
+                    (
+                        client_cursor.surface.surface_id,
+                        client_cursor.surface.commit_sequence,
+                    )
+                });
+            let hardware_cursor_commit = (cursor_render_mode == NativeCursorRenderMode::Hardware)
+                .then(|| pre_kms_atomic_cursor.as_ref())
+                .flatten()
+                .and_then(NativeAtomicCursor::client_source_key)
+                .map(|source_key| {
+                    (
+                        source_key.surface_id,
+                        oblivion_one::compositor::SurfaceCommitSequence(
+                            source_key.commit_sequence,
+                        ),
+                    )
+                });
+            let exact_cursor_commit = software_cursor_commit.or(hardware_cursor_commit);
+            initial_surface_damage = Some(
+                server.capture_surface_damage_presentation_for_surface_ids_and_commit(
+                    initial_surface_ids,
+                    exact_cursor_commit,
+                ),
+            );
+            if let Some((surface_id, _)) = exact_cursor_commit
+                && initial_surface_damage
+                    .as_ref()
+                    .is_some_and(|surface_damage| surface_damage.contains_surface_id(surface_id))
+            {
+                server.note_client_cursor_surface_sample(software_cursor_commit.is_none());
+            }
             let mut initial_gpu_sampling_started = false;
             let parts = match explicit.render_to_slot(
                 slot,

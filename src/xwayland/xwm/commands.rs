@@ -54,6 +54,7 @@ impl XwmCommand {
             Self::SetState { .. } => "SetState",
             Self::SyncClientLists { .. } => "SyncClientLists",
             Self::SetWorkspace { .. } => "SetWorkspace",
+            Self::ClearWorkspace { .. } => "ClearWorkspace",
             Self::PublishDesktopState { .. } => "PublishDesktopState",
             Self::BeginResizeSync { .. } => "BeginResizeSync",
             Self::SetAllowCommits { .. } => "SetAllowCommits",
@@ -85,6 +86,7 @@ impl XwmCommand {
             Self::Focus { window, .. } => *window,
             Self::SyncClientLists { .. } => None,
             Self::SetWorkspace { window, .. } => Some(*window),
+            Self::ClearWorkspace { window } => Some(*window),
             Self::PublishDesktopState { .. } => None,
         }
     }
@@ -509,6 +511,11 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     AtomEnum::CARDINAL,
                     &[workspace],
                 )
+                .map_err(XwmError::Connection)?;
+        }
+        XwmCommand::ClearWorkspace { window } => {
+            xwm.connection
+                .delete_property(window.xid(), xwm.atoms.get(XwmAtomName::NetWmDesktop))
                 .map_err(XwmError::Connection)?;
         }
         XwmCommand::PublishDesktopState {

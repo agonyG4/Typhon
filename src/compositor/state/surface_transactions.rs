@@ -200,20 +200,20 @@ impl CompositorState {
         let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
         let _committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
         let opaque_region_changed = data.apply_opaque_region_change(opaque_region);
+        let renderable_index = self.renderable_surface_index(surface_id);
         let (opaque_width, opaque_height) = surface_size
             .map(|size| (size.width, size.height))
             .or_else(|| {
-                self.renderable_surfaces
-                    .iter()
-                    .find(|surface| surface.surface_id == surface_id)
-                    .map(|surface| (surface.width, surface.height))
+                renderable_index.and_then(|index| {
+                    self.renderable_surfaces
+                        .get(index)
+                        .map(|surface| (surface.width, surface.height))
+                })
             })
             .unwrap_or((0, 0));
         let opaque_region = data.opaque_region_for_surface_size(opaque_width, opaque_height);
-        if let Some(renderable) = self
-            .renderable_surfaces
-            .iter_mut()
-            .find(|surface| surface.surface_id == surface_id)
+        if let Some(renderable) =
+            renderable_index.and_then(|index| self.renderable_surfaces.get_mut(index))
         {
             renderable.set_opaque_region(opaque_region.clone());
         }
@@ -299,11 +299,7 @@ impl CompositorState {
                     },
                 );
                 self.note_explicit_commit_published(commit_id);
-                if self
-                    .renderable_surfaces
-                    .iter()
-                    .any(|surface| surface.surface_id == surface_id)
-                {
+                if renderable_index.is_some() {
                     self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
                 } else {
                     self.complete_frame_callbacks(frame_callbacks);
