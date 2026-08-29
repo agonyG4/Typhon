@@ -2409,6 +2409,7 @@ fn history_lost_repairs_only_the_current_surface_footprint() {
 #[derive(Clone)]
 struct TopologyOracleVisuals {
     colors: std::collections::HashMap<u32, u32>,
+    decoration_colors: std::collections::HashMap<u32, u32>,
     markers: std::collections::HashMap<u32, (u32, u32, u32, u32, u32)>,
 }
 
@@ -2425,13 +2426,53 @@ fn topology_oracle_surface(
     surface
 }
 
+fn topology_oracle_surface_with_buffer(
+    surface_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    buffer: BufferIdentity,
+    damage: RenderableSurfaceDamage,
+) -> RenderableSurface {
+    let mut surface = topology_oracle_surface(surface_id, x, y, width, height, damage);
+    surface.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        buffer,
+        BufferSize::new(width, height).expect("test surface size must be non-zero"),
+        vec![0; width as usize * height as usize],
+    );
+    surface
+}
+
 fn topology_oracle_snapshot(
     surfaces: &[RenderableSurface],
     popup_surface_ids: &[u32],
 ) -> NativeSceneSnapshot {
-    let mut snapshot = NativeSceneSnapshot::from_surfaces(surfaces, Vec::new());
-    snapshot.popup_surface_ids = popup_surface_ids.to_vec();
-    snapshot
+    let decorations = surfaces
+        .iter()
+        .filter_map(|surface| match surface.surface_id {
+            401 => Some(DecorationSceneSnapshot::from_bounds(
+                WindowId::from_raw(401).expect("window A id"),
+                401,
+                16,
+                0,
+                168,
+                148,
+                1,
+            )),
+            402 => Some(DecorationSceneSnapshot::from_bounds(
+                WindowId::from_raw(402).expect("window B id"),
+                402,
+                86,
+                50,
+                168,
+                148,
+                1,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    NativeSceneSnapshot::from_surfaces_with_popup_ids(surfaces, decorations, popup_surface_ids)
 }
 
 fn topology_oracle_pixel(
@@ -2441,25 +2482,54 @@ fn topology_oracle_pixel(
     y: i32,
 ) -> u32 {
     let mut pixel = 0xff00_0000;
+    let mut painted_roots = std::collections::HashSet::new();
     for surface in &snapshot.surfaces {
-        let Some(bounds) = surface.bounds else {
-            continue;
-        };
-        if !native_damage_rect_contains(bounds, x, y) {
+        let root_surface_id = surface.visual_root_surface_id;
+        if !painted_roots.insert(root_surface_id) {
             continue;
         }
-        pixel = visuals.colors[&surface.surface_id];
-        if let Some((marker_x, marker_y, marker_width, marker_height, marker_color)) =
-            visuals.markers.get(&surface.surface_id).copied()
+        for member in snapshot
+            .surfaces
+            .iter()
+            .filter(|member| member.visual_root_surface_id == root_surface_id)
         {
-            let marker = NativeDamageRect {
-                x: bounds.x.saturating_add(marker_x as i32),
-                y: bounds.y.saturating_add(marker_y as i32),
-                width: marker_width,
-                height: marker_height,
+            let Some(bounds) = member.bounds else {
+                continue;
             };
-            if native_damage_rect_contains(marker, x, y) {
-                pixel = marker_color;
+            if !native_damage_rect_contains(bounds, x, y) {
+                continue;
+            }
+            pixel = visuals.colors[&member.surface_id];
+            if let Some((marker_x, marker_y, marker_width, marker_height, marker_color)) =
+                visuals.markers.get(&member.surface_id).copied()
+            {
+                let marker = NativeDamageRect {
+                    x: bounds.x.saturating_add(marker_x as i32),
+                    y: bounds.y.saturating_add(marker_y as i32),
+                    width: marker_width,
+                    height: marker_height,
+                };
+                if native_damage_rect_contains(marker, x, y) {
+                    pixel = marker_color;
+                }
+            }
+        }
+        if !snapshot.popup_surface_ids.contains(&root_surface_id)
+            && let Some(decoration) = snapshot
+                .decorations
+                .iter()
+                .find(|decoration| decoration.identity().1 == root_surface_id)
+        {
+            let (decoration_x, decoration_y, decoration_width, decoration_height) =
+                decoration.bounds();
+            let bounds = NativeDamageRect {
+                x: decoration_x,
+                y: decoration_y,
+                width: decoration_width,
+                height: decoration_height,
+            };
+            if native_damage_rect_contains(bounds, x, y) {
+                pixel = visuals.decoration_colors[&root_surface_id];
             }
         }
     }
@@ -2553,12 +2623,79 @@ fn topology_oracle_present(
     *presented_scene = current_scene;
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the oracle keeps each rejected output state explicit"
+)]
+fn topology_oracle_reject_candidate(
+    planner: &mut PartialRepaintPlanner,
+    slots: &mut [Vec<u32>],
+    slot_index: usize,
+    age: i32,
+    presented_scene: &NativeSceneSnapshot,
+    current_scene: &NativeSceneSnapshot,
+    visuals: &TopologyOracleVisuals,
+    width: u32,
+    height: u32,
+    label: &str,
+) {
+    let current_damage = native_output_damage_for_scene_snapshots(
+        width,
+        height,
+        presented_scene,
+        current_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    let plan = planner.plan(
+        current_damage.as_renderer_damage(width, height),
+        BufferAge::Value(age),
+    );
+    topology_oracle_paint_repair(
+        &mut slots[slot_index],
+        width,
+        height,
+        current_scene,
+        visuals,
+        &plan.repair_damage,
+    );
+    let reference = (0..height as i32)
+        .flat_map(|y| (0..width as i32).map(move |x| (x, y)))
+        .map(|(x, y)| topology_oracle_pixel(current_scene, visuals, x, y))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        slots[slot_index], reference,
+        "rejected regional topology candidate differs from full reference after {label}"
+    );
+    // A rejected render may have written a scratch/output slot, but it is not
+    // a presented transition: neither planner history nor the presented scene
+    // is advanced here. The next selected slot must repair from that state.
+}
+
 #[test]
 fn topology_transitions_match_full_reference_with_rotating_output_ages() {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
-    let a = topology_oracle_surface(401, 20, 20, 160, 120, RenderableSurfaceDamage::Empty);
-    let b = topology_oracle_surface(402, 90, 70, 160, 120, RenderableSurfaceDamage::Empty);
+    let client_buffer_a = test_buffer_identity();
+    let client_buffer_b = test_buffer_identity();
+    let client_buffer_c = test_buffer_identity();
+    let a = topology_oracle_surface_with_buffer(
+        401,
+        20,
+        20,
+        160,
+        120,
+        client_buffer_a.clone(),
+        RenderableSurfaceDamage::Empty,
+    );
+    let b = topology_oracle_surface_with_buffer(
+        402,
+        90,
+        70,
+        160,
+        120,
+        client_buffer_a.clone(),
+        RenderableSurfaceDamage::Empty,
+    );
     let mut visuals = TopologyOracleVisuals {
         colors: [
             (401, 0xff00_55aa),
@@ -2569,6 +2706,9 @@ fn topology_transitions_match_full_reference_with_rotating_output_ages() {
         ]
         .into_iter()
         .collect(),
+        decoration_colors: [(401, 0xff11_3355), (402, 0xff55_3311)]
+            .into_iter()
+            .collect(),
         markers: std::collections::HashMap::new(),
     };
     let initial_scene = topology_oracle_snapshot(&[a.clone(), b.clone()], &[]);
@@ -2742,18 +2882,24 @@ fn topology_transitions_match_full_reference_with_rotating_output_ages() {
     );
 
     let rejected = topology_oracle_snapshot(&[a.clone(), b_content.clone(), moved_child], &[]);
-    let rejected_damage = native_output_damage_for_scene_snapshots(
-        WIDTH,
-        HEIGHT,
-        &presented_scene,
-        &rejected,
-        NativeCursorDamageBounds::default(),
-    );
-    assert!(!rejected_damage.is_empty());
-    topology_oracle_present(
+    let presented_before_rejection = presented_scene.clone();
+    topology_oracle_reject_candidate(
         &mut planner,
         &mut slots,
         1,
+        3,
+        &presented_scene,
+        &rejected,
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "rejected candidate",
+    );
+    assert_eq!(presented_scene, presented_before_rejection);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
         3,
         &mut presented_scene,
         rejected,
@@ -2769,10 +2915,90 @@ fn topology_transitions_match_full_reference_with_rotating_output_ages() {
         2,
         3,
         &mut presented_scene,
-        topology_oracle_snapshot(&[a, b_content], &[]),
+        topology_oracle_snapshot(&[a.clone(), b_content.clone()], &[]),
         &visuals,
         WIDTH,
         HEIGHT,
         "subsurface unmap",
+    );
+
+    let mut buffer_b = b_content.clone();
+    buffer_b.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        client_buffer_b.clone(),
+        buffer_b.buffer_size(),
+        vec![0; buffer_b.buffer_size().width as usize * buffer_b.buffer_size().height as usize],
+    );
+    buffer_b.generation = 3;
+    buffer_b.commit_sequence = SurfaceCommitSequence(3);
+    buffer_b.damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 4,
+        y: 4,
+        width: 12,
+        height: 10,
+    }]);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        0,
+        1,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), buffer_b.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "client buffer A to B",
+    );
+
+    let mut buffer_c = buffer_b.clone();
+    buffer_c.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        client_buffer_c.clone(),
+        buffer_c.buffer_size(),
+        vec![0; buffer_c.buffer_size().width as usize * buffer_c.buffer_size().height as usize],
+    );
+    buffer_c.generation = 4;
+    buffer_c.commit_sequence = SurfaceCommitSequence(4);
+    buffer_c.damage = RenderableSurfaceDamage::Empty;
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        1,
+        2,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), buffer_c.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "client buffer B to C authoritative Empty",
+    );
+
+    let mut buffer_a_again = buffer_c.clone();
+    buffer_a_again.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        client_buffer_a,
+        buffer_a_again.buffer_size(),
+        vec![
+            0;
+            buffer_a_again.buffer_size().width as usize
+                * buffer_a_again.buffer_size().height as usize
+        ],
+    );
+    buffer_a_again.generation = 5;
+    buffer_a_again.commit_sequence = SurfaceCommitSequence(5);
+    buffer_a_again.damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 18,
+        y: 16,
+        width: 16,
+        height: 12,
+    }]);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a, buffer_a_again], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "client buffer C to A",
     );
 }
