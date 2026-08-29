@@ -19,6 +19,7 @@ pub(crate) struct DmabufGpuReleaseMetrics {
     pub(crate) obligations_completed: u64,
     pub(crate) fences_created: u64,
     pub(crate) fences_signaled: u64,
+    pub(crate) no_visual_fence_only: u64,
     pub(crate) completion_fd_failures: u64,
     pub(crate) registration_failures: u64,
     pub(crate) active_leases: u64,
@@ -106,6 +107,10 @@ impl DmabufGpuReleaseRegistry {
     pub(crate) fn note_obligations_armed(&mut self, count: usize) {
         self.metrics.obligations_armed =
             self.metrics.obligations_armed.saturating_add(count as u64);
+    }
+
+    pub(crate) fn note_no_visual_fence_only(&mut self) {
+        self.metrics.no_visual_fence_only = self.metrics.no_visual_fence_only.saturating_add(1);
     }
 
     pub(crate) fn metrics(&self) -> DmabufGpuReleaseMetrics {

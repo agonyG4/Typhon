@@ -641,7 +641,7 @@ impl Drop for NativeRuntime {
         );
         let dmabuf_release_metrics = self.dmabuf_gpu_release_metrics();
         println!(
-            "typhon pacing: event=dmabuf_gpu_release_summary leases_registered={} leases_completed={} leases_requeued={} obligations_armed={} obligations_completed={} fences_created={} fences_signaled={} completion_fd_failures={} registration_failures={} active_leases={} peak_active_leases={}",
+            "typhon pacing: event=dmabuf_gpu_release_summary leases_registered={} leases_completed={} leases_requeued={} obligations_armed={} obligations_completed={} fences_created={} fences_signaled={} no_visual_fence_only={} completion_fd_failures={} registration_failures={} active_leases={} peak_active_leases={}",
             dmabuf_release_metrics.leases_registered,
             dmabuf_release_metrics.leases_completed,
             dmabuf_release_metrics.leases_requeued,
@@ -649,6 +649,7 @@ impl Drop for NativeRuntime {
             dmabuf_release_metrics.obligations_completed,
             dmabuf_release_metrics.fences_created,
             dmabuf_release_metrics.fences_signaled,
+            dmabuf_release_metrics.no_visual_fence_only,
             dmabuf_release_metrics.completion_fd_failures,
             dmabuf_release_metrics.registration_failures,
             dmabuf_release_metrics.active_leases,

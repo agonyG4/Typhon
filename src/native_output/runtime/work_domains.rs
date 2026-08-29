@@ -188,6 +188,7 @@ mod tests {
     const SEAT: u32 = 1 << 7;
     const XWAYLAND_XWM: u32 = 1 << 11;
     const CONTROL: u32 = 1 << 14;
+    const DMABUF_GPU_RELEASE: u32 = 1 << 16;
 
     fn wakeup(bits: u32) -> NativeWakeup {
         NativeWakeup {
@@ -225,6 +226,16 @@ mod tests {
         let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
 
         assert!(!domains.wayland_dispatch);
+    }
+
+    #[test]
+    fn dmabuf_gpu_release_readiness_does_not_schedule_output_work() {
+        let domains = NativeWorkDomains::classify(&wakeup(DMABUF_GPU_RELEASE), &state());
+
+        assert!(!domains.scene);
+        assert!(!domains.wayland_dispatch);
+        assert!(!domains.presentation);
+        assert!(!domains.cursor);
     }
 
     #[test]

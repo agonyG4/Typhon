@@ -1174,13 +1174,19 @@ impl NativeRuntime {
                                     let completion_fd = release_fence.duplicate_completion_fd();
                                     match completion_fd {
                                         Ok(completion_fd) => {
-                                            if dmabuf_gpu_release_registry
-                                                .register(lease_id, completion_fd, event_loop)
-                                                .is_err()
-                                            {
-                                                dmabuf_gpu_release_registry
-                                                    .note_registration_failure();
-                                                server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                            match dmabuf_gpu_release_registry.register(
+                                                lease_id,
+                                                completion_fd,
+                                                event_loop,
+                                            ) {
+                                                Ok(_) => dmabuf_gpu_release_registry
+                                                    .note_no_visual_fence_only(),
+                                                Err(_) => {
+                                                    dmabuf_gpu_release_registry
+                                                        .note_registration_failure();
+                                                    server
+                                                        .requeue_dmabuf_gpu_release_lease(lease_id);
+                                                }
                                             }
                                         }
                                         Err(_) => {
