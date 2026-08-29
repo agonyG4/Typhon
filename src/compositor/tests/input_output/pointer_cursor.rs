@@ -275,7 +275,7 @@ fn locked_pointer_warp_is_ignored_while_active() {
         )
     }));
     assert_eq!(state.locked_count, 1);
-    assert_eq!(state.unlocked_count, 1);
+    assert_eq!(state.unlocked_count, 0);
     assert_eq!(state.relative_motion_count, 1);
 }
 
