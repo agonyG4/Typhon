@@ -3,6 +3,8 @@ use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 
 #[cfg(test)]
 mod frame_consumption_tests {
+    use std::num::NonZeroU64;
+
     use super::*;
 
     #[test]
@@ -526,7 +528,7 @@ mod frame_consumption_tests {
     }
 
     #[test]
-    fn protocol_only_tick_drains_release_work_through_terminal_batch() {
+    fn protocol_only_tick_defers_release_work_without_gpu_proof() {
         let mut state = CompositorState::default();
         state.queue_dmabuf_buffer_release(test_dmabuf_release(501));
 
@@ -535,7 +537,8 @@ mod frame_consumption_tests {
             ProtocolOnlyCompletion::NoCallbacks
         );
         assert!(state.pending_dmabuf_buffer_releases.is_empty());
-        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
         assert!(state.frame_batches.is_empty());
     }
 
