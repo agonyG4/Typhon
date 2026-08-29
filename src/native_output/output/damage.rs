@@ -1229,13 +1229,16 @@ fn push_order_transition_damage(
     let changed_current_ids = &current_ids[prefix..current_ids.len().saturating_sub(suffix)];
     let affected_visual_roots = changed_previous_ids
         .iter()
-        .chain(changed_current_ids)
         .filter_map(|surface_id| {
             previous_by_id
                 .get(surface_id)
-                .or_else(|| current_by_id.get(surface_id))
                 .map(|surface| surface.visual_root_surface_id)
         })
+        .chain(changed_current_ids.iter().filter_map(|surface_id| {
+            current_by_id
+                .get(surface_id)
+                .map(|surface| surface.visual_root_surface_id)
+        }))
         .collect::<HashSet<_>>();
 
     for surface_id in changed_previous_ids {
