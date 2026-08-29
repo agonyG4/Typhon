@@ -581,14 +581,33 @@ impl CompositorState {
         &mut self,
         token: SurfaceDamagePresentation,
     ) {
-        self.settle_surface_damage(token);
+        self.settle_surface_damage(token, SurfaceDamageSettlement::Presented);
     }
-    fn settle_surface_damage(&mut self, token: SurfaceDamagePresentation) {
+    pub(in crate::compositor) fn commit_surface_damage_no_visual_change(
+        &mut self,
+        token: SurfaceDamagePresentation,
+    ) {
+        self.settle_surface_damage(token, SurfaceDamageSettlement::NoVisualChange);
+    }
+    fn settle_surface_damage(
+        &mut self,
+        token: SurfaceDamagePresentation,
+        settlement: SurfaceDamageSettlement,
+    ) {
         let sampled_entries = token.sampled_commits.len() as u64;
         let mut metrics = self.locality_metrics.get();
-        metrics.surface_damage_settlement_presented = metrics
-            .surface_damage_settlement_presented
-            .saturating_add(sampled_entries);
+        match settlement {
+            SurfaceDamageSettlement::Presented => {
+                metrics.surface_damage_settlement_presented = metrics
+                    .surface_damage_settlement_presented
+                    .saturating_add(sampled_entries);
+            }
+            SurfaceDamageSettlement::NoVisualChange => {
+                metrics.surface_damage_settlement_no_visual_change = metrics
+                    .surface_damage_settlement_no_visual_change
+                    .saturating_add(sampled_entries);
+            }
+        }
         self.locality_metrics.set(metrics);
         for (key, sampled_commit) in token.sampled_commits {
             let mut metrics = self.locality_metrics.get();
@@ -957,20 +976,6 @@ impl CompositorState {
                         | InputSerialKind::KeyboardKeyPress { .. }
                         | InputSerialKind::TouchDown { .. }
                 )
-        })
-    }
-
-    pub(in crate::compositor) fn validate_set_cursor_serial(
-        &self,
-        serial: u32,
-        surface: &wl_surface::WlSurface,
-    ) -> bool {
-        self.recent_input_serials.iter().any(|input| {
-            input.serial == serial
-                && input.kind == InputSerialKind::PointerEnter
-                && input.surface.id().same_client_as(&surface.id())
-                && same_surface_resource(&input.surface, surface)
-                && input.focus_generation == self.focus_generation
         })
     }
 

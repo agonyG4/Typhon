@@ -1053,6 +1053,11 @@ impl OwnCompositorServer {
         self.state.commit_surface_damage_presented(token);
     }
 
+    #[doc(hidden)]
+    pub fn commit_surface_damage_no_visual_change(&mut self, token: SurfaceDamagePresentation) {
+        self.state.commit_surface_damage_no_visual_change(token);
+    }
+
     pub fn note_client_cursor_surface_sample(&self, hardware: bool) {
         self.state.note_client_cursor_surface_sample(hardware);
     }

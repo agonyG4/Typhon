@@ -675,10 +675,12 @@ impl CompositorState {
         let callback_time = self.frame_callback_time_ms();
         self.complete_frame_callbacks_at_time(callbacks, callback_time);
         let _ = self.complete_frame_batch_releases(batch_id, batch);
-        // No-visual-change completion has no physical presentation terminal.
-        // Drop the sampled lineage so a later frame still settles against the
-        // last actually presented commit.
-        let _ = surface_damage;
+        // A proven no-visual-change terminal advances only the logical
+        // surface-damage baseline. It does not advance any physical output
+        // presentation authority.
+        if let Some(surface_damage) = surface_damage {
+            self.commit_surface_damage_no_visual_change(surface_damage);
+        }
         self.clear_legacy_batch_reference(batch_id);
     }
 

@@ -150,10 +150,12 @@ impl CompositorState {
                 .expect("no prepared frame batch for no-visual-change settlement");
             self.complete_no_visual_change_frame_batch(batch_id);
         } else {
-            // A sampled token is only evidence for the rendered frame. With
-            // no physical presentation there is no new last-presented state
-            // to advance, so dropping it is deliberate.
-            let _ = surface_damage;
+            // The output-damage authority has proven this logical transition
+            // needs no pixels repaired. Settle its surface lineage without
+            // asserting a physical output presentation.
+            if let Some(surface_damage) = surface_damage {
+                self.commit_surface_damage_no_visual_change(surface_damage);
+            }
         }
         completed_work
     }

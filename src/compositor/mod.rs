@@ -788,6 +788,11 @@ pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceDamageSettlement {
+    Presented,
+    NoVisualChange,
+}
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceDamagePresentation {
