@@ -48,7 +48,7 @@
 
   Then send one `PointerMotionSample` with an absolute position different from the anchor and relative values `(dx, dy, dx_unaccelerated, dy_unaccelerated) = (9.25, -4.5, 10.75, -6.0)`. Assert the compositor position remains the anchor, `pointer_motion` remains false, exactly one relative event is received, and all four relative values match exactly. This proves an ignored warp does not alter the absolute baseline or create relative motion while physical relative motion still flows.
 
-  Finally commit a valid cursor-position hint at `(70.0, 50.0)`, destroy the lock, flush, wait, and roundtrip. Assert the deactivation request carries the existing hint-derived output position, the lock emits one `unlocked` event, and the relative event count remains one. Stop and join the test server on every exit path using the established test style.
+  Finally commit a valid cursor-position hint at `(70.0, 50.0)`, destroy the lock, flush, wait, and roundtrip. Assert the deactivation request carries the existing hint-derived output position, the relative event count remains one, and the existing resource-destruction path does not synthesize an `unlocked` event. Stop and join the test server on every exit path using the established test style.
 
 - [ ] **Step 2: Write the native backend locked-warp test.**
 
