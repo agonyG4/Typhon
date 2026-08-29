@@ -231,12 +231,7 @@ impl CompositorState {
                 .surface_indices
                 .get(&surface_id)
                 .copied();
-            let Some(source) = self
-                .renderable_surfaces
-                .iter()
-                .find(|surface| surface.surface_id == surface_id)
-                .cloned()
-            else {
+            let Some(source) = self.renderable_surface(surface_id).cloned() else {
                 membership_changed |= cached_index.is_some();
                 continue;
             };

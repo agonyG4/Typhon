@@ -122,6 +122,10 @@ fn merge_damage(
     newer: Option<RenderableSurfaceDamage>,
 ) -> Option<RenderableSurfaceDamage> {
     match (older, newer) {
+        (Some(RenderableSurfaceDamage::HistoryLost), _)
+        | (_, Some(RenderableSurfaceDamage::HistoryLost)) => {
+            Some(RenderableSurfaceDamage::HistoryLost)
+        }
         (Some(RenderableSurfaceDamage::Full), _) | (_, Some(RenderableSurfaceDamage::Full)) => {
             Some(RenderableSurfaceDamage::Full)
         }

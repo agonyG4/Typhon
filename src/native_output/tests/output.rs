@@ -2002,3 +2002,647 @@ fn stable_geometry_content_damage_does_not_escalate_to_full_bounds() {
     assert_eq!(damage.rects[0].width, 5);
     assert_eq!(damage.rects[0].height, 6);
 }
+
+#[test]
+fn popup_map_is_regional_and_does_not_damage_unrelated_output() {
+    let base = test_renderable_surface(300, 0, 0, 960, 640, RenderableSurfaceDamage::Empty);
+    let popup = test_renderable_surface(301, 320, 220, 80, 60, RenderableSurfaceDamage::Full);
+    let previous = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&base), Vec::new());
+    let mut current = NativeSceneSnapshot::from_surfaces(&[base, popup], Vec::new());
+    current.popup_surface_ids = vec![301];
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 430, 330)),
+        "popup map damage: {:?}",
+        damage
+    );
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 900, 600))
+    );
+}
+
+#[test]
+fn popup_unmap_is_regional_and_repairs_the_old_tree_footprint() {
+    let base = test_renderable_surface(310, 0, 0, 960, 640, RenderableSurfaceDamage::Empty);
+    let popup = test_renderable_surface(311, 320, 220, 80, 60, RenderableSurfaceDamage::Empty);
+    let mut previous = NativeSceneSnapshot::from_surfaces(&[base.clone(), popup], Vec::new());
+    previous.popup_surface_ids = vec![311];
+    let current = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&base), Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 430, 330)),
+        "popup unmap damage: {:?}",
+        damage
+    );
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 900, 600))
+    );
+}
+
+#[test]
+fn popup_reposition_repairs_old_and_new_regions_without_full_output() {
+    let previous_popup =
+        test_renderable_surface(321, 120, 100, 80, 60, RenderableSurfaceDamage::Empty);
+    let current_popup =
+        test_renderable_surface(321, 500, 400, 80, 60, RenderableSurfaceDamage::Empty);
+    let previous = NativeSceneSnapshot::from_surfaces(&[previous_popup], Vec::new());
+    let current = NativeSceneSnapshot::from_surfaces(&[current_popup], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 200, 180))
+    );
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 580, 480))
+    );
+}
+
+#[test]
+fn popup_content_only_commit_remains_regional() {
+    let previous_popup =
+        test_renderable_surface(331, 120, 100, 120, 90, RenderableSurfaceDamage::Empty);
+    let mut current_popup = previous_popup.clone();
+    current_popup.generation = 2;
+    current_popup.commit_sequence = SurfaceCommitSequence(2);
+    current_popup.damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 4,
+        y: 5,
+        width: 8,
+        height: 9,
+    }]);
+    let previous = NativeSceneSnapshot::from_surfaces(&[previous_popup], Vec::new());
+    let current = NativeSceneSnapshot::from_surfaces(&[current_popup], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert_eq!(damage.rects.len(), 1);
+    assert!(native_damage_rect_contains(damage.rects[0], 196, 177));
+    assert!(!native_damage_rect_contains(damage.rects[0], 260, 220));
+}
+
+#[test]
+fn subsurface_map_unmap_and_move_repair_only_child_regions() {
+    let parent = test_renderable_surface(340, 100, 100, 300, 220, RenderableSurfaceDamage::Empty);
+    let mut old_child = test_renderable_surface(341, 0, 0, 40, 30, RenderableSurfaceDamage::Empty);
+    old_child.placement = SurfacePlacement::subsurface(340, 40, 40);
+    let mut new_child =
+        test_renderable_surface(341, 120, 40, 40, 30, RenderableSurfaceDamage::Empty);
+    new_child.placement = SurfacePlacement::subsurface(340, 40, 40);
+    let previous = NativeSceneSnapshot::from_surfaces(&[parent.clone(), old_child], Vec::new());
+    let current = NativeSceneSnapshot::from_surfaces(&[parent, new_child], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 215, 215))
+    );
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 335, 255))
+    );
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 900, 600))
+    );
+}
+
+#[test]
+fn subsurface_reorder_damages_only_the_changed_middle_span() {
+    let surface = |surface_id, x| {
+        test_renderable_surface(surface_id, x, 120, 40, 40, RenderableSurfaceDamage::Empty)
+    };
+    let a = surface(350, 20);
+    let b = surface(351, 100);
+    let c = surface(352, 180);
+    let d = surface(353, 260);
+    let e = surface(354, 340);
+    let previous = NativeSceneSnapshot::from_surfaces(
+        &[a.clone(), b.clone(), c.clone(), d.clone(), e.clone()],
+        Vec::new(),
+    );
+    let current = NativeSceneSnapshot::from_surfaces(&[a, b, e, c, d], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    for (x, y) in [(320, 260), (440, 290), (550, 330), (350, 260), (470, 330)] {
+        assert!(
+            damage
+                .rects
+                .iter()
+                .any(|rect| native_damage_rect_contains(*rect, x, y)),
+            "changed order span must cover ({x}, {y}): {:?}",
+            damage.rects
+        );
+    }
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 100, 200))
+    );
+}
+
+#[test]
+fn visibility_transition_remains_a_true_global_invalidation() {
+    let surface = test_renderable_surface(360, 100, 100, 80, 60, RenderableSurfaceDamage::Empty);
+    let previous = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&surface), Vec::new());
+    let mut current = previous.clone();
+    current.visibility_signature = 1;
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_eq!(damage.kind, NativeDamageKind::FullOutput);
+}
+
+#[test]
+fn authoritative_empty_remains_empty_when_content_identity_changes() {
+    let previous = test_renderable_surface(370, 100, 100, 120, 90, RenderableSurfaceDamage::Empty);
+    let mut current = previous.clone();
+    current.generation = 2;
+    current.commit_sequence = SurfaceCommitSequence(2);
+    current.damage = RenderableSurfaceDamage::Empty;
+    let previous = NativeSceneSnapshot::from_surfaces(&[previous], Vec::new());
+    let current = NativeSceneSnapshot::from_surfaces(&[current], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert!(damage.is_empty());
+}
+
+#[test]
+fn native_snapshot_exposes_authoritative_empty_damage_evidence() {
+    let surface = test_renderable_surface(371, 100, 100, 120, 90, RenderableSurfaceDamage::Empty);
+    let snapshot = NativeSceneSnapshot::from_surfaces(&[surface], Vec::new());
+
+    assert_eq!(
+        snapshot.surfaces[0].damage,
+        NativeSurfaceDamageEvidence::AuthoritativeEmpty
+    );
+}
+
+#[test]
+fn native_snapshot_exposes_history_lost_damage_evidence() {
+    let surface =
+        test_renderable_surface(372, 100, 100, 120, 90, RenderableSurfaceDamage::HistoryLost);
+    let snapshot = NativeSceneSnapshot::from_surfaces(&[surface], Vec::new());
+
+    assert_eq!(
+        snapshot.surfaces[0].damage,
+        NativeSurfaceDamageEvidence::HistoryLost
+    );
+}
+
+#[derive(Clone)]
+struct TopologyOracleVisuals {
+    colors: std::collections::HashMap<u32, u32>,
+    markers: std::collections::HashMap<u32, (u32, u32, u32, u32, u32)>,
+}
+
+fn topology_oracle_surface(
+    surface_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    damage: RenderableSurfaceDamage,
+) -> RenderableSurface {
+    let mut surface = test_renderable_surface(surface_id, 0, 0, width, height, damage);
+    surface.placement = SurfacePlacement::absolute_root_at(x, y);
+    surface
+}
+
+fn topology_oracle_snapshot(
+    surfaces: &[RenderableSurface],
+    popup_surface_ids: &[u32],
+) -> NativeSceneSnapshot {
+    let mut snapshot = NativeSceneSnapshot::from_surfaces(surfaces, Vec::new());
+    snapshot.popup_surface_ids = popup_surface_ids.to_vec();
+    snapshot
+}
+
+fn topology_oracle_pixel(
+    snapshot: &NativeSceneSnapshot,
+    visuals: &TopologyOracleVisuals,
+    x: i32,
+    y: i32,
+) -> u32 {
+    let mut pixel = 0xff00_0000;
+    for surface in &snapshot.surfaces {
+        let Some(bounds) = surface.bounds else {
+            continue;
+        };
+        if !native_damage_rect_contains(bounds, x, y) {
+            continue;
+        }
+        pixel = visuals.colors[&surface.surface_id];
+        if let Some((marker_x, marker_y, marker_width, marker_height, marker_color)) =
+            visuals.markers.get(&surface.surface_id).copied()
+        {
+            let marker = NativeDamageRect {
+                x: bounds.x.saturating_add(marker_x as i32),
+                y: bounds.y.saturating_add(marker_y as i32),
+                width: marker_width,
+                height: marker_height,
+            };
+            if native_damage_rect_contains(marker, x, y) {
+                pixel = marker_color;
+            }
+        }
+    }
+    pixel
+}
+
+fn topology_oracle_paint_repair(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    snapshot: &NativeSceneSnapshot,
+    visuals: &TopologyOracleVisuals,
+    repair_damage: &OutputDamage,
+) {
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let damaged = match repair_damage {
+                OutputDamage::Full => true,
+                OutputDamage::Empty => false,
+                OutputDamage::Rects(rects) => rects.iter().any(|rect| {
+                    native_damage_rect_contains(
+                        NativeDamageRect {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        },
+                        x,
+                        y,
+                    )
+                }),
+            };
+            if damaged {
+                frame[(y as u32 * width + x as u32) as usize] =
+                    topology_oracle_pixel(snapshot, visuals, x, y);
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the oracle keeps each output state explicit"
+)]
+fn topology_oracle_present(
+    planner: &mut PartialRepaintPlanner,
+    slots: &mut [Vec<u32>],
+    slot_index: usize,
+    age: i32,
+    presented_scene: &mut NativeSceneSnapshot,
+    current_scene: NativeSceneSnapshot,
+    visuals: &TopologyOracleVisuals,
+    width: u32,
+    height: u32,
+    label: &str,
+) {
+    let current_damage = native_output_damage_for_scene_snapshots(
+        width,
+        height,
+        presented_scene,
+        &current_scene,
+        NativeCursorDamageBounds::default(),
+    );
+    let plan = planner.plan(
+        current_damage.as_renderer_damage(width, height),
+        BufferAge::Value(age),
+    );
+    topology_oracle_paint_repair(
+        &mut slots[slot_index],
+        width,
+        height,
+        &current_scene,
+        visuals,
+        &plan.repair_damage,
+    );
+    let reference = (0..height as i32)
+        .flat_map(|y| (0..width as i32).map(move |x| (x, y)))
+        .map(|(x, y)| topology_oracle_pixel(&current_scene, visuals, x, y))
+        .collect::<Vec<_>>();
+    let first_mismatch = slots[slot_index]
+        .iter()
+        .zip(&reference)
+        .position(|(actual, expected)| actual != expected)
+        .map(|index| (index % width as usize, index / width as usize));
+    assert_eq!(
+        slots[slot_index], reference,
+        "regional topology repaint differs from full reference after {label} at {first_mismatch:?}; logical={current_damage:?} repair={:?}",
+        plan.repair_damage
+    );
+    planner.commit_presented_transition(plan.render_damage);
+    *presented_scene = current_scene;
+}
+
+#[test]
+fn topology_transitions_match_full_reference_with_rotating_output_ages() {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    let a = topology_oracle_surface(401, 20, 20, 160, 120, RenderableSurfaceDamage::Empty);
+    let b = topology_oracle_surface(402, 90, 70, 160, 120, RenderableSurfaceDamage::Empty);
+    let mut visuals = TopologyOracleVisuals {
+        colors: [
+            (401, 0xff00_55aa),
+            (402, 0xff22_aa55),
+            (403, 0xffaa_5522),
+            (404, 0xffaa_22aa),
+            (405, 0xff55_aaaa),
+        ]
+        .into_iter()
+        .collect(),
+        markers: std::collections::HashMap::new(),
+    };
+    let initial_scene = topology_oracle_snapshot(&[a.clone(), b.clone()], &[]);
+    let initial = (0..HEIGHT as i32)
+        .flat_map(|y| (0..WIDTH as i32).map(move |x| (x, y)))
+        .map(|(x, y)| topology_oracle_pixel(&initial_scene, &visuals, x, y))
+        .collect::<Vec<_>>();
+    let mut slots = vec![initial.clone(), initial.clone(), initial];
+    let mut planner = PartialRepaintPlanner::new(
+        (WIDTH, HEIGHT),
+        EglPartialRepaintCapabilities {
+            buffer_age: true,
+            partial_render_repair: true,
+            swap_buffers_with_damage: true,
+        },
+    );
+    let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+    planner.commit_presented_transition(first.render_damage);
+    let mut presented_scene = initial_scene;
+
+    let mut b_content = b.clone();
+    b_content.generation = 2;
+    b_content.commit_sequence = SurfaceCommitSequence(2);
+    b_content.damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 12,
+        y: 14,
+        width: 32,
+        height: 24,
+    }]);
+    visuals.markers.insert(402, (12, 14, 32, 24, 0xffff_ee22));
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        1,
+        1,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "content partial damage",
+    );
+
+    let popup = topology_oracle_surface(403, 130, 100, 110, 80, RenderableSurfaceDamage::Full);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
+        1,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone(), popup.clone()], &[403]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "popup map",
+    );
+
+    let moved_popup =
+        topology_oracle_surface(403, 360, 260, 110, 80, RenderableSurfaceDamage::Empty);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        0,
+        1,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone(), moved_popup.clone()], &[403]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "popup move",
+    );
+
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        1,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), moved_popup.clone(), b_content.clone()], &[403]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "popup reorder",
+    );
+
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "popup unmap",
+    );
+
+    let mut child = topology_oracle_surface(404, 0, 0, 70, 50, RenderableSurfaceDamage::Full);
+    child.placement = SurfacePlacement::subsurface(401, 35, 30);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        0,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone(), child.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "subsurface map",
+    );
+
+    let mut moved_child = child.clone();
+    moved_child.placement = SurfacePlacement::subsurface(401, 95, 55);
+    moved_child.damage = RenderableSurfaceDamage::Empty;
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        1,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a.clone(), b_content.clone(), moved_child.clone()], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "subsurface move",
+    );
+
+    let mut sibling = topology_oracle_surface(405, 0, 0, 80, 60, RenderableSurfaceDamage::Full);
+    sibling.placement = SurfacePlacement::subsurface(401, 65, 45);
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(
+            &[
+                a.clone(),
+                b_content.clone(),
+                moved_child.clone(),
+                sibling.clone(),
+            ],
+            &[],
+        ),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "subsurface sibling map",
+    );
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        0,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(
+            &[
+                a.clone(),
+                b_content.clone(),
+                sibling.clone(),
+                moved_child.clone(),
+            ],
+            &[],
+        ),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "subsurface reorder",
+    );
+
+    let rejected = topology_oracle_snapshot(&[a.clone(), b_content.clone(), moved_child], &[]);
+    let rejected_damage = native_output_damage_for_scene_snapshots(
+        WIDTH,
+        HEIGHT,
+        &presented_scene,
+        &rejected,
+        NativeCursorDamageBounds::default(),
+    );
+    assert!(!rejected_damage.is_empty());
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        1,
+        3,
+        &mut presented_scene,
+        rejected,
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "rejected candidate retry",
+    );
+
+    topology_oracle_present(
+        &mut planner,
+        &mut slots,
+        2,
+        3,
+        &mut presented_scene,
+        topology_oracle_snapshot(&[a, b_content], &[]),
+        &visuals,
+        WIDTH,
+        HEIGHT,
+        "subsurface unmap",
+    );
+}

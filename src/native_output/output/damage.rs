@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeDamageSummary {
@@ -237,6 +238,13 @@ pub(crate) struct NativeDamageRect {
     pub(crate) height: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeSurfaceDamageEvidence {
+    AuthoritativeEmpty,
+    Known(Vec<NativeDamageRect>),
+    HistoryLost,
+}
+
 /// Geometry and mapped damage metadata for a scene. It deliberately excludes
 /// `RenderableSurface::buffer`, so submitted-frame history never owns a copy
 /// of client pixels.
@@ -244,7 +252,7 @@ pub(crate) struct NativeDamageRect {
 pub(crate) struct NativeSceneSurfaceSnapshot {
     pub(crate) surface_id: u32,
     pub(crate) bounds: Option<NativeDamageRect>,
-    pub(crate) damage: Vec<NativeDamageRect>,
+    pub(crate) damage: NativeSurfaceDamageEvidence,
     pub(crate) content_generation: u64,
     pub(crate) commit_sequence: u64,
 }
@@ -271,12 +279,27 @@ impl NativeSceneSnapshot {
             .map(|(element, surface)| {
                 let RenderSceneElementId::Surface(surface_id) = element.id();
                 let buffer_size = element.buffer_size();
-                let damage = element
-                    .damage()
-                    .clipped_rects(buffer_size.width, buffer_size.height)
-                    .into_iter()
-                    .filter_map(|rect| NativeDamageRect::from_render_element_damage(element, rect))
-                    .collect();
+                let damage = match &surface.damage {
+                    oblivion_one::compositor::RenderableSurfaceDamage::Empty => {
+                        NativeSurfaceDamageEvidence::AuthoritativeEmpty
+                    }
+                    oblivion_one::compositor::RenderableSurfaceDamage::HistoryLost => {
+                        NativeSurfaceDamageEvidence::HistoryLost
+                    }
+                    oblivion_one::compositor::RenderableSurfaceDamage::Full
+                    | oblivion_one::compositor::RenderableSurfaceDamage::Partial(_) => {
+                        NativeSurfaceDamageEvidence::Known(
+                            element
+                                .damage()
+                                .clipped_rects(buffer_size.width, buffer_size.height)
+                                .into_iter()
+                                .filter_map(|rect| {
+                                    NativeDamageRect::from_render_element_damage(element, rect)
+                                })
+                                .collect(),
+                        )
+                    }
+                };
                 NativeSceneSurfaceSnapshot {
                     surface_id,
                     bounds: NativeDamageRect::from_render_element_bounds(element),
@@ -318,11 +341,18 @@ impl NativeSceneSnapshot {
             }
             mix(surface.content_generation);
             mix(surface.commit_sequence);
-            for damage in &surface.damage {
-                mix(damage.x as u64);
-                mix(damage.y as u64);
-                mix(u64::from(damage.width));
-                mix(u64::from(damage.height));
+            match &surface.damage {
+                NativeSurfaceDamageEvidence::AuthoritativeEmpty => mix(0),
+                NativeSurfaceDamageEvidence::HistoryLost => mix(1),
+                NativeSurfaceDamageEvidence::Known(damage) => {
+                    mix(2);
+                    for damage in damage {
+                        mix(damage.x as u64);
+                        mix(damage.y as u64);
+                        mix(u64::from(damage.width));
+                        mix(u64::from(damage.height));
+                    }
+                }
             }
         }
         for decoration in &self.decorations {
@@ -957,16 +987,27 @@ pub(crate) fn native_output_damage_for_scene_snapshots(
     current: &NativeSceneSnapshot,
     cursor_damage: NativeCursorDamageBounds,
 ) -> NativeOutputDamage {
-    if previous.popup_surface_ids != current.popup_surface_ids
-        || previous.external_overlay_surface_ids != current.external_overlay_surface_ids
+    // Popup/subsurface membership is represented by the exact ordered surface
+    // snapshots below. External overlay membership and visibility can change
+    // the sampled output outside a bounded surface footprint, so they remain
+    // explicit conservative global invalidations.
+    if previous.external_overlay_surface_ids != current.external_overlay_surface_ids
         || previous.visibility_signature != current.visibility_signature
-        || previous.surface_order_signature != current.surface_order_signature
     {
         return NativeOutputDamage::full_output(width, height);
     }
     let mut scene = native_scene_surface_transition_damage(
         width,
         height,
+        &previous.surfaces,
+        &current.surfaces,
+    );
+    push_surface_membership_transition_damage(
+        &mut scene,
+        width,
+        height,
+        &previous.popup_surface_ids,
+        &current.popup_surface_ids,
         &previous.surfaces,
         &current.surfaces,
     );
@@ -1008,6 +1049,13 @@ fn native_scene_surface_transition_damage(
         .map(|surface| (surface.surface_id, surface))
         .collect::<HashMap<_, _>>();
     let mut accumulator = NativeDamageAccumulator::for_output(output_width, output_height);
+    push_order_transition_damage(
+        &mut accumulator,
+        output_width,
+        output_height,
+        previous,
+        current,
+    );
     for (surface_id, previous_surface) in &previous_by_id {
         let Some(current_surface) = current_by_id.get(surface_id) else {
             push_clipped_scene_rect(
@@ -1037,27 +1085,18 @@ fn native_scene_surface_transition_damage(
                 output_height,
                 current_surface.bounds,
             );
-            if current_surface.damage.is_empty() {
-                push_clipped_scene_rect(
-                    &mut accumulator,
-                    output_width,
-                    output_height,
-                    current_surface.bounds,
-                );
-            } else {
-                push_clipped_scene_damage(
-                    &mut accumulator,
-                    output_width,
-                    output_height,
-                    &current_surface.damage,
-                );
-            }
+            push_clipped_scene_damage(
+                &mut accumulator,
+                output_width,
+                output_height,
+                current_surface,
+            );
         } else {
             push_clipped_scene_damage(
                 &mut accumulator,
                 output_width,
                 output_height,
-                &current_surface.damage,
+                current_surface,
             );
         }
     }
@@ -1073,7 +1112,7 @@ fn native_scene_surface_transition_damage(
                 &mut accumulator,
                 output_width,
                 output_height,
-                &current_surface.damage,
+                current_surface,
             );
         }
     }
@@ -1095,10 +1134,122 @@ fn push_clipped_scene_damage(
     accumulator: &mut NativeDamageAccumulator,
     output_width: u32,
     output_height: u32,
-    damage: &[NativeDamageRect],
+    surface: &NativeSceneSurfaceSnapshot,
 ) {
-    for rect in damage {
-        push_clipped_scene_rect(accumulator, output_width, output_height, Some(*rect));
+    match &surface.damage {
+        NativeSurfaceDamageEvidence::AuthoritativeEmpty => {}
+        NativeSurfaceDamageEvidence::Known(damage) => {
+            for rect in damage {
+                push_clipped_scene_rect(accumulator, output_width, output_height, Some(*rect));
+            }
+        }
+        NativeSurfaceDamageEvidence::HistoryLost => {
+            push_clipped_scene_rect(accumulator, output_width, output_height, surface.bounds);
+        }
+    }
+}
+
+fn push_order_transition_damage(
+    accumulator: &mut NativeDamageAccumulator,
+    output_width: u32,
+    output_height: u32,
+    previous: &[NativeSceneSurfaceSnapshot],
+    current: &[NativeSceneSurfaceSnapshot],
+) {
+    let previous_ids = previous
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let current_ids = current
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    if previous_ids == current_ids {
+        return;
+    }
+
+    let prefix = previous_ids
+        .iter()
+        .zip(&current_ids)
+        .take_while(|(previous, current)| previous == current)
+        .count();
+    let maximum_suffix = previous_ids
+        .len()
+        .saturating_sub(prefix)
+        .min(current_ids.len().saturating_sub(prefix));
+    let suffix = (0..maximum_suffix)
+        .take_while(|offset| {
+            previous_ids[previous_ids.len() - 1 - offset]
+                == current_ids[current_ids.len() - 1 - offset]
+        })
+        .count();
+
+    let previous_by_id = previous
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    let current_by_id = current
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    for surface_id in previous_ids[prefix..previous_ids.len().saturating_sub(suffix)].iter() {
+        push_clipped_scene_rect(
+            accumulator,
+            output_width,
+            output_height,
+            previous_by_id
+                .get(surface_id)
+                .and_then(|surface| surface.bounds),
+        );
+    }
+    for surface_id in current_ids[prefix..current_ids.len().saturating_sub(suffix)].iter() {
+        push_clipped_scene_rect(
+            accumulator,
+            output_width,
+            output_height,
+            current_by_id
+                .get(surface_id)
+                .and_then(|surface| surface.bounds),
+        );
+    }
+}
+
+fn push_surface_membership_transition_damage(
+    accumulator: &mut NativeDamageAccumulator,
+    output_width: u32,
+    output_height: u32,
+    previous_ids: &[u32],
+    current_ids: &[u32],
+    previous_surfaces: &[NativeSceneSurfaceSnapshot],
+    current_surfaces: &[NativeSceneSurfaceSnapshot],
+) {
+    let previous_ids = previous_ids.iter().copied().collect::<HashSet<_>>();
+    let current_ids = current_ids.iter().copied().collect::<HashSet<_>>();
+    let previous_by_id = previous_surfaces
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    let current_by_id = current_surfaces
+        .iter()
+        .map(|surface| (surface.surface_id, surface))
+        .collect::<HashMap<_, _>>();
+    for surface_id in previous_ids.symmetric_difference(&current_ids) {
+        push_clipped_scene_rect(
+            accumulator,
+            output_width,
+            output_height,
+            previous_by_id
+                .get(surface_id)
+                .and_then(|surface| surface.bounds),
+        );
+        push_clipped_scene_rect(
+            accumulator,
+            output_width,
+            output_height,
+            current_by_id
+                .get(surface_id)
+                .and_then(|surface| surface.bounds),
+        );
     }
 }
 

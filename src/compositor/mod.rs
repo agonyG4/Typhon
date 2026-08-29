@@ -516,6 +516,8 @@ pub struct SurfaceLocalityMetrics {
     pub presentation_settlement_entries: u64,
     pub presentation_settlement_journal_lookups: u64,
     pub presentation_global_scans: u64,
+    pub damage_authoritative_empty: u64,
+    pub damage_history_lost_repairs: u64,
     pub surface_damage_settlement_presented: u64,
     pub surface_damage_settlement_no_visual_change: u64,
     pub xwayland_content_replacements: u64,
@@ -785,11 +787,6 @@ pub enum FrameBatchDiscardReason {
 pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SurfaceDamageSettlement {
-    Presented,
-    NoVisualChange,
 }
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

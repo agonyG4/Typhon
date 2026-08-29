@@ -1390,6 +1390,12 @@ impl NativeRuntime {
                         drop(resolved_scene);
                         server.capture_frame_callbacks_for_render();
                         server.set_prepared_frame_surface_damage(surface_damage);
+                        // The resolved scene is dropped only to release its
+                        // immutable server borrow while frame-batch state is
+                        // attached. These two mutations cannot change scene
+                        // selection, geometry, content, or topology, so the
+                        // re-resolved scene below is the same scene whose IDs
+                        // created this frame's presentation lineage.
                         let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
                         let paint_outcome = match scanout.paint_server_frame(
                             frame_renderer,

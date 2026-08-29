@@ -457,39 +457,11 @@ impl CompositorState {
     pub(in crate::compositor) fn capture_surface_damage_presentation(
         &self,
     ) -> SurfaceDamagePresentation {
-        let mut metrics = self.locality_metrics.get();
-        metrics.presentation_global_scans = metrics.presentation_global_scans.saturating_add(1);
-        self.locality_metrics.set(metrics);
-        let mut sampled_commits = Vec::new();
-        for surface_id in self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .chain(self.client_cursor_surfaces.keys().copied())
-        {
-            let Some(generation) = self
-                .surface_presentation_generations
-                .get(&surface_id)
-                .copied()
-            else {
-                continue;
-            };
-            let Some(commit) = self
-                .surface_damage_journals
-                .get(&surface_id)
-                .map(SurfaceDamageJournal::current_commit)
-            else {
-                continue;
-            };
-            let key = SurfacePresentationKey {
-                surface_id,
-                generation,
-            };
-            if !sampled_commits.iter().any(|(sampled, _)| *sampled == key) {
-                sampled_commits.push((key, commit));
-            }
-        }
-        SurfaceDamagePresentation { sampled_commits }
+        self.capture_surface_damage_presentation_for_surface_ids(
+            self.active_scene_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id),
+        )
     }
     pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface(
         &self,
@@ -609,33 +581,14 @@ impl CompositorState {
         &mut self,
         token: SurfaceDamagePresentation,
     ) {
-        self.settle_surface_damage(token, SurfaceDamageSettlement::Presented);
+        self.settle_surface_damage(token);
     }
-    pub(in crate::compositor) fn commit_surface_damage_no_visual_change(
-        &mut self,
-        token: SurfaceDamagePresentation,
-    ) {
-        self.settle_surface_damage(token, SurfaceDamageSettlement::NoVisualChange);
-    }
-    fn settle_surface_damage(
-        &mut self,
-        token: SurfaceDamagePresentation,
-        settlement: SurfaceDamageSettlement,
-    ) {
+    fn settle_surface_damage(&mut self, token: SurfaceDamagePresentation) {
         let sampled_entries = token.sampled_commits.len() as u64;
         let mut metrics = self.locality_metrics.get();
-        match settlement {
-            SurfaceDamageSettlement::Presented => {
-                metrics.surface_damage_settlement_presented = metrics
-                    .surface_damage_settlement_presented
-                    .saturating_add(sampled_entries);
-            }
-            SurfaceDamageSettlement::NoVisualChange => {
-                metrics.surface_damage_settlement_no_visual_change = metrics
-                    .surface_damage_settlement_no_visual_change
-                    .saturating_add(sampled_entries);
-            }
-        }
+        metrics.surface_damage_settlement_presented = metrics
+            .surface_damage_settlement_presented
+            .saturating_add(sampled_entries);
         self.locality_metrics.set(metrics);
         for (key, sampled_commit) in token.sampled_commits {
             let mut metrics = self.locality_metrics.get();
@@ -667,32 +620,50 @@ impl CompositorState {
                 .presentation_settlement_journal_lookups
                 .saturating_add(1);
             self.locality_metrics.set(metrics);
+            let surface_size = self
+                .renderable_surface_indices
+                .get(&key.surface_id)
+                .copied()
+                .and_then(|index| self.renderable_surfaces.get(index))
+                .map(|surface| surface.buffer_size());
+            let surface_size = surface_size.or_else(|| {
+                self.client_cursor_surfaces
+                    .get(&key.surface_id)
+                    .map(|surface| surface.buffer_size())
+            });
+            let Some(surface_size) = surface_size else {
+                continue;
+            };
+            let damage_since =
+                journal.damage_since(sampled_commit, surface_size.width, surface_size.height);
+            let mut metrics = self.locality_metrics.get();
+            match &damage_since {
+                DamageSince::Empty => {
+                    metrics.damage_authoritative_empty =
+                        metrics.damage_authoritative_empty.saturating_add(1);
+                }
+                DamageSince::HistoryLost => {
+                    metrics.damage_history_lost_repairs =
+                        metrics.damage_history_lost_repairs.saturating_add(1);
+                }
+                DamageSince::Known(_) => {}
+            }
+            self.locality_metrics.set(metrics);
+            let damage = match damage_since {
+                DamageSince::Empty => RenderableSurfaceDamage::Empty,
+                DamageSince::Known(damage) => damage,
+                DamageSince::HistoryLost => RenderableSurfaceDamage::HistoryLost,
+            };
             if let Some(index) = self
                 .renderable_surface_indices
                 .get(&key.surface_id)
                 .copied()
             {
                 if let Some(surface) = self.renderable_surfaces.get_mut(index) {
-                    surface.damage = match journal.damage_since(
-                        sampled_commit,
-                        surface.buffer_size().width,
-                        surface.buffer_size().height,
-                    ) {
-                        DamageSince::Empty => RenderableSurfaceDamage::Empty,
-                        DamageSince::Known(damage) => damage,
-                        DamageSince::HistoryLost => RenderableSurfaceDamage::Full,
-                    };
+                    surface.damage = damage;
                 }
             } else if let Some(surface) = self.client_cursor_surfaces.get_mut(&key.surface_id) {
-                surface.damage = match journal.damage_since(
-                    sampled_commit,
-                    surface.buffer_size().width,
-                    surface.buffer_size().height,
-                ) {
-                    DamageSince::Empty => RenderableSurfaceDamage::Empty,
-                    DamageSince::Known(damage) => damage,
-                    DamageSince::HistoryLost => RenderableSurfaceDamage::Full,
-                };
+                surface.damage = damage;
             }
         }
     }
@@ -1388,6 +1359,67 @@ mod ordered_publication_tests {
     }
 
     #[test]
+    fn presented_settlement_preserves_history_lost_as_surface_local_evidence() {
+        let mut state = CompositorState::default();
+        let surface_id = 910;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(1)));
+        state.surface_presentation_generations.insert(surface_id, 1);
+        let mut journal = SurfaceDamageJournal::new(1);
+        let sampled_commit = journal.record_for_surface_commit(
+            SurfaceCommitSequence(1),
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]),
+            2,
+            2,
+        );
+        state.surface_damage_journals.insert(surface_id, journal);
+        let token = state.capture_surface_damage_presentation_for_surface_commit(
+            surface_id,
+            SurfaceCommitSequence(1),
+        );
+        let journal = state
+            .surface_damage_journals
+            .get_mut(&surface_id)
+            .expect("test journal remains registered");
+        journal.record_for_surface_commit(
+            SurfaceCommitSequence(2),
+            RenderableSurfaceDamage::Empty,
+            2,
+            2,
+        );
+        journal.record_for_surface_commit(
+            SurfaceCommitSequence(3),
+            RenderableSurfaceDamage::Empty,
+            2,
+            2,
+        );
+
+        state.commit_surface_damage_presented(token);
+
+        assert_eq!(
+            state.presented_surface_commits.get(&surface_id),
+            Some(&sampled_commit)
+        );
+        assert_eq!(
+            state
+                .renderable_surface(surface_id)
+                .expect("surface remains")
+                .damage,
+            RenderableSurfaceDamage::HistoryLost
+        );
+        assert_eq!(
+            state
+                .surface_locality_metrics_for_test()
+                .damage_history_lost_repairs,
+            1
+        );
+    }
+
+    #[test]
     fn content_and_metadata_commits_have_distinct_epoch_behavior() {
         let mut state = CompositorState::default();
         let buffer_id = state
@@ -1645,6 +1677,10 @@ mod ordered_publication_tests {
     fn presentation_capture_and_settlement_scale_with_sample_count() {
         let mut state = CompositorState::default();
         for surface_id in 1..=1_000 {
+            state.append_renderable_surface(test_cursor_surface(
+                surface_id,
+                SurfaceCommitSequence(1),
+            ));
             state.surface_presentation_generations.insert(surface_id, 1);
             let mut journal = SurfaceDamageJournal::new(4);
             journal.record(RenderableSurfaceDamage::Full, 10, 10);
@@ -1674,6 +1710,14 @@ mod ordered_publication_tests {
         );
         assert_eq!(
             after.presentation_global_scans - before.presentation_global_scans,
+            0
+        );
+        assert_eq!(
+            after.damage_authoritative_empty - before.damage_authoritative_empty,
+            4
+        );
+        assert_eq!(
+            after.damage_history_lost_repairs - before.damage_history_lost_repairs,
             0
         );
     }

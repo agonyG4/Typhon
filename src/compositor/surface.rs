@@ -305,6 +305,10 @@ pub enum RenderableSurfaceDamage {
     Empty,
     Full,
     Partial(Vec<SurfaceDamageRect>),
+    /// The journal could not prove the damage between the sampled and
+    /// presented commits. This is conservative surface-local evidence, not
+    /// an authoritative full-output invalidation.
+    HistoryLost,
 }
 
 impl RenderableSurfaceDamage {
@@ -332,7 +336,14 @@ impl RenderableSurfaceDamage {
         matches!(self, Self::Full)
     }
 
+    pub const fn is_history_lost(&self) -> bool {
+        matches!(self, Self::HistoryLost)
+    }
+
     pub fn normalized_for_surface(self, surface_width: u32, surface_height: u32) -> Self {
+        if matches!(self, Self::HistoryLost) {
+            return Self::HistoryLost;
+        }
         if self.covers_surface(surface_width, surface_height) {
             return Self::Full;
         }
@@ -340,6 +351,7 @@ impl RenderableSurfaceDamage {
         match self {
             Self::Empty => Self::Empty,
             Self::Full => Self::Full,
+            Self::HistoryLost => Self::HistoryLost,
             Self::Partial(rects) => {
                 let clipped_rects = rects
                     .into_iter()
@@ -358,6 +370,7 @@ impl RenderableSurfaceDamage {
         match self {
             Self::Empty => false,
             Self::Full => true,
+            Self::HistoryLost => true,
             Self::Partial(rects) => {
                 let surface_pixels = u64::from(surface_width) * u64::from(surface_height);
                 rects.iter().any(|rect| {
@@ -378,6 +391,7 @@ impl RenderableSurfaceDamage {
         match self {
             Self::Empty => Vec::new(),
             Self::Full => vec![SurfaceDamageRect::full(surface_width, surface_height)],
+            Self::HistoryLost => vec![SurfaceDamageRect::full(surface_width, surface_height)],
             Self::Partial(rects) => rects
                 .iter()
                 .filter_map(|rect| rect.clipped_to_surface(surface_width, surface_height))
@@ -387,6 +401,7 @@ impl RenderableSurfaceDamage {
 
     pub fn union(self, other: Self, surface_width: u32, surface_height: u32) -> Self {
         match (self, other) {
+            (Self::HistoryLost, _) | (_, Self::HistoryLost) => Self::HistoryLost,
             (Self::Full, _) | (_, Self::Full) => Self::Full,
             (Self::Empty, damage) | (damage, Self::Empty) => {
                 damage.normalized_for_surface(surface_width, surface_height)

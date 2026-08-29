@@ -1792,7 +1792,7 @@ fn partial_scene_damage_rects(
 
         match &element.damage {
             RenderableSurfaceDamage::Empty => {}
-            RenderableSurfaceDamage::Full => {
+            RenderableSurfaceDamage::Full | RenderableSurfaceDamage::HistoryLost => {
                 if let Some(rect) = snapshot
                     .visible_target
                     .output_rect()

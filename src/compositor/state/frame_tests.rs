@@ -418,7 +418,7 @@ mod frame_consumption_tests {
     }
 
     #[test]
-    fn no_visual_change_batch_settles_owned_surface_damage_without_presentation() {
+    fn no_visual_change_batch_drops_owned_surface_damage_without_presentation() {
         let mut state = CompositorState::default();
         let surface_id = 77;
         state.surface_presentation_generations.insert(surface_id, 1);
@@ -439,22 +439,24 @@ mod frame_consumption_tests {
 
         state.complete_no_visual_change_frame_batch(batch_id);
 
-        assert_eq!(
-            state.presented_surface_commits.get(&surface_id),
-            Some(&settled)
-        );
+        assert_eq!(state.presented_surface_commits.get(&surface_id), None);
         assert!(matches!(
-            state.surface_damage_journals[&surface_id].damage_since(settled, 2, 2),
-            DamageSince::Empty
+            state.surface_damage_journals[&surface_id].damage_since(
+                SurfaceCommitCounter::default(),
+                2,
+                2,
+            ),
+            DamageSince::Known(RenderableSurfaceDamage::Full)
         ));
         assert!(state.frame_batches.is_empty());
         let metrics = state.locality_metrics.get();
-        assert_eq!(metrics.surface_damage_settlement_no_visual_change, 1);
+        assert_eq!(metrics.surface_damage_settlement_no_visual_change, 0);
         assert_eq!(metrics.surface_damage_settlement_presented, 0);
+        assert!(settled.0 > 0);
     }
 
     #[test]
-    fn no_visual_change_without_protocol_work_settles_lineage_without_a_batch() {
+    fn no_visual_change_without_protocol_work_drops_lineage_without_a_batch() {
         let mut state = CompositorState::default();
         let surface_id = 80;
         state.surface_presentation_generations.insert(surface_id, 1);
@@ -472,10 +474,8 @@ mod frame_consumption_tests {
         );
 
         assert!(state.settle_no_visual_change_work(Some(token), false));
-        assert_eq!(
-            state.presented_surface_commits.get(&surface_id),
-            Some(&settled)
-        );
+        assert_eq!(state.presented_surface_commits.get(&surface_id), None);
+        assert!(settled.0 > 0);
         assert!(state.frame_batches.is_empty());
         assert!(state.legacy_prepared_frame_batch.is_none());
     }
@@ -537,7 +537,7 @@ mod frame_consumption_tests {
     }
 
     #[test]
-    fn repeated_surface_only_no_visual_settlement_keeps_lineage_bounded() {
+    fn repeated_surface_only_no_visual_settlement_keeps_unpresented_history_explicit() {
         let mut state = CompositorState::default();
         let surface_id = 81;
         state.surface_presentation_generations.insert(surface_id, 1);
@@ -565,14 +565,17 @@ mod frame_consumption_tests {
             assert!(state.settle_no_visual_change_work(Some(token), false));
             assert!(state.frame_batches.is_empty());
             assert!(state.legacy_prepared_frame_batch.is_none());
-            assert!(matches!(
-                state
-                    .surface_damage_journals
-                    .get(&surface_id)
-                    .expect("test journal remains registered")
-                    .damage_since(state.presented_surface_commits[&surface_id], 100, 80,),
-                DamageSince::Empty
-            ));
+            assert!(!state.presented_surface_commits.contains_key(&surface_id));
+            let history = state
+                .surface_damage_journals
+                .get(&surface_id)
+                .expect("test journal remains registered")
+                .damage_since(SurfaceCommitCounter::default(), 100, 80);
+            if sequence <= 64 {
+                assert!(matches!(history, DamageSince::Empty));
+            } else {
+                assert!(matches!(history, DamageSince::HistoryLost));
+            }
         }
 
         let partial_commit = SurfaceCommitSequence(129);
@@ -592,13 +595,13 @@ mod frame_consumption_tests {
                 .surface_damage_journals
                 .get(&surface_id)
                 .expect("test journal remains registered")
-                .damage_since(state.presented_surface_commits[&surface_id], 100, 80),
-            DamageSince::Known(damage) if damage == partial
+                .damage_since(SurfaceCommitCounter::default(), 100, 80),
+            DamageSince::HistoryLost
         ));
     }
 
     #[test]
-    fn repeated_no_visual_change_settlement_does_not_lose_empty_journal_history() {
+    fn repeated_no_visual_change_does_not_claim_unpresented_journal_history() {
         let mut state = CompositorState::default();
         let surface_id = 78;
         state.surface_presentation_generations.insert(surface_id, 1);
@@ -612,7 +615,7 @@ mod frame_consumption_tests {
                 .surface_damage_journals
                 .get_mut(&surface_id)
                 .expect("test journal remains registered");
-            let settled = journal.record_for_surface_commit(
+            let _committed = journal.record_for_surface_commit(
                 commit_sequence,
                 RenderableSurfaceDamage::Empty,
                 2,
@@ -626,14 +629,17 @@ mod frame_consumption_tests {
             state.set_frame_batch_surface_damage(batch_id, token);
             state.complete_no_visual_change_frame_batch(batch_id);
 
-            assert_eq!(
-                state.presented_surface_commits.get(&surface_id),
-                Some(&settled)
+            assert!(!state.presented_surface_commits.contains_key(&surface_id));
+            let history = state.surface_damage_journals[&surface_id].damage_since(
+                SurfaceCommitCounter::default(),
+                2,
+                2,
             );
-            assert!(matches!(
-                state.surface_damage_journals[&surface_id].damage_since(settled, 2, 2),
-                DamageSince::Empty
-            ));
+            if sequence <= 64 {
+                assert!(matches!(history, DamageSince::Empty));
+            } else {
+                assert!(matches!(history, DamageSince::HistoryLost));
+            }
         }
 
         assert_eq!(
@@ -647,7 +653,7 @@ mod frame_consumption_tests {
     }
 
     #[test]
-    fn empty_settlements_preserve_a_later_small_partial_damage() {
+    fn unpresented_empty_history_loss_is_conservative_for_later_partial_damage() {
         let mut state = CompositorState::default();
         let surface_id = 79;
         state.surface_presentation_generations.insert(surface_id, 1);
@@ -689,14 +695,14 @@ mod frame_consumption_tests {
             .expect("test journal remains registered");
         journal.record_for_surface_commit(partial_commit, partial.clone(), 100, 80);
 
-        let settled = state
-            .presented_surface_commits
-            .get(&surface_id)
-            .copied()
-            .expect("empty commits were settled");
+        assert!(!state.presented_surface_commits.contains_key(&surface_id));
         assert!(matches!(
-            state.surface_damage_journals[&surface_id].damage_since(settled, 100, 80),
-            DamageSince::Known(damage) if damage == partial
+            state.surface_damage_journals[&surface_id].damage_since(
+                SurfaceCommitCounter::default(),
+                100,
+                80
+            ),
+            DamageSince::HistoryLost
         ));
     }
 
