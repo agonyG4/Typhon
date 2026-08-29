@@ -269,6 +269,7 @@ pub(crate) struct NativeSceneSnapshot {
 }
 
 impl NativeSceneSnapshot {
+    #[cfg(test)]
     pub(crate) fn from_surfaces(
         surfaces: &[RenderableSurface],
         decorations: Vec<DecorationSceneSnapshot>,
