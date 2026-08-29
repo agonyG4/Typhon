@@ -620,7 +620,6 @@ impl NativePointerConstraintBackend {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn active_locked(&self) -> bool {
         self.active
             .as_ref()
@@ -665,6 +664,15 @@ impl NativePointerConstraintBackend {
                 restore_position,
             } => self.deactivate(id, restore_position),
             PointerConstraintBackendRequest::WarpPointer { position } => {
+                if self.active_locked() {
+                    native_pointer_debug_log_lazy(|| {
+                        format!(
+                            "backend warp ignored reason=active_lock position=({},{})",
+                            position.x, position.y
+                        )
+                    });
+                    return NativePointerConstraintBackendAction::default();
+                }
                 native_pointer_debug_log_lazy(|| {
                     format!(
                         "backend warp requested position=({},{})",

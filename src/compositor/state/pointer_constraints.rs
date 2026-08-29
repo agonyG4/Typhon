@@ -1095,6 +1095,10 @@ impl CompositorState {
         position: OutputPosition,
         send_motion: bool,
     ) {
+        if self.active_locked_pointer_binding().is_some() {
+            pointer_debug_log("pointer warp ignored reason=active_lock");
+            return;
+        }
         let before = OutputPosition {
             x: self.last_pointer_x,
             y: self.last_pointer_y,
