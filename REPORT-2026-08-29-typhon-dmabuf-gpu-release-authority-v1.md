@@ -22,6 +22,18 @@ Normal rendered-frame fence setup still has the existing pageflip fallback. The
 compatibility backend remains conservative and does not enter an unsupported
 native-fence retry loop.
 
+## Checkout authority and source delta
+
+The local checkout was authoritative for this work. At the source audit,
+`origin/main` was `a0d5b8a`, while the local branch already contained the v1
+DMA-BUF, exact-lineage, regional-damage, O1, SHM, and pointer-closure commits
+through `a62933d`. No public snapshot was substituted for the local source.
+
+The final local history contains the separate concurrent pointer design commit
+`01497b8`, this implementation commit `004bbdc`, and the plan bookkeeping commit
+`0e7923f`. The pointer design/spec work was preserved and was not included in
+the v1.1 implementation commit.
+
 ## Exact root causes
 
 ### P0: incomplete Direct/KMS barrier
