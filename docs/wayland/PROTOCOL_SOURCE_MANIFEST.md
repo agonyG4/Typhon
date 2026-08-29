@@ -24,8 +24,8 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 | crate | version | Cargo.lock checksum |
 |---|---:|---|
 | `wayland-backend` | 0.3.15 | `2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d` |
-| `wayland-server` | 0.31.13 | `cc1846eb04c49182e04f4a099e2a830a2b745610bbc1d61246e206f29c7000a0` |
-| `wayland-client` | 0.31.14 | `645c7c96bb74690c3189b5c9cb4ca1627062bb23693a4fad9d8c3de958260144` |
+| `wayland-server` | 0.31.14 | `0dde9c29be0f723a573977de51ee455bf3dfa03652730a74f9dd3b337e374d75` |
+| `wayland-client` | 0.31.15 | `e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073` |
 | `wayland-scanner` | 0.31.10 | `9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a` |
 | `wayland-protocols` | 0.32.12 | `563a85523cade2429938e790815fd7319062103b9f4a2dc806e9b53b95982d8f` |
 | `input` | 0.10.0 | `f9793345a65d71317763a33066b5d8351f8760dde8d4930fe9e39b5f14a7959d` |
@@ -35,13 +35,13 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 
 ### Core and generated core interfaces
 
-- Core XML: `wayland-server-0.31.13/wayland.xml`
+- Core XML: `wayland-server-0.31.14/wayland.xml`
 - Client-side core XML copy used by generated test proxies:
-  `wayland-client-0.31.14/wayland.xml`
+  `wayland-client-0.31.15/wayland.xml`
 - Core XML SHA-256 (both copies):
-  `08fb558d96742b41eab330c386f7b0c17d82169e69edad612ea89c17d6b1d53e`
-- Server generator invocation: `wayland-server-0.31.13/src/lib.rs:114-123`
-- Client generator invocation: `wayland-client-0.31.14/src/lib.rs:212-221`
+  `cc860987e54f8d85c940e97fa1270c69b6e4ad31fbcf5a7f00107ce1157f5e07`
+- Server generator invocation: `wayland-server-0.31.14/src/lib.rs:114-123`
+- Client generator invocation: `wayland-client-0.31.15/src/lib.rs:212-221`
 
 ### Native scroll metadata source
 
@@ -90,7 +90,7 @@ Typhon’s local generated protocols are invoked from:
 
 | XML | SHA-256 |
 |---|---|
-| Core `wayland.xml` (server/client copies) | `08fb558d96742b41eab330c386f7b0c17d82169e69edad612ea89c17d6b1d53e` |
+| Core `wayland.xml` (server/client copies) | `cc860987e54f8d85c940e97fa1270c69b6e4ad31fbcf5a7f00107ce1157f5e07` |
 | stable `xdg-shell.xml` | `5084e76386f6c3959bee957a784c57de204be0de3f57533ce07b4be0617b171a` |
 | stable `viewporter.xml` | `dcb12279a03746301fe490aaed4b38a403485a925abfce2ccfceb644e104fe71` |
 | stable `presentation-time.xml` | `dffac93bcb2bb1d8c385e72b8a8c2c0d4d79a336866322f3ba886dce2b27b1e2` |
@@ -103,7 +103,7 @@ Typhon’s local generated protocols are invoked from:
 ## Upstream comparison source
 
 The primary comparison source for this checkpoint is the XML distributed in
-the locked `wayland-server` 0.31.13 and `wayland-protocols` 0.32.12 source
+the locked `wayland-server` 0.31.14 and `wayland-protocols` 0.32.12 source
 packages. Those packages identify the upstream repositories as
 `https://gitlab.freedesktop.org/wayland/wayland` and
 `https://gitlab.freedesktop.org/wayland/wayland-protocols`; no unpinned live
@@ -119,7 +119,7 @@ From a checkout with the locked Cargo.lock and an offline Cargo cache:
 cargo fetch --locked --offline
 cargo fmt --check
 cargo build --locked
-sha256sum "$CARGO_HOME/registry/src/"*/wayland-server-0.31.13/wayland.xml
+sha256sum "$CARGO_HOME/registry/src/"*/wayland-server-0.31.14/wayland.xml
 sha256sum "$CARGO_HOME/registry/src/"*/wayland-protocols-0.32.12/protocols/stable/xdg-shell/xdg-shell.xml
 cargo test --lib output_production_model_runs_10_000_operations -- --test-threads=1
 cargo test --lib dnd_production_state_seeded_model_runs_100_000_transitions -- --test-threads=1
@@ -175,7 +175,9 @@ The target contract is:
 | `wp_linux_drm_syncobj_manager_v1` | 1 | GPU + syncobj capability |
 | `wl_drm` | 2 | GPU-buffer capability |
 
-No version is upgraded by this milestone.
+The core `wl_seat` version is upgraded to 11 by this milestone so the
+implemented `wl_pointer.warp` event can be advertised. Other globals retain
+their existing versions.
 
 ## Deterministic compliance evidence
 
