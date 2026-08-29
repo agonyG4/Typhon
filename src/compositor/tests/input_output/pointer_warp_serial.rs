@@ -248,7 +248,7 @@ fn current_pointer_enter_serial_allows_same_client_target_surface() {
     fixture.warp(&target.surface, 30.0, 40.0, serial);
 
     assert_ne!(fixture.last_pointer_position(), anchor);
-    assert!(fixture.state.pointer_motion);
+    assert!(!fixture.state.pointer_motion);
     assert_eq!(
         fixture.state.pointer_event_log,
         vec!["leave", "frame", "enter", "frame"]

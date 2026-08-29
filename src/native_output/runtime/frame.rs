@@ -674,14 +674,16 @@ impl NativePointerConstraintBackend {
                     });
                     return NativePointerConstraintBackendAction::default();
                 }
+                let constraint = self.active_constraint_state();
+                let final_position = constraint.constrain_position(position);
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "backend warp requested position=({},{})",
-                        position.x, position.y
+                        "backend warp constraint={:?} requested=({},{}) final=({},{})",
+                        constraint, position.x, position.y, final_position.x, final_position.y
                     )
                 });
                 NativePointerConstraintBackendAction {
-                    cursor_position: Some(position),
+                    cursor_position: Some(final_position),
                     ..NativePointerConstraintBackendAction::default()
                 }
             }

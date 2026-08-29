@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::compositor) enum PointerRepositionCause {
+    ClientWarp,
+    LockedPointerRestore,
+}
+
+impl PointerRepositionCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientWarp => "client_warp",
+            Self::LockedPointerRestore => "locked_pointer_restore",
+        }
+    }
+}
+
 impl CompositorState {
     #[cfg(test)]
     pub(in crate::compositor) fn activate_pointer_constraint_for_focused_surface(
@@ -1049,7 +1064,7 @@ impl CompositorState {
                     "oneshot compatibility warp selected id={} generation={} output=({},{})",
                     backend_id.constraint_id, backend_id.generation, position.x, position.y
                 ));
-                self.apply_pointer_warp(position, true);
+                self.apply_pointer_warp(position, PointerRepositionCause::LockedPointerRestore);
             } else if mode == PointerConstraintMode::Locked
                 && lifetime == PointerConstraintLifetime::Oneshot
             {
@@ -1092,55 +1107,125 @@ impl CompositorState {
 
     pub(in crate::compositor) fn apply_pointer_warp(
         &mut self,
-        position: OutputPosition,
-        send_motion: bool,
+        requested: OutputPosition,
+        cause: PointerRepositionCause,
     ) {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log("pointer warp ignored reason=active_lock");
             return;
         }
+        let constraint = if let Some(active) = self.active_confined_pointer_binding() {
+            let final_position = active.region.closest_point(requested);
+            pointer_debug_log(format!(
+                "pointer.reposition request cause={} constraint=confined requested=({},{}) final=({},{})",
+                cause.as_str(),
+                requested.x,
+                requested.y,
+                final_position.x,
+                final_position.y
+            ));
+            final_position
+        } else {
+            pointer_debug_log(format!(
+                "pointer.reposition request cause={} constraint=none requested=({},{}) final=({},{})",
+                cause.as_str(),
+                requested.x,
+                requested.y,
+                requested.x,
+                requested.y
+            ));
+            requested
+        };
         let before = OutputPosition {
             x: self.last_pointer_x,
             y: self.last_pointer_y,
         };
-        self.update_pointer_position(position.x, position.y);
+        self.update_pointer_position(constraint.x, constraint.y);
         pointer_debug_log(format!(
-            "pointer warp compositor before=({},{}) after=({},{}) send_motion={}",
-            before.x, before.y, position.x, position.y, send_motion
+            "pointer warp compositor before=({},{}) after=({},{}) cause={}",
+            before.x,
+            before.y,
+            constraint.x,
+            constraint.y,
+            cause.as_str()
         ));
-        self.pending_pointer_constraint_backend_requests
-            .push(PointerConstraintBackendRequest::WarpPointer { position });
-        if send_motion {
-            self.send_pointer_motion_after_warp(position);
-        }
+        self.pending_pointer_constraint_backend_requests.push(
+            PointerConstraintBackendRequest::WarpPointer {
+                position: constraint,
+            },
+        );
+        self.deliver_pointer_reposition(constraint, cause);
     }
 
-    pub(in crate::compositor) fn send_pointer_motion_after_warp(
+    pub(in crate::compositor) fn deliver_pointer_reposition(
         &mut self,
         position: OutputPosition,
+        cause: PointerRepositionCause,
     ) {
         if self.active_locked_pointer_binding().is_some() {
-            pointer_debug_log("pointer warp motion suppressed reason=active_lock");
+            pointer_debug_log(format!(
+                "pointer.reposition delivery suppressed cause={} reason=active_lock",
+                cause.as_str()
+            ));
             return;
         }
         if let Some(active) = self.active_confined_pointer_binding() {
             self.pin_confined_pointer_focus(&active);
+            let Some(target) =
+                self.pointer_target_for_surface_at_output(&active.surface, position.x, position.y)
+            else {
+                pointer_debug_log(format!(
+                    "pointer.reposition delivery dropped cause={} reason=confined_local_unresolved",
+                    cause.as_str()
+                ));
+                return;
+            };
+            self.send_pointer_enter_if_needed(&target);
+            self.send_pointer_legacy_reposition(&target);
             return;
         }
         if self.send_implicit_pointer_grab_motion(position.x, position.y) {
+            pointer_debug_log(format!(
+                "pointer.reposition delivery cause={} focus=implicit_grab",
+                cause.as_str()
+            ));
             return;
         }
         let Some(target) = self.pointer_target_at(position.x, position.y) else {
             self.clear_pointer_focus();
             return;
         };
+        if !self.pointer_target_allowed_by_popup_grab(&target) {
+            self.clear_pointer_focus();
+            return;
+        }
+        let focus_changed = !self
+            .pointer_surface
+            .as_ref()
+            .is_some_and(|surface| same_surface_resource(surface, &target.surface));
         self.ensure_pointer_focus(&target.surface);
+        if focus_changed {
+            self.send_pointer_enter_if_needed(&target);
+            pointer_debug_log(format!(
+                "pointer.reposition delivery cause={} focus=crossing event=enter",
+                cause.as_str()
+            ));
+            return;
+        }
+        self.send_pointer_enter_if_needed(&target);
+        self.send_pointer_legacy_reposition(&target);
+    }
+
+    fn send_pointer_legacy_reposition(&mut self, target: &PointerTarget) {
         let time = wayland_event_time();
         for pointer in self
             .pointer_resources
             .iter()
             .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
         {
+            if !self.pointer_resource_entered_surface(pointer, &target.surface) {
+                continue;
+            }
             let _ = pointer.send_event(wl_pointer::Event::Motion {
                 time,
                 surface_x: target.surface_x,

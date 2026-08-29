@@ -1036,7 +1036,7 @@ impl CompositorState {
             self.pending_locked_pointer_reveal_matches(&pointer, &surface)
         ));
         let matches_pending_unlock = self.pending_locked_pointer_reveal_matches(&pointer, &surface);
-        self.apply_pointer_warp(position, true);
+        self.apply_pointer_warp(position, PointerRepositionCause::ClientWarp);
         if matches_pending_unlock {
             if let Some(pending) = self.pending_locked_pointer_reveal.as_mut() {
                 pending.fallback_position = Some(position);
