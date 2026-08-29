@@ -8,7 +8,76 @@ use oblivion_one::compositor::{DmabufGpuReleaseLeaseId, OwnCompositorServer};
 use oblivion_one::native::event_loop::{NativeEventLoop, NativeEventSource, ReactorToken};
 
 use crate::native_output::NativePerfField;
+use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 use crate::native_output::scanout::AtomicEglGbmScanout;
+
+const DMABUF_RELEASE_RETRY_BASE_DELAY_NS: u64 = 1_000_000;
+const DMABUF_RELEASE_RETRY_MAX_DELAY_NS: u64 = 250_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmabufGpuReleaseSafety {
+    pub(crate) direct_kms_ownership_live: bool,
+}
+
+impl DmabufGpuReleaseSafety {
+    pub(crate) const fn from_ownership(
+        atomic_submitted_or_presented: bool,
+        worker_queued: bool,
+        worker_executing: bool,
+        worker_inflight: bool,
+    ) -> Self {
+        Self {
+            direct_kms_ownership_live: atomic_submitted_or_presented
+                || worker_queued
+                || worker_executing
+                || worker_inflight,
+        }
+    }
+
+    pub(crate) const fn permits_compositor_gpu_release(self) -> bool {
+        !self.direct_kms_ownership_live
+    }
+}
+
+pub(crate) fn dmabuf_gpu_release_safety(
+    explicit: &AtomicEglGbmScanout,
+    worker: Option<&KmsCommitWorkerHandle>,
+) -> DmabufGpuReleaseSafety {
+    // The KMS worker owns DirectPrimaryLease independently of the explicit
+    // scanout state.  A GL completion fence cannot prove that worker-owned
+    // framebuffer access has ended, so every worker phase is conservative.
+    let (worker_queued, worker_executing, worker_inflight) = worker
+        .map(|worker| {
+            let (queued, executing, inflight) = worker.direct_content_keys();
+            (queued.is_some(), executing.is_some(), inflight.is_some())
+        })
+        .unwrap_or_default();
+    DmabufGpuReleaseSafety::from_ownership(
+        explicit.has_live_direct_kms_ownership(),
+        worker_queued,
+        worker_executing,
+        worker_inflight,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufReleaseRetryReason {
+    NoGpuProofAvailable,
+    CompletionFdDuplicationFailed,
+    ReactorRegistrationFailed,
+    DirectKmsOwnershipBlocked,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DmabufReleaseRetryState {
+    #[default]
+    Idle,
+    Pending {
+        reason: DmabufReleaseRetryReason,
+        next_retry_deadline_ns: u64,
+        attempts: u32,
+    },
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DmabufGpuReleaseMetrics {
@@ -20,6 +89,7 @@ pub(crate) struct DmabufGpuReleaseMetrics {
     pub(crate) fences_created: u64,
     pub(crate) fences_signaled: u64,
     pub(crate) no_visual_fence_only: u64,
+    pub(crate) fence_creation_failures: u64,
     pub(crate) completion_fd_failures: u64,
     pub(crate) registration_failures: u64,
     pub(crate) active_leases: u64,
@@ -37,6 +107,7 @@ pub(crate) struct DmabufGpuReleaseRegistry {
     next_lease_id: u64,
     watches: HashMap<ReactorToken, DmabufGpuReleaseWatch>,
     metrics: DmabufGpuReleaseMetrics,
+    retry: DmabufReleaseRetryState,
 }
 
 impl DmabufGpuReleaseRegistry {
@@ -104,6 +175,11 @@ impl DmabufGpuReleaseRegistry {
         self.metrics.completion_fd_failures = self.metrics.completion_fd_failures.saturating_add(1);
     }
 
+    pub(crate) fn note_fence_creation_failure(&mut self) {
+        self.metrics.fence_creation_failures =
+            self.metrics.fence_creation_failures.saturating_add(1);
+    }
+
     pub(crate) fn note_obligations_armed(&mut self, count: usize) {
         self.metrics.obligations_armed =
             self.metrics.obligations_armed.saturating_add(count as u64);
@@ -111,6 +187,73 @@ impl DmabufGpuReleaseRegistry {
 
     pub(crate) fn note_no_visual_fence_only(&mut self) {
         self.metrics.no_visual_fence_only = self.metrics.no_visual_fence_only.saturating_add(1);
+    }
+
+    pub(crate) fn schedule_retry_if_needed(
+        &mut self,
+        reason: DmabufReleaseRetryReason,
+        now_ns: u64,
+    ) {
+        if matches!(self.retry, DmabufReleaseRetryState::Idle) {
+            self.retry = DmabufReleaseRetryState::Pending {
+                reason,
+                next_retry_deadline_ns: now_ns.saturating_add(DMABUF_RELEASE_RETRY_BASE_DELAY_NS),
+                attempts: 0,
+            };
+        }
+    }
+
+    pub(crate) fn retry_after_failure(&mut self, reason: DmabufReleaseRetryReason, now_ns: u64) {
+        let attempts = match self.retry {
+            DmabufReleaseRetryState::Idle => 1,
+            DmabufReleaseRetryState::Pending { attempts, .. } => attempts.saturating_add(1),
+        };
+        let shift = attempts.min(8);
+        let delay = DMABUF_RELEASE_RETRY_BASE_DELAY_NS
+            .saturating_mul(1_u64 << shift)
+            .min(DMABUF_RELEASE_RETRY_MAX_DELAY_NS);
+        self.retry = DmabufReleaseRetryState::Pending {
+            reason,
+            next_retry_deadline_ns: now_ns.saturating_add(delay),
+            attempts,
+        };
+    }
+
+    pub(crate) fn retry_due(&self, now_ns: u64) -> bool {
+        matches!(
+            self.retry,
+            DmabufReleaseRetryState::Pending {
+                next_retry_deadline_ns,
+                ..
+            } if next_retry_deadline_ns <= now_ns
+        )
+    }
+
+    pub(crate) fn retry_deadline_ns(&self) -> Option<u64> {
+        match self.retry {
+            DmabufReleaseRetryState::Idle => None,
+            DmabufReleaseRetryState::Pending {
+                next_retry_deadline_ns,
+                ..
+            } => Some(next_retry_deadline_ns),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_attempts(&self) -> u32 {
+        match self.retry {
+            DmabufReleaseRetryState::Idle => 0,
+            DmabufReleaseRetryState::Pending { attempts, .. } => attempts,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_visual_work(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn complete_retry(&mut self) {
+        self.retry = DmabufReleaseRetryState::Idle;
     }
 
     pub(crate) fn metrics(&self) -> DmabufGpuReleaseMetrics {
@@ -199,6 +342,7 @@ pub(crate) fn arm_composited_dmabuf_release(
     registry: &mut DmabufGpuReleaseRegistry,
     server: &mut OwnCompositorServer,
     explicit: &AtomicEglGbmScanout,
+    safety: DmabufGpuReleaseSafety,
     event_loop: &mut NativeEventLoop,
     batch_id: oblivion_one::compositor::CompositorFrameBatchId,
     lease_id: Option<DmabufGpuReleaseLeaseId>,
@@ -207,7 +351,7 @@ pub(crate) fn arm_composited_dmabuf_release(
         return Ok(0);
     };
     let count = server.frame_batch_dmabuf_release_count(batch_id);
-    if count == 0 || explicit.has_live_direct_kms_ownership() {
+    if count == 0 || !safety.permits_compositor_gpu_release() {
         return Ok(0);
     }
     let completion_fd = match explicit.duplicate_ready_render_completion_fd() {
@@ -229,6 +373,97 @@ pub(crate) fn arm_composited_dmabuf_release(
             server.requeue_dmabuf_gpu_release_lease(lease_id);
             Ok(0)
         }
+    }
+}
+
+impl super::NativeRuntime {
+    pub(super) fn service_due_dmabuf_release_retry(
+        &mut self,
+        now_ns: u64,
+    ) -> super::NativeResult<()> {
+        if !self.dmabuf_gpu_release_registry.retry_due(now_ns) {
+            return Ok(());
+        }
+        if self.server.deferred_dmabuf_release_count() == 0 {
+            self.dmabuf_gpu_release_registry.complete_retry();
+            return Ok(());
+        }
+
+        let safety = match &*self.scanout {
+            crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
+                dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref())
+            }
+            _ => {
+                // Compatibility backends retain their existing conservative
+                // presentation-bound authority; they never enter this retry
+                // loop.
+                self.dmabuf_gpu_release_registry.complete_retry();
+                return Ok(());
+            }
+        };
+        if !safety.permits_compositor_gpu_release() {
+            self.dmabuf_gpu_release_registry
+                .retry_after_failure(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked, now_ns);
+            return Ok(());
+        }
+
+        let lease_id = self.dmabuf_gpu_release_registry.allocate_lease_id()?;
+        let release_fence = match &*self.scanout {
+            crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
+                match explicit.create_render_fence() {
+                    Ok(fence) => fence,
+                    Err(_) => {
+                        self.dmabuf_gpu_release_registry
+                            .note_fence_creation_failure();
+                        self.dmabuf_gpu_release_registry.retry_after_failure(
+                            DmabufReleaseRetryReason::NoGpuProofAvailable,
+                            now_ns,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            _ => unreachable!("scanout backend changed during DMA-BUF retry"),
+        };
+        let completion_fd = match release_fence.duplicate_completion_fd() {
+            Ok(fd) => fd,
+            Err(_) => {
+                self.dmabuf_gpu_release_registry
+                    .note_completion_fd_failure();
+                self.dmabuf_gpu_release_registry.retry_after_failure(
+                    DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
+                    now_ns,
+                );
+                return Ok(());
+            }
+        };
+        let transferred = self
+            .server
+            .transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id);
+        if transferred == 0 {
+            self.dmabuf_gpu_release_registry.complete_retry();
+            return Ok(());
+        }
+        self.dmabuf_gpu_release_registry
+            .note_obligations_armed(transferred);
+        match self.dmabuf_gpu_release_registry.register(
+            lease_id,
+            completion_fd,
+            &mut self.event_loop,
+        ) {
+            Ok(_) => {
+                self.dmabuf_gpu_release_registry.complete_retry();
+            }
+            Err(_) => {
+                self.dmabuf_gpu_release_registry.note_registration_failure();
+                self.server.requeue_dmabuf_gpu_release_lease(lease_id);
+                self.dmabuf_gpu_release_registry.retry_after_failure(
+                    DmabufReleaseRetryReason::ReactorRegistrationFailed,
+                    now_ns,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -353,5 +588,57 @@ mod tests {
         assert_eq!(registry.active_count(), 0);
         assert_eq!(event_loop.source_for_token(token), None);
         assert_eq!(registry.metrics().leases_requeued, 1);
+    }
+
+    #[test]
+    fn every_worker_direct_ownership_state_blocks_gpu_release() {
+        for (queued, executing, inflight) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let safety = DmabufGpuReleaseSafety::from_ownership(false, queued, executing, inflight);
+            assert!(safety.direct_kms_ownership_live);
+            assert!(!safety.permits_compositor_gpu_release());
+        }
+    }
+
+    #[test]
+    fn empty_worker_and_atomic_direct_ownership_allows_gpu_release() {
+        let safety = DmabufGpuReleaseSafety::from_ownership(false, false, false, false);
+
+        assert!(!safety.direct_kms_ownership_live);
+        assert!(safety.permits_compositor_gpu_release());
+    }
+
+    #[test]
+    fn deferred_release_retry_debt_uses_capped_backoff_without_visual_work() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        registry.schedule_retry_if_needed(DmabufReleaseRetryReason::NoGpuProofAvailable, 1_000);
+
+        let first_deadline = registry.retry_deadline_ns().unwrap();
+        assert!(first_deadline > 1_000);
+        assert!(!registry.retry_due(first_deadline - 1));
+        assert!(registry.retry_due(first_deadline));
+        assert!(!registry.is_visual_work());
+
+        registry.retry_after_failure(
+            DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
+            first_deadline,
+        );
+        let second_deadline = registry.retry_deadline_ns().unwrap();
+        assert!(second_deadline > first_deadline);
+        assert_eq!(registry.retry_attempts(), 1);
+
+        for attempt in 0..32 {
+            registry.retry_after_failure(
+                DmabufReleaseRetryReason::ReactorRegistrationFailed,
+                second_deadline + attempt,
+            );
+        }
+        assert!(registry.retry_deadline_ns().unwrap() - second_deadline < 1_000_000_000);
+        assert!(!registry.is_visual_work());
+        registry.complete_retry();
+        assert_eq!(registry.retry_deadline_ns(), None);
     }
 }

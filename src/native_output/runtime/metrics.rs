@@ -411,6 +411,20 @@ impl NativeRuntime {
         let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
         let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
         let now_ns = monotonic_now_ns()?;
+        let dmabuf_retry_deadline =
+            if matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_)) {
+                if self.server.deferred_dmabuf_release_count() > 0 {
+                    self.dmabuf_gpu_release_registry.schedule_retry_if_needed(
+                        DmabufReleaseRetryReason::NoGpuProofAvailable,
+                        now_ns,
+                    );
+                } else {
+                    self.dmabuf_gpu_release_registry.complete_retry();
+                }
+                self.dmabuf_gpu_release_registry.retry_deadline_ns()
+            } else {
+                None
+            };
         self.event_loop.arm_deadline(earliest_native_deadline(
             earliest_native_deadline(
                 earliest_native_deadline(scheduler_deadline, visual_deadline),
@@ -429,8 +443,11 @@ impl NativeRuntime {
                                     .has_pending_astrea_toplevel_publication()
                                     .then_some(now_ns),
                                 earliest_native_deadline(
-                                    self.server.next_surface_pacing_deadline_ns(),
-                                    self.server.next_commit_timing_planning_deadline_ns(),
+                                    earliest_native_deadline(
+                                        self.server.next_surface_pacing_deadline_ns(),
+                                        self.server.next_commit_timing_planning_deadline_ns(),
+                                    ),
+                                    dmabuf_retry_deadline,
                                 ),
                             ),
                         ),

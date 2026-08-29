@@ -1133,6 +1133,8 @@ impl NativeRuntime {
                         ));
                         presentation_deadline.clear_scheduled_target();
                         let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
+                        let release_safety =
+                            dmabuf_gpu_release_safety(explicit, kms_commit_worker.as_ref());
                         let dmabuf_gpu_release_lease_id = (server.pending_dmabuf_release_count()
                             > 0)
                         .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
@@ -1162,6 +1164,7 @@ impl NativeRuntime {
                                 runtime_plane_plan.as_ref(),
                             ),
                             frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
+                            release_safety,
                             dmabuf_gpu_release_lease_id,
                         )?;
                         match render_outcome {
@@ -1179,13 +1182,20 @@ impl NativeRuntime {
                                                 completion_fd,
                                                 event_loop,
                                             ) {
-                                                Ok(_) => dmabuf_gpu_release_registry
-                                                    .note_no_visual_fence_only(),
+                                                Ok(_) => {
+                                                    dmabuf_gpu_release_registry
+                                                        .note_no_visual_fence_only();
+                                                    dmabuf_gpu_release_registry.complete_retry();
+                                                }
                                                 Err(_) => {
                                                     dmabuf_gpu_release_registry
                                                         .note_registration_failure();
                                                     server
                                                         .requeue_dmabuf_gpu_release_lease(lease_id);
+                                                    dmabuf_gpu_release_registry.retry_after_failure(
+                                                        DmabufReleaseRetryReason::ReactorRegistrationFailed,
+                                                        monotonic_now_ns()?,
+                                                    );
                                                 }
                                             }
                                         }
@@ -1193,8 +1203,21 @@ impl NativeRuntime {
                                             dmabuf_gpu_release_registry
                                                 .note_completion_fd_failure();
                                             server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                            dmabuf_gpu_release_registry.retry_after_failure(
+                                                DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
+                                                monotonic_now_ns()?,
+                                            );
                                         }
                                     }
+                                } else if server.deferred_dmabuf_release_count() > 0 {
+                                    let reason = if release_safety.permits_compositor_gpu_release()
+                                    {
+                                        DmabufReleaseRetryReason::NoGpuProofAvailable
+                                    } else {
+                                        DmabufReleaseRetryReason::DirectKmsOwnershipBlocked
+                                    };
+                                    dmabuf_gpu_release_registry
+                                        .retry_after_failure(reason, monotonic_now_ns()?);
                                 }
                                 render_telemetry.record_skipped(render_us);
                                 frame_scheduler.note_immediate_completion();
@@ -1228,6 +1251,7 @@ impl NativeRuntime {
                                     dmabuf_gpu_release_registry,
                                     server,
                                     explicit,
+                                    release_safety,
                                     event_loop,
                                     protocol_batch_id,
                                     dmabuf_gpu_release_lease_id,

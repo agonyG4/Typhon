@@ -111,6 +111,7 @@ impl NativeRuntime {
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         let now_ns = monotonic_now_ns()?;
+        self.service_due_dmabuf_release_retry(now_ns)?;
         let runtime_state = self.native_runtime_state(&cycle, now_ns);
         let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
         let operation_plan = work_domains.operation_plan();

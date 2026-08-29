@@ -2,13 +2,14 @@ use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
     KmsCommitJob, KmsCommitPayloadError, KmsCommitTestPolicy, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerAdmissionError, KmsWorkerEvent,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     ContentEpochId, CursorPlaneAssignment, DirectScanoutCandidateKey, OutputContentKey,
     OutputReleasePlan, OutputSlotId, OutputTransaction, OutputTransactionId,
-    runtime::AtomicCommitKind,
+    runtime::{AtomicCommitKind, DmabufGpuReleaseSafety},
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use oblivion_one::native::{
@@ -89,6 +90,16 @@ fn test_direct_transaction_with_surface_id(
         OutputReleasePlan::Pageflip,
     )
     .expect("direct transaction")
+}
+
+fn worker_direct_release_safety(handle: &KmsCommitWorkerHandle) -> DmabufGpuReleaseSafety {
+    let (queued, executing, inflight) = handle.direct_content_keys();
+    DmabufGpuReleaseSafety::from_ownership(
+        false,
+        queued.is_some(),
+        executing.is_some(),
+        inflight.is_some(),
+    )
 }
 
 #[test]
@@ -361,6 +372,7 @@ fn assert_executing_direct_candidate_survives_real_submit(
 
     executor.started.wait();
     assert_eq!(handle.direct_content_keys().1, Some(key));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
     assert!(matches!(
         handle.try_reserve_direct_admission(key),
         Err(KmsWorkerAdmissionError::DuplicateCandidate)
@@ -373,6 +385,7 @@ fn assert_executing_direct_candidate_survives_real_submit(
         |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == token),
     );
     assert_eq!(handle.direct_content_keys().2, Some(key));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     handle
         .ack_pageflip(test_job(token).token, test_job(token).transaction_id, 1)
@@ -402,6 +415,7 @@ fn assert_duplicate_candidate_is_rejected_after_atomic_dequeue(
 
     pause.wait_until_selected();
     assert_eq!(handle.direct_content_keys(), (None, Some(key), None));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
     assert!(matches!(
         handle.try_reserve_direct_admission(key),
         Err(KmsWorkerAdmissionError::DuplicateCandidate)
@@ -422,6 +436,7 @@ fn assert_duplicate_candidate_is_rejected_after_atomic_dequeue(
         |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == token),
     );
     assert_eq!(handle.direct_content_keys().2, Some(key));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
     handle
         .ack_pageflip(test_job(token).token, test_job(token).transaction_id, 1)
         .unwrap();
@@ -531,6 +546,79 @@ fn queued_direct_job_keeps_dmabuf_and_framebuffer_alive() {
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     drop(events);
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn queued_direct_worker_lease_blocks_gpu_release_safety_snapshot() {
+    let executor = Arc::new(BlockingDirectSubmitExecutor {
+        started: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let first_key = test_direct_key(3);
+    let second_key = test_direct_key(4);
+    let (first_lease, first_cleanup_count) =
+        DirectPrimaryLease::test_fixture_with_probe(first_key, 42);
+    let (second_lease, second_cleanup_count) =
+        DirectPrimaryLease::test_fixture_with_probe(second_key, 43);
+    let first = test_direct_job(80, first_key, 42, Some(first_lease));
+    let first_identity = first.identity();
+    reserve_for_test(&handle, first.kind)
+        .enqueue(first)
+        .unwrap();
+    executor.started.wait();
+
+    let mut second = test_direct_job(81, second_key, 43, Some(second_lease));
+    second.validation_base = KmsValidationBase::Predecessor(first_identity);
+    reserve_for_test(&handle, second.kind)
+        .enqueue(second)
+        .unwrap();
+    assert_eq!(handle.direct_content_keys().0, Some(second_key));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
+    assert_eq!(
+        first_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        second_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+
+    executor.release.wait();
+    let first_events = wait_for_fence_event(
+        &handle,
+        80,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 80),
+    );
+    handle
+        .ack_pageflip(test_job(80).token, test_job(80).transaction_id, 1)
+        .unwrap();
+    drop(first_events);
+    executor.started.wait();
+    assert_eq!(handle.direct_content_keys().1, Some(second_key));
+    assert!(!worker_direct_release_safety(&handle).permits_compositor_gpu_release());
+
+    executor.release.wait();
+    let second_events = wait_for_fence_event(
+        &handle,
+        81,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 81),
+    );
+    handle
+        .ack_pageflip(test_job(81).token, test_job(81).transaction_id, 1)
+        .unwrap();
+    drop(second_events);
+    assert_eq!(handle.direct_content_keys(), (None, None, None));
+    assert_eq!(
+        first_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        second_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
     handle.request_quiesce();
     handle.join().unwrap();
 }

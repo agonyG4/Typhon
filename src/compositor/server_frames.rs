@@ -413,6 +413,20 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn deferred_dmabuf_release_count(&self) -> usize {
+        self.state.deferred_dmabuf_release_count()
+    }
+
+    #[doc(hidden)]
+    pub fn transfer_deferred_dmabuf_releases_to_gpu_lease(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        self.state
+            .transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id)
+    }
+
+    #[doc(hidden)]
     pub fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
         &mut self,
         batch_id: CompositorFrameBatchId,

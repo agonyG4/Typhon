@@ -30,7 +30,7 @@ use crate::egl_renderer::{
     create_gles_context, detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
 use crate::native_output::runtime::{
-    DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
+    DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition, DmabufGpuReleaseSafety,
     direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
     settle_no_visual_change_output_transaction,
 };
@@ -730,6 +730,7 @@ impl AtomicEglGbmScanout {
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
         frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
         async_policy_inputs: AtomicAsyncPolicyInputs,
+        dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let metadata = server
@@ -971,7 +972,7 @@ impl AtomicEglGbmScanout {
             }) => {
                 let release_fence = if dmabuf_gpu_release_lease_id.is_some()
                     && server.frame_batch_dmabuf_release_count(protocol_batch_id) > 0
-                    && !self.has_live_direct_kms_ownership()
+                    && dmabuf_gpu_release_safety.permits_compositor_gpu_release()
                 {
                     self.create_render_fence().ok()
                 } else {

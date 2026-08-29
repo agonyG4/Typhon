@@ -126,6 +126,8 @@ impl CompositorState {
             || self.has_pending_interactive_visual_work()
             || self.has_unowned_frame_callbacks()
             || self.has_visible_pending_presentation_feedbacks()
+            // Deferred DMA-BUF releases are runtime retry debt.  They must
+            // not manufacture a visual frame when no scene work exists.
             || !self.pending_dmabuf_buffer_releases.is_empty()
     }
 
@@ -394,6 +396,32 @@ impl CompositorState {
 
     pub(in crate::compositor) fn pending_dmabuf_release_count(&self) -> usize {
         self.pending_dmabuf_buffer_releases.len() + self.deferred_dmabuf_buffer_releases.len()
+    }
+
+    pub(in crate::compositor) fn deferred_dmabuf_release_count(&self) -> usize {
+        self.deferred_dmabuf_buffer_releases.len()
+    }
+
+    pub(in crate::compositor) fn transfer_deferred_dmabuf_releases_to_gpu_lease(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let obligations = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
+        let count = obligations.len();
+        if count > 0 {
+            let previous = self.dmabuf_gpu_release_leases.insert(
+                lease_id,
+                DmabufGpuReleaseLease {
+                    source_batch_id: None,
+                    obligations,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "DMA-BUF GPU release lease ID was reused"
+            );
+        }
+        count
     }
 
     pub(in crate::compositor) fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
