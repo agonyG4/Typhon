@@ -118,6 +118,113 @@ fn valid_pointer_warp_moves_pointer_and_sends_absolute_motion_without_relative_m
 }
 
 #[test]
+fn confined_pointer_warp_clamps_before_compositor_and_backend_position_changes() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        pointer_warp: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let pointer_warp: client_wp_pointer_warp_v1::WpPointerWarpV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 80, 60).unwrap();
+    let surface_id = surface.id().protocol_id();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+    );
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: anchor.0,
+            y: anchor.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state.pointer_enter_serial.unwrap();
+
+    let constraint_region = compositor.create_region(&qh, ());
+    constraint_region.add(10, 10, 20, 20);
+    let _confine = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        Some(&constraint_region),
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let activation_requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = activation_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected confined backend activation request");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let _ = capture_pointer_constraint_backend_requests(&commands);
+
+    pointer_warp.warp_pointer(&surface, &pointer, 70.0, 50.0, serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLastPointerPosition(reply))
+        .unwrap();
+    let compositor_position = receiver.recv().unwrap();
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let expected = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 29.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 29.0,
+    );
+    assert_eq!(compositor_position, expected);
+    assert_eq!(state.pointer_enter_surface_id, Some(surface_id));
+    assert!(requests.iter().any(|request| {
+        matches!(
+            request,
+            PointerConstraintBackendRequest::WarpPointer {
+                position: OutputPosition { x, y }
+            } if (*x, *y) == expected
+        )
+    }));
+}
+
+#[test]
 fn pointer_warp_rejects_stale_serial_and_out_of_surface_coordinates() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {

@@ -238,16 +238,21 @@ fn current_pointer_enter_serial_allows_same_client_target_surface() {
     let mut fixture = PointerWarpFixture::new();
     let target = fixture.create_surface();
     let anchor = (
-        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
-        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 8.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 8.0,
     );
     let serial = fixture.focus_at(anchor.0, anchor.1);
 
     fixture.state.pointer_motion = false;
+    fixture.state.pointer_event_log.clear();
     fixture.warp(&target.surface, 30.0, 40.0, serial);
 
     assert_ne!(fixture.last_pointer_position(), anchor);
     assert!(fixture.state.pointer_motion);
+    assert_eq!(
+        fixture.state.pointer_event_log,
+        vec!["leave", "frame", "enter", "frame"]
+    );
 }
 
 #[test]

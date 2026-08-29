@@ -1004,6 +1004,39 @@ fn native_pointer_constraint_backend_warps_when_unlocked() {
 }
 
 #[test]
+fn native_pointer_constraint_backend_clamps_warp_when_confined() {
+    let mut backend = NativePointerConstraintBackend::new();
+    let id = PointerConstraintBackendId {
+        constraint_id: 14,
+        generation: 1,
+    };
+    let region = OutputRegion::from_rect(OutputRect::new(40.0, 30.0, 60.0, 40.0).unwrap());
+    let requested = CompositorOutputPosition { x: 240.0, y: 160.0 };
+    let expected = CompositorOutputPosition { x: 99.0, y: 69.0 };
+    let anchor = CompositorOutputPosition { x: 50.0, y: 40.0 };
+    backend.handle_request(
+        PointerConstraintBackendRequest::ActivateConfined {
+            id,
+            region: region.clone(),
+        },
+        anchor,
+    );
+
+    let action = backend.handle_request(
+        PointerConstraintBackendRequest::WarpPointer {
+            position: requested,
+        },
+        anchor,
+    );
+
+    assert_eq!(action.cursor_position, Some(expected));
+    assert_eq!(
+        backend.active_constraint_state(),
+        NativePointerConstraintState::Confined { region }
+    );
+}
+
+#[test]
 fn native_pointer_constraint_backend_activates_confined_with_region() {
     let mut backend = NativePointerConstraintBackend::new();
     let id = PointerConstraintBackendId {
