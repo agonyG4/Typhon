@@ -271,6 +271,21 @@ mod tests {
     }
 
     #[test]
+    fn completion_fd_is_independent_from_submission_and_timing_ownership() {
+        let submission = pipe_read_end();
+        let raw_submission = submission.as_raw_fd();
+        let mut fence = NativeRenderFence::from_submission_fd(submission);
+        let raw_timing = fence.timing_fd().unwrap().as_raw_fd();
+        let completion = fence.duplicate_completion_fd().unwrap();
+
+        assert_ne!(completion.as_raw_fd(), raw_submission);
+        assert_ne!(completion.as_raw_fd(), raw_timing);
+        assert_eq!(fence.take_submission_fd().unwrap().as_raw_fd(), raw_submission);
+        assert_eq!(fence.take_timing_fd().unwrap().as_raw_fd(), raw_timing);
+        assert!(fence.duplicate_completion_fd().is_ok());
+    }
+
+    #[test]
     fn timing_fence_duplication_failure_keeps_valid_submission_fence() {
         let submission = pipe_read_end();
         let raw_submission = submission.as_raw_fd();

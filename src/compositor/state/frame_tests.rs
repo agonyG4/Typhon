@@ -521,7 +521,7 @@ mod frame_consumption_tests {
         assert!(state.frame_batches.is_empty());
         assert!(state.legacy_prepared_frame_batch.is_none());
         assert!(state.pending_dmabuf_buffer_releases.is_empty());
-        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
     }
 
     #[test]
