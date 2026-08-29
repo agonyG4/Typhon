@@ -955,6 +955,55 @@ fn native_pointer_constraint_backend_activates_locked_once() {
 }
 
 #[test]
+fn native_pointer_constraint_backend_ignores_warp_while_locked() {
+    let mut backend = NativePointerConstraintBackend::new();
+    let id = PointerConstraintBackendId {
+        constraint_id: 13,
+        generation: 1,
+    };
+    let anchor = CompositorOutputPosition {
+        x: 100.25,
+        y: 80.75,
+    };
+    let warp_position = CompositorOutputPosition { x: 240.0, y: 160.0 };
+    backend.handle_request(
+        PointerConstraintBackendRequest::ActivateLocked { id, anchor },
+        anchor,
+    );
+
+    let action = backend.handle_request(
+        PointerConstraintBackendRequest::WarpPointer {
+            position: warp_position,
+        },
+        anchor,
+    );
+
+    assert_eq!(action, NativePointerConstraintBackendAction::default());
+    assert!(backend.active_locked());
+    assert_eq!(
+        backend.active_constraint_state(),
+        NativePointerConstraintState::Locked { anchor }
+    );
+}
+
+#[test]
+fn native_pointer_constraint_backend_warps_when_unlocked() {
+    let mut backend = NativePointerConstraintBackend::new();
+    let position = CompositorOutputPosition { x: 240.0, y: 160.0 };
+
+    let action = backend.handle_request(
+        PointerConstraintBackendRequest::WarpPointer { position },
+        CompositorOutputPosition { x: 100.0, y: 80.0 },
+    );
+
+    assert_eq!(action.cursor_position, Some(position));
+    assert!(action.activated.is_none());
+    assert!(action.deactivated.is_none());
+    assert!(action.failed.is_none());
+    assert!(action.cursor_visibility_changed.is_none());
+}
+
+#[test]
 fn native_pointer_constraint_backend_activates_confined_with_region() {
     let mut backend = NativePointerConstraintBackend::new();
     let id = PointerConstraintBackendId {
