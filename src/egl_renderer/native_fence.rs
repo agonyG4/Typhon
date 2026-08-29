@@ -124,6 +124,21 @@ impl NativeRenderFence {
         self.timing_fd.as_ref().or(self.submission_fd.as_ref())
     }
 
+    pub(crate) fn duplicate_completion_fd(&self) -> io::Result<OwnedFd> {
+        let fd = self
+            .readiness_fd()
+            .ok_or_else(|| io::Error::other("native render fence has no completion FD"))?;
+        self.duplicate_completion_fd_with(duplicate_cloexec, fd.as_raw_fd())
+    }
+
+    fn duplicate_completion_fd_with(
+        &self,
+        duplicate: impl FnOnce(i32) -> io::Result<OwnedFd>,
+        raw_fd: i32,
+    ) -> io::Result<OwnedFd> {
+        duplicate(raw_fd)
+    }
+
     pub(crate) fn is_signaled_nonblocking(&self) -> io::Result<bool> {
         let fd = self
             .readiness_fd()
@@ -280,9 +295,13 @@ mod tests {
 
         assert_ne!(completion.as_raw_fd(), raw_submission);
         assert_ne!(completion.as_raw_fd(), raw_timing);
-        assert_eq!(fence.take_submission_fd().unwrap().as_raw_fd(), raw_submission);
-        assert_eq!(fence.take_timing_fd().unwrap().as_raw_fd(), raw_timing);
+        assert_eq!(
+            fence.take_submission_fd().unwrap().as_raw_fd(),
+            raw_submission
+        );
         assert!(fence.duplicate_completion_fd().is_ok());
+        assert_eq!(fence.take_timing_fd().unwrap().as_raw_fd(), raw_timing);
+        assert!(fence.duplicate_completion_fd().is_err());
     }
 
     #[test]
@@ -298,5 +317,29 @@ mod tests {
             fence.take_submission_fd().unwrap().as_raw_fd(),
             raw_submission
         );
+    }
+
+    #[test]
+    fn completion_fence_duplication_failure_keeps_submission_and_timing_fds() {
+        let submission = pipe_read_end();
+        let raw_submission = submission.as_raw_fd();
+        let mut fence = NativeRenderFence::from_submission_fd(submission);
+        let raw_timing = fence.timing_fd().unwrap().as_raw_fd();
+
+        assert_eq!(
+            fence
+                .duplicate_completion_fd_with(
+                    |_| Err(io::Error::from_raw_os_error(libc::EMFILE)),
+                    raw_timing,
+                )
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        assert_eq!(
+            fence.take_submission_fd().unwrap().as_raw_fd(),
+            raw_submission
+        );
+        assert_eq!(fence.take_timing_fd().unwrap().as_raw_fd(), raw_timing);
     }
 }
