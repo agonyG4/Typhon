@@ -22,7 +22,7 @@
 
 ## File map
 
-- `src/compositor/tests/input_output/pointer_cursor.rs`: Wayland integration regression that drives a focused surface through lock, valid client warp, relative motion, and unlock.
+- `src/compositor/tests/input_output/pointer_lock_warp.rs`: Wayland integration regression that drives a focused surface through lock, valid client warp, relative motion, and unlock.
 - `src/native_output/tests/input.rs`: unit tests for the native pointer-constraint backend’s locked and unlocked `WarpPointer` behavior.
 - `src/compositor/state/pointer_constraints.rs`: compositor-side early return that preserves authoritative absolute position and avoids normal backend warp work during an active lock.
 - `src/native_output/runtime/frame.rs`: native backend defense-in-depth guard using its existing active constraint state.
@@ -32,7 +32,8 @@
 
 **Files:**
 
-- Modify: `src/compositor/tests/input_output/pointer_cursor.rs` near the existing pointer-warp tests.
+- Create: `src/compositor/tests/input_output/pointer_lock_warp.rs` for the active-lock warp regression.
+- Modify: `src/compositor/tests/input_output/mod.rs` to register the focused regression module.
 - Modify: `src/native_output/tests/input.rs` near the existing native pointer-constraint backend tests.
 
 **Interfaces:**
@@ -42,7 +43,7 @@
 
 - [ ] **Step 1: Write the compositor integration test without changing production code.**
 
-  In `pointer_cursor.rs`, add `locked_pointer_warp_is_ignored_while_active` using capabilities `{ pointer_constraints: true, pointer_warp: true, relative_pointer: true, ..desktop_baseline() }`. Create a 160x120 buffered toplevel, obtain a pointer, relative pointer, pointer-constraints manager, and pointer-warp manager, and move the server pointer to `FIRST_SURFACE_OFFSET + (20, 14)`. Save the enter serial and the anchor position.
+  In `pointer_lock_warp.rs`, add `locked_pointer_warp_is_ignored_while_active` using capabilities `{ pointer_constraints: true, pointer_warp: true, relative_pointer: true, ..desktop_baseline() }`. Create a 160x120 buffered toplevel, obtain a pointer, relative pointer, pointer-constraints manager, and pointer-warp manager, and move the server pointer to `FIRST_SURFACE_OFFSET + (20, 14)`. Save the enter serial and the anchor position.
 
   Create a persistent locked pointer, process the request, and call `activate_backend_locked_pointer` so the test is explicitly after backend confirmation. Clear the captured activation requests and client motion state. Issue `warp_pointer(&surface, &pointer, 80.0, 60.0, serial)`, flush, wait for server work, and roundtrip the client. Capture `last_pointer_x/y` and assert it is exactly the anchor; assert `state.pointer_motion` is false; assert no `WarpPointer` request was captured; assert `state.relative_motion_count == 0`; and assert the lock remains active (`locked_count == 1`, `unlocked_count == 0`).
 
