@@ -2215,6 +2215,103 @@ fn subsurface_reorder_damages_only_the_changed_middle_span() {
 }
 
 #[test]
+fn decorated_window_reorder_repairs_ssd_only_pixels_regionally() {
+    let window_a = test_renderable_surface(380, 100, 100, 200, 200, RenderableSurfaceDamage::Empty);
+    let window_b = test_renderable_surface(381, 180, 120, 200, 200, RenderableSurfaceDamage::Empty);
+    let decoration_a = DecorationSceneSnapshot::from_bounds(
+        WindowId::from_raw(380).expect("window A id"),
+        380,
+        96,
+        70,
+        208,
+        234,
+        1,
+    );
+    let decoration_b = DecorationSceneSnapshot::from_bounds(
+        WindowId::from_raw(381).expect("window B id"),
+        381,
+        176,
+        90,
+        208,
+        234,
+        1,
+    );
+    let previous = NativeSceneSnapshot::from_surfaces(
+        &[window_a.clone(), window_b.clone()],
+        vec![decoration_a.clone(), decoration_b.clone()],
+    );
+    let current = NativeSceneSnapshot::from_surfaces(
+        &[window_b, window_a],
+        vec![decoration_b, decoration_a],
+    );
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 190, 95)),
+        "reorder must repair overlapping SSD-only pixels: {:?}",
+        damage.rects
+    );
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 900, 600))
+    );
+}
+
+#[test]
+fn unchanged_decorated_window_order_does_not_damage_ssd() {
+    let window_a = test_renderable_surface(390, 100, 100, 200, 200, RenderableSurfaceDamage::Empty);
+    let window_b = test_renderable_surface(391, 180, 120, 200, 200, RenderableSurfaceDamage::Empty);
+    let decorations = vec![
+        DecorationSceneSnapshot::from_bounds(
+            WindowId::from_raw(390).expect("window A id"),
+            390,
+            96,
+            70,
+            208,
+            234,
+            1,
+        ),
+        DecorationSceneSnapshot::from_bounds(
+            WindowId::from_raw(391).expect("window B id"),
+            391,
+            176,
+            90,
+            208,
+            234,
+            1,
+        ),
+    ];
+    let previous = NativeSceneSnapshot::from_surfaces(
+        &[window_a.clone(), window_b.clone()],
+        decorations.clone(),
+    );
+    let current = NativeSceneSnapshot::from_surfaces(&[window_a, window_b], decorations);
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert!(damage.is_empty(), "unchanged order must not repaint SSDs: {damage:?}");
+}
+
+#[test]
 fn visibility_transition_remains_a_true_global_invalidation() {
     let surface = test_renderable_surface(360, 100, 100, 80, 60, RenderableSurfaceDamage::Empty);
     let previous = NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&surface), Vec::new());
