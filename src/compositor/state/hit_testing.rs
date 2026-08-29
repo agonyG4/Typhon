@@ -958,14 +958,18 @@ impl CompositorState {
         })
     }
 
-    pub(in crate::compositor) fn pointer_has_current_enter_serial_for_client(
+    pub(in crate::compositor) fn pointer_has_valid_warp_enter_serial(
         &self,
         pointer: &wl_pointer::WlPointer,
         serial: u32,
         surface: &wl_surface::WlSurface,
     ) -> bool {
         resource_belongs_to_surface_client(pointer, surface)
-            && self.validate_set_cursor_serial(serial, surface)
+            && self.pointer_enter_serials.iter().any(|entry| {
+                same_wayland_resource(&entry.pointer, pointer)
+                    && entry.serial == serial
+                    && entry.surface.id().same_client_as(&surface.id())
+            })
     }
 
     pub(in crate::compositor) fn warp_pointer_protocol_request(
@@ -1007,20 +1011,11 @@ impl CompositorState {
             reject("unknown_pointer");
             return;
         }
-        let focused_surface = self
-            .implicit_pointer_grab
-            .as_ref()
-            .map(|grab| grab.surface.clone())
-            .or_else(|| self.pointer_surface.clone());
-        let Some(focused_surface) = focused_surface else {
+        if self.implicit_pointer_grab.is_none() && self.pointer_surface.is_none() {
             reject("no_pointer_focus");
             return;
-        };
-        if !same_surface_resource(&focused_surface, &surface) {
-            reject("surface_not_focused");
-            return;
         }
-        if !self.pointer_has_current_enter_serial_for_client(&pointer, serial, &surface) {
+        if !self.pointer_has_valid_warp_enter_serial(&pointer, serial, &surface) {
             reject("invalid_serial");
             return;
         }
