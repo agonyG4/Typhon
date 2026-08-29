@@ -124,6 +124,9 @@ Document the worker safety barrier, retry ownership, all unchanged boundaries, a
 
 Run `rtk cargo fmt --check`, `rtk cargo check`, `rtk cargo clippy --all-targets --all-features -- -D warnings`, `rtk cargo test`, `git diff --check`, and `git status --short`. Do not hide unrelated failures.
 
-- [ ] **Step 3: Commit only task files**
+- [x] **Step 3: Commit only task files**
+
+  Committed as `004bbdc fix: close DMA-BUF worker ownership and retry liveness`.
+  The unrelated pointer-reposition changes remain outside that commit.
 
 Stage the v1.1 source, tests, plan, and report. Preserve concurrent pointer-reposition work and do not stage unrelated changes.
