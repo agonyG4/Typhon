@@ -2570,6 +2570,13 @@ fn topology_oracle_paint_repair(
     }
 }
 
+#[derive(Clone)]
+struct RejectedTopologyCandidate {
+    slot_index: usize,
+    scene: NativeSceneSnapshot,
+    physical_pixels: Vec<u32>,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the oracle keeps each output state explicit"
@@ -2638,7 +2645,7 @@ fn topology_oracle_reject_candidate(
     width: u32,
     height: u32,
     label: &str,
-) {
+) -> RejectedTopologyCandidate {
     let current_damage = native_output_damage_for_scene_snapshots(
         width,
         height,
@@ -2669,6 +2676,48 @@ fn topology_oracle_reject_candidate(
     // A rejected render may have written a scratch/output slot, but it is not
     // a presented transition: neither planner history nor the presented scene
     // is advanced here. The next selected slot must repair from that state.
+    RejectedTopologyCandidate {
+        slot_index,
+        scene: current_scene.clone(),
+        physical_pixels: slots[slot_index].clone(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the oracle keeps each retry state explicit"
+)]
+fn topology_oracle_retry_candidate(
+    planner: &mut PartialRepaintPlanner,
+    slots: &mut [Vec<u32>],
+    rejected: RejectedTopologyCandidate,
+    slot_index: usize,
+    age: i32,
+    presented_scene: &mut NativeSceneSnapshot,
+    current_scene: NativeSceneSnapshot,
+    visuals: &TopologyOracleVisuals,
+    width: u32,
+    height: u32,
+    label: &str,
+) {
+    assert_ne!(
+        rejected.slot_index, slot_index,
+        "the rejected output slot remains unavailable for this retry"
+    );
+    assert_eq!(rejected.scene, current_scene);
+    assert_eq!(slots[rejected.slot_index], rejected.physical_pixels);
+    topology_oracle_present(
+        planner,
+        slots,
+        slot_index,
+        age,
+        presented_scene,
+        current_scene,
+        visuals,
+        width,
+        height,
+        label,
+    );
 }
 
 #[test]
@@ -2883,7 +2932,7 @@ fn topology_transitions_match_full_reference_with_rotating_output_ages() {
 
     let rejected = topology_oracle_snapshot(&[a.clone(), b_content.clone(), moved_child], &[]);
     let presented_before_rejection = presented_scene.clone();
-    topology_oracle_reject_candidate(
+    let rejected_candidate = topology_oracle_reject_candidate(
         &mut planner,
         &mut slots,
         1,
@@ -2896,9 +2945,10 @@ fn topology_transitions_match_full_reference_with_rotating_output_ages() {
         "rejected candidate",
     );
     assert_eq!(presented_scene, presented_before_rejection);
-    topology_oracle_present(
+    topology_oracle_retry_candidate(
         &mut planner,
         &mut slots,
+        rejected_candidate,
         2,
         3,
         &mut presented_scene,
