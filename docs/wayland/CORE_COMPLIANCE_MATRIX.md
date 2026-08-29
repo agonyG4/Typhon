@@ -195,7 +195,7 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_pointer` | n/a | event `axis_stop` | 5 | input state | Implemented | Partial |
 | `wl_pointer` | n/a | event `axis_discrete` | 5 | input state | Implemented | Partial |
 | `wl_pointer` | n/a | event `axis_value120` | 8 | input state | Implemented | Implemented |
-| `wl_pointer` | n/a | event `axis_relative_direction` | 9 | input state | Implemented | Outside advertised seat pointer resource bound |
+| `wl_pointer` | n/a | event `axis_relative_direction` | 9 | input state | Implemented | Partial; the normalized axis frame does not carry physical direction metadata |
 | `wl_pointer` | n/a | event `warp` | 11 | pointer reposition state | Implemented | Explicit compositor repositions only; never shared with enter or motion frame |
 | `wl_keyboard` | n/a | event `keymap` | 1 | input state | Implemented | Partial |
 | `wl_keyboard` | n/a | event `enter` | 1 | input state | Implemented | Implemented |

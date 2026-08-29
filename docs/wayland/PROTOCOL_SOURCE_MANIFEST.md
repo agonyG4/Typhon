@@ -214,6 +214,10 @@ their existing versions.
   compositor repositions pass through pointer-constraint authority, use
   leave/enter for focus crossings, and use `warp` only for same-focus v11+
   pointer resources; legacy resources retain their existing motion behavior.
+- The v9 `wl_pointer.axis_relative_direction` binding is audited but remains
+  partial because Typhon's normalized axis frame does not preserve physical
+  direction metadata. The v10 repeated key state is optional and existing
+  keyboard delivery remains unchanged.
 - `wl_data_device_manager` remains v3 when clipboard capability is enabled;
   v3 drag-and-drop is part of the contract and is not removed by lowering the
   version.

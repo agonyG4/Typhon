@@ -59,8 +59,9 @@ The direct core binding update is the minimum `wayland-client`/`wayland-server`
 release pair exposing the Wayland 1.26 `wl_pointer.warp` event. The audited
 changes from the currently advertised seat version 8 through version 11 are:
 
-* pointer version 9: `axis_relative_direction` already exists in the current
-  bindings and remains delivered only for physical axis input;
+* pointer version 9: `axis_relative_direction` exists in the current bindings,
+  but Typhon's normalized axis frame does not carry physical direction
+  metadata, so this milestone leaves that optional metadata event unsynthesized;
 * keyboard version 10: the `repeated` key-state enum already exists and is
   unaffected;
 * pointer version 11: `wl_pointer.warp` is implemented for explicit
