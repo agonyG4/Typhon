@@ -578,6 +578,9 @@ mod frame_consumption_tests {
                 .damage_since(journal_commit, 100, 80);
             assert!(matches!(history, DamageSince::Empty));
         }
+        let metrics = state.surface_locality_metrics_for_test();
+        assert_eq!(metrics.surface_damage_settlement_no_visual_change, 128);
+        assert_eq!(metrics.surface_damage_settlement_presented, 0);
 
         let partial_commit = SurfaceCommitSequence(129);
         let partial = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
