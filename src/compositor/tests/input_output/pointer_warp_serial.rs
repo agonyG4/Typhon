@@ -184,6 +184,7 @@ fn current_pointer_enter_serial_survives_generic_serial_churn() {
     assert_eq!(fixture.state.pointer_leave_count, 0);
 
     fixture.state.pointer_motion = false;
+    fixture.state.pointer_event_log.clear();
     fixture.warp(&fixture.surface.surface.clone(), 80.0, 60.0, serial);
 
     let expected = (
@@ -193,6 +194,7 @@ fn current_pointer_enter_serial_survives_generic_serial_churn() {
     assert_eq!(fixture.last_pointer_position(), expected);
     assert!(fixture.state.pointer_motion);
     assert_eq!(fixture.state.pointer_leave_count, 0);
+    assert_eq!(fixture.state.pointer_event_log, vec!["motion", "frame"]);
 }
 
 #[test]
