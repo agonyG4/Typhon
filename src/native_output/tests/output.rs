@@ -2276,6 +2276,38 @@ fn native_snapshot_exposes_history_lost_damage_evidence() {
     );
 }
 
+#[test]
+fn history_lost_repairs_only_the_current_surface_footprint() {
+    let previous_surface =
+        test_renderable_surface(373, 100, 100, 120, 90, RenderableSurfaceDamage::Empty);
+    let current_surface =
+        test_renderable_surface(373, 100, 100, 120, 90, RenderableSurfaceDamage::HistoryLost);
+    let previous = NativeSceneSnapshot::from_surfaces(&[previous_surface], Vec::new());
+    let current = NativeSceneSnapshot::from_surfaces(&[current_surface], Vec::new());
+
+    let damage = native_output_damage_for_scene_snapshots(
+        960,
+        640,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+    assert!(
+        damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 200, 180))
+    );
+    assert!(
+        !damage
+            .rects
+            .iter()
+            .any(|rect| native_damage_rect_contains(*rect, 900, 600))
+    );
+}
+
 #[derive(Clone)]
 struct TopologyOracleVisuals {
     colors: std::collections::HashMap<u32, u32>,
