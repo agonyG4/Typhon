@@ -24,12 +24,13 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids();
         let render_generation = server.scene_render_generation();
-        let snapshot = NativeSceneSnapshot::from_surfaces(
+        let snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(
             surfaces.as_ref(),
             decorations
                 .iter()
                 .map(DecorationRenderInstance::scene_snapshot)
                 .collect(),
+            popup_surface_ids.as_ref(),
         );
         Self {
             surfaces,

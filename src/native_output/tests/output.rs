@@ -2240,10 +2240,8 @@ fn decorated_window_reorder_repairs_ssd_only_pixels_regionally() {
         &[window_a.clone(), window_b.clone()],
         vec![decoration_a.clone(), decoration_b.clone()],
     );
-    let current = NativeSceneSnapshot::from_surfaces(
-        &[window_b, window_a],
-        vec![decoration_b, decoration_a],
-    );
+    let current =
+        NativeSceneSnapshot::from_surfaces(&[window_b, window_a], vec![decoration_b, decoration_a]);
 
     let damage = native_output_damage_for_scene_snapshots(
         960,
@@ -2308,7 +2306,10 @@ fn unchanged_decorated_window_order_does_not_damage_ssd() {
         NativeCursorDamageBounds::default(),
     );
 
-    assert!(damage.is_empty(), "unchanged order must not repaint SSDs: {damage:?}");
+    assert!(
+        damage.is_empty(),
+        "unchanged order must not repaint SSDs: {damage:?}"
+    );
 }
 
 #[test]

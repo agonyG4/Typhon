@@ -444,11 +444,7 @@ mod frame_consumption_tests {
             Some(&settled)
         );
         assert!(matches!(
-            state.surface_damage_journals[&surface_id].damage_since(
-                settled,
-                2,
-                2,
-            ),
+            state.surface_damage_journals[&surface_id].damage_since(settled, 2, 2,),
             DamageSince::Empty
         ));
         assert!(state.frame_batches.is_empty());
@@ -722,11 +718,7 @@ mod frame_consumption_tests {
             .copied()
             .expect("latest Empty commit is the logical baseline");
         assert_eq!(
-            state.surface_damage_journals[&surface_id].damage_since(
-                baseline,
-                100,
-                80
-            ),
+            state.surface_damage_journals[&surface_id].damage_since(baseline, 100, 80),
             DamageSince::Known(partial)
         );
     }

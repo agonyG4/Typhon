@@ -251,6 +251,7 @@ pub(crate) enum NativeSurfaceDamageEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeSceneSurfaceSnapshot {
     pub(crate) surface_id: u32,
+    pub(crate) visual_root_surface_id: u32,
     pub(crate) bounds: Option<NativeDamageRect>,
     pub(crate) damage: NativeSurfaceDamageEvidence,
     pub(crate) content_generation: u64,
@@ -272,7 +273,26 @@ impl NativeSceneSnapshot {
         surfaces: &[RenderableSurface],
         decorations: Vec<DecorationSceneSnapshot>,
     ) -> Self {
+        Self::from_surfaces_with_popup_ids(surfaces, decorations, &[])
+    }
+
+    pub(crate) fn from_surfaces_with_popup_ids(
+        surfaces: &[RenderableSurface],
+        decorations: Vec<DecorationSceneSnapshot>,
+        popup_surface_ids: &[u32],
+    ) -> Self {
         let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
+        let visual_root_by_surface_id =
+            oblivion_one::compositor::visual_stack_groups(surfaces, popup_surface_ids)
+                .into_iter()
+                .flat_map(|group| {
+                    group
+                        .surface_indices()
+                        .iter()
+                        .map(|&index| (surfaces[index].surface_id, group.root_surface_id()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<HashMap<_, _>>();
         let surfaces: Vec<NativeSceneSurfaceSnapshot> = elements
             .iter()
             .zip(surfaces)
@@ -302,6 +322,10 @@ impl NativeSceneSnapshot {
                 };
                 NativeSceneSurfaceSnapshot {
                     surface_id,
+                    visual_root_surface_id: visual_root_by_surface_id
+                        .get(&surface_id)
+                        .copied()
+                        .unwrap_or(surface_id),
                     bounds: NativeDamageRect::from_render_element_bounds(element),
                     damage,
                     content_generation: element.generation(),
@@ -314,7 +338,7 @@ impl NativeSceneSnapshot {
         Self {
             surfaces,
             decorations,
-            popup_surface_ids: Vec::new(),
+            popup_surface_ids: popup_surface_ids.to_vec(),
             external_overlay_surface_ids: Vec::new(),
             visibility_signature: 0,
             surface_order_signature,
@@ -330,6 +354,7 @@ impl NativeSceneSnapshot {
         for surface in &self.surfaces {
             mix(1);
             mix(u64::from(surface.surface_id));
+            mix(u64::from(surface.visual_root_surface_id));
             if let Some(bounds) = surface.bounds {
                 mix(1);
                 mix(bounds.x as u64);
@@ -1001,6 +1026,8 @@ pub(crate) fn native_output_damage_for_scene_snapshots(
         height,
         &previous.surfaces,
         &current.surfaces,
+        &previous.decorations,
+        &current.decorations,
     );
     push_surface_membership_transition_damage(
         &mut scene,
@@ -1039,6 +1066,8 @@ fn native_scene_surface_transition_damage(
     output_height: u32,
     previous: &[NativeSceneSurfaceSnapshot],
     current: &[NativeSceneSurfaceSnapshot],
+    previous_decorations: &[DecorationSceneSnapshot],
+    current_decorations: &[DecorationSceneSnapshot],
 ) -> NativeDamageAccumulator {
     let previous_by_id = previous
         .iter()
@@ -1055,6 +1084,8 @@ fn native_scene_surface_transition_damage(
         output_height,
         previous,
         current,
+        previous_decorations,
+        current_decorations,
     );
     for (surface_id, previous_surface) in &previous_by_id {
         let Some(current_surface) = current_by_id.get(surface_id) else {
@@ -1155,6 +1186,8 @@ fn push_order_transition_damage(
     output_height: u32,
     previous: &[NativeSceneSurfaceSnapshot],
     current: &[NativeSceneSurfaceSnapshot],
+    previous_decorations: &[DecorationSceneSnapshot],
+    current_decorations: &[DecorationSceneSnapshot],
 ) {
     let previous_ids = previous
         .iter()
@@ -1192,7 +1225,20 @@ fn push_order_transition_damage(
         .iter()
         .map(|surface| (surface.surface_id, surface))
         .collect::<HashMap<_, _>>();
-    for surface_id in previous_ids[prefix..previous_ids.len().saturating_sub(suffix)].iter() {
+    let changed_previous_ids = &previous_ids[prefix..previous_ids.len().saturating_sub(suffix)];
+    let changed_current_ids = &current_ids[prefix..current_ids.len().saturating_sub(suffix)];
+    let affected_visual_roots = changed_previous_ids
+        .iter()
+        .chain(changed_current_ids)
+        .filter_map(|surface_id| {
+            previous_by_id
+                .get(surface_id)
+                .or_else(|| current_by_id.get(surface_id))
+                .map(|surface| surface.visual_root_surface_id)
+        })
+        .collect::<HashSet<_>>();
+
+    for surface_id in changed_previous_ids {
         push_clipped_scene_rect(
             accumulator,
             output_width,
@@ -1202,7 +1248,7 @@ fn push_order_transition_damage(
                 .and_then(|surface| surface.bounds),
         );
     }
-    for surface_id in current_ids[prefix..current_ids.len().saturating_sub(suffix)].iter() {
+    for surface_id in changed_current_ids {
         push_clipped_scene_rect(
             accumulator,
             output_width,
@@ -1212,6 +1258,55 @@ fn push_order_transition_damage(
                 .and_then(|surface| surface.bounds),
         );
     }
+
+    // A visual group owns more than its client surfaces: a decorated root
+    // also owns the SSD pixels around the client footprint. Include the old
+    // and current bounds of every surface and decoration in an affected
+    // group, while keeping popup groups independent from their parent SSD.
+    for surface in previous
+        .iter()
+        .filter(|surface| affected_visual_roots.contains(&surface.visual_root_surface_id))
+    {
+        push_clipped_scene_rect(accumulator, output_width, output_height, surface.bounds);
+    }
+    for surface in current
+        .iter()
+        .filter(|surface| affected_visual_roots.contains(&surface.visual_root_surface_id))
+    {
+        push_clipped_scene_rect(accumulator, output_width, output_height, surface.bounds);
+    }
+    for decoration in previous_decorations
+        .iter()
+        .filter(|decoration| affected_visual_roots.contains(&decoration.identity().1))
+    {
+        push_clipped_decoration_rect(accumulator, output_width, output_height, decoration);
+    }
+    for decoration in current_decorations
+        .iter()
+        .filter(|decoration| affected_visual_roots.contains(&decoration.identity().1))
+    {
+        push_clipped_decoration_rect(accumulator, output_width, output_height, decoration);
+    }
+}
+
+fn push_clipped_decoration_rect(
+    accumulator: &mut NativeDamageAccumulator,
+    output_width: u32,
+    output_height: u32,
+    decoration: &DecorationSceneSnapshot,
+) {
+    let (x, y, width, height) = decoration.bounds();
+    push_clipped_scene_rect(
+        accumulator,
+        output_width,
+        output_height,
+        Some(NativeDamageRect {
+            x,
+            y,
+            width,
+            height,
+        }),
+    );
 }
 
 fn push_surface_membership_transition_damage(

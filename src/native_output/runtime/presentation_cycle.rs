@@ -1367,6 +1367,7 @@ impl NativeRuntime {
                             .then(NativeProcessCpuSample::read_current)
                             .flatten();
                         let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
+                        let captured_scene_signature = resolved_scene.scene_identity_signature();
                         let exact_cursor_commit = cursor_render_mode
                             .is_software()
                             .then(|| server.client_cursor_render_state())
@@ -1379,7 +1380,7 @@ impl NativeRuntime {
                             });
                         let surface_damage = server
                             .capture_surface_damage_presentation_for_surface_ids_and_commit(
-                                sampled_surface_ids,
+                                sampled_surface_ids.clone(),
                                 exact_cursor_commit,
                             );
                         if let Some((surface_id, _)) = exact_cursor_commit
@@ -1397,6 +1398,16 @@ impl NativeRuntime {
                         // re-resolved scene below is the same scene whose IDs
                         // created this frame's presentation lineage.
                         let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
+                        assert_eq!(
+                            resolved_scene.surface_ids().collect::<Vec<_>>(),
+                            sampled_surface_ids,
+                            "compatibility frame scene changed between lineage capture and paint"
+                        );
+                        assert_eq!(
+                            resolved_scene.scene_identity_signature(),
+                            captured_scene_signature,
+                            "compatibility frame scene identity changed between lineage capture and paint"
+                        );
                         let paint_outcome = match scanout.paint_server_frame(
                             frame_renderer,
                             &resolved_scene,
