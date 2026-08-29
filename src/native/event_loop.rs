@@ -389,8 +389,8 @@ impl NativeEventLoop {
         }
     }
 
-    #[cfg(test)]
-    fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
+    #[doc(hidden)]
+    pub fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
         let (slot_index, generation) = token.decode()?;
         let slot = self.registrations.get(slot_index)?;
         (slot.generation == generation).then_some(slot.registration.as_ref()?.source)
