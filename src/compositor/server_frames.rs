@@ -402,6 +402,48 @@ impl OwnCompositorServer {
         self.state.take_frame_batch_for_render(frame_id)
     }
 
+    #[doc(hidden)]
+    pub fn frame_batch_dmabuf_release_count(&self, batch_id: CompositorFrameBatchId) -> usize {
+        self.state.frame_batch_dmabuf_release_count(batch_id)
+    }
+
+    #[doc(hidden)]
+    pub fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        self.state
+            .transfer_frame_batch_dmabuf_releases_to_gpu_lease(batch_id, lease_id)
+    }
+
+    #[doc(hidden)]
+    pub fn transfer_frame_batch_dmabuf_releases_to_pending_gpu_lease(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        self.state
+            .transfer_frame_batch_dmabuf_releases_to_pending_gpu_lease(batch_id, lease_id)
+    }
+
+    #[doc(hidden)]
+    pub fn requeue_dmabuf_gpu_release_lease(&mut self, lease_id: DmabufGpuReleaseLeaseId) -> usize {
+        self.state.requeue_dmabuf_gpu_release_lease(lease_id)
+    }
+
+    #[doc(hidden)]
+    pub fn complete_dmabuf_gpu_release_lease(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let completed = self.state.complete_dmabuf_gpu_release_lease(lease_id);
+        if completed > 0 {
+            let _ = self.display.flush_clients();
+        }
+        completed
+    }
+
     #[cfg(test)]
     pub(crate) fn test_frame_callback_pacing_is_completed(
         &self,

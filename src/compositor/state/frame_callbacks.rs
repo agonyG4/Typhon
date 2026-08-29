@@ -674,7 +674,7 @@ impl CompositorState {
             .collect();
         let callback_time = self.frame_callback_time_ms();
         self.complete_frame_callbacks_at_time(callbacks, callback_time);
-        let _ = self.complete_frame_batch_releases(batch_id, batch);
+        let _ = self.defer_frame_batch_releases(batch_id, batch);
         // A proven no-visual-change terminal advances only the logical
         // surface-damage baseline. It does not advance any physical output
         // presentation authority.

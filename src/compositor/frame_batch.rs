@@ -3,8 +3,8 @@ use std::num::NonZeroU64;
 use wayland_server::protocol::wl_callback;
 
 use super::{
-    CommitTimingTargetClaim, FifoBarrierClaim, PendingPresentationFeedback, SurfaceBufferRelease,
-    SurfaceDamagePresentation,
+    CommitTimingTargetClaim, DmabufReleaseObligation, FifoBarrierClaim,
+    PendingPresentationFeedback, SurfaceDamagePresentation,
 };
 
 #[doc(hidden)]
@@ -24,6 +24,26 @@ impl CompositorFrameBatchId {
     pub(super) const fn for_shutdown() -> Self {
         Self(NonZeroU64::MIN)
     }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DmabufGpuReleaseLeaseId(NonZeroU64);
+
+impl DmabufGpuReleaseLeaseId {
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DmabufGpuReleaseLease {
+    pub(super) source_batch_id: Option<CompositorFrameBatchId>,
+    pub(super) obligations: Vec<DmabufReleaseObligation>,
 }
 
 #[doc(hidden)]
@@ -94,7 +114,7 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) callback_settlement: FrameCallbackSettlement,
     pub(super) callback_terminal_ownership_checked: bool,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    pub(super) dmabuf_releases_to_complete_on_present: Vec<SurfaceBufferRelease>,
+    pub(super) dmabuf_releases_to_complete_on_present: Vec<DmabufReleaseObligation>,
     pub(super) fifo_barrier_claims: Vec<FifoBarrierClaim>,
     pub(super) commit_timing_target_claims: Vec<CommitTimingTargetClaim>,
     pub(super) surface_damage: Option<SurfaceDamagePresentation>,

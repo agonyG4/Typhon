@@ -522,6 +522,7 @@ mod frame_consumption_tests {
         assert!(state.legacy_prepared_frame_batch.is_none());
         assert!(state.pending_dmabuf_buffer_releases.is_empty());
         assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
     }
 
     #[test]
@@ -755,14 +756,17 @@ mod frame_consumption_tests {
         assert!(state.frame_batches.contains_key(&batch));
     }
 
-    fn test_dmabuf_release(point: u64) -> SurfaceBufferRelease {
-        SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint::for_tests(99, point))
+    fn test_dmabuf_release(point: u64) -> DmabufReleaseObligation {
+        DmabufReleaseObligation {
+            buffer_id: BufferId::for_tests(point.saturating_add(1)),
+            release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint::for_tests(99, point)),
+        }
     }
 
-    fn test_dmabuf_points(releases: &[SurfaceBufferRelease]) -> Vec<u64> {
+    fn test_dmabuf_points(releases: &[DmabufReleaseObligation]) -> Vec<u64> {
         releases
             .iter()
-            .map(|release| match release {
+            .map(|obligation| match &obligation.release {
                 SurfaceBufferRelease::ExplicitSync(point) => point.point,
                 SurfaceBufferRelease::WlBuffer(_) => panic!("test release is not explicit sync"),
             })
@@ -920,13 +924,14 @@ mod frame_consumption_tests {
     fn reused_buffer_with_distinct_explicit_sync_points_is_not_a_duplicate() {
         let mut state = CompositorState::default();
         let first = test_dmabuf_release(300);
-        let second = match &first {
-            SurfaceBufferRelease::ExplicitSync(point) => {
-                SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint {
+        let second = match &first.release {
+            SurfaceBufferRelease::ExplicitSync(point) => DmabufReleaseObligation {
+                buffer_id: first.buffer_id,
+                release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint {
                     timeline: point.timeline.clone(),
                     point: 301,
-                })
-            }
+                }),
+            },
             SurfaceBufferRelease::WlBuffer(_) => unreachable!(),
         };
         state.queue_dmabuf_buffer_release(first);
@@ -955,6 +960,47 @@ mod frame_consumption_tests {
                 .buffer_release_duplicate_attempts,
             1
         );
+    }
+
+    #[test]
+    fn gpu_release_lease_completes_exact_obligation_without_frame_presentation() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(450);
+        state.queue_dmabuf_buffer_release(obligation);
+        let batch = state.take_frame_batch_for_render(45);
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(1).unwrap());
+
+        assert_eq!(
+            state.transfer_frame_batch_dmabuf_releases_to_gpu_lease(batch, lease),
+            1
+        );
+        assert!(
+            state.frame_batches[&batch]
+                .dmabuf_releases_to_complete_on_present
+                .is_empty()
+        );
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 1);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert!(state.dmabuf_gpu_release_leases.is_empty());
+    }
+
+    #[test]
+    fn gpu_release_lease_requeues_when_exact_token_is_current_again() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(451);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+        let batch = state.take_frame_batch_for_render(46);
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(2).unwrap());
+        assert_eq!(
+            state.transfer_frame_batch_dmabuf_releases_to_gpu_lease(batch, lease),
+            1
+        );
+        state.active_dmabuf_buffers.insert(99, obligation.clone());
+
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 0);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
+        assert!(state.deferred_dmabuf_buffer_releases[0].same_release_token(&obligation));
     }
 
     #[test]

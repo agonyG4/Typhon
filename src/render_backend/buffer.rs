@@ -11,6 +11,11 @@ impl BufferId {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("test buffer ID must be nonzero"))
+    }
 }
 
 #[derive(Debug, Clone)]

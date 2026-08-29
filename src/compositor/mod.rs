@@ -144,13 +144,14 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
-pub(crate) use frame_batch::CompositorFrameBatch;
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{
-    BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackAdmission, FrameCallbackMetrics,
+    BufferReleaseMetrics, CompositorFrameBatchId, DmabufGpuReleaseLeaseId, FrameCallbackAdmission,
+    FrameCallbackMetrics,
 };
-pub(in crate::compositor) use state_data::CurrentSurfaceBuffer;
+pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
 pub use state_data::ShmBufferLifetimeMetrics;
+pub(in crate::compositor) use state_data::{CurrentSurfaceBuffer, DmabufReleaseObligation};
 #[allow(unused_imports)]
 pub(in crate::compositor) use toplevel_publication::*;
 use workspace_protocol::WorkspaceProtocolState;
@@ -697,8 +698,10 @@ pub struct CompositorState {
     held_pointer_buttons: Vec<PointerPress>,
     implicit_pointer_grab: Option<ImplicitPointerGrab>,
     recent_input_serials: Vec<InputSerial>,
-    active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
-    pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
+    active_dmabuf_buffers: HashMap<u32, DmabufReleaseObligation>,
+    pending_dmabuf_buffer_releases: Vec<DmabufReleaseObligation>,
+    deferred_dmabuf_buffer_releases: Vec<DmabufReleaseObligation>,
+    dmabuf_gpu_release_leases: HashMap<DmabufGpuReleaseLeaseId, DmabufGpuReleaseLease>,
     buffer_release_metrics: BufferReleaseMetrics,
     shm_buffer_lifetime_metrics: ShmBufferLifetimeMetrics,
     frame_callback_metrics: FrameCallbackMetrics,

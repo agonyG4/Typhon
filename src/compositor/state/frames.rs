@@ -280,8 +280,9 @@ impl CompositorState {
             NonZeroU64::new(self.next_frame_batch_id)
                 .expect("compositor frame batch IDs start at one"),
         );
-        let dmabuf_releases_to_complete_on_present =
-            std::mem::take(&mut self.pending_dmabuf_buffer_releases);
+        let mut dmabuf_releases_to_complete_on_present =
+            std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
+        dmabuf_releases_to_complete_on_present.append(&mut self.pending_dmabuf_buffer_releases);
         let callbacks = self.take_visible_pending_frame_callbacks();
         let callback_count = callbacks.len();
         let callback_commit_ns = (callback_count > 0).then_some(
@@ -380,6 +381,137 @@ impl CompositorState {
         self.note_buffer_releases_restored(batch_id, restored_dmabuf);
         self.clear_legacy_batch_reference(batch_id);
         self.rebuild_scene_work_index();
+    }
+
+    pub(in crate::compositor) fn frame_batch_dmabuf_release_count(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> usize {
+        self.frame_batches.get(&batch_id).map_or(0, |batch| {
+            batch.dmabuf_releases_to_complete_on_present.len()
+        })
+    }
+
+    pub(in crate::compositor) fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let batch = self
+            .frame_batches
+            .get_mut(&batch_id)
+            .expect("missing compositor frame batch for DMA-BUF GPU release transfer");
+        let obligations = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
+        let count = obligations.len();
+        if count > 0 {
+            let previous = self.dmabuf_gpu_release_leases.insert(
+                lease_id,
+                DmabufGpuReleaseLease {
+                    source_batch_id: Some(batch_id),
+                    obligations,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "DMA-BUF GPU release lease ID was reused"
+            );
+        }
+        count
+    }
+
+    pub(in crate::compositor) fn transfer_frame_batch_dmabuf_releases_to_pending_gpu_lease(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let batch = self
+            .frame_batches
+            .get_mut(&batch_id)
+            .expect("missing compositor frame batch for DMA-BUF release-only transfer");
+        let obligations = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
+        let count = obligations.len();
+        if count > 0 {
+            let previous = self.dmabuf_gpu_release_leases.insert(
+                lease_id,
+                DmabufGpuReleaseLease {
+                    source_batch_id: None,
+                    obligations,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "DMA-BUF GPU release lease ID was reused"
+            );
+        }
+        count
+    }
+
+    pub(in crate::compositor) fn requeue_dmabuf_gpu_release_lease(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let Some(lease) = self.dmabuf_gpu_release_leases.remove(&lease_id) else {
+            return 0;
+        };
+        let count = lease.obligations.len();
+        if let Some(batch_id) = lease.source_batch_id
+            && let Some(batch) = self.frame_batches.get_mut(&batch_id)
+        {
+            batch
+                .dmabuf_releases_to_complete_on_present
+                .extend(lease.obligations);
+        } else {
+            self.deferred_dmabuf_buffer_releases
+                .extend(lease.obligations);
+        }
+        count
+    }
+
+    pub(in crate::compositor) fn complete_dmabuf_gpu_release_lease(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+    ) -> usize {
+        let Some(lease) = self.dmabuf_gpu_release_leases.remove(&lease_id) else {
+            return 0;
+        };
+        let mut requeued = Vec::new();
+        let mut completed = 0;
+        for obligation in lease.obligations {
+            let active_again = self
+                .active_dmabuf_buffers
+                .values()
+                .any(|active| active.same_release_token(&obligation));
+            if active_again {
+                requeued.push(obligation);
+            } else {
+                self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+                completed += 1;
+            }
+        }
+        if !requeued.is_empty() {
+            self.deferred_dmabuf_buffer_releases.extend(requeued);
+        }
+        completed
+    }
+
+    pub(in crate::compositor) fn defer_frame_batch_releases(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        mut batch: CompositorFrameBatch,
+    ) -> CompositorFrameBatch {
+        let deferred = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
+        let deferred_count = deferred.len();
+        if !deferred.is_empty() {
+            self.deferred_dmabuf_buffer_releases.extend(deferred);
+            client_pacing_log(
+                "buffer_releases_deferred_without_gpu_proof",
+                &[
+                    ("frame_batch_id", batch_id.get().to_string()),
+                    ("count", deferred_count.to_string()),
+                ],
+            );
+        }
+        batch
     }
 
     pub(in crate::compositor) fn discard_frame_batch(
@@ -644,8 +776,8 @@ impl CompositorState {
                 ("count", dmabuf_releases.len().to_string()),
             ],
         );
-        for release in dmabuf_releases {
-            self.complete_dmabuf_release(batch_id, frame_id, release);
+        for obligation in dmabuf_releases {
+            self.complete_dmabuf_release(batch_id, frame_id, obligation);
         }
         batch
     }
@@ -703,9 +835,9 @@ impl CompositorState {
         &mut self,
         batch_id: CompositorFrameBatchId,
         frame_id: u64,
-        release: SurfaceBufferRelease,
+        obligation: DmabufReleaseObligation,
     ) {
-        release.release();
+        obligation.release.release();
         self.buffer_release_metrics.buffer_releases_completed = self
             .buffer_release_metrics
             .buffer_releases_completed
@@ -757,9 +889,20 @@ impl CompositorState {
         self.legacy_prepared_frame_batch = None;
         self.legacy_submitted_frame_batch = None;
 
+        let deferred_dmabuf = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
+        for obligation in deferred_dmabuf {
+            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+        }
         let pending_dmabuf = std::mem::take(&mut self.pending_dmabuf_buffer_releases);
-        for release in pending_dmabuf {
-            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+        for obligation in pending_dmabuf {
+            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+        }
+
+        let gpu_leases = std::mem::take(&mut self.dmabuf_gpu_release_leases);
+        for (_, lease) in gpu_leases {
+            for obligation in lease.obligations {
+                self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+            }
         }
 
         let mut active_dmabuf = std::mem::take(&mut self.active_dmabuf_buffers);
@@ -775,8 +918,8 @@ impl CompositorState {
                 self.release_surface_buffer_direct(pending.release_target());
             }
         }
-        for (_, release) in active_dmabuf {
-            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+        for (_, obligation) in active_dmabuf {
+            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
         }
     }
 
@@ -800,10 +943,11 @@ impl CompositorState {
 
     pub(in crate::compositor) fn buffer_release_is_owned(
         &self,
-        candidate: &SurfaceBufferRelease,
+        candidate: &DmabufReleaseObligation,
     ) -> bool {
-        let same = |release: &SurfaceBufferRelease| release.same_release_token(candidate);
+        let same = |obligation: &DmabufReleaseObligation| obligation.same_release_token(candidate);
         self.pending_dmabuf_buffer_releases.iter().any(same)
+            || self.deferred_dmabuf_buffer_releases.iter().any(same)
             || self.frame_batches.values().any(|batch| {
                 batch
                     .dmabuf_releases_to_complete_on_present
@@ -816,6 +960,10 @@ impl CompositorState {
                     .iter()
                     .any(same)
             })
+            || self
+                .dmabuf_gpu_release_leases
+                .values()
+                .any(|lease| lease.obligations.iter().any(same))
     }
 
     pub(in crate::compositor) fn note_buffer_release_duplicate_attempt(&mut self) {
@@ -832,8 +980,18 @@ impl CompositorState {
 
     pub(in crate::compositor) fn scrub_dead_buffer_releases(&mut self) {
         let mut discarded = 0u64;
-        self.pending_dmabuf_buffer_releases.retain(|release| {
-            let alive = match release {
+        self.pending_dmabuf_buffer_releases.retain(|obligation| {
+            let alive = match &obligation.release {
+                SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                SurfaceBufferRelease::ExplicitSync(_) => true,
+            };
+            if !alive {
+                discarded = discarded.saturating_add(1);
+            }
+            alive
+        });
+        self.deferred_dmabuf_buffer_releases.retain(|obligation| {
+            let alive = match &obligation.release {
                 SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
                 SurfaceBufferRelease::ExplicitSync(_) => true,
             };
@@ -845,8 +1003,8 @@ impl CompositorState {
         for batch in self.frame_batches.values_mut() {
             batch
                 .dmabuf_releases_to_complete_on_present
-                .retain(|release| {
-                    let alive = match release {
+                .retain(|obligation| {
+                    let alive = match &obligation.release {
                         SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
                         SurfaceBufferRelease::ExplicitSync(_) => true,
                     };
@@ -859,8 +1017,8 @@ impl CompositorState {
         for batch in self.retired_frame_batches.values_mut() {
             batch
                 .dmabuf_releases_to_complete_on_present
-                .retain(|release| {
-                    let alive = match release {
+                .retain(|obligation| {
+                    let alive = match &obligation.release {
                         SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
                         SurfaceBufferRelease::ExplicitSync(_) => true,
                     };
@@ -869,6 +1027,18 @@ impl CompositorState {
                     }
                     alive
                 });
+        }
+        for lease in self.dmabuf_gpu_release_leases.values_mut() {
+            lease.obligations.retain(|obligation| {
+                let alive = match &obligation.release {
+                    SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                    SurfaceBufferRelease::ExplicitSync(_) => true,
+                };
+                if !alive {
+                    discarded = discarded.saturating_add(1);
+                }
+                alive
+            });
         }
         self.buffer_release_metrics.buffer_releases_discarded = self
             .buffer_release_metrics

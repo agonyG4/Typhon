@@ -1705,6 +1705,18 @@ pub(super) enum SurfaceBufferRelease {
     ExplicitSync(ExplicitSyncPoint),
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DmabufReleaseObligation {
+    pub(super) buffer_id: BufferId,
+    pub(super) release: SurfaceBufferRelease,
+}
+
+impl DmabufReleaseObligation {
+    pub(super) fn same_release_token(&self, other: &Self) -> bool {
+        self.release.same_release_token(&other.release)
+    }
+}
+
 impl SurfaceBufferRelease {
     /// Compares protocol completion identity, not the underlying client buffer allocation.
     /// An explicit-sync reuse of one `wl_buffer` has a new token when its timeline point changes.
