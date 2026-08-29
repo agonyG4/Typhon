@@ -877,29 +877,33 @@ impl CompositorState {
         &mut self,
         id: PointerConstraintBackendId,
     ) {
-        let Some(constraint) = self.pointer_constraints.get(&id.constraint_id) else {
-            pointer_debug_log(format!(
-                "backend deactivated stale id={id:?} reason=unknown"
-            ));
-            return;
-        };
-        if constraint.generation != id.generation || constraint.backend_id() != id {
-            pointer_debug_log(format!(
-                "backend deactivated stale id={id:?} current={:?}",
-                constraint.backend_id()
-            ));
-            return;
-        }
-        let restore_position = self
+        let pending_restore = self
             .pending_locked_pointer_reveal
             .as_ref()
             .filter(|pending| pending.backend_id == id)
             .and_then(|pending| pending.fallback_position);
+        if let Some(current_id) = self
+            .pointer_constraints
+            .get(&id.constraint_id)
+            .map(PointerConstraint::backend_id)
+        {
+            if current_id != id {
+                pointer_debug_log(format!(
+                    "backend deactivated stale id={id:?} current={current_id:?}"
+                ));
+                return;
+            }
+        } else if pending_restore.is_none() {
+            pointer_debug_log(format!(
+                "backend deactivated stale id={id:?} reason=unknown"
+            ));
+            return;
+        }
         if self.active_backend_constraint == Some(id) {
             self.active_backend_constraint = None;
         }
         self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
-        if let Some(position) = restore_position {
+        if let Some(position) = pending_restore {
             self.deliver_pointer_reposition(position, PointerRepositionCause::LockedPointerRestore);
             self.finalize_pending_locked_pointer_reveal("backend_deactivated");
         }

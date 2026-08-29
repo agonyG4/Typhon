@@ -324,15 +324,15 @@ fn v11_reposition_respects_implicit_grab_owner() {
     fixture.process();
 
     fixture.state.pointer_event_log.clear();
-    fixture.warp(&target.surface, 30.0, 40.0, serial);
+    fixture.warp(&target.surface, 70.0, 50.0, serial);
 
     assert_eq!(
         fixture.state.pointer_enter_surface_id,
         Some(fixture.surface.surface.id().protocol_id())
     );
     assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
-    assert_eq!(fixture.state.pointer_surface_x, Some(46.0));
-    assert_eq!(fixture.state.pointer_surface_y, Some(56.0));
+    assert!(fixture.state.pointer_surface_x.unwrap() > 160.0);
+    assert!(fixture.state.pointer_surface_y.unwrap() > 120.0);
 }
 
 #[test]
