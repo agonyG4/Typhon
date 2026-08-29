@@ -24,6 +24,7 @@ mod cursor_cycle;
 mod cycle;
 mod cycle_dispatch;
 mod direct_plan;
+mod dmabuf_release;
 mod frame;
 mod kms_worker;
 mod kms_worker_startup;
@@ -60,6 +61,8 @@ mod xwayland_reactor;
 #[cfg(test)]
 mod xwayland_reactor_tests;
 
+pub(super) use dmabuf_release::arm_composited_dmabuf_release;
+pub(crate) use dmabuf_release::{DmabufGpuReleaseMetrics, DmabufGpuReleaseRegistry};
 use metrics::NativeRenderTelemetry;
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
@@ -292,6 +295,7 @@ pub(crate) struct NativeRuntime {
     acquire_watches: ExplicitSyncWatchRegistry,
     parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
+    dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
     started_at: Instant,
     vrr_plan: NativeVrrPlan,
@@ -450,10 +454,17 @@ impl NativeRuntime {
     pub(super) fn resource_efficiency_mut(&mut self) -> &mut ResourceEfficiencyMetrics {
         &mut self.render_telemetry.resource_efficiency
     }
+
+    pub(super) fn dmabuf_gpu_release_metrics(&self) -> DmabufGpuReleaseMetrics {
+        self.dmabuf_gpu_release_registry.metrics()
+    }
 }
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        let _ = self
+            .dmabuf_gpu_release_registry
+            .cancel_all(&mut self.event_loop, &mut self.server);
         let _ = self.control_server.shutdown(&mut self.event_loop);
         if let Some(token) = self.cursor_io_worker_reactor_token.take() {
             let _ = self.event_loop.unregister(token);
@@ -627,6 +638,21 @@ impl Drop for NativeRuntime {
             buffer_release_metrics.buffer_releases_restored,
             buffer_release_metrics.buffer_releases_discarded,
             buffer_release_metrics.buffer_release_duplicate_attempts,
+        );
+        let dmabuf_release_metrics = self.dmabuf_gpu_release_metrics();
+        println!(
+            "typhon pacing: event=dmabuf_gpu_release_summary leases_registered={} leases_completed={} leases_requeued={} obligations_armed={} obligations_completed={} fences_created={} fences_signaled={} completion_fd_failures={} registration_failures={} active_leases={} peak_active_leases={}",
+            dmabuf_release_metrics.leases_registered,
+            dmabuf_release_metrics.leases_completed,
+            dmabuf_release_metrics.leases_requeued,
+            dmabuf_release_metrics.obligations_armed,
+            dmabuf_release_metrics.obligations_completed,
+            dmabuf_release_metrics.fences_created,
+            dmabuf_release_metrics.fences_signaled,
+            dmabuf_release_metrics.completion_fd_failures,
+            dmabuf_release_metrics.registration_failures,
+            dmabuf_release_metrics.active_leases,
+            dmabuf_release_metrics.peak_active_leases,
         );
     }
 }

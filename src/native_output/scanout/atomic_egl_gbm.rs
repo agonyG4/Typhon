@@ -613,6 +613,10 @@ impl AtomicEglGbmScanout {
         .map_err(|error| io::Error::other(format!("native render fence export failed: {error}")))
     }
 
+    pub(crate) fn duplicate_ready_render_completion_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.swapchain()?.duplicate_ready_render_completion_fd()
+    }
+
     pub(crate) fn initial_slot(&self) -> OutputSlotId {
         OutputSlotId::new(0).expect("slot zero is valid")
     }
@@ -726,6 +730,7 @@ impl AtomicEglGbmScanout {
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
         frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
         async_policy_inputs: AtomicAsyncPolicyInputs,
+        dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let metadata = server
             .fullscreen_tree_presentation_metadata()
@@ -964,7 +969,15 @@ impl AtomicEglGbmScanout {
                 reason,
                 render_us,
             }) => {
-                settle_no_visual_change_output_transaction(
+                let release_fence = if dmabuf_gpu_release_lease_id.is_some()
+                    && server.frame_batch_dmabuf_release_count(protocol_batch_id) > 0
+                    && !self.has_live_direct_kms_ownership()
+                {
+                    self.create_render_fence().ok()
+                } else {
+                    None
+                };
+                let settle_result = settle_no_visual_change_output_transaction(
                     output_transactions,
                     transaction_id,
                     MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -974,12 +987,29 @@ impl AtomicEglGbmScanout {
                         })?;
                         self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
                         server.set_frame_batch_surface_damage(batch_id, surface_damage);
+                        if let (Some(lease_id), Some(_)) =
+                            (dmabuf_gpu_release_lease_id, release_fence.as_ref())
+                        {
+                            server.transfer_frame_batch_dmabuf_releases_to_pending_gpu_lease(
+                                batch_id, lease_id,
+                            );
+                        }
                         server.complete_no_visual_change_frame_batch(batch_id);
                         Ok(())
                     },
                 )
-                .map_err(|error| io::Error::other(error.to_string()))?;
-                return Ok(AtomicFrameRenderOutcome::Skipped { reason, render_us });
+                .map_err(|error| io::Error::other(error.to_string()));
+                if let Err(error) = settle_result {
+                    if let Some(lease_id) = dmabuf_gpu_release_lease_id {
+                        server.requeue_dmabuf_gpu_release_lease(lease_id);
+                    }
+                    return Err(error);
+                }
+                return Ok(AtomicFrameRenderOutcome::Skipped {
+                    reason,
+                    render_us,
+                    dmabuf_gpu_release: dmabuf_gpu_release_lease_id.zip(release_fence),
+                });
             }
             Err(error) => {
                 let failure_stage = if gpu_sampling_started {
@@ -1253,6 +1283,13 @@ impl AtomicEglGbmScanout {
         &self.direct.ownership
     }
 
+    pub(crate) fn has_live_direct_kms_ownership(&self) -> bool {
+        let ownership = &self.direct.ownership;
+        ownership.submitted.is_some()
+            || ownership.presented.is_some()
+            || !ownership.suspended.is_empty()
+    }
+
     pub(crate) fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
         self.dmabuf_feedback.clone()
     }
@@ -1331,6 +1368,10 @@ pub(crate) enum AtomicFrameRenderOutcome {
     Skipped {
         reason: FrameSkipReason,
         render_us: u64,
+        dmabuf_gpu_release: Option<(
+            oblivion_one::compositor::DmabufGpuReleaseLeaseId,
+            NativeRenderFence,
+        )>,
     },
 }
 

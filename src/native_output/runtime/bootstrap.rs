@@ -608,6 +608,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: Vec::new(),
             event_loop,
+            dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             started_at: Instant::now(),
             vrr_plan,

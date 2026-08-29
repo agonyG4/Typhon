@@ -1076,6 +1076,14 @@ impl AtomicOutputSwapchain {
             .map(AsRawFd::as_raw_fd)
     }
 
+    pub(crate) fn duplicate_ready_render_completion_fd(&self) -> io::Result<OwnedFd> {
+        self.ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?
+            .render_fence
+            .duplicate_completion_fd()
+    }
+
     pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
         self.pending
             .as_ref()?

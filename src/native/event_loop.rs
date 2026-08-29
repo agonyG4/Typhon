@@ -19,6 +19,7 @@ pub enum NativeEventSource {
     Timer,
     ExplicitSyncAcquire,
     OutputRenderFence,
+    DmabufGpuRelease,
     ChildSignal,
     XwaylandListen,
     XwaylandDisplayReady,
@@ -83,6 +84,7 @@ impl WakeReasons {
     const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
     const CHILD_SIGNAL: u32 = 1 << 6;
     const OUTPUT_RENDER_FENCE: u32 = 1 << 8;
+    const DMABUF_GPU_RELEASE: u32 = 1 << 16;
     const XWAYLAND_LISTEN: u32 = 1 << 9;
     const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
     const XWAYLAND_XWM: u32 = 1 << 11;
@@ -133,6 +135,10 @@ impl WakeReasons {
         self.0 & Self::OUTPUT_RENDER_FENCE != 0
     }
 
+    pub const fn dmabuf_gpu_release(self) -> bool {
+        self.0 & Self::DMABUF_GPU_RELEASE != 0
+    }
+
     pub const fn xwayland_listen(self) -> bool {
         self.0 & Self::XWAYLAND_LISTEN != 0
     }
@@ -169,6 +175,7 @@ impl WakeReasons {
             NativeEventSource::Timer => Self::TIMER,
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
             NativeEventSource::OutputRenderFence => Self::OUTPUT_RENDER_FENCE,
+            NativeEventSource::DmabufGpuRelease => Self::DMABUF_GPU_RELEASE,
             NativeEventSource::ChildSignal => Self::CHILD_SIGNAL,
             NativeEventSource::XwaylandListen => Self::XWAYLAND_LISTEN,
             NativeEventSource::XwaylandDisplayReady => Self::XWAYLAND_DISPLAY_READY,
@@ -204,6 +211,7 @@ pub struct NativeWakeup {
     pub blocked_ns: u64,
     pub timer_lateness_ns: Option<u64>,
     pub explicit_sync_acquire_tokens: Vec<ReactorToken>,
+    pub dmabuf_gpu_release_tokens: Vec<ReactorToken>,
     pub xwayland_events: Vec<XwaylandReadyEvent>,
     pub control_events: Vec<ControlReadyEvent>,
     pub cursor_io_events: Vec<CursorIoReadyEvent>,
@@ -435,6 +443,7 @@ impl NativeEventLoop {
         let observed_ns = monotonic_now_ns()?;
         let mut reasons = WakeReasons::default();
         let mut explicit_sync_acquire_tokens = Vec::new();
+        let mut dmabuf_gpu_release_tokens = Vec::new();
         let mut xwayland_events = Vec::new();
         let mut control_events = Vec::new();
         let mut cursor_io_events = Vec::new();
@@ -463,6 +472,7 @@ impl NativeEventLoop {
                 if is_xwayland_source(registration_source)
                     || is_control_source(registration_source)
                     || registration_source == NativeEventSource::CursorIoWorker
+                    || registration_source == NativeEventSource::DmabufGpuRelease
                 {
                     reasons.insert(registration_source);
                     if is_xwayland_source(registration_source) {
@@ -475,6 +485,8 @@ impl NativeEventLoop {
                             token,
                             flags: event_flags,
                         });
+                    } else if registration_source == NativeEventSource::DmabufGpuRelease {
+                        dmabuf_gpu_release_tokens.push(token);
                     } else {
                         control_events.push(ControlReadyEvent {
                             token,
@@ -494,6 +506,9 @@ impl NativeEventLoop {
                 match registration_source {
                     NativeEventSource::ExplicitSyncAcquire => {
                         explicit_sync_acquire_tokens.push(token);
+                    }
+                    NativeEventSource::DmabufGpuRelease => {
+                        dmabuf_gpu_release_tokens.push(token);
                     }
                     NativeEventSource::XwaylandListen
                     | NativeEventSource::XwaylandDisplayReady
@@ -537,6 +552,7 @@ impl NativeEventLoop {
             blocked_ns: observed_ns.saturating_sub(wait_started_ns),
             timer_lateness_ns,
             explicit_sync_acquire_tokens,
+            dmabuf_gpu_release_tokens,
             xwayland_events,
             control_events,
             cursor_io_events,

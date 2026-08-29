@@ -93,6 +93,7 @@ impl NativeRuntime {
                 blocked_ns: 0,
                 timer_lateness_ns: None,
                 explicit_sync_acquire_tokens: Vec::new(),
+                dmabuf_gpu_release_tokens: Vec::new(),
                 xwayland_events: Vec::new(),
                 control_events: Vec::new(),
                 cursor_io_events: Vec::new(),

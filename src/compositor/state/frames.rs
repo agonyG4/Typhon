@@ -392,6 +392,10 @@ impl CompositorState {
         })
     }
 
+    pub(in crate::compositor) fn pending_dmabuf_release_count(&self) -> usize {
+        self.pending_dmabuf_buffer_releases.len() + self.deferred_dmabuf_buffer_releases.len()
+    }
+
     pub(in crate::compositor) fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
         &mut self,
         batch_id: CompositorFrameBatchId,
@@ -837,6 +841,7 @@ impl CompositorState {
         frame_id: u64,
         obligation: DmabufReleaseObligation,
     ) {
+        let buffer_id = obligation.buffer_id;
         obligation.release.release();
         self.buffer_release_metrics.buffer_releases_completed = self
             .buffer_release_metrics
@@ -847,6 +852,7 @@ impl CompositorState {
             &[
                 ("frame_batch_id", batch_id.get().to_string()),
                 ("frame_id", frame_id.to_string()),
+                ("buffer_id", buffer_id.get().to_string()),
                 ("kind", "dmabuf".to_string()),
             ],
         );

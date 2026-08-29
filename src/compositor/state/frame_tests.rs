@@ -985,6 +985,43 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn one_gpu_release_lease_completes_multiple_retired_obligations() {
+        let mut state = CompositorState::default();
+        for point in 450..454 {
+            state.queue_dmabuf_buffer_release(test_dmabuf_release(point));
+        }
+        let batch = state.take_frame_batch_for_render(454);
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(3).unwrap());
+
+        assert_eq!(
+            state.transfer_frame_batch_dmabuf_releases_to_gpu_lease(batch, lease),
+            4
+        );
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 4);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 4);
+    }
+
+    #[test]
+    fn no_visual_change_defers_release_until_a_gpu_proof_is_available() {
+        let mut state = CompositorState::default();
+        state.queue_dmabuf_buffer_release(test_dmabuf_release(454));
+        let no_visual_batch = state.take_frame_batch_for_render(455);
+        state.complete_no_visual_change_frame_batch(no_visual_batch);
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
+
+        let retry_batch = state.take_frame_batch_for_render(456);
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(4).unwrap());
+        assert_eq!(
+            state.transfer_frame_batch_dmabuf_releases_to_gpu_lease(retry_batch, lease),
+            1
+        );
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 1);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
     fn gpu_release_lease_requeues_when_exact_token_is_current_again() {
         let mut state = CompositorState::default();
         let obligation = test_dmabuf_release(451);

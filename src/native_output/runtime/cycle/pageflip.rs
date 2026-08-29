@@ -144,6 +144,7 @@ fn select_cursor_promotion(
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
+        self.service_dmabuf_gpu_releases(&wakeup.dmabuf_gpu_release_tokens)?;
         self.check_kms_commit_worker_health()?;
         if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
             // Submit acknowledgments establish physical pending ownership

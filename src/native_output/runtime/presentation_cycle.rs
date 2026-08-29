@@ -105,6 +105,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: _,
             event_loop,
+            dmabuf_gpu_release_registry,
             drm_reactor_token: _,
             output_render_fence_token,
             kms_commit_worker,
@@ -1132,6 +1133,10 @@ impl NativeRuntime {
                         ));
                         presentation_deadline.clear_scheduled_target();
                         let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
+                        let dmabuf_gpu_release_lease_id = (server.pending_dmabuf_release_count()
+                            > 0)
+                        .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
+                        .transpose()?;
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -1157,9 +1162,34 @@ impl NativeRuntime {
                                 runtime_plane_plan.as_ref(),
                             ),
                             frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
+                            dmabuf_gpu_release_lease_id,
                         )?;
                         match render_outcome {
-                            AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
+                            AtomicFrameRenderOutcome::Skipped {
+                                reason,
+                                render_us,
+                                dmabuf_gpu_release,
+                            } => {
+                                if let Some((lease_id, release_fence)) = dmabuf_gpu_release {
+                                    let completion_fd = release_fence.duplicate_completion_fd();
+                                    match completion_fd {
+                                        Ok(completion_fd) => {
+                                            if dmabuf_gpu_release_registry
+                                                .register(lease_id, completion_fd, event_loop)
+                                                .is_err()
+                                            {
+                                                dmabuf_gpu_release_registry
+                                                    .note_registration_failure();
+                                                server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            dmabuf_gpu_release_registry
+                                                .note_completion_fd_failure();
+                                            server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                        }
+                                    }
+                                }
                                 render_telemetry.record_skipped(render_us);
                                 frame_scheduler.note_immediate_completion();
                                 frame_completed = true;
@@ -1188,6 +1218,14 @@ impl NativeRuntime {
                             }
                             #[rustfmt::skip]
                             AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot } => {
+                                let _ = arm_composited_dmabuf_release(
+                                    dmabuf_gpu_release_registry,
+                                    server,
+                                    explicit,
+                                    event_loop,
+                                    protocol_batch_id,
+                                    dmabuf_gpu_release_lease_id,
+                                )?;
                                 if o1_admission.is_some_and(|admission| admission.used_extra_credit) {
                                     frame_pacing.note_o1_credit2_extra_credit_consumed();
                                 }

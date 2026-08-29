@@ -408,6 +408,11 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn pending_dmabuf_release_count(&self) -> usize {
+        self.state.pending_dmabuf_release_count()
+    }
+
+    #[doc(hidden)]
     pub fn transfer_frame_batch_dmabuf_releases_to_gpu_lease(
         &mut self,
         batch_id: CompositorFrameBatchId,
