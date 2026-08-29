@@ -11,6 +11,7 @@ struct PointerWarpFixture {
     connection: Connection,
     queue: EventQueue<RegistryTestState>,
     state: RegistryTestState,
+    globals: wayland_client::globals::GlobalList,
     commands: Sender<ServerCommand>,
     server_thread: Option<std::thread::JoinHandle<OwnCompositorServer>>,
     _compositor: client_wl_compositor::WlCompositor,
@@ -72,6 +73,7 @@ impl PointerWarpFixture {
             connection,
             queue,
             state,
+            globals,
             commands,
             server_thread: Some(server_thread),
             _compositor: compositor,
@@ -286,6 +288,42 @@ fn v11_same_surface_client_warp_uses_warp_event_without_motion() {
     assert_eq!(fixture.state.pointer_surface_y, Some(60.0));
     assert_eq!(fixture.state.relative_motion_count, 0);
     assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
+}
+
+#[test]
+fn mixed_pointer_resource_versions_receive_their_own_reposition_event() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let qh = fixture.queue.handle();
+    let legacy_seat: client_wl_seat::WlSeat = fixture.globals.bind(&qh, 1..=7, ()).unwrap();
+    let legacy_pointer = legacy_seat.get_pointer(&qh, ());
+    fixture.connection.flush().unwrap();
+
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    fixture.focus_at(anchor.0, anchor.1);
+    let modern_id = fixture.pointer.id().protocol_id();
+    let legacy_id = legacy_pointer.id().protocol_id();
+    let modern_serial = fixture
+        .state
+        .pointer_enter_serials
+        .iter()
+        .find_map(|(pointer_id, serial)| (*pointer_id == modern_id).then_some(*serial))
+        .expect("expected v11 pointer enter serial");
+
+    fixture.state.pointer_motion = false;
+    fixture.state.pointer_event_log.clear();
+    fixture.state.pointer_warp_resource_ids.clear();
+    fixture.state.pointer_motion_resource_ids.clear();
+    fixture.warp(&fixture.surface.surface.clone(), 80.0, 60.0, modern_serial);
+
+    assert_eq!(fixture.state.pointer_warp_resource_ids, vec![modern_id]);
+    assert_eq!(fixture.state.pointer_motion_resource_ids, vec![legacy_id]);
+    assert_eq!(
+        fixture.state.pointer_event_log,
+        vec!["warp", "frame", "motion", "frame"]
+    );
 }
 
 #[test]

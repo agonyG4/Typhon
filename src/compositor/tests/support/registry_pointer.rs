@@ -35,6 +35,9 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 ..
             } => {
                 state.pointer_motion = true;
+                state
+                    .pointer_motion_resource_ids
+                    .push(proxy.id().protocol_id());
                 state.pointer_surface_x = Some(surface_x);
                 state.pointer_surface_y = Some(surface_y);
                 state.pointer_event_log.push("motion");
@@ -43,6 +46,9 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 surface_x,
                 surface_y,
             } => {
+                state
+                    .pointer_warp_resource_ids
+                    .push(proxy.id().protocol_id());
                 state.pointer_surface_x = Some(surface_x);
                 state.pointer_surface_y = Some(surface_y);
                 state.pointer_event_log.push("warp");

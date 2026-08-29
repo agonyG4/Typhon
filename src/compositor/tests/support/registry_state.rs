@@ -72,6 +72,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) pointer_enter_frame_count: usize,
     pub(in crate::compositor::tests) pointer_enter_without_frame_count: usize,
     pub(in crate::compositor::tests) pointer_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) pointer_warp_resource_ids: Vec<u32>,
+    pub(in crate::compositor::tests) pointer_motion_resource_ids: Vec<u32>,
     pub(in crate::compositor::tests) pointer_surface_x: Option<f64>,
     pub(in crate::compositor::tests) pointer_surface_y: Option<f64>,
     pub(in crate::compositor::tests) relative_motion_count: usize,
