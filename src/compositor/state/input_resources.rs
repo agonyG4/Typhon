@@ -139,10 +139,6 @@ impl CompositorState {
             pointer_debug_log("cursor request ignored reason=invalid-focus-or-enter-serial");
             return;
         }
-        let resolves_pending_unlock = self
-            .pending_locked_pointer_reveal
-            .as_ref()
-            .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
         let Some(surface) = surface else {
             let choice = ClientCursorChoice::Hidden {
                 pointer: pointer.clone(),
@@ -158,9 +154,6 @@ impl CompositorState {
                 self.advance_render_generation(RenderGenerationCause::CursorState);
             }
             self.sync_cursor_visibility_request();
-            if resolves_pending_unlock {
-                self.finalize_pending_locked_pointer_reveal("client_hidden_cursor");
-            }
             return;
         };
         let surface_id = compositor_surface_id(&surface);
@@ -203,9 +196,6 @@ impl CompositorState {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
         self.sync_cursor_visibility_request();
-        if resolves_pending_unlock {
-            self.finalize_pending_locked_pointer_reveal("client_cursor_surface");
-        }
     }
 
     pub(in crate::compositor) fn set_pointer_shape(
@@ -223,10 +213,6 @@ impl CompositorState {
             pointer_debug_log("shape request ignored reason=invalid-focus-or-enter-serial");
             return;
         }
-        let resolves_pending_unlock = self
-            .pending_locked_pointer_reveal
-            .as_ref()
-            .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
         let choice = ClientCursorChoice::Shape {
             pointer: pointer.clone(),
             shape,
@@ -250,9 +236,6 @@ impl CompositorState {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
         self.sync_cursor_visibility_request();
-        if resolves_pending_unlock {
-            self.finalize_pending_locked_pointer_reveal("client_shape_cursor");
-        }
     }
 
     pub(in crate::compositor) fn is_cursor_surface(&self, surface_id: u32) -> bool {

@@ -859,7 +859,9 @@ struct PendingLockedPointerReveal {
     pointer: wl_pointer::WlPointer,
     surface: wl_surface::WlSurface,
     fallback_position: Option<OutputPosition>,
-    created_dispatch_epoch: u64,
+    backend_restore_settled: bool,
+    backend_settled_dispatch_epoch: Option<u64>,
+    client_warp_position: Option<OutputPosition>,
 }
 #[derive(Debug, Clone)]
 struct ImplicitPointerGrab {

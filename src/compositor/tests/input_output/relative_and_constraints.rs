@@ -1328,6 +1328,7 @@ fn pending_oneshot_locked_destroy_removes_queued_activation() {
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    state.pointer_event_log.clear();
 
     let lock = constraints.lock_pointer(
         &surface,
@@ -1355,6 +1356,109 @@ fn pending_oneshot_locked_destroy_removes_queued_activation() {
         )),
         "destroyed pending oneshot lock must not leave queued activation: {requests:?}"
     );
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::WarpPointer {
+            position: OutputPosition { x, y }
+        } if (*x, *y) == (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + 70.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1) + 50.0,
+        )
+    )));
+    assert_eq!(state.pointer_event_log, vec!["motion", "frame"]);
+    assert_eq!(state.locked_count, 0);
+    assert_eq!(state.unlocked_count, 0);
+}
+
+#[test]
+fn pending_oneshot_locked_destroy_uses_v11_warp_delivery() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=11, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    state.pointer_event_log.clear();
+    state.pointer_motion = false;
+
+    let lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Oneshot,
+        &qh,
+        (),
+    );
+    lock.set_cursor_position_hint(70.0, 50.0);
+    surface.commit();
+    lock.destroy();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let final_position = {
+        let (reply, receiver) = mpsc::channel();
+        commands
+            .send(ServerCommand::CaptureLastPointerPosition(reply))
+            .unwrap();
+        receiver.recv().unwrap()
+    };
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert!(requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ActivateLocked { .. }
+    )));
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::WarpPointer {
+            position: OutputPosition { x, y }
+        } if (*x, *y) == (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + 70.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1) + 50.0,
+        )
+    )));
+    assert_eq!(
+        final_position,
+        (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + 70.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1) + 50.0,
+        )
+    );
+    assert_eq!(state.pointer_event_log, vec!["warp", "frame"]);
+    assert!(!state.pointer_motion);
     assert_eq!(state.locked_count, 0);
     assert_eq!(state.unlocked_count, 0);
 }

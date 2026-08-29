@@ -1036,12 +1036,11 @@ impl CompositorState {
             self.pending_locked_pointer_reveal_matches(&pointer, &surface)
         ));
         let matches_pending_unlock = self.pending_locked_pointer_reveal_matches(&pointer, &surface);
-        self.apply_pointer_warp(position, PointerRepositionCause::ClientWarp);
-        if matches_pending_unlock {
-            if let Some(pending) = self.pending_locked_pointer_reveal.as_mut() {
-                pending.fallback_position = Some(position);
-            }
-            self.finalize_pending_locked_pointer_reveal("matching_client_warp");
+        let applied_position =
+            self.apply_pointer_warp(position, PointerRepositionCause::ClientWarp);
+        if matches_pending_unlock && let Some(applied_position) = applied_position {
+            self.record_pending_locked_pointer_client_warp(applied_position);
+            self.try_settle_pending_locked_pointer_reveal("matching_client_warp");
         }
     }
 

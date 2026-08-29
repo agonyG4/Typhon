@@ -3,7 +3,8 @@ use super::*;
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) enum PointerRepositionCause {
     ClientWarp,
-    LockedPointerRestore,
+    ActiveLockedPointerRestore,
+    PendingOneshotHintWarp,
 }
 
 const WL_POINTER_WARP_SINCE: u32 = 11;
@@ -12,7 +13,8 @@ impl PointerRepositionCause {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ClientWarp => "client_warp",
-            Self::LockedPointerRestore => "locked_pointer_restore",
+            Self::ActiveLockedPointerRestore => "active_locked_pointer_restore",
+            Self::PendingOneshotHintWarp => "pending_oneshot_hint_warp",
         }
     }
 }
@@ -117,7 +119,9 @@ impl CompositorState {
             pointer,
             surface,
             fallback_position,
-            created_dispatch_epoch: self.dispatch_epoch,
+            backend_restore_settled: false,
+            backend_settled_dispatch_epoch: None,
+            client_warp_position: None,
         });
     }
 
@@ -166,8 +170,69 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|pending| {
                 same_wayland_resource(&pending.pointer, pointer)
-                    && same_surface_resource(&pending.surface, surface)
+                    && pending.surface.id().same_client_as(&surface.id())
             })
+    }
+
+    pub(in crate::compositor) fn mark_pending_locked_pointer_backend_settled(
+        &mut self,
+        id: PointerConstraintBackendId,
+    ) {
+        let Some(pending) = self
+            .pending_locked_pointer_reveal
+            .as_mut()
+            .filter(|pending| pending.backend_id == id)
+        else {
+            return;
+        };
+        pending.backend_restore_settled = true;
+        pending.backend_settled_dispatch_epoch = Some(self.dispatch_epoch);
+        pointer_debug_log(format!(
+            "pointer.unlock backend_restore_settled id={} generation={} epoch={}",
+            id.constraint_id, id.generation, self.dispatch_epoch
+        ));
+        self.try_settle_pending_locked_pointer_reveal("backend_restore_settled");
+    }
+
+    pub(in crate::compositor) fn record_pending_locked_pointer_client_warp(
+        &mut self,
+        position: OutputPosition,
+    ) {
+        let Some(pending) = self.pending_locked_pointer_reveal.as_mut() else {
+            return;
+        };
+        pending.client_warp_position = Some(position);
+        pointer_debug_log(format!(
+            "pointer.unlock client_warp_position=({}, {}) id={} generation={}",
+            position.x, position.y, pending.backend_id.constraint_id, pending.backend_id.generation
+        ));
+    }
+
+    pub(in crate::compositor) fn try_settle_pending_locked_pointer_reveal(&mut self, reason: &str) {
+        let should_finalize = self
+            .pending_locked_pointer_reveal
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.backend_restore_settled && pending.client_warp_position.is_some()
+            });
+        if should_finalize {
+            self.finalize_pending_locked_pointer_reveal(reason);
+        }
+    }
+
+    fn settle_pending_locked_pointer_reveal_fallback(&mut self) {
+        let Some(pending) = self.pending_locked_pointer_reveal.as_ref() else {
+            return;
+        };
+        let Some(position) = pending.fallback_position else {
+            self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback");
+            return;
+        };
+        self.deliver_pointer_reposition(
+            position,
+            PointerRepositionCause::ActiveLockedPointerRestore,
+        );
+        self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback");
     }
 
     pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal(&mut self, reason: &str) {
@@ -182,15 +247,20 @@ impl CompositorState {
                 self.advance_render_generation(RenderGenerationCause::CursorState);
             }
         }
+        let final_position = pending
+            .client_warp_position
+            .or(pending.fallback_position)
+            .unwrap_or(OutputPosition {
+                x: self.last_pointer_x,
+                y: self.last_pointer_y,
+            });
         pointer_debug_log(format!(
-            "pointer.unlock transition_finalize reason={} id={} generation={} final=({}) visibility_request={} epoch={}",
+            "pointer.unlock transition_finalize reason={} id={} generation={} final=({},{}) visibility_request={} epoch={}",
             reason,
             pending.backend_id.constraint_id,
             pending.backend_id.generation,
-            pending
-                .fallback_position
-                .map(|position| format!("{},{}", position.x, position.y))
-                .unwrap_or_else(|| format!("{},{}", self.last_pointer_x, self.last_pointer_y)),
+            final_position.x,
+            final_position.y,
             self.cursor_visibility.desired_visible(),
             self.dispatch_epoch
         ));
@@ -198,14 +268,19 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal_after_dispatch(&mut self) {
-        let should_finalize = self
+        let should_fallback = self
             .pending_locked_pointer_reveal
             .as_ref()
             .is_some_and(|pending| {
-                pending.created_dispatch_epoch.saturating_add(2) < self.dispatch_epoch
+                pending
+                    .backend_settled_dispatch_epoch
+                    .is_some_and(|settled_epoch| {
+                        pending.client_warp_position.is_none()
+                            && settled_epoch.saturating_add(2) < self.dispatch_epoch
+                    })
             });
-        if should_finalize {
-            self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback");
+        if should_fallback {
+            self.settle_pending_locked_pointer_reveal_fallback();
         }
     }
 
@@ -877,11 +952,23 @@ impl CompositorState {
         &mut self,
         id: PointerConstraintBackendId,
     ) {
-        let pending_restore = self
+        if self
+            .active_backend_constraint
+            .is_some_and(|current_id| current_id != id)
+            || self
+                .pending_backend_constraint
+                .is_some_and(|current_id| current_id != id)
+        {
+            pointer_debug_log(format!(
+                "backend deactivated stale id={id:?} current_active={:?} current_pending={:?}",
+                self.active_backend_constraint, self.pending_backend_constraint
+            ));
+            return;
+        }
+        let pending_matches = self
             .pending_locked_pointer_reveal
             .as_ref()
-            .filter(|pending| pending.backend_id == id)
-            .and_then(|pending| pending.fallback_position);
+            .is_some_and(|pending| pending.backend_id == id);
         if let Some(current_id) = self
             .pointer_constraints
             .get(&id.constraint_id)
@@ -893,7 +980,7 @@ impl CompositorState {
                 ));
                 return;
             }
-        } else if pending_restore.is_none() {
+        } else if !pending_matches {
             pointer_debug_log(format!(
                 "backend deactivated stale id={id:?} reason=unknown"
             ));
@@ -903,10 +990,7 @@ impl CompositorState {
             self.active_backend_constraint = None;
         }
         self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
-        if let Some(position) = pending_restore {
-            self.deliver_pointer_reposition(position, PointerRepositionCause::LockedPointerRestore);
-            self.finalize_pending_locked_pointer_reveal("backend_deactivated");
-        }
+        self.mark_pending_locked_pointer_backend_settled(id);
     }
 
     pub(in crate::compositor) fn cancel_pending_pointer_constraint_backend_requests(
@@ -1092,7 +1176,7 @@ impl CompositorState {
                     "oneshot compatibility warp selected id={} generation={} output=({},{})",
                     backend_id.constraint_id, backend_id.generation, position.x, position.y
                 ));
-                self.apply_pointer_warp(position, PointerRepositionCause::LockedPointerRestore);
+                self.apply_pointer_warp(position, PointerRepositionCause::PendingOneshotHintWarp);
             } else if mode == PointerConstraintMode::Locked
                 && lifetime == PointerConstraintLifetime::Oneshot
             {
@@ -1137,10 +1221,10 @@ impl CompositorState {
         &mut self,
         requested: OutputPosition,
         cause: PointerRepositionCause,
-    ) {
+    ) -> Option<OutputPosition> {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log("pointer warp ignored reason=active_lock");
-            return;
+            return None;
         }
         let constraint = if let Some(active) = self.active_confined_pointer_binding() {
             let final_position = active.region.closest_point(requested);
@@ -1183,6 +1267,7 @@ impl CompositorState {
             },
         );
         self.deliver_pointer_reposition(constraint, cause);
+        Some(constraint)
     }
 
     pub(in crate::compositor) fn deliver_pointer_reposition(
@@ -1258,7 +1343,7 @@ impl CompositorState {
             if !self.pointer_resource_entered_surface(pointer, &target.surface) {
                 continue;
             }
-            if matches!(cause, PointerRepositionCause::LockedPointerRestore)
+            if matches!(cause, PointerRepositionCause::ActiveLockedPointerRestore)
                 && pointer.version() < WL_POINTER_WARP_SINCE
             {
                 continue;

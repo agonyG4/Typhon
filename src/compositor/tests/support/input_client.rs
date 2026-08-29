@@ -341,6 +341,26 @@ pub(in crate::compositor::tests) fn capture_pointer_constraint_backend_requests(
     receiver.recv().unwrap()
 }
 
+pub(in crate::compositor::tests) fn capture_pending_locked_pointer_reveal(
+    commands: &Sender<ServerCommand>,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePendingLockedPointerReveal(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
+pub(in crate::compositor::tests) fn capture_pending_locked_pointer_reveal_and_backend_requests(
+    commands: &Sender<ServerCommand>,
+) -> (bool, Vec<PointerConstraintBackendRequest>) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePendingLockedPointerRevealAndBackendRequests(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
 pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_motion_sample(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

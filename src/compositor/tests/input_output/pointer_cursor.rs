@@ -1613,7 +1613,7 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
-    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=11, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
         globals.bind(&qh, 1..=1, ()).unwrap();
@@ -1668,16 +1668,41 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
             } if (*x, *y) == (origin_x + 120.0, origin_y)
         )
     }));
+    let backend_id = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
     assert!(!unlock_requests.iter().any(|request| matches!(
         request,
         PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
     )));
 
+    state.pointer_event_log.clear();
     pointer_warp.warp_pointer(&surface, &pointer, 30.0, 0.0, serial);
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     let warp_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(capture_pending_locked_pointer_reveal(&commands));
+    assert_eq!(state.pointer_event_log, vec!["warp", "frame"]);
+    assert!(!warp_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let (pending_after_ack, settlement_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&commands);
+    assert!(!pending_after_ack);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
@@ -1689,7 +1714,7 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
             } if (*x, *y) == (origin_x + 30.0, origin_y)
         )
     });
-    let visible_index = warp_requests.iter().position(|request| {
+    let visible_index = settlement_requests.iter().position(|request| {
         matches!(
             request,
             PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
@@ -1697,7 +1722,8 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
     });
     assert!(warp_index.is_some());
     assert!(visible_index.is_some());
-    assert!(warp_index.unwrap() < visible_index.unwrap());
+    assert_eq!(warp_index, Some(0));
+    assert_eq!(visible_index, Some(0));
 }
 
 #[test]
@@ -1767,6 +1793,30 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
         PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
     )));
 
+    let backend_id = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
+    state.pointer_event_log.clear();
+    state.pointer_motion = false;
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let (pending_after_ack, ack_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&commands);
+    assert!(!ack_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+    assert!(pending_after_ack);
+
     for _ in 0..4 {
         wait_for_server_commands(&commands);
     }
@@ -1776,6 +1826,7 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
         .send(ServerCommand::CaptureLastPointerPosition(reply))
         .unwrap();
     let final_position = receiver.recv().unwrap();
+    let pending_after_fallback = capture_pending_locked_pointer_reveal(&commands);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
@@ -1785,7 +1836,10 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
             PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
         )
     }));
+    assert!(!pending_after_fallback);
     assert_eq!(final_position, (origin_x + 120.0, origin_y));
+    assert!(state.pointer_event_log.is_empty());
+    assert!(!state.pointer_motion);
 }
 
 #[test]
@@ -1793,6 +1847,7 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
+        pointer_warp: true,
         ..InputProtocolCapabilities::desktop_baseline()
     };
     let server =
@@ -1807,9 +1862,11 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
-    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=11, ()).unwrap();
     let pointer = seat.get_pointer(&qh, ());
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let pointer_warp: client_wp_pointer_warp_v1::WpPointerWarpV1 =
         globals.bind(&qh, 1..=1, ()).unwrap();
     let (surface, _xdg_surface, _toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
@@ -1846,14 +1903,44 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    let unlock_requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
+    assert!(capture_pending_locked_pointer_reveal(&commands));
+
     pointer.set_cursor(serial, None, 0, 0);
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    let requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(
+        capture_pending_locked_pointer_reveal(&commands),
+        "set_cursor(NULL) must not settle pointer position"
+    );
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    state.pointer_event_log.clear();
+    pointer_warp.warp_pointer(&surface, &pointer, 30.0, 0.0, serial);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let (pending_after_warp, requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&commands);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
+    assert!(!pending_after_warp);
+    assert_eq!(state.pointer_event_log, vec!["warp", "frame"]);
     assert!(!requests.iter().any(|request| matches!(
         request,
         PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }

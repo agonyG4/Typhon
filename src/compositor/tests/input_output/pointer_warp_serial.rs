@@ -420,6 +420,21 @@ fn v11_lock_restore_uses_warp_without_relative_motion() {
         ))
         .unwrap();
     fixture.process();
+    assert!(
+        fixture.state.pointer_event_log.is_empty(),
+        "backend restore ACK must not publish fallback before dispatch grace"
+    );
+    let (pending_after_ack, ack_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
+    assert!(pending_after_ack);
+    assert!(!ack_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+
+    for _ in 0..4 {
+        fixture.process();
+    }
     let reveal_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
 
     assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
@@ -439,6 +454,265 @@ fn v11_lock_restore_uses_warp_without_relative_motion() {
             PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
         )
     }));
+    assert!(!capture_pending_locked_pointer_reveal(&fixture.commands));
+}
+
+#[test]
+fn v11_client_warp_after_backend_ack_settles_unlock() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    let serial = fixture.focus_at(anchor.0, anchor.1);
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &fixture.queue.handle(),
+        (),
+    );
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
+        .unwrap();
+
+    lock.set_cursor_position_hint(120.0, 0.0);
+    fixture.surface.surface.commit();
+    lock.destroy();
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+    let backend_id = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
+
+    fixture.state.pointer_event_log.clear();
+    fixture
+        .commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    fixture.process();
+    assert!(
+        fixture.state.pointer_event_log.is_empty(),
+        "backend ACK must leave a post-unlock warp window"
+    );
+    fixture.state.pointer_motion = false;
+    fixture.state.pointer_surface_x = None;
+    fixture.state.pointer_surface_y = None;
+    fixture.state.pointer_event_log.clear();
+    fixture.warp(&fixture.surface.surface.clone(), 30.0, 0.0, serial);
+    let (pending_after_warp, final_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
+
+    assert_eq!(
+        fixture.last_pointer_position(),
+        (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + 30.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1),
+        )
+    );
+    assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
+    assert!(!fixture.state.pointer_motion);
+    assert!(!pending_after_warp);
+    let warp_index = final_requests.iter().position(|request| {
+        matches!(
+            request,
+            PointerConstraintBackendRequest::WarpPointer {
+                position: OutputPosition { x, y }
+            } if (*x, *y) == (
+                f64::from(render::FIRST_SURFACE_OFFSET.0) + 30.0,
+                f64::from(render::FIRST_SURFACE_OFFSET.1),
+            )
+        )
+    });
+    let visible_index = final_requests.iter().position(|request| {
+        matches!(
+            request,
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+        )
+    });
+    assert!(warp_index.is_some());
+    assert!(visible_index.is_some());
+    assert!(warp_index.unwrap() < visible_index.unwrap());
+}
+
+#[test]
+fn pending_unlock_accepts_same_client_cross_surface_warp() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let target = fixture.create_surface();
+    fixture.process();
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 8.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 8.0,
+    );
+    let serial = fixture.focus_at(anchor.0, anchor.1);
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &fixture.queue.handle(),
+        (),
+    );
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
+        .unwrap();
+
+    lock.set_cursor_position_hint(120.0, 0.0);
+    fixture.surface.surface.commit();
+    lock.destroy();
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+    let backend_id = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
+
+    fixture.state.pointer_event_log.clear();
+    fixture.warp(&target.surface, 30.0, 40.0, serial);
+    let (pending_after_warp, warp_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
+    assert!(pending_after_warp);
+    assert_eq!(
+        fixture.state.pointer_event_log,
+        vec!["leave", "frame", "enter", "frame"]
+    );
+
+    fixture
+        .commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    fixture.process();
+    let (pending_after_ack, settlement_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
+    assert!(!pending_after_ack);
+    let client_warp_position = warp_requests.iter().find_map(|request| match request {
+        PointerConstraintBackendRequest::WarpPointer { position } => Some(*position),
+        _ => None,
+    });
+    let final_pointer_position = fixture.last_pointer_position();
+    assert_eq!(
+        client_warp_position,
+        Some(OutputPosition {
+            x: final_pointer_position.0,
+            y: final_pointer_position.1,
+        })
+    );
+    assert!(settlement_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+    assert_eq!(
+        fixture.state.pointer_event_log,
+        vec!["leave", "frame", "enter", "frame"]
+    );
+    assert_eq!(
+        fixture.state.pointer_enter_surface_id,
+        Some(target.surface.id().protocol_id())
+    );
+}
+
+#[test]
+fn stale_backend_deactivation_cannot_settle_newer_constraint() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let origin_x = f64::from(render::FIRST_SURFACE_OFFSET.0);
+    let origin_y = f64::from(render::FIRST_SURFACE_OFFSET.1);
+    let anchor = (origin_x + 20.0, origin_y + 14.0);
+    fixture.focus_at(anchor.0, anchor.1);
+    let lock_one = fixture.constraints.lock_pointer(
+        &fixture.surface.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &fixture.queue.handle(),
+        (),
+    );
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
+        .unwrap();
+
+    lock_one.set_cursor_position_hint(120.0, 0.0);
+    fixture.surface.surface.commit();
+    lock_one.destroy();
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+    let backend_one = unlock_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected first lock deactivation request");
+
+    let _lock_two = fixture.constraints.lock_pointer(
+        &fixture.surface.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &fixture.queue.handle(),
+        (),
+    );
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    let newer_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+    let backend_two = newer_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected newer lock activation request");
+    assert_ne!(backend_one, backend_two);
+
+    fixture.state.pointer_event_log.clear();
+    fixture
+        .commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_one,
+        ))
+        .unwrap();
+    fixture.process();
+    for _ in 0..4 {
+        fixture.process();
+    }
+    let (pending_after_stale_ack, stale_requests) =
+        capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
+    assert!(pending_after_stale_ack);
+    assert!(fixture.state.pointer_event_log.is_empty());
+    assert!(!stale_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+    )));
+    assert_eq!(
+        fixture.last_pointer_position(),
+        (origin_x + 120.0, origin_y)
+    );
+
+    fixture
+        .commands
+        .send(ServerCommand::PointerConstraintBackendActivated(
+            backend_two,
+        ))
+        .unwrap();
+    fixture.process();
+    assert!(!capture_pending_locked_pointer_reveal(&fixture.commands));
 }
 
 #[test]

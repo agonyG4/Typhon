@@ -170,6 +170,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CompleteProtocolOnlyFrameTick(Sender<ProtocolOnlyCompletion>),
     CaptureIdleInhibited(Sender<bool>),
     CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
+    CapturePendingLockedPointerReveal(Sender<bool>),
+    CapturePendingLockedPointerRevealAndBackendRequests(
+        Sender<(bool, Vec<PointerConstraintBackendRequest>)>,
+    ),
     CapturePointerConstraintIds(Sender<Vec<u64>>),
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
@@ -779,6 +783,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CapturePointerConstraintBackendRequests(reply) => {
                         let _ = reply.send(server.take_pointer_constraint_backend_requests());
+                    }
+                    ServerCommand::CapturePendingLockedPointerReveal(reply) => {
+                        let _ = reply.send(server.state.pending_locked_pointer_reveal.is_some());
+                    }
+                    ServerCommand::CapturePendingLockedPointerRevealAndBackendRequests(reply) => {
+                        let pending = server.state.pending_locked_pointer_reveal.is_some();
+                        let requests = server.take_pointer_constraint_backend_requests();
+                        let _ = reply.send((pending, requests));
                     }
                     ServerCommand::CapturePointerConstraintIds(reply) => {
                         let ids = server.state.pointer_constraints.keys().copied().collect();
