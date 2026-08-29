@@ -156,7 +156,7 @@ The target contract is:
 | `ext_workspace_manager_v1` | 1 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
-| `wl_seat` | 8 | always |
+| `wl_seat` | 11 | always |
 | `wp_cursor_shape_manager_v1` | 2 | cursor-shape input capability |
 | `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |
 | `wp_fifo_manager_v1` | 1 | qualified native frame-pacing capability |
@@ -208,6 +208,10 @@ No version is upgraded by this milestone.
   is introduced.
 - `wl_touch` is not advertised as a seat capability. A `get_touch` request is
   therefore a required `wl_seat.missing_capability` error.
+- `wl_pointer.warp` is advertised through the core seat version 11. Explicit
+  compositor repositions pass through pointer-constraint authority, use
+  leave/enter for focus crossings, and use `warp` only for same-focus v11+
+  pointer resources; legacy resources retain their existing motion behavior.
 - `wl_data_device_manager` remains v3 when clipboard capability is enabled;
   v3 drag-and-drop is part of the contract and is not removed by lowering the
   version.

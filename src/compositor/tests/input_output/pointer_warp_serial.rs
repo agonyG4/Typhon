@@ -27,6 +27,10 @@ struct PointerWarpFixture {
 
 impl PointerWarpFixture {
     fn new() -> Self {
+        Self::new_at_seat_version(7)
+    }
+
+    fn new_at_seat_version(seat_version: u32) -> Self {
         let socket_name = unique_socket_name();
         let capabilities = InputProtocolCapabilities {
             pointer_constraints: true,
@@ -46,7 +50,7 @@ impl PointerWarpFixture {
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
-        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=seat_version, ()).unwrap();
         let pointer = seat.get_pointer(&qh, ());
         let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
             globals.bind(&qh, 1..=1, ()).unwrap();
@@ -253,6 +257,148 @@ fn current_pointer_enter_serial_allows_same_client_target_surface() {
         fixture.state.pointer_event_log,
         vec!["leave", "frame", "enter", "frame"]
     );
+}
+
+#[test]
+fn v11_same_surface_client_warp_uses_warp_event_without_motion() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    let serial = fixture.focus_at(anchor.0, anchor.1);
+
+    fixture.state.pointer_motion = false;
+    fixture.state.pointer_surface_x = None;
+    fixture.state.pointer_surface_y = None;
+    fixture.state.pointer_event_log.clear();
+    fixture.warp(&fixture.surface.surface.clone(), 80.0, 60.0, serial);
+
+    let expected = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 80.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 60.0,
+    );
+    assert_eq!(fixture.last_pointer_position(), expected);
+    assert!(!fixture.state.pointer_motion);
+    assert_eq!(fixture.state.pointer_surface_x, Some(80.0));
+    assert_eq!(fixture.state.pointer_surface_y, Some(60.0));
+    assert_eq!(fixture.state.relative_motion_count, 0);
+    assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
+}
+
+#[test]
+fn v11_cross_surface_reposition_is_enter_frame_isolated() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let target = fixture.create_surface();
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 8.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 8.0,
+    );
+    let serial = fixture.focus_at(anchor.0, anchor.1);
+
+    fixture.state.pointer_event_log.clear();
+    fixture.warp(&target.surface, 30.0, 40.0, serial);
+
+    assert_eq!(
+        fixture.state.pointer_event_log,
+        vec!["leave", "frame", "enter", "frame"]
+    );
+}
+
+#[test]
+fn v11_reposition_respects_implicit_grab_owner() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let target = fixture.create_surface();
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 8.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 8.0,
+    );
+    let serial = fixture.focus_at(anchor.0, anchor.1);
+    fixture
+        .commands
+        .send(ServerCommand::PointerButton {
+            button: 272,
+            pressed: true,
+        })
+        .unwrap();
+    fixture.process();
+
+    fixture.state.pointer_event_log.clear();
+    fixture.warp(&target.surface, 30.0, 40.0, serial);
+
+    assert_eq!(
+        fixture.state.pointer_enter_surface_id,
+        Some(fixture.surface.surface.id().protocol_id())
+    );
+    assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
+    assert_eq!(fixture.state.pointer_surface_x, Some(46.0));
+    assert_eq!(fixture.state.pointer_surface_y, Some(56.0));
+}
+
+#[test]
+fn v11_lock_restore_uses_warp_without_relative_motion() {
+    let mut fixture = PointerWarpFixture::new_at_seat_version(11);
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    fixture.focus_at(anchor.0, anchor.1);
+    let lock = fixture.constraints.lock_pointer(
+        &fixture.surface.surface,
+        &fixture.pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &fixture.queue.handle(),
+        (),
+    );
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
+        .unwrap();
+
+    let restore_local = (70.0, 50.0);
+    lock.set_cursor_position_hint(restore_local.0, restore_local.1);
+    fixture.surface.surface.commit();
+    lock.destroy();
+    fixture.connection.flush().unwrap();
+    fixture.process();
+    let requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::Deactivate { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected lock deactivation request");
+
+    fixture.state.pointer_event_log.clear();
+    fixture.state.relative_motion_count = 0;
+    fixture
+        .commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(
+            backend_id,
+        ))
+        .unwrap();
+    fixture.process();
+    let reveal_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
+
+    assert_eq!(fixture.state.pointer_event_log, vec!["warp", "frame"]);
+    assert_eq!(fixture.state.pointer_surface_x, Some(restore_local.0));
+    assert_eq!(fixture.state.pointer_surface_y, Some(restore_local.1));
+    assert_eq!(fixture.state.relative_motion_count, 0);
+    assert_eq!(
+        fixture.last_pointer_position(),
+        (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + restore_local.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1) + restore_local.1,
+        )
+    );
+    assert!(reveal_requests.iter().any(|request| {
+        matches!(
+            request,
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+        )
+    }));
 }
 
 #[test]

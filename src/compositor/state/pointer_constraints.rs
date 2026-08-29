@@ -6,6 +6,8 @@ pub(in crate::compositor) enum PointerRepositionCause {
     LockedPointerRestore,
 }
 
+const WL_POINTER_WARP_SINCE: u32 = 11;
+
 impl PointerRepositionCause {
     const fn as_str(self) -> &'static str {
         match self {
@@ -875,10 +877,32 @@ impl CompositorState {
         &mut self,
         id: PointerConstraintBackendId,
     ) {
+        let Some(constraint) = self.pointer_constraints.get(&id.constraint_id) else {
+            pointer_debug_log(format!(
+                "backend deactivated stale id={id:?} reason=unknown"
+            ));
+            return;
+        };
+        if constraint.generation != id.generation || constraint.backend_id() != id {
+            pointer_debug_log(format!(
+                "backend deactivated stale id={id:?} current={:?}",
+                constraint.backend_id()
+            ));
+            return;
+        }
+        let restore_position = self
+            .pending_locked_pointer_reveal
+            .as_ref()
+            .filter(|pending| pending.backend_id == id)
+            .and_then(|pending| pending.fallback_position);
         if self.active_backend_constraint == Some(id) {
             self.active_backend_constraint = None;
         }
         self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
+        if let Some(position) = restore_position {
+            self.deliver_pointer_reposition(position, PointerRepositionCause::LockedPointerRestore);
+            self.finalize_pending_locked_pointer_reveal("backend_deactivated");
+        }
     }
 
     pub(in crate::compositor) fn cancel_pending_pointer_constraint_backend_requests(
@@ -1181,10 +1205,10 @@ impl CompositorState {
                 return;
             };
             self.send_pointer_enter_if_needed(&target);
-            self.send_pointer_legacy_reposition(&target);
+            self.send_pointer_reposition_to_resources(&target, cause);
             return;
         }
-        if self.send_implicit_pointer_grab_motion(position.x, position.y) {
+        if self.send_implicit_pointer_grab_reposition(position.x, position.y, cause) {
             pointer_debug_log(format!(
                 "pointer.reposition delivery cause={} focus=implicit_grab",
                 cause.as_str()
@@ -1213,10 +1237,14 @@ impl CompositorState {
             return;
         }
         self.send_pointer_enter_if_needed(&target);
-        self.send_pointer_legacy_reposition(&target);
+        self.send_pointer_reposition_to_resources(&target, cause);
     }
 
-    fn send_pointer_legacy_reposition(&mut self, target: &PointerTarget) {
+    fn send_pointer_reposition_to_resources(
+        &mut self,
+        target: &PointerTarget,
+        cause: PointerRepositionCause,
+    ) {
         let time = wayland_event_time();
         for pointer in self
             .pointer_resources
@@ -1226,13 +1254,68 @@ impl CompositorState {
             if !self.pointer_resource_entered_surface(pointer, &target.surface) {
                 continue;
             }
-            let _ = pointer.send_event(wl_pointer::Event::Motion {
-                time,
-                surface_x: target.surface_x,
-                surface_y: target.surface_y,
-            });
+            if matches!(cause, PointerRepositionCause::LockedPointerRestore)
+                && pointer.version() < WL_POINTER_WARP_SINCE
+            {
+                continue;
+            }
+            let event = if pointer.version() >= WL_POINTER_WARP_SINCE {
+                pointer_debug_log(format!(
+                    "pointer.reposition delivery cause={} focus=same pointer={} version={} event=warp local=({},{})",
+                    cause.as_str(),
+                    pointer.id().protocol_id(),
+                    pointer.version(),
+                    target.surface_x,
+                    target.surface_y
+                ));
+                wl_pointer::Event::Warp {
+                    surface_x: target.surface_x,
+                    surface_y: target.surface_y,
+                }
+            } else {
+                pointer_debug_log(format!(
+                    "pointer.reposition delivery cause={} focus=same pointer={} version={} event=legacy_motion local=({},{})",
+                    cause.as_str(),
+                    pointer.id().protocol_id(),
+                    pointer.version(),
+                    target.surface_x,
+                    target.surface_y
+                ));
+                wl_pointer::Event::Motion {
+                    time,
+                    surface_x: target.surface_x,
+                    surface_y: target.surface_y,
+                }
+            };
+            let _ = pointer.send_event(event);
             send_pointer_frame_if_supported(pointer);
         }
+    }
+
+    fn send_implicit_pointer_grab_reposition(
+        &mut self,
+        x: f64,
+        y: f64,
+        cause: PointerRepositionCause,
+    ) -> bool {
+        let Some(surface) = self.implicit_pointer_grab_surface("surface-destroyed") else {
+            return false;
+        };
+        let Some(target) = self.pointer_target_for_grabbed_surface_at_output(&surface, x, y) else {
+            let surface_id = compositor_surface_id(&surface);
+            self.cancel_implicit_pointer_grab_for_surface_ids(&[surface_id], "surface-destroyed");
+            self.refresh_pointer_focus_at_last_position();
+            return true;
+        };
+        pointer_debug_log(format!(
+            "pointer.reposition delivery cause={} focus=implicit_grab surface={} local=({},{})",
+            cause.as_str(),
+            compositor_surface_id(&surface),
+            target.surface_x,
+            target.surface_y
+        ));
+        self.send_pointer_reposition_to_resources(&target, cause);
+        true
     }
 
     pub(in crate::compositor) fn remove_pointer_constraint(&mut self, constraint_id: u64) {

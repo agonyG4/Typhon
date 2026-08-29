@@ -557,7 +557,10 @@ pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 2;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
-pub(crate) const WL_SEAT: u32 = 8;
+// Wayland 1.26 adds wl_pointer.warp at wl_pointer/wl_seat version 11. All
+// explicit compositor repositions are delivered through the constraint-aware
+// reposition path before this version is advertised.
+pub(crate) const WL_SEAT: u32 = 11;
 pub(crate) const EXT_WORKSPACE_MANAGER_V1: u32 = 1;
 pub(crate) const XWAYLAND_SHELL_V1: u32 = crate::xwayland::XWAYLAND_SHELL_V1_VERSION;
 

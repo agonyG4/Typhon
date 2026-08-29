@@ -39,6 +39,14 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 state.pointer_surface_y = Some(surface_y);
                 state.pointer_event_log.push("motion");
             }
+            client_wl_pointer::Event::Warp {
+                surface_x,
+                surface_y,
+            } => {
+                state.pointer_surface_x = Some(surface_x);
+                state.pointer_surface_y = Some(surface_y);
+                state.pointer_event_log.push("warp");
+            }
             client_wl_pointer::Event::Button {
                 serial,
                 state: button_state,

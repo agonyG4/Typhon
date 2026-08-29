@@ -60,7 +60,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `ext_workspace_manager_v1` | 1 | Partial |
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
-| `wl_seat` | 8 | Implemented |
+| `wl_seat` | 11 | Implemented |
 | `wp_cursor_shape_manager_v1` | 2 | Implemented (pointer capability gated) |
 | `xwayland_shell_v1` | 1 | Implemented for the active private XWayland client |
 
@@ -177,12 +177,12 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_surface` | 6 | event `preferred_buffer_scale` | 6 | output membership | Implemented | Implemented |
 | `wl_surface` | 6 | event `preferred_buffer_transform` | 6 | output membership | Implemented | Implemented |
 | `wl_surface` | 6 | request `get_release` | 6 | explicit-sync/frame ownership | BackendOwned | Partial |
-| `wl_seat` | 8 | event `capabilities` | 1 | `protocols/input.rs` | Implemented | Implemented |
-| `wl_seat` | 8 | request `get_pointer` | 1 | `protocols/input.rs` | Implemented | Implemented |
-| `wl_seat` | 8 | request `get_keyboard` | 1 | `protocols/input.rs` | Implemented | Implemented |
-| `wl_seat` | 8 | request `get_touch` | 1 | `protocols/input.rs` | CapabilityRejected | Implemented |
-| `wl_seat` | 8 | event `name` | 2 | `protocols/input.rs` | Implemented | Implemented |
-| `wl_seat` | 8 | request `release` | 5 | `protocols/input.rs` | DestroyedResourceNoFurtherDispatch | Partial |
+| `wl_seat` | 11 | event `capabilities` | 1 | `protocols/input.rs` | Implemented | Implemented |
+| `wl_seat` | 11 | request `get_pointer` | 1 | `protocols/input.rs` | Implemented | Implemented |
+| `wl_seat` | 11 | request `get_keyboard` | 1 | `protocols/input.rs` | Implemented | Implemented |
+| `wl_seat` | 11 | request `get_touch` | 1 | `protocols/input.rs` | CapabilityRejected | Implemented |
+| `wl_seat` | 11 | event `name` | 2 | `protocols/input.rs` | Implemented | Implemented |
+| `wl_seat` | 11 | request `release` | 5 | `protocols/input.rs` | DestroyedResourceNoFurtherDispatch | Partial |
 | `wl_pointer` | n/a | request `set_cursor` | 1 | `protocols/input.rs` | ProtocolError | Partial |
 | `wl_pointer` | n/a | event `enter` | 1 | input state | Implemented | Partial |
 | `wl_pointer` | n/a | event `leave` | 1 | input state | Implemented | Partial |
@@ -196,6 +196,7 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_pointer` | n/a | event `axis_discrete` | 5 | input state | Implemented | Partial |
 | `wl_pointer` | n/a | event `axis_value120` | 8 | input state | Implemented | Implemented |
 | `wl_pointer` | n/a | event `axis_relative_direction` | 9 | input state | Implemented | Outside advertised seat pointer resource bound |
+| `wl_pointer` | n/a | event `warp` | 11 | pointer reposition state | Implemented | Explicit compositor repositions only; never shared with enter or motion frame |
 | `wl_keyboard` | n/a | event `keymap` | 1 | input state | Implemented | Partial |
 | `wl_keyboard` | n/a | event `enter` | 1 | input state | Implemented | Implemented |
 | `wl_keyboard` | n/a | event `leave` | 1 | input state | Implemented | Partial |
@@ -300,7 +301,7 @@ the inventory.
 | `wl_surface.commit` | `state/surface_transactions.rs` | `wayland_client_surface_commit_creates_renderable_shm_snapshot`, `output_membership_reconciles_leave_and_remap_enter` | `wl_surface.invalid_size` | 6 | Implemented | field ownership is audited in `SURFACE_PENDING_STATE_AUDIT.md` |
 | `wl_surface.enter/leave` | `state/output_membership.rs` | `output_membership_reconciles_leave_and_remap_enter`, `output_membership_reconciles_move_outside_without_duplicate_enter`, `output_production_model_runs_10_000_operations` | none | 6 | Implemented | geometric overlap and same-client output resources are reconciled; the production-backed model covers resource ownership, effective subsurface mapping, and teardown |
 | `wl_surface.preferred_buffer_scale/transform` | `state/output_membership.rs` | `preferred_buffer_events_are_version_gated_and_deduplicated`, `preferred_buffer_events_emit_changed_values_and_default_returns_once`, `output_production_model_runs_10_000_operations` | none | 6 | Implemented | default events are suppressed until a preference changes and the production-backed model checks deduplication/version gating |
-| `wl_seat.get_touch` | `protocols/input.rs` | `get_touch_without_advertised_touch_capability_is_a_wire_error` | `wl_seat.missing_capability` | 8 | Implemented | touch remains intentionally unadvertised |
+| `wl_seat.get_touch` | `protocols/input.rs` | `get_touch_without_advertised_touch_capability_is_a_wire_error` | `wl_seat.missing_capability` | 11 | Implemented | touch remains intentionally unadvertised |
 | `wl_subcompositor.get_subsurface` | `protocols/core.rs` | `invalid_subsurface_sibling_is_a_wire_error_and_does_not_disconnect_another_client` | `wl_subcompositor.bad_surface` | 1 | Implemented | tree policy remains single-output |
 | `wl_shm.create_pool` | `protocols/buffers.rs` | `invalid_shm_pool_size_is_a_wire_error_and_does_not_disconnect_another_client` | `wl_shm.invalid_fd` / locked size mapping | 2 | Implemented | request-time FD usability depends on host FD |
 | `wl_shm_pool.create_buffer` | `protocols/buffers.rs` | `wl_shm_pool_resize_growth_enables_buffer_above_initial_size` | `wl_shm.invalid_format`, `invalid_stride`, `invalid_fd` | 2 | Implemented | only advertised formats are accepted |
