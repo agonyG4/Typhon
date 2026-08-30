@@ -417,6 +417,10 @@ impl OwnCompositorServer {
         self.state.deferred_dmabuf_release_count()
     }
 
+    pub fn retryable_deferred_dmabuf_release_count(&self) -> usize {
+        self.state.retryable_deferred_dmabuf_release_count()
+    }
+
     #[doc(hidden)]
     pub fn transfer_deferred_dmabuf_releases_to_gpu_lease(
         &mut self,

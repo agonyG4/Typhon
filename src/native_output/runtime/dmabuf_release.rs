@@ -92,6 +92,7 @@ pub(crate) struct DmabufGpuReleaseMetrics {
     pub(crate) fence_creation_failures: u64,
     pub(crate) completion_fd_failures: u64,
     pub(crate) registration_failures: u64,
+    pub(crate) retry_skipped_current_token: u64,
     pub(crate) active_leases: u64,
     pub(crate) peak_active_leases: u64,
 }
@@ -200,6 +201,24 @@ impl DmabufGpuReleaseRegistry {
                 next_retry_deadline_ns: now_ns.saturating_add(DMABUF_RELEASE_RETRY_BASE_DELAY_NS),
                 attempts: 0,
             };
+        }
+    }
+
+    pub(crate) fn update_retry_for_deferred_work(
+        &mut self,
+        deferred_count: usize,
+        retryable_count: usize,
+        reason: DmabufReleaseRetryReason,
+        now_ns: u64,
+    ) {
+        if retryable_count == 0 {
+            if deferred_count > 0 {
+                self.metrics.retry_skipped_current_token =
+                    self.metrics.retry_skipped_current_token.saturating_add(1);
+            }
+            self.complete_retry();
+        } else {
+            self.schedule_retry_if_needed(reason, now_ns);
         }
     }
 
@@ -384,8 +403,16 @@ impl super::NativeRuntime {
         if !self.dmabuf_gpu_release_registry.retry_due(now_ns) {
             return Ok(());
         }
-        if self.server.deferred_dmabuf_release_count() == 0 {
-            self.dmabuf_gpu_release_registry.complete_retry();
+        let deferred_count = self.server.deferred_dmabuf_release_count();
+        let retryable_count = self.server.retryable_deferred_dmabuf_release_count();
+        if deferred_count == 0 || retryable_count == 0 {
+            self.dmabuf_gpu_release_registry
+                .update_retry_for_deferred_work(
+                    deferred_count,
+                    retryable_count,
+                    DmabufReleaseRetryReason::NoGpuProofAvailable,
+                    now_ns,
+                );
             return Ok(());
         }
 
@@ -640,5 +667,22 @@ mod tests {
         assert!(!registry.is_visual_work());
         registry.complete_retry();
         assert_eq!(registry.retry_deadline_ns(), None);
+    }
+
+    #[test]
+    fn current_token_only_deferred_work_does_not_arm_retry_debt() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        for now_ns in (0..1_000_000_000).step_by(1_000_000) {
+            registry.update_retry_for_deferred_work(
+                1,
+                0,
+                DmabufReleaseRetryReason::NoGpuProofAvailable,
+                now_ns,
+            );
+        }
+
+        assert_eq!(registry.retry_deadline_ns(), None);
+        assert_eq!(registry.retry_attempts(), 0);
+        assert_eq!(registry.metrics().retry_skipped_current_token, 1_000);
     }
 }

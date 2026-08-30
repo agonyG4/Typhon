@@ -1063,6 +1063,168 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn gpu_requeued_current_token_stays_protected_through_a_later_pageflip() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(452);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+        let batch = state.take_frame_batch_for_render(47);
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(6).unwrap());
+        assert_eq!(
+            state.transfer_frame_batch_dmabuf_releases_to_gpu_lease(batch, lease),
+            1
+        );
+        state.complete_no_visual_change_frame_batch(batch);
+        state.active_dmabuf_buffers.insert(99, obligation.clone());
+
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 0);
+        let ordinary = state.take_frame_batch_for_render(48);
+        assert_eq!(state.frame_batch_dmabuf_release_count(ordinary), 0);
+        state.complete_presented_frame_batch(
+            48,
+            ordinary,
+            FramePresentation::software_now(state.presentation_clock).unwrap(),
+        );
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
+        assert_eq!(
+            state
+                .buffer_release_metrics
+                .dmabuf_release_terminal_revalidated,
+            1
+        );
+        assert_eq!(
+            state
+                .buffer_release_metrics
+                .dmabuf_release_terminal_requeued_current,
+            1
+        );
+        assert!(state.dmabuf_release_token_is_active(&obligation));
+
+        state.active_dmabuf_buffers.remove(&99);
+        let final_batch = state.take_frame_batch_for_render(49);
+        state.complete_presented_frame_batch(
+            49,
+            final_batch,
+            FramePresentation::software_now(state.presentation_clock).unwrap(),
+        );
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn frame_batch_pageflip_revalidates_a_token_that_becomes_current_after_capture() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(453);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+        let batch = state.take_frame_batch_for_render(50);
+        state.active_dmabuf_buffers.insert(100, obligation.clone());
+
+        state.complete_presented_frame_batch(
+            50,
+            batch,
+            FramePresentation::software_now(state.presentation_clock).unwrap(),
+        );
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_buffer_releases.len(), 1);
+        assert!(state.dmabuf_release_token_is_active(&obligation));
+    }
+
+    #[test]
+    fn distinct_explicit_release_token_remains_releasable_while_same_buffer_is_current() {
+        let mut state = CompositorState::default();
+        let first = test_dmabuf_release(454);
+        let second = match &first.release {
+            SurfaceBufferRelease::ExplicitSync(point) => DmabufReleaseObligation {
+                buffer_id: first.buffer_id,
+                release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint {
+                    timeline: point.timeline.clone(),
+                    point: 455,
+                }),
+            },
+            SurfaceBufferRelease::WlBuffer(_) => unreachable!(),
+        };
+        state.queue_dmabuf_buffer_release(first.clone());
+        let batch = state.take_frame_batch_for_render(51);
+        state.active_dmabuf_buffers.insert(101, second.clone());
+
+        state.complete_presented_frame_batch(
+            51,
+            batch,
+            FramePresentation::software_now(state.presentation_clock).unwrap(),
+        );
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert!(state.dmabuf_release_token_is_active(&second));
+        assert!(!state.dmabuf_release_token_is_active(&first));
+    }
+
+    #[test]
+    fn deferred_transfer_skips_current_tokens_but_retries_inactive_tokens() {
+        let mut state = CompositorState::default();
+        let obligations = (460..464).map(test_dmabuf_release).collect::<Vec<_>>();
+        for obligation in &obligations {
+            state.queue_dmabuf_buffer_release(obligation.clone());
+        }
+        let batch = state.take_frame_batch_for_render(52);
+        state.complete_no_visual_change_frame_batch(batch);
+        state
+            .active_dmabuf_buffers
+            .insert(102, obligations[0].clone());
+        state
+            .active_dmabuf_buffers
+            .insert(103, obligations[2].clone());
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(7).unwrap());
+
+        assert_eq!(state.retryable_deferred_dmabuf_release_count(), 2);
+        assert_eq!(
+            state.transfer_deferred_dmabuf_releases_to_gpu_lease(lease),
+            2
+        );
+        assert_eq!(state.deferred_dmabuf_release_count(), 2);
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 2);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 2);
+        assert!(state.dmabuf_release_token_is_active(&obligations[0]));
+        assert!(state.dmabuf_release_token_is_active(&obligations[2]));
+        assert_eq!(state.deferred_dmabuf_release_count(), 2);
+    }
+
+    #[test]
+    fn safe_abandonment_revalidates_a_current_release_token() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(465);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+        let batch = state.take_frame_batch_for_render(53);
+        state.active_dmabuf_buffers.insert(104, obligation.clone());
+
+        state.complete_frame_batch_after_safe_abandonment(
+            batch,
+            FrameBatchDiscardReason::OutputDestroyed,
+        );
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_release_count(), 1);
+        assert!(state.dmabuf_release_token_is_active(&obligation));
+    }
+
+    #[test]
+    fn direct_presentation_revalidates_a_current_release_token() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(466);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+        let batch = state.take_frame_batch_for_render(54);
+        state.active_dmabuf_buffers.insert(105, obligation.clone());
+        let presentation =
+            FramePresentation::synchronized(state.presentation_clock, 2, 0, 1).unwrap();
+
+        state.complete_direct_presented_frame_batch(54, batch, 7, presentation);
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(state.deferred_dmabuf_release_count(), 1);
+        assert!(state.dmabuf_release_token_is_active(&obligation));
+    }
+
+    #[test]
     fn adversarial_three_buffer_client_completes_one_thousand_presentations() {
         let mut state = CompositorState::default();
         let mut reusable = [false, true, true];

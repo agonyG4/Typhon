@@ -634,17 +634,19 @@ impl Drop for NativeRuntime {
         self.server.finish_commit_debug_for_shutdown();
         let buffer_release_metrics = self.server.buffer_release_metrics();
         println!(
-            "typhon pacing: event=buffer_release_summary buffer_releases_captured={} buffer_releases_completed={} buffer_releases_deferred={} buffer_releases_restored={} buffer_releases_discarded={} buffer_release_duplicate_attempts={}",
+            "typhon pacing: event=buffer_release_summary buffer_releases_captured={} buffer_releases_completed={} buffer_releases_deferred={} buffer_releases_restored={} buffer_releases_discarded={} buffer_release_duplicate_attempts={} dmabuf_release_terminal_revalidated={} dmabuf_release_terminal_requeued_current={}",
             buffer_release_metrics.buffer_releases_captured,
             buffer_release_metrics.buffer_releases_completed,
             buffer_release_metrics.buffer_releases_deferred,
             buffer_release_metrics.buffer_releases_restored,
             buffer_release_metrics.buffer_releases_discarded,
             buffer_release_metrics.buffer_release_duplicate_attempts,
+            buffer_release_metrics.dmabuf_release_terminal_revalidated,
+            buffer_release_metrics.dmabuf_release_terminal_requeued_current,
         );
         let dmabuf_release_metrics = self.dmabuf_gpu_release_metrics();
         println!(
-            "typhon pacing: event=dmabuf_gpu_release_summary leases_registered={} leases_completed={} leases_requeued={} obligations_armed={} obligations_completed={} fences_created={} fences_signaled={} no_visual_fence_only={} fence_creation_failures={} completion_fd_failures={} registration_failures={} active_leases={} peak_active_leases={}",
+            "typhon pacing: event=dmabuf_gpu_release_summary leases_registered={} leases_completed={} leases_requeued={} obligations_armed={} obligations_completed={} fences_created={} fences_signaled={} no_visual_fence_only={} fence_creation_failures={} completion_fd_failures={} registration_failures={} retry_skipped_current_token={} active_leases={} peak_active_leases={}",
             dmabuf_release_metrics.leases_registered,
             dmabuf_release_metrics.leases_completed,
             dmabuf_release_metrics.leases_requeued,
@@ -656,6 +658,7 @@ impl Drop for NativeRuntime {
             dmabuf_release_metrics.fence_creation_failures,
             dmabuf_release_metrics.completion_fd_failures,
             dmabuf_release_metrics.registration_failures,
+            dmabuf_release_metrics.retry_skipped_current_token,
             dmabuf_release_metrics.active_leases,
             dmabuf_release_metrics.peak_active_leases,
         );

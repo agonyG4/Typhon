@@ -1,8 +1,9 @@
-# Typhon DMA-BUF GPU Release Authority v1.1
+# Typhon DMA-BUF GPU Release Authority v1.2
 
 Date: 2026-08-29
 Repository: `/home/agony/GitHub/Typhon`
-Scope: KMS-worker DirectPrimaryLease exclusion and deferred-release liveness.
+Scope: v1.1 KMS-worker DirectPrimaryLease exclusion and deferred-release
+liveness, plus exact current-token eligibility and retry quiescence.
 
 ## Outcome
 
@@ -22,17 +23,24 @@ Normal rendered-frame fence setup still has the existing pageflip fallback. The
 compatibility backend remains conservative and does not enter an unsupported
 native-fence retry loop.
 
+The v1.2 correction keeps an exact release obligation ineligible whenever its
+exact protocol token is current again. This is enforced at GPU-fence,
+pageflip/direct-presentation, and safe-abandonment terminals. Deferred work is
+partitioned by the same authority: current-token-blocked obligations remain
+event-driven, while inactive obligations retain the v1.1 bounded retry debt.
+
 ## Checkout authority and source delta
 
-The local checkout was authoritative for this work. At the source audit,
-`origin/main` was `a0d5b8a`, while the local branch already contained the v1
-DMA-BUF, exact-lineage, regional-damage, O1, SHM, and pointer-closure commits
-through `a62933d`. No public snapshot was substituted for the local source.
+The local checkout was authoritative for this work. At the v1.2 source audit,
+`origin/main` was `a0d5b8a`, while the local branch was at the later
+pointer-unlock closure `97fa2a4` and already contained the v1 DMA-BUF,
+exact-lineage, regional-damage, O1, SHM, and v1.1 worker/liveness commits. No
+public snapshot was substituted for the local source.
 
-The final local history contains the separate concurrent pointer design commit
-`01497b8`, this implementation commit `004bbdc`, and the plan bookkeeping commit
-`0e7923f`. The pointer design/spec work was preserved and was not included in
-the v1.1 implementation commit.
+The concurrent pointer design/spec and implementation commits were preserved
+and were not modified or staged by v1.2. The v1.2 working-tree changes are
+limited to the exact-token release authority, retry gate, tests, report, and
+plan listed below.
 
 ## Exact root causes
 
@@ -258,23 +266,163 @@ native GPU fence unsignaled before pageflip was not run in this environment; the
 native runtime requires a suitable DRM/KMS TTY. This report does not claim that
 integration category as executed.
 
+## v1.2 corrective closure
+
+### Exact root cause
+
+The v1.1 GPU-fence terminal already checked
+`active_dmabuf_buffers` with `same_release_token()`. The later ordinary
+frame-batch terminal did not: `complete_frame_batch_releases()` called the
+low-level release method directly. A token requeued by a GPU lease could
+therefore be captured by a later batch and incorrectly receive a legacy
+`wl_buffer.release` at pageflip while the exact token was current again.
+
+The retry scheduler had the same ownership distinction missing in a different
+place. It treated every deferred obligation as retryable, so a token that was
+blocked only by being current could repeatedly create release-only fences.
+
+### Before and after ownership flow
+
+Before v1.2:
+
+```text
+GPU terminal checks exact token
+        |
+        +-- current -> deferred
+        |
+        +-- inactive -> release
+
+deferred list -> retry timer/fence machinery without eligibility partition
+frame batch terminal -> direct protocol release without revalidation
+```
+
+After v1.2:
+
+```text
+every non-shutdown terminal
+        |
+        v
+dmabuf_release_token_is_active(same_release_token)
+        |
+        +-- current -> deferred, no release
+        |
+        +-- inactive -> exact protocol terminal
+
+deferred list
+        |
+        +-- current token -> event-driven only; no retry deadline/fence
+        |
+        +-- inactive token -> existing bounded retry debt/fence machinery
+```
+
+`complete_dmabuf_release_if_inactive()` is the single non-shutdown terminal
+helper. GPU completion, normal pageflip, Direct presentation, and safe
+abandonment all use it. Shutdown retains its explicit forced terminal after
+renderer/KMS teardown. `take_frame_batch_for_render()` also leaves current-token
+deferred obligations deferred, preventing avoidable release-only fences; the
+terminal check remains mandatory for tokens that become current after capture.
+
+Logical release eligibility remains separate from physical presentation. The
+helper changes only protocol-release ownership and bounded release metrics. It
+does not advance scene history, output-buffer presentation serials, pageflip
+state, `wp_presentation`, or O1 callback admission.
+
+### RED tests and pre-fix failures
+
+The tests were added before the production changes. The first focused RED run
+failed at compilation because the planned exact-token and retryability APIs did
+not exist. Against the pre-fix source, the relevant terminal behavior was also
+directly visible in source: a later frame-batch completion called
+`complete_dmabuf_release()` without checking the active token, and deferred
+transfer moved every obligation.
+
+The new deterministic tests now cover the former failure modes:
+
+- `gpu_requeued_current_token_stays_protected_through_a_later_pageflip`:
+  requeued current token remains unreleased through a later ordinary frame and
+  releases once after final retirement.
+- `frame_batch_pageflip_revalidates_a_token_that_becomes_current_after_capture`:
+  capture-before-reattach is protected at the terminal.
+- `distinct_explicit_release_token_remains_releasable_while_same_buffer_is_current`:
+  same `BufferId` does not merge distinct explicit points.
+- `deferred_transfer_skips_current_tokens_but_retries_inactive_tokens`:
+  mixed deferred work transfers only inactive obligations.
+- `safe_abandonment_revalidates_a_current_release_token` and
+  `direct_presentation_revalidates_a_current_release_token`: both additional
+  non-shutdown terminals use the same authority.
+- `current_token_only_deferred_work_does_not_arm_retry_debt`: a current-only
+  deferred set has no deadline or retry attempts despite one second of
+  deterministic clock advancement.
+
+The pre-existing GPU requeue test continues to pass, proving that the v1.1
+GPU terminal behavior was preserved rather than replaced.
+
+### Retry liveness and metrics
+
+`retryable_deferred_dmabuf_release_count()` applies the exact-token authority
+to the deferred list. The runtime deadline arming, due-retry service, and
+NoVisualChange fallback use this count. `update_retry_for_deferred_work()`
+clears retry debt when only current tokens remain and records bounded
+`retry_skipped_current_token` visibility. Inactive deferred obligations still
+use v1.1's 1 ms initial delay, capped exponential backoff, and asynchronous
+GPU-fence registry. No refresh-rate polling, draw, callback, KMS commit, or
+busy wait is introduced.
+
+Terminal metrics now expose `dmabuf_release_terminal_revalidated` and
+`dmabuf_release_terminal_requeued_current`. The v1.1 worker Direct/KMS safety
+snapshot remains the source of truth for normal rendered release, NoVisualChange
+release-only fencing, and deferred retry.
+
+### Integrated and protocol evidence
+
+The existing v1.1 deterministic integrated topology/buffer-age oracle remains
+unchanged and passed its targeted full-reference pixel comparison. It covers
+rotating client/output buffers, output ages, popup/subsurface transitions,
+rejected-candidate retry, and overlapping SSD visuals. v1.2 adds the exact
+reattachment/pageflip ownership cases around that oracle; it does not weaken
+regional damage or buffer-age history.
+
+The focused state tests use exact release-token fixtures, including distinct
+explicit-sync points. Existing protocol and explicit-sync suites were retained.
+No new native DRM/KMS run or new real unsignaled-GPU-fence Wayland integration
+run was performed in this environment, so this report does not claim native
+pre-pageflip release qualification.
+
+### Files changed in v1.2
+
+- `src/compositor/frame_batch.rs`: bounded terminal revalidation metrics.
+- `src/compositor/server_frames.rs`: server access to retryable deferred count.
+- `src/compositor/state/frames.rs`: centralized exact-token terminal authority,
+  frame-capture filtering, inactive deferred transfer, and shutdown separation.
+- `src/compositor/state/frame_tests.rs`: current-token terminal, distinct-token,
+  mixed-deferred, and retry-quiescence coverage.
+- `src/native_output/runtime/dmabuf_release.rs`: retry gate and skip metric.
+- `src/native_output/runtime/metrics.rs`: retry deadlines based on retryable
+  deferred obligations.
+- `src/native_output/runtime/presentation_cycle.rs`: NoVisualChange retry gate.
+- `src/native_output/runtime/mod.rs`: bounded shutdown metric output.
+- `docs/superpowers/plans/2026-08-29-typhon-dmabuf-gpu-release-authority-v1-2-plan.md`:
+  v1.2 implementation plan.
+- This report.
+
+No pointer-reposition file was modified or staged.
+
 ## Verification results
 
 Focused checks completed during this closure:
 
-- `rtk cargo test --locked dmabuf_release --bin oblivion-one`: 7 passed;
-- `rtk cargo check --locked`: passed;
-- `rtk cargo clippy --locked --all-targets --all-features -- -D warnings`:
-  no issues reported;
-- `rtk cargo test --locked compositor::state::frame_tests --lib`: 53 passed;
-- `rtk cargo test --locked direct_lease --bin oblivion-one`: 28 passed;
-- `rtk cargo test --locked scheduler --bin oblivion-one`: 7 passed;
-- `rtk cargo test --locked --bin oblivion-one topology_transitions_match_full_reference_with_rotating_output_ages`: 1 passed;
-- `rtk cargo test --locked --bin oblivion-one rejected_rendered_candidate_does_not_advance_history_and_retry_reuses_exact_pixels`: 1 passed;
-- `rtk cargo test --locked wayland_client_syncobj_dmabuf_release_signals_release_point_after_present --lib`: 1 passed;
-- existing native fence, work-domain, integrated topology/buffer-age, Direct
-  Scanout, SHM, O1, and explicit-sync-focused suites were retained and focused
-  checks were run as part of the preceding v1 qualification.
+- `rtk cargo test --lib frame_consumption_tests`: 59 passed;
+- `rtk cargo test dmabuf_release::tests`: 7 passed;
+- `rtk cargo test current_token_only_deferred_work_does_not_arm_retry_debt`:
+  1 passed;
+- `rtk cargo test xwayland_reactor_x11_window_reaches_window_ready_without_direct_fd_polling`:
+  1 passed when replayed independently;
+- `rtk cargo test one_child_exit_wakes_the_sigchld_signalfd_once`: 1 passed
+  when replayed independently;
+- the v1.1 worker Direct/KMS, scheduler render-ahead, native-fence,
+  work-domain, integrated topology/buffer-age, Direct Scanout, SHM, O1, and
+  explicit-sync-focused suites remain unchanged and were covered by the
+  preceding qualification.
 
 Final requested verification:
 
@@ -282,17 +430,21 @@ Final requested verification:
 rtk cargo fmt --check: passed
 rtk cargo check: passed
 rtk cargo clippy --all-targets --all-features -- -D warnings: passed
-rtk cargo test: failed in unrelated tests/sigchld.rs::one_child_exit_wakes_the_sigchld_signalfd_once
-  observed: left 0, expected 1
-  all other reported suites passed; the failing test is unchanged and was
-  reproduced in the preceding v1 verification
-git diff --check: passed
-git status --short: only the v1.1 source, plan, and report are modified/untracked
+rtk cargo test --lib: 1,961 passed, 2 ignored
+rtk cargo test: two full-run attempts each exposed one unrelated flaky test:
+  run 1: native_output::runtime::xwayland_reactor_tests::xwayland_reactor_x11_window_reaches_window_ready_without_direct_fd_polling
+    observed assertion: unrelated below parent below popup physically
+  run 2: native::kms::tests::explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success
+    observed assertion: left 1, right -1
+  independent replay of both failures passed; no v1.2 source touches either
+  module. Therefore the full aggregate command is recorded as not clean.
+git diff --check: passed at final handoff
+git status --short: clean after the v1.2 commit
 ```
 
-The known full-suite `sigchld::one_child_exit_wakes_the_sigchld_signalfd_once`
-failure is unrelated to this closure and reproduced in isolation in the
-preceding v1 verification. It was not modified.
+The two full-run failures are unrelated to this closure and both passed in
+isolation. The SIGCHLD test also passed independently. None of those modules
+were modified.
 
 No native DRM/KMS qualification was executed. Therefore this report makes no
 claim about native pre-pageflip release latency, 165 Hz measurements, or actual

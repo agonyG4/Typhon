@@ -1209,7 +1209,7 @@ impl NativeRuntime {
                                             );
                                         }
                                     }
-                                } else if server.deferred_dmabuf_release_count() > 0 {
+                                } else if server.retryable_deferred_dmabuf_release_count() > 0 {
                                     let reason = if release_safety.permits_compositor_gpu_release()
                                     {
                                         DmabufReleaseRetryReason::NoGpuProofAvailable

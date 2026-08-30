@@ -55,6 +55,8 @@ pub struct BufferReleaseMetrics {
     pub buffer_releases_restored: u64,
     pub buffer_releases_discarded: u64,
     pub buffer_release_duplicate_attempts: u64,
+    pub dmabuf_release_terminal_revalidated: u64,
+    pub dmabuf_release_terminal_requeued_current: u64,
 }
 
 #[doc(hidden)]
