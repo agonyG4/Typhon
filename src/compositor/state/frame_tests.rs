@@ -766,6 +766,13 @@ mod frame_consumption_tests {
         }
     }
 
+    fn test_dmabuf_release_for_buffer(buffer_id: u64, point: u64) -> DmabufReleaseObligation {
+        DmabufReleaseObligation {
+            buffer_id: BufferId::for_tests(buffer_id),
+            release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint::for_tests(99, point)),
+        }
+    }
+
     fn test_dmabuf_points(releases: &[DmabufReleaseObligation]) -> Vec<u64> {
         releases
             .iter()
@@ -879,6 +886,85 @@ mod frame_consumption_tests {
         assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
         assert!(state.retired_frame_batches.is_empty());
         state.release_client_buffers_for_shutdown();
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn shutdown_deduplicates_active_and_deferred_exact_dmabuf_token() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(400);
+        state.active_dmabuf_buffers.insert(1, obligation.clone());
+        state.deferred_dmabuf_buffer_releases.push(obligation);
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn shutdown_deduplicates_active_and_frame_batch_exact_dmabuf_token() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(401);
+        let batch_id = state.take_frame_batch_for_render(401);
+        state
+            .frame_batches
+            .get_mut(&batch_id)
+            .expect("test frame batch exists")
+            .dmabuf_releases_to_complete_on_present
+            .push(obligation.clone());
+        state.active_dmabuf_buffers.insert(1, obligation);
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn shutdown_deduplicates_active_and_gpu_lease_exact_dmabuf_token() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(402);
+        let lease_id = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(1).unwrap());
+        state.active_dmabuf_buffers.insert(1, obligation.clone());
+        state.dmabuf_gpu_release_leases.insert(
+            lease_id,
+            DmabufGpuReleaseLease {
+                source_batch_id: None,
+                obligations: vec![obligation],
+            },
+        );
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn shutdown_keeps_distinct_explicit_points_for_one_buffer_distinct() {
+        let mut state = CompositorState::default();
+        let first = test_dmabuf_release_for_buffer(403, 1);
+        let second = test_dmabuf_release_for_buffer(403, 2);
+        state.active_dmabuf_buffers.insert(1, first.clone());
+        state
+            .deferred_dmabuf_buffer_releases
+            .extend([first, second]);
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 2);
+    }
+
+    #[test]
+    fn repeated_shutdown_release_finalization_is_idempotent() {
+        let mut state = CompositorState::default();
+        let obligation = test_dmabuf_release(404);
+        state.active_dmabuf_buffers.insert(1, obligation.clone());
+        state.deferred_dmabuf_buffer_releases.push(obligation);
+
+        state.release_client_buffers_for_shutdown();
+        let completed_after_first_shutdown = state.buffer_release_metrics.buffer_releases_completed;
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(completed_after_first_shutdown, 1);
         assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
     }
 

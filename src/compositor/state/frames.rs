@@ -9,6 +9,30 @@ enum DmabufReleaseCompletion {
     DeferredCurrent,
 }
 
+#[derive(Debug, Default)]
+pub(in crate::compositor) struct ShutdownDmabufReleaseSet {
+    obligations: Vec<DmabufReleaseObligation>,
+}
+
+impl ShutdownDmabufReleaseSet {
+    pub(in crate::compositor) fn push(&mut self, obligation: DmabufReleaseObligation) {
+        if self
+            .obligations
+            .iter()
+            .any(|existing| existing.same_release_token(&obligation))
+        {
+            return;
+        }
+        self.obligations.push(obligation);
+    }
+
+    pub(in crate::compositor) fn complete(self, state: &mut CompositorState) {
+        for obligation in self.obligations {
+            state.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+        }
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) const fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
         self.buffer_release_metrics
@@ -948,7 +972,17 @@ impl CompositorState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn release_client_buffers_for_shutdown(&mut self) {
+        let mut releases = ShutdownDmabufReleaseSet::default();
+        self.release_client_buffers_for_shutdown_with(&mut releases);
+        releases.complete(self);
+    }
+
+    pub(in crate::compositor) fn release_client_buffers_for_shutdown_with(
+        &mut self,
+        releases: &mut ShutdownDmabufReleaseSet,
+    ) {
         for batch_id in self.frame_batches.keys().copied().collect::<Vec<_>>() {
             let mut batch = self
                 .frame_batches
@@ -963,7 +997,7 @@ impl CompositorState {
             self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
             let dmabuf_releases = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
             for obligation in dmabuf_releases {
-                self.complete_dmabuf_release(batch_id, batch.frame_id, obligation);
+                releases.push(obligation);
             }
         }
         for batch_id in self
@@ -985,7 +1019,7 @@ impl CompositorState {
             self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
             let dmabuf_releases = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
             for obligation in dmabuf_releases {
-                self.complete_dmabuf_release(batch_id, batch.frame_id, obligation);
+                releases.push(obligation);
             }
         }
         self.legacy_prepared_frame_batch = None;
@@ -993,17 +1027,17 @@ impl CompositorState {
 
         let deferred_dmabuf = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
         for obligation in deferred_dmabuf {
-            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+            releases.push(obligation);
         }
         let pending_dmabuf = std::mem::take(&mut self.pending_dmabuf_buffer_releases);
         for obligation in pending_dmabuf {
-            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+            releases.push(obligation);
         }
 
         let gpu_leases = std::mem::take(&mut self.dmabuf_gpu_release_leases);
         for (_, lease) in gpu_leases {
             for obligation in lease.obligations {
-                self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+                releases.push(obligation);
             }
         }
 
@@ -1015,13 +1049,16 @@ impl CompositorState {
             if pending.data.is_shm() {
                 self.release_unmaterialized_pending_buffer(pending, false);
             } else if let Some(release) = active_dmabuf.remove(&surface_id) {
-                self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+                releases.push(release);
             } else {
-                self.release_surface_buffer_direct(pending.release_target());
+                releases.push(DmabufReleaseObligation {
+                    buffer_id: pending.data.buffer_id(),
+                    release: pending.release_target(),
+                });
             }
         }
         for (_, obligation) in active_dmabuf {
-            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, obligation);
+            releases.push(obligation);
         }
     }
 

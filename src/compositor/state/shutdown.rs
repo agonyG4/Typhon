@@ -1,7 +1,10 @@
 use super::*;
 
 impl CompositorState {
-    pub(in crate::compositor) fn release_cached_resources_for_shutdown(&mut self) {
+    pub(in crate::compositor) fn release_cached_resources_for_shutdown(
+        &mut self,
+        releases: &mut ShutdownDmabufReleaseSet,
+    ) {
         let mut cached = self.subsurface_transactions.drain_cached_commits();
         for transaction in self.pending_surface_tree_transactions.drain(..) {
             cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
@@ -14,12 +17,27 @@ impl CompositorState {
                 feedback.feedback.discarded();
             }
             if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
-                buffer.release_target().release();
+                if buffer.data.is_shm() {
+                    buffer.release_target().release();
+                } else {
+                    releases.push(DmabufReleaseObligation {
+                        buffer_id: buffer.data.buffer_id(),
+                        release: buffer.release_target(),
+                    });
+                }
             }
         }
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             self.note_explicit_commit_destroyed(commit.surface_commit_id, "compositor_shutdown");
-            commit.pending.release_target().release();
+            let pending = commit.pending;
+            if pending.data.is_shm() {
+                pending.release_target().release();
+            } else {
+                releases.push(DmabufReleaseObligation {
+                    buffer_id: pending.data.buffer_id(),
+                    release: pending.release_target(),
+                });
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
+use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics};
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -153,9 +154,13 @@ impl OwnCompositorServer {
         if !self.shutdown_releases_armed {
             return;
         }
-        self.state.release_cached_resources_for_shutdown();
+        let mut dmabuf_releases = ShutdownDmabufReleaseSet::default();
+        self.state
+            .release_cached_resources_for_shutdown(&mut dmabuf_releases);
         self.state.discard_all_pending_presentation_feedbacks();
-        self.state.release_client_buffers_for_shutdown();
+        self.state
+            .release_client_buffers_for_shutdown_with(&mut dmabuf_releases);
+        dmabuf_releases.complete(&mut self.state);
         println!(
             "oblivion-one compliance: {:?}",
             self.state.compliance_metrics

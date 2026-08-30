@@ -1,9 +1,10 @@
-# Typhon DMA-BUF GPU Release Authority v1.2
+# Typhon DMA-BUF GPU Release Authority v1.3
 
-Date: 2026-08-29
+Date: 2026-08-30
 Repository: `/home/agony/GitHub/Typhon`
 Scope: v1.1 KMS-worker DirectPrimaryLease exclusion and deferred-release
-liveness, plus exact current-token eligibility and retry quiescence.
+liveness, v1.2 exact current-token eligibility and retry quiescence, plus v1.3
+shutdown exactly-once DMA-BUF completion.
 
 ## Outcome
 
@@ -407,6 +408,107 @@ pre-pageflip release qualification.
 
 No pointer-reposition file was modified or staged.
 
+## v1.3 shutdown exactly-once closure
+
+### Exact root cause
+
+The runtime exact-token ownership model was correct, but the final shutdown
+path force-completed each ownership container independently. Frame batches,
+retired batches, deferred and pending obligations, GPU leases, active DMA-BUF
+ownership, and an unmaterialized current DMA-BUF could therefore each call the
+low-level `complete_dmabuf_release()` for the same
+`SurfaceBufferRelease` token. Shutdown had already proven KMS and EGL teardown,
+so this was no longer an early hardware-release hazard, but it violated
+exactly-once protocol ownership.
+
+### Before and after shutdown ownership flow
+
+Before v1.3:
+
+```text
+cached commits -> direct release
+frame/deferred/GPU/active containers -> independent direct release
+same exact token in two containers -> two protocol completions
+```
+
+After v1.3:
+
+```text
+final proven shutdown boundary
+    -> drain cached and all client-buffer ownership containers
+    -> retain one ShutdownDmabufReleaseSet entry per
+       SurfaceBufferRelease::same_release_token()
+    -> complete unique DMA-BUF tokens once
+```
+
+The shared set is shutdown-local and is not used by normal runtime ownership.
+It deduplicates protocol-token identity, never `BufferId`: the same
+`wl_buffer` token is completed once, while one allocation with distinct
+explicit-sync timeline points remains two obligations. SHM cached,
+unmaterialized, and materialized shutdown paths retain their existing direct
+release behavior and are not routed through the DMA-BUF set.
+
+### Source audit
+
+`OwnCompositorServer::finish_commit_debug_for_shutdown()` now creates one set,
+passes it through `release_cached_resources_for_shutdown()` and
+`release_client_buffers_for_shutdown_with()`, then completes it after both
+ownership domains are drained. The client-buffer drain covers frame batches,
+retired batches, deferred obligations, pending obligations, GPU leases, active
+DMA-BUF obligations, and current unmaterialized DMA-BUF attachments. Cached
+subsurface commits and pending explicit-sync commits use the same set for
+DMA-BUF attachments. A compatibility wrapper for the state-only shutdown test
+path owns and completes its own local set. The existing shutdown armed guard
+still makes the server finalization boundary idempotent.
+
+No normal GPU lease, retry debt, current-token eligibility, Direct/KMS barrier,
+NativeRenderFence, O1, SHM, regional damage, KMS scheduling, or Direct Scanout
+code was changed.
+
+### RED/GREEN evidence
+
+The RED command against the pre-fix implementation was:
+
+```text
+rtk cargo test --lib shutdown_deduplicates -- --nocapture
+3 tests failed: active+deferred, active+frame-batch, and active+GPU-lease
+each observed 2 completions instead of 1
+```
+
+The distinct-explicit-point and repeated-finalization guards were added in the
+same TDD batch; the pre-fix source already exposed the independent direct
+completion behavior. After the shutdown collector was implemented:
+
+```text
+rtk cargo test --lib shutdown_deduplicates -- --nocapture: 3 passed
+rtk cargo test --lib shutdown_ -- --nocapture: 13 passed
+rtk cargo test --lib frame_consumption_tests -- --nocapture: 64 passed
+```
+
+The tests use the compositor's exact `SurfaceBufferRelease` token fixture with
+explicit-sync points. The distinct-point case uses one `BufferId` with two
+different points and therefore verifies that shutdown does not deduplicate by
+allocation identity. Existing Wayland protocol tests continue to cover real
+`wl_buffer` resources; no new native KMS protocol run was required for this
+teardown-only closure.
+
+### Files changed in v1.3
+
+- `src/compositor/state/frames.rs`: shutdown-local exact-token collection and
+  shared DMA-BUF completion after all client-buffer ownership is drained.
+- `src/compositor/state/shutdown.rs`: route cached and pending DMA-BUF
+  attachments through the shared shutdown collection while preserving SHM
+  release paths.
+- `src/compositor/server.rs`: share the collection across cached-resource and
+  client-buffer shutdown phases at the final server boundary.
+- `src/compositor/state/frame_tests.rs`: duplicate-token, distinct-explicit-
+  point, and repeated-shutdown regression coverage.
+- `docs/superpowers/plans/2026-08-30-typhon-dmabuf-gpu-release-authority-v1-3-plan.md`:
+  v1.3 implementation and verification checklist.
+- This report.
+
+No pointer-reposition or unlock work was modified or staged.
+
 ## Verification results
 
 Focused checks completed during this closure:
@@ -445,6 +547,21 @@ git status --short: clean after the v1.2 commit
 The two full-run failures are unrelated to this closure and both passed in
 isolation. The SIGCHLD test also passed independently. None of those modules
 were modified.
+
+### v1.3 final verification
+
+```text
+rtk cargo fmt --check: passed
+rtk cargo check: passed
+rtk cargo clippy --all-targets --all-features -- -D warnings: passed
+rtk cargo test --lib: 1,966 passed, 2 ignored
+rtk cargo test: 3,127 passed, 5 ignored, 40 filtered out
+git diff --check: passed before commit
+```
+
+The v1.3 aggregate test run was clean. No native DRM/KMS qualification was
+executed; this teardown-only change therefore makes no native-performance or
+real-KMS claim.
 
 No native DRM/KMS qualification was executed. Therefore this report makes no
 claim about native pre-pageflip release latency, 165 Hz measurements, or actual
