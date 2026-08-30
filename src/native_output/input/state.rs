@@ -13,6 +13,8 @@ pub(crate) struct NativeInputState {
     pub(crate) keyboard_shortcuts_inhibited: bool,
     keyboard_shortcut_inhibition_generation: u64,
     pub(crate) pointer_constraint: NativePointerConstraintState,
+    debug_input_epoch: Option<u64>,
+    debug_constraint_id: Option<PointerConstraintBackendId>,
     pub(crate) binding_manager: AstreaBindingManager,
     pub(crate) cursor_visible: bool,
     pub(crate) forwarded_control_keys: Vec<u16>,
@@ -37,6 +39,8 @@ impl NativeInputState {
             keyboard_shortcuts_inhibited: false,
             keyboard_shortcut_inhibition_generation: 0,
             pointer_constraint: NativePointerConstraintState::None,
+            debug_input_epoch: None,
+            debug_constraint_id: None,
             binding_manager: AstreaBindingManager::default(),
             cursor_visible: true,
             forwarded_control_keys: Vec::new(),
@@ -81,6 +85,15 @@ impl NativeInputState {
             x: self.cursor_x,
             y: self.cursor_y,
         }
+    }
+
+    pub(crate) fn set_native_input_epoch_debug(
+        &mut self,
+        epoch: Option<u64>,
+        constraint_id: Option<PointerConstraintBackendId>,
+    ) {
+        self.debug_input_epoch = epoch;
+        self.debug_constraint_id = constraint_id;
     }
 
     pub(crate) fn set_pointer_locked_at(&mut self, anchor: CompositorOutputPosition) {
@@ -416,7 +429,10 @@ impl NativeInputState {
         }
         native_pointer_debug_log_lazy(|| {
             format!(
-                "pointer.motion native locked={} absolute_updated={} relative=({},{}) cursor=({},{})",
+                "pointer.motion native epoch={:?} constraint={:?} timestamp_usec={} locked={} absolute_updated={} relative=({},{}) cursor=({},{})",
+                self.debug_input_epoch,
+                self.debug_constraint_id,
+                sample.timestamp_usec,
                 locked_at_start,
                 effect.pointer_motion.is_some(),
                 sample.relative.map(|relative| relative.dx).unwrap_or(0.0),

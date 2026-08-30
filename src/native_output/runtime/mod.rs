@@ -289,6 +289,7 @@ pub(crate) struct NativeRuntime {
     kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
     input_batch: NativeInputBatch,
+    input_epoch: NativeInputEpoch,
     seat_session: Option<NativeSeatSession>,
     session: NativeSessionLifecycle,
     pending_session_recovery: Option<NativeScanoutRecovery>,

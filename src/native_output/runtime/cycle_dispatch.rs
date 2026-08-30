@@ -24,6 +24,34 @@ fn input_requires_full_server_progression(
     may_change_pointer_constraints && !dispatch_wayland
 }
 
+fn settle_native_pointer_constraint_backend_requests(
+    input_epoch: &NativeInputEpoch,
+    server: &mut OwnCompositorServer,
+    backend: &mut NativePointerConstraintBackend,
+    input_state: &mut NativeInputState,
+    cursor_mode: NativeCursorRenderMode,
+    settlement_point: NativeInputConstraintSettlementPoint,
+) -> NativeResult<bool> {
+    if !input_epoch.constraint_settlement_allowed() {
+        let pending = server.pointer_constraint_backend_request_count();
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.constraint deferred epoch={:?} reason=input_epoch_active pending={}",
+                input_epoch.active_id(),
+                pending,
+            )
+        });
+        return Ok(false);
+    }
+    process_native_pointer_constraint_backend_requests(
+        server,
+        backend,
+        input_state,
+        cursor_mode,
+        settlement_point,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyCursorArgs {}
@@ -751,6 +779,7 @@ impl NativeRuntime {
             legacy_cursor,
             input_devices,
             input_batch,
+            input_epoch,
             acquire_notifier,
             acquire_watches,
             parked_acquire_watches: _,
@@ -779,6 +808,27 @@ impl NativeRuntime {
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
+        let pending_constraint_requests_before_settlement =
+            server.pointer_constraint_backend_request_count();
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.constraint pending_before_settlement={} epoch_active={:?} backlog_pending={}",
+                pending_constraint_requests_before_settlement,
+                input_epoch.active_id(),
+                input_epoch.backlog_pending(),
+            )
+        });
+        let mut redraw_requested = settle_native_pointer_constraint_backend_requests(
+            input_epoch,
+            server,
+            pointer_constraint_backend,
+            input_state,
+            *cursor_render_mode,
+            NativeInputConstraintSettlementPoint::BeforeInputEpoch,
+        )?;
+        synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
+        let pending_constraint_requests_before_read =
+            server.pointer_constraint_backend_request_count();
         let (accepted, tick_us, pacing_readiness_changed) = if dispatch_wayland {
             let tick_start = Instant::now();
             let (accepted, pacing_readiness_changed) = server.dispatch_wayland_with_outcome()?;
@@ -791,13 +841,16 @@ impl NativeRuntime {
         } else {
             (0, 0, false)
         };
-        let mut redraw_requested = process_native_pointer_constraint_backend_requests(
-            server,
-            pointer_constraint_backend,
-            input_state,
-            *cursor_render_mode,
-        )?;
-        synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
+        let pending_constraint_requests_after_read =
+            server.pointer_constraint_backend_request_count();
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.constraint pending_after_wayland_read={} queued_during_read={}",
+                pending_constraint_requests_after_read,
+                pending_constraint_requests_after_read
+                    .saturating_sub(pending_constraint_requests_before_read),
+            )
+        });
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
             for _ in *known_toplevels..current_toplevels {
@@ -839,6 +892,30 @@ impl NativeRuntime {
         input_devices.drain_events_into(input_batch);
         let input_drain_us = elapsed_micros(input_drain_start);
         let raw_input_events = input_batch.raw.len();
+        // The backend state captured here is authoritative for every event in
+        // this epoch. Protocol progress below may queue a new transition, but
+        // it cannot change the native semantics of this materialized batch.
+        let input_epoch_id = if raw_input_events > 0 || input_epoch.backlog_pending() {
+            let continuation = input_epoch.backlog_pending();
+            let epoch_id = input_epoch.begin(continuation);
+            let constraint = pointer_constraint_backend
+                .active
+                .as_ref()
+                .map(|constraint| (constraint.id, constraint.mode));
+            input_state.set_native_input_epoch_debug(Some(epoch_id), constraint.map(|(id, _)| id));
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "input.epoch begin id={} continuation={} constraint={:?} backlog_pending={}",
+                    epoch_id,
+                    continuation,
+                    constraint,
+                    input_epoch.backlog_pending(),
+                )
+            });
+            Some(epoch_id)
+        } else {
+            None
+        };
         for _ in 0..raw_input_events {
             render_telemetry
                 .resource_efficiency
@@ -857,8 +934,29 @@ impl NativeRuntime {
                 .max()
         })
         .flatten();
+        let oldest_input_timestamp_usec = input_batch
+            .raw
+            .iter()
+            .filter_map(|event| event.timestamp_usec())
+            .min();
+        let newest_input_timestamp_usec = input_batch
+            .raw
+            .iter()
+            .filter_map(|event| event.timestamp_usec())
+            .max();
         input_batch.coalesce_pointer_motion_events();
         let coalesced_input_events = input_batch.coalesced.len();
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "input.epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={}",
+                input_epoch_id,
+                raw_input_events,
+                coalesced_input_events,
+                oldest_input_timestamp_usec,
+                newest_input_timestamp_usec,
+                input_batch.budget_exhausted,
+            )
+        });
         for _ in 0..coalesced_input_events {
             render_telemetry
                 .resource_efficiency
@@ -941,6 +1039,7 @@ impl NativeRuntime {
                 dispatch_wayland,
                 may_change_pointer_constraints,
             ) {
+                let pending_before_tick = server.pointer_constraint_backend_request_count();
                 render_telemetry
                     .resource_efficiency
                     .record_server_tick_call();
@@ -952,18 +1051,17 @@ impl NativeRuntime {
                     }
                 };
                 redraw_requested |= pacing_visual_work;
-                redraw_requested |= match process_native_pointer_constraint_backend_requests(
-                    server,
-                    pointer_constraint_backend,
-                    input_state,
-                    *cursor_render_mode,
-                ) {
-                    Ok(redraw_requested) => redraw_requested,
-                    Err(error) => {
-                        let _ = server.end_native_input_batch();
-                        return Err(error);
-                    }
-                };
+                let pending_after_tick = server.pointer_constraint_backend_request_count();
+                if pending_after_tick > pending_before_tick {
+                    native_pointer_debug_log_lazy(|| {
+                        format!(
+                            "pointer.constraint deferred epoch={:?} reason=protocol_progression pending={} queued_during_tick={}",
+                            input_epoch.active_id(),
+                            pending_after_tick,
+                            pending_after_tick.saturating_sub(pending_before_tick),
+                        )
+                    });
+                }
                 if let Err(error) = synchronize_cursor_state_for_server(
                     server,
                     atomic_cursor,
@@ -978,11 +1076,28 @@ impl NativeRuntime {
         let interaction_reconciled =
             reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
         redraw_requested |= interaction_reconciled;
-        redraw_requested |= match process_native_pointer_constraint_backend_requests(
+        let completed_input_epoch = input_epoch_id;
+        input_epoch.finish(input_batch.budget_exhausted);
+        native_pointer_debug_log_lazy(|| {
+            format!(
+                "input.epoch end id={:?} raw={} coalesced={} budget_exhausted={} backlog_pending={}",
+                completed_input_epoch,
+                raw_input_events,
+                coalesced_input_events,
+                input_batch.budget_exhausted,
+                input_epoch.backlog_pending(),
+            )
+        });
+        if !input_epoch.backlog_pending() {
+            input_state.set_native_input_epoch_debug(None, None);
+        }
+        redraw_requested |= match settle_native_pointer_constraint_backend_requests(
+            input_epoch,
             server,
             pointer_constraint_backend,
             input_state,
             *cursor_render_mode,
+            NativeInputConstraintSettlementPoint::AfterInputEpoch(completed_input_epoch),
         ) {
             Ok(redraw_requested) => redraw_requested,
             Err(error) => {
@@ -1036,6 +1151,180 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::input_requires_full_server_progression;
+    use crate::native_output::input::NativeInputEpoch;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConstraintMode {
+        None,
+        Locked(u64),
+        Confined(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConstraintTransition {
+        ActivateLocked(u64),
+        ActivateConfined(u64),
+        Deactivate,
+    }
+
+    fn settle_if_allowed(
+        epoch: &NativeInputEpoch,
+        mode: &mut ConstraintMode,
+        transition: ConstraintTransition,
+    ) {
+        if !epoch.constraint_settlement_allowed() {
+            return;
+        }
+        *mode = match transition {
+            ConstraintTransition::ActivateLocked(generation) => ConstraintMode::Locked(generation),
+            ConstraintTransition::ActivateConfined(generation) => {
+                ConstraintMode::Confined(generation)
+            }
+            ConstraintTransition::Deactivate => ConstraintMode::None,
+        };
+    }
+
+    fn record_motion(
+        epoch: &NativeInputEpoch,
+        mode: ConstraintMode,
+        delta: f64,
+        result: &mut Vec<(Option<u64>, ConstraintMode, f64)>,
+    ) {
+        result.push((epoch.active_id(), mode, delta));
+    }
+
+    #[test]
+    fn current_dispatch_activation_waits_until_the_current_input_epoch_ends() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::None;
+        let mut results = Vec::new();
+        epoch.begin(false);
+
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(7));
+        record_motion(&epoch, mode, 60.0, &mut results);
+        epoch.finish(false);
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(7));
+        epoch.begin(false);
+        record_motion(&epoch, mode, 5.0, &mut results);
+
+        assert_eq!(
+            results,
+            vec![
+                (Some(1), ConstraintMode::None, 60.0),
+                (Some(2), ConstraintMode::Locked(7), 5.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_existing_activation_is_effective_before_the_new_input_epoch() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::None;
+        let mut results = Vec::new();
+
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(7));
+        epoch.begin(false);
+        record_motion(&epoch, mode, 60.0, &mut results);
+
+        assert_eq!(results, vec![(Some(1), ConstraintMode::Locked(7), 60.0)]);
+    }
+
+    #[test]
+    fn protocol_progression_cannot_change_generation_mid_batch() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::None;
+        let mut results = Vec::new();
+        epoch.begin(false);
+
+        record_motion(&epoch, mode, 10.0, &mut results);
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(8));
+        record_motion(&epoch, mode, 50.0, &mut results);
+        epoch.finish(false);
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(8));
+
+        assert_eq!(
+            results,
+            vec![
+                (Some(1), ConstraintMode::None, 10.0),
+                (Some(1), ConstraintMode::None, 50.0),
+            ]
+        );
+        assert_eq!(mode, ConstraintMode::Locked(8));
+    }
+
+    #[test]
+    fn protocol_progression_cannot_deactivate_mid_batch() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::Locked(9);
+        let mut results = Vec::new();
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(9));
+        epoch.begin(false);
+
+        record_motion(&epoch, mode, 10.0, &mut results);
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::Deactivate);
+        record_motion(&epoch, mode, 20.0, &mut results);
+        epoch.finish(false);
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::Deactivate);
+        epoch.begin(false);
+        record_motion(&epoch, mode, 5.0, &mut results);
+
+        assert_eq!(
+            results,
+            vec![
+                (Some(1), ConstraintMode::Locked(9), 10.0),
+                (Some(1), ConstraintMode::Locked(9), 20.0),
+                (Some(2), ConstraintMode::None, 5.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn confined_transition_uses_the_same_epoch_boundary() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::None;
+        let mut results = Vec::new();
+        epoch.begin(false);
+
+        record_motion(&epoch, mode, 10.0, &mut results);
+        settle_if_allowed(
+            &epoch,
+            &mut mode,
+            ConstraintTransition::ActivateConfined(11),
+        );
+        record_motion(&epoch, mode, 20.0, &mut results);
+        epoch.finish(false);
+        settle_if_allowed(
+            &epoch,
+            &mut mode,
+            ConstraintTransition::ActivateConfined(11),
+        );
+
+        assert_eq!(
+            results,
+            vec![
+                (Some(1), ConstraintMode::None, 10.0),
+                (Some(1), ConstraintMode::None, 20.0),
+            ]
+        );
+        assert_eq!(mode, ConstraintMode::Confined(11));
+    }
+
+    #[test]
+    fn a_budget_continuation_keeps_one_constraint_epoch_open() {
+        let mut epoch = NativeInputEpoch::default();
+        let mut mode = ConstraintMode::None;
+        epoch.begin(false);
+        epoch.finish(true);
+        assert!(epoch.backlog_pending());
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(12));
+        let continuation = epoch.begin(true);
+        assert_eq!(continuation, 1);
+        assert_eq!(mode, ConstraintMode::None);
+        epoch.finish(false);
+        assert!(!epoch.backlog_pending());
+        settle_if_allowed(&epoch, &mut mode, ConstraintTransition::ActivateLocked(12));
+        assert_eq!(mode, ConstraintMode::Locked(12));
+    }
 
     #[test]
     fn ordinary_pointer_motion_never_enters_full_server_progression() {

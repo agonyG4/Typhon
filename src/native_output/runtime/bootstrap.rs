@@ -599,6 +599,7 @@ impl NativeRuntime {
             legacy_cursor,
             input_devices,
             input_batch: NativeInputBatch::default(),
+            input_epoch: NativeInputEpoch::default(),
             seat_session,
             session: NativeSessionLifecycle::default(),
             pending_session_recovery: None,

@@ -1303,6 +1303,11 @@ impl OwnCompositorServer {
         self.state.take_pointer_constraint_backend_requests()
     }
 
+    #[allow(dead_code)] // Used by the native-output binary; the library target omits that runtime.
+    pub fn pointer_constraint_backend_request_count(&self) -> usize {
+        self.state.pointer_constraint_backend_request_count()
+    }
+
     #[doc(hidden)]
     pub fn take_pending_process_launches(&mut self) -> Vec<PendingProcessLaunch> {
         self.state.take_pending_process_launches()

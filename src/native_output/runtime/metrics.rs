@@ -424,6 +424,7 @@ impl NativeRuntime {
             } else {
                 None
             };
+        let input_backlog_deadline = self.input_epoch.backlog_pending().then_some(now_ns);
         self.event_loop.arm_deadline(earliest_native_deadline(
             earliest_native_deadline(
                 earliest_native_deadline(scheduler_deadline, visual_deadline),
@@ -432,7 +433,10 @@ impl NativeRuntime {
             earliest_native_deadline(
                 self.acquire_watches.next_fallback_deadline_ns(),
                 earliest_native_deadline(
-                    self.xwayland.next_deadline_ns(),
+                    earliest_native_deadline(
+                        self.xwayland.next_deadline_ns(),
+                        input_backlog_deadline,
+                    ),
                     earliest_native_deadline(
                         self.cursor_output_arbitration.deadline_ns(),
                         earliest_native_deadline(

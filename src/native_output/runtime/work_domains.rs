@@ -19,6 +19,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) xwayland_generation_changed: bool,
     pub(super) recovery_required: bool,
     pub(super) shutdown_requested: bool,
+    pub(super) input_backlog_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,7 +102,7 @@ impl NativeWorkDomains {
 
     pub(super) fn classify(wakeup: &NativeWakeup, state: &NativeRuntimeState) -> Self {
         let reasons = wakeup.reasons;
-        let input = reasons.input();
+        let input = reasons.input() || state.input_backlog_pending;
         let wayland_protocol = reasons.wayland_listener() || reasons.wayland_clients();
         let control = reasons.control();
         let children = reasons.child_signal();
@@ -225,6 +226,18 @@ mod tests {
     fn input_only_readiness_does_not_request_wayland_read_dispatch() {
         let domains = NativeWorkDomains::classify(&wakeup(INPUT), &state());
 
+        assert!(!domains.wayland_dispatch);
+    }
+
+    #[test]
+    fn pending_input_backlog_is_serviceable_without_new_fd_readiness() {
+        let mut state = state();
+        state.input_backlog_pending = true;
+
+        let domains = NativeWorkDomains::classify(&wakeup(0), &state);
+
+        assert!(domains.input);
+        assert!(domains.operation_plan().service_input);
         assert!(!domains.wayland_dispatch);
     }
 

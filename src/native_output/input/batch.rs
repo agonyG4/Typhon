@@ -1,9 +1,13 @@
 use super::*;
 
+pub(crate) const NATIVE_INPUT_DRAIN_BUDGET: usize = 256;
+
 #[derive(Debug, Default)]
 pub(crate) struct NativeInputBatch {
     pub(crate) raw: Vec<NativeHardwareInputEvent>,
     pub(crate) coalesced: Vec<NativeHardwareInputEvent>,
+    /// The bounded drain stopped before the backend reported exhaustion.
+    pub(crate) budget_exhausted: bool,
 }
 
 impl NativeInputBatch {

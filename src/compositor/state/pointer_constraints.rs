@@ -1605,4 +1605,9 @@ impl CompositorState {
     ) -> Vec<PointerConstraintBackendRequest> {
         std::mem::take(&mut self.pending_pointer_constraint_backend_requests)
     }
+
+    #[allow(dead_code)] // Used by the native-output binary; the library target omits that runtime.
+    pub(in crate::compositor) fn pointer_constraint_backend_request_count(&self) -> usize {
+        self.pending_pointer_constraint_backend_requests.len()
+    }
 }

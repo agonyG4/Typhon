@@ -67,6 +67,7 @@ impl NativeRuntime {
                 != self.xwayland_reactor_generation,
             recovery_required: self.pending_session_recovery.is_some(),
             shutdown_requested: cycle.shutdown_requested,
+            input_backlog_pending: self.input_epoch.backlog_pending(),
         }
     }
 
@@ -342,7 +343,7 @@ impl NativeRuntime {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
         }
-        if !presentation_work {
+        if !presentation_work || self.input_epoch.backlog_pending() {
             self.arm_runtime_deadline()?;
         }
         cycle.fast_path_completed = !prepare_outcome.acquire_service_ran && !presentation_work;

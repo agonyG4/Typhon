@@ -120,6 +120,54 @@ fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
 }
 
 #[test]
+fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
+        devices: vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("test-event"),
+        }],
+        suspended: false,
+    });
+    let events = vec![
+        LinuxInputEvent {
+            _time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_KEY,
+            code: KEY_P,
+            value: 1,
+        };
+        257
+    ];
+    let mut write = fs::File::from(write);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            events.as_ptr().cast::<u8>(),
+            events.len() * std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    write.write_all(bytes).unwrap();
+    drop(write);
+
+    let mut batch = NativeInputBatch::default();
+    backend.drain_events_into(&mut batch);
+    assert_eq!(batch.raw.len(), 256);
+    assert!(batch.budget_exhausted);
+
+    backend.drain_events_into(&mut batch);
+    assert_eq!(batch.raw.len(), 1);
+    assert!(!batch.budget_exhausted);
+}
+
+#[test]
 fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
     // SAFETY: this test serializes access to the process environment with

@@ -126,12 +126,12 @@ impl NativeInputBackend {
 
     pub(crate) fn drain_events_into(&mut self, batch: &mut NativeInputBatch) {
         batch.raw.clear();
-        match self {
+        batch.budget_exhausted = match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
-                backend.drain_events_into(&mut batch.raw);
+                backend.drain_events_into(&mut batch.raw)
             }
             Self::RawEvdev(backend) => backend.drain_events_into(&mut batch.raw),
-        }
+        };
     }
 
     #[cfg(test)]
@@ -238,19 +238,19 @@ impl LibinputInputBackend {
         })
     }
 
-    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
         if self.suspended {
-            return;
+            return false;
         }
-        self.drain_events_unconditionally(events);
+        self.drain_events_unconditionally(events)
     }
 
-    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
         if let Err(error) = self.input.dispatch() {
             eprintln!("native input: libinput dispatch failed: {error}");
-            return;
+            return false;
         }
         for event in &mut self.input {
             if let Some(event) = hardware_input_event_from_libinput(
@@ -260,18 +260,18 @@ impl LibinputInputBackend {
                 &mut self.scroll_v120_remainders,
             ) {
                 events.push(event);
-                if events.len() >= 256 {
-                    break;
+                if events.len() >= NATIVE_INPUT_DRAIN_BUDGET {
+                    return true;
                 }
             }
         }
+        false
     }
 
     fn discard_events_unconditionally(&mut self) {
-        let mut events = Vec::with_capacity(256);
+        let mut events = Vec::with_capacity(NATIVE_INPUT_DRAIN_BUDGET);
         loop {
-            self.drain_events_unconditionally(&mut events);
-            if events.len() != 256 {
+            if !self.drain_events_unconditionally(&mut events) {
                 break;
             }
         }
@@ -865,12 +865,12 @@ impl NativeInputDevices {
         }
     }
 
-    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
         if self.suspended {
-            return;
+            return false;
         }
-        self.drain_events_unconditionally(events);
+        self.drain_events_unconditionally(events)
     }
 
     #[cfg(test)]
@@ -880,25 +880,25 @@ impl NativeInputDevices {
         events
     }
 
-    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) {
+    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
         for device in &mut self.devices {
             while let Some(event) = read_linux_input_event(device) {
                 if let Some(event) = NativeHardwareInputEvent::from_linux_event(event) {
                     events.push(event);
                 }
-                if events.len() >= 256 {
-                    return;
+                if events.len() >= NATIVE_INPUT_DRAIN_BUDGET {
+                    return true;
                 }
             }
         }
+        false
     }
 
     fn discard_events_unconditionally(&mut self) {
-        let mut events = Vec::with_capacity(256);
+        let mut events = Vec::with_capacity(NATIVE_INPUT_DRAIN_BUDGET);
         loop {
-            self.drain_events_unconditionally(&mut events);
-            if events.is_empty() {
+            if !self.drain_events_unconditionally(&mut events) {
                 break;
             }
         }
@@ -1307,6 +1307,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     backend: &mut NativePointerConstraintBackend,
     input_state: &mut NativeInputState,
     cursor_mode: NativeCursorRenderMode,
+    settlement_point: NativeInputConstraintSettlementPoint,
 ) -> NativeResult<bool> {
     let mut redraw_requested = false;
     loop {
@@ -1318,8 +1319,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             let cursor_position = input_state.cursor_position_f64();
             native_pointer_debug_log_lazy(|| {
                 format!(
-                    "pointer.constraint native_request {:?} cursor=({},{})",
-                    request, cursor_position.x, cursor_position.y
+                    "pointer.constraint native_request epoch={:?} {:?} cursor=({},{})",
+                    settlement_point, request, cursor_position.x, cursor_position.y
                 )
             });
             if let Some(id) = pointer_constraint_activation_request_id(&request)
@@ -1327,8 +1328,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             {
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "pointer.constraint native_request dropped stale id={} generation={} rollback=not_needed",
-                        id.constraint_id, id.generation
+                        "pointer.constraint native_request dropped stale epoch={:?} id={} generation={} rollback=not_needed",
+                        settlement_point, id.constraint_id, id.generation
                     )
                 });
                 continue;
@@ -1337,8 +1338,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             if let Some((id, reason)) = action.failed {
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "pointer.constraint native_failed id={} generation={} reason={}",
-                        id.constraint_id, id.generation, reason
+                        "pointer.constraint native_failed epoch={:?} id={} generation={} reason={}",
+                        settlement_point, id.constraint_id, id.generation, reason
                     )
                 });
                 server.pointer_constraint_backend_failed(id, reason);
@@ -1346,7 +1347,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             if let Some(constraint) = action.activated {
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "pointer.constraint native_activated id={} generation={} mode={:?} anchor=({},{})",
+                        "pointer.constraint native_activated epoch={:?} id={} generation={} mode={:?} anchor=({},{})",
+                        settlement_point,
                         constraint.id.constraint_id,
                         constraint.id.generation,
                         constraint.mode,
@@ -1370,8 +1372,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             if let Some(restore_position) = action.restore_position {
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "pointer.unlock native_restore output=({},{})",
-                        restore_position.x, restore_position.y
+                        "pointer.unlock native_restore epoch={:?} output=({},{})",
+                        settlement_point, restore_position.x, restore_position.y
                     )
                 });
                 input_state.clear_pointer_constraint();
@@ -1385,8 +1387,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             if let Some(id) = action.deactivated {
                 native_pointer_debug_log_lazy(|| {
                     format!(
-                        "pointer.constraint native_deactivated id={} generation={}",
-                        id.constraint_id, id.generation
+                        "pointer.constraint native_deactivated epoch={:?} id={} generation={}",
+                        settlement_point, id.constraint_id, id.generation
                     )
                 });
                 server.pointer_constraint_backend_deactivated(id);
