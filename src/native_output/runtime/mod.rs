@@ -63,8 +63,9 @@ mod xwayland_reactor_tests;
 
 pub(super) use dmabuf_release::arm_composited_dmabuf_release;
 pub(crate) use dmabuf_release::{
-    DmabufGpuReleaseMetrics, DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety,
-    DmabufReleaseRetryReason, dmabuf_gpu_release_safety,
+    DmabufGpuReleaseMetrics, DmabufGpuReleaseOrigin, DmabufGpuReleaseQualificationSummary,
+    DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety, DmabufReleaseRetryReason,
+    dmabuf_gpu_release_safety,
 };
 use metrics::NativeRenderTelemetry;
 pub(crate) use resource_efficiency::{
@@ -462,6 +463,12 @@ impl NativeRuntime {
     pub(super) fn dmabuf_gpu_release_metrics(&self) -> DmabufGpuReleaseMetrics {
         self.dmabuf_gpu_release_registry.metrics()
     }
+
+    pub(super) fn dmabuf_gpu_release_qualification_summary(
+        &self,
+    ) -> DmabufGpuReleaseQualificationSummary {
+        self.dmabuf_gpu_release_registry.qualification_summary()
+    }
 }
 
 impl Drop for NativeRuntime {
@@ -662,6 +669,32 @@ impl Drop for NativeRuntime {
             dmabuf_release_metrics.retry_skipped_current_token,
             dmabuf_release_metrics.active_leases,
             dmabuf_release_metrics.peak_active_leases,
+        );
+        let dmabuf_qualification = self.dmabuf_gpu_release_qualification_summary();
+        println!(
+            "typhon pacing: event=dmabuf_gpu_release_timing_summary composited_correlations_armed={} composited_correlations_paired={} release_before_pageflip_leases={} release_before_pageflip_obligations={} release_after_pageflip_leases={} release_after_pageflip_obligations={} release_same_timestamp_leases={} exact_signal_timestamps={} signal_timestamp_unavailable={} timestamp_order_anomalies={} correlation_pending={} correlation_overflows={} correlation_duplicates={} gpu_release_fence_wait_p50_us={} gpu_release_fence_wait_p95_us={} gpu_release_fence_wait_p99_us={} release_to_pageflip_lead_p50_us={} release_to_pageflip_lead_p95_us={} release_to_pageflip_lead_p99_us={} pageflip_to_release_lag_p50_us={} pageflip_to_release_lag_p95_us={} pageflip_to_release_lag_p99_us={}",
+            dmabuf_qualification.composited_correlations_armed,
+            dmabuf_qualification.composited_correlations_paired,
+            dmabuf_qualification.release_before_pageflip_leases,
+            dmabuf_qualification.release_before_pageflip_obligations,
+            dmabuf_qualification.release_after_pageflip_leases,
+            dmabuf_qualification.release_after_pageflip_obligations,
+            dmabuf_qualification.release_same_timestamp_leases,
+            dmabuf_qualification.exact_signal_timestamps,
+            dmabuf_qualification.signal_timestamp_unavailable,
+            dmabuf_qualification.timestamp_order_anomalies,
+            dmabuf_qualification.correlation_pending,
+            dmabuf_qualification.correlation_overflows,
+            dmabuf_qualification.correlation_duplicates,
+            dmabuf_qualification.gpu_release_fence_wait_p50_us,
+            dmabuf_qualification.gpu_release_fence_wait_p95_us,
+            dmabuf_qualification.gpu_release_fence_wait_p99_us,
+            dmabuf_qualification.release_to_pageflip_lead_p50_us,
+            dmabuf_qualification.release_to_pageflip_lead_p95_us,
+            dmabuf_qualification.release_to_pageflip_lead_p99_us,
+            dmabuf_qualification.pageflip_to_release_lag_p50_us,
+            dmabuf_qualification.pageflip_to_release_lag_p95_us,
+            dmabuf_qualification.pageflip_to_release_lag_p99_us,
         );
     }
 }

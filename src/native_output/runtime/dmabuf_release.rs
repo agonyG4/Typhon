@@ -1,18 +1,25 @@
 use std::{
     collections::HashMap,
     io,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
 };
 
 use oblivion_one::compositor::{DmabufGpuReleaseLeaseId, OwnCompositorServer};
-use oblivion_one::native::event_loop::{NativeEventLoop, NativeEventSource, ReactorToken};
+use oblivion_one::native::{
+    event_loop::{NativeEventLoop, NativeEventSource, ReactorToken},
+    sync_file::query_sync_file_info,
+};
 
 use crate::native_output::NativePerfField;
+use crate::native_output::OutputTransactionId;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
+use crate::native_output::pacing::BoundedSamples;
 use crate::native_output::scanout::AtomicEglGbmScanout;
 
 const DMABUF_RELEASE_RETRY_BASE_DELAY_NS: u64 = 1_000_000;
 const DMABUF_RELEASE_RETRY_MAX_DELAY_NS: u64 = 250_000_000;
+pub(crate) const DMABUF_GPU_RELEASE_CORRELATION_CAPACITY: usize = 256;
+const DMABUF_GPU_RELEASE_SAMPLE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DmabufGpuReleaseSafety {
@@ -68,6 +75,209 @@ pub(crate) enum DmabufReleaseRetryReason {
     DirectKmsOwnershipBlocked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufGpuReleaseOrigin {
+    Composited {
+        transaction_id: OutputTransactionId,
+    },
+    NoVisual,
+    DeferredRetry,
+    #[cfg(test)]
+    Uncorrelated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DmabufGpuReleaseCorrelation {
+    obligation_count: usize,
+    registered_at_ns: u64,
+    gpu_signal_ns: Option<u64>,
+    pageflip_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DmabufGpuReleaseQualificationSummary {
+    pub(crate) composited_correlations_armed: u64,
+    pub(crate) composited_correlations_paired: u64,
+    pub(crate) release_before_pageflip_leases: u64,
+    pub(crate) release_before_pageflip_obligations: u64,
+    pub(crate) release_after_pageflip_leases: u64,
+    pub(crate) release_after_pageflip_obligations: u64,
+    pub(crate) release_same_timestamp_leases: u64,
+    pub(crate) exact_signal_timestamps: u64,
+    pub(crate) signal_timestamp_unavailable: u64,
+    pub(crate) timestamp_order_anomalies: u64,
+    pub(crate) correlation_pending: usize,
+    pub(crate) correlation_overflows: u64,
+    pub(crate) correlation_duplicates: u64,
+    pub(crate) gpu_release_fence_wait_p50_us: u64,
+    pub(crate) gpu_release_fence_wait_p95_us: u64,
+    pub(crate) gpu_release_fence_wait_p99_us: u64,
+    pub(crate) release_to_pageflip_lead_p50_us: u64,
+    pub(crate) release_to_pageflip_lead_p95_us: u64,
+    pub(crate) release_to_pageflip_lead_p99_us: u64,
+    pub(crate) pageflip_to_release_lag_p50_us: u64,
+    pub(crate) pageflip_to_release_lag_p95_us: u64,
+    pub(crate) pageflip_to_release_lag_p99_us: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DmabufGpuReleaseObservability {
+    correlations: HashMap<OutputTransactionId, DmabufGpuReleaseCorrelation>,
+    summary: DmabufGpuReleaseQualificationSummary,
+    fence_wait_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+    release_to_pageflip_lead_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+    pageflip_to_release_lag_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+}
+
+impl DmabufGpuReleaseObservability {
+    fn arm_composited(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        obligation_count: usize,
+        registered_at_ns: u64,
+    ) -> bool {
+        self.summary.composited_correlations_armed =
+            self.summary.composited_correlations_armed.saturating_add(1);
+        if self.correlations.contains_key(&transaction_id) {
+            self.summary.correlation_duplicates =
+                self.summary.correlation_duplicates.saturating_add(1);
+            return false;
+        }
+        if self.correlations.len() >= DMABUF_GPU_RELEASE_CORRELATION_CAPACITY {
+            self.summary.correlation_overflows =
+                self.summary.correlation_overflows.saturating_add(1);
+            return false;
+        }
+        self.correlations.insert(
+            transaction_id,
+            DmabufGpuReleaseCorrelation {
+                obligation_count,
+                registered_at_ns,
+                gpu_signal_ns: None,
+                pageflip_ns: None,
+            },
+        );
+        true
+    }
+
+    fn note_gpu_signal(&mut self, transaction_id: OutputTransactionId, signal_ns: u64) {
+        let Some(correlation) = self.correlations.get_mut(&transaction_id) else {
+            return;
+        };
+        correlation.gpu_signal_ns = Some(signal_ns);
+        self.finish_if_paired(transaction_id);
+    }
+
+    pub(crate) fn note_composited_pageflip(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        pageflip_ns: u64,
+    ) {
+        let Some(correlation) = self.correlations.get_mut(&transaction_id) else {
+            return;
+        };
+        correlation.pageflip_ns = Some(pageflip_ns);
+        self.finish_if_paired(transaction_id);
+    }
+
+    fn finish_if_paired(&mut self, transaction_id: OutputTransactionId) {
+        let Some(correlation) = self.correlations.get(&transaction_id).copied() else {
+            return;
+        };
+        let (Some(gpu_signal_ns), Some(pageflip_ns)) =
+            (correlation.gpu_signal_ns, correlation.pageflip_ns)
+        else {
+            return;
+        };
+        self.correlations.remove(&transaction_id);
+        self.summary.composited_correlations_paired = self
+            .summary
+            .composited_correlations_paired
+            .saturating_add(1);
+        match gpu_signal_ns.cmp(&pageflip_ns) {
+            std::cmp::Ordering::Less => {
+                self.summary.release_before_pageflip_leases = self
+                    .summary
+                    .release_before_pageflip_leases
+                    .saturating_add(1);
+                self.summary.release_before_pageflip_obligations = self
+                    .summary
+                    .release_before_pageflip_obligations
+                    .saturating_add(correlation.obligation_count as u64);
+                self.release_to_pageflip_lead_ns
+                    .record(pageflip_ns.saturating_sub(gpu_signal_ns));
+            }
+            std::cmp::Ordering::Equal => {
+                self.summary.release_same_timestamp_leases =
+                    self.summary.release_same_timestamp_leases.saturating_add(1);
+            }
+            std::cmp::Ordering::Greater => {
+                self.summary.release_after_pageflip_leases =
+                    self.summary.release_after_pageflip_leases.saturating_add(1);
+                self.summary.release_after_pageflip_obligations = self
+                    .summary
+                    .release_after_pageflip_obligations
+                    .saturating_add(correlation.obligation_count as u64);
+                self.pageflip_to_release_lag_ns
+                    .record(gpu_signal_ns.saturating_sub(pageflip_ns));
+            }
+        }
+    }
+
+    fn record_exact_signal(
+        &mut self,
+        origin: DmabufGpuReleaseOrigin,
+        registered_at_ns: u64,
+        signal_ns: u64,
+    ) {
+        self.summary.exact_signal_timestamps =
+            self.summary.exact_signal_timestamps.saturating_add(1);
+        if registered_at_ns == 0 {
+            // Test-only or legacy uncorrelated registrations have no
+            // trustworthy registration timestamp for a wait sample.
+        } else if signal_ns < registered_at_ns {
+            self.summary.timestamp_order_anomalies =
+                self.summary.timestamp_order_anomalies.saturating_add(1);
+        } else {
+            self.fence_wait_ns
+                .record(signal_ns.saturating_sub(registered_at_ns));
+        }
+        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
+            self.note_gpu_signal(transaction_id, signal_ns);
+        }
+    }
+
+    #[cfg(test)]
+    fn note_non_composited_signal(&mut self, origin: DmabufGpuReleaseOrigin) {
+        debug_assert!(!matches!(origin, DmabufGpuReleaseOrigin::Composited { .. }));
+        self.summary.exact_signal_timestamps =
+            self.summary.exact_signal_timestamps.saturating_add(1);
+    }
+
+    fn note_timestamp_unavailable(&mut self) {
+        self.summary.signal_timestamp_unavailable =
+            self.summary.signal_timestamp_unavailable.saturating_add(1);
+    }
+
+    fn summary(&self) -> DmabufGpuReleaseQualificationSummary {
+        let (wait_p50, wait_p95, wait_p99) = self.fence_wait_ns.percentiles();
+        let (lead_p50, lead_p95, lead_p99) = self.release_to_pageflip_lead_ns.percentiles();
+        let (lag_p50, lag_p95, lag_p99) = self.pageflip_to_release_lag_ns.percentiles();
+        let mut summary = self.summary;
+        summary.correlation_pending = self.correlations.len();
+        summary.gpu_release_fence_wait_p50_us = wait_p50 / 1_000;
+        summary.gpu_release_fence_wait_p95_us = wait_p95 / 1_000;
+        summary.gpu_release_fence_wait_p99_us = wait_p99 / 1_000;
+        summary.release_to_pageflip_lead_p50_us = lead_p50 / 1_000;
+        summary.release_to_pageflip_lead_p95_us = lead_p95 / 1_000;
+        summary.release_to_pageflip_lead_p99_us = lead_p99 / 1_000;
+        summary.pageflip_to_release_lag_p50_us = lag_p50 / 1_000;
+        summary.pageflip_to_release_lag_p95_us = lag_p95 / 1_000;
+        summary.pageflip_to_release_lag_p99_us = lag_p99 / 1_000;
+        summary
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum DmabufReleaseRetryState {
     #[default]
@@ -101,6 +311,8 @@ pub(crate) struct DmabufGpuReleaseMetrics {
 struct DmabufGpuReleaseWatch {
     lease_id: DmabufGpuReleaseLeaseId,
     completion_fd: OwnedFd,
+    origin: DmabufGpuReleaseOrigin,
+    registered_at_ns: u64,
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +320,7 @@ pub(crate) struct DmabufGpuReleaseRegistry {
     next_lease_id: u64,
     watches: HashMap<ReactorToken, DmabufGpuReleaseWatch>,
     metrics: DmabufGpuReleaseMetrics,
+    observability: DmabufGpuReleaseObservability,
     retry: DmabufReleaseRetryState,
 }
 
@@ -123,11 +336,31 @@ impl DmabufGpuReleaseRegistry {
         Ok(DmabufGpuReleaseLeaseId::new(id))
     }
 
+    #[cfg(test)]
     pub(crate) fn register(
         &mut self,
         lease_id: DmabufGpuReleaseLeaseId,
         completion_fd: OwnedFd,
         event_loop: &mut NativeEventLoop,
+    ) -> io::Result<ReactorToken> {
+        self.register_with_origin(
+            lease_id,
+            completion_fd,
+            event_loop,
+            DmabufGpuReleaseOrigin::Uncorrelated,
+            0,
+            0,
+        )
+    }
+
+    pub(crate) fn register_with_origin(
+        &mut self,
+        lease_id: DmabufGpuReleaseLeaseId,
+        completion_fd: OwnedFd,
+        event_loop: &mut NativeEventLoop,
+        origin: DmabufGpuReleaseOrigin,
+        obligation_count: usize,
+        registered_at_ns: u64,
     ) -> io::Result<ReactorToken> {
         if self
             .watches
@@ -149,6 +382,8 @@ impl DmabufGpuReleaseRegistry {
                 DmabufGpuReleaseWatch {
                     lease_id,
                     completion_fd,
+                    origin,
+                    registered_at_ns,
                 },
             )
             .is_some()
@@ -157,6 +392,10 @@ impl DmabufGpuReleaseRegistry {
             return Err(io::Error::other(
                 "native reactor returned a duplicate DMA-BUF release token",
             ));
+        }
+        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
+            self.observability
+                .arm_composited(transaction_id, obligation_count, registered_at_ns);
         }
         self.metrics.leases_registered = self.metrics.leases_registered.saturating_add(1);
         self.metrics.fences_created = self.metrics.fences_created.saturating_add(1);
@@ -279,6 +518,19 @@ impl DmabufGpuReleaseRegistry {
         self.metrics
     }
 
+    pub(crate) fn qualification_summary(&self) -> DmabufGpuReleaseQualificationSummary {
+        self.observability.summary()
+    }
+
+    pub(crate) fn note_composited_pageflip(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        pageflip_ns: u64,
+    ) {
+        self.observability
+            .note_composited_pageflip(transaction_id, pageflip_ns);
+    }
+
     #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
         self.watches.len()
@@ -290,15 +542,32 @@ impl DmabufGpuReleaseRegistry {
         event_loop: &mut NativeEventLoop,
         server: &mut OwnCompositorServer,
     ) -> io::Result<usize> {
-        self.service_ready_with(tokens, event_loop, |lease_id| {
-            server.complete_dmabuf_gpu_release_lease(lease_id)
-        })
+        self.service_ready_with_timestamp(
+            tokens,
+            event_loop,
+            |watch| {
+                query_sync_file_info(watch.completion_fd.as_fd())
+                    .map(|info| Some(info.signal_timestamp_ns))
+            },
+            |lease_id| server.complete_dmabuf_gpu_release_lease(lease_id),
+        )
     }
 
+    #[cfg(test)]
     fn service_ready_with(
         &mut self,
         tokens: &[ReactorToken],
         event_loop: &mut NativeEventLoop,
+        complete: impl FnMut(DmabufGpuReleaseLeaseId) -> usize,
+    ) -> io::Result<usize> {
+        self.service_ready_with_timestamp(tokens, event_loop, |_| Ok(None), complete)
+    }
+
+    fn service_ready_with_timestamp(
+        &mut self,
+        tokens: &[ReactorToken],
+        event_loop: &mut NativeEventLoop,
+        mut timestamp: impl FnMut(&DmabufGpuReleaseWatch) -> io::Result<Option<u64>>,
         mut complete: impl FnMut(DmabufGpuReleaseLeaseId) -> usize,
     ) -> io::Result<usize> {
         let mut completed = 0;
@@ -312,8 +581,16 @@ impl DmabufGpuReleaseRegistry {
             let Some(watch) = self.watches.remove(&token) else {
                 continue;
             };
-            let _completion_fd = watch.completion_fd;
+            match timestamp(&watch) {
+                Ok(Some(signal_ns)) => self.observability.record_exact_signal(
+                    watch.origin,
+                    watch.registered_at_ns,
+                    signal_ns,
+                ),
+                Ok(None) | Err(_) => self.observability.note_timestamp_unavailable(),
+            }
             let watch_completed = complete(watch.lease_id);
+            let _completion_fd = watch.completion_fd;
             completed += watch_completed;
             self.metrics.leases_completed = self.metrics.leases_completed.saturating_add(1);
             self.metrics.obligations_completed = self
@@ -357,6 +634,7 @@ impl DmabufGpuReleaseRegistry {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn arm_composited_dmabuf_release(
     registry: &mut DmabufGpuReleaseRegistry,
     server: &mut OwnCompositorServer,
@@ -365,6 +643,7 @@ pub(crate) fn arm_composited_dmabuf_release(
     event_loop: &mut NativeEventLoop,
     batch_id: oblivion_one::compositor::CompositorFrameBatchId,
     lease_id: Option<DmabufGpuReleaseLeaseId>,
+    transaction_id: OutputTransactionId,
 ) -> io::Result<usize> {
     let Some(lease_id) = lease_id else {
         return Ok(0);
@@ -385,7 +664,14 @@ pub(crate) fn arm_composited_dmabuf_release(
         return Ok(0);
     }
     registry.note_obligations_armed(transferred);
-    match registry.register(lease_id, completion_fd, event_loop) {
+    match registry.register_with_origin(
+        lease_id,
+        completion_fd,
+        event_loop,
+        DmabufGpuReleaseOrigin::Composited { transaction_id },
+        transferred,
+        oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(0),
+    ) {
         Ok(_) => Ok(transferred),
         Err(_) => {
             registry.note_registration_failure();
@@ -473,10 +759,13 @@ impl super::NativeRuntime {
         }
         self.dmabuf_gpu_release_registry
             .note_obligations_armed(transferred);
-        match self.dmabuf_gpu_release_registry.register(
+        match self.dmabuf_gpu_release_registry.register_with_origin(
             lease_id,
             completion_fd,
             &mut self.event_loop,
+            DmabufGpuReleaseOrigin::DeferredRetry,
+            transferred,
+            now_ns,
         ) {
             Ok(_) => {
                 self.dmabuf_gpu_release_registry.complete_retry();
@@ -684,5 +973,245 @@ mod tests {
         assert_eq!(registry.retry_deadline_ns(), None);
         assert_eq!(registry.retry_attempts(), 0);
         assert_eq!(registry.metrics().retry_skipped_current_token, 1_000);
+    }
+
+    fn transaction_id(value: u64) -> crate::native_output::OutputTransactionId {
+        crate::native_output::OutputTransactionId::new(
+            std::num::NonZeroU64::new(value).expect("transaction ID is non-zero"),
+        )
+    }
+
+    #[test]
+    fn qualification_classifies_gpu_completion_before_pageflip_by_timestamp() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(1);
+        observability.arm_composited(transaction_id, 3, 1_000_000);
+        observability.note_gpu_signal(transaction_id, 2_000_000);
+        observability.note_composited_pageflip(transaction_id, 5_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.composited_correlations_paired, 1);
+        assert_eq!(summary.release_before_pageflip_leases, 1);
+        assert_eq!(summary.release_before_pageflip_obligations, 3);
+        assert_eq!(summary.release_to_pageflip_lead_p50_us, 3_000);
+    }
+
+    #[test]
+    fn qualification_classifies_gpu_completion_after_pageflip_by_timestamp() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(2);
+        observability.arm_composited(transaction_id, 2, 1_000_000);
+        observability.note_composited_pageflip(transaction_id, 4_000_000);
+        observability.note_gpu_signal(transaction_id, 5_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.release_after_pageflip_leases, 1);
+        assert_eq!(summary.release_after_pageflip_obligations, 2);
+        assert_eq!(summary.pageflip_to_release_lag_p50_us, 1_000);
+    }
+
+    #[test]
+    fn qualification_equal_timestamps_are_not_before_or_after() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(3);
+        observability.arm_composited(transaction_id, 1, 1_000_000);
+        observability.note_gpu_signal(transaction_id, 4_000_000);
+        observability.note_composited_pageflip(transaction_id, 4_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.release_same_timestamp_leases, 1);
+        assert_eq!(summary.release_before_pageflip_leases, 0);
+        assert_eq!(summary.release_after_pageflip_leases, 0);
+    }
+
+    #[test]
+    fn qualification_uses_physical_timestamps_not_delivery_order() {
+        let mut gpu_first = DmabufGpuReleaseObservability::default();
+        let first = transaction_id(4);
+        gpu_first.arm_composited(first, 1, 1_000_000);
+        gpu_first.note_gpu_signal(first, 1_100_000);
+        gpu_first.note_composited_pageflip(first, 1_000_000);
+
+        let mut pageflip_first = DmabufGpuReleaseObservability::default();
+        let second = transaction_id(5);
+        pageflip_first.arm_composited(second, 1, 1_000_000);
+        pageflip_first.note_composited_pageflip(second, 1_100_000);
+        pageflip_first.note_gpu_signal(second, 1_000_000);
+
+        assert_eq!(gpu_first.summary().release_after_pageflip_leases, 1);
+        assert_eq!(pageflip_first.summary().release_before_pageflip_leases, 1);
+    }
+
+    #[test]
+    fn timestamp_unavailability_does_not_classify_or_block_release() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let (read, write) = pipe();
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        let id = lease_id(&mut registry);
+        let token = registry
+            .register_with_origin(
+                id,
+                read,
+                &mut event_loop,
+                DmabufGpuReleaseOrigin::Composited {
+                    transaction_id: transaction_id(6),
+                },
+                1,
+                1_000_000,
+            )
+            .unwrap();
+        unsafe { libc::write(write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+        let wakeup = event_loop.wait().unwrap();
+        let mut completed = Vec::new();
+        registry
+            .service_ready_with_timestamp(
+                &wakeup.dmabuf_gpu_release_tokens,
+                &mut event_loop,
+                |_| Err(io::Error::other("timestamp unavailable")),
+                |lease_id| {
+                    completed.push(lease_id);
+                    1
+                },
+            )
+            .unwrap();
+
+        assert_eq!(completed, vec![id]);
+        let summary = registry.qualification_summary();
+        assert_eq!(summary.signal_timestamp_unavailable, 1);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(event_loop.source_for_token(token), None);
+    }
+
+    #[test]
+    fn no_visual_and_deferred_retry_origins_do_not_create_pageflip_pairs() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        observability.note_non_composited_signal(DmabufGpuReleaseOrigin::NoVisual);
+        observability.note_non_composited_signal(DmabufGpuReleaseOrigin::DeferredRetry);
+
+        let summary = observability.summary();
+        assert_eq!(summary.exact_signal_timestamps, 2);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(summary.release_before_pageflip_leases, 0);
+        assert_eq!(summary.release_after_pageflip_leases, 0);
+    }
+
+    #[test]
+    fn qualification_fence_wait_percentiles_use_bounded_samples() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        for (index, wait_ns) in [1, 2, 3, 4, 5].into_iter().enumerate() {
+            observability.record_exact_signal(
+                DmabufGpuReleaseOrigin::NoVisual,
+                (index as u64 + 1) * 1_000_000,
+                (index as u64 + 1) * 1_000_000 + wait_ns * 1_000_000,
+            );
+        }
+
+        let summary = observability.summary();
+        assert_eq!(summary.gpu_release_fence_wait_p50_us, 3_000);
+        assert_eq!(summary.gpu_release_fence_wait_p95_us, 5_000);
+        assert_eq!(summary.gpu_release_fence_wait_p99_us, 5_000);
+    }
+
+    #[test]
+    fn inverted_registration_and_signal_timestamps_are_excluded_from_wait_samples() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        observability.record_exact_signal(DmabufGpuReleaseOrigin::NoVisual, 5_000_000, 4_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.timestamp_order_anomalies, 1);
+        assert_eq!(summary.gpu_release_fence_wait_p50_us, 0);
+    }
+
+    #[test]
+    fn qualification_correlation_capacity_is_bounded() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        for value in 1..=(DMABUF_GPU_RELEASE_CORRELATION_CAPACITY as u64 + 7) {
+            let _ = observability.arm_composited(transaction_id(value), 1, value);
+        }
+
+        let summary = observability.summary();
+        assert_eq!(
+            summary.correlation_pending,
+            DMABUF_GPU_RELEASE_CORRELATION_CAPACITY
+        );
+        assert_eq!(summary.correlation_overflows, 7);
+    }
+
+    #[test]
+    fn qualification_pairs_only_matching_transactions() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let first = transaction_id(300);
+        let second = transaction_id(301);
+        let third = transaction_id(302);
+        observability.arm_composited(first, 1, 1);
+        observability.arm_composited(second, 2, 1);
+        observability.arm_composited(third, 3, 1);
+        observability.note_composited_pageflip(second, 20);
+        observability.note_gpu_signal(third, 30);
+        observability.note_gpu_signal(second, 10);
+        observability.note_composited_pageflip(third, 40);
+
+        let summary = observability.summary();
+        assert_eq!(summary.composited_correlations_paired, 2);
+        assert_eq!(summary.release_before_pageflip_obligations, 5);
+        assert_eq!(summary.correlation_pending, 1);
+    }
+
+    #[test]
+    fn duplicate_transaction_correlation_does_not_replace_original() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(400);
+        assert!(observability.arm_composited(transaction_id, 1, 1));
+        assert!(!observability.arm_composited(transaction_id, 2, 2));
+        observability.note_gpu_signal(transaction_id, 3);
+        observability.note_composited_pageflip(transaction_id, 4);
+
+        let summary = observability.summary();
+        assert_eq!(summary.correlation_duplicates, 1);
+        assert_eq!(summary.release_before_pageflip_obligations, 1);
+    }
+
+    #[test]
+    fn normal_registered_lease_completes_once_while_correlation_is_metrics_only() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let (read, write) = pipe();
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        let id = lease_id(&mut registry);
+        let transaction_id = transaction_id(500);
+        let token = registry
+            .register_with_origin(
+                id,
+                read,
+                &mut event_loop,
+                DmabufGpuReleaseOrigin::Composited { transaction_id },
+                3,
+                1_000,
+            )
+            .unwrap();
+        unsafe { libc::write(write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+        let wakeup = event_loop.wait().unwrap();
+        let mut completions = 0;
+        registry
+            .service_ready_with_timestamp(
+                &wakeup.dmabuf_gpu_release_tokens,
+                &mut event_loop,
+                |_| Ok(Some(2_000)),
+                |_| {
+                    completions += 1;
+                    3
+                },
+            )
+            .unwrap();
+        registry.note_composited_pageflip(transaction_id, 3_000);
+
+        assert_eq!(completions, 1);
+        assert_eq!(registry.metrics().leases_completed, 1);
+        assert_eq!(
+            registry
+                .qualification_summary()
+                .composited_correlations_paired,
+            1
+        );
+        assert_eq!(event_loop.source_for_token(token), None);
     }
 }

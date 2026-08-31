@@ -189,6 +189,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: _,
             event_loop,
+            dmabuf_gpu_release_registry,
             drm_reactor_token: _,
             output_render_fence_token,
             kms_commit_worker,
@@ -805,6 +806,8 @@ impl NativeRuntime {
                         )
                         .into());
                     }
+                    dmabuf_gpu_release_registry
+                        .note_composited_pageflip(transaction_id, presented_at_ns);
                     if !scene_history.promote_pageflip(pageflip_token.get()) {
                         return Err(io::Error::other(
                             "composited pageflip scene promotion did not match transition",

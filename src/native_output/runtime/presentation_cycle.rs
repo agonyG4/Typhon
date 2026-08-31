@@ -1177,10 +1177,13 @@ impl NativeRuntime {
                                     let completion_fd = release_fence.duplicate_completion_fd();
                                     match completion_fd {
                                         Ok(completion_fd) => {
-                                            match dmabuf_gpu_release_registry.register(
+                                            match dmabuf_gpu_release_registry.register_with_origin(
                                                 lease_id,
                                                 completion_fd,
                                                 event_loop,
+                                                DmabufGpuReleaseOrigin::NoVisual,
+                                                0,
+                                                monotonic_now_ns().unwrap_or(0),
                                             ) {
                                                 Ok(_) => {
                                                     dmabuf_gpu_release_registry
@@ -1255,6 +1258,7 @@ impl NativeRuntime {
                                     event_loop,
                                     protocol_batch_id,
                                     dmabuf_gpu_release_lease_id,
+                                    transaction_id,
                                 )?;
                                 if o1_admission.is_some_and(|admission| admission.used_extra_credit) {
                                     frame_pacing.note_o1_credit2_extra_credit_consumed();
