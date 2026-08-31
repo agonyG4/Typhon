@@ -113,3 +113,21 @@ actual native settlement boundary.
 - Existing pointer and resource-efficiency behavior remains green.
 - Sober/Roblox remains an interactive qualification item, not a deterministic
   test claim.
+
+## Verification record
+
+- RED: the real compositor/resource backlog regression delivered the pending
+  motion to a relative-pointer resource created after the semantic transition.
+- RED: the real compositor anchor regression retained the request-time anchor
+  `(92.0, 86.0)` after the settlement position had moved to `(100.0, 92.0)`.
+- GREEN: the backlog resource regression now delivers zero old samples and
+  the next real sample exactly; the mid-batch read gate and settlement-anchor
+  regressions pass.
+- GREEN: focused pointer/relative/constraint, native pointer-backend, native
+  input/coalescing, cycle-dispatch, resource-efficiency, and work-domain
+  suites pass.
+- GREEN: `cargo fmt --check`, `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets -- -D warnings`,
+  `cargo test --locked`, and `git diff --check` pass.
+- Sober/Roblox was not run interactively by the agent; runtime qualification
+  remains a user-facing step.
