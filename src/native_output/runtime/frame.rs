@@ -651,8 +651,8 @@ impl NativePointerConstraintBackend {
         cursor_position: CompositorOutputPosition,
     ) -> NativePointerConstraintBackendAction {
         match request {
-            PointerConstraintBackendRequest::ActivateLocked { id, anchor } => {
-                self.activate_locked(id, anchor)
+            PointerConstraintBackendRequest::ActivateLocked { id } => {
+                self.activate_locked(id, cursor_position)
             }
             PointerConstraintBackendRequest::ActivateConfined { id, region } => {
                 self.activate_confined(id, cursor_position, region)
@@ -698,6 +698,20 @@ impl NativePointerConstraintBackend {
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn handle_resolved_request(
+        &mut self,
+        request: PointerConstraintBackendRequest,
+        cursor_position: CompositorOutputPosition,
+        locked_anchor: Option<CompositorOutputPosition>,
+    ) -> NativePointerConstraintBackendAction {
+        match request {
+            PointerConstraintBackendRequest::ActivateLocked { id } => {
+                self.activate_locked(id, locked_anchor.unwrap_or(cursor_position))
+            }
+            request => self.handle_request(request, cursor_position),
         }
     }
 

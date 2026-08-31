@@ -186,7 +186,6 @@ pub struct PointerConstraintBackendId {
 pub enum PointerConstraintBackendRequest {
     ActivateLocked {
         id: PointerConstraintBackendId,
-        anchor: OutputPosition,
     },
     ActivateConfined {
         id: PointerConstraintBackendId,

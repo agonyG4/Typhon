@@ -530,56 +530,34 @@ impl CompositorState {
             ));
             return;
         }
-        let confinement_region = self.pointer_constraint_output_region(constraint_id);
-        let request = {
-            let Some(constraint) = self.pointer_constraints.get(&constraint_id) else {
-                return;
-            };
-            let backend_id = constraint.backend_id();
-            match constraint.mode {
-                PointerConstraintMode::Locked => {
-                    let Some(anchor) = self.pointer_constraint_activation_anchor(
-                        constraint_id,
-                        confinement_region.as_ref(),
-                    ) else {
-                        pointer_debug_log(format!(
-                            "constraint activation skipped id={} reason=anchor_unresolved",
-                            constraint.id
-                        ));
-                        return;
-                    };
-                    let target = self
-                        .pointer_target_for_grabbed_surface_at_output(&surface, anchor.x, anchor.y)
-                        .unwrap_or(PointerTarget {
-                            surface: surface.clone(),
-                            surface_x: anchor.x,
-                            surface_y: anchor.y,
-                        });
-                    self.ensure_pointer_focus(&surface);
-                    self.send_pointer_enter_to_resource(&pointer, &target);
-                    PointerConstraintBackendRequest::ActivateLocked {
-                        id: backend_id,
-                        anchor,
-                    }
-                }
-                PointerConstraintMode::Confined => {
-                    let Some(region) = confinement_region else {
-                        pointer_debug_log(format!(
-                            "constraint activation skipped id={} reason=region_unresolved mode={:?}",
-                            constraint.id, constraint.mode
-                        ));
-                        return;
-                    };
-                    PointerConstraintBackendRequest::ActivateConfined {
-                        id: backend_id,
-                        region,
-                    }
-                }
-                PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
-                    id: backend_id,
-                    restore_position: None,
-                },
+        let Some((backend_id, mode)) = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .map(|constraint| (constraint.backend_id(), constraint.mode))
+        else {
+            return;
+        };
+        let request = match mode {
+            PointerConstraintMode::Locked => {
+                PointerConstraintBackendRequest::ActivateLocked { id: backend_id }
             }
+            PointerConstraintMode::Confined => {
+                let Some(region) = self.pointer_constraint_output_region(constraint_id) else {
+                    pointer_debug_log(format!(
+                        "constraint activation skipped id={} reason=region_unresolved mode={:?}",
+                        constraint_id, mode
+                    ));
+                    return;
+                };
+                PointerConstraintBackendRequest::ActivateConfined {
+                    id: backend_id,
+                    region,
+                }
+            }
+            PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
+                id: backend_id,
+                restore_position: None,
+            },
         };
         let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
             return;
@@ -590,12 +568,6 @@ impl CompositorState {
         let backend_id = constraint.backend_id();
         self.pending_backend_constraint = Some(backend_id);
         constraint.backend_pending = true;
-        if let PointerConstraintBackendRequest::ActivateLocked { anchor, .. } = &request {
-            self.pending_locked_activation_anchors
-                .insert(backend_id, *anchor);
-        } else {
-            self.pending_locked_activation_anchors.remove(&backend_id);
-        }
         pointer_debug_log(format!(
             "constraint activation queued id={} generation={}",
             backend_id.constraint_id, backend_id.generation
@@ -617,12 +589,9 @@ impl CompositorState {
         &self,
         constraint_id: u64,
         region: Option<&OutputRegion>,
+        current: OutputPosition,
     ) -> Option<OutputPosition> {
         let constraint = self.pointer_constraints.get(&constraint_id)?;
-        let current = OutputPosition {
-            x: self.last_pointer_x,
-            y: self.last_pointer_y,
-        };
         let Some(region) = region else {
             return Some(current);
         };
@@ -726,19 +695,117 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn resolve_pointer_constraint_backend_request(
+        &mut self,
+        request: PointerConstraintBackendRequest,
+        current_position: OutputPosition,
+    ) -> Option<(PointerConstraintBackendRequest, Option<OutputPosition>)> {
+        let PointerConstraintBackendRequest::ActivateLocked { id } = request else {
+            return Some((request, None));
+        };
+        if !self.pointer_constraint_backend_activation_current(id) {
+            return None;
+        }
+        let Some((pointer, surface, mode)) =
+            self.pointer_constraints
+                .get(&id.constraint_id)
+                .map(|constraint| {
+                    (
+                        constraint.pointer.clone(),
+                        constraint.surface.clone(),
+                        constraint.mode,
+                    )
+                })
+        else {
+            self.abort_pointer_constraint_backend_activation(id, "constraint_missing");
+            return None;
+        };
+        if mode != PointerConstraintMode::Locked {
+            self.abort_pointer_constraint_backend_activation(id, "mode_changed");
+            return None;
+        }
+        if !pointer.is_alive() || !surface.is_alive() {
+            self.abort_pointer_constraint_backend_activation(id, "resource_dead");
+            return None;
+        }
+        let Some(focused) = self.pointer_surface.clone() else {
+            self.abort_pointer_constraint_backend_activation(id, "focus_missing");
+            return None;
+        };
+        if !resource_belongs_to_surface_client(&pointer, &focused)
+            || !resource_belongs_to_surface_client(&pointer, &surface)
+            || self.root_surface_id_for_surface(compositor_surface_id(&focused))
+                != self.root_surface_id_for_surface(compositor_surface_id(&surface))
+        {
+            self.abort_pointer_constraint_backend_activation(id, "focus_client_or_root_changed");
+            return None;
+        }
+        let region = self.pointer_constraint_output_region(id.constraint_id);
+        let Some(anchor) = self.pointer_constraint_activation_anchor(
+            id.constraint_id,
+            region.as_ref(),
+            current_position,
+        ) else {
+            self.abort_pointer_constraint_backend_activation(id, "anchor_unresolved");
+            return None;
+        };
+        let target = self
+            .pointer_target_for_grabbed_surface_at_output(&surface, anchor.x, anchor.y)
+            .unwrap_or(PointerTarget {
+                surface: surface.clone(),
+                surface_x: anchor.x,
+                surface_y: anchor.y,
+            });
+        self.ensure_pointer_focus(&surface);
+        if !self.pointer_resource_entered_surface(&pointer, &surface) {
+            self.send_pointer_enter_to_resource(&pointer, &target);
+        }
+        pointer_debug_log(format!(
+            "pointer.constraint activation_resolved id={} generation={} cursor=({},{}) anchor=({},{})",
+            id.constraint_id,
+            id.generation,
+            current_position.x,
+            current_position.y,
+            anchor.x,
+            anchor.y
+        ));
+        Some((
+            PointerConstraintBackendRequest::ActivateLocked { id },
+            Some(anchor),
+        ))
+    }
+
+    fn abort_pointer_constraint_backend_activation(
+        &mut self,
+        id: PointerConstraintBackendId,
+        reason: &str,
+    ) {
+        if self.pending_backend_constraint == Some(id) {
+            self.pending_backend_constraint = None;
+        }
+        if let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id)
+            && constraint.generation == id.generation
+        {
+            constraint.backend_pending = false;
+        }
+        pointer_debug_log(format!(
+            "constraint activation aborted id={} generation={} reason={}",
+            id.constraint_id, id.generation, reason
+        ));
+    }
+
     pub(in crate::compositor) fn pointer_constraint_backend_activated(
         &mut self,
         id: PointerConstraintBackendId,
+        activation_anchor: OutputPosition,
     ) {
         if self.pending_backend_constraint != Some(id) {
             pointer_debug_log(format!(
                 "backend activated stale id={:?} current_active={:?} current_pending={:?}",
                 id, self.active_backend_constraint, self.pending_backend_constraint
             ));
-            self.pending_locked_activation_anchors.remove(&id);
             return;
         }
-        let locked_activation_anchor = self.pending_locked_activation_anchors.remove(&id);
         let activation = {
             let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
                 return;
@@ -794,10 +861,6 @@ impl CompositorState {
                     pending.backend_id.constraint_id, pending.backend_id.generation
                 ));
             }
-            let activation_anchor = locked_activation_anchor.unwrap_or(OutputPosition {
-                x: self.last_pointer_x,
-                y: self.last_pointer_y,
-            });
             pointer_debug_log(format!(
                 "pointer.constraint backend_activated id={} generation={} mode={:?} surface={} pointer={} client={} anchor_output=({},{})",
                 id.constraint_id,
@@ -934,7 +997,6 @@ impl CompositorState {
         if self.pending_backend_constraint == Some(id) {
             self.pending_backend_constraint = None;
         }
-        self.pending_locked_activation_anchors.remove(&id);
         self.cancel_pending_locked_pointer_reveal_for_id(id, "backend_failed");
         let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
             return;
@@ -1020,7 +1082,6 @@ impl CompositorState {
                 id.constraint_id, id.generation, removed
             ));
         }
-        self.pending_locked_activation_anchors.remove(&id);
         self.cancel_pending_locked_pointer_reveal_for_id(id, "constraint_backend_work_canceled");
         if self.pending_backend_constraint == Some(id) {
             self.pending_backend_constraint = None;

@@ -177,6 +177,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerConstraintIds(Sender<Vec<u64>>),
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
+    CaptureActiveLockedPointerAnchor(Sender<Option<(f64, f64)>>),
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
     CaptureKeyboardFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedWindowId(Sender<Option<WindowId>>),
@@ -208,6 +209,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
         y: f64,
         reply: Sender<bool>,
     },
+    BeginNativeInputBatch,
+    ProgressWaylandDuringNativeInputBatch,
+    EndNativeInputBatch,
     PointerConstraintBackendActivated(PointerConstraintBackendId),
     PointerConstraintBackendFailed(PointerConstraintBackendId),
     #[allow(dead_code)]
@@ -809,6 +813,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(compositor_surface_id),
                         );
                     }
+                    ServerCommand::CaptureActiveLockedPointerAnchor(reply) => {
+                        let anchor =
+                            server
+                                .state
+                                .active_locked_pointer_routing
+                                .as_ref()
+                                .map(|routing| {
+                                    (routing.activation_anchor.x, routing.activation_anchor.y)
+                                });
+                        let _ = reply.send(anchor);
+                    }
                     ServerCommand::CaptureFocusedSurfaceId(reply) => {
                         let _ = reply.send(
                             server
@@ -873,6 +888,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply } => {
                         let _ = reply
                             .send(server.update_pointer_position_without_client_dispatch(x, y));
+                    }
+                    ServerCommand::BeginNativeInputBatch => {
+                        server.begin_native_input_batch();
+                    }
+                    ServerCommand::ProgressWaylandDuringNativeInputBatch => {
+                        let _ = server.tick();
+                    }
+                    ServerCommand::EndNativeInputBatch => {
+                        let _ = server.end_native_input_batch();
                     }
                     ServerCommand::PointerConstraintBackendActivated(id) => {
                         server.pointer_constraint_backend_activated(id);

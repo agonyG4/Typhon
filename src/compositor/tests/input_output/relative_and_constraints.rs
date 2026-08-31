@@ -341,6 +341,308 @@ fn late_created_relative_pointer_receives_locked_motion() {
 }
 
 #[test]
+fn native_input_epoch_does_not_deliver_backlog_to_new_relative_pointer() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        relative_pointer: true,
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let anchor = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: anchor.0,
+            y: anchor.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+
+    commands.send(ServerCommand::BeginNativeInputBatch).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 9001,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 60.0,
+                dy: -4.0,
+                dx_unaccelerated: 60.0,
+                dy_unaccelerated: -4.0,
+            }),
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::EndNativeInputBatch).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.relative_motion_count, 0);
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected locked activation after the protected epoch");
+
+    state.relative_motion_count = 0;
+    state.relative_motion_dx = None;
+    state.relative_motion_dy = None;
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 9002,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 5.0,
+                dy: 2.0,
+                dx_unaccelerated: 5.0,
+                dy_unaccelerated: 2.0,
+            }),
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.relative_motion_count, 1);
+    assert_eq!(state.relative_motion_utime, Some(9002));
+    assert_eq!(state.relative_motion_dx, Some(5.0));
+    assert_eq!(state.relative_motion_dy, Some(2.0));
+}
+
+#[test]
+fn native_input_epoch_defers_mid_batch_wayland_progression() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        relative_pointer: true,
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::BeginNativeInputBatch).unwrap();
+    wait_for_server_commands(&commands);
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+
+    commands
+        .send(ServerCommand::ProgressWaylandDuringNativeInputBatch)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 9010,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 60.0,
+                dy: -4.0,
+                dx_unaccelerated: 60.0,
+                dy_unaccelerated: -4.0,
+            }),
+        }))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::EndNativeInputBatch).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.relative_motion_count, 0);
+}
+
+#[test]
+fn locked_activation_resolves_anchor_at_settlement_position() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let request_position = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    );
+    let settlement_position = (request_position.0 + 8.0, request_position.1 + 6.0);
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: request_position.0,
+            y: request_position.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected pending locked activation");
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: settlement_position.0,
+            y: settlement_position.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let active_anchor = capture_active_locked_pointer_anchor(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(active_anchor, Some(settlement_position));
+}
+
+#[test]
 fn lock_activation_repairs_missing_source_pointer_enter() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
@@ -745,7 +1047,7 @@ fn locked_relative_motion_different_same_client_source_pointers_each_get_frame()
 }
 
 #[test]
-fn locked_constraint_activation_anchor_survives_intervening_cursor_move() {
+fn locked_constraint_activation_anchor_uses_settlement_position() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -833,15 +1135,15 @@ fn locked_constraint_activation_anchor_survives_intervening_cursor_move() {
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
-    assert_eq!(position, anchor);
-    assert_ne!(position, moved);
+    assert_eq!(position, moved);
+    assert_ne!(position, anchor);
     assert!(deactivation_requests.iter().any(|request| {
         matches!(
             request,
             PointerConstraintBackendRequest::Deactivate {
                 restore_position: Some(OutputPosition { x, y }),
                 ..
-            } if (*x, *y) == anchor
+            } if (*x, *y) == moved
         )
     }));
 }

@@ -1,5 +1,19 @@
 use super::*;
+use ::input::AsRaw;
 use oblivion_one::compositor::InteractionUpdateOutcome;
+
+#[inline]
+fn libinput_event_type_is_pending(event_type: ::input::ffi::libinput_event_type) -> bool {
+    event_type != ::input::ffi::libinput_event_type_LIBINPUT_EVENT_NONE
+}
+
+fn libinput_queue_has_event(input: &::input::Libinput) -> bool {
+    // `Libinput::next` consumes the internal queue, while dispatch only
+    // populates it.  Check the queue directly at the bounded-drain boundary
+    // so a continuation can consume it without dispatching again.
+    let event_type = unsafe { ::input::ffi::libinput_next_event_type(input.as_raw() as *mut _) };
+    libinput_event_type_is_pending(event_type)
+}
 
 pub(crate) enum NativeInputEventFds<'a> {
     Libinput(Option<RawFd>),
@@ -124,11 +138,11 @@ impl NativeInputBackend {
         }
     }
 
-    pub(crate) fn drain_events_into(&mut self, batch: &mut NativeInputBatch) {
+    pub(crate) fn drain_events_into(&mut self, batch: &mut NativeInputBatch, dispatch: bool) {
         batch.raw.clear();
         batch.budget_exhausted = match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
-                backend.drain_events_into(&mut batch.raw)
+                backend.drain_events_into(&mut batch.raw, dispatch)
             }
             Self::RawEvdev(backend) => backend.drain_events_into(&mut batch.raw),
         };
@@ -137,7 +151,7 @@ impl NativeInputBackend {
     #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut batch = NativeInputBatch::default();
-        self.drain_events_into(&mut batch);
+        self.drain_events_into(&mut batch, true);
         batch.raw
     }
 }
@@ -238,17 +252,25 @@ impl LibinputInputBackend {
         })
     }
 
-    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
+    pub(crate) fn drain_events_into(
+        &mut self,
+        events: &mut Vec<NativeHardwareInputEvent>,
+        dispatch: bool,
+    ) -> bool {
         events.clear();
         if self.suspended {
             return false;
         }
-        self.drain_events_unconditionally(events)
+        self.drain_events_unconditionally(events, dispatch)
     }
 
-    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
+    fn drain_events_unconditionally(
+        &mut self,
+        events: &mut Vec<NativeHardwareInputEvent>,
+        dispatch: bool,
+    ) -> bool {
         events.clear();
-        if let Err(error) = self.input.dispatch() {
+        if dispatch && let Err(error) = self.input.dispatch() {
             eprintln!("native input: libinput dispatch failed: {error}");
             return false;
         }
@@ -261,7 +283,7 @@ impl LibinputInputBackend {
             ) {
                 events.push(event);
                 if events.len() >= NATIVE_INPUT_DRAIN_BUDGET {
-                    return true;
+                    return libinput_queue_has_event(&self.input);
                 }
             }
         }
@@ -271,7 +293,7 @@ impl LibinputInputBackend {
     fn discard_events_unconditionally(&mut self) {
         let mut events = Vec::with_capacity(NATIVE_INPUT_DRAIN_BUDGET);
         loop {
-            if !self.drain_events_unconditionally(&mut events) {
+            if !self.drain_events_unconditionally(&mut events, true) {
                 break;
             }
         }
@@ -1334,7 +1356,18 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 });
                 continue;
             }
-            let action = backend.handle_request(request, cursor_position);
+            let Some((request, locked_anchor)) =
+                server.resolve_pointer_constraint_backend_request(request, cursor_position)
+            else {
+                continue;
+            };
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "pointer.constraint activation_resolved epoch={:?} anchor={:?} cursor=({},{})",
+                    settlement_point, locked_anchor, cursor_position.x, cursor_position.y
+                )
+            });
+            let action = backend.handle_resolved_request(request, cursor_position, locked_anchor);
             if let Some((id, reason)) = action.failed {
                 native_pointer_debug_log_lazy(|| {
                     format!(
@@ -1367,7 +1400,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                     }
                     PointerConstraintMode::None => input_state.clear_pointer_constraint(),
                 }
-                server.pointer_constraint_backend_activated(constraint.id);
+                server.pointer_constraint_backend_activated_at(constraint.id, constraint.anchor);
             }
             if let Some(restore_position) = action.restore_position {
                 native_pointer_debug_log_lazy(|| {
@@ -1484,6 +1517,21 @@ pub(crate) fn apply_native_window_action(
     };
     resize_perf.observe_action(action, changed, perf);
     changed
+}
+
+#[cfg(test)]
+mod libinput_epoch_tests {
+    use super::libinput_event_type_is_pending;
+
+    #[test]
+    fn exact_budget_exhaustion_is_not_a_continuation_without_a_queued_event() {
+        assert!(!libinput_event_type_is_pending(
+            ::input::ffi::libinput_event_type_LIBINPUT_EVENT_NONE
+        ));
+        assert!(libinput_event_type_is_pending(
+            ::input::ffi::libinput_event_type_LIBINPUT_EVENT_POINTER_MOTION
+        ));
+    }
 }
 
 #[cfg(test)]

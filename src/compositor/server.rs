@@ -65,13 +65,14 @@ use super::{
     DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
     FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
-    InputProtocolCapabilities, InteractionUpdateOutcome, OutputRect, PendingProcessLaunch,
-    PointerAxisFrame, PresentationClock, PresentationProtocolCapabilities, ProtocolOnlyCompletion,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
-    WindowFocusReason, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
-    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    InputProtocolCapabilities, InteractionUpdateOutcome, OutputPosition, OutputRect,
+    PendingProcessLaunch, PointerAxisFrame, PresentationClock, PresentationProtocolCapabilities,
+    ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
+    SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePresentationMetadata,
+    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
+    XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
 };
 #[derive(Debug)]
@@ -1314,7 +1315,20 @@ impl OwnCompositorServer {
     }
 
     pub fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
-        self.state.pointer_constraint_backend_activated(id);
+        let anchor = OutputPosition {
+            x: self.state.last_pointer_x,
+            y: self.state.last_pointer_y,
+        };
+        self.state.pointer_constraint_backend_activated(id, anchor);
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn pointer_constraint_backend_activated_at(
+        &mut self,
+        id: PointerConstraintBackendId,
+        anchor: OutputPosition,
+    ) {
+        self.state.pointer_constraint_backend_activated(id, anchor);
         let _ = self.flush_wayland_clients();
     }
 
@@ -1323,6 +1337,15 @@ impl OwnCompositorServer {
         id: PointerConstraintBackendId,
     ) -> bool {
         self.state.pointer_constraint_backend_activation_current(id)
+    }
+
+    pub fn resolve_pointer_constraint_backend_request(
+        &mut self,
+        request: PointerConstraintBackendRequest,
+        current_position: OutputPosition,
+    ) -> Option<(PointerConstraintBackendRequest, Option<OutputPosition>)> {
+        self.state
+            .resolve_pointer_constraint_backend_request(request, current_position)
     }
 
     pub fn pointer_constraint_backend_deactivated(&mut self, id: PointerConstraintBackendId) {
@@ -1655,6 +1678,9 @@ impl OwnCompositorServer {
     /// explicitly in its pacing domain.
     #[doc(hidden)]
     pub fn dispatch_wayland_with_outcome(&mut self) -> Result<(usize, bool), CompositorError> {
+        if self.native_input_batch_active {
+            return Ok((0, false));
+        }
         let pacing_generation_before = self.state.surface_pacing_readiness_generation();
         let mut accepted = 0;
         while let Some(stream) = self.socket.accept()? {

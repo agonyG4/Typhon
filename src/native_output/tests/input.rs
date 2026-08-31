@@ -158,11 +158,11 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     drop(write);
 
     let mut batch = NativeInputBatch::default();
-    backend.drain_events_into(&mut batch);
+    backend.drain_events_into(&mut batch, true);
     assert_eq!(batch.raw.len(), 256);
     assert!(batch.budget_exhausted);
 
-    backend.drain_events_into(&mut batch);
+    backend.drain_events_into(&mut batch, true);
     assert_eq!(batch.raw.len(), 1);
     assert!(!batch.budget_exhausted);
 }
@@ -975,17 +975,11 @@ fn native_pointer_constraint_backend_activates_locked_once() {
     };
 
     let first = backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked {
-            id,
-            anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
-        },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         CompositorOutputPosition { x: 10.0, y: 20.0 },
     );
     let duplicate = backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked {
-            id,
-            anchor: CompositorOutputPosition { x: 30.0, y: 40.0 },
-        },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         CompositorOutputPosition { x: 30.0, y: 40.0 },
     );
 
@@ -1015,7 +1009,7 @@ fn native_pointer_constraint_backend_ignores_warp_while_locked() {
     };
     let warp_position = CompositorOutputPosition { x: 240.0, y: 160.0 };
     backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked { id, anchor },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         anchor,
     );
 
@@ -1125,10 +1119,7 @@ fn native_pointer_constraint_backend_mismatched_deactivation_cannot_unlock_newer
         generation: 1,
     };
     backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked {
-            id: active,
-            anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
-        },
+        PointerConstraintBackendRequest::ActivateLocked { id: active },
         CompositorOutputPosition { x: 10.0, y: 20.0 },
     );
 
@@ -1152,10 +1143,7 @@ fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
         generation: 1,
     };
     backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked {
-            id,
-            anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
-        },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         CompositorOutputPosition { x: 10.0, y: 20.0 },
     );
 
@@ -1175,10 +1163,7 @@ fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
     assert!(!backend.active_locked());
 
     backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked {
-            id,
-            anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
-        },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         CompositorOutputPosition { x: 10.0, y: 20.0 },
     );
     let action = backend.handle_request(
@@ -1208,7 +1193,7 @@ fn native_pointer_constraint_backend_preserves_fractional_activation_anchor() {
     };
 
     backend.handle_request(
-        PointerConstraintBackendRequest::ActivateLocked { id, anchor },
+        PointerConstraintBackendRequest::ActivateLocked { id },
         anchor,
     );
     let action = backend.handle_request(
@@ -1220,6 +1205,39 @@ fn native_pointer_constraint_backend_preserves_fractional_activation_anchor() {
     );
 
     assert_eq!(action.restore_position, Some(anchor));
+}
+
+#[test]
+fn native_pointer_constraint_backend_uses_settlement_anchor() {
+    let mut backend = NativePointerConstraintBackend::new();
+    let id = PointerConstraintBackendId {
+        constraint_id: 15,
+        generation: 1,
+    };
+    let request_position = CompositorOutputPosition { x: 100.0, y: 80.0 };
+    let settlement_anchor = CompositorOutputPosition { x: 132.5, y: 96.25 };
+
+    let action = backend.handle_resolved_request(
+        PointerConstraintBackendRequest::ActivateLocked { id },
+        request_position,
+        Some(settlement_anchor),
+    );
+
+    assert_eq!(
+        action.activated,
+        Some(NativePointerConstraint {
+            id,
+            mode: PointerConstraintMode::Locked,
+            anchor: settlement_anchor,
+            region: None,
+        })
+    );
+    assert_eq!(
+        backend.active_constraint_state(),
+        NativePointerConstraintState::Locked {
+            anchor: settlement_anchor
+        }
+    );
 }
 
 #[test]

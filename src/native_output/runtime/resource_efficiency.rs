@@ -143,6 +143,7 @@ impl ResourceEfficiencyMetrics {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn record_server_tick_call(&mut self) {
         self.server_tick_calls = self.server_tick_calls.saturating_add(1);
     }

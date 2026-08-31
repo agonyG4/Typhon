@@ -613,7 +613,6 @@ pub struct CompositorState {
     dispatch_epoch: u64,
     active_backend_constraint: Option<PointerConstraintBackendId>,
     pending_backend_constraint: Option<PointerConstraintBackendId>,
-    pending_locked_activation_anchors: HashMap<PointerConstraintBackendId, OutputPosition>,
     pending_locked_pointer_reveal: Option<PendingLockedPointerReveal>,
     pending_pointer_constraint_backend_requests: Vec<PointerConstraintBackendRequest>,
     cursor_visibility: CursorVisibilityState,

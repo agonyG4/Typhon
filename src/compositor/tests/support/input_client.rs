@@ -361,6 +361,16 @@ pub(in crate::compositor::tests) fn capture_pending_locked_pointer_reveal_and_ba
     receiver.recv().unwrap()
 }
 
+pub(in crate::compositor::tests) fn capture_active_locked_pointer_anchor(
+    commands: &Sender<ServerCommand>,
+) -> Option<(f64, f64)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureActiveLockedPointerAnchor(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
 pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_motion_sample(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

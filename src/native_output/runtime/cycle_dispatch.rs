@@ -752,6 +752,7 @@ impl NativeRuntime {
     pub(super) fn dispatch_wayland_and_input(
         &mut self,
         cycle: &mut NativeCycleState,
+        service_input: bool,
         dispatch_wayland: bool,
     ) -> NativeResult<bool> {
         if cycle.wakeup.reasons.input() {
@@ -808,6 +809,14 @@ impl NativeRuntime {
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
+        let mut accepted = 0;
+        let mut tick_us = 0;
+        let mut pacing_readiness_changed = false;
+        let mut deferred_wayland_progression = false;
+        let mut input_drain_us = 0;
+        let mut raw_input_events = 0;
+        let mut coalesced_input_events = 0;
+        let mut input_event_timestamp_usec = None;
         let pending_constraint_requests_before_settlement =
             server.pointer_constraint_backend_request_count();
         native_pointer_debug_log_lazy(|| {
@@ -827,30 +836,259 @@ impl NativeRuntime {
             NativeInputConstraintSettlementPoint::BeforeInputEpoch,
         )?;
         synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
+        // A serviceable native input queue owns the semantic epoch.  Read-side
+        // Wayland work is intentionally performed after that epoch so requests
+        // that create or alter input resources cannot reinterpret its events.
         let pending_constraint_requests_before_read =
             server.pointer_constraint_backend_request_count();
-        let (accepted, tick_us, pacing_readiness_changed) = if dispatch_wayland {
+        if dispatch_wayland && !service_input {
             let tick_start = Instant::now();
-            let (accepted, pacing_readiness_changed) = server.dispatch_wayland_with_outcome()?;
+            let (dispatch_accepted, dispatch_pacing_readiness_changed) =
+                server.dispatch_wayland_with_outcome()?;
             render_telemetry.resource_efficiency.record_client_flush();
-            (
-                accepted,
-                elapsed_micros(tick_start),
-                pacing_readiness_changed,
-            )
-        } else {
-            (0, 0, false)
-        };
-        let pending_constraint_requests_after_read =
+            accepted = dispatch_accepted;
+            tick_us = elapsed_micros(tick_start);
+            pacing_readiness_changed = dispatch_pacing_readiness_changed;
+        }
+        let mut pending_constraint_requests_after_read =
             server.pointer_constraint_backend_request_count();
-        native_pointer_debug_log_lazy(|| {
-            format!(
-                "pointer.constraint pending_after_wayland_read={} queued_during_read={}",
-                pending_constraint_requests_after_read,
-                pending_constraint_requests_after_read
-                    .saturating_sub(pending_constraint_requests_before_read),
+        if dispatch_wayland && !service_input {
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "wayland.input_read dispatch after_epoch=false pending={} queued_during_read={}",
+                    pending_constraint_requests_after_read,
+                    pending_constraint_requests_after_read
+                        .saturating_sub(pending_constraint_requests_before_read),
+                )
+            });
+        }
+        let mut skipped_input_repaints = 0usize;
+        let mut completed_input_epoch = None;
+        if service_input {
+            server.begin_native_input_batch();
+            let continuation = input_epoch.backlog_pending();
+            let input_epoch_id = input_epoch.begin(continuation);
+            let constraint = pointer_constraint_backend
+                .active
+                .as_ref()
+                .map(|constraint| (constraint.id, constraint.mode));
+            input_state
+                .set_native_input_epoch_debug(Some(input_epoch_id), constraint.map(|(id, _)| id));
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "input.semantic_epoch begin id={} continuation={} constraint={:?} backlog_pending={} wayland_read_deferred={}",
+                    input_epoch_id,
+                    continuation,
+                    constraint,
+                    input_epoch.backlog_pending(),
+                    true,
+                )
+            });
+            let input_drain_start = Instant::now();
+            input_devices.drain_events_into(input_batch, !input_epoch.backlog_pending());
+            input_drain_us = elapsed_micros(input_drain_start);
+            raw_input_events = input_batch.raw.len();
+            // The backend state captured here is authoritative for every event in
+            // this epoch. Protocol progress below may queue a new transition, but
+            // it cannot change the native semantics of this materialized batch.
+            for _ in 0..raw_input_events {
+                render_telemetry
+                    .resource_efficiency
+                    .record_raw_input_event();
+            }
+            input_event_timestamp_usec = matches!(
+                input_devices.kind(),
+                NativeInputBackendKind::LibseatLibinputUdev
+                    | NativeInputBackendKind::DirectLibinputUdev
             )
-        });
+            .then(|| {
+                input_batch
+                    .raw
+                    .iter()
+                    .filter_map(|event| event.timestamp_usec())
+                    .max()
+            })
+            .flatten();
+            let oldest_input_timestamp_usec = input_batch
+                .raw
+                .iter()
+                .filter_map(|event| event.timestamp_usec())
+                .min();
+            let newest_input_timestamp_usec = input_batch
+                .raw
+                .iter()
+                .filter_map(|event| event.timestamp_usec())
+                .max();
+            input_batch.coalesce_pointer_motion_events();
+            coalesced_input_events = input_batch.coalesced.len();
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "input.semantic_epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={} continuation={}",
+                    input_epoch_id,
+                    raw_input_events,
+                    coalesced_input_events,
+                    oldest_input_timestamp_usec,
+                    newest_input_timestamp_usec,
+                    input_batch.budget_exhausted,
+                    input_batch.budget_exhausted,
+                )
+            });
+            for _ in 0..coalesced_input_events {
+                render_telemetry
+                    .resource_efficiency
+                    .record_coalesced_input_event();
+            }
+            for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
+                let may_change_pointer_constraints = event.may_change_pointer_constraints();
+                let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
+                    server.keyboard_shortcut_inhibition_snapshot(),
+                );
+                effect.append(input_state.handle_hardware_input_event(event));
+                if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
+                    render_telemetry.resource_efficiency.record_pointer_sample();
+                }
+                let effect_requested_redraw = effect.redraw_requested;
+                let cursor_visible = !server.client_cursor_explicitly_hidden()
+                    && (server.client_cursor_render_state().is_some()
+                        || server.interaction_cursor_override_active()
+                        || input_state.cursor_visible());
+                if let Err(error) = apply_cursor_position(
+                    atomic_cursor,
+                    legacy_cursor,
+                    effect.cursor_position,
+                    cursor_visible,
+                    *cursor_preference,
+                    cursor_render_mode,
+                    perf,
+                ) {
+                    if *cursor_preference == NativeCursorPreference::Hardware {
+                        let shutdown_result = acquire_watches.shutdown(event_loop);
+                        let _ = server.end_native_input_batch();
+                        shutdown_result?;
+                        return Err(error.into());
+                    }
+                    let _ = server.end_native_input_batch();
+                    return Err(error.into());
+                }
+                let application = match apply_native_input_effect(
+                    effect,
+                    NativeInputApplyContext {
+                        server,
+                        perf,
+                        resize_perf,
+                        cursor_mode: *cursor_render_mode,
+                        app_gpu_policy: *effective_app_gpu_policy,
+                        seat_session: seat_session.as_ref(),
+                        process_supervisor,
+                        xwayland: xwayland_app_environment,
+                    },
+                ) {
+                    Ok(application) => application,
+                    Err(error) => {
+                        let _ = server.end_native_input_batch();
+                        return Err(error);
+                    }
+                };
+                if application.exit_requested {
+                    cycle.shutdown_requested = true;
+                    break;
+                }
+                if let Some(launch) = application.launch {
+                    log_native_app_spawn(perf, &launch);
+                    pending_launches.push_back(launch);
+                }
+                if effect_requested_redraw && !application.redraw_requested {
+                    skipped_input_repaints = skipped_input_repaints.saturating_add(1);
+                }
+                redraw_requested |= application.redraw_requested;
+                let interaction_reconciled = reconcile_trigger_liveness(
+                    server,
+                    input_state,
+                    TriggerLivenessPoint::Event(event_index),
+                );
+                redraw_requested |= interaction_reconciled;
+                // A semantic input epoch cannot perform a client read-side
+                // dispatch. Remember the narrow native-only progression request
+                // and service it once after the epoch has ended.
+                if input_requires_full_server_progression(
+                    dispatch_wayland,
+                    may_change_pointer_constraints,
+                ) {
+                    deferred_wayland_progression = true;
+                    native_pointer_debug_log_lazy(|| {
+                        format!(
+                            "wayland.input_read deferred epoch={:?} reason=protocol_progression",
+                            input_epoch.active_id(),
+                        )
+                    });
+                }
+            }
+            let interaction_reconciled =
+                reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
+            redraw_requested |= interaction_reconciled;
+            completed_input_epoch = Some(input_epoch_id);
+            input_epoch.finish(input_batch.budget_exhausted);
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "input.semantic_epoch end id={:?} raw={} coalesced={} budget_exhausted={} backlog_pending={}",
+                    completed_input_epoch,
+                    raw_input_events,
+                    coalesced_input_events,
+                    input_batch.budget_exhausted,
+                    input_epoch.backlog_pending(),
+                )
+            });
+            if !input_epoch.backlog_pending() {
+                input_state.set_native_input_epoch_debug(None, None);
+            }
+            if let Err(error) = synchronize_cursor_state_for_server(
+                server,
+                atomic_cursor,
+                legacy_cursor,
+                input_state,
+            ) {
+                let _ = server.end_native_input_batch();
+                return Err(error.into());
+            }
+            let _ = observe_atomic_cursor_output_liveness(
+                atomic_cursor.as_ref(),
+                cursor_output_arbitration,
+                frame_scheduler,
+                monotonic_now_ns()?,
+                *cursor_render_mode,
+                input_state.cursor_visible(),
+            );
+            let client_flush = server.end_native_input_batch()?;
+            if client_flush {
+                render_telemetry.resource_efficiency.record_client_flush();
+            }
+        }
+        let input_backlog_continuation = service_input && input_epoch.backlog_pending();
+        let should_dispatch_after_input = service_input
+            && !input_backlog_continuation
+            && (dispatch_wayland || deferred_wayland_progression);
+        if should_dispatch_after_input {
+            let tick_start = Instant::now();
+            let pending_before_read = server.pointer_constraint_backend_request_count();
+            let (dispatch_accepted, dispatch_pacing_readiness_changed) =
+                server.dispatch_wayland_with_outcome()?;
+            accepted = dispatch_accepted;
+            tick_us = elapsed_micros(tick_start);
+            pacing_readiness_changed = dispatch_pacing_readiness_changed;
+            render_telemetry.resource_efficiency.record_client_flush();
+            pending_constraint_requests_after_read =
+                server.pointer_constraint_backend_request_count();
+            native_pointer_debug_log_lazy(|| {
+                format!(
+                    "wayland.input_read dispatch after_epoch=true pending={} queued_during_read={}",
+                    pending_constraint_requests_after_read,
+                    pending_constraint_requests_after_read.saturating_sub(pending_before_read),
+                )
+            });
+            if deferred_wayland_progression {
+                redraw_requested |= server.progress_surface_pacing(monotonic_now_ns()?)?;
+            }
+        }
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
             for _ in *known_toplevels..current_toplevels {
@@ -886,242 +1124,22 @@ impl NativeRuntime {
                 server.accepted_clients()
             );
         }
-        server.begin_native_input_batch();
-        let mut skipped_input_repaints = 0usize;
-        let input_drain_start = Instant::now();
-        input_devices.drain_events_into(input_batch);
-        let input_drain_us = elapsed_micros(input_drain_start);
-        let raw_input_events = input_batch.raw.len();
-        // The backend state captured here is authoritative for every event in
-        // this epoch. Protocol progress below may queue a new transition, but
-        // it cannot change the native semantics of this materialized batch.
-        let input_epoch_id = if raw_input_events > 0 || input_epoch.backlog_pending() {
-            let continuation = input_epoch.backlog_pending();
-            let epoch_id = input_epoch.begin(continuation);
-            let constraint = pointer_constraint_backend
-                .active
-                .as_ref()
-                .map(|constraint| (constraint.id, constraint.mode));
-            input_state.set_native_input_epoch_debug(Some(epoch_id), constraint.map(|(id, _)| id));
-            native_pointer_debug_log_lazy(|| {
-                format!(
-                    "input.epoch begin id={} continuation={} constraint={:?} backlog_pending={}",
-                    epoch_id,
-                    continuation,
-                    constraint,
-                    input_epoch.backlog_pending(),
-                )
-            });
-            Some(epoch_id)
-        } else {
-            None
-        };
-        for _ in 0..raw_input_events {
-            render_telemetry
-                .resource_efficiency
-                .record_raw_input_event();
-        }
-        let input_event_timestamp_usec = matches!(
-            input_devices.kind(),
-            NativeInputBackendKind::LibseatLibinputUdev
-                | NativeInputBackendKind::DirectLibinputUdev
-        )
-        .then(|| {
-            input_batch
-                .raw
-                .iter()
-                .filter_map(|event| event.timestamp_usec())
-                .max()
-        })
-        .flatten();
-        let oldest_input_timestamp_usec = input_batch
-            .raw
-            .iter()
-            .filter_map(|event| event.timestamp_usec())
-            .min();
-        let newest_input_timestamp_usec = input_batch
-            .raw
-            .iter()
-            .filter_map(|event| event.timestamp_usec())
-            .max();
-        input_batch.coalesce_pointer_motion_events();
-        let coalesced_input_events = input_batch.coalesced.len();
-        native_pointer_debug_log_lazy(|| {
-            format!(
-                "input.epoch batch id={:?} raw={} coalesced={} oldest_ts_us={:?} newest_ts_us={:?} budget_exhausted={}",
-                input_epoch_id,
-                raw_input_events,
-                coalesced_input_events,
-                oldest_input_timestamp_usec,
-                newest_input_timestamp_usec,
-                input_batch.budget_exhausted,
-            )
-        });
-        for _ in 0..coalesced_input_events {
-            render_telemetry
-                .resource_efficiency
-                .record_coalesced_input_event();
-        }
-        for (event_index, event) in input_batch.coalesced.drain(..).enumerate() {
-            let may_change_pointer_constraints = event.may_change_pointer_constraints();
-            let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
-                server.keyboard_shortcut_inhibition_snapshot(),
-            );
-            effect.append(input_state.handle_hardware_input_event(event));
-            if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
-                render_telemetry.resource_efficiency.record_pointer_sample();
-            }
-            let effect_requested_redraw = effect.redraw_requested;
-            let cursor_visible = !server.client_cursor_explicitly_hidden()
-                && (server.client_cursor_render_state().is_some()
-                    || server.interaction_cursor_override_active()
-                    || input_state.cursor_visible());
-            if let Err(error) = apply_cursor_position(
-                atomic_cursor,
-                legacy_cursor,
-                effect.cursor_position,
-                cursor_visible,
-                *cursor_preference,
-                cursor_render_mode,
-                perf,
-            ) {
-                if *cursor_preference == NativeCursorPreference::Hardware {
-                    let shutdown_result = acquire_watches.shutdown(event_loop);
-                    let _ = server.end_native_input_batch();
-                    shutdown_result?;
-                    return Err(error.into());
-                }
-                let _ = server.end_native_input_batch();
-                return Err(error.into());
-            }
-            let application = match apply_native_input_effect(
-                effect,
-                NativeInputApplyContext {
-                    server,
-                    perf,
-                    resize_perf,
-                    cursor_mode: *cursor_render_mode,
-                    app_gpu_policy: *effective_app_gpu_policy,
-                    seat_session: seat_session.as_ref(),
-                    process_supervisor,
-                    xwayland: xwayland_app_environment,
-                },
-            ) {
-                Ok(application) => application,
-                Err(error) => {
-                    let _ = server.end_native_input_batch();
-                    return Err(error);
-                }
-            };
-            if application.exit_requested {
-                cycle.shutdown_requested = true;
-                break;
-            }
-            if let Some(launch) = application.launch {
-                log_native_app_spawn(perf, &launch);
-                pending_launches.push_back(launch);
-            }
-            if effect_requested_redraw && !application.redraw_requested {
-                skipped_input_repaints = skipped_input_repaints.saturating_add(1);
-            }
-            redraw_requested |= application.redraw_requested;
-            let interaction_reconciled = reconcile_trigger_liveness(
-                server,
-                input_state,
-                TriggerLivenessPoint::Event(event_index),
-            );
-            redraw_requested |= interaction_reconciled;
-            // A readable Wayland wake already paid for this cycle's one
-            // read-side dispatch. Native-only key/button input retains the
-            // narrow follow-up for pointer-constraint state, but combined
-            // readiness must not turn into a duplicate full tick.
-            if input_requires_full_server_progression(
-                dispatch_wayland,
-                may_change_pointer_constraints,
-            ) {
-                let pending_before_tick = server.pointer_constraint_backend_request_count();
-                render_telemetry
-                    .resource_efficiency
-                    .record_server_tick_call();
-                let (_, pacing_visual_work) = match server.tick_with_outcome() {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        let _ = server.end_native_input_batch();
-                        return Err(error.into());
-                    }
-                };
-                redraw_requested |= pacing_visual_work;
-                let pending_after_tick = server.pointer_constraint_backend_request_count();
-                if pending_after_tick > pending_before_tick {
-                    native_pointer_debug_log_lazy(|| {
-                        format!(
-                            "pointer.constraint deferred epoch={:?} reason=protocol_progression pending={} queued_during_tick={}",
-                            input_epoch.active_id(),
-                            pending_after_tick,
-                            pending_after_tick.saturating_sub(pending_before_tick),
-                        )
-                    });
-                }
-                if let Err(error) = synchronize_cursor_state_for_server(
-                    server,
-                    atomic_cursor,
-                    legacy_cursor,
-                    input_state,
-                ) {
-                    let _ = server.end_native_input_batch();
-                    return Err(error.into());
-                }
-            }
-        }
-        let interaction_reconciled =
-            reconcile_trigger_liveness(server, input_state, TriggerLivenessPoint::BatchEnd);
-        redraw_requested |= interaction_reconciled;
-        let completed_input_epoch = input_epoch_id;
-        input_epoch.finish(input_batch.budget_exhausted);
-        native_pointer_debug_log_lazy(|| {
-            format!(
-                "input.epoch end id={:?} raw={} coalesced={} budget_exhausted={} backlog_pending={}",
-                completed_input_epoch,
-                raw_input_events,
-                coalesced_input_events,
-                input_batch.budget_exhausted,
-                input_epoch.backlog_pending(),
-            )
-        });
-        if !input_epoch.backlog_pending() {
-            input_state.set_native_input_epoch_debug(None, None);
-        }
-        redraw_requested |= match settle_native_pointer_constraint_backend_requests(
+        redraw_requested |= settle_native_pointer_constraint_backend_requests(
             input_epoch,
             server,
             pointer_constraint_backend,
             input_state,
             *cursor_render_mode,
-            NativeInputConstraintSettlementPoint::AfterInputEpoch(completed_input_epoch),
-        ) {
-            Ok(redraw_requested) => redraw_requested,
-            Err(error) => {
-                let _ = server.end_native_input_batch();
-                return Err(error);
-            }
-        };
+            if let Some(epoch) = completed_input_epoch {
+                NativeInputConstraintSettlementPoint::AfterInputEpoch(Some(epoch))
+            } else {
+                NativeInputConstraintSettlementPoint::BeforeInputEpoch
+            },
+        )?;
         if let Err(error) =
             synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)
         {
-            let _ = server.end_native_input_batch();
             return Err(error.into());
-        }
-        let _ = observe_atomic_cursor_output_liveness(
-            atomic_cursor.as_ref(),
-            cursor_output_arbitration,
-            frame_scheduler,
-            monotonic_now_ns()?,
-            *cursor_render_mode,
-            input_state.cursor_visible(),
-        );
-        let client_flush = server.end_native_input_batch()?;
-        if client_flush {
-            render_telemetry.resource_efficiency.record_client_flush();
         }
         if let Some(event_timestamp_us) = input_event_timestamp_usec {
             let dispatch_latency_us = monotonic_now_ns()?

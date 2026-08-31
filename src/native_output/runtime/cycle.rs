@@ -199,13 +199,16 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        let wayland_pacing_readiness_changed = if operation_plan.dispatch_wayland_read_side
-            || operation_plan.service_input
-        {
-            self.dispatch_wayland_and_input(&mut cycle, operation_plan.dispatch_wayland_read_side)?
-        } else {
-            false
-        };
+        let wayland_pacing_readiness_changed =
+            if operation_plan.dispatch_wayland_read_side || operation_plan.service_input {
+                self.dispatch_wayland_and_input(
+                    &mut cycle,
+                    operation_plan.service_input,
+                    operation_plan.dispatch_wayland_read_side,
+                )?
+            } else {
+                false
+            };
         if work_domains.commit_timing_planning
             || (work_domains.wayland_dispatch && self.server.has_pending_commit_timing_planning())
         {
