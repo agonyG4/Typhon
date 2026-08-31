@@ -24,11 +24,27 @@ regional damage, buffer age, or KMS scheduling.
    bounded shutdown timing summary. No runtime ownership or presentation state
    transition is changed.
 
+## Registration-timing correction
+
+The async-watch registration timestamp is not a fence-creation timestamp. A
+sync-file signal observed before watch registration is therefore a valid
+pre-signaled completion: count it separately and record a zero remaining
+registry wait. Exact GPU-vs-pageflip classification continues to compare only
+the sync-file signal timestamp with the kernel-derived pageflip timestamp.
+
+If an exact signal timestamp cannot be queried for a composited watch, remove
+that transaction from the correlation ledger as unpairable. Preserve the safe
+protocol completion and keep NoVisual/DeferredRetry uncorrelated.
+
 ## Test-first sequence
 
 - RED: correlation ordering, before/after/equal classification, unavailable
   timestamps, origin exclusion, percentile semantics, inversion handling,
   capacity, transaction isolation, and exactly-once registry completion.
+- RED v1.1: pre-signaled zero-wait accounting, registration-wait percentile
+  inclusion, physical-classification independence, unpairable correlation
+  removal, repeated unavailable-timestamp boundedness, and successful-arm
+  metric semantics.
 - GREEN: implement the ledger and watch metadata.
 - GREEN: wire normal composited registration to `OutputTransactionId`, the
   readable-FD timestamp query, and the exact DRM pageflip timestamp.

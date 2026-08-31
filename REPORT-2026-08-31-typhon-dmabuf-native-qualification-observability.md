@@ -63,7 +63,7 @@ Changed files:
 
 - `src/native_output/runtime/dmabuf_release.rs`: added
   `DmabufGpuReleaseOrigin`, a fixed-capacity 256-entry transaction correlation
-  ledger, bounded wait/lead/lag samples using the existing `BoundedSamples`,
+  ledger, bounded registry-wait/lead/lag samples using the existing `BoundedSamples`,
   exact sync-file timestamp querying before FD disposal, and qualification
   counters/snapshots. Timestamp-query failures are recorded and do not prevent
   an already-readable GPU lease from completing.
@@ -109,6 +109,14 @@ separately and are not classified as before-pageflip.
 The ledger is capped at 256 entries. Overflow and duplicate transaction IDs
 increment bounded counters and do not affect release behavior.
 
+Registry wait semantics are intentionally separate from physical correlation:
+the registration timestamp is when the asynchronous reactor watch is installed,
+not when the EGL fence is created. A sync-file signal timestamp earlier than
+registration is recorded as `already_signaled_before_registration` and adds a
+zero-microsecond registry-wait sample. It is not a clock anomaly. An exact
+timestamp query failure removes the associated composited correlation as
+unpairable while still allowing the already-safe protocol release to complete.
+
 ## Deterministic RED/GREEN coverage
 
 The RED run was performed before the implementation API existed. The focused
@@ -138,9 +146,16 @@ Focused GREEN result:
 cargo test: 19 passed, 3123 filtered out (19 suites, 0.01s)
 ```
 
+The v1.1 corrective focused suite added seven tests and passed as:
+
+```text
+running 26 tests
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 1039 filtered out
+```
+
 ## Static/unit verification
 
-Completed successfully:
+The v1.0 observability commit was fully verified before this v1.1 correction:
 
 ```text
 rtk cargo fmt --check
@@ -156,9 +171,25 @@ Full test result:
 cargo test: 3147 passed, 5 ignored, 40 filtered out (30 suites, 45.83s)
 ```
 
-Strict Clippy reported no issues. Formatting and diff checks produced no
-diagnostics. The final working tree before commit contained only the four
-runtime source files and the two closure documents listed above.
+For v1.1, formatting still passed and the observability test executable passed
+all 26 focused tests. The final full-suite rerun was interrupted by unrelated
+pointer-constraint edits appearing concurrently in the working tree. Current
+`cargo check` and strict all-target Clippy are blocked by that incomplete
+pointer change, including missing `OutputPosition`/anchor state and mismatched
+`ActivateLocked` fields. The independent pointer test reruns reproduce the same
+source inconsistency. Those files are not part of this closure and were not
+edited or staged.
+
+The full-suite process that ran before the source inconsistency became visible
+reported two unrelated pointer test failures:
+
+```text
+locked_activation_resolves_anchor_at_settlement_position: assertion mismatch
+native_input_epoch_does_not_deliver_backlog_to_new_relative_pointer: assertion mismatch
+```
+
+No observability test failure was observed. The current worktree intentionally
+retains the concurrent pointer files as user-owned changes.
 
 ## Native DRM/KMS verification
 
@@ -172,12 +203,48 @@ Therefore the exact native summary lines requested for a hardware run are
 unavailable for this checkout session. The new runtime will emit, at shutdown:
 
 ```text
-typhon pacing: event=dmabuf_gpu_release_timing_summary composited_correlations_armed=... composited_correlations_paired=... release_before_pageflip_leases=... release_before_pageflip_obligations=... release_after_pageflip_leases=... release_after_pageflip_obligations=... release_same_timestamp_leases=... exact_signal_timestamps=... signal_timestamp_unavailable=... timestamp_order_anomalies=... correlation_pending=... correlation_overflows=... correlation_duplicates=... gpu_release_fence_wait_p50_us=... gpu_release_fence_wait_p95_us=... gpu_release_fence_wait_p99_us=... release_to_pageflip_lead_p50_us=... release_to_pageflip_lead_p95_us=... release_to_pageflip_lead_p99_us=... pageflip_to_release_lag_p50_us=... pageflip_to_release_lag_p95_us=... pageflip_to_release_lag_p99_us=...
+typhon pacing: event=dmabuf_gpu_release_timing_summary composited_correlations_armed=... composited_correlations_paired=... release_before_pageflip_leases=... release_before_pageflip_obligations=... release_after_pageflip_leases=... release_after_pageflip_obligations=... release_same_timestamp_leases=... exact_signal_timestamps=... signal_timestamp_unavailable=... correlations_unpairable_signal_timestamp=... already_signaled_before_registration=... timestamp_order_anomalies=... correlation_pending=... correlation_overflows=... correlation_duplicates=... gpu_release_registry_wait_p50_us=... gpu_release_registry_wait_p95_us=... gpu_release_registry_wait_p99_us=... release_to_pageflip_lead_p50_us=... release_to_pageflip_lead_p95_us=... release_to_pageflip_lead_p99_us=... pageflip_to_release_lag_p50_us=... pageflip_to_release_lag_p95_us=... pageflip_to_release_lag_p99_us=...
 ```
 
 The existing `TYPHON_FRAME_PACING_DEBUG=1` summary remains the authority for
 O1 render-ahead and 165 Hz pacing metrics; no pacing fields were duplicated or
 modified.
+
+## v1.1 registration-timing correction
+
+The first observability implementation treated
+`signal_timestamp_ns < registered_at_ns` as `timestamp_order_anomalies`. The
+current source ordering makes that case normal: `NativeRenderFence::create()`
+can signal before the later composited release watch is installed. The metric
+now records `already_signaled_before_registration` and contributes a zero
+microsecond sample to the renamed `gpu_release_registry_wait_*` percentiles.
+The registration timestamp remains explicitly documented as async-watch
+registration time, not fence-creation time.
+
+Physical ordering is unchanged and still compares only:
+
+```text
+exact sync-file signal_timestamp_ns
+vs.
+exact kernel-derived presented_at_ns
+```
+
+using the same `OutputTransactionId`. In particular, a GPU timestamp before
+watch registration can still be classified as before the pageflip when its
+physical timestamp is earlier.
+
+An unavailable exact timestamp now receives the watch origin. For a
+`Composited` watch, its correlation entry is removed immediately and counted as
+`correlations_unpairable_signal_timestamp`; it cannot consume ledger capacity
+or remain pending forever. `NoVisual` and `DeferredRetry` only increment the
+normal unavailable-timestamp counter. In every case the already-safe protocol
+release continues.
+
+Additional v1.1 deterministic tests cover pre-signaled zero-wait accounting,
+post-registration wait accounting, percentile inclusion of zero, physical
+classification independence, unpairable correlation removal, repeated
+unavailable timestamps without overflow, and successful-only correlation-arm
+metrics.
 
 ## Non-regression evidence
 

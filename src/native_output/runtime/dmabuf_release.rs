@@ -105,13 +105,15 @@ pub(crate) struct DmabufGpuReleaseQualificationSummary {
     pub(crate) release_same_timestamp_leases: u64,
     pub(crate) exact_signal_timestamps: u64,
     pub(crate) signal_timestamp_unavailable: u64,
+    pub(crate) correlations_unpairable_signal_timestamp: u64,
+    pub(crate) already_signaled_before_registration: u64,
     pub(crate) timestamp_order_anomalies: u64,
     pub(crate) correlation_pending: usize,
     pub(crate) correlation_overflows: u64,
     pub(crate) correlation_duplicates: u64,
-    pub(crate) gpu_release_fence_wait_p50_us: u64,
-    pub(crate) gpu_release_fence_wait_p95_us: u64,
-    pub(crate) gpu_release_fence_wait_p99_us: u64,
+    pub(crate) gpu_release_registry_wait_p50_us: u64,
+    pub(crate) gpu_release_registry_wait_p95_us: u64,
+    pub(crate) gpu_release_registry_wait_p99_us: u64,
     pub(crate) release_to_pageflip_lead_p50_us: u64,
     pub(crate) release_to_pageflip_lead_p95_us: u64,
     pub(crate) release_to_pageflip_lead_p99_us: u64,
@@ -136,8 +138,6 @@ impl DmabufGpuReleaseObservability {
         obligation_count: usize,
         registered_at_ns: u64,
     ) -> bool {
-        self.summary.composited_correlations_armed =
-            self.summary.composited_correlations_armed.saturating_add(1);
         if self.correlations.contains_key(&transaction_id) {
             self.summary.correlation_duplicates =
                 self.summary.correlation_duplicates.saturating_add(1);
@@ -157,6 +157,8 @@ impl DmabufGpuReleaseObservability {
                 pageflip_ns: None,
             },
         );
+        self.summary.composited_correlations_armed =
+            self.summary.composited_correlations_armed.saturating_add(1);
         true
     }
 
@@ -236,8 +238,11 @@ impl DmabufGpuReleaseObservability {
             // Test-only or legacy uncorrelated registrations have no
             // trustworthy registration timestamp for a wait sample.
         } else if signal_ns < registered_at_ns {
-            self.summary.timestamp_order_anomalies =
-                self.summary.timestamp_order_anomalies.saturating_add(1);
+            self.summary.already_signaled_before_registration = self
+                .summary
+                .already_signaled_before_registration
+                .saturating_add(1);
+            self.fence_wait_ns.record(0);
         } else {
             self.fence_wait_ns
                 .record(signal_ns.saturating_sub(registered_at_ns));
@@ -254,9 +259,17 @@ impl DmabufGpuReleaseObservability {
             self.summary.exact_signal_timestamps.saturating_add(1);
     }
 
-    fn note_timestamp_unavailable(&mut self) {
+    fn note_timestamp_unavailable(&mut self, origin: DmabufGpuReleaseOrigin) {
         self.summary.signal_timestamp_unavailable =
             self.summary.signal_timestamp_unavailable.saturating_add(1);
+        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin
+            && self.correlations.remove(&transaction_id).is_some()
+        {
+            self.summary.correlations_unpairable_signal_timestamp = self
+                .summary
+                .correlations_unpairable_signal_timestamp
+                .saturating_add(1);
+        }
     }
 
     fn summary(&self) -> DmabufGpuReleaseQualificationSummary {
@@ -265,9 +278,9 @@ impl DmabufGpuReleaseObservability {
         let (lag_p50, lag_p95, lag_p99) = self.pageflip_to_release_lag_ns.percentiles();
         let mut summary = self.summary;
         summary.correlation_pending = self.correlations.len();
-        summary.gpu_release_fence_wait_p50_us = wait_p50 / 1_000;
-        summary.gpu_release_fence_wait_p95_us = wait_p95 / 1_000;
-        summary.gpu_release_fence_wait_p99_us = wait_p99 / 1_000;
+        summary.gpu_release_registry_wait_p50_us = wait_p50 / 1_000;
+        summary.gpu_release_registry_wait_p95_us = wait_p95 / 1_000;
+        summary.gpu_release_registry_wait_p99_us = wait_p99 / 1_000;
         summary.release_to_pageflip_lead_p50_us = lead_p50 / 1_000;
         summary.release_to_pageflip_lead_p95_us = lead_p95 / 1_000;
         summary.release_to_pageflip_lead_p99_us = lead_p99 / 1_000;
@@ -587,7 +600,7 @@ impl DmabufGpuReleaseRegistry {
                     watch.registered_at_ns,
                     signal_ns,
                 ),
-                Ok(None) | Err(_) => self.observability.note_timestamp_unavailable(),
+                Ok(None) | Err(_) => self.observability.note_timestamp_unavailable(watch.origin),
             }
             let watch_completed = complete(watch.lease_id);
             let _completion_fd = watch.completion_fd;
@@ -765,7 +778,7 @@ impl super::NativeRuntime {
             &mut self.event_loop,
             DmabufGpuReleaseOrigin::DeferredRetry,
             transferred,
-            now_ns,
+            oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(now_ns),
         ) {
             Ok(_) => {
                 self.dmabuf_gpu_release_registry.complete_retry();
@@ -1078,6 +1091,8 @@ mod tests {
         assert_eq!(completed, vec![id]);
         let summary = registry.qualification_summary();
         assert_eq!(summary.signal_timestamp_unavailable, 1);
+        assert_eq!(summary.correlations_unpairable_signal_timestamp, 1);
+        assert_eq!(summary.correlation_pending, 0);
         assert_eq!(summary.composited_correlations_paired, 0);
         assert_eq!(event_loop.source_for_token(token), None);
     }
@@ -1107,9 +1122,9 @@ mod tests {
         }
 
         let summary = observability.summary();
-        assert_eq!(summary.gpu_release_fence_wait_p50_us, 3_000);
-        assert_eq!(summary.gpu_release_fence_wait_p95_us, 5_000);
-        assert_eq!(summary.gpu_release_fence_wait_p99_us, 5_000);
+        assert_eq!(summary.gpu_release_registry_wait_p50_us, 3_000);
+        assert_eq!(summary.gpu_release_registry_wait_p95_us, 5_000);
+        assert_eq!(summary.gpu_release_registry_wait_p99_us, 5_000);
     }
 
     #[test]
@@ -1118,8 +1133,9 @@ mod tests {
         observability.record_exact_signal(DmabufGpuReleaseOrigin::NoVisual, 5_000_000, 4_000_000);
 
         let summary = observability.summary();
-        assert_eq!(summary.timestamp_order_anomalies, 1);
-        assert_eq!(summary.gpu_release_fence_wait_p50_us, 0);
+        assert_eq!(summary.already_signaled_before_registration, 1);
+        assert_eq!(summary.timestamp_order_anomalies, 0);
+        assert_eq!(summary.gpu_release_registry_wait_p50_us, 0);
     }
 
     #[test]
@@ -1169,6 +1185,114 @@ mod tests {
         let summary = observability.summary();
         assert_eq!(summary.correlation_duplicates, 1);
         assert_eq!(summary.release_before_pageflip_obligations, 1);
+    }
+
+    #[test]
+    fn pre_signaled_completion_is_zero_wait_not_a_timestamp_anomaly() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        observability.record_exact_signal(DmabufGpuReleaseOrigin::NoVisual, 5_000_000, 4_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.already_signaled_before_registration, 1);
+        assert_eq!(summary.timestamp_order_anomalies, 0);
+        assert_eq!(summary.gpu_release_registry_wait_p50_us, 0);
+    }
+
+    #[test]
+    fn post_registration_completion_records_remaining_registry_wait() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        observability.record_exact_signal(DmabufGpuReleaseOrigin::NoVisual, 4_000_000, 5_500_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.already_signaled_before_registration, 0);
+        assert_eq!(summary.gpu_release_registry_wait_p50_us, 1_500);
+    }
+
+    #[test]
+    fn registry_wait_percentiles_include_pre_signaled_zero_samples() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        observability.record_exact_signal(DmabufGpuReleaseOrigin::NoVisual, 5, 4);
+        for (index, wait_ns) in [1, 2, 3, 4].into_iter().enumerate() {
+            let registered_at_ns = (index as u64 + 1) * 10_000_000;
+            observability.record_exact_signal(
+                DmabufGpuReleaseOrigin::NoVisual,
+                registered_at_ns,
+                registered_at_ns + wait_ns * 1_000_000,
+            );
+        }
+
+        let summary = observability.summary();
+        assert_eq!(summary.gpu_release_registry_wait_p50_us, 2_000);
+        assert_eq!(summary.gpu_release_registry_wait_p95_us, 4_000);
+        assert_eq!(summary.gpu_release_registry_wait_p99_us, 4_000);
+    }
+
+    #[test]
+    fn registration_wait_semantics_do_not_change_physical_pageflip_classification() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(600);
+        observability.arm_composited(transaction_id, 1, 5_000_000);
+        observability.note_gpu_signal(transaction_id, 4_000_000);
+        observability.note_composited_pageflip(transaction_id, 8_000_000);
+
+        let summary = observability.summary();
+        assert_eq!(summary.release_before_pageflip_leases, 1);
+        assert_eq!(summary.release_to_pageflip_lead_p50_us, 4_000);
+        assert_eq!(summary.already_signaled_before_registration, 0);
+    }
+
+    #[test]
+    fn unavailable_composited_timestamp_removes_unpairable_correlation() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(601);
+        observability.arm_composited(transaction_id, 1, 1);
+        observability.note_composited_pageflip(transaction_id, 2);
+        observability
+            .note_timestamp_unavailable(DmabufGpuReleaseOrigin::Composited { transaction_id });
+
+        let summary = observability.summary();
+        assert_eq!(summary.signal_timestamp_unavailable, 1);
+        assert_eq!(summary.correlations_unpairable_signal_timestamp, 1);
+        assert_eq!(summary.correlation_pending, 0);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(summary.release_before_pageflip_leases, 0);
+        assert_eq!(summary.release_after_pageflip_leases, 0);
+        assert_eq!(summary.release_same_timestamp_leases, 0);
+    }
+
+    #[test]
+    fn repeated_unavailable_composited_timestamps_do_not_fill_ledger() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        for value in 1..=(DMABUF_GPU_RELEASE_CORRELATION_CAPACITY as u64 + 7) {
+            let transaction_id = transaction_id(value);
+            let _ = observability.arm_composited(transaction_id, 1, value);
+            observability
+                .note_timestamp_unavailable(DmabufGpuReleaseOrigin::Composited { transaction_id });
+        }
+
+        let summary = observability.summary();
+        assert_eq!(summary.correlation_pending, 0);
+        assert_eq!(summary.correlation_overflows, 0);
+        assert_eq!(
+            summary.correlations_unpairable_signal_timestamp,
+            DMABUF_GPU_RELEASE_CORRELATION_CAPACITY as u64 + 7,
+        );
+        assert_eq!(
+            summary.composited_correlations_armed,
+            DMABUF_GPU_RELEASE_CORRELATION_CAPACITY as u64 + 7,
+        );
+    }
+
+    #[test]
+    fn armed_counts_only_successful_correlation_insertions() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(602);
+        assert!(observability.arm_composited(transaction_id, 1, 1));
+        assert!(!observability.arm_composited(transaction_id, 1, 2));
+
+        let summary = observability.summary();
+        assert_eq!(summary.composited_correlations_armed, 1);
+        assert_eq!(summary.correlation_duplicates, 1);
     }
 
     #[test]
