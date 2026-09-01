@@ -681,6 +681,11 @@ impl NativeFrameScheduler {
         self.pending_page_flip_token.is_some()
     }
 
+    pub fn page_flip_watchdog_deadline_ns(&self) -> Option<u64> {
+        self.pending_page_flip_token
+            .and(self.watchdog_deadline_ns)
+    }
+
     pub fn worker_submission_queued(&self) -> bool {
         self.worker_queued.is_some()
     }

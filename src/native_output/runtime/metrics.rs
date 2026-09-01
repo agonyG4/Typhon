@@ -502,10 +502,16 @@ impl NativeRuntime {
                         })
                 }
             }
-            // Buffer and page-flip ownership is external readiness.  A
-            // legacy scheduler deadline may describe an earlier visual
-            // target, but it cannot make either owner progress.
-            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => None,
+            // Buffer and page-flip ownership is external readiness.  Preserve
+            // only the genuine page-flip watchdog; never reuse a visual
+            // target deadline as a poll for either owner.
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
+                .frame_scheduler
+                .page_flip_watchdog_deadline_ns()
+                .map(|at_ns| NativeDeadline {
+                    owner: NativeDeadlineOwner::FrameScheduler,
+                    at_ns,
+                }),
             SchedulerDecision::Idle
             | SchedulerDecision::Render
             | SchedulerDecision::RenderAhead
