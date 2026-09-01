@@ -1,8 +1,25 @@
+use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::native::event_loop::NativeEventLoop;
 pub(crate) use oblivion_one::native::event_loop::{
     NativeContinuationReason, NativeContinuationReasons,
 };
 use oblivion_one::native::scheduler::{SchedulerWakeDeadline, SchedulerWakeDeadlineKind};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum NativePageflipTimeoutOwner {
+    #[default]
+    MainThread,
+    KmsWorker,
+}
+
+impl From<KmsCommitWorkerTransport> for NativePageflipTimeoutOwner {
+    fn from(transport: KmsCommitWorkerTransport) -> Self {
+        match transport {
+            KmsCommitWorkerTransport::Synchronous => Self::MainThread,
+            KmsCommitWorkerTransport::Worker => Self::KmsWorker,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDeadlineOwner {
@@ -99,6 +116,7 @@ impl NativeWakeAuthorityMetrics {
         plan: NativeWakePlan,
         now_ns: u64,
         previously_armed: Option<u64>,
+        fired_deadline_ns: Option<u64>,
     ) {
         match plan.deadline {
             Some(deadline) => {
@@ -106,7 +124,11 @@ impl NativeWakeAuthorityMetrics {
                 if deadline.at_ns <= now_ns {
                     self.past_deadline_arms = self.past_deadline_arms.saturating_add(1);
                 }
-                if previously_armed == Some(deadline.at_ns) && deadline.at_ns <= now_ns {
+                if fired_deadline_ns
+                    .or(previously_armed)
+                    .is_some_and(|previous| previous == deadline.at_ns)
+                    && deadline.at_ns <= now_ns
+                {
                     self.stale_deadline_rearms = self.stale_deadline_rearms.saturating_add(1);
                 }
                 match deadline.owner {
@@ -150,6 +172,21 @@ impl NativeWakeAuthorityMetrics {
                 self.runtime_timer_disarms = self.runtime_timer_disarms.saturating_add(1);
             }
         }
+    }
+
+    pub(crate) fn observe_plan_after_wake(
+        &mut self,
+        plan: NativeWakePlan,
+        now_ns: u64,
+        event_loop: &mut NativeEventLoop,
+    ) {
+        let fired_deadline_ns = event_loop.take_fired_deadline_ns();
+        self.observe_plan(
+            plan,
+            now_ns,
+            event_loop.armed_deadline_ns(),
+            fired_deadline_ns,
+        );
     }
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
@@ -282,6 +319,27 @@ pub(crate) fn native_deadline_from_scheduler(deadline: SchedulerWakeDeadline) ->
     }
 }
 
+pub(crate) fn scheduler_deadline_for_timeout_owner(
+    deadline: Option<SchedulerWakeDeadline>,
+    owner: NativePageflipTimeoutOwner,
+) -> Option<NativeDeadline> {
+    deadline
+        .filter(|deadline| {
+            owner == NativePageflipTimeoutOwner::MainThread
+                || deadline.kind != SchedulerWakeDeadlineKind::PageFlipWatchdog
+        })
+        .map(native_deadline_from_scheduler)
+}
+
+pub(crate) fn atomic_commit_watchdog_deadline_for_timeout_owner(
+    deadline_ns: Option<u64>,
+    owner: NativePageflipTimeoutOwner,
+) -> Option<u64> {
+    (owner == NativePageflipTimeoutOwner::MainThread)
+        .then_some(deadline_ns)
+        .flatten()
+}
+
 const fn earliest_deadline(
     current: Option<NativeDeadline>,
     candidate: Option<NativeDeadline>,
@@ -392,9 +450,136 @@ mod tests {
         };
         let mut metrics = NativeWakeAuthorityMetrics::default();
 
-        metrics.observe_plan(plan, 5, Some(5));
+        metrics.observe_plan(plan, 5, Some(5), None);
 
         assert_eq!(metrics.stale_deadline_rearms, 1);
         assert_eq!(metrics.past_deadline_arms, 1);
+    }
+
+    #[test]
+    fn real_timer_wake_preserves_fired_identity_for_the_next_plan() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let fired_at_ns = oblivion_one::native::event_loop::monotonic_now_ns().unwrap();
+        event_loop.arm_deadline(Some(fired_at_ns)).unwrap();
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.timer());
+        assert_eq!(event_loop.armed_deadline_ns(), None);
+        assert_eq!(event_loop.fired_deadline_ns(), Some(fired_at_ns));
+
+        let same_expired_plan = NativeWakePlan {
+            deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: fired_at_ns,
+            }),
+            ..NativeWakePlan::default()
+        };
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        let now_ns = fired_at_ns.saturating_add(1);
+        metrics.observe_plan_after_wake(same_expired_plan, now_ns, &mut event_loop);
+        assert_eq!(event_loop.fired_deadline_ns(), None);
+        event_loop
+            .arm_deadline(same_expired_plan.deadline.map(|deadline| deadline.at_ns))
+            .unwrap();
+
+        assert_eq!(metrics.stale_deadline_rearms, 1);
+
+        let future_plan = NativeWakePlan {
+            deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: now_ns.saturating_add(1_000_000),
+            }),
+            ..NativeWakePlan::default()
+        };
+        metrics.observe_plan_after_wake(future_plan, now_ns, &mut event_loop);
+        assert_eq!(metrics.stale_deadline_rearms, 1);
+    }
+
+    #[test]
+    fn worker_transport_has_exclusive_pageflip_timeout_authority() {
+        let owner = NativePageflipTimeoutOwner::from(KmsCommitWorkerTransport::Worker);
+        let scheduler_watchdog = Some(SchedulerWakeDeadline {
+            kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+            at_ns: 2_000,
+        });
+
+        assert_eq!(
+            scheduler_deadline_for_timeout_owner(scheduler_watchdog, owner,),
+            None
+        );
+        assert_eq!(
+            atomic_commit_watchdog_deadline_for_timeout_owner(Some(1_000), owner,),
+            None
+        );
+
+        let plan =
+            build_native_wake_plan(NativeWakePlanInputs {
+                scheduler_deadline: scheduler_deadline_for_timeout_owner(scheduler_watchdog, owner),
+                atomic_commit_watchdog_deadline_ns:
+                    atomic_commit_watchdog_deadline_for_timeout_owner(Some(1_000), owner),
+                explicit_sync_fallback_deadline_ns: Some(3_000),
+                ..NativeWakePlanInputs::default()
+            });
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::ExplicitSyncFallback,
+                at_ns: 3_000,
+            })
+        );
+    }
+
+    #[test]
+    fn synchronous_transport_keeps_pageflip_watchdog_authority() {
+        let owner = NativePageflipTimeoutOwner::from(KmsCommitWorkerTransport::Synchronous);
+        let scheduler_watchdog = scheduler_deadline_for_timeout_owner(
+            Some(SchedulerWakeDeadline {
+                kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+                at_ns: 2_000,
+            }),
+            owner,
+        );
+
+        assert_eq!(
+            scheduler_watchdog,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::FrameScheduler,
+                at_ns: 2_000,
+            })
+        );
+        assert_eq!(
+            atomic_commit_watchdog_deadline_for_timeout_owner(Some(1_000), owner,),
+            Some(1_000)
+        );
+
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_deadline: scheduler_watchdog,
+            atomic_commit_watchdog_deadline_ns: Some(1_000),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::AtomicCommitWatchdog,
+                at_ns: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn worker_transport_preserves_non_pageflip_scheduler_deadlines() {
+        let owner = NativePageflipTimeoutOwner::from(KmsCommitWorkerTransport::Worker);
+        assert_eq!(
+            scheduler_deadline_for_timeout_owner(
+                Some(SchedulerWakeDeadline {
+                    kind: SchedulerWakeDeadlineKind::RenderStart,
+                    at_ns: 2_000,
+                }),
+                owner,
+            ),
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 2_000,
+            })
+        );
     }
 }

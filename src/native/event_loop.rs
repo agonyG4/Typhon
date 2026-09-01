@@ -304,6 +304,7 @@ pub struct NativeEventLoop {
     free_registration_slots: Vec<usize>,
     events: Vec<libc::epoll_event>,
     armed_deadline_ns: Option<u64>,
+    fired_deadline_ns: Option<u64>,
     continuation_reasons: NativeContinuationReasons,
     continuation_signaled: bool,
     continuation_requests: u64,
@@ -348,6 +349,7 @@ impl NativeEventLoop {
             free_registration_slots: Vec::new(),
             events: vec![libc::epoll_event { events: 0, u64: 0 }; MAX_READY_EVENTS],
             armed_deadline_ns: None,
+            fired_deadline_ns: None,
             continuation_reasons: NativeContinuationReasons::default(),
             continuation_signaled: false,
             continuation_requests: 0,
@@ -550,6 +552,14 @@ impl NativeEventLoop {
         self.armed_deadline_ns
     }
 
+    pub const fn fired_deadline_ns(&self) -> Option<u64> {
+        self.fired_deadline_ns
+    }
+
+    pub fn take_fired_deadline_ns(&mut self) -> Option<u64> {
+        self.fired_deadline_ns.take()
+    }
+
     pub const fn continuation_requests(&self) -> u64 {
         self.continuation_requests
     }
@@ -728,6 +738,9 @@ impl NativeEventLoop {
         if reasons.timer() {
             self.drain_timer()?;
             self.armed_deadline_ns = None;
+            self.fired_deadline_ns = fired_deadline_ns;
+        } else {
+            self.fired_deadline_ns = None;
         }
         let timer_lateness_ns = reasons
             .timer()
@@ -1692,6 +1705,19 @@ mod tests {
         assert!(wakeup.reasons.timer());
         assert!(wakeup.timer_lateness_ns.is_some());
         assert_eq!(event_loop.armed_deadline_ns(), None);
+    }
+
+    #[test]
+    fn fired_timer_identity_survives_consumption() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let deadline_ns = monotonic_now_ns().unwrap();
+        event_loop.arm_deadline(Some(deadline_ns)).unwrap();
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.timer());
+        assert_eq!(event_loop.armed_deadline_ns(), None);
+        assert_eq!(event_loop.fired_deadline_ns(), Some(deadline_ns));
     }
 
     #[test]

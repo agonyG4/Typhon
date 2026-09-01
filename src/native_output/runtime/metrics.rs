@@ -11,7 +11,9 @@ use oblivion_one::control_snapshots::{
     RepaintPerformanceSnapshot, SignedTimingSummarySnapshot, TimingSummarySnapshot,
     WorkerTimingPerformanceSnapshot,
 };
-use oblivion_one::native::scheduler::apply_atomic_commit_lane_guard;
+use oblivion_one::native::scheduler::{
+    SchedulerWakeDeadline, SchedulerWakeDeadlineKind, apply_atomic_commit_lane_guard,
+};
 use std::{collections::BTreeMap, time::Duration};
 
 const RENDER_REPAINT_REASON_COUNT: usize = 12;
@@ -421,6 +423,8 @@ impl NativeRuntime {
                 )
                 .total_cost_ns,
         );
+        let pageflip_timeout_owner: NativePageflipTimeoutOwner =
+            self.kms_commit_worker_transport.into();
         let explicit_output = matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_));
         if explicit_output {
             let pipeline = self
@@ -462,7 +466,9 @@ impl NativeRuntime {
             return Ok((action == decision.action)
                 .then_some(decision.wake_deadline)
                 .flatten()
-                .map(native_deadline_from_scheduler));
+                .and_then(|deadline| {
+                    scheduler_deadline_for_timeout_owner(Some(deadline), pageflip_timeout_owner)
+                }));
         }
 
         let decision = self
@@ -505,13 +511,17 @@ impl NativeRuntime {
             // Buffer and page-flip ownership is external readiness.  Preserve
             // only the genuine page-flip watchdog; never reuse a visual
             // target deadline as a poll for either owner.
-            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
-                .frame_scheduler
-                .page_flip_watchdog_deadline_ns()
-                .map(|at_ns| NativeDeadline {
-                    owner: NativeDeadlineOwner::FrameScheduler,
-                    at_ns,
-                }),
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => {
+                scheduler_deadline_for_timeout_owner(
+                    self.frame_scheduler
+                        .page_flip_watchdog_deadline_ns()
+                        .map(|at_ns| SchedulerWakeDeadline {
+                            kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+                            at_ns,
+                        }),
+                    pageflip_timeout_owner,
+                )
+            }
             SchedulerDecision::Idle
             | SchedulerDecision::Render
             | SchedulerDecision::RenderAhead
@@ -531,7 +541,7 @@ impl NativeRuntime {
         now_ns: u64,
     ) -> NativeResult<()> {
         self.wake_authority
-            .observe_plan(plan, now_ns, self.event_loop.armed_deadline_ns());
+            .observe_plan_after_wake(plan, now_ns, &mut self.event_loop);
         for reason in [
             NativeContinuationReason::InputBacklog,
             NativeContinuationReason::AstreaPublication,
@@ -560,6 +570,8 @@ impl NativeRuntime {
 
     pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
+        let pageflip_timeout_owner: NativePageflipTimeoutOwner =
+            self.kms_commit_worker_transport.into();
         let dmabuf_retry_deadline =
             if matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_)) {
                 self.dmabuf_gpu_release_registry
@@ -580,7 +592,10 @@ impl NativeRuntime {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
             scheduler_deadline: self.current_scheduler_wake_deadline(now_ns)?,
-            atomic_commit_watchdog_deadline_ns: self.atomic_commit_arbiter.watchdog_deadline_ns(),
+            atomic_commit_watchdog_deadline_ns: atomic_commit_watchdog_deadline_for_timeout_owner(
+                self.atomic_commit_arbiter.watchdog_deadline_ns(),
+                pageflip_timeout_owner,
+            ),
             explicit_sync_fallback_deadline_ns: self.acquire_watches.next_fallback_deadline_ns(),
             xwayland_timeout_deadline_ns: self.xwayland.next_deadline_ns(),
             cursor_response_deadline_ns: self.cursor_output_arbitration.deadline_ns(),
