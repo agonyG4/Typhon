@@ -262,9 +262,8 @@ impl DmabufGpuReleaseObservability {
     fn note_timestamp_unavailable(&mut self, origin: DmabufGpuReleaseOrigin) {
         self.summary.signal_timestamp_unavailable =
             self.summary.signal_timestamp_unavailable.saturating_add(1);
-        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin
-            && self.correlations.remove(&transaction_id).is_some()
-        {
+        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
+            self.correlations.remove(&transaction_id);
             self.summary.correlations_unpairable_signal_timestamp = self
                 .summary
                 .correlations_unpairable_signal_timestamp
@@ -1247,6 +1246,24 @@ mod tests {
         let transaction_id = transaction_id(601);
         observability.arm_composited(transaction_id, 1, 1);
         observability.note_composited_pageflip(transaction_id, 2);
+        observability
+            .note_timestamp_unavailable(DmabufGpuReleaseOrigin::Composited { transaction_id });
+
+        let summary = observability.summary();
+        assert_eq!(summary.signal_timestamp_unavailable, 1);
+        assert_eq!(summary.correlations_unpairable_signal_timestamp, 1);
+        assert_eq!(summary.correlation_pending, 0);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(summary.release_before_pageflip_leases, 0);
+        assert_eq!(summary.release_after_pageflip_leases, 0);
+        assert_eq!(summary.release_same_timestamp_leases, 0);
+    }
+
+    #[test]
+    fn unavailable_composited_timestamp_counts_without_a_pending_correlation() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(603);
+
         observability
             .note_timestamp_unavailable(DmabufGpuReleaseOrigin::Composited { transaction_id });
 
