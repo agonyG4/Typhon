@@ -148,6 +148,9 @@ impl NativeFrameScheduler {
             return SchedulerDecision::WaitForWorkerQueue;
         }
         if pipeline.kernel_primary_submitted() {
+            if !self.visual_work_queued && self.page_flip_watchdog_expired(now_ns) {
+                return SchedulerDecision::PageFlipWatchdogExpired;
+            }
             if matches!(prepared, SchedulerPreparedPrimary::Ready { .. })
                 && context.worker_queue_available
                 && context.render_ahead_allowed
@@ -220,6 +223,20 @@ impl NativeFrameScheduler {
         } else {
             SchedulerDecision::Idle
         }
+    }
+
+    fn page_flip_watchdog_expired(&mut self, now_ns: u64) -> bool {
+        if !self
+            .watchdog_deadline_ns
+            .is_some_and(|deadline| now_ns >= deadline)
+        {
+            return false;
+        }
+        if !self.watchdog_reported {
+            self.watchdog_timeout_count = self.watchdog_timeout_count.saturating_add(1);
+            self.watchdog_reported = true;
+        }
+        true
     }
 
     pub fn decision_with_pipeline_diagnostics(
@@ -471,6 +488,22 @@ mod tests {
                 at_ns: 1_000_000_001,
             })
         );
+    }
+
+    #[test]
+    fn expired_pageflip_watchdog_is_terminal_before_rearming() {
+        let mut scheduler = NativeFrameScheduler::with_watchdog(165, 0, 100);
+        scheduler.note_async_submission(41, 1).unwrap();
+        let pipeline = TestPipeline {
+            kernel_primary_submitted: true,
+            ..TestPipeline::default()
+        };
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(context(101, None), &pipeline);
+
+        assert_eq!(decision.action, SchedulerDecision::PageFlipWatchdogExpired);
+        assert_eq!(decision.wake_deadline, None);
+        assert_eq!(scheduler.watchdog_timeout_count(), 1);
     }
 
     #[test]
