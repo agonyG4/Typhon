@@ -27,6 +27,7 @@ pub enum NativeEventSource {
     XwaylandStderr,
     ControlListener,
     ControlClient,
+    RuntimeContinuation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,6 +86,7 @@ impl WakeReasons {
     const CHILD_SIGNAL: u32 = 1 << 6;
     const OUTPUT_RENDER_FENCE: u32 = 1 << 8;
     const DMABUF_GPU_RELEASE: u32 = 1 << 16;
+    const RUNTIME_CONTINUATION: u32 = 1 << 17;
     const XWAYLAND_LISTEN: u32 = 1 << 9;
     const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
     const XWAYLAND_XWM: u32 = 1 << 11;
@@ -182,7 +184,12 @@ impl WakeReasons {
             NativeEventSource::XwaylandXwm => Self::XWAYLAND_XWM,
             NativeEventSource::XwaylandStderr => Self::XWAYLAND_STDERR,
             NativeEventSource::ControlListener | NativeEventSource::ControlClient => Self::CONTROL,
+            NativeEventSource::RuntimeContinuation => Self::RUNTIME_CONTINUATION,
         };
+    }
+
+    pub const fn runtime_continuation(self) -> bool {
+        self.0 & Self::RUNTIME_CONTINUATION != 0
     }
 }
 
@@ -207,6 +214,7 @@ pub struct CursorIoReadyEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWakeup {
     pub reasons: WakeReasons,
+    pub continuation: NativeContinuationReasons,
     pub ready_sources: usize,
     pub blocked_ns: u64,
     pub timer_lateness_ns: Option<u64>,
@@ -215,6 +223,60 @@ pub struct NativeWakeup {
     pub xwayland_events: Vec<XwaylandReadyEvent>,
     pub control_events: Vec<ControlReadyEvent>,
     pub cursor_io_events: Vec<CursorIoReadyEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeContinuationReason {
+    InputBacklog,
+    AstreaPublication,
+    CommitTimingPlanning,
+    XwaylandContinuation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeContinuationReasons(u32);
+
+impl NativeContinuationReasons {
+    const INPUT_BACKLOG: u32 = 1 << 0;
+    const ASTREA_PUBLICATION: u32 = 1 << 1;
+    const COMMIT_TIMING_PLANNING: u32 = 1 << 2;
+    const XWAYLAND_CONTINUATION: u32 = 1 << 3;
+
+    pub const fn contains(self, reason: NativeContinuationReason) -> bool {
+        self.0 & reason.bit() != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn insert(mut self, reason: NativeContinuationReason) -> Self {
+        self.0 |= reason.bit();
+        self
+    }
+}
+
+impl NativeContinuationReason {
+    const fn bit(self) -> u32 {
+        match self {
+            Self::InputBacklog => NativeContinuationReasons::INPUT_BACKLOG,
+            Self::AstreaPublication => NativeContinuationReasons::ASTREA_PUBLICATION,
+            Self::CommitTimingPlanning => NativeContinuationReasons::COMMIT_TIMING_PLANNING,
+            Self::XwaylandContinuation => NativeContinuationReasons::XWAYLAND_CONTINUATION,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -234,10 +296,16 @@ struct RegistrationSlot {
 pub struct NativeEventLoop {
     epoll: OwnedFd,
     timer: OwnedFd,
+    continuation: OwnedFd,
     registrations: Vec<RegistrationSlot>,
     free_registration_slots: Vec<usize>,
     events: Vec<libc::epoll_event>,
     armed_deadline_ns: Option<u64>,
+    continuation_reasons: NativeContinuationReasons,
+    continuation_signaled: bool,
+    continuation_requests: u64,
+    continuation_coalesced: u64,
+    continuation_wakes: u64,
     benign_unregistration_count: u64,
     stale_unregistration_count: u64,
 }
@@ -259,26 +327,45 @@ impl NativeEventLoop {
             unsafe { libc::close(epoll_fd) };
             return Err(error);
         }
+        let continuation_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if continuation_fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(epoll_fd);
+                libc::close(timer_fd);
+            }
+            return Err(error);
+        }
 
         let mut event_loop = Self {
             epoll: unsafe { OwnedFd::from_raw_fd(epoll_fd) },
             timer: unsafe { OwnedFd::from_raw_fd(timer_fd) },
+            continuation: unsafe { OwnedFd::from_raw_fd(continuation_fd) },
             registrations: Vec::new(),
             free_registration_slots: Vec::new(),
             events: vec![libc::epoll_event { events: 0, u64: 0 }; MAX_READY_EVENTS],
             armed_deadline_ns: None,
+            continuation_reasons: NativeContinuationReasons::default(),
+            continuation_signaled: false,
+            continuation_requests: 0,
+            continuation_coalesced: 0,
+            continuation_wakes: 0,
             benign_unregistration_count: 0,
             stale_unregistration_count: 0,
         };
         event_loop.register_raw(timer_fd, NativeEventSource::Timer)?;
+        event_loop.register_raw(continuation_fd, NativeEventSource::RuntimeContinuation)?;
         Ok(event_loop)
     }
 
     pub fn register(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<ReactorToken> {
-        if source == NativeEventSource::Timer {
+        if matches!(
+            source,
+            NativeEventSource::Timer | NativeEventSource::RuntimeContinuation
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the timer source is owned by the event loop",
+                "the timer and continuation sources are owned by the event loop",
             ));
         }
         self.register_raw(fd, source)
@@ -423,6 +510,55 @@ impl NativeEventLoop {
         Ok(())
     }
 
+    pub fn request_continuation(&mut self, reason: NativeContinuationReason) -> io::Result<()> {
+        self.continuation_reasons = self.continuation_reasons.insert(reason);
+        self.continuation_requests = self.continuation_requests.saturating_add(1);
+        if self.continuation_signaled {
+            self.continuation_coalesced = self.continuation_coalesced.saturating_add(1);
+            return Ok(());
+        }
+        let value = 1u64;
+        let written = unsafe {
+            libc::write(
+                self.continuation.as_raw_fd(),
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if written == std::mem::size_of::<u64>() as isize {
+            self.continuation_signaled = true;
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            self.continuation_signaled = true;
+            self.continuation_coalesced = self.continuation_coalesced.saturating_add(1);
+            Ok(())
+        } else if written < 0 {
+            Err(error)
+        } else {
+            Err(io::Error::other(
+                "short write to native continuation eventfd",
+            ))
+        }
+    }
+
+    pub const fn armed_deadline_ns(&self) -> Option<u64> {
+        self.armed_deadline_ns
+    }
+
+    pub const fn continuation_requests(&self) -> u64 {
+        self.continuation_requests
+    }
+
+    pub const fn continuation_coalesced(&self) -> u64 {
+        self.continuation_coalesced
+    }
+
+    pub const fn continuation_wakes(&self) -> u64 {
+        self.continuation_wakes
+    }
+
     pub fn wait(&mut self) -> io::Result<NativeWakeup> {
         let wait_started_ns = monotonic_now_ns()?;
         let ready = retry_interrupted(|| {
@@ -536,18 +672,23 @@ impl NativeEventLoop {
             }
         }
 
+        let continuation = if reasons.runtime_continuation() {
+            self.drain_continuation()?
+        } else {
+            NativeContinuationReasons::default()
+        };
+        let fired_deadline_ns = self.armed_deadline_ns;
         if reasons.timer() {
             self.drain_timer()?;
+            self.armed_deadline_ns = None;
         }
         let timer_lateness_ns = reasons
             .timer()
-            .then(|| {
-                self.armed_deadline_ns
-                    .map(|deadline| observed_ns.saturating_sub(deadline))
-            })
+            .then(|| fired_deadline_ns.map(|deadline| observed_ns.saturating_sub(deadline)))
             .flatten();
         Ok(NativeWakeup {
             reasons,
+            continuation,
             ready_sources: ready,
             blocked_ns: observed_ns.saturating_sub(wait_started_ns),
             timer_lateness_ns,
@@ -681,6 +822,29 @@ impl NativeEventLoop {
             }
         }
         Ok(())
+    }
+
+    fn drain_continuation(&mut self) -> io::Result<NativeContinuationReasons> {
+        let mut units = 0u64;
+        let read = unsafe {
+            libc::read(
+                self.continuation.as_raw_fd(),
+                (&mut units as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+        }
+        self.continuation_signaled = false;
+        self.continuation_wakes = self.continuation_wakes.saturating_add(1);
+        Ok(std::mem::replace(
+            &mut self.continuation_reasons,
+            NativeContinuationReasons::default(),
+        ))
     }
 }
 
@@ -1375,5 +1539,96 @@ mod tests {
         let wakeup = event_loop.wait().unwrap();
         assert_eq!(wakeup.xwayland_events[0].token, replacement_token);
         assert_eq!(event_loop.stale_unregistration_count(), 1);
+    }
+
+    #[test]
+    fn continuation_reasons_coalesce_into_one_eventfd_wake() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+
+        event_loop
+            .request_continuation(NativeContinuationReason::InputBacklog)
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::AstreaPublication)
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::CommitTimingPlanning)
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::XwaylandContinuation)
+            .unwrap();
+
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.runtime_continuation());
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::InputBacklog)
+        );
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::AstreaPublication)
+        );
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::CommitTimingPlanning)
+        );
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::XwaylandContinuation)
+        );
+        assert_eq!(event_loop.continuation_requests(), 4);
+        assert_eq!(event_loop.continuation_coalesced(), 3);
+        assert_eq!(event_loop.continuation_wakes(), 1);
+    }
+
+    #[test]
+    fn continuation_and_real_fd_readiness_share_one_epoll_turn() {
+        let input = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(input.as_raw_fd(), NativeEventSource::Input(0))
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::InputBacklog)
+            .unwrap();
+        signal(input.as_raw_fd());
+
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.runtime_continuation());
+        assert!(wakeup.reasons.input());
+        assert_eq!(wakeup.ready_sources, 2);
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::InputBacklog)
+        );
+    }
+
+    #[test]
+    fn consumed_timer_is_not_still_armed() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .arm_deadline(Some(monotonic_now_ns().unwrap()))
+            .unwrap();
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.timer());
+        assert!(wakeup.timer_lateness_ns.is_some());
+        assert_eq!(event_loop.armed_deadline_ns(), None);
+    }
+
+    #[test]
+    fn external_registration_cannot_impersonate_continuation_source() {
+        let source = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let error = event_loop
+            .register(source.as_raw_fd(), NativeEventSource::RuntimeContinuation)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

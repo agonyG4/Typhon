@@ -179,7 +179,7 @@ impl NativeWorkDomains {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oblivion_one::native::event_loop::WakeReasons;
+    use oblivion_one::native::event_loop::{NativeContinuationReasons, WakeReasons};
 
     const INPUT: u32 = 1 << 3;
     const TIMER: u32 = 1 << 4;
@@ -194,6 +194,7 @@ mod tests {
     fn wakeup(bits: u32) -> NativeWakeup {
         NativeWakeup {
             reasons: WakeReasons::from_bits(bits),
+            continuation: NativeContinuationReasons::default(),
             ready_sources: 1,
             blocked_ns: 0,
             timer_lateness_ns: None,

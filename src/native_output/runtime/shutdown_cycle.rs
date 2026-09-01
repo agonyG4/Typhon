@@ -89,6 +89,7 @@ impl NativeRuntime {
         let cycle = NativeCycleState {
             wakeup: NativeWakeup {
                 reasons: Default::default(),
+                continuation: Default::default(),
                 ready_sources: 0,
                 blocked_ns: 0,
                 timer_lateness_ns: None,

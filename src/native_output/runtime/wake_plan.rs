@@ -1,3 +1,6 @@
+pub(crate) use oblivion_one::native::event_loop::{
+    NativeContinuationReason, NativeContinuationReasons,
+};
 use oblivion_one::native::scheduler::{SchedulerWakeDeadline, SchedulerWakeDeadlineKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,56 +20,6 @@ pub(crate) enum NativeDeadlineOwner {
 pub(crate) struct NativeDeadline {
     pub(crate) owner: NativeDeadlineOwner,
     pub(crate) at_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeContinuationReason {
-    InputBacklog,
-    AstreaPublication,
-    CommitTimingPlanning,
-    XwaylandContinuation,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct NativeContinuationReasons(u32);
-
-impl NativeContinuationReasons {
-    const INPUT_BACKLOG: u32 = 1 << 0;
-    const ASTREA_PUBLICATION: u32 = 1 << 1;
-    const COMMIT_TIMING_PLANNING: u32 = 1 << 2;
-    const XWAYLAND_CONTINUATION: u32 = 1 << 3;
-
-    pub(crate) const fn contains(self, reason: NativeContinuationReason) -> bool {
-        self.0 & reason.bit() != 0
-    }
-
-    pub(crate) const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    pub(crate) const fn bits(self) -> u32 {
-        self.0
-    }
-
-    const fn insert(mut self, reason: NativeContinuationReason) -> Self {
-        self.0 |= reason.bit();
-        self
-    }
-
-    pub(crate) const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
-
-impl NativeContinuationReason {
-    const fn bit(self) -> u32 {
-        match self {
-            Self::InputBacklog => NativeContinuationReasons::INPUT_BACKLOG,
-            Self::AstreaPublication => NativeContinuationReasons::ASTREA_PUBLICATION,
-            Self::CommitTimingPlanning => NativeContinuationReasons::COMMIT_TIMING_PLANNING,
-            Self::XwaylandContinuation => NativeContinuationReasons::XWAYLAND_CONTINUATION,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
