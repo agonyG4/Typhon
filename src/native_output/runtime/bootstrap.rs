@@ -501,7 +501,7 @@ impl NativeRuntime {
         let initial_wake_plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: scheduler_anchor_ns,
             scheduler_deadline: frame_scheduler
-                .next_deadline_ns()
+                .page_flip_watchdog_deadline_ns()
                 .map(|at_ns| NativeDeadline {
                     owner: NativeDeadlineOwner::FrameScheduler,
                     at_ns,
