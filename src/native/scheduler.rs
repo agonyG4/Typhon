@@ -7,8 +7,8 @@ use std::time::Duration;
 mod pipeline;
 pub use pipeline::{
     ExplicitAtomicSchedulerContext, ExplicitAtomicSchedulerDecision, PipelineWaitReason,
-    PresentationPipelineView, SchedulerPreparedPrimary, apply_atomic_commit_lane_guard,
-    rendered_primary_must_wait_for_lane,
+    PresentationPipelineView, SchedulerPreparedPrimary, SchedulerWakeDeadline,
+    SchedulerWakeDeadlineKind, apply_atomic_commit_lane_guard, rendered_primary_must_wait_for_lane,
 };
 
 const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;

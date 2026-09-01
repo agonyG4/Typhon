@@ -55,8 +55,8 @@ mod session;
 mod session_io;
 mod shutdown;
 mod shutdown_cycle;
-mod work_domains;
 mod wake_plan;
+mod work_domains;
 mod xwayland;
 mod xwayland_reactor;
 #[cfg(test)]

@@ -46,9 +46,24 @@ pub enum PipelineWaitReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerWakeDeadlineKind {
+    RenderStart,
+    SubmitNotBefore,
+    ProtocolRefresh,
+    PageFlipWatchdog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerWakeDeadline {
+    pub kind: SchedulerWakeDeadlineKind,
+    pub at_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExplicitAtomicSchedulerDecision {
     pub action: SchedulerDecision,
     pub wait_reason: Option<PipelineWaitReason>,
+    pub wake_deadline: Option<SchedulerWakeDeadline>,
 }
 
 fn ready_submit_decision(now_ns: u64, target: Option<PresentationTarget>) -> SchedulerDecision {
@@ -251,10 +266,60 @@ impl NativeFrameScheduler {
             | SchedulerDecision::CompleteProtocolOnly
             | SchedulerDecision::PageFlipWatchdogExpired => None,
         };
+        let wake_deadline = match action {
+            SchedulerDecision::WaitForRefresh => {
+                if let Some(target) = ready_target_for_pipeline(pipeline) {
+                    Some(SchedulerWakeDeadline {
+                        kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
+                        at_ns: target.submit_not_before().get(),
+                    })
+                } else if self.visual_work_queued {
+                    context
+                        .presentation_target
+                        .map(|target| SchedulerWakeDeadline {
+                            kind: SchedulerWakeDeadlineKind::RenderStart,
+                            at_ns: target.render_start_deadline.get(),
+                        })
+                } else if self.protocol_work_queued {
+                    self.refresh_deadline_ns.map(|at_ns| SchedulerWakeDeadline {
+                        kind: SchedulerWakeDeadlineKind::ProtocolRefresh,
+                        at_ns,
+                    })
+                } else {
+                    None
+                }
+            }
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
+                .pending_page_flip_token
+                .and(self.watchdog_deadline_ns)
+                .map(|at_ns| SchedulerWakeDeadline {
+                    kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+                    at_ns,
+                }),
+            SchedulerDecision::Idle
+            | SchedulerDecision::Render
+            | SchedulerDecision::RenderAhead
+            | SchedulerDecision::SubmitReady
+            | SchedulerDecision::SubmitReadyLate
+            | SchedulerDecision::ReadyTargetInvalidated
+            | SchedulerDecision::CompleteProtocolOnly
+            | SchedulerDecision::PageFlipWatchdogExpired => None,
+            SchedulerDecision::WaitForWorkerQueue => None,
+        };
         ExplicitAtomicSchedulerDecision {
             action,
             wait_reason,
+            wake_deadline,
         }
+    }
+}
+
+fn ready_target_for_pipeline(
+    pipeline: &impl PresentationPipelineView,
+) -> Option<PresentationTarget> {
+    match pipeline.prepared_primary() {
+        SchedulerPreparedPrimary::Ready { target } => Some(target),
+        SchedulerPreparedPrimary::None | SchedulerPreparedPrimary::Rendering => None,
     }
 }
 
@@ -350,7 +415,10 @@ mod tests {
         }
     }
 
-    fn context(now_ns: u64, presentation_target: Option<PresentationTarget>) -> ExplicitAtomicSchedulerContext {
+    fn context(
+        now_ns: u64,
+        presentation_target: Option<PresentationTarget>,
+    ) -> ExplicitAtomicSchedulerContext {
         ExplicitAtomicSchedulerContext {
             now: MonotonicTimestampNs::new(now_ns),
             predicted_total_cost: Duration::from_millis(2),
@@ -369,13 +437,15 @@ mod tests {
             ..TestPipeline::default()
         };
 
-        let decision = scheduler.decision_with_pipeline_diagnostics(
-            context(5_000_000, Some(target(4_000_000, 6_000_000))),
-            &pipeline,
-        );
+        let mut scheduler_context = context(5_000_000, Some(target(4_000_000, 6_000_000)));
+        scheduler_context.render_ahead_allowed = false;
+        let decision = scheduler.decision_with_pipeline_diagnostics(scheduler_context, &pipeline);
 
         assert_eq!(decision.action, SchedulerDecision::WaitForWorkerQueue);
-        assert_eq!(decision.wait_reason, Some(PipelineWaitReason::WorkerQueueOccupied));
+        assert_eq!(
+            decision.wait_reason,
+            Some(PipelineWaitReason::WorkerQueueOccupied)
+        );
         assert_eq!(decision.wake_deadline, None);
     }
 
@@ -394,7 +464,13 @@ mod tests {
         );
 
         assert_eq!(decision.action, SchedulerDecision::WaitForPageFlip);
-        assert_eq!(decision.wake_deadline, None);
+        assert_eq!(
+            decision.wake_deadline,
+            Some(SchedulerWakeDeadline {
+                kind: SchedulerWakeDeadlineKind::PageFlipWatchdog,
+                at_ns: 1_000_000_001,
+            })
+        );
     }
 
     #[test]
@@ -430,10 +506,8 @@ mod tests {
             ..TestPipeline::default()
         };
 
-        let decision = scheduler.decision_with_pipeline_diagnostics(
-            context(4_000_000, Some(ready_target)),
-            &pipeline,
-        );
+        let decision = scheduler
+            .decision_with_pipeline_diagnostics(context(4_000_000, Some(ready_target)), &pipeline);
 
         assert_eq!(decision.action, SchedulerDecision::WaitForRefresh);
         assert_eq!(
@@ -447,14 +521,61 @@ mod tests {
 
     #[test]
     fn actionable_scheduler_decisions_have_no_rediscovery_deadline() {
-        for action in [
-            SchedulerDecision::Render,
-            SchedulerDecision::RenderAhead,
-            SchedulerDecision::SubmitReady,
-            SchedulerDecision::SubmitReadyLate,
-            SchedulerDecision::CompleteProtocolOnly,
-        ] {
-            assert_eq!(scheduler_wake_deadline_for(action), None);
+        let mut render = NativeFrameScheduler::new(165, 0);
+        render.queue_visual_work();
+        assert_eq!(
+            render
+                .decision_with_pipeline_diagnostics(
+                    context(5_000_000, Some(target(4_000_000, 6_000_000))),
+                    &TestPipeline::default(),
+                )
+                .wake_deadline,
+            None
+        );
+
+        let mut render_ahead = NativeFrameScheduler::new(165, 0);
+        render_ahead.note_async_submission(41, 1).unwrap();
+        render_ahead.queue_visual_work();
+        let worker_pipeline = TestPipeline {
+            worker_primary_queued: true,
+            ..TestPipeline::default()
+        };
+        assert_eq!(
+            render_ahead
+                .decision_with_pipeline_diagnostics(
+                    context(5_000_000, Some(target(4_000_000, 6_000_000))),
+                    &worker_pipeline,
+                )
+                .wake_deadline,
+            None
+        );
+
+        for now_ns in [5_000_000, 5_000_002] {
+            let mut ready = NativeFrameScheduler::new(165, 0);
+            let ready_target = target(3_000_000, 5_000_000);
+            ready.note_ready_frame(Some(ready_target));
+            let decision = ready.decision_with_pipeline_diagnostics(
+                context(now_ns, Some(ready_target)),
+                &TestPipeline {
+                    prepared: SchedulerPreparedPrimary::Ready {
+                        target: ready_target,
+                    },
+                    ..TestPipeline::default()
+                },
+            );
+            assert_eq!(decision.wake_deadline, None);
         }
+
+        let mut protocol = NativeFrameScheduler::new(165, 0);
+        protocol.queue_protocol_work(0);
+        assert_eq!(
+            protocol
+                .decision_with_pipeline_diagnostics(
+                    context(6_060_606, None),
+                    &TestPipeline::default(),
+                )
+                .wake_deadline,
+            None
+        );
     }
 }
