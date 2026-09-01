@@ -540,6 +540,7 @@ impl NativeRuntime {
             NativeContinuationReason::ControlTimeout,
         ] {
             if plan.continuation.contains(reason) {
+                self.wake_authority.note_continuation(reason);
                 self.event_loop.request_continuation(reason)?;
             }
         }
@@ -552,7 +553,7 @@ impl NativeRuntime {
         &mut self,
         reason: NativeContinuationReason,
     ) -> NativeResult<()> {
-        self.wake_authority.note_direct_continuation(reason);
+        self.wake_authority.note_continuation(reason);
         self.event_loop.request_continuation(reason)?;
         Ok(())
     }

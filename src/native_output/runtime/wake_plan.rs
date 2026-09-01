@@ -70,7 +70,7 @@ pub(crate) struct NativeWakeAuthorityMetrics {
 }
 
 impl NativeWakeAuthorityMetrics {
-    pub(crate) fn note_direct_continuation(&mut self, reason: NativeContinuationReason) {
+    pub(crate) fn note_continuation(&mut self, reason: NativeContinuationReason) {
         match reason {
             NativeContinuationReason::InputBacklog => {
                 self.input_backlog_continuations =
