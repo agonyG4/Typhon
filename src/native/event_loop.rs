@@ -231,6 +231,7 @@ pub enum NativeContinuationReason {
     AstreaPublication,
     CommitTimingPlanning,
     XwaylandContinuation,
+    ControlTimeout,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -241,6 +242,7 @@ impl NativeContinuationReasons {
     const ASTREA_PUBLICATION: u32 = 1 << 1;
     const COMMIT_TIMING_PLANNING: u32 = 1 << 2;
     const XWAYLAND_CONTINUATION: u32 = 1 << 3;
+    const CONTROL_TIMEOUT: u32 = 1 << 4;
 
     pub const fn contains(self, reason: NativeContinuationReason) -> bool {
         self.0 & reason.bit() != 0
@@ -275,6 +277,7 @@ impl NativeContinuationReason {
             Self::AstreaPublication => NativeContinuationReasons::ASTREA_PUBLICATION,
             Self::CommitTimingPlanning => NativeContinuationReasons::COMMIT_TIMING_PLANNING,
             Self::XwaylandContinuation => NativeContinuationReasons::XWAYLAND_CONTINUATION,
+            Self::ControlTimeout => NativeContinuationReasons::CONTROL_TIMEOUT,
         }
     }
 }
@@ -714,6 +717,15 @@ impl NativeEventLoop {
         source: NativeEventSource,
         events: u32,
     ) -> io::Result<ReactorToken> {
+        if matches!(
+            source,
+            NativeEventSource::Timer | NativeEventSource::RuntimeContinuation
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the timer and continuation sources are owned by the event loop",
+            ));
+        }
         self.register_raw_with_events(fd, source, events)
     }
 
