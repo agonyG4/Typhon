@@ -29,15 +29,11 @@ struct AcquirePrepareOutcome {
 
 impl NativeRuntime {
     fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
-        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
-        let scheduled_target_deadline =
-            super::planner::visual_target_deadline_for_target(self.scheduled_presentation_target);
-        let scheduled_target_due =
-            scheduled_target_deadline.is_some_and(|deadline| deadline <= now_ns);
+        let scheduled_target_due = self
+            .scheduled_presentation_target
+            .is_some_and(|target| target.render_start_deadline.get() <= now_ns);
         if self.frame_scheduler.visual_work_queued() {
-            scheduler_deadline.is_some_and(|deadline| deadline <= now_ns)
-                || scheduled_target_due
-                || (scheduler_deadline.is_none() && scheduled_target_deadline.is_none())
+            scheduled_target_due || self.scheduled_presentation_target.is_none()
         } else {
             self.queued_redraw_requested
         }
@@ -168,6 +164,7 @@ impl NativeRuntime {
         if !self.session.permits_output() {
             if work_domains.wayland_dispatch
                 || work_domains.astrea_publication
+                || work_domains.commit_timing_planning
                 || work_domains.presentation
                 || work_domains.surface_pacing
                 || work_domains.explicit_sync
@@ -431,13 +428,24 @@ impl NativeRuntime {
                         self.log_shutdown_transition(transition);
                         continue;
                     }
-                    self.event_loop.arm_deadline(earliest_native_deadline(
-                        Some(monotonic_now_ns()?.saturating_add(50_000_000)),
-                        earliest_native_deadline(
-                            self.control_server.next_deadline_ns(),
-                            self.server.next_surface_pacing_deadline_ns(),
-                        ),
-                    ))?;
+                    let now_ns = monotonic_now_ns()?;
+                    let control_timeout_deadline = self.control_server.next_deadline_ns();
+                    let plan = build_native_wake_plan(NativeWakePlanInputs {
+                        now_ns,
+                        scheduler_deadline: Some(NativeDeadline {
+                            owner: NativeDeadlineOwner::ControlTimeout,
+                            at_ns: now_ns.saturating_add(50_000_000),
+                        }),
+                        control_timeout_deadline_ns: control_timeout_deadline
+                            .filter(|deadline| *deadline > now_ns),
+                        surface_pacing_deadline_ns: (!self
+                            .server
+                            .has_surface_pacing_readiness_pending())
+                        .then(|| self.server.next_surface_pacing_deadline_ns())
+                        .flatten(),
+                        ..NativeWakePlanInputs::default()
+                    });
+                    self.install_native_wake_plan(plan, now_ns)?;
                     return Ok(());
                 }
                 ShutdownState::Restoring => {
@@ -449,33 +457,51 @@ impl NativeRuntime {
     }
 
     fn arm_shutdown_deadline(&mut self) -> NativeResult<()> {
-        self.event_loop.arm_deadline(earliest_native_deadline(
-            self.shutdown.pageflip_deadline_ns(),
-            earliest_native_deadline(
-                self.control_server.next_deadline_ns(),
-                self.server.next_surface_pacing_deadline_ns(),
-            ),
-        ))?;
-        Ok(())
+        let now_ns = monotonic_now_ns()?;
+        let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns,
+            scheduler_deadline: self
+                .shutdown
+                .pageflip_deadline_ns()
+                .map(|at_ns| NativeDeadline {
+                    owner: NativeDeadlineOwner::AtomicCommitWatchdog,
+                    at_ns,
+                }),
+            control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            surface_pacing_deadline_ns: (!self.server.has_surface_pacing_readiness_pending())
+                .then(|| self.server.next_surface_pacing_deadline_ns())
+                .flatten(),
+            control_timeout_pending: control_timeout_deadline.is_some_and(|deadline| deadline <= now_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        self.install_native_wake_plan(plan, now_ns)
     }
 
     fn arm_suspended_deadline(&mut self) -> NativeResult<()> {
-        let publication_deadline = self
-            .server
-            .has_pending_astrea_toplevel_publication()
-            .then(monotonic_now_ns)
-            .transpose()?;
-        self.event_loop.arm_deadline(earliest_native_deadline(
-            earliest_native_deadline(
-                self.shutdown.suspended_reactor_deadline_ns(),
-                self.control_server.next_deadline_ns(),
-            ),
-            earliest_native_deadline(
-                publication_deadline,
-                self.server.next_surface_pacing_deadline_ns(),
-            ),
-        ))?;
-        Ok(())
+        let now_ns = monotonic_now_ns()?;
+        let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns,
+            scheduler_deadline: self.shutdown.suspended_reactor_deadline_ns().map(|at_ns| {
+                NativeDeadline {
+                    owner: NativeDeadlineOwner::ControlTimeout,
+                    at_ns,
+                }
+            }),
+            control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            surface_pacing_deadline_ns: (!self.server.has_surface_pacing_readiness_pending())
+                .then(|| self.server.next_surface_pacing_deadline_ns())
+                .flatten(),
+            input_backlog: self.input_epoch.backlog_pending(),
+            astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
+            commit_timing_planning: self.server.has_pending_commit_timing_planning(),
+            control_timeout_pending: control_timeout_deadline.is_some_and(|deadline| deadline <= now_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        self.install_native_wake_plan(plan, now_ns)
     }
 
     fn quiesce_control_server(&mut self) -> NativeResult<()> {
@@ -612,7 +638,11 @@ impl NativeRuntime {
             NativeSuspendedReadiness {
                 wayland: cycle.wakeup.reasons.wayland_listener()
                     || cycle.wakeup.reasons.wayland_clients(),
-                input: cycle.wakeup.reasons.input(),
+                input: cycle.wakeup.reasons.input()
+                    || cycle
+                        .wakeup
+                        .continuation
+                        .contains(NativeContinuationReason::InputBacklog),
                 drm: cycle.wakeup.reasons.drm(),
                 timer: cycle.wakeup.reasons.timer(),
                 explicit_sync: cycle.wakeup.reasons.explicit_sync_acquire(),
@@ -620,7 +650,13 @@ impl NativeRuntime {
                 cursor: false,
             },
         )?;
-        if cycle.wakeup.reasons.timer() && self.server.has_pending_astrea_toplevel_publication() {
+        if (cycle.wakeup.reasons.timer()
+            || cycle
+                .wakeup
+                .continuation
+                .contains(NativeContinuationReason::AstreaPublication))
+            && self.server.has_pending_astrea_toplevel_publication()
+        {
             self.server.service_pending_astrea_toplevel_updates();
             self.server.flush_wayland_clients()?;
             self.resource_efficiency_mut().record_client_flush();

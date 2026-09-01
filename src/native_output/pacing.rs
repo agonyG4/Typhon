@@ -308,6 +308,9 @@ mod tests {
             "expired_deadline_wait_count=0",
             "repeated_immediate_timer_wake_count=0",
             "multiple_deadline_owner_violation_count=0",
+            "active_pageflip_interval_p50_us=0",
+            "active_pageflip_interval_p95_us=0",
+            "active_pageflip_interval_p99_us=0",
             "adaptive_triple_entries_proven_presentation_miss=0",
         ] {
             assert!(summary.contains(field), "missing summary field {field}");
@@ -382,6 +385,20 @@ mod tests {
         assert_eq!(pacing.expired_deadline_wait_count, 2);
         assert_eq!(pacing.repeated_immediate_timer_wake_count, 1);
         assert_eq!(pacing.multiple_deadline_owner_violation_count, 2);
+    }
+
+    #[test]
+    fn active_pageflip_percentiles_exclude_idle_gaps() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        for now_ns in [6_060_000, 12_121_000, 24_241_000, 84_241_000, 90_301_000] {
+            pacing.note_pageflip(now_ns, now_ns, 1, 6_060);
+        }
+
+        let timing = pacing.timing_metrics();
+        assert_eq!(timing.active_pageflip_interval, (6_061, 12_120, 12_120));
+        assert_eq!(pacing.idle_intervals_excluded, 1);
+        assert_eq!(timing.pageflip_interval, (6_061, 60_000, 60_000));
     }
 }
 use super::scanout::NativeScanoutBufferSnapshot;
@@ -701,6 +718,7 @@ pub(crate) struct NativeFramePacing {
     ready_waiting_for_target: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     atomic_submit: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     pageflip_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    active_pageflip_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     commit_to_present: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     misses: RefreshMissBuckets,
     last_pageflip_ns: Option<u64>,
@@ -750,6 +768,7 @@ pub(crate) struct NativePacingTimingMetrics {
     pub(crate) wake_lateness: (u64, u64, u64),
     pub(crate) target_error: (u64, u64, u64),
     pub(crate) pageflip_interval: (u64, u64, u64),
+    pub(crate) active_pageflip_interval: (u64, u64, u64),
     pub(crate) commit_to_present: (u64, u64, u64),
     pub(crate) missed_refresh_1x: u64,
     pub(crate) missed_refresh_2x: u64,
@@ -817,6 +836,7 @@ impl NativeFramePacing {
             ready_waiting_for_target: BoundedSamples::default(),
             atomic_submit: BoundedSamples::default(),
             pageflip_intervals: BoundedSamples::default(),
+            active_pageflip_intervals: BoundedSamples::default(),
             commit_to_present: BoundedSamples::default(),
             misses: RefreshMissBuckets::default(),
             last_pageflip_ns: None,
@@ -1128,6 +1148,7 @@ impl NativeFramePacing {
             let us = now_ns.saturating_sub(last) / 1_000;
             self.pageflip_intervals.record(us);
             if is_active_refresh_interval(us, refresh_interval_us) {
+                self.active_pageflip_intervals.record(us);
                 self.misses.record(us, refresh_interval_us);
             } else {
                 self.idle_intervals_excluded = self.idle_intervals_excluded.saturating_add(1);
@@ -1325,6 +1346,7 @@ impl NativeFramePacing {
             wake_lateness: self.wake_lateness.percentiles(),
             target_error: self.target_error.percentiles(),
             pageflip_interval: self.pageflip_intervals.percentiles(),
+            active_pageflip_interval: self.active_pageflip_intervals.percentiles(),
             commit_to_present: self.commit_to_present.percentiles(),
             missed_refresh_1x: self.misses.missed_1x,
             missed_refresh_2x: self.misses.missed_2x,
@@ -1342,6 +1364,7 @@ impl NativeFramePacing {
     }
     pub(crate) fn summary_line(&self, compositor_trace_dropped_entries: u64) -> String {
         let (pf50, pf95, pf99) = self.pageflip_intervals.percentiles();
+        let (active_pf50, active_pf95, active_pf99) = self.active_pageflip_intervals.percentiles();
         let (cp50, cp95, cp99) = self.commit_to_present.percentiles();
         let (wake50, wake95, wake99) = self.wake_lateness.percentiles();
         let (slot50, slot95, slot99) = self.slot_hold.percentiles();
@@ -1484,6 +1507,9 @@ impl NativeFramePacing {
                 PacingField::u64("pageflip_interval_p50_us", pf50),
                 PacingField::u64("pageflip_interval_p95_us", pf95),
                 PacingField::u64("pageflip_interval_p99_us", pf99),
+                PacingField::u64("active_pageflip_interval_p50_us", active_pf50),
+                PacingField::u64("active_pageflip_interval_p95_us", active_pf95),
+                PacingField::u64("active_pageflip_interval_p99_us", active_pf99),
                 PacingField::u64("commit_to_present_p50_us", cp50),
                 PacingField::u64("commit_to_present_p95_us", cp95),
                 PacingField::u64("commit_to_present_p99_us", cp99),

@@ -193,19 +193,6 @@ pub(super) fn visual_target_deadline_for_mode(
     .flatten()
 }
 
-pub(super) fn visual_target_deadline_for_target(
-    scheduled_target: Option<PresentationTarget>,
-) -> Option<u64> {
-    scheduled_target
-        .filter(|target| {
-            !matches!(
-                target.reason,
-                PresentationTargetReason::ReactiveDouble | PresentationTargetReason::Normal
-            )
-        })
-        .map(|target| target.render_start_deadline.get())
-}
-
 pub(super) const fn pacing_mode_for_target(
     target: Option<PresentationTarget>,
 ) -> NativeOutputPacingMode {

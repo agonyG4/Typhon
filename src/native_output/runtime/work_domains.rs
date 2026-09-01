@@ -1,4 +1,5 @@
 use super::{NativeWakeup, NativeWorkClass, NativeWorkDecision};
+use oblivion_one::native::event_loop::NativeContinuationReason;
 
 /// Runtime state that is not encoded in a single reactor wakeup.
 ///
@@ -102,9 +103,16 @@ impl NativeWorkDomains {
 
     pub(super) fn classify(wakeup: &NativeWakeup, state: &NativeRuntimeState) -> Self {
         let reasons = wakeup.reasons;
-        let input = reasons.input() || state.input_backlog_pending;
+        let input = reasons.input()
+            || state.input_backlog_pending
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::InputBacklog);
         let wayland_protocol = reasons.wayland_listener() || reasons.wayland_clients();
-        let control = reasons.control();
+        let control = reasons.control()
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::ControlTimeout);
         let children = reasons.child_signal();
         let session = reasons.seat();
         let xwayland = reasons.xwayland_listen()
@@ -112,12 +120,21 @@ impl NativeWorkDomains {
             || reasons.xwayland_xwm()
             || reasons.xwayland_stderr()
             || !wakeup.xwayland_events.is_empty()
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::XwaylandContinuation)
             || state.xwayland_generation_changed;
         let explicit_sync = reasons.explicit_sync_acquire()
             || !wakeup.explicit_sync_acquire_tokens.is_empty()
             || state.explicit_sync_service_due;
-        let astrea_publication = state.astrea_publication_due;
-        let commit_timing_planning = state.commit_timing_planning_due;
+        let astrea_publication = state.astrea_publication_due
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::AstreaPublication);
+        let commit_timing_planning = state.commit_timing_planning_due
+            || wakeup
+                .continuation
+                .contains(NativeContinuationReason::CommitTimingPlanning);
         let cursor = reasons.cursor_io_worker()
             || !wakeup.cursor_io_events.is_empty()
             || state.cursor_only_due;

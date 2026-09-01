@@ -130,6 +130,7 @@ pub(crate) struct NativeRepaintInputs {
     pub(crate) page_flip_pending: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn earliest_native_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -607,6 +608,7 @@ pub(crate) struct NativePointerConstraint {
 pub(crate) struct NativePointerConstraintBackendAction {
     pub(crate) activated: Option<NativePointerConstraint>,
     pub(crate) deactivated: Option<PointerConstraintBackendId>,
+    pub(crate) deactivated_mode: Option<PointerConstraintMode>,
     pub(crate) failed: Option<(PointerConstraintBackendId, &'static str)>,
     pub(crate) restore_position: Option<CompositorOutputPosition>,
     pub(crate) cursor_position: Option<CompositorOutputPosition>,
@@ -786,6 +788,7 @@ impl NativePointerConstraintBackend {
             .then(|| restore_position.unwrap_or(active.anchor));
         NativePointerConstraintBackendAction {
             deactivated: Some(id),
+            deactivated_mode: Some(active.mode),
             restore_position,
             ..NativePointerConstraintBackendAction::default()
         }

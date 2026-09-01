@@ -448,7 +448,7 @@ impl NativeRuntime {
                 started_generation = self.xwayland.generation();
             }
             if continuation {
-                self.event_loop.arm_deadline(Some(monotonic_now_ns()?))?;
+                self.request_native_continuation(NativeContinuationReason::XwaylandContinuation)?;
             }
         }
         self.sync_xwayland_reactor_sources()?;

@@ -196,7 +196,7 @@ impl NativeRuntime {
         if let Some(transition) = self.shutdown.note_kms_teardown_complete(safety) {
             self.log_shutdown_transition(transition);
         }
-        self.event_loop.arm_deadline(None)?;
+        self.install_native_wake_plan(NativeWakePlan::default(), monotonic_now_ns()?)?;
         Ok(())
     }
 }

@@ -73,6 +73,10 @@ pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
 };
 pub(crate) use scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
+pub(super) use wake_plan::{
+    NativeDeadline, NativeDeadlineOwner, NativeWakeAuthorityMetrics, NativeWakePlan,
+    NativeWakePlanInputs, build_native_wake_plan, native_deadline_from_scheduler,
+};
 pub(super) use work_domains::{NativeRuntimeState, NativeWorkDomains};
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
@@ -89,17 +93,19 @@ pub(crate) use cycle::run;
 #[cfg(test)]
 pub(crate) use frame::NativeCursorOutputDisposition;
 #[cfg(test)]
+pub(crate) use frame::earliest_native_deadline;
+#[cfg(test)]
 pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
-    ResolvedNativeFrameScene, earliest_native_deadline, native_pointer_debug_log_lazy,
-    normalize_refresh_hz,
+    NativePointerConstraintBackendAction,
+    ResolvedNativeFrameScene, native_pointer_debug_log_lazy, normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{
-    NativeFrameRequest, NativePointerConstraint, NativePointerConstraintBackendAction,
-    NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
+    NativeFrameRequest, NativePointerConstraint, NativeRepaintDecision, NativeRepaintInputs,
+    native_repaint_decision,
 };
 pub(super) use planner::{
     NativeCursorOwnerPlan, NativeKmsStartupDecision, decide_native_cursor_owner,
@@ -366,6 +372,7 @@ pub(crate) struct NativeRuntime {
     stale_pageflip_events: u64,
     presentation_cadence: PresentationCadenceMetrics,
     frame_pacing: NativeFramePacing,
+    wake_authority: NativeWakeAuthorityMetrics,
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
@@ -511,6 +518,7 @@ impl Drop for NativeRuntime {
             let _ = oblivion_one::xwayland::trace::take_recent_lifecycle_trace();
         }
         if self.frame_pacing.summary_enabled() {
+            println!("{}", self.wake_authority.summary_line(&self.event_loop));
             println!(
                 "{}",
                 self.frame_pacing

@@ -1,10 +1,9 @@
-use super::planner::visual_target_deadline_for_target;
 use super::resource_efficiency::ResourceEfficiencyMetrics;
 use super::*;
 use crate::egl_renderer::{FullRepaintReason, GlesSceneFrameStats, RepaintMode};
 use crate::native_output::{
     KmsTarget,
-    kms_worker::{WorkerMetricsSnapshot, WorkerTimingSnapshot},
+    kms_worker::{KmsCommitWorkerTransport, WorkerMetricsSnapshot, WorkerTimingSnapshot},
     scanout::NativePaintStats,
 };
 use oblivion_one::control_snapshots::{
@@ -12,6 +11,7 @@ use oblivion_one::control_snapshots::{
     RepaintPerformanceSnapshot, SignedTimingSummarySnapshot, TimingSummarySnapshot,
     WorkerTimingPerformanceSnapshot,
 };
+use oblivion_one::native::scheduler::apply_atomic_commit_lane_guard;
 use std::{collections::BTreeMap, time::Duration};
 
 const RENDER_REPAINT_REASON_COUNT: usize = 12;
@@ -337,6 +337,9 @@ impl NativeRuntime {
                 pageflip_interval_p50_us: pacing.pageflip_interval.0,
                 pageflip_interval_p95_us: pacing.pageflip_interval.1,
                 pageflip_interval_p99_us: pacing.pageflip_interval.2,
+                active_pageflip_interval_p50_us: pacing.active_pageflip_interval.0,
+                active_pageflip_interval_p95_us: pacing.active_pageflip_interval.1,
+                active_pageflip_interval_p99_us: pacing.active_pageflip_interval.2,
                 commit_to_present_p50_us: pacing.commit_to_present.0,
                 commit_to_present_p95_us: pacing.commit_to_present.1,
                 commit_to_present_p99_us: pacing.commit_to_present.2,
@@ -406,10 +409,152 @@ fn xwayland_scene_metric_fields(
 }
 
 impl NativeRuntime {
+    fn current_scheduler_wake_deadline(
+        &mut self,
+        now_ns: u64,
+    ) -> NativeResult<Option<NativeDeadline>> {
+        let predicted_total_cost = Duration::from_nanos(
+            self.render_journal
+                .prediction_with_kms_guard(
+                    Duration::from_nanos(self.presentation_timing.mode().refresh_interval_ns()),
+                    self.presentation_timing.apply_guard_ns(),
+                )
+                .total_cost_ns,
+        );
+        let explicit_output = matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_));
+        if explicit_output {
+            let pipeline = self
+                .validate_output_pipeline()
+                .map_err(|error| {
+                    io::Error::other(format!("wake pipeline validation failed: {error:?}"))
+                })?
+                .ok_or_else(|| io::Error::other("explicit output has no pipeline snapshot"))?;
+            let worker_mode = self.kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
+            let worker_queue_available = worker_mode
+                && self.atomic_commit_arbiter.worker_slot_available()
+                && self
+                    .kms_commit_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.admission_available());
+            let render_ahead_allowed =
+                self.adaptive_buffering.desired_credit() > 1 && pipeline.triple_capable();
+            let decision = self.frame_scheduler.decision_with_pipeline_diagnostics(
+                ExplicitAtomicSchedulerContext {
+                    now: MonotonicTimestampNs::new(now_ns),
+                    predicted_total_cost,
+                    presentation_target: self.scheduled_presentation_target,
+                    render_ahead_allowed,
+                    worker_queue_available,
+                },
+                &pipeline,
+            );
+            let can_queue_worker_next = super::presentation_worker::can_queue_worker_primary(
+                worker_mode,
+                decision.action,
+                Some(&pipeline),
+                self.kms_commit_worker.as_ref(),
+            );
+            let action = apply_atomic_commit_lane_guard(
+                decision.action,
+                self.atomic_commit_arbiter.atomic_commit_pending(),
+                can_queue_worker_next,
+            );
+            return Ok((action == decision.action)
+                .then_some(decision.wake_deadline)
+                .flatten()
+                .map(native_deadline_from_scheduler));
+        }
+
+        let decision = self
+            .frame_scheduler
+            .decision_with_context(SchedulerFrameContext {
+                pacing_mode: self.adaptive_buffering.pacing_mode(),
+                capabilities: SchedulerCapabilities::legacy(),
+                presentation_target: self.scheduled_presentation_target,
+                predicted_total_cost,
+                now: MonotonicTimestampNs::new(now_ns),
+                render_target_available: self.scanout.render_target_available(),
+                render_ahead_allowed: false,
+                ready_frame_present: self.frame_scheduler.ready_frame_queued(),
+                ready_target_current: true,
+                worker_queue_available: false,
+            });
+        let deadline = match decision {
+            SchedulerDecision::WaitForRefresh => {
+                if let Some(target) = self.frame_scheduler.ready_target() {
+                    (now_ns < target.submit_not_before().get()).then_some(NativeDeadline {
+                        owner: NativeDeadlineOwner::PresentationTarget,
+                        at_ns: target.submit_not_before().get(),
+                    })
+                } else if self.frame_scheduler.visual_work_queued() {
+                    self.scheduled_presentation_target
+                        .filter(|target| now_ns < target.render_start_deadline.get())
+                        .map(|target| NativeDeadline {
+                            owner: NativeDeadlineOwner::PresentationTarget,
+                            at_ns: target.render_start_deadline.get(),
+                        })
+                } else {
+                    self.frame_scheduler
+                        .next_deadline_ns()
+                        .map(|at_ns| NativeDeadline {
+                            owner: NativeDeadlineOwner::FrameScheduler,
+                            at_ns,
+                        })
+                }
+            }
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
+                .frame_scheduler
+                .next_deadline_ns()
+                .map(|at_ns| NativeDeadline {
+                    owner: NativeDeadlineOwner::FrameScheduler,
+                    at_ns,
+                }),
+            SchedulerDecision::Idle
+            | SchedulerDecision::Render
+            | SchedulerDecision::RenderAhead
+            | SchedulerDecision::SubmitReady
+            | SchedulerDecision::SubmitReadyLate
+            | SchedulerDecision::ReadyTargetInvalidated
+            | SchedulerDecision::CompleteProtocolOnly
+            | SchedulerDecision::WaitForWorkerQueue
+            | SchedulerDecision::PageFlipWatchdogExpired => None,
+        };
+        Ok(deadline)
+    }
+
+    pub(super) fn install_native_wake_plan(
+        &mut self,
+        plan: NativeWakePlan,
+        now_ns: u64,
+    ) -> NativeResult<()> {
+        self.wake_authority
+            .observe_plan(plan, now_ns, self.event_loop.armed_deadline_ns());
+        for reason in [
+            NativeContinuationReason::InputBacklog,
+            NativeContinuationReason::AstreaPublication,
+            NativeContinuationReason::CommitTimingPlanning,
+            NativeContinuationReason::XwaylandContinuation,
+            NativeContinuationReason::ControlTimeout,
+        ] {
+            if plan.continuation.contains(reason) {
+                self.event_loop.request_continuation(reason)?;
+            }
+        }
+        self.event_loop
+            .arm_deadline(plan.deadline.map(|deadline| deadline.at_ns))?;
+        Ok(())
+    }
+
+    pub(super) fn request_native_continuation(
+        &mut self,
+        reason: NativeContinuationReason,
+    ) -> NativeResult<()> {
+        self.wake_authority.note_direct_continuation(reason);
+        self.event_loop.request_continuation(reason)?;
+        Ok(())
+    }
+
     pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
-        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
-        let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
-        let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
         let now_ns = monotonic_now_ns()?;
         let dmabuf_retry_deadline =
             if matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_)) {
@@ -424,41 +569,28 @@ impl NativeRuntime {
             } else {
                 None
             };
-        let input_backlog_deadline = self.input_epoch.backlog_pending().then_some(now_ns);
-        self.event_loop.arm_deadline(earliest_native_deadline(
-            earliest_native_deadline(
-                earliest_native_deadline(scheduler_deadline, visual_deadline),
-                atomic_commit_deadline,
-            ),
-            earliest_native_deadline(
-                self.acquire_watches.next_fallback_deadline_ns(),
-                earliest_native_deadline(
-                    earliest_native_deadline(
-                        self.xwayland.next_deadline_ns(),
-                        input_backlog_deadline,
-                    ),
-                    earliest_native_deadline(
-                        self.cursor_output_arbitration.deadline_ns(),
-                        earliest_native_deadline(
-                            self.control_server.next_deadline_ns(),
-                            earliest_native_deadline(
-                                self.server
-                                    .has_pending_astrea_toplevel_publication()
-                                    .then_some(now_ns),
-                                earliest_native_deadline(
-                                    earliest_native_deadline(
-                                        self.server.next_surface_pacing_deadline_ns(),
-                                        self.server.next_commit_timing_planning_deadline_ns(),
-                                    ),
-                                    dmabuf_retry_deadline,
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        ))?;
-        Ok(())
+        let surface_pacing_deadline = (!self.server.has_surface_pacing_readiness_pending())
+            .then(|| self.server.next_surface_pacing_deadline_ns())
+            .flatten();
+        let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns,
+            scheduler_deadline: self.current_scheduler_wake_deadline(now_ns)?,
+            atomic_commit_watchdog_deadline_ns: self.atomic_commit_arbiter.watchdog_deadline_ns(),
+            explicit_sync_fallback_deadline_ns: self.acquire_watches.next_fallback_deadline_ns(),
+            xwayland_timeout_deadline_ns: self.xwayland.next_deadline_ns(),
+            cursor_response_deadline_ns: self.cursor_output_arbitration.deadline_ns(),
+            control_timeout_deadline_ns: control_timeout_deadline
+                .filter(|deadline| *deadline > now_ns),
+            surface_pacing_deadline_ns: surface_pacing_deadline,
+            dmabuf_retry_deadline_ns: dmabuf_retry_deadline,
+            input_backlog: self.input_epoch.backlog_pending(),
+            astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
+            commit_timing_planning: self.server.has_pending_commit_timing_planning(),
+            xwayland_continuation: false,
+            control_timeout_pending: control_timeout_deadline.is_some_and(|deadline| deadline <= now_ns),
+        });
+        self.install_native_wake_plan(plan, now_ns)
     }
 
     pub(super) fn update_cycle_metrics(
@@ -1221,13 +1353,14 @@ impl NativeRuntime {
             fields
         });
         let now_ns = monotonic_now_ns()?;
-        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
-        let visual_deadline = visual_target_deadline_for_target(self.scheduled_presentation_target);
+        let scheduler_deadline = self
+            .current_scheduler_wake_deadline(now_ns)?
+            .map(|deadline| deadline.at_ns);
         self.frame_pacing.note_deadline_state(
             scheduler_decision,
             now_ns,
             scheduler_deadline,
-            visual_deadline,
+            None,
             self.frame_scheduler.ready_frame_queued() || self.scanout.ready_frame_queued(),
             cycle.wakeup.reasons.timer(),
         );

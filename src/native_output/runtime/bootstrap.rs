@@ -497,22 +497,28 @@ impl NativeRuntime {
                 .note_async_submission(token, scheduler_anchor_ns)
                 .map_err(io::Error::other)?;
         }
-        event_loop.arm_deadline(earliest_native_deadline(
-            earliest_native_deadline(
-                frame_scheduler.next_deadline_ns(),
-                acquire_watches.next_fallback_deadline_ns(),
-            ),
-            earliest_native_deadline(
-                xwayland.next_deadline_ns(),
-                earliest_native_deadline(
-                    control_server.next_deadline_ns(),
-                    earliest_native_deadline(
-                        server.next_surface_pacing_deadline_ns(),
-                        server.next_commit_timing_planning_deadline_ns(),
-                    ),
-                ),
-            ),
-        ))?;
+        let initial_control_timeout_deadline = control_server.next_deadline_ns();
+        let initial_wake_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: scheduler_anchor_ns,
+            scheduler_deadline: frame_scheduler
+                .next_deadline_ns()
+                .map(|at_ns| NativeDeadline {
+                    owner: NativeDeadlineOwner::FrameScheduler,
+                    at_ns,
+                }),
+            explicit_sync_fallback_deadline_ns: acquire_watches.next_fallback_deadline_ns(),
+            xwayland_timeout_deadline_ns: xwayland.next_deadline_ns(),
+            control_timeout_deadline_ns: initial_control_timeout_deadline
+                .filter(|deadline| *deadline > scheduler_anchor_ns),
+            surface_pacing_deadline_ns: (!server.has_surface_pacing_readiness_pending())
+                .then(|| server.next_surface_pacing_deadline_ns())
+                .flatten(),
+            astrea_publication: server.has_pending_astrea_toplevel_publication(),
+            commit_timing_planning: server.has_pending_commit_timing_planning(),
+            control_timeout_pending: initial_control_timeout_deadline
+                .is_some_and(|deadline| deadline <= scheduler_anchor_ns),
+            ..NativeWakePlanInputs::default()
+        });
         let last_rendered_scene_generation = server.scene_render_generation();
         let last_submitted_cursor_epoch = atomic_cursor
             .as_ref()
@@ -671,6 +677,7 @@ impl NativeRuntime {
             stale_pageflip_events,
             presentation_cadence,
             frame_pacing,
+            wake_authority: NativeWakeAuthorityMetrics::default(),
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -688,6 +695,7 @@ impl NativeRuntime {
                 .resource_efficiency_mut()
                 .record_xwayland_environment_materialization();
         }
+        runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
     }
