@@ -502,13 +502,10 @@ impl NativeRuntime {
                         })
                 }
             }
-            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
-                .frame_scheduler
-                .next_deadline_ns()
-                .map(|at_ns| NativeDeadline {
-                    owner: NativeDeadlineOwner::FrameScheduler,
-                    at_ns,
-                }),
+            // Buffer and page-flip ownership is external readiness.  A
+            // legacy scheduler deadline may describe an earlier visual
+            // target, but it cannot make either owner progress.
+            SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => None,
             SchedulerDecision::Idle
             | SchedulerDecision::Render
             | SchedulerDecision::RenderAhead
