@@ -584,8 +584,11 @@ pub struct KmsPerformanceSnapshot {
     pub pageflip_interval_p50_us: u64,
     pub pageflip_interval_p95_us: u64,
     pub pageflip_interval_p99_us: u64,
+    #[serde(default)]
     pub active_pageflip_interval_p50_us: u64,
+    #[serde(default)]
     pub active_pageflip_interval_p95_us: u64,
+    #[serde(default)]
     pub active_pageflip_interval_p99_us: u64,
     pub commit_to_present_p50_us: u64,
     pub commit_to_present_p95_us: u64,
@@ -844,6 +847,9 @@ mod tests {
                 "pageflipIntervalP50Us": 0,
                 "pageflipIntervalP95Us": 0,
                 "pageflipIntervalP99Us": 0,
+                "activePageflipIntervalP50Us": 0,
+                "activePageflipIntervalP95Us": 0,
+                "activePageflipIntervalP99Us": 0,
                 "commitToPresentP50Us": 0,
                 "commitToPresentP95Us": 0,
                 "commitToPresentP99Us": 0,
