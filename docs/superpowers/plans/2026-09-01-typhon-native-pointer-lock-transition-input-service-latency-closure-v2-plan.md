@@ -25,14 +25,16 @@
 
 ## Phase 3: bounded guard RED -> GREEN
 
-- Add a production-owned guard state machine with a fixed maximum of four
+- Add a production-owned guard state machine with a fixed maximum of six
   checkpoints.
 - Add deterministic checkpoint tests for input arriving after checkpoint zero,
   no-input bounded completion, no-transition zero checks, and exactly-once
   fresh service.
-- Integrate the guard at the real cycle boundaries before XWayland/client
-  scene, acquire/prepare, and render/presentation/KMS. Keep checkpoint zero
-  immediately after real transition settlement.
+- Integrate the guard at the real cycle boundaries immediately after
+  settlement, before surface pacing, before cursor/control, before
+  XWayland/client scene, before acquire/prepare, and before
+  render/presentation/KMS. Keep checkpoint zero immediately after real
+  transition settlement.
 - Preserve active-epoch ownership and merge fresh microturn state explicitly.
 
 ## Phase 4: readiness and integration coverage

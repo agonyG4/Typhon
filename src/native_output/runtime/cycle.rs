@@ -118,9 +118,6 @@ impl NativeRuntime {
         let now_ns = monotonic_now_ns()?;
         if self.pointer_timing.enabled() {
             self.pointer_timing.record_next_reactor_wake(now_ns);
-            if cycle.wakeup.reasons.input() {
-                self.pointer_timing.record_next_input_service(now_ns);
-            }
             self.pointer_timing.record_reactor_wake_return(now_ns);
         }
         self.service_due_dmabuf_release_retry(now_ns)?;
@@ -226,21 +223,16 @@ impl NativeRuntime {
             } else {
                 NativeWaylandInputDispatchOutcome::default()
             };
-        let mut wayland_pacing_readiness_changed = dispatch_outcome.pacing_readiness_changed;
-        if dispatch_outcome.routing_transition.is_some() {
-            let input_serviceable = self.event_loop.input_ready_nonblocking()?;
-            if matches!(
-                decide_input_routing_barrier(
-                    dispatch_outcome.routing_transition,
-                    input_serviceable
-                ),
-                NativeInputRoutingBarrierDecision::ServiceInputMicroturn
-            ) {
-                let microturn =
-                    self.service_fresh_input_microturn_after_routing_transition(&mut cycle)?;
-                wayland_pacing_readiness_changed |= microturn;
-            }
+        let mut routing_guard = NativeInputTransitionLatencyGuard::default();
+        if let Some(transition) = dispatch_outcome.routing_transition {
+            routing_guard.arm(transition);
         }
+        let mut wayland_pacing_readiness_changed = dispatch_outcome.pacing_readiness_changed;
+        wayland_pacing_readiness_changed |= self.service_input_at_routing_guard_checkpoint(
+            &mut routing_guard,
+            &mut cycle,
+            NativeInputRoutingGuardCheckpoint::AfterTransition,
+        )?;
         if work_domains.commit_timing_planning
             || (work_domains.wayland_dispatch && self.server.has_pending_commit_timing_planning())
         {
@@ -254,6 +246,11 @@ impl NativeRuntime {
         let pacing_visual_work = if work_domains
             .should_service_surface_pacing_after_wayland(wayland_pacing_readiness_changed)
         {
+            let _ = self.service_input_at_routing_guard_checkpoint(
+                &mut routing_guard,
+                &mut cycle,
+                NativeInputRoutingGuardCheckpoint::BeforeSurfacePacing,
+            )?;
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -287,6 +284,13 @@ impl NativeRuntime {
             && (work_domains.control || work_domains.cursor))
             .then(monotonic_now_ns)
             .transpose()?;
+        if work_domains.control || work_domains.cursor {
+            let _ = self.service_input_at_routing_guard_checkpoint(
+                &mut routing_guard,
+                &mut cycle,
+                NativeInputRoutingGuardCheckpoint::BeforeCursorAndControl,
+            )?;
+        }
         if work_domains.control {
             self.service_control_events(&cycle.wakeup)?;
         }
@@ -301,6 +305,13 @@ impl NativeRuntime {
             );
         }
         let xwayland_scene_work = wayland_client_work || xwayland_work;
+        if xwayland_scene_work {
+            let _ = self.service_input_at_routing_guard_checkpoint(
+                &mut routing_guard,
+                &mut cycle,
+                NativeInputRoutingGuardCheckpoint::BeforeXwaylandScene,
+            )?;
+        }
         if xwayland_scene_work {
             let phase_started_at_ns = self
                 .pointer_timing
@@ -348,6 +359,13 @@ impl NativeRuntime {
             &self.native_runtime_state(&cycle, monotonic_now_ns()?),
         )
         .operation_plan();
+        if prepare_operation_plan.service_acquire_and_prepare {
+            let _ = self.service_input_at_routing_guard_checkpoint(
+                &mut routing_guard,
+                &mut cycle,
+                NativeInputRoutingGuardCheckpoint::BeforeAcquirePrepare,
+            )?;
+        }
         let prepare_outcome = if prepare_operation_plan.service_acquire_and_prepare {
             let phase_started_at_ns = self
                 .pointer_timing
@@ -402,6 +420,13 @@ impl NativeRuntime {
             prepare_outcome.visual_work_created,
         );
         if presentation_work {
+            let _ = self.service_input_at_routing_guard_checkpoint(
+                &mut routing_guard,
+                &mut cycle,
+                NativeInputRoutingGuardCheckpoint::BeforePresentation,
+            )?;
+        }
+        if presentation_work {
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -430,7 +455,7 @@ impl NativeRuntime {
             self.note_timing_scope("egl_draw", render_started.elapsed());
             if let Some(start_ns) = phase_started_at_ns {
                 self.pointer_timing.record_phase(
-                    NativePointerTimingPhase::PresentKms,
+                    NativePointerTimingPhase::RenderPresentKms,
                     start_ns,
                     monotonic_now_ns()?,
                 );
@@ -453,31 +478,47 @@ impl NativeRuntime {
     /// Give newly readable native input one bounded microturn after a routing
     /// transition.  The checkpoint does not drain or acknowledge any other
     /// reactor source, so all cycle-tail work remains owned by this cycle.
+    fn service_input_at_routing_guard_checkpoint(
+        &mut self,
+        guard: &mut NativeInputTransitionLatencyGuard,
+        cycle: &mut NativeCycleState,
+        checkpoint: NativeInputRoutingGuardCheckpoint,
+    ) -> NativeResult<bool> {
+        if !guard.armed() {
+            return Ok(false);
+        }
+        let mut input_serviceable = false;
+        let decision = guard.checkpoint_with_readiness(checkpoint, || {
+            let ready = self.event_loop.input_ready_nonblocking()?;
+            input_serviceable = ready;
+            Ok::<bool, std::io::Error>(ready)
+        })?;
+        if self.pointer_timing.enabled() {
+            self.pointer_timing.record_checkpoint(
+                checkpoint.index(),
+                input_serviceable,
+                matches!(decision, NativeRoutingGuardDecision::ServiceFreshInput),
+            );
+        }
+        if !matches!(decision, NativeRoutingGuardDecision::ServiceFreshInput) {
+            return Ok(false);
+        }
+        let outcome = self.service_fresh_input_microturn_after_routing_transition(cycle)?;
+        if let Some(transition) = outcome.routing_transition {
+            guard.arm(transition);
+        }
+        Ok(outcome.pacing_readiness_changed)
+    }
+
     fn service_fresh_input_microturn_after_routing_transition(
         &mut self,
         cycle: &mut NativeCycleState,
-    ) -> NativeResult<bool> {
-        let previous_accepted = cycle.accepted;
-        let previous_tick_us = cycle.tick_us;
-        let previous_input_drain_us = cycle.input_drain_us;
-        let previous_raw_input_events = cycle.raw_input_events;
-        let previous_coalesced_input_events = cycle.coalesced_input_events;
-        let previous_skipped_input_repaints = cycle.skipped_input_repaints;
-        let previous_redraw_requested = cycle.redraw_requested;
-        let previous_shutdown_requested = cycle.shutdown_requested;
+    ) -> NativeResult<NativeWaylandInputDispatchOutcome> {
+        let baseline = cycle.microturn_baseline();
 
         let outcome = self.dispatch_wayland_and_input(cycle, true, false)?;
-        cycle.accepted = previous_accepted.saturating_add(cycle.accepted);
-        cycle.tick_us = previous_tick_us.saturating_add(cycle.tick_us);
-        cycle.input_drain_us = previous_input_drain_us.saturating_add(cycle.input_drain_us);
-        cycle.raw_input_events = previous_raw_input_events.saturating_add(cycle.raw_input_events);
-        cycle.coalesced_input_events =
-            previous_coalesced_input_events.saturating_add(cycle.coalesced_input_events);
-        cycle.skipped_input_repaints =
-            previous_skipped_input_repaints.saturating_add(cycle.skipped_input_repaints);
-        cycle.redraw_requested |= previous_redraw_requested;
-        cycle.shutdown_requested |= previous_shutdown_requested;
-        Ok(outcome.pacing_readiness_changed)
+        cycle.merge_input_microturn(baseline);
+        Ok(outcome)
     }
 
     fn flush_presentation_trace(&self) -> NativeResult<()> {

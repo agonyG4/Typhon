@@ -26,6 +26,7 @@ mod cycle_dispatch;
 mod direct_plan;
 mod dmabuf_release;
 mod frame;
+mod input_transition_guard;
 mod kms_worker;
 mod kms_worker_startup;
 mod kms_worker_teardown;
@@ -96,10 +97,7 @@ pub(super) use cursor_cycle::{
     synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
-use cycle_dispatch::{
-    NativeInputRoutingBarrierDecision, NativeWaylandInputDispatchOutcome,
-    decide_input_routing_barrier,
-};
+use cycle_dispatch::NativeWaylandInputDispatchOutcome;
 #[cfg(test)]
 pub(crate) use frame::NativeCursorOutputDisposition;
 #[cfg(test)]
@@ -116,6 +114,10 @@ pub(crate) use frame::{
 pub(crate) use frame::{
     NativeFrameRequest, NativePointerConstraint, NativeRepaintDecision, NativeRepaintInputs,
     native_repaint_decision,
+};
+pub(super) use input_transition_guard::{
+    NativeInputRoutingGuardCheckpoint, NativeInputTransitionLatencyGuard,
+    NativeRoutingGuardDecision,
 };
 pub(super) use planner::{
     NativeCursorOwnerPlan, NativeKmsStartupDecision, decide_native_cursor_owner,
@@ -167,7 +169,79 @@ pub(super) struct NativeCycleState {
     pub(super) shutdown_requested: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct NativeCycleMicroturnBaseline {
+    work_class: NativeWorkClass,
+    fast_path_completed: bool,
+    pageflip_drain_us: u64,
+    pageflip_completed: bool,
+    completed_pageflip_token: Option<u64>,
+    frame_completed: bool,
+    frame_rendered: bool,
+    frame_submitted: bool,
+    present_us: u64,
+    pageflip_pending_at_tick: bool,
+    accepted: usize,
+    redraw_requested: bool,
+    skipped_input_repaints: usize,
+    input_drain_us: u64,
+    raw_input_events: usize,
+    coalesced_input_events: usize,
+    shutdown_requested: bool,
+    tick_us: u64,
+}
+
 impl NativeCycleState {
+    pub(super) const fn microturn_baseline(&self) -> NativeCycleMicroturnBaseline {
+        NativeCycleMicroturnBaseline {
+            work_class: self.work_class,
+            fast_path_completed: self.fast_path_completed,
+            pageflip_drain_us: self.pageflip_drain_us,
+            pageflip_completed: self.pageflip_completed,
+            completed_pageflip_token: self.completed_pageflip_token,
+            frame_completed: self.frame_completed,
+            frame_rendered: self.frame_rendered,
+            frame_submitted: self.frame_submitted,
+            present_us: self.present_us,
+            pageflip_pending_at_tick: self.pageflip_pending_at_tick,
+            accepted: self.accepted,
+            redraw_requested: self.redraw_requested,
+            skipped_input_repaints: self.skipped_input_repaints,
+            input_drain_us: self.input_drain_us,
+            raw_input_events: self.raw_input_events,
+            coalesced_input_events: self.coalesced_input_events,
+            shutdown_requested: self.shutdown_requested,
+            tick_us: self.tick_us,
+        }
+    }
+
+    pub(super) fn merge_input_microturn(&mut self, baseline: NativeCycleMicroturnBaseline) {
+        self.work_class = baseline.work_class;
+        self.fast_path_completed = baseline.fast_path_completed;
+        self.pageflip_drain_us = baseline.pageflip_drain_us;
+        self.pageflip_completed = baseline.pageflip_completed;
+        self.completed_pageflip_token = baseline.completed_pageflip_token;
+        self.frame_completed = baseline.frame_completed;
+        self.frame_rendered = baseline.frame_rendered;
+        self.frame_submitted = baseline.frame_submitted;
+        self.present_us = baseline.present_us;
+        self.pageflip_pending_at_tick = baseline.pageflip_pending_at_tick;
+        self.accepted = baseline.accepted.saturating_add(self.accepted);
+        self.redraw_requested |= baseline.redraw_requested;
+        self.skipped_input_repaints = baseline
+            .skipped_input_repaints
+            .saturating_add(self.skipped_input_repaints);
+        self.input_drain_us = baseline.input_drain_us.saturating_add(self.input_drain_us);
+        self.raw_input_events = baseline
+            .raw_input_events
+            .saturating_add(self.raw_input_events);
+        self.coalesced_input_events = baseline
+            .coalesced_input_events
+            .saturating_add(self.coalesced_input_events);
+        self.shutdown_requested |= baseline.shutdown_requested;
+        self.tick_us = baseline.tick_us.saturating_add(self.tick_us);
+    }
+
     pub(super) const fn record_presentation_result(
         &mut self,
         frame_completed: bool,
@@ -177,6 +251,92 @@ impl NativeCycleState {
         self.frame_completed = frame_completed;
         self.frame_rendered = frame_rendered;
         self.frame_submitted = frame_submitted;
+    }
+}
+
+#[cfg(test)]
+mod microturn_tests {
+    use super::*;
+
+    fn cycle_state() -> NativeCycleState {
+        NativeCycleState {
+            wakeup: NativeWakeup {
+                reasons: Default::default(),
+                continuation: Default::default(),
+                ready_sources: 0,
+                blocked_ns: 0,
+                timer_lateness_ns: None,
+                explicit_sync_acquire_tokens: Vec::new(),
+                dmabuf_gpu_release_tokens: Vec::new(),
+                xwayland_events: Vec::new(),
+                control_events: Vec::new(),
+                cursor_io_events: Vec::new(),
+            },
+            work_class: NativeWorkClass::ProtocolOnly,
+            fast_path_completed: true,
+            pageflip_drain_us: 11,
+            pageflip_completed: true,
+            completed_pageflip_token: Some(12),
+            frame_completed: true,
+            frame_rendered: true,
+            frame_submitted: true,
+            present_us: 13,
+            pageflip_pending_at_tick: true,
+            tick_us: 14,
+            accepted: 15,
+            redraw_requested: true,
+            skipped_input_repaints: 16,
+            input_drain_us: 17,
+            raw_input_events: 18,
+            coalesced_input_events: 19,
+            shutdown_requested: true,
+        }
+    }
+
+    #[test]
+    fn input_microturn_merges_only_additive_results() {
+        let mut cycle = cycle_state();
+        let baseline = cycle.microturn_baseline();
+
+        cycle.work_class = NativeWorkClass::PrimaryScene;
+        cycle.fast_path_completed = false;
+        cycle.pageflip_drain_us = 101;
+        cycle.pageflip_completed = false;
+        cycle.completed_pageflip_token = Some(102);
+        cycle.frame_completed = false;
+        cycle.frame_rendered = false;
+        cycle.frame_submitted = false;
+        cycle.present_us = 103;
+        cycle.pageflip_pending_at_tick = false;
+        cycle.tick_us = 104;
+        cycle.accepted = 105;
+        cycle.redraw_requested = false;
+        cycle.skipped_input_repaints = 106;
+        cycle.input_drain_us = 107;
+        cycle.raw_input_events = 108;
+        cycle.coalesced_input_events = 109;
+        cycle.shutdown_requested = false;
+
+        cycle.merge_input_microturn(baseline);
+
+        assert_eq!(cycle.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(cycle.fast_path_completed);
+        assert_eq!(cycle.pageflip_drain_us, 11);
+        assert!(cycle.pageflip_completed);
+        assert_eq!(cycle.completed_pageflip_token, Some(12));
+        assert!(cycle.frame_completed);
+        assert!(cycle.frame_rendered);
+        assert!(cycle.frame_submitted);
+        assert_eq!(cycle.present_us, 13);
+        assert!(cycle.pageflip_pending_at_tick);
+        assert_eq!(cycle.tick_us, 118);
+        assert_eq!(cycle.accepted, 120);
+        assert!(cycle.redraw_requested);
+        assert_eq!(cycle.skipped_input_repaints, 122);
+        assert_eq!(cycle.input_drain_us, 124);
+        assert_eq!(cycle.raw_input_events, 126);
+        assert_eq!(cycle.coalesced_input_events, 128);
+        assert!(cycle.shutdown_requested);
     }
 }
 

@@ -48,13 +48,15 @@ its existing bounded drain semantics and has no libinput dispatch span.
 ## Transition guard
 
 The guard is armed only by a completed locked/confined activation or
-deactivation. It performs at most four statically bounded input-readiness
+deactivation. It performs at most six statically bounded input-readiness
 checkpoints:
 
 1. immediately after the transition,
-2. before XWayland/client-scene tail work when that work will run,
-3. before acquire/prepare when that work will run,
-4. immediately before render/presentation/KMS when that work will run.
+2. before surface pacing when that work will run,
+3. before cursor/control work when that work will run,
+4. before XWayland/client-scene tail work when that work will run,
+5. before acquire/prepare when that work will run,
+6. immediately before render/presentation/KMS when that work will run.
 
 At a checkpoint, an input-only epoll peek either does nothing or runs exactly
 one real input microturn through the existing dispatch seam. The peek is

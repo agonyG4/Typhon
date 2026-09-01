@@ -47,22 +47,6 @@ pub(super) struct NativeWaylandInputDispatchOutcome {
     pub(super) routing_transition: Option<NativeInputRoutingTransition>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum NativeInputRoutingBarrierDecision {
-    ContinueCycleTail,
-    ServiceInputMicroturn,
-}
-
-pub(super) fn decide_input_routing_barrier(
-    routing_transition: Option<NativeInputRoutingTransition>,
-    input_serviceable: bool,
-) -> NativeInputRoutingBarrierDecision {
-    match (routing_transition, input_serviceable) {
-        (Some(_), true) => NativeInputRoutingBarrierDecision::ServiceInputMicroturn,
-        _ => NativeInputRoutingBarrierDecision::ContinueCycleTail,
-    }
-}
-
 fn settle_native_pointer_constraint_backend_requests(
     input_epoch: &NativeInputEpoch,
     server: &mut OwnCompositorServer,
@@ -794,7 +778,7 @@ impl NativeRuntime {
         service_input: bool,
         dispatch_wayland: bool,
     ) -> NativeResult<NativeWaylandInputDispatchOutcome> {
-        if cycle.wakeup.reasons.input() {
+        if service_input {
             NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
         }
         let xwayland_app_environment = self.xwayland.normal_app_environment();
@@ -880,9 +864,8 @@ impl NativeRuntime {
         let mut routing_transition = initial_settlement.routing_transition;
         if timing_enabled && let Some(transition) = routing_transition {
             let at_ns = monotonic_now_ns()?;
-            pointer_timing.observe_transition(timing_transition(transition), at_ns);
-            pointer_timing.record_activation_resolution(at_ns);
-            pointer_timing.record_native_activation(at_ns);
+            pointer_timing
+                .record_routing_transition_committed(timing_transition(transition), at_ns);
         }
         let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
         synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
@@ -944,15 +927,40 @@ impl NativeRuntime {
                     true,
                 )
             });
-            let native_dispatch_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
             let input_drain_start = Instant::now();
-            input_devices.drain_events_into(input_batch, !input_epoch.backlog_pending());
-            input_drain_us = elapsed_micros(input_drain_start);
-            if let Some(start_ns) = native_dispatch_start_at_ns {
-                let end_ns = monotonic_now_ns()?;
-                pointer_timing.record_libinput_dispatch(start_ns, end_ns);
-                pointer_timing.record_native_batch_materialized(end_ns);
+            let libinput_dispatch_start_at_ns = (timing_enabled
+                && !continuation
+                && matches!(
+                    input_devices.kind(),
+                    NativeInputBackendKind::LibseatLibinputUdev
+                        | NativeInputBackendKind::DirectLibinputUdev
+                ))
+            .then(monotonic_now_ns)
+            .transpose()?;
+            let dispatch_succeeded = continuation || input_devices.begin_semantic_epoch();
+            if let Some(start_ns) = libinput_dispatch_start_at_ns {
+                pointer_timing.record_libinput_dispatch(start_ns, monotonic_now_ns()?);
             }
+            let queue_drain_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+            let queue_drain_start = Instant::now();
+            if dispatch_succeeded {
+                input_devices.drain_epoch_chunk_into(input_batch);
+            } else {
+                input_batch.raw.clear();
+                input_batch.coalesced.clear();
+                input_batch.budget_exhausted = false;
+            }
+            let queue_drain_end_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+            if let Some(start_ns) = queue_drain_start_at_ns {
+                pointer_timing.record_queue_drain(
+                    start_ns,
+                    queue_drain_end_at_ns.expect("timing end recorded with timing start"),
+                );
+                pointer_timing.record_native_batch_materialized(
+                    queue_drain_end_at_ns.expect("timing end recorded with timing start"),
+                );
+            }
+            input_drain_us = elapsed_micros(input_drain_start);
             raw_input_events = input_batch.raw.len();
             // The backend state captured here is authoritative for every event in
             // this epoch. Protocol progress below may queue a new transition, but
@@ -1230,9 +1238,8 @@ impl NativeRuntime {
         }
         if timing_enabled && let Some(transition) = final_settlement.routing_transition {
             let at_ns = monotonic_now_ns()?;
-            pointer_timing.observe_transition(timing_transition(transition), at_ns);
-            pointer_timing.record_activation_resolution(at_ns);
-            pointer_timing.record_native_activation(at_ns);
+            pointer_timing
+                .record_routing_transition_committed(timing_transition(transition), at_ns);
         }
         let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
         if let Err(error) =
@@ -1276,13 +1283,8 @@ impl NativeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NativeInputRoutingBarrierDecision, decide_input_routing_barrier,
-        input_requires_full_server_progression,
-    };
+    use super::input_requires_full_server_progression;
     use crate::native_output::input::NativeInputEpoch;
-    use crate::native_output::input::NativeInputRoutingTransition;
-    use oblivion_one::compositor::PointerConstraintBackendId;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintMode {
@@ -1469,28 +1471,6 @@ mod tests {
     fn constraint_sensitive_input_keeps_its_narrow_follow_up() {
         assert!(input_requires_full_server_progression(false, true));
         assert!(!input_requires_full_server_progression(true, true));
-    }
-
-    #[test]
-    fn routing_transition_barrier_only_services_fresh_ready_input() {
-        let id = PointerConstraintBackendId {
-            constraint_id: 31,
-            generation: 1,
-        };
-        let transition = Some(NativeInputRoutingTransition::LockedActivated(id));
-
-        assert_eq!(
-            decide_input_routing_barrier(transition, true),
-            NativeInputRoutingBarrierDecision::ServiceInputMicroturn
-        );
-        assert_eq!(
-            decide_input_routing_barrier(transition, false),
-            NativeInputRoutingBarrierDecision::ContinueCycleTail
-        );
-        assert_eq!(
-            decide_input_routing_barrier(None, true),
-            NativeInputRoutingBarrierDecision::ContinueCycleTail
-        );
     }
 }
 

@@ -37,12 +37,11 @@ pub(crate) enum NativePointerTimingPhase {
     CursorAndControl,
     XwaylandScene,
     AcquirePrepare,
-    Render,
-    PresentKms,
+    RenderPresentKms,
 }
 
 impl NativePointerTimingPhase {
-    const COUNT: usize = 6;
+    const COUNT: usize = 5;
 
     const fn index(self) -> usize {
         match self {
@@ -50,8 +49,7 @@ impl NativePointerTimingPhase {
             Self::CursorAndControl => 1,
             Self::XwaylandScene => 2,
             Self::AcquirePrepare => 3,
-            Self::Render => 4,
-            Self::PresentKms => 5,
+            Self::RenderPresentKms => 4,
         }
     }
 
@@ -61,8 +59,7 @@ impl NativePointerTimingPhase {
             Self::CursorAndControl => "cursor_control",
             Self::XwaylandScene => "xwayland_scene",
             Self::AcquirePrepare => "acquire_prepare",
-            Self::Render => "render",
-            Self::PresentKms => "present_kms",
+            Self::RenderPresentKms => "render_present_kms",
         }
     }
 }
@@ -70,17 +67,17 @@ impl NativePointerTimingPhase {
 #[derive(Clone, Copy, Debug, Default)]
 struct NativePointerTimingRecord {
     transition: Option<NativePointerTimingTransition>,
-    transition_at_ns: u64,
+    routing_transition_committed_at_ns: u64,
     reactor_wake_return_at_ns: Option<u64>,
     input_service_start_at_ns: Option<u64>,
     input_service_end_at_ns: Option<u64>,
     libinput_dispatch_start_at_ns: Option<u64>,
     libinput_dispatch_end_at_ns: Option<u64>,
+    queue_drain_start_at_ns: Option<u64>,
+    queue_drain_end_at_ns: Option<u64>,
     native_batch_materialized_at_ns: Option<u64>,
     wayland_read_start_at_ns: Option<u64>,
     wayland_read_end_at_ns: Option<u64>,
-    activation_resolution_at_ns: Option<u64>,
-    native_activation_at_ns: Option<u64>,
     cursor_sync_start_at_ns: Option<u64>,
     cursor_sync_end_at_ns: Option<u64>,
     dispatch_return_at_ns: Option<u64>,
@@ -88,6 +85,10 @@ struct NativePointerTimingRecord {
     next_reactor_wake_at_ns: Option<u64>,
     next_input_service_at_ns: Option<u64>,
     phase_spans: [Option<(u64, u64)>; NativePointerTimingPhase::COUNT],
+    checkpoint_count: u8,
+    first_serviceable_checkpoint: Option<u8>,
+    fresh_input_microturn: bool,
+    superseded_incomplete_transition_observations: u64,
     first_batch: Option<NativePointerTimingBatch>,
     first_batch_materialized_at_ns: Option<u64>,
     complete: bool,
@@ -102,6 +103,7 @@ pub(crate) struct NativePointerTimingTrace {
     next_slot: usize,
     active_slot: Option<usize>,
     completed_record_count: u64,
+    superseded_incomplete_transition_observations: u64,
     formatted_summary_count: u64,
     emitted_summary_count: u64,
 }
@@ -123,6 +125,7 @@ impl NativePointerTimingTrace {
             next_slot: 0,
             active_slot: None,
             completed_record_count: 0,
+            superseded_incomplete_transition_observations: 0,
             formatted_summary_count: 0,
             emitted_summary_count: 0,
         }
@@ -132,7 +135,7 @@ impl NativePointerTimingTrace {
         self.enabled
     }
 
-    pub(crate) fn observe_transition(
+    pub(crate) fn record_routing_transition_committed(
         &mut self,
         transition: NativePointerTimingTransition,
         at_ns: u64,
@@ -141,11 +144,24 @@ impl NativePointerTimingTrace {
             return;
         }
 
+        let superseded_incomplete_transition_observations = if let Some(active_slot) =
+            self.active_slot
+            && self.records[active_slot]
+                .is_some_and(|record| !record.complete && record.transition.is_some())
+        {
+            self.superseded_incomplete_transition_observations = self
+                .superseded_incomplete_transition_observations
+                .saturating_add(1);
+            self.superseded_incomplete_transition_observations
+        } else {
+            self.superseded_incomplete_transition_observations
+        };
         let slot = self.next_slot;
         self.next_slot = (slot + 1) % TIMING_RING_CAPACITY;
         self.records[slot] = Some(NativePointerTimingRecord {
             transition: Some(transition),
-            transition_at_ns: at_ns,
+            routing_transition_committed_at_ns: at_ns,
+            superseded_incomplete_transition_observations,
             ..Default::default()
         });
         self.active_slot = Some(slot);
@@ -162,7 +178,7 @@ impl NativePointerTimingTrace {
         let Some(record) = self.records[slot].as_mut() else {
             return;
         };
-        if record.complete || record.first_batch.is_some() {
+        if record.complete || record.first_batch.is_some() || batch.raw_events == 0 {
             return;
         }
 
@@ -180,9 +196,7 @@ impl NativePointerTimingTrace {
     pub(crate) fn record_input_service_start(&mut self, at_ns: u64) {
         self.set_record(|record| {
             record.input_service_start_at_ns.get_or_insert(at_ns);
-            if record.transition_at_ns <= at_ns {
-                record.next_input_service_at_ns.get_or_insert(at_ns);
-            }
+            record.next_input_service_at_ns.get_or_insert(at_ns);
         });
     }
 
@@ -197,6 +211,13 @@ impl NativePointerTimingTrace {
         });
     }
 
+    pub(crate) fn record_queue_drain(&mut self, start_ns: u64, end_ns: u64) {
+        self.set_record(|record| {
+            record.queue_drain_start_at_ns = Some(start_ns);
+            record.queue_drain_end_at_ns = Some(end_ns);
+        });
+    }
+
     pub(crate) fn record_native_batch_materialized(&mut self, at_ns: u64) {
         self.set_record(|record| record.native_batch_materialized_at_ns = Some(at_ns));
     }
@@ -206,14 +227,6 @@ impl NativePointerTimingTrace {
             record.wayland_read_start_at_ns = Some(start_ns);
             record.wayland_read_end_at_ns = Some(end_ns);
         });
-    }
-
-    pub(crate) fn record_activation_resolution(&mut self, at_ns: u64) {
-        self.set_record(|record| record.activation_resolution_at_ns = Some(at_ns));
-    }
-
-    pub(crate) fn record_native_activation(&mut self, at_ns: u64) {
-        self.set_record(|record| record.native_activation_at_ns = Some(at_ns));
     }
 
     pub(crate) fn record_cursor_sync(&mut self, start_ns: u64, end_ns: u64) {
@@ -235,12 +248,22 @@ impl NativePointerTimingTrace {
         self.set_record(|record| record.next_reactor_wake_at_ns = Some(at_ns));
     }
 
-    pub(crate) fn record_next_input_service(&mut self, at_ns: u64) {
+    pub(crate) fn record_checkpoint(
+        &mut self,
+        checkpoint: u8,
+        input_serviceable: bool,
+        fresh_input_microturn: bool,
+    ) {
         self.set_record(|record| {
-            record.next_input_service_at_ns.get_or_insert(at_ns);
+            record.checkpoint_count = record.checkpoint_count.saturating_add(1);
+            if input_serviceable {
+                record
+                    .first_serviceable_checkpoint
+                    .get_or_insert(checkpoint);
+            }
+            record.fresh_input_microturn |= fresh_input_microturn;
         });
     }
-
     pub(crate) fn record_phase(
         &mut self,
         phase: NativePointerTimingPhase,
@@ -320,7 +343,7 @@ impl NativePointerTimingTrace {
             .iter()
             .flatten()
             .filter(|record| record.complete)
-            .map(|record| record.transition_at_ns)
+            .map(|record| record.routing_transition_committed_at_ns)
             .min()
     }
 }
@@ -335,7 +358,10 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         .oldest_hardware_timestamp_us
         .zip(batch.newest_hardware_timestamp_us)
         .map(|(oldest, newest)| newest.saturating_sub(oldest));
-    let phase = record
+    let hardware_timestamp_span_us = span_us
+        .map(|span| span.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let largest_phase = record
         .phase_spans
         .iter()
         .enumerate()
@@ -347,67 +373,71 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
                 1 => NativePointerTimingPhase::CursorAndControl,
                 2 => NativePointerTimingPhase::XwaylandScene,
                 3 => NativePointerTimingPhase::AcquirePrepare,
-                4 => NativePointerTimingPhase::Render,
-                5 => NativePointerTimingPhase::PresentKms,
+                4 => NativePointerTimingPhase::RenderPresentKms,
                 _ => unreachable!(),
             };
             format!("{}:{duration}", phase.as_str())
         })
-        .unwrap_or_else(|| "none:0".to_owned());
-    let input_service_duration_ns = duration(
+        .unwrap_or_else(|| "unknown".to_owned());
+    let input_service_duration_ns = format_duration(
         record.input_service_start_at_ns,
         record.input_service_end_at_ns,
     );
-    let native_dispatch_duration_ns = duration(
+    let libinput_dispatch_duration_ns = format_duration(
         record.libinput_dispatch_start_at_ns,
         record.libinput_dispatch_end_at_ns,
     );
-    let wayland_read_duration_ns = duration(
+    let queue_drain_duration_ns =
+        format_duration(record.queue_drain_start_at_ns, record.queue_drain_end_at_ns);
+    let wayland_read_duration_ns = format_duration(
         record.wayland_read_start_at_ns,
         record.wayland_read_end_at_ns,
     );
     let cursor_sync_duration_ns =
-        duration(record.cursor_sync_start_at_ns, record.cursor_sync_end_at_ns);
-    let reactor_wait_ns = record
-        .cycle_return_at_ns
-        .zip(record.next_reactor_wake_at_ns)
-        .map(|(cycle_return, wake)| wake.saturating_sub(cycle_return))
-        .unwrap_or(0);
+        format_duration(record.cursor_sync_start_at_ns, record.cursor_sync_end_at_ns);
+    let reactor_wait_ns =
+        format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} activation_to_dispatch_return_ns={} activation_to_cycle_return_ns={} activation_to_next_wake_ns={} activation_to_next_input_service_ns={} reactor_wait_ns={} input_service_duration_ns={} native_dispatch_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} raw={} coalesced={} hw_span_us={} largest_phase={phase}",
-        record
-            .dispatch_return_at_ns
-            .map(|at| at.saturating_sub(record.transition_at_ns))
-            .unwrap_or(0),
-        record
-            .cycle_return_at_ns
-            .map(|at| at.saturating_sub(record.transition_at_ns))
-            .unwrap_or(0),
-        record
-            .next_reactor_wake_at_ns
-            .map(|at| at.saturating_sub(record.transition_at_ns))
-            .unwrap_or(0),
-        record
-            .next_input_service_at_ns
-            .map(|at| at.saturating_sub(record.transition_at_ns))
-            .unwrap_or(0),
+        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_next_input_service_ns={} reactor_wait_ns={} input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        record.routing_transition_committed_at_ns,
+        format_transition_duration(record.dispatch_return_at_ns, record),
+        format_transition_duration(record.cycle_return_at_ns, record),
+        format_transition_duration(record.next_reactor_wake_at_ns, record),
+        format_transition_duration(record.next_input_service_at_ns, record),
         reactor_wait_ns,
         input_service_duration_ns,
-        native_dispatch_duration_ns,
+        libinput_dispatch_duration_ns,
+        queue_drain_duration_ns,
         wayland_read_duration_ns,
         cursor_sync_duration_ns,
         batch.raw_events,
         batch.coalesced_events,
-        span_us.unwrap_or(0),
+        hardware_timestamp_span_us,
+        record.checkpoint_count,
+        record
+            .first_serviceable_checkpoint
+            .map(|checkpoint| checkpoint.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        record.fresh_input_microturn,
+        record.superseded_incomplete_transition_observations,
     )
 }
 
-fn duration(start_ns: Option<u64>, end_ns: Option<u64>) -> u64 {
+fn format_transition_duration(at_ns: Option<u64>, record: &NativePointerTimingRecord) -> String {
+    at_ns
+        .map(|at| {
+            at.saturating_sub(record.routing_transition_committed_at_ns)
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn format_duration(start_ns: Option<u64>, end_ns: Option<u64>) -> String {
     start_ns
         .zip(end_ns)
-        .map(|(start, end)| end.saturating_sub(start))
-        .unwrap_or(0)
+        .map(|(start, end)| end.saturating_sub(start).to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 #[cfg(test)]
@@ -430,7 +460,7 @@ mod tests {
     #[test]
     fn disabled_timing_probe_does_not_format_or_emit() {
         let mut trace = NativePointerTimingTrace::disabled_for_test();
-        trace.observe_transition(test_transition(), 10);
+        trace.record_routing_transition_committed(test_transition(), 10);
         trace.observe_first_batch(test_batch(), 20);
 
         assert_eq!(trace.formatted_summary_count(), 0);
@@ -442,7 +472,7 @@ mod tests {
     fn timing_ring_replaces_oldest_record_deterministically() {
         let mut trace = NativePointerTimingTrace::enabled_for_test();
         for timestamp in 1..=9 {
-            trace.observe_transition(test_transition(), timestamp);
+            trace.record_routing_transition_committed(test_transition(), timestamp);
             trace.observe_first_batch(test_batch(), timestamp + 1);
         }
 
@@ -453,7 +483,7 @@ mod tests {
     #[test]
     fn timing_probe_records_only_one_summary_per_transition() {
         let mut trace = NativePointerTimingTrace::enabled_for_test();
-        trace.observe_transition(test_transition(), 10);
+        trace.record_routing_transition_committed(test_transition(), 10);
         trace.observe_first_batch(test_batch(), 20);
         trace.observe_first_batch(test_batch(), 30);
         trace.record_reactor_wake_return(40);
@@ -465,15 +495,92 @@ mod tests {
     #[test]
     fn timing_probe_does_not_change_recorded_batch_values() {
         let mut trace = NativePointerTimingTrace::enabled_for_test();
-        trace.observe_transition(test_transition(), 10);
-        trace.record_phase(NativePointerTimingPhase::Render, 20, 42);
+        trace.record_routing_transition_committed(test_transition(), 10);
+        trace.record_phase(NativePointerTimingPhase::RenderPresentKms, 20, 42);
         trace.observe_first_batch(test_batch(), 50);
 
         let record = trace.records[0].expect("completed record");
         assert_eq!(record.first_batch, Some(test_batch()));
         assert_eq!(
-            record.phase_spans[NativePointerTimingPhase::Render.index()],
+            record.phase_spans[NativePointerTimingPhase::RenderPresentKms.index()],
             Some((20, 42))
         );
+    }
+
+    #[test]
+    fn actual_input_service_time_is_not_reactor_wake_time() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.record_next_reactor_wake(200);
+        trace.record_input_service_start(450);
+
+        let record = trace.records[0].expect("active record");
+        assert_eq!(record.next_reactor_wake_at_ns, Some(200));
+        assert_eq!(record.next_input_service_at_ns, Some(450));
+        assert_eq!(record.next_input_service_at_ns.unwrap() - 100, 350);
+    }
+
+    #[test]
+    fn empty_input_service_does_not_complete_transition_observation() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.observe_first_batch(NativePointerTimingBatch::default(), 200);
+
+        assert_eq!(trace.completed_record_count(), 0);
+
+        trace.observe_first_batch(test_batch(), 300);
+        assert_eq!(trace.completed_record_count(), 1);
+    }
+
+    #[test]
+    fn incomplete_transition_observation_is_counted_when_replaced() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.record_routing_transition_committed(
+            NativePointerTimingTransition::LockedDeactivated,
+            200,
+        );
+
+        assert_eq!(trace.superseded_incomplete_transition_observations, 1);
+        assert_eq!(
+            trace.records[1]
+                .expect("replacement record")
+                .superseded_incomplete_transition_observations,
+            1
+        );
+    }
+
+    #[test]
+    fn timing_summary_uses_actual_service_and_unknown_phase_values() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.record_next_reactor_wake(200);
+        trace.record_input_service_start(450);
+        trace.observe_first_batch(test_batch(), 500);
+
+        let summary = format_summary(&trace.records[0].expect("completed record"));
+        assert!(summary.contains("routing_transition_committed_at_ns=100"));
+        assert!(summary.contains("transition_to_next_input_service_ns=350"));
+        assert!(summary.contains("transition_to_next_reactor_wake_ns=100"));
+        assert!(summary.contains("input_service_duration_ns=unknown"));
+        assert!(summary.contains("largest_phase=unknown"));
+    }
+
+    #[test]
+    fn timing_summary_does_not_invent_a_hardware_timestamp_span() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.observe_first_batch(
+            NativePointerTimingBatch {
+                raw_events: 1,
+                coalesced_events: 1,
+                oldest_hardware_timestamp_us: None,
+                newest_hardware_timestamp_us: None,
+            },
+            200,
+        );
+
+        let summary = format_summary(&trace.records[0].expect("completed record"));
+        assert!(summary.contains("hw_span_us=unknown"));
     }
 }

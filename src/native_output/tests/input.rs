@@ -158,12 +158,28 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     drop(write);
 
     let mut batch = NativeInputBatch::default();
-    backend.drain_events_into(&mut batch, true);
+    assert!(backend.begin_semantic_epoch());
+    backend.drain_epoch_chunk_into(&mut batch);
     assert_eq!(batch.raw.len(), 256);
     assert!(batch.budget_exhausted);
 
-    backend.drain_events_into(&mut batch, true);
+    backend.drain_epoch_chunk_into(&mut batch);
     assert_eq!(batch.raw.len(), 1);
+    assert!(!batch.budget_exhausted);
+}
+
+#[test]
+fn raw_evdev_epoch_ingress_separates_begin_from_queue_drain() {
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
+        devices: Vec::new(),
+        suspended: false,
+    });
+    let mut batch = NativeInputBatch::default();
+
+    assert!(backend.begin_semantic_epoch());
+    backend.drain_epoch_chunk_into(&mut batch);
+
+    assert!(batch.raw.is_empty());
     assert!(!batch.budget_exhausted);
 }
 

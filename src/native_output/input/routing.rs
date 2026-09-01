@@ -139,20 +139,31 @@ impl NativeInputBackend {
         }
     }
 
-    pub(crate) fn drain_events_into(&mut self, batch: &mut NativeInputBatch, dispatch: bool) {
+    pub(crate) fn begin_semantic_epoch(&mut self) -> bool {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.begin_semantic_epoch()
+            }
+            Self::RawEvdev(backend) => backend.begin_semantic_epoch(),
+        }
+    }
+
+    pub(crate) fn drain_epoch_chunk_into(&mut self, batch: &mut NativeInputBatch) {
         batch.raw.clear();
         batch.budget_exhausted = match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
-                backend.drain_events_into(&mut batch.raw, dispatch)
+                backend.drain_epoch_chunk_into(&mut batch.raw)
             }
-            Self::RawEvdev(backend) => backend.drain_events_into(&mut batch.raw),
+            Self::RawEvdev(backend) => backend.drain_epoch_chunk_into(&mut batch.raw),
         };
     }
 
     #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut batch = NativeInputBatch::default();
-        self.drain_events_into(&mut batch, true);
+        if self.begin_semantic_epoch() {
+            self.drain_epoch_chunk_into(&mut batch);
+        }
         batch.raw
     }
 }
@@ -253,28 +264,26 @@ impl LibinputInputBackend {
         })
     }
 
-    pub(crate) fn drain_events_into(
-        &mut self,
-        events: &mut Vec<NativeHardwareInputEvent>,
-        dispatch: bool,
-    ) -> bool {
+    fn begin_semantic_epoch(&mut self) -> bool {
+        if self.suspended {
+            return false;
+        }
+        if let Err(error) = self.input.dispatch() {
+            eprintln!("native input: libinput dispatch failed: {error}");
+            return false;
+        }
+        true
+    }
+
+    fn drain_epoch_chunk_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         events.clear();
         if self.suspended {
             return false;
         }
-        self.drain_events_unconditionally(events, dispatch)
+        self.drain_queue_unconditionally(events)
     }
 
-    fn drain_events_unconditionally(
-        &mut self,
-        events: &mut Vec<NativeHardwareInputEvent>,
-        dispatch: bool,
-    ) -> bool {
-        events.clear();
-        if dispatch && let Err(error) = self.input.dispatch() {
-            eprintln!("native input: libinput dispatch failed: {error}");
-            return false;
-        }
+    fn drain_queue_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
         for event in &mut self.input {
             if let Some(event) = hardware_input_event_from_libinput(
                 event,
@@ -291,10 +300,18 @@ impl LibinputInputBackend {
         false
     }
 
+    fn drain_events_unconditionally(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
+        if let Err(error) = self.input.dispatch() {
+            eprintln!("native input: libinput dispatch failed: {error}");
+            return false;
+        }
+        self.drain_queue_unconditionally(events)
+    }
+
     fn discard_events_unconditionally(&mut self) {
         let mut events = Vec::with_capacity(NATIVE_INPUT_DRAIN_BUDGET);
         loop {
-            if !self.drain_events_unconditionally(&mut events, true) {
+            if !self.drain_events_unconditionally(&mut events) {
                 break;
             }
         }
@@ -888,7 +905,14 @@ impl NativeInputDevices {
         }
     }
 
-    pub(crate) fn drain_events_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
+    pub(crate) fn begin_semantic_epoch(&mut self) -> bool {
+        true
+    }
+
+    pub(crate) fn drain_epoch_chunk_into(
+        &mut self,
+        events: &mut Vec<NativeHardwareInputEvent>,
+    ) -> bool {
         events.clear();
         if self.suspended {
             return false;
@@ -899,7 +923,7 @@ impl NativeInputDevices {
     #[cfg(test)]
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
-        self.drain_events_into(&mut events);
+        self.drain_epoch_chunk_into(&mut events);
         events
     }
 

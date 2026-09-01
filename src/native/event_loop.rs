@@ -590,11 +590,10 @@ impl NativeEventLoop {
                 Ok(result as usize)
             }
         })?;
-        let readiness_mask =
-            (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
+        let terminal_mask = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
         for index in 0..ready {
             let event = self.events[index];
-            if event.events & readiness_mask == 0 {
+            if event.events & terminal_mask != 0 || event.events & libc::EPOLLIN as u32 == 0 {
                 continue;
             }
             let token = ReactorToken::from_raw(event.u64);
@@ -1079,6 +1078,53 @@ mod tests {
         signal(input.as_raw_fd());
         assert!(event_loop.input_ready_nonblocking().unwrap());
         assert!(event_loop.input_ready_nonblocking().unwrap());
+
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.input());
+        assert!(wakeup.reasons.control());
+    }
+
+    #[test]
+    fn input_readiness_checkpoint_ignores_terminal_input_flags() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(read.as_raw_fd(), NativeEventSource::Input(0))
+            .unwrap();
+        drop(write);
+
+        assert!(!event_loop.input_ready_nonblocking().unwrap());
+    }
+
+    #[test]
+    fn input_readiness_checkpoint_preserves_drm_and_continuation_sources() {
+        let input = event_fd();
+        let drm = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(input.as_raw_fd(), NativeEventSource::Input(0))
+            .unwrap();
+        event_loop
+            .register(drm.as_raw_fd(), NativeEventSource::Drm)
+            .unwrap();
+
+        event_loop
+            .request_continuation(NativeContinuationReason::AstreaPublication)
+            .unwrap();
+        signal(input.as_raw_fd());
+        signal(drm.as_raw_fd());
+
+        assert!(event_loop.input_ready_nonblocking().unwrap());
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.input());
+        assert!(wakeup.reasons.drm());
+        assert!(wakeup.reasons.runtime_continuation());
     }
 
     #[test]
