@@ -226,10 +226,10 @@ impl NativeFrameScheduler {
     }
 
     fn page_flip_watchdog_expired(&mut self, now_ns: u64) -> bool {
-        if !self
-            .watchdog_deadline_ns
-            .is_some_and(|deadline| now_ns >= deadline)
-        {
+        let Some(deadline) = self.watchdog_deadline_ns else {
+            return false;
+        };
+        if now_ns < deadline {
             return false;
         }
         if !self.watchdog_reported {
