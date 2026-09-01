@@ -36,6 +36,7 @@ mod plane_cycle;
 #[cfg(test)]
 mod plane_cycle_tests;
 mod planner;
+mod pointer_timing;
 mod presentation;
 mod presentation_cursor;
 mod presentation_cycle;
@@ -69,6 +70,10 @@ pub(crate) use dmabuf_release::{
     dmabuf_gpu_release_safety,
 };
 use metrics::NativeRenderTelemetry;
+pub(super) use pointer_timing::{
+    NativePointerTimingBatch, NativePointerTimingPhase, NativePointerTimingTrace,
+    NativePointerTimingTransition,
+};
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
 };
@@ -90,6 +95,10 @@ pub(super) use cursor_cycle::{
     synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
+use cycle_dispatch::{
+    NativeInputRoutingBarrierDecision, NativeWaylandInputDispatchOutcome,
+    decide_input_routing_barrier,
+};
 #[cfg(test)]
 pub(crate) use frame::NativeCursorOutputDisposition;
 #[cfg(test)]
@@ -99,8 +108,8 @@ pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
-    NativePointerConstraintBackendAction,
-    ResolvedNativeFrameScene, native_pointer_debug_log_lazy, normalize_refresh_hz,
+    NativePointerConstraintBackendAction, ResolvedNativeFrameScene, native_pointer_debug_log_lazy,
+    normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{
@@ -373,6 +382,7 @@ pub(crate) struct NativeRuntime {
     presentation_cadence: PresentationCadenceMetrics,
     frame_pacing: NativeFramePacing,
     wake_authority: NativeWakeAuthorityMetrics,
+    pointer_timing: NativePointerTimingTrace,
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,

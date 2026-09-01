@@ -562,6 +562,50 @@ impl NativeEventLoop {
         self.continuation_wakes
     }
 
+    /// Check only native input registrations without consuming any fd
+    /// readiness or changing the current wake snapshot.
+    pub fn input_ready_nonblocking(&mut self) -> io::Result<bool> {
+        let ready = retry_interrupted(|| {
+            let result = unsafe {
+                libc::epoll_wait(
+                    self.epoll.as_raw_fd(),
+                    self.events.as_mut_ptr(),
+                    self.events.len() as libc::c_int,
+                    0,
+                )
+            };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(result as usize)
+            }
+        })?;
+        let readiness_mask =
+            (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
+        for index in 0..ready {
+            let event = self.events[index];
+            if event.events & readiness_mask == 0 {
+                continue;
+            }
+            let token = ReactorToken::from_raw(event.u64);
+            let Some((registration_index, generation)) = token.decode() else {
+                continue;
+            };
+            let Some(slot) = self.registrations.get(registration_index) else {
+                continue;
+            };
+            if slot.generation != generation {
+                continue;
+            }
+            if slot.registration.as_ref().is_some_and(|registration| {
+                matches!(registration.source, NativeEventSource::Input(_))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn wait(&mut self) -> io::Result<NativeWakeup> {
         let wait_started_ns = monotonic_now_ns()?;
         let ready = retry_interrupted(|| {
@@ -853,10 +897,7 @@ impl NativeEventLoop {
         }
         self.continuation_signaled = false;
         self.continuation_wakes = self.continuation_wakes.saturating_add(1);
-        Ok(std::mem::replace(
-            &mut self.continuation_reasons,
-            NativeContinuationReasons::default(),
-        ))
+        Ok(std::mem::take(&mut self.continuation_reasons))
     }
 }
 
@@ -1005,6 +1046,26 @@ mod tests {
 
         assert!(wakeup.reasons.input());
         assert!(!wakeup.reasons.timer());
+    }
+
+    #[test]
+    fn input_readiness_checkpoint_is_nonconsuming_and_ignores_other_sources() {
+        let input = event_fd();
+        let control = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(input.as_raw_fd(), NativeEventSource::Input(0))
+            .unwrap();
+        event_loop
+            .register(control.as_raw_fd(), NativeEventSource::ControlListener)
+            .unwrap();
+
+        assert!(!event_loop.input_ready_nonblocking().unwrap());
+        signal(control.as_raw_fd());
+        assert!(!event_loop.input_ready_nonblocking().unwrap());
+        signal(input.as_raw_fd());
+        assert!(event_loop.input_ready_nonblocking().unwrap());
+        assert!(event_loop.input_ready_nonblocking().unwrap());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::runtime::NativePointerConstraintBackendAction;
 use ::input::AsRaw;
 use oblivion_one::compositor::InteractionUpdateOutcome;
 
@@ -1330,8 +1331,9 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     input_state: &mut NativeInputState,
     cursor_mode: NativeCursorRenderMode,
     settlement_point: NativeInputConstraintSettlementPoint,
-) -> NativeResult<bool> {
+) -> NativeResult<NativePointerConstraintSettlementOutcome> {
     let mut redraw_requested = false;
+    let mut routing_transition = None;
     loop {
         let requests = server.take_pointer_constraint_backend_requests();
         if requests.is_empty() {
@@ -1368,6 +1370,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 )
             });
             let action = backend.handle_resolved_request(request, cursor_position, locked_anchor);
+            let action_transition = native_pointer_routing_transition(&action);
             if let Some((id, reason)) = action.failed {
                 native_pointer_debug_log_lazy(|| {
                     format!(
@@ -1426,6 +1429,9 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 });
                 server.pointer_constraint_backend_deactivated(id);
             }
+            if routing_transition.is_none() {
+                routing_transition = action_transition;
+            }
             if let Some(visible) = action.cursor_visibility_changed {
                 native_pointer_debug_log_lazy(|| {
                     format!("cursor visibility native visible={}", visible)
@@ -1438,7 +1444,50 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
         }
     }
     input_state.pointer_constraint = backend.active_constraint_state();
-    Ok(redraw_requested)
+    Ok(NativePointerConstraintSettlementOutcome {
+        redraw_requested,
+        routing_transition,
+    })
+}
+
+fn native_pointer_routing_transition(
+    action: &NativePointerConstraintBackendAction,
+) -> Option<NativeInputRoutingTransition> {
+    if let Some(constraint) = action.activated.as_ref() {
+        return match constraint.mode {
+            PointerConstraintMode::Locked => {
+                Some(NativeInputRoutingTransition::LockedActivated(constraint.id))
+            }
+            PointerConstraintMode::Confined => Some(
+                NativeInputRoutingTransition::ConfinedActivated(constraint.id),
+            ),
+            PointerConstraintMode::None => None,
+        };
+    }
+
+    match (action.deactivated, action.deactivated_mode) {
+        (Some(id), Some(PointerConstraintMode::Locked)) => {
+            Some(NativeInputRoutingTransition::LockedDeactivated(id))
+        }
+        (Some(id), Some(PointerConstraintMode::Confined)) => {
+            Some(NativeInputRoutingTransition::ConfinedDeactivated(id))
+        }
+        (Some(_), Some(PointerConstraintMode::None)) | (_, None) | (None, _) => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeInputRoutingTransition {
+    LockedActivated(PointerConstraintBackendId),
+    LockedDeactivated(PointerConstraintBackendId),
+    ConfinedActivated(PointerConstraintBackendId),
+    ConfinedDeactivated(PointerConstraintBackendId),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativePointerConstraintSettlementOutcome {
+    pub(crate) redraw_requested: bool,
+    pub(crate) routing_transition: Option<NativeInputRoutingTransition>,
 }
 
 pub(crate) fn pointer_constraint_activation_request_id(
@@ -1602,5 +1651,93 @@ mod scroll_event_tests {
         let absent_axis = continuous_axis_component(false, 0.0);
         assert_eq!(absent_axis.continuous, None);
         assert!(!absent_axis.stopped);
+    }
+}
+
+#[cfg(test)]
+mod routing_transition_tests {
+    use super::*;
+
+    fn id(constraint_id: u64, generation: u64) -> PointerConstraintBackendId {
+        PointerConstraintBackendId {
+            constraint_id,
+            generation,
+        }
+    }
+
+    #[test]
+    fn successful_backend_activation_produces_one_scheduler_transition() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let constraint_id = id(22, 4);
+        let action = backend.handle_resolved_request(
+            PointerConstraintBackendRequest::ActivateLocked { id: constraint_id },
+            CompositorOutputPosition { x: 12.5, y: 18.25 },
+            Some(CompositorOutputPosition { x: 20.0, y: 30.0 }),
+        );
+
+        assert_eq!(
+            native_pointer_routing_transition(&action),
+            Some(NativeInputRoutingTransition::LockedActivated(constraint_id))
+        );
+    }
+
+    #[test]
+    fn stale_or_rejected_actions_do_not_produce_scheduler_transitions() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let active_id = id(23, 1);
+        let rejected_id = id(24, 1);
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked { id: active_id },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+        let rejected = backend.handle_request(
+            PointerConstraintBackendRequest::ActivateConfined {
+                id: rejected_id,
+                region: OutputRegion::from_rect(OutputRect::new(0.0, 0.0, 10.0, 10.0).unwrap()),
+            },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+        let stale_deactivation = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id: rejected_id,
+                restore_position: None,
+            },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+        let visibility = backend.handle_request(
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: false },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+
+        assert!(native_pointer_routing_transition(&rejected).is_none());
+        assert!(native_pointer_routing_transition(&stale_deactivation).is_none());
+        assert!(native_pointer_routing_transition(&visibility).is_none());
+    }
+
+    #[test]
+    fn successful_deactivation_preserves_the_mode_in_the_transition() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let constraint_id = id(25, 1);
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateConfined {
+                id: constraint_id,
+                region: OutputRegion::from_rect(OutputRect::new(0.0, 0.0, 10.0, 10.0).unwrap()),
+            },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id: constraint_id,
+                restore_position: None,
+            },
+            CompositorOutputPosition { x: 1.0, y: 2.0 },
+        );
+
+        assert_eq!(
+            native_pointer_routing_transition(&action),
+            Some(NativeInputRoutingTransition::ConfinedDeactivated(
+                constraint_id
+            ))
+        );
     }
 }

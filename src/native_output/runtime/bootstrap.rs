@@ -678,6 +678,7 @@ impl NativeRuntime {
             presentation_cadence,
             frame_pacing,
             wake_authority: NativeWakeAuthorityMetrics::default(),
+            pointer_timing: NativePointerTimingTrace::from_env(),
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,

@@ -53,10 +53,18 @@ impl NativeRuntime {
                         .acquire_watches
                         .next_fallback_deadline_ns()
                         .is_some_and(|deadline| deadline <= now_ns)),
-            astrea_publication_due: cycle.wakeup.reasons.timer()
-                && self.server.has_pending_astrea_toplevel_publication(),
-            commit_timing_planning_due: cycle.wakeup.reasons.timer()
-                && self.server.has_pending_commit_timing_planning(),
+            astrea_publication_due: cycle
+                .wakeup
+                .continuation
+                .contains(NativeContinuationReason::AstreaPublication)
+                || (cycle.wakeup.reasons.timer()
+                    && self.server.has_pending_astrea_toplevel_publication()),
+            commit_timing_planning_due: cycle
+                .wakeup
+                .continuation
+                .contains(NativeContinuationReason::CommitTimingPlanning)
+                || (cycle.wakeup.reasons.timer()
+                    && self.server.has_pending_commit_timing_planning()),
             pacing_active: self.server.has_surface_pacing_work(),
             pacing_due: self.should_progress_surface_pacing(now_ns),
             xwayland_generation_changed: self.xwayland.reactor_registration_generation()
@@ -108,6 +116,13 @@ impl NativeRuntime {
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         let now_ns = monotonic_now_ns()?;
+        if self.pointer_timing.enabled() {
+            self.pointer_timing.record_next_reactor_wake(now_ns);
+            if cycle.wakeup.reasons.input() {
+                self.pointer_timing.record_next_input_service(now_ns);
+            }
+            self.pointer_timing.record_reactor_wake_return(now_ns);
+        }
         self.service_due_dmabuf_release_retry(now_ns)?;
         let runtime_state = self.native_runtime_state(&cycle, now_ns);
         let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
@@ -147,7 +162,12 @@ impl NativeRuntime {
             }
             self.sync_xwayland_reactor_sources()?;
         }
-        if cycle.wakeup.reasons.timer() {
+        if cycle.wakeup.reasons.timer()
+            || cycle
+                .wakeup
+                .continuation
+                .contains(NativeContinuationReason::ControlTimeout)
+        {
             self.control_server.expire_idle_clients(
                 &mut self.event_loop,
                 monotonic_now_ns()?,
@@ -196,7 +216,7 @@ impl NativeRuntime {
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
-        let wayland_pacing_readiness_changed =
+        let dispatch_outcome =
             if operation_plan.dispatch_wayland_read_side || operation_plan.service_input {
                 self.dispatch_wayland_and_input(
                     &mut cycle,
@@ -204,8 +224,23 @@ impl NativeRuntime {
                     operation_plan.dispatch_wayland_read_side,
                 )?
             } else {
-                false
+                NativeWaylandInputDispatchOutcome::default()
             };
+        let mut wayland_pacing_readiness_changed = dispatch_outcome.pacing_readiness_changed;
+        if dispatch_outcome.routing_transition.is_some() {
+            let input_serviceable = self.event_loop.input_ready_nonblocking()?;
+            if matches!(
+                decide_input_routing_barrier(
+                    dispatch_outcome.routing_transition,
+                    input_serviceable
+                ),
+                NativeInputRoutingBarrierDecision::ServiceInputMicroturn
+            ) {
+                let microturn =
+                    self.service_fresh_input_microturn_after_routing_transition(&mut cycle)?;
+                wayland_pacing_readiness_changed |= microturn;
+            }
+        }
         if work_domains.commit_timing_planning
             || (work_domains.wayland_dispatch && self.server.has_pending_commit_timing_planning())
         {
@@ -219,9 +254,23 @@ impl NativeRuntime {
         let pacing_visual_work = if work_domains
             .should_service_surface_pacing_after_wayland(wayland_pacing_readiness_changed)
         {
+            let phase_started_at_ns = self
+                .pointer_timing
+                .enabled()
+                .then(monotonic_now_ns)
+                .transpose()?;
             self.resource_efficiency_mut()
                 .record_surface_pacing_service_run();
-            self.server.progress_surface_pacing(monotonic_now_ns()?)?
+            let result = self.server.progress_surface_pacing(monotonic_now_ns()?);
+            let pacing_visual_work = result?;
+            if let Some(start_ns) = phase_started_at_ns {
+                self.pointer_timing.record_phase(
+                    NativePointerTimingPhase::SurfacePacing,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
+            pacing_visual_work
         } else {
             false
         };
@@ -234,19 +283,42 @@ impl NativeRuntime {
         } else if work_domains.input {
             self.note_timing_scope("input_dispatch", wayland_dispatch_started.elapsed());
         }
+        let cursor_control_started_at_ns = (self.pointer_timing.enabled()
+            && (work_domains.control || work_domains.cursor))
+            .then(monotonic_now_ns)
+            .transpose()?;
         if work_domains.control {
             self.service_control_events(&cycle.wakeup)?;
         }
         if work_domains.cursor {
             self.service_cursor_io_completions(&cycle.wakeup)?;
         }
+        if let Some(start_ns) = cursor_control_started_at_ns {
+            self.pointer_timing.record_phase(
+                NativePointerTimingPhase::CursorAndControl,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
         let xwayland_scene_work = wayland_client_work || xwayland_work;
         if xwayland_scene_work {
+            let phase_started_at_ns = self
+                .pointer_timing
+                .enabled()
+                .then(monotonic_now_ns)
+                .transpose()?;
             self.dispatch_xwayland_client_disconnects()?;
             self.dispatch_xwayland_shell_binds()?;
             self.initialize_managed_xwayland()?;
             cycle.redraw_requested |= self.dispatch_xwayland_scene_batch()?;
             self.sync_xwayland_reactor_sources()?;
+            if let Some(start_ns) = phase_started_at_ns {
+                self.pointer_timing.record_phase(
+                    NativePointerTimingPhase::XwaylandScene,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         }
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
@@ -277,6 +349,11 @@ impl NativeRuntime {
         )
         .operation_plan();
         let prepare_outcome = if prepare_operation_plan.service_acquire_and_prepare {
+            let phase_started_at_ns = self
+                .pointer_timing
+                .enabled()
+                .then(monotonic_now_ns)
+                .transpose()?;
             self.resource_efficiency_mut().record_acquire_prepare_run();
             if prepare_operation_plan.explicit_sync_service {
                 self.resource_efficiency_mut()
@@ -288,6 +365,13 @@ impl NativeRuntime {
                 prepare_operation_plan.explicit_sync_service,
             )?;
             self.note_timing_scope("prepare_frame", prepare_started.elapsed());
+            if let Some(start_ns) = phase_started_at_ns {
+                self.pointer_timing.record_phase(
+                    NativePointerTimingPhase::AcquirePrepare,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
             outcome
         } else {
             self.resource_efficiency_mut().record_acquire_prepare_skip();
@@ -318,6 +402,11 @@ impl NativeRuntime {
             prepare_outcome.visual_work_created,
         );
         if presentation_work {
+            let phase_started_at_ns = self
+                .pointer_timing
+                .enabled()
+                .then(monotonic_now_ns)
+                .transpose()?;
             let render_started = Instant::now();
             self.resource_efficiency_mut()
                 .record_presentation_planning_run();
@@ -339,6 +428,13 @@ impl NativeRuntime {
                 NativeWorkClass::CursorOnly => {}
             }
             self.note_timing_scope("egl_draw", render_started.elapsed());
+            if let Some(start_ns) = phase_started_at_ns {
+                self.pointer_timing.record_phase(
+                    NativePointerTimingPhase::PresentKms,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         } else {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
@@ -348,7 +444,40 @@ impl NativeRuntime {
         }
         cycle.fast_path_completed = !prepare_outcome.acquire_service_ran && !presentation_work;
         self.flush_presentation_trace()?;
+        if self.pointer_timing.enabled() {
+            self.pointer_timing.record_cycle_return(monotonic_now_ns()?);
+        }
         Ok(())
+    }
+
+    /// Give newly readable native input one bounded microturn after a routing
+    /// transition.  The checkpoint does not drain or acknowledge any other
+    /// reactor source, so all cycle-tail work remains owned by this cycle.
+    fn service_fresh_input_microturn_after_routing_transition(
+        &mut self,
+        cycle: &mut NativeCycleState,
+    ) -> NativeResult<bool> {
+        let previous_accepted = cycle.accepted;
+        let previous_tick_us = cycle.tick_us;
+        let previous_input_drain_us = cycle.input_drain_us;
+        let previous_raw_input_events = cycle.raw_input_events;
+        let previous_coalesced_input_events = cycle.coalesced_input_events;
+        let previous_skipped_input_repaints = cycle.skipped_input_repaints;
+        let previous_redraw_requested = cycle.redraw_requested;
+        let previous_shutdown_requested = cycle.shutdown_requested;
+
+        let outcome = self.dispatch_wayland_and_input(cycle, true, false)?;
+        cycle.accepted = previous_accepted.saturating_add(cycle.accepted);
+        cycle.tick_us = previous_tick_us.saturating_add(cycle.tick_us);
+        cycle.input_drain_us = previous_input_drain_us.saturating_add(cycle.input_drain_us);
+        cycle.raw_input_events = previous_raw_input_events.saturating_add(cycle.raw_input_events);
+        cycle.coalesced_input_events =
+            previous_coalesced_input_events.saturating_add(cycle.coalesced_input_events);
+        cycle.skipped_input_repaints =
+            previous_skipped_input_repaints.saturating_add(cycle.skipped_input_repaints);
+        cycle.redraw_requested |= previous_redraw_requested;
+        cycle.shutdown_requested |= previous_shutdown_requested;
+        Ok(outcome.pacing_readiness_changed)
     }
 
     fn flush_presentation_trace(&self) -> NativeResult<()> {
@@ -473,7 +602,8 @@ impl NativeRuntime {
             surface_pacing_deadline_ns: (!self.server.has_surface_pacing_readiness_pending())
                 .then(|| self.server.next_surface_pacing_deadline_ns())
                 .flatten(),
-            control_timeout_pending: control_timeout_deadline.is_some_and(|deadline| deadline <= now_ns),
+            control_timeout_pending: control_timeout_deadline
+                .is_some_and(|deadline| deadline <= now_ns),
             ..NativeWakePlanInputs::default()
         });
         self.install_native_wake_plan(plan, now_ns)
@@ -498,7 +628,8 @@ impl NativeRuntime {
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
-            control_timeout_pending: control_timeout_deadline.is_some_and(|deadline| deadline <= now_ns),
+            control_timeout_pending: control_timeout_deadline
+                .is_some_and(|deadline| deadline <= now_ns),
             ..NativeWakePlanInputs::default()
         });
         self.install_native_wake_plan(plan, now_ns)
