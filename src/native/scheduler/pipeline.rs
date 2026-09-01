@@ -257,3 +257,204 @@ impl NativeFrameScheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::presentation_deadline::PresentationTargetReason;
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestPipeline {
+        future_primary_limit: u8,
+        kernel_commit_occupied: bool,
+        kernel_primary_submitted: bool,
+        worker_commit_occupied: bool,
+        worker_primary_queued: bool,
+        prepared: SchedulerPreparedPrimary,
+        free_compositor_slots: u8,
+        future_primary_depth: u8,
+        direct_active: bool,
+        triple_capable: bool,
+    }
+
+    impl Default for TestPipeline {
+        fn default() -> Self {
+            Self {
+                future_primary_limit: 2,
+                kernel_commit_occupied: false,
+                kernel_primary_submitted: false,
+                worker_commit_occupied: false,
+                worker_primary_queued: false,
+                prepared: SchedulerPreparedPrimary::None,
+                free_compositor_slots: 1,
+                future_primary_depth: 0,
+                direct_active: false,
+                triple_capable: true,
+            }
+        }
+    }
+
+    impl PresentationPipelineView for TestPipeline {
+        fn future_primary_limit(&self) -> u8 {
+            self.future_primary_limit
+        }
+
+        fn kernel_commit_occupied(&self) -> bool {
+            self.kernel_commit_occupied
+        }
+
+        fn kernel_primary_submitted(&self) -> bool {
+            self.kernel_primary_submitted
+        }
+
+        fn worker_commit_occupied(&self) -> bool {
+            self.worker_commit_occupied
+        }
+
+        fn worker_primary_queued(&self) -> bool {
+            self.worker_primary_queued
+        }
+
+        fn prepared_primary(&self) -> SchedulerPreparedPrimary {
+            self.prepared
+        }
+
+        fn free_compositor_slots(&self) -> u8 {
+            self.free_compositor_slots
+        }
+
+        fn future_primary_depth(&self) -> u8 {
+            self.future_primary_depth
+        }
+
+        fn direct_active(&self) -> bool {
+            self.direct_active
+        }
+
+        fn triple_capable(&self) -> bool {
+            self.triple_capable
+        }
+    }
+
+    fn target(render_start_deadline: u64, submit_not_before: u64) -> PresentationTarget {
+        PresentationTarget {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(submit_not_before + 1),
+            submit_not_before: MonotonicTimestampNs::new(submit_not_before),
+            render_start_deadline: MonotonicTimestampNs::new(render_start_deadline),
+            refresh_interval: Duration::from_millis(6),
+            reason: PresentationTargetReason::PredictedPressure,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        }
+    }
+
+    fn context(now_ns: u64, presentation_target: Option<PresentationTarget>) -> ExplicitAtomicSchedulerContext {
+        ExplicitAtomicSchedulerContext {
+            now: MonotonicTimestampNs::new(now_ns),
+            predicted_total_cost: Duration::from_millis(2),
+            presentation_target,
+            render_ahead_allowed: true,
+            worker_queue_available: true,
+        }
+    }
+
+    #[test]
+    fn expired_visual_target_cannot_poll_a_worker_blocked_pipeline() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        let pipeline = TestPipeline {
+            worker_primary_queued: true,
+            ..TestPipeline::default()
+        };
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(
+            context(5_000_000, Some(target(4_000_000, 6_000_000))),
+            &pipeline,
+        );
+
+        assert_eq!(decision.action, SchedulerDecision::WaitForWorkerQueue);
+        assert_eq!(decision.wait_reason, Some(PipelineWaitReason::WorkerQueueOccupied));
+        assert_eq!(decision.wake_deadline, None);
+    }
+
+    #[test]
+    fn pageflip_blocked_pipeline_ignores_obsolete_visual_deadline() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_async_submission(41, 1).unwrap();
+        let pipeline = TestPipeline {
+            kernel_primary_submitted: true,
+            ..TestPipeline::default()
+        };
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(
+            context(5_000_000, Some(target(4_000_000, 6_000_000))),
+            &pipeline,
+        );
+
+        assert_eq!(decision.action, SchedulerDecision::WaitForPageFlip);
+        assert_eq!(decision.wake_deadline, None);
+    }
+
+    #[test]
+    fn wait_for_refresh_keeps_exact_render_start_deadline() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        let pipeline = TestPipeline::default();
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(
+            context(4_000_000, Some(target(5_000_000, 6_000_000))),
+            &pipeline,
+        );
+
+        assert_eq!(decision.action, SchedulerDecision::WaitForRefresh);
+        assert_eq!(
+            decision.wake_deadline,
+            Some(SchedulerWakeDeadline {
+                kind: SchedulerWakeDeadlineKind::RenderStart,
+                at_ns: 5_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn ready_frame_uses_submit_boundary_instead_of_render_start() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        let ready_target = target(3_000_000, 5_000_000);
+        scheduler.note_ready_frame(Some(ready_target));
+        let pipeline = TestPipeline {
+            prepared: SchedulerPreparedPrimary::Ready {
+                target: ready_target,
+            },
+            ..TestPipeline::default()
+        };
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(
+            context(4_000_000, Some(ready_target)),
+            &pipeline,
+        );
+
+        assert_eq!(decision.action, SchedulerDecision::WaitForRefresh);
+        assert_eq!(
+            decision.wake_deadline,
+            Some(SchedulerWakeDeadline {
+                kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
+                at_ns: 5_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn actionable_scheduler_decisions_have_no_rediscovery_deadline() {
+        for action in [
+            SchedulerDecision::Render,
+            SchedulerDecision::RenderAhead,
+            SchedulerDecision::SubmitReady,
+            SchedulerDecision::SubmitReadyLate,
+            SchedulerDecision::CompleteProtocolOnly,
+        ] {
+            assert_eq!(scheduler_wake_deadline_for(action), None);
+        }
+    }
+}
