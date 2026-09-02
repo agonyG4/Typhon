@@ -4,7 +4,7 @@
 
 Starting HEAD recorded before this task: `6e24da9b0ce2e673795f01727572a6a5907e8b54` (`native: attribute wake deadline anomalies by owner`).
 
-The checkout advanced during the work through the already-present content-cadence commits `0e3a96c` and `5726c4e`; the focused implementation commit is `916c12a806a76bd95811db1923fa7b1d3194c4d2` (`native: use targeted input readiness authority`). The report commit is the final HEAD for this task.
+The checkout advanced during the work through the already-present content-cadence commits `0e3a96c` and `5726c4e`. The focused implementation commit is `916c12a806a76bd95811db1923fa7b1d3194c4d2` (`native: use targeted input readiness authority`). The checkout was subsequently observed at `77df0650e783446dbd9a63e007aa44a052b92912`, an unrelated root-level content-frame-clock report commit; no native-input source changed after `916c12a`.
 
 This closure preserves semantic epochs, explicit ingress, the pre-read gate, the post-transition guard, epoch-owned Wayland progression, bounded continuation, exact motion, coalescing, raw evdev fallback, and Native Wake Authority.
 
@@ -74,7 +74,7 @@ Results actually run:
 - `rtk cargo fmt --check`: passed;
 - `rtk cargo check --locked --all-targets`: passed;
 - `rtk git diff --check`: passed;
-- `rtk cargo clippy --locked --all-targets -- -D warnings`: not clean due two unrelated presentation-pacing diagnostics in the concurrent checkout (`classify_content_frame` has 9 arguments and a test uses field assignment after `Default`); no input-readiness diagnostic was emitted;
+- `rtk cargo clippy --locked --all-targets -- -D warnings`: the first run stopped on two unrelated presentation-pacing diagnostics in the concurrent checkout (`classify_content_frame` had 9 arguments and a test used field assignment after `Default`); a fresh rerun at the subsequently observed `77df065` HEAD passed with no issues;
 - `rtk cargo test --locked`: one unrelated XWayland geometry test failed in the initial run; its exact isolated rerun passed;
 - `rtk cargo test --locked -- --test-threads=1`: passed, 3,225 passed, 5 ignored, 40 filtered.
 
