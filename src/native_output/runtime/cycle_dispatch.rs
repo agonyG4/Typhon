@@ -1593,6 +1593,22 @@ mod tests {
     }
 
     #[test]
+    fn pre_read_seam_reads_wayland_when_input_remains_unavailable() {
+        let probe_count = std::cell::Cell::new(0);
+        let mut service_input = false;
+
+        let decision = promote_native_input_before_wayland_read(true, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(false)
+        })
+        .unwrap();
+
+        assert_eq!(decision, NativePreReadInputDecision::ReadWayland);
+        assert!(!service_input);
+        assert_eq!(probe_count.get(), 1);
+    }
+
+    #[test]
     fn pre_read_seam_performs_at_most_one_probe() {
         let probe_count = std::cell::Cell::new(0);
         let mut service_input = false;
@@ -1605,6 +1621,27 @@ mod tests {
 
         assert_eq!(decision, NativePreReadInputDecision::PromoteInputEpoch);
         assert!(service_input);
+        assert_eq!(probe_count.get(), 1);
+    }
+
+    #[test]
+    fn promoted_pre_read_turn_cannot_probe_again_before_wayland_progress() {
+        let probe_count = std::cell::Cell::new(0);
+        let mut service_input = false;
+
+        let first = promote_native_input_before_wayland_read(true, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(true)
+        })
+        .unwrap();
+        let second = promote_native_input_before_wayland_read(true, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(true)
+        })
+        .unwrap();
+
+        assert_eq!(first, NativePreReadInputDecision::PromoteInputEpoch);
+        assert_eq!(second, NativePreReadInputDecision::NoGate);
         assert_eq!(probe_count.get(), 1);
     }
 
