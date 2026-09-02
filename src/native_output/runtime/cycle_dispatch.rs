@@ -873,7 +873,6 @@ impl NativeRuntime {
         let mut accepted = 0;
         let mut tick_us = 0;
         let mut pacing_readiness_changed = false;
-        let mut deferred_wayland_progression = false;
         let mut input_drain_us = 0;
         let mut raw_input_events = 0;
         let mut coalesced_input_events = 0;
@@ -1153,7 +1152,7 @@ impl NativeRuntime {
                     dispatch_wayland,
                     may_change_pointer_constraints,
                 ) {
-                    deferred_wayland_progression = true;
+                    input_epoch.request_deferred_wayland_progression();
                     native_pointer_debug_log_lazy(|| {
                         format!(
                             "wayland.input_read deferred epoch={:?} reason=protocol_progression",
@@ -1209,6 +1208,11 @@ impl NativeRuntime {
                 render_telemetry.resource_efficiency.record_client_flush();
             }
         }
+        let deferred_wayland_progression = if !input_epoch.backlog_pending() {
+            input_epoch.take_deferred_wayland_progression()
+        } else {
+            false
+        };
         let input_backlog_continuation = service_input && input_epoch.backlog_pending();
         let should_dispatch_after_input = service_input
             && !input_backlog_continuation
@@ -1631,6 +1635,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision, NativePreReadInputDecision::NoGate);
+        assert_eq!(probe_count.get(), 0);
+    }
+
+    #[test]
+    fn pre_read_seam_does_not_probe_input_only_turns() {
+        let probe_count = std::cell::Cell::new(0);
+        let mut service_input = false;
+
+        let decision = promote_native_input_before_wayland_read(
+            false,
+            &mut service_input,
+            || {
+                probe_count.set(probe_count.get() + 1);
+                Ok::<bool, std::convert::Infallible>(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decision, NativePreReadInputDecision::NoGate);
+        assert!(!service_input);
         assert_eq!(probe_count.get(), 0);
     }
 }

@@ -16,6 +16,7 @@ pub(crate) struct NativeInputEpoch {
     next_id: u64,
     active_id: Option<u64>,
     backlog_pending: bool,
+    deferred_wayland_progression: bool,
 }
 
 impl NativeInputEpoch {
@@ -47,5 +48,33 @@ impl NativeInputEpoch {
 
     pub(crate) const fn constraint_settlement_allowed(&self) -> bool {
         self.active_id.is_none()
+    }
+
+    pub(crate) fn request_deferred_wayland_progression(&mut self) {
+        self.deferred_wayland_progression = true;
+    }
+
+    pub(crate) fn take_deferred_wayland_progression(&mut self) -> bool {
+        std::mem::take(&mut self.deferred_wayland_progression)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeInputEpoch;
+
+    #[test]
+    fn deferred_wayland_progression_survives_a_budget_continuation() {
+        let mut epoch = NativeInputEpoch::default();
+        epoch.begin(false);
+        epoch.request_deferred_wayland_progression();
+        epoch.finish(true);
+
+        assert!(epoch.backlog_pending());
+        assert_eq!(epoch.begin(true), 1);
+        epoch.finish(false);
+
+        assert!(epoch.take_deferred_wayland_progression());
+        assert!(!epoch.take_deferred_wayland_progression());
     }
 }
