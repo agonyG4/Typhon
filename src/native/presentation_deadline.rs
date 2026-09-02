@@ -42,6 +42,21 @@ pub enum PresentationTargetReason {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationTargetAuthority {
+    Advisory,
+    Reserved,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryRefreshFrontier {
+    pub sequence: u64,
+    pub presentation_time: MonotonicTimestampNs,
+    pub clock_generation: u64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentationTarget {
     pub sequence: u64,
     pub presentation_time: MonotonicTimestampNs,
@@ -73,6 +88,21 @@ impl PresentationTarget {
 
     pub const fn predicted_unreachable(self) -> bool {
         self.predicted_unreachable
+    }
+
+    pub const fn authority(self) -> PresentationTargetAuthority {
+        match self.reason {
+            PresentationTargetReason::ReactiveDouble => PresentationTargetAuthority::Advisory,
+            PresentationTargetReason::Normal
+            | PresentationTargetReason::PredictedPressure
+            | PresentationTargetReason::ProvenReadinessMiss
+            | PresentationTargetReason::ForcedValidation
+            | PresentationTargetReason::CommitTiming => PresentationTargetAuthority::Reserved,
+        }
+    }
+
+    pub const fn is_binding(self) -> bool {
+        matches!(self.authority(), PresentationTargetAuthority::Reserved)
     }
 
     pub const fn opportunity(self) -> PresentationOpportunity {
@@ -231,6 +261,7 @@ impl PresentationDeadlinePlanner {
         lower_bound: PresentationTarget,
     ) -> Option<PresentationTarget> {
         let ready_at = now.checked_add(predicted_total_cost)?;
+        let lower_bound = self.physical_predecessor_for(lower_bound);
         let (sequence, presentation_time, estimated) =
             self.earliest_reachable_after(ready_at, lower_bound)?;
 
@@ -260,6 +291,7 @@ impl PresentationDeadlinePlanner {
         if !self.is_current(lower_bound) {
             return None;
         }
+        let lower_bound = self.physical_predecessor_for(lower_bound);
         let ready_at = now.checked_add(predicted_total_cost)?;
         let (sequence, presentation_time, estimated) =
             self.earliest_reachable_after(ready_at, lower_bound)?;
@@ -313,10 +345,11 @@ impl PresentationDeadlinePlanner {
         if !self.is_current(pending) {
             return None;
         }
-        let sequence = pending.sequence.checked_add(1)?;
-        let presentation_time = pending
+        let predecessor = self.physical_predecessor_for(pending);
+        let sequence = predecessor.sequence.checked_add(1)?;
+        let presentation_time = predecessor
             .presentation_time
-            .checked_add(pending.refresh_interval)?;
+            .checked_add(predecessor.refresh_interval)?;
         let ready_at = now.checked_add(predicted_total_cost)?;
         let unreachable = ready_at > presentation_time;
         if unreachable
@@ -333,12 +366,12 @@ impl PresentationDeadlinePlanner {
             presentation_time,
             predicted_total_cost,
             reason,
-            pending.estimated,
+            predecessor.estimated,
             unreachable,
-            pending
+            predecessor
                 .presentation_time
                 .checked_add(SUBMIT_NOT_BEFORE_GUARD)
-                .unwrap_or(pending.presentation_time),
+                .unwrap_or(predecessor.presentation_time),
         );
         self.scheduled = Some(target);
         Some(target)
@@ -375,6 +408,45 @@ impl PresentationDeadlinePlanner {
 
     pub const fn is_current(&self, target: PresentationTarget) -> bool {
         target.clock_generation == self.clock_generation
+    }
+
+    fn physical_predecessor_for(&self, target: PresentationTarget) -> PresentationTarget {
+        let Some(frontier) = self.primary_refresh_frontier(target) else {
+            return target;
+        };
+        PresentationTarget {
+            sequence: frontier.sequence,
+            presentation_time: frontier.presentation_time,
+            submit_not_before: frontier.presentation_time,
+            render_start_deadline: frontier.presentation_time,
+            refresh_interval: self.refresh_interval,
+            reason: PresentationTargetReason::Normal,
+            clock_generation: frontier.clock_generation,
+            estimated: false,
+            predicted_unreachable: false,
+        }
+    }
+
+    pub fn primary_refresh_frontier(
+        &self,
+        future_primary: PresentationTarget,
+    ) -> Option<PrimaryRefreshFrontier> {
+        if !self.is_current(future_primary) {
+            return None;
+        }
+        if future_primary.is_binding() {
+            return Some(PrimaryRefreshFrontier {
+                sequence: future_primary.sequence,
+                presentation_time: future_primary.presentation_time,
+                clock_generation: future_primary.clock_generation,
+            });
+        }
+        let presentation_time = self.last_presented_at?.checked_add(self.refresh_interval)?;
+        Some(PrimaryRefreshFrontier {
+            sequence: self.last_presented_sequence.saturating_add(1),
+            presentation_time,
+            clock_generation: self.clock_generation,
+        })
     }
 
     fn earliest_reachable(
@@ -697,7 +769,33 @@ mod tests {
         assert_eq!(target.render_start_deadline.get(), 75_000_000);
         assert_eq!(target.submit_not_before().get(), 75_000_000);
         assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
+        assert_eq!(target.authority(), PresentationTargetAuthority::Advisory);
+        assert!(!target.is_binding());
         assert_eq!(planner.scheduled_target(), None);
+    }
+
+    #[test]
+    fn advisory_reactive_target_uses_the_next_physical_refresh_as_frontier() {
+        let refresh = Duration::from_nanos(6_060_606);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+        planner.note_presented(presented_at);
+        let advisory = planner
+            .reactive_target(
+                MonotonicTimestampNs::new(1_000_500_000),
+                Duration::from_millis(17),
+            )
+            .unwrap();
+
+        assert_eq!(advisory.sequence, 4);
+        assert_eq!(
+            planner.primary_refresh_frontier(advisory),
+            Some(PrimaryRefreshFrontier {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(1_006_060_606),
+                clock_generation: 1,
+            })
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::super::planner::{
     plan_scheduled_target_for_budget, plan_scheduled_target_for_mode,
-    plan_visual_target_for_budget, visual_target_deadline_for_mode,
+    plan_visual_target_for_budget, reactive_or_commit_timing_target,
+    visual_target_deadline_for_mode,
 };
 use super::kms_worker::{
     ValidationBaseInvalidationDisposition, WorkerRejectionKind, direct_rejection_policy,
@@ -10,6 +11,7 @@ use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
 use crate::native_output::kms_worker::ValidationBaseInvalidationReason;
 use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::native::presentation_deadline::PresentationTargetAuthority;
 use oblivion_one::native::scheduler::apply_atomic_commit_lane_guard;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,6 +90,127 @@ fn reactive_double_never_schedules_a_normal_visual_target() {
 
     assert_eq!(target, None);
     assert_eq!(planner.scheduled_target(), None);
+}
+
+#[test]
+fn reactive_advisory_pending_target_does_not_reserve_a_false_o1_frontier() {
+    let refresh = Duration::from_nanos(6_060_606);
+    let physical_presented_at = MonotonicTimestampNs::new(1_000_000_000);
+    let now = MonotonicTimestampNs::new(1_000_500_000);
+    let mut planner = PresentationDeadlinePlanner::new(refresh);
+    assert_eq!(planner.note_presented(physical_presented_at), 1);
+
+    let reactive =
+        reactive_or_commit_timing_target(&planner, None, None, now, Duration::from_millis(17))
+            .expect("reactive target");
+    assert_eq!(reactive.reason, PresentationTargetReason::ReactiveDouble);
+    assert_eq!(reactive.authority(), PresentationTargetAuthority::Advisory);
+    assert_eq!(reactive.sequence, 4);
+
+    let successor = plan_visual_target_for_budget(
+        &mut planner,
+        true,
+        Some(reactive),
+        now,
+        Duration::from_millis(1),
+        true,
+        true,
+        false,
+        None,
+    )
+    .expect("O1 successor");
+
+    assert_eq!(
+        successor.sequence, 3,
+        "an advisory ReactiveDouble prediction must not reserve seq 4"
+    );
+    assert_eq!(
+        successor.presentation_time.get(),
+        physical_presented_at
+            .get()
+            .saturating_add(refresh.as_nanos() as u64 * 2)
+    );
+}
+
+#[test]
+fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
+    let refresh = Duration::from_nanos(6_060_606);
+    let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+    let mut physical_presented_at = presented_at;
+    let mut planner = PresentationDeadlinePlanner::new(refresh);
+    assert_eq!(planner.note_presented(presented_at), 1);
+
+    // The 17 ms prediction deliberately models conservative metadata while
+    // the actual service below is one millisecond and the callback reaction is
+    // 500 us.  The first frame is physically the next refresh even though its
+    // advisory target lands several intervals later.
+    let mut pending = reactive_or_commit_timing_target(
+        &planner,
+        None,
+        None,
+        MonotonicTimestampNs::new(presented_at.get() + 500_000),
+        Duration::from_millis(17),
+    )
+    .expect("initial callback-driven target");
+    assert_eq!(pending.authority(), PresentationTargetAuthority::Advisory);
+
+    let mut primary_intervals = Vec::new();
+    let mut expected_physical_sequence = 1;
+    let mut render_ahead_successes = 0;
+    for _ in 0..128 {
+        let callback_commit = MonotonicTimestampNs::new(physical_presented_at.get() + 500_000);
+        let successor = plan_visual_target_for_budget(
+            &mut planner,
+            true,
+            Some(pending),
+            callback_commit,
+            Duration::from_millis(1),
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("one-refresh O1 successor");
+        render_ahead_successes += 1;
+
+        physical_presented_at =
+            MonotonicTimestampNs::new(physical_presented_at.get() + refresh.as_nanos() as u64);
+        expected_physical_sequence += 1;
+        assert_eq!(
+            planner.note_presented(physical_presented_at),
+            expected_physical_sequence
+        );
+        primary_intervals.push(refresh.as_nanos() as u64);
+        assert_eq!(successor.sequence, expected_physical_sequence + 1);
+        assert!(successor.is_binding());
+        pending = successor;
+    }
+
+    assert_eq!(render_ahead_successes, 128);
+    assert!(
+        primary_intervals
+            .iter()
+            .all(|interval| *interval == 6_060_606)
+    );
+}
+
+#[test]
+fn genuinely_slow_render_keeps_a_later_opportunity_legitimate() {
+    let refresh = Duration::from_nanos(6_060_606);
+    let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+    let mut planner = PresentationDeadlinePlanner::new(refresh);
+    planner.note_presented(presented_at);
+
+    let target = planner
+        .reactive_target(
+            MonotonicTimestampNs::new(presented_at.get() + 500_000),
+            Duration::from_millis(8),
+        )
+        .expect("slow client target");
+
+    assert_eq!(target.authority(), PresentationTargetAuthority::Advisory);
+    assert_eq!(target.sequence, 3);
+    assert!(target.presentation_time.get() > presented_at.get() + 6_060_606);
 }
 
 #[test]
