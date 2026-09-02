@@ -1594,6 +1594,45 @@ mod tests {
             vec!["pre_read_probe", "native_epoch", "wayland_read"]
         );
     }
+
+    #[test]
+    fn pre_read_seam_performs_at_most_one_probe() {
+        let probe_count = std::cell::Cell::new(0);
+        let mut service_input = false;
+
+        let decision = promote_native_input_before_wayland_read(
+            true,
+            &mut service_input,
+            || {
+                probe_count.set(probe_count.get() + 1);
+                Ok::<bool, std::convert::Infallible>(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decision, NativePreReadInputDecision::PromoteInputEpoch);
+        assert!(service_input);
+        assert_eq!(probe_count.get(), 1);
+    }
+
+    #[test]
+    fn pre_read_seam_does_not_probe_input_owned_turns() {
+        let probe_count = std::cell::Cell::new(0);
+        let mut service_input = true;
+
+        let decision = promote_native_input_before_wayland_read(
+            true,
+            &mut service_input,
+            || {
+                probe_count.set(probe_count.get() + 1);
+                Ok::<bool, std::convert::Infallible>(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decision, NativePreReadInputDecision::NoGate);
+        assert_eq!(probe_count.get(), 0);
+    }
 }
 
 fn cursor_failure(
