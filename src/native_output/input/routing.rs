@@ -21,6 +21,43 @@ pub(crate) enum NativeInputEventFds<'a> {
     Raw(std::slice::Iter<'a, NativeInputDevice>),
 }
 
+fn poll_native_input_fds(poll_fds: &mut [libc::pollfd]) -> io::Result<bool> {
+    if poll_fds.is_empty() {
+        return Ok(false);
+    }
+
+    let ready = loop {
+        let result =
+            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, 0) };
+        if result >= 0 {
+            break result;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    };
+    if ready == 0 {
+        return Ok(false);
+    }
+
+    let terminal_events =
+        (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL | libc::POLLRDHUP) as libc::c_short;
+    let readable = libc::POLLIN as libc::c_short;
+    Ok(poll_fds
+        .iter()
+        .any(|poll_fd| poll_fd.revents & terminal_events == 0 && poll_fd.revents & readable != 0))
+}
+
+fn libinput_poll_fd(input: &::input::Libinput) -> libc::pollfd {
+    libc::pollfd {
+        fd: input.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
 impl Iterator for NativeInputEventFds<'_> {
     type Item = RawFd;
 
@@ -111,6 +148,18 @@ impl NativeInputBackend {
         }
     }
 
+    /// Query native input readiness without consulting or advancing the global
+    /// reactor's ready list.  The backend owns the exact input registrations,
+    /// so this is the semantic readiness authority for input gates.
+    pub(crate) fn ready_nonblocking(&mut self) -> io::Result<bool> {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.ready_nonblocking()
+            }
+            Self::RawEvdev(backend) => backend.ready_nonblocking(),
+        }
+    }
+
     pub(crate) fn suspend_for_session(&mut self) {
         match self {
             Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
@@ -170,6 +219,7 @@ impl NativeInputBackend {
 
 pub(crate) struct LibinputInputBackend {
     pub(crate) input: ::input::Libinput,
+    input_poll_fd: libc::pollfd,
     pub(crate) seat_name: String,
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
@@ -230,8 +280,10 @@ impl LibinputInputBackend {
         println!(
             "native input: libseat/libinput assigned {assigned_seat}, {device_count} device(s)"
         );
+        let input_poll_fd = libinput_poll_fd(&input);
         Ok(Self {
             input,
+            input_poll_fd,
             seat_name: assigned_seat,
             output_width,
             output_height,
@@ -253,8 +305,10 @@ impl LibinputInputBackend {
         input.dispatch()?;
         let device_count = drain_initial_libinput_device_events(&mut input);
         println!("native input: libinput assigned {seat_name}, {device_count} device(s)");
+        let input_poll_fd = libinput_poll_fd(&input);
         Ok(Self {
             input,
+            input_poll_fd,
             seat_name: seat_name.to_string(),
             output_width,
             output_height,
@@ -273,6 +327,13 @@ impl LibinputInputBackend {
             return false;
         }
         true
+    }
+
+    fn ready_nonblocking(&mut self) -> io::Result<bool> {
+        if self.suspended {
+            return Ok(false);
+        }
+        poll_native_input_fds(std::slice::from_mut(&mut self.input_poll_fd))
     }
 
     fn drain_epoch_chunk_into(&mut self, events: &mut Vec<NativeHardwareInputEvent>) -> bool {
@@ -858,9 +919,26 @@ pub(crate) struct NativeInputDevice {
 pub(crate) struct NativeInputDevices {
     pub(crate) devices: Vec<NativeInputDevice>,
     pub(crate) suspended: bool,
+    input_poll_fds: Vec<libc::pollfd>,
 }
 
 impl NativeInputDevices {
+    pub(crate) fn from_devices(devices: Vec<NativeInputDevice>, suspended: bool) -> Self {
+        let input_poll_fds = devices
+            .iter()
+            .map(|device| libc::pollfd {
+                fd: device.file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        Self {
+            devices,
+            suspended,
+            input_poll_fds,
+        }
+    }
+
     pub(crate) fn open_readable() -> Self {
         let mut devices = Vec::new();
         let mut denied_paths = Vec::new();
@@ -899,14 +977,18 @@ impl NativeInputDevices {
         } else {
             println!("native input: opened {} device(s)", devices.len());
         }
-        Self {
-            devices,
-            suspended: false,
-        }
+        Self::from_devices(devices, false)
     }
 
     pub(crate) fn begin_semantic_epoch(&mut self) -> bool {
         true
+    }
+
+    pub(crate) fn ready_nonblocking(&mut self) -> io::Result<bool> {
+        if self.suspended {
+            return Ok(false);
+        }
+        poll_native_input_fds(&mut self.input_poll_fds)
     }
 
     pub(crate) fn drain_epoch_chunk_into(

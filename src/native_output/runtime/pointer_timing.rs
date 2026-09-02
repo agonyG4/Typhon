@@ -35,6 +35,9 @@ pub(crate) struct NativePointerTimingBatch {
 pub(crate) struct NativePointerPreReadObservation {
     pub(crate) probe_performed: bool,
     pub(crate) input_promoted: bool,
+    pub(crate) pre_read_probe_at_ns: Option<u64>,
+    pub(crate) wayland_read_start_at_ns: Option<u64>,
+    pub(crate) wayland_read_end_at_ns: Option<u64>,
     pub(crate) batch: Option<NativePointerTimingBatch>,
 }
 
@@ -75,6 +78,7 @@ impl NativePointerTimingPhase {
 struct NativePointerTimingRecord {
     transition: Option<NativePointerTimingTransition>,
     routing_transition_committed_at_ns: u64,
+    pre_read_probe_at_ns: Option<u64>,
     reactor_wake_return_at_ns: Option<u64>,
     active_input_service_start_at_ns: Option<u64>,
     first_input_service_attempt_at_ns: Option<u64>,
@@ -185,10 +189,13 @@ impl NativePointerTimingTrace {
         self.records[slot] = Some(NativePointerTimingRecord {
             transition: Some(transition),
             routing_transition_committed_at_ns: at_ns,
+            pre_read_probe_at_ns: pre_read.pre_read_probe_at_ns,
             superseded_incomplete_transition_observations,
             pre_read_probe: pre_read.probe_performed,
             pre_read_input_promoted: pre_read.input_promoted,
             pre_transition_input: pre_read.batch,
+            wayland_read_start_at_ns: pre_read.wayland_read_start_at_ns,
+            wayland_read_end_at_ns: pre_read.wayland_read_end_at_ns,
             ..Default::default()
         });
         self.active_slot = Some(slot);
@@ -447,13 +454,22 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         record.wayland_read_start_at_ns,
         record.wayland_read_end_at_ns,
     );
+    let pre_read_probe_to_transition_ns = record
+        .pre_read_probe_at_ns
+        .map(|at| {
+            record
+                .routing_transition_committed_at_ns
+                .saturating_sub(at)
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
     let cursor_sync_duration_ns =
         format_duration(record.cursor_sync_start_at_ns, record.cursor_sync_end_at_ns);
     let reactor_wait_ns =
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} pre_read_probe_to_transition_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
         record.routing_transition_committed_at_ns,
         format_transition_duration(record.dispatch_return_at_ns, record),
         format_transition_duration(record.cycle_return_at_ns, record),
@@ -464,6 +480,7 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         libinput_dispatch_duration_ns,
         queue_drain_duration_ns,
         wayland_read_duration_ns,
+        pre_read_probe_to_transition_ns,
         cursor_sync_duration_ns,
         record.pre_read_probe,
         record.pre_read_input_promoted,
@@ -670,6 +687,7 @@ mod tests {
                 probe_performed: true,
                 input_promoted: true,
                 batch: Some(test_batch()),
+                ..Default::default()
             },
         );
 
@@ -679,5 +697,24 @@ mod tests {
         assert!(summary.contains("pre_transition_input_raw=28"));
         assert!(summary.contains("pre_transition_input_coalesced=1"));
         assert!(summary.contains("pre_transition_input_hw_span_us=26998"));
+    }
+
+    #[test]
+    fn timing_summary_carries_wayland_read_from_pre_transition_observation() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read(
+            test_transition(),
+            150,
+            NativePointerPreReadObservation {
+                pre_read_probe_at_ns: Some(100),
+                wayland_read_start_at_ns: Some(110),
+                wayland_read_end_at_ns: Some(130),
+                ..Default::default()
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("wayland_read_duration_ns=20"));
+        assert!(summary.contains("pre_read_probe_to_transition_ns=50"));
     }
 }

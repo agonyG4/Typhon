@@ -489,7 +489,7 @@ impl NativeRuntime {
         }
         let mut input_serviceable = false;
         let decision = guard.checkpoint_with_readiness(checkpoint, || {
-            let ready = self.event_loop.input_ready_nonblocking()?;
+            let ready = self.input_devices.ready_nonblocking()?;
             input_serviceable = ready;
             Ok::<bool, std::io::Error>(ready)
         })?;

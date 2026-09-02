@@ -572,49 +572,6 @@ impl NativeEventLoop {
         self.continuation_wakes
     }
 
-    /// Check only native input registrations without consuming any fd
-    /// readiness or changing the current wake snapshot.
-    pub fn input_ready_nonblocking(&mut self) -> io::Result<bool> {
-        let ready = retry_interrupted(|| {
-            let result = unsafe {
-                libc::epoll_wait(
-                    self.epoll.as_raw_fd(),
-                    self.events.as_mut_ptr(),
-                    self.events.len() as libc::c_int,
-                    0,
-                )
-            };
-            if result < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(result as usize)
-            }
-        })?;
-        let terminal_mask = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
-        for index in 0..ready {
-            let event = self.events[index];
-            if event.events & terminal_mask != 0 || event.events & libc::EPOLLIN as u32 == 0 {
-                continue;
-            }
-            let token = ReactorToken::from_raw(event.u64);
-            let Some((registration_index, generation)) = token.decode() else {
-                continue;
-            };
-            let Some(slot) = self.registrations.get(registration_index) else {
-                continue;
-            };
-            if slot.generation != generation {
-                continue;
-            }
-            if slot.registration.as_ref().is_some_and(|registration| {
-                matches!(registration.source, NativeEventSource::Input(_))
-            }) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub fn wait(&mut self) -> io::Result<NativeWakeup> {
         let wait_started_ns = monotonic_now_ns()?;
         let ready = retry_interrupted(|| {
@@ -1042,6 +999,30 @@ mod tests {
         assert_eq!(written as usize, std::mem::size_of::<u64>());
     }
 
+    fn bounded_global_batch_contains_input(sources: &[NativeEventSource]) -> bool {
+        sources
+            .iter()
+            .take(MAX_READY_EVENTS)
+            .any(|source| matches!(source, NativeEventSource::Input(_)))
+    }
+
+    #[test]
+    fn bounded_global_batch_cannot_answer_targeted_input_readiness() {
+        // Linux epoll may return a bounded prefix of a larger ready set and
+        // round-robin omitted registrations on the next wait.  This is a
+        // proof of insufficiency for a semantic input query, not a readiness
+        // ordering assertion about one particular kernel run.
+        let mut sources = vec![NativeEventSource::Drm; MAX_READY_EVENTS];
+        sources.push(NativeEventSource::Input(0));
+
+        assert!(!bounded_global_batch_contains_input(&sources));
+        assert!(
+            sources
+                .iter()
+                .any(|source| matches!(source, NativeEventSource::Input(_)))
+        );
+    }
+
     #[test]
     fn input_readiness_wakes_before_future_refresh_deadline() {
         let input = event_fd();
@@ -1058,73 +1039,6 @@ mod tests {
 
         assert!(wakeup.reasons.input());
         assert!(!wakeup.reasons.timer());
-    }
-
-    #[test]
-    fn input_readiness_checkpoint_is_nonconsuming_and_ignores_other_sources() {
-        let input = event_fd();
-        let control = event_fd();
-        let mut event_loop = NativeEventLoop::new().unwrap();
-        event_loop
-            .register(input.as_raw_fd(), NativeEventSource::Input(0))
-            .unwrap();
-        event_loop
-            .register(control.as_raw_fd(), NativeEventSource::ControlListener)
-            .unwrap();
-
-        assert!(!event_loop.input_ready_nonblocking().unwrap());
-        signal(control.as_raw_fd());
-        assert!(!event_loop.input_ready_nonblocking().unwrap());
-        signal(input.as_raw_fd());
-        assert!(event_loop.input_ready_nonblocking().unwrap());
-        assert!(event_loop.input_ready_nonblocking().unwrap());
-
-        let wakeup = event_loop.wait().unwrap();
-        assert!(wakeup.reasons.input());
-        assert!(wakeup.reasons.control());
-    }
-
-    #[test]
-    fn input_readiness_checkpoint_ignores_terminal_input_flags() {
-        let mut pipe = [0; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-        let mut event_loop = NativeEventLoop::new().unwrap();
-        event_loop
-            .register(read.as_raw_fd(), NativeEventSource::Input(0))
-            .unwrap();
-        drop(write);
-
-        assert!(!event_loop.input_ready_nonblocking().unwrap());
-    }
-
-    #[test]
-    fn input_readiness_checkpoint_preserves_drm_and_continuation_sources() {
-        let input = event_fd();
-        let drm = event_fd();
-        let mut event_loop = NativeEventLoop::new().unwrap();
-        event_loop
-            .register(input.as_raw_fd(), NativeEventSource::Input(0))
-            .unwrap();
-        event_loop
-            .register(drm.as_raw_fd(), NativeEventSource::Drm)
-            .unwrap();
-
-        event_loop
-            .request_continuation(NativeContinuationReason::AstreaPublication)
-            .unwrap();
-        signal(input.as_raw_fd());
-        signal(drm.as_raw_fd());
-
-        assert!(event_loop.input_ready_nonblocking().unwrap());
-        let wakeup = event_loop.wait().unwrap();
-        assert!(wakeup.reasons.input());
-        assert!(wakeup.reasons.drm());
-        assert!(wakeup.reasons.runtime_continuation());
     }
 
     #[test]

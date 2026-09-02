@@ -341,7 +341,7 @@ fn late_created_relative_pointer_receives_locked_motion() {
 }
 
 #[test]
-fn native_input_epoch_does_not_deliver_backlog_to_new_relative_pointer() {
+fn pre_read_native_input_epoch_keeps_old_delta_from_new_relative_pointer() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         relative_pointer: true,
@@ -403,6 +403,9 @@ fn native_input_epoch_does_not_deliver_backlog_to_new_relative_pointer() {
     );
     connection.flush().unwrap();
 
+    // This is the real-resource semantic-cut regression for the native
+    // Wayland-only pre-read promotion: the old delta is acquired before the
+    // client read is allowed to create the relative resource and lock.
     commands.send(ServerCommand::BeginNativeInputBatch).unwrap();
     wait_for_server_commands(&commands);
     commands
@@ -454,6 +457,11 @@ fn native_input_epoch_does_not_deliver_backlog_to_new_relative_pointer() {
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        capture_active_locked_pointer_anchor(&commands),
+        Some(anchor)
+    );
 
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();

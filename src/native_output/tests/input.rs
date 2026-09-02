@@ -50,13 +50,13 @@ fn raw_evdev_events_discarded_during_suspend_do_not_replay() {
     );
     let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
     let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let mut devices = NativeInputDevices {
-        devices: vec![NativeInputDevice {
+    let mut devices = NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
         }],
-        suspended: false,
-    };
+        false,
+    );
     let event = LinuxInputEvent {
         _time: libc::timeval {
             tv_sec: 0,
@@ -89,13 +89,13 @@ fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
     );
     let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
     let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
-        devices: vec![NativeInputDevice {
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
         }],
-        suspended: false,
-    });
+        false,
+    ));
 
     backend.suspend_for_session();
     let event = LinuxInputEvent {
@@ -120,6 +120,86 @@ fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
 }
 
 #[test]
+fn raw_backend_targeted_readiness_is_complete_and_nonconsuming() {
+    let mut first_pipe = [0; 2];
+    let mut second_pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(first_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pipe2(second_pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let first_read = unsafe { OwnedFd::from_raw_fd(first_pipe[0]) };
+    let first_write = unsafe { OwnedFd::from_raw_fd(first_pipe[1]) };
+    let second_read = unsafe { OwnedFd::from_raw_fd(second_pipe[0]) };
+    let second_write = unsafe { OwnedFd::from_raw_fd(second_pipe[1]) };
+    let second_write_fd = second_write.as_raw_fd();
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(
+        vec![
+            NativeInputDevice {
+                file: fs::File::from(first_read),
+                path: PathBuf::from("first-event"),
+            },
+            NativeInputDevice {
+                file: fs::File::from(second_read),
+                path: PathBuf::from("second-event"),
+            },
+        ],
+        false,
+    ));
+
+    assert!(!backend.ready_nonblocking().unwrap());
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_P,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            second_write_fd,
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+
+    assert!(backend.ready_nonblocking().unwrap());
+    assert!(backend.ready_nonblocking().unwrap());
+    assert_eq!(backend.drain_events().len(), 1);
+
+    drop(first_write);
+    assert!(!backend.ready_nonblocking().unwrap());
+
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_P,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            second_write_fd,
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+    assert!(backend.ready_nonblocking().unwrap());
+
+    backend.suspend_for_session();
+    assert!(!backend.ready_nonblocking().unwrap());
+}
+
+#[test]
 fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     let mut pipe = [0; 2];
     assert_eq!(
@@ -128,13 +208,13 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
     );
     let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
     let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
-        devices: vec![NativeInputDevice {
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(
+        vec![NativeInputDevice {
             file: fs::File::from(read),
             path: PathBuf::from("test-event"),
         }],
-        suspended: false,
-    });
+        false,
+    ));
     let events = vec![
         LinuxInputEvent {
             _time: libc::timeval {
@@ -170,10 +250,8 @@ fn raw_evdev_budget_reports_a_continuation_without_changing_event_storage() {
 
 #[test]
 fn raw_evdev_epoch_ingress_separates_begin_from_queue_drain() {
-    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
-        devices: Vec::new(),
-        suspended: false,
-    });
+    let mut backend =
+        NativeInputBackend::RawEvdev(NativeInputDevices::from_devices(Vec::new(), false));
     let mut batch = NativeInputBatch::default();
 
     assert!(backend.begin_semantic_epoch());

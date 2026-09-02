@@ -909,16 +909,27 @@ impl NativeRuntime {
             pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
         }
         let pre_read_probe_performed = dispatch_wayland && !service_input;
+        let pre_read_probe_at_ns = if pre_read_probe_performed && timing_enabled {
+            Some(monotonic_now_ns()?)
+        } else {
+            None
+        };
+        // A Wayland-only wake owns a final semantic arbitration cut here.
+        // Query the backend's exact input registrations rather than the
+        // bounded global reactor snapshot, which may omit a ready input
+        // source under unrelated-fd saturation.
         let pre_read_input_promoted = matches!(
             promote_native_input_before_wayland_read(dispatch_wayland, &mut service_input, || {
-                event_loop.input_ready_nonblocking()
+                input_devices.ready_nonblocking()
             },)?,
             NativePreReadInputDecision::PromoteInputEpoch
         );
         let mut pre_read_observation = NativePointerPreReadObservation {
             probe_performed: pre_read_probe_performed,
             input_promoted: pre_read_input_promoted,
+            pre_read_probe_at_ns,
             batch: None,
+            ..Default::default()
         };
         // A serviceable native input queue owns the semantic epoch.  Read-side
         // Wayland work is intentionally performed after that epoch so requests
@@ -931,7 +942,10 @@ impl NativeRuntime {
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
             if let Some(start_ns) = wayland_read_start_at_ns {
-                pointer_timing.record_wayland_read(start_ns, monotonic_now_ns()?);
+                let end_ns = monotonic_now_ns()?;
+                pointer_timing.record_wayland_read(start_ns, end_ns);
+                pre_read_observation.wayland_read_start_at_ns = Some(start_ns);
+                pre_read_observation.wayland_read_end_at_ns = Some(end_ns);
             }
             render_telemetry.resource_efficiency.record_client_flush();
             accepted = dispatch_accepted;
@@ -1222,7 +1236,10 @@ impl NativeRuntime {
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
             if let Some(start_ns) = wayland_read_start_at_ns {
-                pointer_timing.record_wayland_read(start_ns, monotonic_now_ns()?);
+                let end_ns = monotonic_now_ns()?;
+                pointer_timing.record_wayland_read(start_ns, end_ns);
+                pre_read_observation.wayland_read_start_at_ns = Some(start_ns);
+                pre_read_observation.wayland_read_end_at_ns = Some(end_ns);
             }
             accepted = dispatch_accepted;
             tick_us = elapsed_micros(tick_start);
