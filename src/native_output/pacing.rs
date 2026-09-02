@@ -405,9 +405,11 @@ mod tests {
     fn content_clock_summary_exposes_bounded_stage_and_attribution_metrics() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
-        let mut callback_metrics = oblivion_one::compositor::FrameCallbackMetrics::default();
-        callback_metrics.last_callback_admission_to_next_commit_ns = Some(500_000);
-        callback_metrics.callback_admission_to_next_commit_samples = 1;
+        let callback_metrics = oblivion_one::compositor::FrameCallbackMetrics {
+            last_callback_admission_to_next_commit_ns: Some(500_000),
+            callback_admission_to_next_commit_samples: 1,
+            ..Default::default()
+        };
         pacing.note_callback_metrics(callback_metrics, 6_060_606);
         pacing.note_explicit_present(ExplicitPresentationObservation {
             planned_sequence: 4,
@@ -448,6 +450,53 @@ mod tests {
         ] {
             assert!(summary.contains(field), "missing content field {field}");
         }
+    }
+
+    #[test]
+    fn content_cadence_attribution_distinguishes_client_target_and_stage_limits() {
+        let classify = |reaction_ns,
+                        selected_distance,
+                        target_feasible,
+                        render_missed,
+                        submit_missed,
+                        kms_slipped| {
+            classify_content_frame(
+                false,
+                reaction_ns,
+                2_000_000,
+                selected_distance,
+                1,
+                target_feasible,
+                render_missed,
+                submit_missed,
+                kms_slipped,
+            )
+        };
+
+        assert_eq!(
+            classify(Some(3_000_000), 1, false, false, false, false),
+            ContentCadenceAttribution::ClientLimited
+        );
+        assert_eq!(
+            classify(Some(500_000), 3, true, false, false, false),
+            ContentCadenceAttribution::TargetLimited
+        );
+        assert_eq!(
+            classify(Some(500_000), 1, false, true, false, false),
+            ContentCadenceAttribution::RenderLimited
+        );
+        assert_eq!(
+            classify(Some(500_000), 1, false, false, true, false),
+            ContentCadenceAttribution::SubmitLimited
+        );
+        assert_eq!(
+            classify(Some(500_000), 1, false, false, false, true),
+            ContentCadenceAttribution::KmsLimited
+        );
+        assert_eq!(
+            classify(Some(500_000), 1, false, false, false, false),
+            ContentCadenceAttribution::TargetHit
+        );
     }
 }
 use super::scanout::NativeScanoutBufferSnapshot;
@@ -703,6 +752,7 @@ impl ContentCadenceAttribution {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_content_frame(
     callback_handoff_limited: bool,
     callback_reaction_ns: Option<u64>,
