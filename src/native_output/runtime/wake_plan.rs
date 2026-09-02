@@ -34,6 +34,22 @@ pub(crate) enum NativeDeadlineOwner {
     DmabufRetry,
 }
 
+const DEADLINE_OWNER_COUNT: usize = 9;
+
+const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
+    match owner {
+        NativeDeadlineOwner::FrameScheduler => 0,
+        NativeDeadlineOwner::PresentationTarget => 1,
+        NativeDeadlineOwner::AtomicCommitWatchdog => 2,
+        NativeDeadlineOwner::ExplicitSyncFallback => 3,
+        NativeDeadlineOwner::XwaylandTimeout => 4,
+        NativeDeadlineOwner::CursorResponse => 5,
+        NativeDeadlineOwner::ControlTimeout => 6,
+        NativeDeadlineOwner::SurfacePacing => 7,
+        NativeDeadlineOwner::DmabufRetry => 8,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeDeadline {
     pub(crate) owner: NativeDeadlineOwner,
@@ -70,6 +86,8 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) runtime_timer_disarms: u64,
     pub(crate) stale_deadline_rearms: u64,
     pub(crate) past_deadline_arms: u64,
+    pub(crate) stale_deadline_arms_by_owner: [u64; DEADLINE_OWNER_COUNT],
+    pub(crate) past_deadline_arms_by_owner: [u64; DEADLINE_OWNER_COUNT],
     pub(crate) input_backlog_continuations: u64,
     pub(crate) astrea_publication_continuations: u64,
     pub(crate) commit_timing_planning_continuations: u64,
@@ -123,6 +141,9 @@ impl NativeWakeAuthorityMetrics {
                 self.runtime_timer_arms = self.runtime_timer_arms.saturating_add(1);
                 if deadline.at_ns <= now_ns {
                     self.past_deadline_arms = self.past_deadline_arms.saturating_add(1);
+                    let owner = deadline_owner_index(deadline.owner);
+                    self.past_deadline_arms_by_owner[owner] =
+                        self.past_deadline_arms_by_owner[owner].saturating_add(1);
                 }
                 if fired_deadline_ns
                     .or(previously_armed)
@@ -130,6 +151,9 @@ impl NativeWakeAuthorityMetrics {
                     && deadline.at_ns <= now_ns
                 {
                     self.stale_deadline_rearms = self.stale_deadline_rearms.saturating_add(1);
+                    let owner = deadline_owner_index(deadline.owner);
+                    self.stale_deadline_arms_by_owner[owner] =
+                        self.stale_deadline_arms_by_owner[owner].saturating_add(1);
                 }
                 match deadline.owner {
                     NativeDeadlineOwner::FrameScheduler => {
@@ -191,7 +215,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} stale_deadline_rearms={} past_deadline_arms={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -204,6 +228,42 @@ impl NativeWakeAuthorityMetrics {
             self.control_timeout_continuations,
             self.stale_deadline_rearms,
             self.past_deadline_arms,
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::FrameScheduler)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::PresentationTarget)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::AtomicCommitWatchdog)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ExplicitSyncFallback)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::XwaylandTimeout)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ControlTimeout)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::SurfacePacing)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::DmabufRetry)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::FrameScheduler)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::PresentationTarget)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::AtomicCommitWatchdog)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ExplicitSyncFallback)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::XwaylandTimeout)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ControlTimeout)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::SurfacePacing)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::DmabufRetry)],
             self.deadline_owner_frame_scheduler,
             self.deadline_owner_presentation_target,
             self.deadline_owner_atomic_watchdog,
@@ -497,6 +557,36 @@ mod tests {
 
         assert_eq!(metrics.stale_deadline_rearms, 1);
         assert_eq!(metrics.past_deadline_arms, 1);
+    }
+
+    #[test]
+    fn stale_and_past_deadline_arms_are_attributed_to_their_owner() {
+        let plan = NativeWakePlan {
+            deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorResponse,
+                at_ns: 5,
+            }),
+            ..NativeWakePlan::default()
+        };
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+
+        metrics.observe_plan(plan, 5, Some(5), None);
+
+        assert_eq!(
+            metrics.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
+            1
+        );
+        assert_eq!(
+            metrics.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::CursorResponse)],
+            1
+        );
+        assert_eq!(
+            metrics.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::PresentationTarget)],
+            0
+        );
     }
 
     #[test]
