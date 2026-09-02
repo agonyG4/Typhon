@@ -910,11 +910,9 @@ impl NativeRuntime {
         }
         let pre_read_probe_performed = dispatch_wayland && !service_input;
         let pre_read_input_promoted = matches!(
-            promote_native_input_before_wayland_read(
-                dispatch_wayland,
-                &mut service_input,
-                || event_loop.input_ready_nonblocking(),
-            )?,
+            promote_native_input_before_wayland_read(dispatch_wayland, &mut service_input, || {
+                event_loop.input_ready_nonblocking()
+            },)?,
             NativePreReadInputDecision::PromoteInputEpoch
         );
         let mut pre_read_observation = NativePointerPreReadObservation {
@@ -1296,12 +1294,11 @@ impl NativeRuntime {
         }
         if timing_enabled && let Some(transition) = final_settlement.routing_transition {
             let at_ns = monotonic_now_ns()?;
-            pointer_timing
-                .record_routing_transition_committed_with_pre_read(
-                    timing_transition(transition),
-                    at_ns,
-                    pre_read_observation,
-                );
+            pointer_timing.record_routing_transition_committed_with_pre_read(
+                timing_transition(transition),
+                at_ns,
+                pre_read_observation,
+            );
         }
         let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
         if let Err(error) =
@@ -1346,8 +1343,8 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_native_pre_read_input, input_requires_full_server_progression,
-        promote_native_input_before_wayland_read, NativePreReadInputDecision,
+        NativePreReadInputDecision, decide_native_pre_read_input,
+        input_requires_full_server_progression, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
 
@@ -1578,14 +1575,10 @@ mod tests {
         let mut order = Vec::new();
 
         assert_eq!(
-            promote_native_input_before_wayland_read(
-                true,
-                &mut service_input,
-                || {
-                    order.push("pre_read_probe");
-                    Ok::<bool, std::convert::Infallible>(true)
-                },
-            )
+            promote_native_input_before_wayland_read(true, &mut service_input, || {
+                order.push("pre_read_probe");
+                Ok::<bool, std::convert::Infallible>(true)
+            },)
             .unwrap(),
             NativePreReadInputDecision::PromoteInputEpoch
         );
@@ -1604,14 +1597,10 @@ mod tests {
         let probe_count = std::cell::Cell::new(0);
         let mut service_input = false;
 
-        let decision = promote_native_input_before_wayland_read(
-            true,
-            &mut service_input,
-            || {
-                probe_count.set(probe_count.get() + 1);
-                Ok::<bool, std::convert::Infallible>(true)
-            },
-        )
+        let decision = promote_native_input_before_wayland_read(true, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(true)
+        })
         .unwrap();
 
         assert_eq!(decision, NativePreReadInputDecision::PromoteInputEpoch);
@@ -1624,14 +1613,10 @@ mod tests {
         let probe_count = std::cell::Cell::new(0);
         let mut service_input = true;
 
-        let decision = promote_native_input_before_wayland_read(
-            true,
-            &mut service_input,
-            || {
-                probe_count.set(probe_count.get() + 1);
-                Ok::<bool, std::convert::Infallible>(true)
-            },
-        )
+        let decision = promote_native_input_before_wayland_read(true, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(true)
+        })
         .unwrap();
 
         assert_eq!(decision, NativePreReadInputDecision::NoGate);
@@ -1643,14 +1628,10 @@ mod tests {
         let probe_count = std::cell::Cell::new(0);
         let mut service_input = false;
 
-        let decision = promote_native_input_before_wayland_read(
-            false,
-            &mut service_input,
-            || {
-                probe_count.set(probe_count.get() + 1);
-                Ok::<bool, std::convert::Infallible>(true)
-            },
-        )
+        let decision = promote_native_input_before_wayland_read(false, &mut service_input, || {
+            probe_count.set(probe_count.get() + 1);
+            Ok::<bool, std::convert::Infallible>(true)
+        })
         .unwrap();
 
         assert_eq!(decision, NativePreReadInputDecision::NoGate);

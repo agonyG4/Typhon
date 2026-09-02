@@ -209,8 +209,7 @@ impl NativePointerTimingTrace {
             return;
         }
 
-        record.first_nonempty_input_service_start_at_ns =
-            record.active_input_service_start_at_ns;
+        record.first_nonempty_input_service_start_at_ns = record.active_input_service_start_at_ns;
         record.first_batch = Some(batch);
         record.first_batch_materialized_at_ns = Some(at_ns);
         record.complete = true;
@@ -225,7 +224,9 @@ impl NativePointerTimingTrace {
     pub(crate) fn record_input_service_start(&mut self, at_ns: u64) {
         self.set_record(|record| {
             record.active_input_service_start_at_ns = Some(at_ns);
-            record.first_input_service_attempt_at_ns.get_or_insert(at_ns);
+            record
+                .first_input_service_attempt_at_ns
+                .get_or_insert(at_ns);
         });
     }
 
