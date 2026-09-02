@@ -69,8 +69,10 @@ struct NativePointerTimingRecord {
     transition: Option<NativePointerTimingTransition>,
     routing_transition_committed_at_ns: u64,
     reactor_wake_return_at_ns: Option<u64>,
-    input_service_start_at_ns: Option<u64>,
-    input_service_end_at_ns: Option<u64>,
+    active_input_service_start_at_ns: Option<u64>,
+    first_input_service_attempt_at_ns: Option<u64>,
+    first_nonempty_input_service_start_at_ns: Option<u64>,
+    first_nonempty_input_service_end_at_ns: Option<u64>,
     libinput_dispatch_start_at_ns: Option<u64>,
     libinput_dispatch_end_at_ns: Option<u64>,
     queue_drain_start_at_ns: Option<u64>,
@@ -83,7 +85,6 @@ struct NativePointerTimingRecord {
     dispatch_return_at_ns: Option<u64>,
     cycle_return_at_ns: Option<u64>,
     next_reactor_wake_at_ns: Option<u64>,
-    next_input_service_at_ns: Option<u64>,
     phase_spans: [Option<(u64, u64)>; NativePointerTimingPhase::COUNT],
     checkpoint_count: u8,
     first_serviceable_checkpoint: Option<u8>,
@@ -182,6 +183,8 @@ impl NativePointerTimingTrace {
             return;
         }
 
+        record.first_nonempty_input_service_start_at_ns =
+            record.active_input_service_start_at_ns;
         record.first_batch = Some(batch);
         record.first_batch_materialized_at_ns = Some(at_ns);
         record.complete = true;
@@ -195,13 +198,20 @@ impl NativePointerTimingTrace {
 
     pub(crate) fn record_input_service_start(&mut self, at_ns: u64) {
         self.set_record(|record| {
-            record.input_service_start_at_ns.get_or_insert(at_ns);
-            record.next_input_service_at_ns.get_or_insert(at_ns);
+            record.active_input_service_start_at_ns = Some(at_ns);
+            record.first_input_service_attempt_at_ns.get_or_insert(at_ns);
         });
     }
 
     pub(crate) fn record_input_service_end(&mut self, at_ns: u64) {
-        self.set_record(|record| record.input_service_end_at_ns = Some(at_ns));
+        self.set_record(|record| {
+            if record.first_nonempty_input_service_start_at_ns.is_some()
+                && record.first_nonempty_input_service_end_at_ns.is_none()
+            {
+                record.first_nonempty_input_service_end_at_ns = Some(at_ns);
+            }
+            record.active_input_service_start_at_ns = None;
+        });
     }
 
     pub(crate) fn record_libinput_dispatch(&mut self, start_ns: u64, end_ns: u64) {
@@ -379,9 +389,9 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
             format!("{}:{duration}", phase.as_str())
         })
         .unwrap_or_else(|| "unknown".to_owned());
-    let input_service_duration_ns = format_duration(
-        record.input_service_start_at_ns,
-        record.input_service_end_at_ns,
+    let first_nonempty_input_service_duration_ns = format_duration(
+        record.first_nonempty_input_service_start_at_ns,
+        record.first_nonempty_input_service_end_at_ns,
     );
     let libinput_dispatch_duration_ns = format_duration(
         record.libinput_dispatch_start_at_ns,
@@ -399,14 +409,14 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_next_input_service_ns={} reactor_wait_ns={} input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
         record.routing_transition_committed_at_ns,
         format_transition_duration(record.dispatch_return_at_ns, record),
         format_transition_duration(record.cycle_return_at_ns, record),
         format_transition_duration(record.next_reactor_wake_at_ns, record),
-        format_transition_duration(record.next_input_service_at_ns, record),
+        format_transition_duration(record.first_input_service_attempt_at_ns, record),
         reactor_wait_ns,
-        input_service_duration_ns,
+        first_nonempty_input_service_duration_ns,
         libinput_dispatch_duration_ns,
         queue_drain_duration_ns,
         wayland_read_duration_ns,
@@ -516,8 +526,8 @@ mod tests {
 
         let record = trace.records[0].expect("active record");
         assert_eq!(record.next_reactor_wake_at_ns, Some(200));
-        assert_eq!(record.next_input_service_at_ns, Some(450));
-        assert_eq!(record.next_input_service_at_ns.unwrap() - 100, 350);
+        assert_eq!(record.first_input_service_attempt_at_ns, Some(450));
+        assert_eq!(record.first_input_service_attempt_at_ns.unwrap() - 100, 350);
     }
 
     #[test]
@@ -560,9 +570,9 @@ mod tests {
 
         let summary = format_summary(&trace.records[0].expect("completed record"));
         assert!(summary.contains("routing_transition_committed_at_ns=100"));
-        assert!(summary.contains("transition_to_next_input_service_ns=350"));
+        assert!(summary.contains("transition_to_first_input_service_attempt_ns=350"));
         assert!(summary.contains("transition_to_next_reactor_wake_ns=100"));
-        assert!(summary.contains("input_service_duration_ns=unknown"));
+        assert!(summary.contains("first_nonempty_input_service_duration_ns=unknown"));
         assert!(summary.contains("largest_phase=unknown"));
     }
 
@@ -582,5 +592,22 @@ mod tests {
 
         let summary = format_summary(&trace.records[0].expect("completed record"));
         assert!(summary.contains("hw_span_us=unknown"));
+    }
+
+    #[test]
+    fn timing_summary_separates_service_attempts() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed(test_transition(), 100);
+        trace.record_input_service_start(200);
+        trace.observe_first_batch(NativePointerTimingBatch::default(), 225);
+        trace.record_input_service_end(250);
+        trace.record_input_service_start(450);
+        trace.observe_first_batch(test_batch(), 475);
+        trace.record_input_service_end(500);
+
+        let summary = format_summary(&trace.records[0].expect("completed record"));
+        assert!(summary.contains("transition_to_first_input_service_attempt_ns=100"));
+        assert!(summary.contains("first_nonempty_input_service_duration_ns=50"));
+        assert!(!summary.contains(" input_service_duration_ns="));
     }
 }
