@@ -890,7 +890,12 @@ impl NativeRuntime {
                 input_epoch.backlog_pending(),
             )
         });
-        let initial_settlement_start = timing_enabled.then(capture_timing_point).transpose()?;
+        let initial_settlement_timing_enabled = timing_enabled
+            && input_epoch.constraint_settlement_allowed()
+            && pending_constraint_requests_before_settlement > 0;
+        let initial_settlement_start = initial_settlement_timing_enabled
+            .then(capture_timing_point)
+            .transpose()?;
         let initial_settlement = settle_native_pointer_constraint_backend_requests(
             input_epoch,
             server,
@@ -898,9 +903,11 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
             NativeInputConstraintSettlementPoint::BeforeInputEpoch,
-            timing_enabled,
+            initial_settlement_timing_enabled,
         )?;
-        let initial_settlement_end = timing_enabled.then(capture_timing_point).transpose()?;
+        let initial_settlement_end = initial_settlement_timing_enabled
+            .then(capture_timing_point)
+            .transpose()?;
         let mut redraw_requested = initial_settlement.redraw_requested;
         let mut routing_transition = initial_settlement.routing_transition;
         if timing_enabled && let Some(transition) = routing_transition {
@@ -1312,7 +1319,12 @@ impl NativeRuntime {
                 server.accepted_clients()
             );
         }
-        let final_settlement_start = timing_enabled.then(capture_timing_point).transpose()?;
+        let final_settlement_timing_enabled = timing_enabled
+            && input_epoch.constraint_settlement_allowed()
+            && server.pointer_constraint_backend_request_count() > 0;
+        let final_settlement_start = final_settlement_timing_enabled
+            .then(capture_timing_point)
+            .transpose()?;
         let final_settlement = settle_native_pointer_constraint_backend_requests(
             input_epoch,
             server,
@@ -1324,9 +1336,11 @@ impl NativeRuntime {
             } else {
                 NativeInputConstraintSettlementPoint::BeforeInputEpoch
             },
-            timing_enabled,
+            final_settlement_timing_enabled,
         )?;
-        let final_settlement_end = timing_enabled.then(capture_timing_point).transpose()?;
+        let final_settlement_end = final_settlement_timing_enabled
+            .then(capture_timing_point)
+            .transpose()?;
         pre_read_observation.constraint_settlement_start = final_settlement_start;
         pre_read_observation.constraint_settlement_end = final_settlement_end;
         pre_read_observation.constraint_activation_start = final_settlement.timing.activation_start;
