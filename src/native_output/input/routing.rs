@@ -1,5 +1,7 @@
 use super::*;
-use crate::native_output::runtime::NativePointerConstraintBackendAction;
+use crate::native_output::runtime::{
+    NativePointerConstraintBackendAction, NativePointerTimingPoint, capture_timing_point,
+};
 use ::input::AsRaw;
 use oblivion_one::compositor::InteractionUpdateOutcome;
 
@@ -1437,9 +1439,11 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     input_state: &mut NativeInputState,
     cursor_mode: NativeCursorRenderMode,
     settlement_point: NativeInputConstraintSettlementPoint,
+    timing_enabled: bool,
 ) -> NativeResult<NativePointerConstraintSettlementOutcome> {
     let mut redraw_requested = false;
     let mut routing_transition = None;
+    let mut timing = NativePointerConstraintSettlementTiming::default();
     loop {
         let requests = server.take_pointer_constraint_backend_requests();
         if requests.is_empty() {
@@ -1509,7 +1513,21 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                     }
                     PointerConstraintMode::None => input_state.clear_pointer_constraint(),
                 }
-                server.pointer_constraint_backend_activated_at(constraint.id, constraint.anchor);
+                let activation_start = timing_enabled.then(capture_timing_point).transpose()?;
+                server.pointer_constraint_backend_activated_state_at(
+                    constraint.id,
+                    constraint.anchor,
+                );
+                let activation_end = timing_enabled.then(capture_timing_point).transpose()?;
+                let flush_start = timing_enabled.then(capture_timing_point).transpose()?;
+                let _ = server.flush_wayland_clients();
+                let flush_end = timing_enabled.then(capture_timing_point).transpose()?;
+                if timing.activation_start.is_none() {
+                    timing.activation_start = activation_start;
+                    timing.activation_end = activation_end;
+                    timing.wayland_flush_start = flush_start;
+                    timing.wayland_flush_end = flush_end;
+                }
             }
             if let Some(restore_position) = action.restore_position {
                 native_pointer_debug_log_lazy(|| {
@@ -1553,6 +1571,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     Ok(NativePointerConstraintSettlementOutcome {
         redraw_requested,
         routing_transition,
+        timing,
     })
 }
 
@@ -1594,6 +1613,15 @@ pub(crate) enum NativeInputRoutingTransition {
 pub(crate) struct NativePointerConstraintSettlementOutcome {
     pub(crate) redraw_requested: bool,
     pub(crate) routing_transition: Option<NativeInputRoutingTransition>,
+    pub(crate) timing: NativePointerConstraintSettlementTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativePointerConstraintSettlementTiming {
+    pub(crate) activation_start: Option<NativePointerTimingPoint>,
+    pub(crate) activation_end: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_flush_start: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_flush_end: Option<NativePointerTimingPoint>,
 }
 
 pub(crate) fn pointer_constraint_activation_request_id(

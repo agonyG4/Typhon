@@ -71,9 +71,10 @@ pub(crate) use dmabuf_release::{
     dmabuf_gpu_release_safety,
 };
 use metrics::NativeRenderTelemetry;
-pub(super) use pointer_timing::{
+pub(crate) use pointer_timing::{
     NativePointerPreReadObservation, NativePointerTimingBatch, NativePointerTimingPhase,
-    NativePointerTimingTrace, NativePointerTimingTransition,
+    NativePointerTimingPoint, NativePointerTimingTrace, NativePointerTimingTransition,
+    capture_timing_point,
 };
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,

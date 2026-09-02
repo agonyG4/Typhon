@@ -1,4 +1,6 @@
-use std::sync::OnceLock;
+use std::{io, sync::OnceLock};
+
+use oblivion_one::native::event_loop::monotonic_now_ns;
 
 const TIMING_RING_CAPACITY: usize = 8;
 
@@ -32,12 +34,54 @@ pub(crate) struct NativePointerTimingBatch {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativePointerTimingPoint {
+    pub(crate) wall_ns: u64,
+    pub(crate) thread_cpu_ns: Option<u64>,
+}
+
+pub(crate) fn capture_timing_point() -> io::Result<NativePointerTimingPoint> {
+    Ok(NativePointerTimingPoint {
+        wall_ns: monotonic_now_ns()?,
+        thread_cpu_ns: thread_cpu_time_ns(),
+    })
+}
+
+pub(crate) fn thread_cpu_time_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } < 0 {
+            return None;
+        }
+        let seconds = u64::try_from(time.tv_sec).ok()?;
+        let nanoseconds = u64::try_from(time.tv_nsec).ok()?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NativePointerPreReadObservation {
     pub(crate) probe_performed: bool,
     pub(crate) input_promoted: bool,
-    pub(crate) pre_read_probe_at_ns: Option<u64>,
-    pub(crate) wayland_read_start_at_ns: Option<u64>,
-    pub(crate) wayland_read_end_at_ns: Option<u64>,
+    pub(crate) pre_read_probe_start: Option<NativePointerTimingPoint>,
+    pub(crate) pre_read_probe_end: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_read_start: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_read_end: Option<NativePointerTimingPoint>,
+    pub(crate) constraint_settlement_start: Option<NativePointerTimingPoint>,
+    pub(crate) constraint_settlement_end: Option<NativePointerTimingPoint>,
+    pub(crate) constraint_activation_start: Option<NativePointerTimingPoint>,
+    pub(crate) constraint_activation_end: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_flush_start: Option<NativePointerTimingPoint>,
+    pub(crate) wayland_flush_end: Option<NativePointerTimingPoint>,
     pub(crate) batch: Option<NativePointerTimingBatch>,
 }
 
@@ -78,7 +122,11 @@ impl NativePointerTimingPhase {
 struct NativePointerTimingRecord {
     transition: Option<NativePointerTimingTransition>,
     routing_transition_committed_at_ns: u64,
-    pre_read_probe_at_ns: Option<u64>,
+    routing_transition_thread_cpu_ns: Option<u64>,
+    pre_read_probe_start_at_ns: Option<u64>,
+    pre_read_probe_end_at_ns: Option<u64>,
+    pre_read_probe_start_thread_cpu_ns: Option<u64>,
+    pre_read_probe_end_thread_cpu_ns: Option<u64>,
     reactor_wake_return_at_ns: Option<u64>,
     active_input_service_start_at_ns: Option<u64>,
     first_input_service_attempt_at_ns: Option<u64>,
@@ -91,6 +139,20 @@ struct NativePointerTimingRecord {
     native_batch_materialized_at_ns: Option<u64>,
     wayland_read_start_at_ns: Option<u64>,
     wayland_read_end_at_ns: Option<u64>,
+    wayland_read_start_thread_cpu_ns: Option<u64>,
+    wayland_read_end_thread_cpu_ns: Option<u64>,
+    constraint_settlement_start_at_ns: Option<u64>,
+    constraint_settlement_end_at_ns: Option<u64>,
+    constraint_settlement_start_thread_cpu_ns: Option<u64>,
+    constraint_settlement_end_thread_cpu_ns: Option<u64>,
+    constraint_activation_start_at_ns: Option<u64>,
+    constraint_activation_end_at_ns: Option<u64>,
+    constraint_activation_start_thread_cpu_ns: Option<u64>,
+    constraint_activation_end_thread_cpu_ns: Option<u64>,
+    wayland_flush_start_at_ns: Option<u64>,
+    wayland_flush_end_at_ns: Option<u64>,
+    wayland_flush_start_thread_cpu_ns: Option<u64>,
+    wayland_flush_end_thread_cpu_ns: Option<u64>,
     cursor_sync_start_at_ns: Option<u64>,
     cursor_sync_end_at_ns: Option<u64>,
     dispatch_return_at_ns: Option<u64>,
@@ -150,22 +212,43 @@ impl NativePointerTimingTrace {
         self.enabled
     }
 
-    pub(crate) fn record_routing_transition_committed(
+    #[cfg(test)]
+    fn record_routing_transition_committed(
         &mut self,
         transition: NativePointerTimingTransition,
         at_ns: u64,
     ) {
-        self.record_routing_transition_committed_with_pre_read(
+        self.record_routing_transition_committed_with_pre_read_timed(
             transition,
-            at_ns,
+            NativePointerTimingPoint {
+                wall_ns: at_ns,
+                thread_cpu_ns: None,
+            },
             NativePointerPreReadObservation::default(),
         );
     }
 
-    pub(crate) fn record_routing_transition_committed_with_pre_read(
+    #[cfg(test)]
+    fn record_routing_transition_committed_with_pre_read(
         &mut self,
         transition: NativePointerTimingTransition,
         at_ns: u64,
+        pre_read: NativePointerPreReadObservation,
+    ) {
+        self.record_routing_transition_committed_with_pre_read_timed(
+            transition,
+            NativePointerTimingPoint {
+                wall_ns: at_ns,
+                thread_cpu_ns: None,
+            },
+            pre_read,
+        );
+    }
+
+    pub(crate) fn record_routing_transition_committed_with_pre_read_timed(
+        &mut self,
+        transition: NativePointerTimingTransition,
+        committed_at: NativePointerTimingPoint,
         pre_read: NativePointerPreReadObservation,
     ) {
         if !self.enabled {
@@ -188,14 +271,60 @@ impl NativePointerTimingTrace {
         self.next_slot = (slot + 1) % TIMING_RING_CAPACITY;
         self.records[slot] = Some(NativePointerTimingRecord {
             transition: Some(transition),
-            routing_transition_committed_at_ns: at_ns,
-            pre_read_probe_at_ns: pre_read.pre_read_probe_at_ns,
+            routing_transition_committed_at_ns: committed_at.wall_ns,
+            routing_transition_thread_cpu_ns: committed_at.thread_cpu_ns,
+            pre_read_probe_start_at_ns: pre_read.pre_read_probe_start.map(|point| point.wall_ns),
+            pre_read_probe_end_at_ns: pre_read.pre_read_probe_end.map(|point| point.wall_ns),
+            pre_read_probe_start_thread_cpu_ns: pre_read
+                .pre_read_probe_start
+                .and_then(|point| point.thread_cpu_ns),
+            pre_read_probe_end_thread_cpu_ns: pre_read
+                .pre_read_probe_end
+                .and_then(|point| point.thread_cpu_ns),
             superseded_incomplete_transition_observations,
             pre_read_probe: pre_read.probe_performed,
             pre_read_input_promoted: pre_read.input_promoted,
             pre_transition_input: pre_read.batch,
-            wayland_read_start_at_ns: pre_read.wayland_read_start_at_ns,
-            wayland_read_end_at_ns: pre_read.wayland_read_end_at_ns,
+            wayland_read_start_at_ns: pre_read.wayland_read_start.map(|point| point.wall_ns),
+            wayland_read_end_at_ns: pre_read.wayland_read_end.map(|point| point.wall_ns),
+            wayland_read_start_thread_cpu_ns: pre_read
+                .wayland_read_start
+                .and_then(|point| point.thread_cpu_ns),
+            wayland_read_end_thread_cpu_ns: pre_read
+                .wayland_read_end
+                .and_then(|point| point.thread_cpu_ns),
+            constraint_settlement_start_at_ns: pre_read
+                .constraint_settlement_start
+                .map(|point| point.wall_ns),
+            constraint_settlement_end_at_ns: pre_read
+                .constraint_settlement_end
+                .map(|point| point.wall_ns),
+            constraint_settlement_start_thread_cpu_ns: pre_read
+                .constraint_settlement_start
+                .and_then(|point| point.thread_cpu_ns),
+            constraint_settlement_end_thread_cpu_ns: pre_read
+                .constraint_settlement_end
+                .and_then(|point| point.thread_cpu_ns),
+            constraint_activation_start_at_ns: pre_read
+                .constraint_activation_start
+                .map(|point| point.wall_ns),
+            constraint_activation_end_at_ns: pre_read
+                .constraint_activation_end
+                .map(|point| point.wall_ns),
+            constraint_activation_start_thread_cpu_ns: pre_read
+                .constraint_activation_start
+                .and_then(|point| point.thread_cpu_ns),
+            constraint_activation_end_thread_cpu_ns: pre_read
+                .constraint_activation_end
+                .and_then(|point| point.thread_cpu_ns),
+            wayland_flush_start_at_ns: pre_read.wayland_flush_start.map(|point| point.wall_ns),
+            wayland_flush_end_at_ns: pre_read.wayland_flush_end.map(|point| point.wall_ns),
+            wayland_flush_start_thread_cpu_ns: pre_read
+                .wayland_flush_start
+                .and_then(|point| point.thread_cpu_ns),
+            wayland_flush_end_thread_cpu_ns: pre_read
+                .wayland_flush_end
+                .and_then(|point| point.thread_cpu_ns),
             ..Default::default()
         });
         self.active_slot = Some(slot);
@@ -264,13 +393,6 @@ impl NativePointerTimingTrace {
 
     pub(crate) fn record_native_batch_materialized(&mut self, at_ns: u64) {
         self.set_record(|record| record.native_batch_materialized_at_ns = Some(at_ns));
-    }
-
-    pub(crate) fn record_wayland_read(&mut self, start_ns: u64, end_ns: u64) {
-        self.set_record(|record| {
-            record.wayland_read_start_at_ns = Some(start_ns);
-            record.wayland_read_end_at_ns = Some(end_ns);
-        });
     }
 
     pub(crate) fn record_cursor_sync(&mut self, start_ns: u64, end_ns: u64) {
@@ -454,8 +576,68 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         record.wayland_read_start_at_ns,
         record.wayland_read_end_at_ns,
     );
+    let pre_read_probe_duration_ns = format_duration(
+        record.pre_read_probe_start_at_ns,
+        record.pre_read_probe_end_at_ns,
+    );
+    let pre_read_probe_thread_cpu_ns = format_duration(
+        record.pre_read_probe_start_thread_cpu_ns,
+        record.pre_read_probe_end_thread_cpu_ns,
+    );
+    let probe_end_to_wayland_read_start_ns = format_duration(
+        record.pre_read_probe_end_at_ns,
+        record.wayland_read_start_at_ns,
+    );
+    let probe_end_to_wayland_read_start_thread_cpu_ns = format_duration(
+        record.pre_read_probe_end_thread_cpu_ns,
+        record.wayland_read_start_thread_cpu_ns,
+    );
+    let wayland_read_thread_cpu_ns = format_duration(
+        record.wayland_read_start_thread_cpu_ns,
+        record.wayland_read_end_thread_cpu_ns,
+    );
+    let wayland_read_end_to_settlement_start_ns = format_duration(
+        record.wayland_read_end_at_ns,
+        record.constraint_settlement_start_at_ns,
+    );
+    let wayland_read_end_to_settlement_start_thread_cpu_ns = format_duration(
+        record.wayland_read_end_thread_cpu_ns,
+        record.constraint_settlement_start_thread_cpu_ns,
+    );
+    let constraint_settlement_duration_ns = format_duration(
+        record.constraint_settlement_start_at_ns,
+        record.constraint_settlement_end_at_ns,
+    );
+    let constraint_settlement_thread_cpu_ns = format_duration(
+        record.constraint_settlement_start_thread_cpu_ns,
+        record.constraint_settlement_end_thread_cpu_ns,
+    );
+    let constraint_activation_duration_ns = format_duration(
+        record.constraint_activation_start_at_ns,
+        record.constraint_activation_end_at_ns,
+    );
+    let constraint_activation_thread_cpu_ns = format_duration(
+        record.constraint_activation_start_thread_cpu_ns,
+        record.constraint_activation_end_thread_cpu_ns,
+    );
+    let wayland_flush_duration_ns = format_duration(
+        record.wayland_flush_start_at_ns,
+        record.wayland_flush_end_at_ns,
+    );
+    let wayland_flush_thread_cpu_ns = format_duration(
+        record.wayland_flush_start_thread_cpu_ns,
+        record.wayland_flush_end_thread_cpu_ns,
+    );
+    let settlement_end_to_transition_ns = format_duration(
+        record.constraint_settlement_end_at_ns,
+        Some(record.routing_transition_committed_at_ns),
+    );
+    let settlement_end_to_transition_thread_cpu_ns = format_duration(
+        record.constraint_settlement_end_thread_cpu_ns,
+        record.routing_transition_thread_cpu_ns,
+    );
     let pre_read_probe_to_transition_ns = record
-        .pre_read_probe_at_ns
+        .pre_read_probe_start_at_ns
         .map(|at| {
             record
                 .routing_transition_committed_at_ns
@@ -463,14 +645,22 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "unknown".to_owned());
+    let pre_read_probe_to_transition_thread_cpu_ns = format_duration(
+        record.pre_read_probe_start_thread_cpu_ns,
+        record.routing_transition_thread_cpu_ns,
+    );
     let cursor_sync_duration_ns =
         format_duration(record.cursor_sync_start_at_ns, record.cursor_sync_end_at_ns);
     let reactor_wait_ns =
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} pre_read_probe_to_transition_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} routing_transition_thread_cpu_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} wayland_read_thread_cpu_ns={} pre_read_probe_duration_ns={} pre_read_probe_thread_cpu_ns={} probe_end_to_wayland_read_start_ns={} probe_end_to_wayland_read_start_thread_cpu_ns={} wayland_read_end_to_settlement_start_ns={} wayland_read_end_to_settlement_start_thread_cpu_ns={} constraint_settlement_duration_ns={} constraint_settlement_thread_cpu_ns={} constraint_activation_duration_ns={} constraint_activation_thread_cpu_ns={} wayland_flush_duration_ns={} wayland_flush_thread_cpu_ns={} settlement_end_to_transition_ns={} settlement_end_to_transition_thread_cpu_ns={} pre_read_probe_to_transition_ns={} pre_read_probe_to_transition_thread_cpu_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
         record.routing_transition_committed_at_ns,
+        record
+            .routing_transition_thread_cpu_ns
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
         format_transition_duration(record.dispatch_return_at_ns, record),
         format_transition_duration(record.cycle_return_at_ns, record),
         format_transition_duration(record.next_reactor_wake_at_ns, record),
@@ -480,7 +670,23 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         libinput_dispatch_duration_ns,
         queue_drain_duration_ns,
         wayland_read_duration_ns,
+        wayland_read_thread_cpu_ns,
+        pre_read_probe_duration_ns,
+        pre_read_probe_thread_cpu_ns,
+        probe_end_to_wayland_read_start_ns,
+        probe_end_to_wayland_read_start_thread_cpu_ns,
+        wayland_read_end_to_settlement_start_ns,
+        wayland_read_end_to_settlement_start_thread_cpu_ns,
+        constraint_settlement_duration_ns,
+        constraint_settlement_thread_cpu_ns,
+        constraint_activation_duration_ns,
+        constraint_activation_thread_cpu_ns,
+        wayland_flush_duration_ns,
+        wayland_flush_thread_cpu_ns,
+        settlement_end_to_transition_ns,
+        settlement_end_to_transition_thread_cpu_ns,
         pre_read_probe_to_transition_ns,
+        pre_read_probe_to_transition_thread_cpu_ns,
         cursor_sync_duration_ns,
         record.pre_read_probe,
         record.pre_read_input_promoted,
@@ -639,6 +845,11 @@ mod tests {
         assert!(summary.contains("transition_to_first_input_service_attempt_ns=350"));
         assert!(summary.contains("transition_to_next_reactor_wake_ns=100"));
         assert!(summary.contains("first_nonempty_input_service_duration_ns=unknown"));
+        assert!(summary.contains("pre_read_probe_duration_ns=unknown"));
+        assert!(summary.contains("probe_end_to_wayland_read_start_ns=unknown"));
+        assert!(summary.contains("wayland_read_end_to_settlement_start_ns=unknown"));
+        assert!(summary.contains("constraint_settlement_duration_ns=unknown"));
+        assert!(summary.contains("wayland_flush_duration_ns=unknown"));
         assert!(summary.contains("largest_phase=unknown"));
     }
 
@@ -706,9 +917,18 @@ mod tests {
             test_transition(),
             150,
             NativePointerPreReadObservation {
-                pre_read_probe_at_ns: Some(100),
-                wayland_read_start_at_ns: Some(110),
-                wayland_read_end_at_ns: Some(130),
+                pre_read_probe_start: Some(NativePointerTimingPoint {
+                    wall_ns: 100,
+                    thread_cpu_ns: None,
+                }),
+                wayland_read_start: Some(NativePointerTimingPoint {
+                    wall_ns: 110,
+                    thread_cpu_ns: None,
+                }),
+                wayland_read_end: Some(NativePointerTimingPoint {
+                    wall_ns: 130,
+                    thread_cpu_ns: None,
+                }),
                 ..Default::default()
             },
         );
@@ -716,5 +936,116 @@ mod tests {
         let summary = format_summary(&trace.records[0].expect("active record"));
         assert!(summary.contains("wayland_read_duration_ns=20"));
         assert!(summary.contains("pre_read_probe_to_transition_ns=50"));
+    }
+
+    fn timing_point(wall_ns: u64, thread_cpu_ns: Option<u64>) -> NativePointerTimingPoint {
+        NativePointerTimingPoint {
+            wall_ns,
+            thread_cpu_ns,
+        }
+    }
+
+    #[test]
+    fn timing_summary_propagates_wall_and_thread_cpu_phase_durations() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read_timed(
+            test_transition(),
+            timing_point(220, Some(1_120)),
+            NativePointerPreReadObservation {
+                probe_performed: true,
+                pre_read_probe_start: Some(timing_point(110, Some(1_010))),
+                pre_read_probe_end: Some(timing_point(120, Some(1_020))),
+                wayland_read_start: Some(timing_point(130, Some(1_030))),
+                wayland_read_end: Some(timing_point(160, Some(1_060))),
+                constraint_settlement_start: Some(timing_point(170, Some(1_070))),
+                constraint_settlement_end: Some(timing_point(200, Some(1_100))),
+                constraint_activation_start: Some(timing_point(175, Some(1_075))),
+                constraint_activation_end: Some(timing_point(180, Some(1_080))),
+                wayland_flush_start: Some(timing_point(181, Some(1_081))),
+                wayland_flush_end: Some(timing_point(184, Some(1_084))),
+                ..Default::default()
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("pre_read_probe_duration_ns=10"));
+        assert!(summary.contains("pre_read_probe_thread_cpu_ns=10"));
+        assert!(summary.contains("probe_end_to_wayland_read_start_ns=10"));
+        assert!(summary.contains("probe_end_to_wayland_read_start_thread_cpu_ns=10"));
+        assert!(summary.contains("wayland_read_duration_ns=30"));
+        assert!(summary.contains("wayland_read_thread_cpu_ns=30"));
+        assert!(summary.contains("wayland_read_end_to_settlement_start_ns=10"));
+        assert!(summary.contains("wayland_read_end_to_settlement_start_thread_cpu_ns=10"));
+        assert!(summary.contains("constraint_settlement_duration_ns=30"));
+        assert!(summary.contains("constraint_settlement_thread_cpu_ns=30"));
+        assert!(summary.contains("constraint_activation_duration_ns=5"));
+        assert!(summary.contains("constraint_activation_thread_cpu_ns=5"));
+        assert!(summary.contains("wayland_flush_duration_ns=3"));
+        assert!(summary.contains("wayland_flush_thread_cpu_ns=3"));
+        assert!(summary.contains("settlement_end_to_transition_ns=20"));
+        assert!(summary.contains("settlement_end_to_transition_thread_cpu_ns=20"));
+        assert!(summary.contains("pre_read_probe_to_transition_ns=110"));
+        assert!(summary.contains("pre_read_probe_to_transition_thread_cpu_ns=110"));
+    }
+
+    #[test]
+    fn timing_summary_keeps_wall_durations_when_thread_cpu_is_unavailable() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read_timed(
+            test_transition(),
+            timing_point(220, None),
+            NativePointerPreReadObservation {
+                pre_read_probe_start: Some(timing_point(110, None)),
+                pre_read_probe_end: Some(timing_point(120, None)),
+                wayland_read_start: Some(timing_point(130, None)),
+                wayland_read_end: Some(timing_point(160, None)),
+                constraint_settlement_start: Some(timing_point(170, None)),
+                constraint_settlement_end: Some(timing_point(200, None)),
+                ..Default::default()
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("pre_read_probe_duration_ns=10"));
+        assert!(summary.contains("wayland_read_duration_ns=30"));
+        assert!(summary.contains("constraint_settlement_duration_ns=30"));
+        assert!(summary.contains("pre_read_probe_to_transition_ns=110"));
+        assert!(summary.contains("pre_read_probe_thread_cpu_ns=unknown"));
+        assert!(summary.contains("wayland_read_thread_cpu_ns=unknown"));
+        assert!(summary.contains("constraint_settlement_thread_cpu_ns=unknown"));
+        assert!(summary.contains("pre_read_probe_to_transition_thread_cpu_ns=unknown"));
+    }
+
+    #[test]
+    fn incomplete_timing_is_not_inherited_by_an_unrelated_transition() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read_timed(
+            test_transition(),
+            timing_point(220, Some(1_220)),
+            NativePointerPreReadObservation {
+                pre_read_probe_start: Some(timing_point(110, Some(1_110))),
+                wayland_read_start: Some(timing_point(130, Some(1_130))),
+                ..Default::default()
+            },
+        );
+        trace.record_routing_transition_committed(
+            NativePointerTimingTransition::LockedDeactivated,
+            300,
+        );
+
+        let summary = format_summary(&trace.records[1].expect("replacement record"));
+        assert!(summary.contains("pre_read_probe_duration_ns=unknown"));
+        assert!(summary.contains("wayland_read_duration_ns=unknown"));
+        assert!(summary.contains("constraint_settlement_duration_ns=unknown"));
+    }
+
+    #[test]
+    fn thread_cpu_clock_is_monotonic_when_available() {
+        let first = thread_cpu_time_ns();
+        let second = thread_cpu_time_ns();
+
+        if let (Some(first), Some(second)) = (first, second) {
+            assert!(second >= first);
+        }
     }
 }

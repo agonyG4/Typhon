@@ -64,6 +64,7 @@ use super::{
     CoreComplianceMetrics, DecorationRenderInstance, DirectScanoutFeedbackCapabilities,
     DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
+    FrameCallbackTimingEvidence,
     FramePacingProtocolCapabilities, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, InteractionUpdateOutcome, OutputPosition, OutputRect,
     PendingProcessLaunch, PointerAxisFrame, PresentationClock, PresentationProtocolCapabilities,
@@ -1319,8 +1320,17 @@ impl OwnCompositorServer {
             x: self.state.last_pointer_x,
             y: self.state.last_pointer_y,
         };
-        self.state.pointer_constraint_backend_activated(id, anchor);
+        self.pointer_constraint_backend_activated_state_at(id, anchor);
         let _ = self.flush_wayland_clients();
+    }
+
+    #[doc(hidden)]
+    pub fn pointer_constraint_backend_activated_state_at(
+        &mut self,
+        id: PointerConstraintBackendId,
+        anchor: OutputPosition,
+    ) {
+        self.state.pointer_constraint_backend_activated(id, anchor);
     }
 
     pub fn pointer_constraint_backend_activated_at(
@@ -1328,7 +1338,7 @@ impl OwnCompositorServer {
         id: PointerConstraintBackendId,
         anchor: OutputPosition,
     ) {
-        self.state.pointer_constraint_backend_activated(id, anchor);
+        self.pointer_constraint_backend_activated_state_at(id, anchor);
         let _ = self.flush_wayland_clients();
     }
 
@@ -1652,6 +1662,13 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn frame_callback_metrics(&self) -> FrameCallbackMetrics {
         self.state.frame_callback_metrics()
+    }
+
+    pub fn frame_callback_timing_for_batch(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> Option<FrameCallbackTimingEvidence> {
+        self.state.frame_callback_timing_for_batch(batch_id)
     }
 
     pub fn verbose_trace_dropped_entries(&self) -> u64 {

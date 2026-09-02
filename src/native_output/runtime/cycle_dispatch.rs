@@ -91,6 +91,7 @@ fn settle_native_pointer_constraint_backend_requests(
     input_state: &mut NativeInputState,
     cursor_mode: NativeCursorRenderMode,
     settlement_point: NativeInputConstraintSettlementPoint,
+    timing_enabled: bool,
 ) -> NativeResult<NativePointerConstraintSettlementOutcome> {
     if !input_epoch.constraint_settlement_allowed() {
         let pending = server.pointer_constraint_backend_request_count();
@@ -109,6 +110,7 @@ fn settle_native_pointer_constraint_backend_requests(
         input_state,
         cursor_mode,
         settlement_point,
+        timing_enabled,
     )
 }
 
@@ -888,6 +890,7 @@ impl NativeRuntime {
                 input_epoch.backlog_pending(),
             )
         });
+        let initial_settlement_start = timing_enabled.then(capture_timing_point).transpose()?;
         let initial_settlement = settle_native_pointer_constraint_backend_requests(
             input_epoch,
             server,
@@ -895,13 +898,25 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
             NativeInputConstraintSettlementPoint::BeforeInputEpoch,
+            timing_enabled,
         )?;
+        let initial_settlement_end = timing_enabled.then(capture_timing_point).transpose()?;
         let mut redraw_requested = initial_settlement.redraw_requested;
         let mut routing_transition = initial_settlement.routing_transition;
         if timing_enabled && let Some(transition) = routing_transition {
-            let at_ns = monotonic_now_ns()?;
-            pointer_timing
-                .record_routing_transition_committed(timing_transition(transition), at_ns);
+            pointer_timing.record_routing_transition_committed_with_pre_read_timed(
+                timing_transition(transition),
+                capture_timing_point()?,
+                NativePointerPreReadObservation {
+                    constraint_settlement_start: initial_settlement_start,
+                    constraint_settlement_end: initial_settlement_end,
+                    constraint_activation_start: initial_settlement.timing.activation_start,
+                    constraint_activation_end: initial_settlement.timing.activation_end,
+                    wayland_flush_start: initial_settlement.timing.wayland_flush_start,
+                    wayland_flush_end: initial_settlement.timing.wayland_flush_end,
+                    ..Default::default()
+                },
+            );
         }
         let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
         synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
@@ -909,8 +924,8 @@ impl NativeRuntime {
             pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
         }
         let pre_read_probe_performed = dispatch_wayland && !service_input;
-        let pre_read_probe_at_ns = if pre_read_probe_performed && timing_enabled {
-            Some(monotonic_now_ns()?)
+        let pre_read_probe_start = if pre_read_probe_performed && timing_enabled {
+            Some(capture_timing_point()?)
         } else {
             None
         };
@@ -924,10 +939,16 @@ impl NativeRuntime {
             },)?,
             NativePreReadInputDecision::PromoteInputEpoch
         );
+        let pre_read_probe_end = if pre_read_probe_performed && timing_enabled {
+            Some(capture_timing_point()?)
+        } else {
+            None
+        };
         let mut pre_read_observation = NativePointerPreReadObservation {
             probe_performed: pre_read_probe_performed,
             input_promoted: pre_read_input_promoted,
-            pre_read_probe_at_ns,
+            pre_read_probe_start,
+            pre_read_probe_end,
             batch: None,
             ..Default::default()
         };
@@ -937,15 +958,14 @@ impl NativeRuntime {
         let pending_constraint_requests_before_read =
             server.pointer_constraint_backend_request_count();
         if dispatch_wayland && !service_input {
-            let wayland_read_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+            let wayland_read_start = timing_enabled.then(capture_timing_point).transpose()?;
             let tick_start = Instant::now();
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
-            if let Some(start_ns) = wayland_read_start_at_ns {
-                let end_ns = monotonic_now_ns()?;
-                pointer_timing.record_wayland_read(start_ns, end_ns);
-                pre_read_observation.wayland_read_start_at_ns = Some(start_ns);
-                pre_read_observation.wayland_read_end_at_ns = Some(end_ns);
+            if wayland_read_start.is_some() {
+                let wayland_read_end = capture_timing_point()?;
+                pre_read_observation.wayland_read_start = wayland_read_start;
+                pre_read_observation.wayland_read_end = Some(wayland_read_end);
             }
             render_telemetry.resource_efficiency.record_client_flush();
             accepted = dispatch_accepted;
@@ -1230,16 +1250,15 @@ impl NativeRuntime {
             && !input_backlog_continuation
             && (dispatch_wayland || deferred_wayland_progression);
         if should_dispatch_after_input {
-            let wayland_read_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
+            let wayland_read_start = timing_enabled.then(capture_timing_point).transpose()?;
             let tick_start = Instant::now();
             let pending_before_read = server.pointer_constraint_backend_request_count();
             let (dispatch_accepted, dispatch_pacing_readiness_changed) =
                 server.dispatch_wayland_with_outcome()?;
-            if let Some(start_ns) = wayland_read_start_at_ns {
-                let end_ns = monotonic_now_ns()?;
-                pointer_timing.record_wayland_read(start_ns, end_ns);
-                pre_read_observation.wayland_read_start_at_ns = Some(start_ns);
-                pre_read_observation.wayland_read_end_at_ns = Some(end_ns);
+            if wayland_read_start.is_some() {
+                let wayland_read_end = capture_timing_point()?;
+                pre_read_observation.wayland_read_start = wayland_read_start;
+                pre_read_observation.wayland_read_end = Some(wayland_read_end);
             }
             accepted = dispatch_accepted;
             tick_us = elapsed_micros(tick_start);
@@ -1293,6 +1312,7 @@ impl NativeRuntime {
                 server.accepted_clients()
             );
         }
+        let final_settlement_start = timing_enabled.then(capture_timing_point).transpose()?;
         let final_settlement = settle_native_pointer_constraint_backend_requests(
             input_epoch,
             server,
@@ -1304,16 +1324,24 @@ impl NativeRuntime {
             } else {
                 NativeInputConstraintSettlementPoint::BeforeInputEpoch
             },
+            timing_enabled,
         )?;
+        let final_settlement_end = timing_enabled.then(capture_timing_point).transpose()?;
+        pre_read_observation.constraint_settlement_start = final_settlement_start;
+        pre_read_observation.constraint_settlement_end = final_settlement_end;
+        pre_read_observation.constraint_activation_start = final_settlement.timing.activation_start;
+        pre_read_observation.constraint_activation_end = final_settlement.timing.activation_end;
+        pre_read_observation.wayland_flush_start = final_settlement.timing.wayland_flush_start;
+        pre_read_observation.wayland_flush_end = final_settlement.timing.wayland_flush_end;
         redraw_requested |= final_settlement.redraw_requested;
         if routing_transition.is_none() {
             routing_transition = final_settlement.routing_transition;
         }
         if timing_enabled && let Some(transition) = final_settlement.routing_transition {
-            let at_ns = monotonic_now_ns()?;
-            pointer_timing.record_routing_transition_committed_with_pre_read(
+            let committed_at = capture_timing_point()?;
+            pointer_timing.record_routing_transition_committed_with_pre_read_timed(
                 timing_transition(transition),
-                at_ns,
+                committed_at,
                 pre_read_observation,
             );
         }
