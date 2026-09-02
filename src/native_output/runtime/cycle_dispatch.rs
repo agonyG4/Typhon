@@ -24,6 +24,43 @@ fn input_requires_full_server_progression(
     may_change_pointer_constraints && !dispatch_wayland
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePreReadInputDecision {
+    ReadWayland,
+    PromoteInputEpoch,
+    NoGate,
+}
+
+fn decide_native_pre_read_input(
+    dispatch_wayland: bool,
+    service_input: bool,
+    input_ready: bool,
+) -> NativePreReadInputDecision {
+    if !dispatch_wayland || service_input {
+        NativePreReadInputDecision::NoGate
+    } else if input_ready {
+        NativePreReadInputDecision::PromoteInputEpoch
+    } else {
+        NativePreReadInputDecision::ReadWayland
+    }
+}
+
+fn promote_native_input_before_wayland_read<E>(
+    dispatch_wayland: bool,
+    service_input: &mut bool,
+    input_ready: impl FnOnce() -> Result<bool, E>,
+) -> Result<NativePreReadInputDecision, E> {
+    if !dispatch_wayland || *service_input {
+        return Ok(NativePreReadInputDecision::NoGate);
+    }
+
+    let decision = decide_native_pre_read_input(dispatch_wayland, *service_input, input_ready()?);
+    if matches!(decision, NativePreReadInputDecision::PromoteInputEpoch) {
+        *service_input = true;
+    }
+    Ok(decision)
+}
+
 fn timing_transition(transition: NativeInputRoutingTransition) -> NativePointerTimingTransition {
     match transition {
         NativeInputRoutingTransition::LockedActivated(_) => {
@@ -778,9 +815,7 @@ impl NativeRuntime {
         service_input: bool,
         dispatch_wayland: bool,
     ) -> NativeResult<NativeWaylandInputDispatchOutcome> {
-        if service_input {
-            NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
-        }
+        let mut service_input = service_input;
         let xwayland_app_environment = self.xwayland.normal_app_environment();
         let perf = self.perf;
         let Self {
@@ -827,6 +862,8 @@ impl NativeRuntime {
             process_supervisor,
             render_telemetry,
             pointer_timing,
+            #[cfg(test)]
+            native_io_recorder,
             shutdown: _,
             session: _,
             ..
@@ -872,6 +909,14 @@ impl NativeRuntime {
         if let Some(start_ns) = cursor_sync_start_at_ns {
             pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
         }
+        let _pre_read_input_promoted = matches!(
+            promote_native_input_before_wayland_read(
+                dispatch_wayland,
+                &mut service_input,
+                || event_loop.input_ready_nonblocking(),
+            )?,
+            NativePreReadInputDecision::PromoteInputEpoch
+        );
         // A serviceable native input queue owns the semantic epoch.  Read-side
         // Wayland work is intentionally performed after that epoch so requests
         // that create or alter input resources cannot reinterpret its events.
@@ -905,6 +950,8 @@ impl NativeRuntime {
         let mut skipped_input_repaints = 0usize;
         let mut completed_input_epoch = None;
         if service_input {
+            #[cfg(test)]
+            native_io_recorder.record(NativeIoOperation::RawInputAction);
             if timing_enabled {
                 pointer_timing.record_input_service_start(monotonic_now_ns()?);
             }
@@ -1283,7 +1330,10 @@ impl NativeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::input_requires_full_server_progression;
+    use super::{
+        decide_native_pre_read_input, input_requires_full_server_progression,
+        promote_native_input_before_wayland_read, NativePreReadInputDecision,
+    };
     use crate::native_output::input::NativeInputEpoch;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1471,6 +1521,67 @@ mod tests {
     fn constraint_sensitive_input_keeps_its_narrow_follow_up() {
         assert!(input_requires_full_server_progression(false, true));
         assert!(!input_requires_full_server_progression(true, true));
+    }
+
+    #[test]
+    fn late_input_at_wayland_pre_read_cut_promotes_one_epoch_before_read() {
+        let mut order = Vec::new();
+
+        assert_eq!(
+            decide_native_pre_read_input(true, false, true),
+            NativePreReadInputDecision::PromoteInputEpoch,
+        );
+        order.push("pre_read_promote");
+        order.push("native_epoch");
+        order.push("wayland_read");
+
+        assert_eq!(
+            order,
+            vec!["pre_read_promote", "native_epoch", "wayland_read"]
+        );
+    }
+
+    #[test]
+    fn pre_read_gate_is_skipped_for_existing_input_ownership() {
+        assert_eq!(
+            decide_native_pre_read_input(true, true, true),
+            NativePreReadInputDecision::NoGate
+        );
+        assert_eq!(
+            decide_native_pre_read_input(false, true, true),
+            NativePreReadInputDecision::NoGate
+        );
+        assert_eq!(
+            decide_native_pre_read_input(true, false, false),
+            NativePreReadInputDecision::ReadWayland
+        );
+    }
+
+    #[test]
+    fn production_pre_read_seam_promotes_input_before_wayland_read() {
+        let mut service_input = false;
+        let mut order = Vec::new();
+
+        assert_eq!(
+            promote_native_input_before_wayland_read(
+                true,
+                &mut service_input,
+                || {
+                    order.push("pre_read_probe");
+                    Ok::<bool, std::convert::Infallible>(true)
+                },
+            )
+            .unwrap(),
+            NativePreReadInputDecision::PromoteInputEpoch
+        );
+        assert!(service_input);
+        order.push("native_epoch");
+        order.push("wayland_read");
+
+        assert_eq!(
+            order,
+            vec!["pre_read_probe", "native_epoch", "wayland_read"]
+        );
     }
 }
 
