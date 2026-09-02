@@ -15,7 +15,13 @@ The implementation commit is:
 017f15a native: decompose pointer transition timing
 ```
 
-The worktree already contained unrelated presentation/KMS/frame-callback edits and deleted historical reports. They were not staged or changed by this task. The report commit follows the implementation commit, so the implementation commit is the reproducible code ending point recorded above.
+The transition-local overhead tightening follow-up is:
+
+```text
+053a21f native: keep timing probes transition-local
+```
+
+The worktree already contained unrelated presentation/KMS/frame-callback edits and deleted historical reports. They were not staged or changed by this task. The report commit follows these implementation commits, so `053a21f` is the reproducible code ending point recorded above.
 
 This task is observability-only. It does not claim to fix the Sober/Roblox pointer jump.
 
@@ -86,7 +92,7 @@ The old direct Wayland-read update of the active timing record was removed. Read
 
 ## Observer neutrality
 
-When `TYPHON_POINTER_TIMING_TRACE` is disabled, the new capture calls are not executed. No per-motion clock, formatting, allocation, file write, or output was added. When enabled, the observer performs only a bounded number of point captures around transition-local phases and retains records in the existing fixed-capacity ring of eight entries. Summary output remains at most one compact `eprintln!` per completed transition; no per-motion diagnostics are used. Timing values never influence scheduling or semantic input decisions.
+When `TYPHON_POINTER_TIMING_TRACE` is disabled, the new capture calls are not executed. No per-motion clock, formatting, allocation, file write, or output was added. When enabled, settlement clocks are sampled only when a real pending settlement candidate exists; ordinary cycles with no candidate do not take the new phase clocks. The observer retains records in the existing fixed-capacity ring of eight entries. Summary output remains at most one compact `eprintln!` per completed transition; no per-motion diagnostics are used. Timing values never influence scheduling or semantic input decisions.
 
 ## TDD evidence
 
@@ -104,6 +110,8 @@ After implementation, the focused GREEN results were:
 * native event-loop tests: 34 passed;
 * relative/constraint integration tests: 38 passed;
 * backend-constraint focused tests: 12 passed.
+
+The transition-local overhead tightening was separately checked with pointer-timing tests and binary clippy; both passed.
 
 The new tests cover wall/CPU propagation, unknown CPU time with retained wall time, missing phase values, causal non-inheritance by an unrelated transition, and monotonic thread CPU readings when available. Existing disabled-trace, fixed-ring, service-time, empty-attempt, supersession, batch, and summary tests remain green.
 
