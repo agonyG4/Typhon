@@ -909,7 +909,8 @@ impl NativeRuntime {
         if let Some(start_ns) = cursor_sync_start_at_ns {
             pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
         }
-        let _pre_read_input_promoted = matches!(
+        let pre_read_probe_performed = dispatch_wayland && !service_input;
+        let pre_read_input_promoted = matches!(
             promote_native_input_before_wayland_read(
                 dispatch_wayland,
                 &mut service_input,
@@ -917,6 +918,11 @@ impl NativeRuntime {
             )?,
             NativePreReadInputDecision::PromoteInputEpoch
         );
+        let mut pre_read_observation = NativePointerPreReadObservation {
+            probe_performed: pre_read_probe_performed,
+            input_promoted: pre_read_input_promoted,
+            batch: None,
+        };
         // A serviceable native input queue owns the semantic epoch.  Read-side
         // Wayland work is intentionally performed after that epoch so requests
         // that create or alter input resources cannot reinterpret its events.
@@ -1042,16 +1048,17 @@ impl NativeRuntime {
                 .max();
             input_batch.coalesce_pointer_motion_events();
             coalesced_input_events = input_batch.coalesced.len();
+            let timing_batch = NativePointerTimingBatch {
+                raw_events: raw_input_events as u32,
+                coalesced_events: coalesced_input_events as u32,
+                oldest_hardware_timestamp_us: oldest_input_timestamp_usec,
+                newest_hardware_timestamp_us: newest_input_timestamp_usec,
+            };
             if timing_enabled {
-                pointer_timing.observe_first_batch(
-                    NativePointerTimingBatch {
-                        raw_events: raw_input_events as u32,
-                        coalesced_events: coalesced_input_events as u32,
-                        oldest_hardware_timestamp_us: oldest_input_timestamp_usec,
-                        newest_hardware_timestamp_us: newest_input_timestamp_usec,
-                    },
-                    monotonic_now_ns()?,
-                );
+                pointer_timing.observe_first_batch(timing_batch, monotonic_now_ns()?);
+                if pre_read_input_promoted {
+                    pre_read_observation.batch = Some(timing_batch);
+                }
             }
             native_pointer_debug_log_lazy(|| {
                 format!(
@@ -1286,7 +1293,11 @@ impl NativeRuntime {
         if timing_enabled && let Some(transition) = final_settlement.routing_transition {
             let at_ns = monotonic_now_ns()?;
             pointer_timing
-                .record_routing_transition_committed(timing_transition(transition), at_ns);
+                .record_routing_transition_committed_with_pre_read(
+                    timing_transition(transition),
+                    at_ns,
+                    pre_read_observation,
+                );
         }
         let cursor_sync_start_at_ns = timing_enabled.then(monotonic_now_ns).transpose()?;
         if let Err(error) =

@@ -72,8 +72,8 @@ pub(crate) use dmabuf_release::{
 };
 use metrics::NativeRenderTelemetry;
 pub(super) use pointer_timing::{
-    NativePointerTimingBatch, NativePointerTimingPhase, NativePointerTimingTrace,
-    NativePointerTimingTransition,
+    NativePointerPreReadObservation, NativePointerTimingBatch, NativePointerTimingPhase,
+    NativePointerTimingTrace, NativePointerTimingTransition,
 };
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,

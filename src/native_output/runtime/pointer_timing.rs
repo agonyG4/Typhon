@@ -31,6 +31,13 @@ pub(crate) struct NativePointerTimingBatch {
     pub(crate) newest_hardware_timestamp_us: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativePointerPreReadObservation {
+    pub(crate) probe_performed: bool,
+    pub(crate) input_promoted: bool,
+    pub(crate) batch: Option<NativePointerTimingBatch>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativePointerTimingPhase {
     SurfacePacing,
@@ -92,6 +99,9 @@ struct NativePointerTimingRecord {
     superseded_incomplete_transition_observations: u64,
     first_batch: Option<NativePointerTimingBatch>,
     first_batch_materialized_at_ns: Option<u64>,
+    pre_read_probe: bool,
+    pre_read_input_promoted: bool,
+    pre_transition_input: Option<NativePointerTimingBatch>,
     complete: bool,
     summary_emitted: bool,
 }
@@ -141,6 +151,19 @@ impl NativePointerTimingTrace {
         transition: NativePointerTimingTransition,
         at_ns: u64,
     ) {
+        self.record_routing_transition_committed_with_pre_read(
+            transition,
+            at_ns,
+            NativePointerPreReadObservation::default(),
+        );
+    }
+
+    pub(crate) fn record_routing_transition_committed_with_pre_read(
+        &mut self,
+        transition: NativePointerTimingTransition,
+        at_ns: u64,
+        pre_read: NativePointerPreReadObservation,
+    ) {
         if !self.enabled {
             return;
         }
@@ -163,6 +186,9 @@ impl NativePointerTimingTrace {
             transition: Some(transition),
             routing_transition_committed_at_ns: at_ns,
             superseded_incomplete_transition_observations,
+            pre_read_probe: pre_read.probe_performed,
+            pre_read_input_promoted: pre_read.input_promoted,
+            pre_transition_input: pre_read.batch,
             ..Default::default()
         });
         self.active_slot = Some(slot);
@@ -371,6 +397,23 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
     let hardware_timestamp_span_us = span_us
         .map(|span| span.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
+    let pre_transition_input_raw = record
+        .pre_transition_input
+        .map(|batch| batch.raw_events.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let pre_transition_input_coalesced = record
+        .pre_transition_input
+        .map(|batch| batch.coalesced_events.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let pre_transition_input_hw_span_us = record
+        .pre_transition_input
+        .and_then(|batch| {
+            batch
+                .oldest_hardware_timestamp_us
+                .zip(batch.newest_hardware_timestamp_us)
+                .map(|(oldest, newest)| newest.saturating_sub(oldest).to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
     let largest_phase = record
         .phase_spans
         .iter()
@@ -409,7 +452,7 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
         record.routing_transition_committed_at_ns,
         format_transition_duration(record.dispatch_return_at_ns, record),
         format_transition_duration(record.cycle_return_at_ns, record),
@@ -421,6 +464,11 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         queue_drain_duration_ns,
         wayland_read_duration_ns,
         cursor_sync_duration_ns,
+        record.pre_read_probe,
+        record.pre_read_input_promoted,
+        pre_transition_input_raw,
+        pre_transition_input_coalesced,
+        pre_transition_input_hw_span_us,
         batch.raw_events,
         batch.coalesced_events,
         hardware_timestamp_span_us,
@@ -609,5 +657,26 @@ mod tests {
         assert!(summary.contains("transition_to_first_input_service_attempt_ns=100"));
         assert!(summary.contains("first_nonempty_input_service_duration_ns=50"));
         assert!(!summary.contains(" input_service_duration_ns="));
+    }
+
+    #[test]
+    fn timing_summary_records_pre_read_input_promotion() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read(
+            test_transition(),
+            100,
+            NativePointerPreReadObservation {
+                probe_performed: true,
+                input_promoted: true,
+                batch: Some(test_batch()),
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("pre_read_probe=true"));
+        assert!(summary.contains("pre_read_input_promoted=true"));
+        assert!(summary.contains("pre_transition_input_raw=28"));
+        assert!(summary.contains("pre_transition_input_coalesced=1"));
+        assert!(summary.contains("pre_transition_input_hw_span_us=26998"));
     }
 }
