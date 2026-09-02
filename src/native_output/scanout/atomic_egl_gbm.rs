@@ -850,6 +850,7 @@ impl AtomicEglGbmScanout {
         // include protocol bookkeeping or diagnostics; everything after it is explicit
         // scene encoding, fence export, and GPU work owned by this output frame.
         let composite_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let callback_metrics = server.frame_callback_metrics();
         let mut gpu_sampling_started = false;
         let (
             render_outcome,
@@ -1077,6 +1078,9 @@ impl AtomicEglGbmScanout {
             composite_started_at,
             fence_exported_at: rendered_at,
             rendered_at,
+            client_commit_ns: callback_metrics.last_callback_commit_ns,
+            callback_reaction_ns: callback_metrics.last_callback_admission_to_next_commit_ns,
+            callback_admission_ns: callback_metrics.last_callback_admission_ns,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
@@ -1153,6 +1157,9 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             composite_started_at,
             rendered_at,
+            client_commit_ns,
+            callback_reaction_ns,
+            callback_admission_ns,
             o1_admission,
             ..
         } = completed.frame;
@@ -1187,6 +1194,9 @@ impl AtomicEglGbmScanout {
                 submit_returned_at: completed.submit_returned_at,
                 fence_signal,
                 o1_admission,
+                client_commit_ns,
+                callback_reaction_ns,
+                callback_admission_ns,
             },
             protocol_batch_id,
             surface_damage,
@@ -1411,6 +1421,9 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) rendered_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
+    pub(crate) client_commit_ns: Option<u64>,
+    pub(crate) callback_reaction_ns: Option<u64>,
+    pub(crate) callback_admission_ns: Option<u64>,
     pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }

@@ -152,6 +152,15 @@ pub(super) fn settle_direct_pageflip(
         submit_started_ns: submit_started_at.get(),
         submit_returned_ns: submit_returned_at.get(),
         reactive_double: target.reason == PresentationTargetReason::ReactiveDouble,
+        target_reason: target.reason,
+        previous_primary_sequence: None,
+        client_commit_ns: None,
+        callback_reaction_ns: None,
+        callback_admission_ns: None,
+        refresh_interval_ns: u64::try_from(target.refresh_interval.as_nanos()).unwrap_or(u64::MAX),
+        render_missed: false,
+        submit_missed: false,
+        kms_slipped: false,
     });
     *scheduled_presentation_target = None;
     Ok(())

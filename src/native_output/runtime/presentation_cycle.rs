@@ -305,6 +305,7 @@ impl NativeRuntime {
             refresh_interval,
             presentation_timing.apply_guard_ns(),
         );
+        frame_pacing.note_prediction(prediction);
         let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
         let pending_target = if explicit_output {
@@ -971,6 +972,10 @@ impl NativeRuntime {
                 );
                 *queued_redraw_requested = false;
             } else {
+                frame_pacing.note_callback_metrics(
+                    server.frame_callback_metrics(),
+                    refresh_interval.as_nanos().try_into().unwrap_or(u64::MAX),
+                );
                 frame_pacing.note_render_started(pacing_mode, render_ahead);
                 let render_observed_at_ns = monotonic_now_ns()?;
                 let render_begin_fields = build_render_begin_fields(

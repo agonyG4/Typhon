@@ -695,6 +695,7 @@ impl Drop for NativeRuntime {
                 self.frame_pacing
                     .summary_line(self.server.verbose_trace_dropped_entries())
             );
+            println!("{}", self.frame_pacing.content_summary_line());
             let transaction_counters = self.output_transactions.counters();
             println!(
                 "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} immediate_presentations_accepted={} immediate_presentations_finalized={} compatibility_noops={} compatibility_failures={} built_composited={} built_direct={} built_plane_delta={} submitted_composited={} submitted_direct={} submitted_plane_delta={} presented_composited={} presented_direct={} presented_plane_delta={}",

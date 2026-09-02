@@ -400,11 +400,62 @@ mod tests {
         assert_eq!(pacing.idle_intervals_excluded, 1);
         assert_eq!(timing.pageflip_interval, (6_061, 60_000, 60_000));
     }
+
+    #[test]
+    fn content_clock_summary_exposes_bounded_stage_and_attribution_metrics() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let mut callback_metrics = oblivion_one::compositor::FrameCallbackMetrics::default();
+        callback_metrics.last_callback_admission_to_next_commit_ns = Some(500_000);
+        callback_metrics.callback_admission_to_next_commit_samples = 1;
+        pacing.note_callback_metrics(callback_metrics, 6_060_606);
+        pacing.note_explicit_present(ExplicitPresentationObservation {
+            planned_sequence: 4,
+            actual_sequence: 2,
+            target_ns: 1_018_181_818,
+            presented_ns: 1_012_121_212,
+            composite_started_ns: 1_010_000_000,
+            rendered_ns: 1_011_000_000,
+            submit_started_ns: 1_011_100_000,
+            submit_returned_ns: 1_011_300_000,
+            reactive_double: true,
+            target_reason: oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
+            previous_primary_sequence: Some(1),
+            client_commit_ns: Some(1_009_500_000),
+            callback_reaction_ns: Some(500_000),
+            callback_admission_ns: None,
+            refresh_interval_ns: 6_060_606,
+            render_missed: false,
+            submit_missed: false,
+            kms_slipped: false,
+        });
+
+        let summary = pacing.content_summary_line();
+        for field in [
+            "event=native_content_frame_clock_summary",
+            "primary_present_interval_p50_us=0",
+            "callback_admission_to_next_commit_p50_us=500",
+            "client_commit_to_render_start_p50_us=500",
+            "render_start_to_ready_p50_us=1000",
+            "ready_to_submit_p50_us=100",
+            "submit_to_pageflip_p50_us=821",
+            "selected_target_distance_intervals_p50=3",
+            "actual_primary_distance_intervals_p50=1",
+            "reactive_target_late_by_intervals=1",
+            "fast_client_samples=1",
+            "content_attribution_target_limited=1",
+            "prediction_total_cost_ns=0",
+        ] {
+            assert!(summary.contains(field), "missing content field {field}");
+        }
+    }
 }
 use super::scanout::NativeScanoutBufferSnapshot;
+use oblivion_one::compositor::FrameCallbackMetrics;
 use oblivion_one::native::adaptive_buffering::{
-    AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss,
+    AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss, RenderPrediction,
 };
+use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 use oblivion_one::native::scheduler::{
     NativeOutputPacingMode, PipelineWaitReason, SchedulerDecision,
 };
@@ -625,6 +676,60 @@ pub(crate) fn frame_id_field(frame_id: Option<NativeOutputFrameId>) -> PacingFie
 const PACING_SAMPLE_CAPACITY: usize = 4096;
 const TARGET_TIMESTAMP_TOLERANCE_NS: u64 = 100_000;
 const TRACE_QUEUE_CAPACITY: usize = 2_048;
+const CONTENT_ATTRIBUTION_COUNT: usize = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentCadenceAttribution {
+    CallbackHandoffLimited,
+    ClientLimited,
+    TargetLimited,
+    RenderLimited,
+    SubmitLimited,
+    KmsLimited,
+    TargetHit,
+}
+
+impl ContentCadenceAttribution {
+    const fn index(self) -> usize {
+        match self {
+            Self::CallbackHandoffLimited => 0,
+            Self::ClientLimited => 1,
+            Self::TargetLimited => 2,
+            Self::RenderLimited => 3,
+            Self::SubmitLimited => 4,
+            Self::KmsLimited => 5,
+            Self::TargetHit => 6,
+        }
+    }
+}
+
+pub(crate) fn classify_content_frame(
+    callback_handoff_limited: bool,
+    callback_reaction_ns: Option<u64>,
+    fast_client_threshold_ns: u64,
+    selected_target_distance: u64,
+    actual_primary_distance: u64,
+    target_was_feasible: bool,
+    render_missed: bool,
+    submit_missed: bool,
+    kms_slipped: bool,
+) -> ContentCadenceAttribution {
+    if callback_handoff_limited {
+        ContentCadenceAttribution::CallbackHandoffLimited
+    } else if callback_reaction_ns.is_some_and(|reaction| reaction > fast_client_threshold_ns) {
+        ContentCadenceAttribution::ClientLimited
+    } else if target_was_feasible && selected_target_distance > 1 && actual_primary_distance == 1 {
+        ContentCadenceAttribution::TargetLimited
+    } else if render_missed {
+        ContentCadenceAttribution::RenderLimited
+    } else if submit_missed {
+        ContentCadenceAttribution::SubmitLimited
+    } else if kms_slipped {
+        ContentCadenceAttribution::KmsLimited
+    } else {
+        ContentCadenceAttribution::TargetHit
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct WorkerPacingReservation {
@@ -720,6 +825,23 @@ pub(crate) struct NativeFramePacing {
     pageflip_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     active_pageflip_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     commit_to_present: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    callback_admission_to_next_commit: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    client_commit_to_render_start: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    render_start_to_ready: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    ready_to_submit: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    submit_to_pageflip: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    selected_target_distance_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    actual_primary_distance_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    reactive_target_early_by_intervals: u64,
+    predictive_target_early_by_intervals: u64,
+    reactive_target_late_by_intervals: u64,
+    predictive_target_late_by_intervals: u64,
+    fast_client_samples: u64,
+    slow_client_samples: u64,
+    content_attribution: [u64; CONTENT_ATTRIBUTION_COUNT],
+    last_callback_reaction_sample_count: u64,
+    last_prediction: Option<RenderPrediction>,
+    last_primary_sequence: Option<u64>,
     misses: RefreshMissBuckets,
     last_pageflip_ns: Option<u64>,
     idle_intervals_excluded: u64,
@@ -741,6 +863,15 @@ pub(crate) struct ExplicitPresentationObservation {
     pub(crate) submit_started_ns: u64,
     pub(crate) submit_returned_ns: u64,
     pub(crate) reactive_double: bool,
+    pub(crate) target_reason: PresentationTargetReason,
+    pub(crate) previous_primary_sequence: Option<u64>,
+    pub(crate) client_commit_ns: Option<u64>,
+    pub(crate) callback_reaction_ns: Option<u64>,
+    pub(crate) callback_admission_ns: Option<u64>,
+    pub(crate) refresh_interval_ns: u64,
+    pub(crate) render_missed: bool,
+    pub(crate) submit_missed: bool,
+    pub(crate) kms_slipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -838,6 +969,23 @@ impl NativeFramePacing {
             pageflip_intervals: BoundedSamples::default(),
             active_pageflip_intervals: BoundedSamples::default(),
             commit_to_present: BoundedSamples::default(),
+            callback_admission_to_next_commit: BoundedSamples::default(),
+            client_commit_to_render_start: BoundedSamples::default(),
+            render_start_to_ready: BoundedSamples::default(),
+            ready_to_submit: BoundedSamples::default(),
+            submit_to_pageflip: BoundedSamples::default(),
+            selected_target_distance_intervals: BoundedSamples::default(),
+            actual_primary_distance_intervals: BoundedSamples::default(),
+            reactive_target_early_by_intervals: 0,
+            predictive_target_early_by_intervals: 0,
+            reactive_target_late_by_intervals: 0,
+            predictive_target_late_by_intervals: 0,
+            fast_client_samples: 0,
+            slow_client_samples: 0,
+            content_attribution: [0; CONTENT_ATTRIBUTION_COUNT],
+            last_callback_reaction_sample_count: 0,
+            last_prediction: None,
+            last_primary_sequence: None,
             misses: RefreshMissBuckets::default(),
             last_pageflip_ns: None,
             idle_intervals_excluded: 0,
@@ -874,6 +1022,38 @@ impl NativeFramePacing {
     pub(crate) fn log(&self, event: &str, fields: Vec<PacingField>) {
         if let Some(trace) = &self.trace {
             trace.send(pacing_line(event, &fields));
+        }
+    }
+
+    pub(crate) fn note_prediction(&mut self, prediction: RenderPrediction) {
+        if self.enabled {
+            self.last_prediction = Some(prediction);
+        }
+    }
+
+    pub(crate) fn note_callback_metrics(
+        &mut self,
+        metrics: FrameCallbackMetrics,
+        refresh_interval_ns: u64,
+    ) {
+        if !self.enabled
+            || metrics.callback_admission_to_next_commit_samples
+                <= self.last_callback_reaction_sample_count
+        {
+            return;
+        }
+        self.last_callback_reaction_sample_count =
+            metrics.callback_admission_to_next_commit_samples;
+        let Some(reaction_ns) = metrics.last_callback_admission_to_next_commit_ns else {
+            return;
+        };
+        self.callback_admission_to_next_commit
+            .record(reaction_ns / 1_000);
+        let fast_threshold_ns = (refresh_interval_ns / 2).min(2_000_000);
+        if reaction_ns <= fast_threshold_ns {
+            self.fast_client_samples = self.fast_client_samples.saturating_add(1);
+        } else {
+            self.slow_client_samples = self.slow_client_samples.saturating_add(1);
         }
     }
     pub(crate) fn note_render_started(
@@ -1215,6 +1395,105 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
+        let refresh_interval_ns = observation.refresh_interval_ns.max(1);
+        let previous_primary_sequence = observation
+            .previous_primary_sequence
+            .or(self.last_primary_sequence);
+        let selected_target_distance = previous_primary_sequence
+            .map(|previous| observation.planned_sequence.saturating_sub(previous))
+            .unwrap_or_default();
+        let actual_primary_distance = previous_primary_sequence
+            .map(|previous| observation.actual_sequence.saturating_sub(previous))
+            .unwrap_or_default();
+        if previous_primary_sequence.is_some() {
+            self.selected_target_distance_intervals
+                .record(selected_target_distance);
+            self.actual_primary_distance_intervals
+                .record(actual_primary_distance);
+        }
+        self.last_primary_sequence = Some(observation.actual_sequence);
+        if let Some(client_commit_ns) = observation.client_commit_ns
+            && observation.composite_started_ns >= client_commit_ns
+        {
+            self.client_commit_to_render_start.record(
+                observation
+                    .composite_started_ns
+                    .saturating_sub(client_commit_ns)
+                    / 1_000,
+            );
+        }
+        self.render_start_to_ready.record(
+            observation
+                .rendered_ns
+                .saturating_sub(observation.composite_started_ns)
+                / 1_000,
+        );
+        self.ready_to_submit.record(
+            observation
+                .submit_started_ns
+                .saturating_sub(observation.rendered_ns)
+                / 1_000,
+        );
+        self.submit_to_pageflip.record(
+            observation
+                .presented_ns
+                .saturating_sub(observation.submit_returned_ns)
+                / 1_000,
+        );
+        let target_distance = observation
+            .target_ns
+            .abs_diff(observation.presented_ns)
+            .div_ceil(refresh_interval_ns);
+        let target_is_early = observation.target_ns <= observation.presented_ns;
+        match (observation.target_reason, target_is_early) {
+            (PresentationTargetReason::ReactiveDouble, true) => {
+                self.reactive_target_early_by_intervals = self
+                    .reactive_target_early_by_intervals
+                    .saturating_add(target_distance);
+            }
+            (PresentationTargetReason::ReactiveDouble, false) => {
+                self.reactive_target_late_by_intervals = self
+                    .reactive_target_late_by_intervals
+                    .saturating_add(target_distance);
+            }
+            (_, true) => {
+                self.predictive_target_early_by_intervals = self
+                    .predictive_target_early_by_intervals
+                    .saturating_add(target_distance);
+            }
+            (_, false) => {
+                self.predictive_target_late_by_intervals = self
+                    .predictive_target_late_by_intervals
+                    .saturating_add(target_distance);
+            }
+        }
+        let target_was_feasible = selected_target_distance > 1 && actual_primary_distance == 1;
+        let fast_client_threshold_ns = (refresh_interval_ns / 2).min(2_000_000);
+        let callback_handoff_limited = observation
+            .callback_admission_ns
+            .zip(observation.client_commit_ns)
+            .zip(self.last_pageflip_ns)
+            .is_some_and(|((admission_ns, commit_ns), previous_pageflip_ns)| {
+                admission_ns >= previous_pageflip_ns.saturating_add(refresh_interval_ns)
+                    && commit_ns > previous_pageflip_ns.saturating_add(refresh_interval_ns)
+                    && observation
+                        .callback_reaction_ns
+                        .is_some_and(|reaction| reaction <= fast_client_threshold_ns)
+            });
+        let attribution = classify_content_frame(
+            callback_handoff_limited,
+            observation.callback_reaction_ns,
+            fast_client_threshold_ns,
+            selected_target_distance,
+            actual_primary_distance,
+            target_was_feasible,
+            observation.render_missed,
+            observation.submit_missed,
+            observation.kms_slipped,
+        );
+        let attribution_index = attribution.index();
+        self.content_attribution[attribution_index] =
+            self.content_attribution[attribution_index].saturating_add(1);
         let signed_error_ns = if observation.presented_ns >= observation.target_ns {
             i64::try_from(
                 observation
@@ -1352,6 +1631,160 @@ impl NativeFramePacing {
             missed_refresh_2x: self.misses.missed_2x,
             missed_refresh_3x_or_more: self.misses.missed_3x_or_more,
         }
+    }
+
+    pub(crate) fn content_summary_line(&self) -> String {
+        let (primary50, primary95, primary99) = self.active_pageflip_intervals.percentiles();
+        let (callback50, callback95, callback99) =
+            self.callback_admission_to_next_commit.percentiles();
+        let (client50, client95, client99) = self.client_commit_to_render_start.percentiles();
+        let (render50, render95, render99) = self.render_start_to_ready.percentiles();
+        let (ready50, ready95, ready99) = self.ready_to_submit.percentiles();
+        let (submit50, submit95, submit99) = self.submit_to_pageflip.percentiles();
+        let (selected50, selected95, selected99) =
+            self.selected_target_distance_intervals.percentiles();
+        let (actual50, actual95, actual99) = self.actual_primary_distance_intervals.percentiles();
+        let prediction = self.last_prediction;
+        pacing_line(
+            "native_content_frame_clock_summary",
+            &[
+                PacingField::u64("primary_present_interval_p50_us", primary50),
+                PacingField::u64("primary_present_interval_p95_us", primary95),
+                PacingField::u64("primary_present_interval_p99_us", primary99),
+                PacingField::u64("callback_admission_to_next_commit_p50_us", callback50),
+                PacingField::u64("callback_admission_to_next_commit_p95_us", callback95),
+                PacingField::u64("callback_admission_to_next_commit_p99_us", callback99),
+                PacingField::u64("client_commit_to_render_start_p50_us", client50),
+                PacingField::u64("client_commit_to_render_start_p95_us", client95),
+                PacingField::u64("client_commit_to_render_start_p99_us", client99),
+                PacingField::u64("render_start_to_ready_p50_us", render50),
+                PacingField::u64("render_start_to_ready_p95_us", render95),
+                PacingField::u64("render_start_to_ready_p99_us", render99),
+                PacingField::u64("ready_to_submit_p50_us", ready50),
+                PacingField::u64("ready_to_submit_p95_us", ready95),
+                PacingField::u64("ready_to_submit_p99_us", ready99),
+                PacingField::u64("submit_to_pageflip_p50_us", submit50),
+                PacingField::u64("submit_to_pageflip_p95_us", submit95),
+                PacingField::u64("submit_to_pageflip_p99_us", submit99),
+                PacingField::u64("selected_target_distance_intervals_p50", selected50),
+                PacingField::u64("selected_target_distance_intervals_p95", selected95),
+                PacingField::u64("selected_target_distance_intervals_p99", selected99),
+                PacingField::u64("actual_primary_distance_intervals_p50", actual50),
+                PacingField::u64("actual_primary_distance_intervals_p95", actual95),
+                PacingField::u64("actual_primary_distance_intervals_p99", actual99),
+                PacingField::u64(
+                    "reactive_target_early_by_intervals",
+                    self.reactive_target_early_by_intervals,
+                ),
+                PacingField::u64(
+                    "predictive_target_early_by_intervals",
+                    self.predictive_target_early_by_intervals,
+                ),
+                PacingField::u64(
+                    "reactive_target_late_by_intervals",
+                    self.reactive_target_late_by_intervals,
+                ),
+                PacingField::u64(
+                    "predictive_target_late_by_intervals",
+                    self.predictive_target_late_by_intervals,
+                ),
+                PacingField::u64("fast_client_samples", self.fast_client_samples),
+                PacingField::u64("slow_client_samples", self.slow_client_samples),
+                PacingField::u64(
+                    "content_attribution_callback_handoff_limited",
+                    self.content_attribution
+                        [ContentCadenceAttribution::CallbackHandoffLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_client_limited",
+                    self.content_attribution[ContentCadenceAttribution::ClientLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_target_limited",
+                    self.content_attribution[ContentCadenceAttribution::TargetLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_render_limited",
+                    self.content_attribution[ContentCadenceAttribution::RenderLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_submit_limited",
+                    self.content_attribution[ContentCadenceAttribution::SubmitLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_kms_limited",
+                    self.content_attribution[ContentCadenceAttribution::KmsLimited.index()],
+                ),
+                PacingField::u64(
+                    "content_attribution_target_hit",
+                    self.content_attribution[ContentCadenceAttribution::TargetHit.index()],
+                ),
+                PacingField::u64(
+                    "prediction_ewma_render_ns",
+                    prediction.map_or(0, |value| value.ewma_render_ns),
+                ),
+                PacingField::u64(
+                    "prediction_upper_render_deviation_ns",
+                    prediction.map_or(0, |value| value.upper_render_deviation_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p90_recent_render_ns",
+                    prediction.map_or(0, |value| value.p90_recent_render_ns),
+                ),
+                PacingField::u64(
+                    "prediction_render_risk_ns",
+                    prediction.map_or(0, |value| value.render_risk_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_wake_lateness_ns",
+                    prediction.map_or(0, |value| value.p95_wake_lateness_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_worker_queue_residency_ns",
+                    prediction.map_or(0, |value| value.p95_worker_queue_residency_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_worker_pre_submit_ns",
+                    prediction.map_or(0, |value| value.p95_worker_pre_submit_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_worker_dispatch_ns",
+                    prediction.map_or(0, |value| value.p95_worker_dispatch_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_atomic_ioctl_ns",
+                    prediction.map_or(0, |value| value.p95_atomic_ioctl_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_atomic_submit_ns",
+                    prediction.map_or(0, |value| value.p95_atomic_submit_ns),
+                ),
+                PacingField::u64(
+                    "prediction_p95_target_slip_ns",
+                    prediction.map_or(0, |value| value.p95_target_slip_ns),
+                ),
+                PacingField::u64(
+                    "prediction_kms_dispatch_budget_ns",
+                    prediction.map_or(0, |value| value.kms_dispatch_budget_ns),
+                ),
+                PacingField::u64(
+                    "prediction_kms_apply_guard_ns",
+                    prediction.map_or(0, |value| value.kms_apply_guard_ns),
+                ),
+                PacingField::u64(
+                    "prediction_kms_total_lead_ns",
+                    prediction.map_or(0, |value| value.kms_total_lead_ns),
+                ),
+                PacingField::u64(
+                    "prediction_total_cost_ns",
+                    prediction.map_or(0, |value| value.total_cost_ns),
+                ),
+                PacingField::bool(
+                    "prediction_idle_wake_guard",
+                    prediction.is_some_and(|value| value.idle_wake_guard),
+                ),
+            ],
+        )
     }
     pub(crate) fn note_fence_timestamp_quality(&mut self, quality: FenceTimestampQuality) {
         if !self.enabled {

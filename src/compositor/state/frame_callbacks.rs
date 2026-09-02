@@ -708,6 +708,11 @@ impl CompositorState {
             .last_callback_admission_to_next_commit_ns
         {
             self.frame_callback_metrics
+                .callback_admission_to_next_commit_samples = self
+                .frame_callback_metrics
+                .callback_admission_to_next_commit_samples
+                .saturating_add(1);
+            self.frame_callback_metrics
                 .callback_admission_to_next_commit_us = self
                 .frame_callback_metrics
                 .callback_admission_to_next_commit_us

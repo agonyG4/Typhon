@@ -100,6 +100,7 @@ pub struct FrameCallbackMetrics {
     pub last_callback_commit_to_admission_ns: Option<u64>,
     pub last_callback_admission_to_next_commit_ns: Option<u64>,
     pub last_callback_render_to_pageflip_ns: Option<u64>,
+    pub callback_admission_to_next_commit_samples: u64,
     pub callback_render_to_admission_us: u64,
     pub callback_commit_to_admission_us: u64,
     pub callback_admission_to_next_commit_us: u64,

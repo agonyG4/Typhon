@@ -1034,6 +1034,24 @@ impl NativeRuntime {
                         submit_returned_ns: frame.submit_returned_at.get(),
                         reactive_double: frame.target.reason
                             == PresentationTargetReason::ReactiveDouble,
+                        target_reason: frame.target.reason,
+                        previous_primary_sequence: None,
+                        client_commit_ns: frame.client_commit_ns,
+                        callback_reaction_ns: frame.callback_reaction_ns,
+                        callback_admission_ns: frame.callback_admission_ns,
+                        refresh_interval_ns: 1_000_000_000 / u64::from((*refresh_hz).max(1)),
+                        render_missed: matches!(
+                            outcome,
+                            Some(KmsPresentationOutcome::RenderReadinessMiss)
+                        ),
+                        submit_missed: matches!(
+                            outcome,
+                            Some(KmsPresentationOutcome::KmsDispatchMiss)
+                        ),
+                        kms_slipped: matches!(
+                            outcome,
+                            Some(KmsPresentationOutcome::KmsApplyGuardMiss)
+                        ),
                     });
                     *scheduled_presentation_target = None;
                 } else {
