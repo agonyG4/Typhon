@@ -137,6 +137,8 @@ rtk cargo test --locked --lib --bins --tests -- --test-threads=1
 
 and was blocked by unrelated missing `surface_callback_admission` and `surface_callback_commit_timing` symbols in `src/compositor/state/frame_callbacks.rs`. No pointer-timing or native-input failure was observed in the completed test binaries.
 
+After additional unrelated presentation edits arrived in the shared worktree, a final all-target check was rerun and was blocked by 27 missing `selection_evidence` fields in presentation-target test initializers. The final binary-only check and binary clippy remained green. The subsequent pointer-timing test compilation was also blocked by those unrelated test-initializer errors; the pointer-timing GREEN run above was completed before that external worktree churn.
+
 ## Files changed by this task
 
 * `src/native_output/runtime/pointer_timing.rs`
