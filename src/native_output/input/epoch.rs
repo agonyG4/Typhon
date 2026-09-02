@@ -16,6 +16,8 @@ pub(crate) struct NativeInputEpoch {
     next_id: u64,
     active_id: Option<u64>,
     backlog_pending: bool,
+    // Protocol progress requested by an event in this epoch must survive a
+    // bounded continuation until the epoch is exhausted.
     deferred_wayland_progression: bool,
 }
 
