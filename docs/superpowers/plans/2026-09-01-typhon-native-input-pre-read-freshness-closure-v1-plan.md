@@ -168,7 +168,7 @@ git commit -m "fix: separate native input service attempts in timing trace"
 
 **Interfaces:**
 - `decide_native_pre_read_input(dispatch_wayland: bool, service_input: bool, input_ready: bool) -> NativePreReadInputDecision` is the production decision used immediately after the real non-consuming probe.
-- `NativeWaylandInputDispatchOutcome` carries the bounded pre-read observation for timing/tests.
+- The dispatch-local `NativePointerPreReadObservation` is passed directly to the real transition timing commit; it is not carried as scheduler state in `NativeWaylandInputDispatchOutcome`.
 
 - [ ] **Step 1: Implement the smallest decision helper.**
 
@@ -308,7 +308,7 @@ Preserve bounded raw reads, suspend discard, no unbounded allocation, and pre-re
 
 - [ ] **Step 5: Audit deferred Wayland progression.**
 
-Run the existing `deferred_wayland_progression` behavior through the >256 test. If it is green, leave the local state architecture untouched and document that the debt remains within the production dispatch invocation. Only if a deterministic RED demonstrates loss across a continuation may epoch-owned state be introduced.
+Run the existing `deferred_wayland_progression` behavior through the >256 test. The deterministic continuation test is expected to expose the current local-state loss; move only this progression debt into `NativeInputEpoch`, consume it after the epoch exhausts, and leave unrelated cycle state local.
 
 - [ ] **Step 6: Run focused GREEN suites.**
 
