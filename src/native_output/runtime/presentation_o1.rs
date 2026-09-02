@@ -37,7 +37,7 @@ pub(super) fn admission_observation_for_frame(
     render_ahead: bool,
 ) -> O1AdmissionObservation {
     O1AdmissionObservation {
-        opportunity: target.opportunity().id(),
+        opportunity: target.physical_claim().opportunity_id(),
         desired_credit,
         owned_future_depth_before,
         overlap_required_ns,
@@ -56,7 +56,12 @@ pub(super) fn overlap_required_for_current_opportunity(
     let Ok(refresh_ns) = u64::try_from(refresh_interval.as_nanos()) else {
         return 0;
     };
-    let Some(successor_ns) = predecessor.presentation_time.get().checked_add(refresh_ns) else {
+    let Some(successor_ns) = predecessor
+        .physical_claim()
+        .presentation_time
+        .get()
+        .checked_add(refresh_ns)
+    else {
         return 0;
     };
     estimate.overlap_required_ns(
@@ -87,6 +92,12 @@ mod tests {
             clock_generation: 7,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 41,
+                presentation_time: MonotonicTimestampNs::new(10_000_000),
+                clock_generation: 7,
+            },
+            selection_evidence: Default::default(),
         }
     }
 

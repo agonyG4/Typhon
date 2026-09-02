@@ -3,6 +3,7 @@ use crate::native_output::presentation::pipeline::{
     OutputPipelineSnapshot, PipelineCommitKind, PipelineValidationError, PreparedCompositedState,
     PresentedPrimaryState, QueuedCommitSnapshot, TripleCapability, validate_pipeline_owner_counts,
 };
+use oblivion_one::native::presentation_deadline::PrimaryRefreshClaim;
 use std::num::NonZeroU64;
 
 fn target(sequence: u64) -> PresentationTarget {
@@ -16,6 +17,12 @@ fn target(sequence: u64) -> PresentationTarget {
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence,
+            presentation_time: MonotonicTimestampNs::new(sequence * 10),
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     }
 }
 
@@ -130,6 +137,45 @@ fn pipeline_snapshot_accepts_two_ordered_future_primaries() {
     snapshot.worker_queued_next = Some(composed_commit(2, 2, 1, 11));
 
     assert_eq!(snapshot.future_primary_depth(), 2);
+    assert_eq!(snapshot.validate(), Ok(()));
+}
+
+#[test]
+fn pipeline_snapshot_orders_advisory_predecessor_by_physical_claim() {
+    let mut snapshot = empty_snapshot();
+    let mut predecessor = target(4);
+    predecessor.reason = PresentationTargetReason::ReactiveDouble;
+    predecessor.physical_claim = PrimaryRefreshClaim {
+        sequence: 2,
+        presentation_time: MonotonicTimestampNs::new(20),
+        clock_generation: 1,
+    };
+    let mut successor = target(3);
+    successor.physical_claim = PrimaryRefreshClaim {
+        sequence: 3,
+        presentation_time: MonotonicTimestampNs::new(30),
+        clock_generation: 1,
+    };
+    snapshot.kernel_submitted = Some(QueuedCommitSnapshot {
+        token: token(1),
+        output_generation: 1,
+        crtc_id: 7,
+        target: predecessor,
+        kind: PipelineCommitKind::CompositedPrimary {
+            transaction_id: transaction_id(1),
+            frame_id: 1,
+            slot: OutputSlotId::new(0).unwrap(),
+            framebuffer_id: 10,
+        },
+    });
+    snapshot.prepared = PreparedCompositedState::Ready {
+        transaction_id: transaction_id(2),
+        slot: OutputSlotId::new(1).unwrap(),
+        target: successor,
+        fence_state:
+            crate::native_output::presentation::pipeline::PreparedFenceState::SubmitWithInFence,
+    };
+
     assert_eq!(snapshot.validate(), Ok(()));
 }
 

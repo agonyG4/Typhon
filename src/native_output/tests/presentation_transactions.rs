@@ -296,6 +296,12 @@ fn output_transaction_descriptor_is_immutable_and_path_typed() {
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: now,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     };
 
     let transaction = super::OutputTransaction::composited(
@@ -351,6 +357,12 @@ fn test_target() -> oblivion_one::native::presentation_deadline::PresentationTar
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: now,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     }
 }
 

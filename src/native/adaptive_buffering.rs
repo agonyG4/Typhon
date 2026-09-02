@@ -540,7 +540,7 @@ impl AdaptiveBufferingController {
         predecessor: Option<PresentationTarget>,
         overlap_required_ns: u64,
     ) {
-        let target_identity = predecessor.map(|target| target.opportunity().id());
+        let target_identity = predecessor.map(|target| target.physical_claim().opportunity_id());
         if self.last_overlap_target == target_identity {
             return;
         }
@@ -895,6 +895,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 10,
+                presentation_time: MonotonicTimestampNs::new(100),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         };
 
         policy.observe_overlap_for_target(Some(target), 1);
@@ -907,11 +913,21 @@ mod tests {
         policy.observe_overlap_for_target(None, 0);
         let target = crate::native::presentation_deadline::PresentationTarget {
             sequence: 11,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 11,
+                presentation_time: MonotonicTimestampNs::new(100),
+                clock_generation: 1,
+            },
             ..target
         };
         policy.observe_overlap_for_target(Some(target), 0);
         let target = crate::native::presentation_deadline::PresentationTarget {
             sequence: 12,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 12,
+                presentation_time: MonotonicTimestampNs::new(100),
+                clock_generation: 1,
+            },
             ..target
         };
         policy.observe_overlap_for_target(Some(target), 0);
@@ -1000,6 +1016,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 10,
+                presentation_time: MonotonicTimestampNs::new(100),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         };
 
         policy.observe_overlap_for_target(Some(predecessor), 1);
@@ -1007,6 +1029,11 @@ mod tests {
             policy.observe_overlap_for_target(
                 Some(crate::native::presentation_deadline::PresentationTarget {
                     sequence,
+                    physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                        sequence,
+                        presentation_time: MonotonicTimestampNs::new(100),
+                        clock_generation: 1,
+                    },
                     ..predecessor
                 }),
                 0,

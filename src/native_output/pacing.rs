@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn pacing_summary_exports_reactive_and_deadline_owner_counters() {
-        let summary = NativeFramePacing::from_env().summary_line(0);
+        let summary = NativeFramePacing::from_env().summary_line(0, 0);
         for field in [
             "reactive_double_frames=0",
             "reactive_double_immediate_submits=0",
@@ -308,6 +308,7 @@ mod tests {
             "expired_deadline_wait_count=0",
             "repeated_immediate_timer_wake_count=0",
             "multiple_deadline_owner_violation_count=0",
+            "target_identity_reuse_after_abandonment=0",
             "active_pageflip_interval_p50_us=0",
             "active_pageflip_interval_p95_us=0",
             "active_pageflip_interval_p99_us=0",
@@ -324,7 +325,7 @@ mod tests {
         pacing.note_pipeline_wait(PipelineWaitReason::FuturePrimaryDepthFull);
         pacing.note_pipeline_wait(PipelineWaitReason::KernelCommitPending);
 
-        let summary = pacing.summary_line(0);
+        let summary = pacing.summary_line(0, 0);
         assert!(summary.contains("pipeline_wait_future_primary_depth_full=1"));
         assert!(summary.contains("pipeline_wait_kernel_commit_pending=1"));
         assert!(summary.contains("pipeline_wait_direct_steady_state=0"));
@@ -405,12 +406,6 @@ mod tests {
     fn content_clock_summary_exposes_bounded_stage_and_attribution_metrics() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
-        let callback_metrics = oblivion_one::compositor::FrameCallbackMetrics {
-            last_callback_admission_to_next_commit_ns: Some(500_000),
-            callback_admission_to_next_commit_samples: 1,
-            ..Default::default()
-        };
-        pacing.note_callback_metrics(callback_metrics, 6_060_606);
         pacing.note_explicit_present(ExplicitPresentationObservation {
             planned_sequence: 4,
             actual_sequence: 2,
@@ -422,6 +417,10 @@ mod tests {
             submit_returned_ns: 1_011_300_000,
             reactive_double: true,
             target_reason: oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
+            target_selection: TargetSelectionEvidence {
+                earliest_feasible_sequence: 2,
+                binding: false,
+            },
             previous_primary_sequence: Some(1),
             client_commit_ns: Some(1_009_500_000),
             callback_reaction_ns: Some(500_000),
@@ -445,7 +444,7 @@ mod tests {
             "actual_primary_distance_intervals_p50=1",
             "reactive_target_late_by_intervals=1",
             "fast_client_samples=1",
-            "content_attribution_target_limited=1",
+            "content_attribution_target_hit=1",
             "prediction_total_cost_ns=0",
         ] {
             assert!(summary.contains(field), "missing content field {field}");
@@ -466,7 +465,15 @@ mod tests {
                 2_000_000,
                 selected_distance,
                 1,
-                target_feasible,
+                TargetSelectionEvidence {
+                    earliest_feasible_sequence: if target_feasible {
+                        selected_distance.saturating_sub(2)
+                    } else {
+                        selected_distance
+                    },
+                    binding: target_feasible,
+                },
+                1,
                 render_missed,
                 submit_missed,
                 kms_slipped,
@@ -479,6 +486,24 @@ mod tests {
         );
         assert_eq!(
             classify(Some(500_000), 3, true, false, false, false),
+            ContentCadenceAttribution::TargetHit
+        );
+        assert_eq!(
+            classify_content_frame(
+                false,
+                Some(500_000),
+                2_000_000,
+                3,
+                3,
+                TargetSelectionEvidence {
+                    earliest_feasible_sequence: 1,
+                    binding: true,
+                },
+                1,
+                false,
+                false,
+                false,
+            ),
             ContentCadenceAttribution::TargetLimited
         );
         assert_eq!(
@@ -500,11 +525,12 @@ mod tests {
     }
 }
 use super::scanout::NativeScanoutBufferSnapshot;
-use oblivion_one::compositor::FrameCallbackMetrics;
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss, RenderPrediction,
 };
-use oblivion_one::native::presentation_deadline::PresentationTargetReason;
+use oblivion_one::native::presentation_deadline::{
+    PresentationTargetReason, TargetSelectionEvidence,
+};
 use oblivion_one::native::scheduler::{
     NativeOutputPacingMode, PipelineWaitReason, SchedulerDecision,
 };
@@ -759,7 +785,8 @@ pub(crate) fn classify_content_frame(
     fast_client_threshold_ns: u64,
     selected_target_distance: u64,
     actual_primary_distance: u64,
-    target_was_feasible: bool,
+    target_selection: TargetSelectionEvidence,
+    earliest_feasible_distance: u64,
     render_missed: bool,
     submit_missed: bool,
     kms_slipped: bool,
@@ -768,7 +795,10 @@ pub(crate) fn classify_content_frame(
         ContentCadenceAttribution::CallbackHandoffLimited
     } else if callback_reaction_ns.is_some_and(|reaction| reaction > fast_client_threshold_ns) {
         ContentCadenceAttribution::ClientLimited
-    } else if target_was_feasible && selected_target_distance > 1 && actual_primary_distance == 1 {
+    } else if target_selection.binding
+        && earliest_feasible_distance < selected_target_distance
+        && actual_primary_distance == selected_target_distance
+    {
         ContentCadenceAttribution::TargetLimited
     } else if render_missed {
         ContentCadenceAttribution::RenderLimited
@@ -889,7 +919,6 @@ pub(crate) struct NativeFramePacing {
     fast_client_samples: u64,
     slow_client_samples: u64,
     content_attribution: [u64; CONTENT_ATTRIBUTION_COUNT],
-    last_callback_reaction_sample_count: u64,
     last_prediction: Option<RenderPrediction>,
     last_primary_sequence: Option<u64>,
     misses: RefreshMissBuckets,
@@ -914,6 +943,7 @@ pub(crate) struct ExplicitPresentationObservation {
     pub(crate) submit_returned_ns: u64,
     pub(crate) reactive_double: bool,
     pub(crate) target_reason: PresentationTargetReason,
+    pub(crate) target_selection: TargetSelectionEvidence,
     pub(crate) previous_primary_sequence: Option<u64>,
     pub(crate) client_commit_ns: Option<u64>,
     pub(crate) callback_reaction_ns: Option<u64>,
@@ -1033,7 +1063,6 @@ impl NativeFramePacing {
             fast_client_samples: 0,
             slow_client_samples: 0,
             content_attribution: [0; CONTENT_ATTRIBUTION_COUNT],
-            last_callback_reaction_sample_count: 0,
             last_prediction: None,
             last_primary_sequence: None,
             misses: RefreshMissBuckets::default(),
@@ -1081,31 +1110,6 @@ impl NativeFramePacing {
         }
     }
 
-    pub(crate) fn note_callback_metrics(
-        &mut self,
-        metrics: FrameCallbackMetrics,
-        refresh_interval_ns: u64,
-    ) {
-        if !self.enabled
-            || metrics.callback_admission_to_next_commit_samples
-                <= self.last_callback_reaction_sample_count
-        {
-            return;
-        }
-        self.last_callback_reaction_sample_count =
-            metrics.callback_admission_to_next_commit_samples;
-        let Some(reaction_ns) = metrics.last_callback_admission_to_next_commit_ns else {
-            return;
-        };
-        self.callback_admission_to_next_commit
-            .record(reaction_ns / 1_000);
-        let fast_threshold_ns = (refresh_interval_ns / 2).min(2_000_000);
-        if reaction_ns <= fast_threshold_ns {
-            self.fast_client_samples = self.fast_client_samples.saturating_add(1);
-        } else {
-            self.slow_client_samples = self.slow_client_samples.saturating_add(1);
-        }
-    }
     pub(crate) fn note_render_started(
         &mut self,
         pacing_mode: NativeOutputPacingMode,
@@ -1517,8 +1521,24 @@ impl NativeFramePacing {
                     .saturating_add(target_distance);
             }
         }
-        let target_was_feasible = selected_target_distance > 1 && actual_primary_distance == 1;
+        let earliest_feasible_distance = previous_primary_sequence
+            .map(|previous| {
+                observation
+                    .target_selection
+                    .earliest_feasible_sequence
+                    .saturating_sub(previous)
+            })
+            .unwrap_or(selected_target_distance);
         let fast_client_threshold_ns = (refresh_interval_ns / 2).min(2_000_000);
+        if let Some(reaction_ns) = observation.callback_reaction_ns {
+            self.callback_admission_to_next_commit
+                .record(reaction_ns / 1_000);
+            if reaction_ns <= fast_client_threshold_ns {
+                self.fast_client_samples = self.fast_client_samples.saturating_add(1);
+            } else {
+                self.slow_client_samples = self.slow_client_samples.saturating_add(1);
+            }
+        }
         let callback_handoff_limited = observation
             .callback_admission_ns
             .zip(observation.client_commit_ns)
@@ -1536,7 +1556,8 @@ impl NativeFramePacing {
             fast_client_threshold_ns,
             selected_target_distance,
             actual_primary_distance,
-            target_was_feasible,
+            observation.target_selection,
+            earliest_feasible_distance,
             observation.render_missed,
             observation.submit_missed,
             observation.kms_slipped,
@@ -1845,7 +1866,11 @@ impl NativeFramePacing {
             FenceTimestampQuality::ObservedApproximate => self.sync_file_info_approximate += 1,
         }
     }
-    pub(crate) fn summary_line(&self, compositor_trace_dropped_entries: u64) -> String {
+    pub(crate) fn summary_line(
+        &self,
+        compositor_trace_dropped_entries: u64,
+        target_identity_reuse_after_abandonment: u64,
+    ) -> String {
         let (pf50, pf95, pf99) = self.pageflip_intervals.percentiles();
         let (active_pf50, active_pf95, active_pf99) = self.active_pageflip_intervals.percentiles();
         let (cp50, cp95, cp99) = self.commit_to_present.percentiles();
@@ -1949,7 +1974,14 @@ impl NativeFramePacing {
                     "sync_file_info_approximate",
                     self.sync_file_info_approximate,
                 ),
-                PacingField::u64("presentation_target_sequence_mutations", 0),
+                PacingField::u64(
+                    "presentation_target_sequence_mutations",
+                    target_identity_reuse_after_abandonment,
+                ),
+                PacingField::u64(
+                    "target_identity_reuse_after_abandonment",
+                    target_identity_reuse_after_abandonment,
+                ),
                 PacingField::u64("scheduler_wakeup_lateness_p50_us", wake50),
                 PacingField::u64("scheduler_wakeup_lateness_p95_us", wake95),
                 PacingField::u64("scheduler_wakeup_lateness_p99_us", wake99),

@@ -361,18 +361,23 @@ impl OutputPipelineSnapshot {
             let [earlier, later] = pair else {
                 continue;
             };
-            if earlier.clock_generation != later.clock_generation {
+            let earlier_claim = earlier.physical_claim();
+            let later_claim = later.physical_claim();
+            if earlier.clock_generation != later.clock_generation
+                || earlier_claim.clock_generation != earlier.clock_generation
+                || later_claim.clock_generation != later.clock_generation
+            {
                 return Err(PipelineValidationError::TargetGenerationMismatch {
                     earlier_generation: earlier.clock_generation,
                     later_generation: later.clock_generation,
                 });
             }
-            if later.sequence <= earlier.sequence
-                || later.presentation_time <= earlier.presentation_time
+            if later_claim.sequence <= earlier_claim.sequence
+                || later_claim.presentation_time <= earlier_claim.presentation_time
             {
                 return Err(PipelineValidationError::NonMonotonicTargetOrder {
-                    earlier_sequence: earlier.sequence,
-                    later_sequence: later.sequence,
+                    earlier_sequence: earlier_claim.sequence,
+                    later_sequence: later_claim.sequence,
                 });
             }
         }

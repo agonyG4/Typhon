@@ -1009,6 +1009,7 @@ mod tests {
         let empty_batch = |frame_id, claims| CompositorFrameBatch {
             frame_id,
             callbacks: Vec::new(),
+            callback_timing: None,
             callback_commit_ns: None,
             callback_render_completed_ns: None,
             callback_admission_ns: None,
@@ -1071,6 +1072,7 @@ mod tests {
             CompositorFrameBatch {
                 frame_id: 70,
                 callbacks: Vec::new(),
+                callback_timing: None,
                 callback_commit_ns: None,
                 callback_render_completed_ns: None,
                 callback_admission_ns: None,
@@ -1127,6 +1129,7 @@ mod tests {
             CompositorFrameBatch {
                 frame_id: 71,
                 callbacks: Vec::new(),
+                callback_timing: None,
                 callback_commit_ns: None,
                 callback_render_completed_ns: None,
                 callback_admission_ns: None,

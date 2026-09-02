@@ -140,14 +140,9 @@ fn advisory_predecessor_does_not_make_an_existing_o1_target_churn() {
     let mut planner = PresentationDeadlinePlanner::new(refresh);
     assert_eq!(planner.note_presented(physical_presented_at), 1);
 
-    let reactive = reactive_or_commit_timing_target(
-        &planner,
-        None,
-        None,
-        now,
-        Duration::from_millis(17),
-    )
-    .expect("reactive target");
+    let reactive =
+        reactive_or_commit_timing_target(&planner, None, None, now, Duration::from_millis(17))
+            .expect("reactive target");
     assert_eq!(reactive.sequence, 4);
 
     let scheduled = plan_visual_target_for_budget(
@@ -646,6 +641,12 @@ fn reactive_double_visual_target_never_owns_an_event_loop_deadline() {
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(10),
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     };
 
     assert_eq!(
@@ -1364,5 +1365,11 @@ fn compatibility_test_target() -> PresentationTarget {
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(10),
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     }
 }

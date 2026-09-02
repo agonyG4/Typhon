@@ -326,11 +326,15 @@ impl CompositorState {
         dmabuf_releases_to_complete_on_present.append(&mut self.pending_dmabuf_buffer_releases);
         let callbacks = self.take_visible_pending_frame_callbacks();
         let callback_count = callbacks.len();
-        let callback_commit_ns = (callback_count > 0).then_some(
-            self.frame_callback_metrics
-                .last_callback_commit_ns
-                .unwrap_or_else(client_pacing_now_ns),
-        );
+        let callback_timing = callbacks
+            .iter()
+            .filter_map(|callback| {
+                self.pending_frame_callback_timing
+                    .get(&callback.id())
+                    .copied()
+            })
+            .max_by_key(|timing| (timing.commit_ns, timing.surface_id));
+        let callback_commit_ns = callback_timing.map(|timing| timing.commit_ns);
         if callback_count > 0 {
             self.frame_callback_metrics.callbacks_captured = self
                 .frame_callback_metrics
@@ -383,6 +387,7 @@ impl CompositorState {
             CompositorFrameBatch {
                 frame_id,
                 callbacks,
+                callback_timing,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
                 callback_admission_ns: None,
@@ -782,6 +787,15 @@ impl CompositorState {
         self.frame_batches
             .remove(&batch_id)
             .expect("compositor frame batch disappeared during completion")
+    }
+
+    pub(in crate::compositor) fn frame_callback_timing_for_batch(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> Option<FrameCallbackTimingEvidence> {
+        self.frame_batches
+            .get(&batch_id)
+            .and_then(|batch| batch.callback_timing)
     }
 
     pub(in crate::compositor) fn clear_legacy_batch_reference(
@@ -1197,6 +1211,7 @@ impl CompositorState {
     ) {
         for callback in &callbacks {
             self.pending_frame_callback_surfaces.remove(&callback.id());
+            self.pending_frame_callback_timing.remove(&callback.id());
         }
         let callbacks: Vec<_> = callbacks
             .into_iter()
@@ -1213,6 +1228,7 @@ impl CompositorState {
     ) {
         for callback in &callbacks {
             self.pending_frame_callback_surfaces.remove(&callback.id());
+            self.pending_frame_callback_timing.remove(&callback.id());
         }
         self.note_callbacks_completed(&callbacks);
         for callback in callbacks {

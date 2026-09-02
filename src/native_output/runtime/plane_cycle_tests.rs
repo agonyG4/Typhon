@@ -51,6 +51,12 @@ fn target() -> PresentationTarget {
         clock_generation: 1,
         estimated: false,
         predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: now,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
     }
 }
 

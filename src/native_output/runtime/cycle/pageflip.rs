@@ -788,6 +788,13 @@ impl NativeRuntime {
                                 .identity_signature(),
                         },
                     );
+                    let physical_claim =
+                        oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                            sequence: actual_logical_sequence,
+                            presentation_time: presented_at,
+                            clock_generation: *drm_file_generation,
+                        };
+                    explicit.validate_physical_primary_presentation(physical_claim)?;
                     let CompositedPageflipCompletion {
                         presented: frame,
                         protocol_batch_id,
@@ -806,6 +813,7 @@ impl NativeRuntime {
                         )
                         .into());
                     }
+                    explicit.note_physical_primary_presentation(physical_claim)?;
                     dmabuf_gpu_release_registry
                         .note_composited_pageflip(transaction_id, presented_at_ns);
                     if !scene_history.promote_pageflip(pageflip_token.get()) {
@@ -1035,6 +1043,7 @@ impl NativeRuntime {
                         reactive_double: frame.target.reason
                             == PresentationTargetReason::ReactiveDouble,
                         target_reason: frame.target.reason,
+                        target_selection: frame.target.selection_evidence(),
                         previous_primary_sequence: None,
                         client_commit_ns: frame.client_commit_ns,
                         callback_reaction_ns: frame.callback_reaction_ns,

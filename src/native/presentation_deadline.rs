@@ -48,11 +48,41 @@ pub enum PresentationTargetAuthority {
 }
 
 #[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TargetSelectionEvidence {
+    pub earliest_feasible_sequence: u64,
+    pub binding: bool,
+}
+
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrimaryRefreshFrontier {
+pub struct PrimaryRefreshClaim {
     pub sequence: u64,
     pub presentation_time: MonotonicTimestampNs,
     pub clock_generation: u64,
+}
+
+pub type PrimaryRefreshFrontier = PrimaryRefreshClaim;
+
+impl PrimaryRefreshClaim {
+    pub const fn identity(self) -> (u64, u64) {
+        (self.clock_generation, self.sequence)
+    }
+
+    pub const fn opportunity_id(self) -> crate::native::buffering::PresentationOpportunityId {
+        crate::native::buffering::PresentationOpportunityId::new(
+            self.clock_generation,
+            self.sequence,
+        )
+    }
+
+    pub fn successor(self, refresh_interval: Duration) -> Option<Self> {
+        Some(Self {
+            sequence: self.sequence.checked_add(1)?,
+            presentation_time: self.presentation_time.checked_add(refresh_interval)?,
+            clock_generation: self.clock_generation,
+        })
+    }
 }
 
 #[doc(hidden)]
@@ -67,6 +97,8 @@ pub struct PresentationTarget {
     pub clock_generation: u64,
     pub estimated: bool,
     pub predicted_unreachable: bool,
+    pub physical_claim: PrimaryRefreshClaim,
+    pub selection_evidence: TargetSelectionEvidence,
 }
 
 impl PresentationTarget {
@@ -76,6 +108,14 @@ impl PresentationTarget {
 
     pub const fn identity(self) -> (u64, u64) {
         (self.clock_generation, self.sequence)
+    }
+
+    pub const fn physical_claim(self) -> PrimaryRefreshClaim {
+        self.physical_claim
+    }
+
+    pub const fn selection_evidence(self) -> TargetSelectionEvidence {
+        self.selection_evidence
     }
 
     pub const fn render_start_deadline(self) -> MonotonicTimestampNs {
@@ -116,6 +156,14 @@ impl PresentationTarget {
         )
     }
 
+    pub const fn physical_opportunity(self) -> PresentationOpportunity {
+        PresentationOpportunity::fixed_vsync(
+            self.physical_claim.opportunity_id(),
+            self.physical_claim.presentation_time,
+            self.refresh_interval,
+        )
+    }
+
     pub const fn opportunity_lease(self) -> OpportunityLease {
         let reason = match self.reason {
             PresentationTargetReason::ReactiveDouble => OpportunityLeaseReason::VisualWork,
@@ -125,7 +173,7 @@ impl PresentationTarget {
             PresentationTargetReason::ForcedValidation => OpportunityLeaseReason::ForcedValidation,
             PresentationTargetReason::CommitTiming => OpportunityLeaseReason::CommitTiming,
         };
-        OpportunityLease::arm(self.opportunity(), reason)
+        OpportunityLease::arm(self.physical_opportunity(), reason)
     }
 }
 
@@ -138,6 +186,8 @@ pub struct PresentationDeadlinePlanner {
     refresh_interval: Duration,
     scheduled: Option<PresentationTarget>,
     pre_render_abandoned: u64,
+    target_identity_reuse_after_abandonment: u64,
+    last_abandoned_target_identity: Option<(u64, u64)>,
 }
 
 impl PresentationDeadlinePlanner {
@@ -149,6 +199,8 @@ impl PresentationDeadlinePlanner {
             refresh_interval: nonzero_refresh(refresh_interval),
             scheduled: None,
             pre_render_abandoned: 0,
+            target_identity_reuse_after_abandonment: 0,
+            last_abandoned_target_identity: None,
         }
     }
 
@@ -168,8 +220,9 @@ impl PresentationDeadlinePlanner {
             .unwrap_or_else(|| self.last_presented_sequence.saturating_add(1));
         self.last_presented_sequence = logical_sequence;
         self.last_presented_at = Some(presented_at);
-        if self.scheduled.take().is_some() {
+        if let Some(abandoned) = self.scheduled.take() {
             self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
+            self.last_abandoned_target_identity = Some(abandoned.physical_claim().identity());
         }
         logical_sequence
     }
@@ -210,8 +263,9 @@ impl PresentationDeadlinePlanner {
     ) -> Option<PresentationTarget> {
         let ready_at = now.checked_add(predicted_total_cost)?;
         let eligible_at = MonotonicTimestampNs::new(ready_at.get().max(requested_target.get()));
+        let earliest_feasible_sequence = self.earliest_reachable(ready_at)?.0;
         let (sequence, presentation_time, estimated) = self.earliest_reachable(eligible_at)?;
-        let target = self.make_target(
+        let mut target = self.make_target(
             sequence,
             presentation_time,
             predicted_total_cost,
@@ -224,6 +278,7 @@ impl PresentationDeadlinePlanner {
                 submit_not_before(presentation_time, self.refresh_interval)
             },
         );
+        target.selection_evidence.earliest_feasible_sequence = earliest_feasible_sequence;
         self.scheduled = Some(target);
         Some(target)
     }
@@ -235,6 +290,11 @@ impl PresentationDeadlinePlanner {
     ) -> Option<PresentationTarget> {
         let ready_at = now.checked_add(predicted_total_cost)?;
         let (sequence, presentation_time, estimated) = self.earliest_reachable(ready_at)?;
+        let physical_claim = self.next_physical_claim().unwrap_or(PrimaryRefreshClaim {
+            sequence,
+            presentation_time,
+            clock_generation: self.clock_generation,
+        });
         Some(PresentationTarget {
             sequence,
             presentation_time,
@@ -248,6 +308,11 @@ impl PresentationDeadlinePlanner {
             clock_generation: self.clock_generation,
             estimated,
             predicted_unreachable: false,
+            physical_claim,
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: physical_claim.sequence,
+                binding: false,
+            },
         })
     }
 
@@ -265,6 +330,14 @@ impl PresentationDeadlinePlanner {
         let (sequence, presentation_time, estimated) =
             self.earliest_reachable_after(ready_at, lower_bound)?;
 
+        let physical_claim = lower_bound
+            .physical_claim()
+            .successor(self.refresh_interval)
+            .unwrap_or(PrimaryRefreshClaim {
+                sequence,
+                presentation_time,
+                clock_generation: self.clock_generation,
+            });
         Some(PresentationTarget {
             sequence,
             presentation_time,
@@ -275,6 +348,11 @@ impl PresentationDeadlinePlanner {
             clock_generation: self.clock_generation,
             estimated,
             predicted_unreachable: false,
+            physical_claim,
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: physical_claim.sequence,
+                binding: false,
+            },
         })
     }
 
@@ -324,15 +402,18 @@ impl PresentationDeadlinePlanner {
     /// End a target that has not entered rendering.  The caller must allocate
     /// a new target identity; this method never retargets the old value.
     pub fn abandon_scheduled_target(&mut self) -> Option<PresentationTarget> {
-        let abandoned = self.scheduled.take();
-        if abandoned.is_some() {
-            self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
-        }
-        abandoned
+        let target = self.scheduled.take()?;
+        self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
+        self.last_abandoned_target_identity = Some(target.physical_claim().identity());
+        Some(target)
     }
 
     pub const fn pre_render_abandoned(&self) -> u64 {
         self.pre_render_abandoned
+    }
+
+    pub const fn target_identity_reuse_after_abandonment(&self) -> u64 {
+        self.target_identity_reuse_after_abandonment
     }
 
     pub fn plan_render_ahead(
@@ -424,6 +505,11 @@ impl PresentationDeadlinePlanner {
             clock_generation: frontier.clock_generation,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: frontier,
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: frontier.sequence,
+                binding: false,
+            },
         }
     }
 
@@ -435,11 +521,7 @@ impl PresentationDeadlinePlanner {
             return None;
         }
         if future_primary.is_binding() {
-            return Some(PrimaryRefreshFrontier {
-                sequence: future_primary.sequence,
-                presentation_time: future_primary.presentation_time,
-                clock_generation: future_primary.clock_generation,
-            });
+            return Some(future_primary.physical_claim());
         }
         let presentation_time = self.last_presented_at?.checked_add(self.refresh_interval)?;
         Some(PrimaryRefreshFrontier {
@@ -479,6 +561,8 @@ impl PresentationDeadlinePlanner {
         }
         let base = self.earliest_reachable(ready_at)?;
         let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let lower_bound_estimated = lower_bound.estimated;
+        let lower_bound = lower_bound.physical_claim();
         let mut sequence = lower_bound.sequence.checked_add(1)?;
         let mut presentation_time = lower_bound
             .presentation_time
@@ -493,15 +577,15 @@ impl PresentationDeadlinePlanner {
             );
         }
         if base.1 > presentation_time || (base.1 == presentation_time && base.0 > sequence) {
-            Some((base.0, base.1, base.2 || lower_bound.estimated))
+            Some((base.0, base.1, base.2 || lower_bound_estimated))
         } else {
-            Some((sequence, presentation_time, base.2 || lower_bound.estimated))
+            Some((sequence, presentation_time, base.2 || lower_bound_estimated))
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn make_target(
-        &self,
+        &mut self,
         sequence: u64,
         presentation_time: MonotonicTimestampNs,
         predicted_total_cost: Duration,
@@ -510,7 +594,7 @@ impl PresentationDeadlinePlanner {
         predicted_unreachable: bool,
         submit_not_before: MonotonicTimestampNs,
     ) -> PresentationTarget {
-        PresentationTarget {
+        let target = PresentationTarget {
             sequence,
             presentation_time,
             submit_not_before,
@@ -520,7 +604,37 @@ impl PresentationDeadlinePlanner {
             clock_generation: self.clock_generation,
             estimated,
             predicted_unreachable,
+            physical_claim: PrimaryRefreshClaim {
+                sequence,
+                presentation_time,
+                clock_generation: self.clock_generation,
+            },
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: sequence,
+                binding: reason != PresentationTargetReason::ReactiveDouble,
+            },
+        };
+        if self
+            .last_abandoned_target_identity
+            .is_some_and(|identity| identity == target.physical_claim().identity())
+        {
+            // Reusing an abandoned physical opportunity would make target
+            // identity churn observable as a silent reservation mutation.
+            // The planner's claim-aware ordering should make this impossible.
+            self.target_identity_reuse_after_abandonment = self
+                .target_identity_reuse_after_abandonment
+                .saturating_add(1);
         }
+        self.last_abandoned_target_identity = None;
+        target
+    }
+
+    fn next_physical_claim(&self) -> Option<PrimaryRefreshClaim> {
+        Some(PrimaryRefreshClaim {
+            sequence: self.last_presented_sequence.checked_add(1)?,
+            presentation_time: self.last_presented_at?.checked_add(self.refresh_interval)?,
+            clock_generation: self.clock_generation,
+        })
     }
 }
 
@@ -707,6 +821,29 @@ mod tests {
     }
 
     #[test]
+    fn reusing_an_abandoned_physical_claim_is_counted() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let original = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        assert_eq!(planner.abandon_scheduled_target(), Some(original));
+        let replacement = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        assert_eq!(replacement.physical_claim(), original.physical_claim());
+        assert_eq!(planner.target_identity_reuse_after_abandonment(), 1);
+    }
+
+    #[test]
     fn presented_sequence_is_derived_from_timestamp_intervals() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
 
@@ -795,6 +932,13 @@ mod tests {
                 presentation_time: MonotonicTimestampNs::new(1_006_060_606),
                 clock_generation: 1,
             })
+        );
+        assert_eq!(
+            advisory.selection_evidence(),
+            TargetSelectionEvidence {
+                earliest_feasible_sequence: 2,
+                binding: false,
+            }
         );
     }
 

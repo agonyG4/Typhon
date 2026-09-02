@@ -98,6 +98,12 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
             clock_generation: 1,
             estimated: true,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: token,
+                presentation_time: MonotonicTimestampNs::new(0),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         },
         submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
             0, 0, 0, 0,

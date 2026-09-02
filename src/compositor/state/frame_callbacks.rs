@@ -1,6 +1,29 @@
 use super::*;
 use crate::compositor::frame_batch::FrameCallbackPacingState;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SurfaceFrameClockState {
+    last_admission_ns: Option<u64>,
+}
+
+impl SurfaceFrameClockState {
+    fn note_commit(self, surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
+        FrameCallbackTimingEvidence {
+            surface_id,
+            commit_ns,
+            admission_ns: self.last_admission_ns,
+            reaction_ns: self
+                .last_admission_ns
+                .filter(|admission_ns| commit_ns >= *admission_ns)
+                .map(|admission_ns| commit_ns.saturating_sub(admission_ns)),
+        }
+    }
+
+    fn note_admission(&mut self, admission_ns: u64) {
+        self.last_admission_ns = Some(admission_ns);
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn queue_frame_callbacks_for_surface(
         &mut self,
@@ -46,7 +69,9 @@ impl CompositorState {
             .saturating_sub(visible_discarded);
         for callback_id in &callback_ids {
             self.pending_frame_callback_surfaces.remove(callback_id);
+            self.pending_frame_callback_timing.remove(callback_id);
         }
+        self.surface_frame_clock.remove(&surface_id);
         for batch in self.frame_batches.values_mut() {
             if batch.callback_terminal_ownership_checked {
                 continue;
@@ -493,6 +518,7 @@ impl CompositorState {
             callback_render_completed_ns,
             admission_ns,
         );
+        self.record_surface_callback_admission(&callbacks, admission_ns);
         self.complete_frame_callbacks(callbacks);
     }
 
@@ -688,21 +714,26 @@ impl CompositorState {
         self.frame_callback_metrics
     }
 
-    pub(in crate::compositor) fn note_frame_callbacks_committed(&mut self, count: usize) {
+    pub(in crate::compositor) fn note_frame_callbacks_committed(
+        &mut self,
+        surface_id: u32,
+        count: usize,
+    ) -> Option<FrameCallbackTimingEvidence> {
         if count == 0 {
-            return;
+            return None;
         }
         let commit_ns = client_pacing_now_ns();
+        let callback_timing = self
+            .surface_frame_clock
+            .entry(surface_id)
+            .or_default()
+            .note_commit(surface_id, commit_ns);
         self.frame_callback_metrics.callbacks_requested = self
             .frame_callback_metrics
             .callbacks_requested
             .saturating_add(count as u64);
         self.frame_callback_metrics
-            .last_callback_admission_to_next_commit_ns = self
-            .frame_callback_metrics
-            .last_callback_admission_ns
-            .filter(|admission_ns| commit_ns >= *admission_ns)
-            .map(|admission_ns| commit_ns.saturating_sub(admission_ns));
+            .last_callback_admission_to_next_commit_ns = callback_timing.reaction_ns;
         if let Some(duration_ns) = self
             .frame_callback_metrics
             .last_callback_admission_to_next_commit_ns
@@ -719,6 +750,60 @@ impl CompositorState {
                 .saturating_add(duration_ns / 1_000);
         }
         self.frame_callback_metrics.last_callback_commit_ns = Some(commit_ns);
+        Some(callback_timing)
+    }
+
+    pub(in crate::compositor) fn register_frame_callback_timing(
+        &mut self,
+        callbacks: &[wl_callback::WlCallback],
+        timing: Option<FrameCallbackTimingEvidence>,
+    ) {
+        let Some(timing) = timing else {
+            return;
+        };
+        for callback in callbacks {
+            self.pending_frame_callback_timing
+                .insert(callback.id(), timing);
+        }
+    }
+
+    fn record_surface_callback_admission(
+        &mut self,
+        callbacks: &[wl_callback::WlCallback],
+        admission_ns: u64,
+    ) {
+        for callback in callbacks {
+            if let Some(surface_id) = self.pending_frame_callback_surfaces.get(&callback.id()) {
+                self.surface_frame_clock
+                    .entry(*surface_id)
+                    .or_default()
+                    .note_admission(admission_ns);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn surface_callback_commit_timing(
+        clocks: &mut HashMap<u32, SurfaceFrameClockState>,
+        surface_id: u32,
+        commit_ns: u64,
+    ) -> FrameCallbackTimingEvidence {
+        clocks
+            .entry(surface_id)
+            .or_default()
+            .note_commit(surface_id, commit_ns)
+    }
+
+    #[cfg(test)]
+    fn surface_callback_admission(
+        clocks: &mut HashMap<u32, SurfaceFrameClockState>,
+        surface_id: u32,
+        admission_ns: u64,
+    ) {
+        clocks
+            .entry(surface_id)
+            .or_default()
+            .note_admission(admission_ns);
     }
 
     pub(in crate::compositor) fn complete_protocol_only_frame_tick(
@@ -776,5 +861,36 @@ impl CompositorState {
                 ("callbacks_remaining", callbacks_remaining.to_string()),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_reaction_is_scoped_to_the_committing_surface() {
+        let mut clocks = HashMap::new();
+        CompositorState::surface_callback_admission(&mut clocks, 1, 100);
+
+        let surface_b_commit = CompositorState::surface_callback_commit_timing(&mut clocks, 2, 110);
+        assert_eq!(surface_b_commit.reaction_ns, None);
+
+        let surface_a_commit = CompositorState::surface_callback_commit_timing(&mut clocks, 1, 150);
+        assert_eq!(surface_a_commit.surface_id, 1);
+        assert_eq!(surface_a_commit.admission_ns, Some(100));
+        assert_eq!(surface_a_commit.reaction_ns, Some(50));
+    }
+
+    #[test]
+    fn callback_reaction_inverse_order_remains_surface_local() {
+        let mut clocks = HashMap::new();
+        CompositorState::surface_callback_admission(&mut clocks, 2, 100);
+
+        let surface_a_commit = CompositorState::surface_callback_commit_timing(&mut clocks, 1, 110);
+        assert_eq!(surface_a_commit.reaction_ns, None);
+
+        let surface_b_commit = CompositorState::surface_callback_commit_timing(&mut clocks, 2, 150);
+        assert_eq!(surface_b_commit.reaction_ns, Some(50));
     }
 }

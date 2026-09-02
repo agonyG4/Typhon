@@ -147,7 +147,7 @@ use explicit_sync::{
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{
     BufferReleaseMetrics, CompositorFrameBatchId, DmabufGpuReleaseLeaseId, FrameCallbackAdmission,
-    FrameCallbackMetrics,
+    FrameCallbackMetrics, FrameCallbackTimingEvidence,
 };
 pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
 pub use state_data::ShmBufferLifetimeMetrics;
@@ -712,6 +712,8 @@ pub struct CompositorState {
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     visible_pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     pending_frame_callback_surfaces: HashMap<ObjectId, u32>,
+    pending_frame_callback_timing: HashMap<ObjectId, FrameCallbackTimingEvidence>,
+    surface_frame_clock: HashMap<u32, SurfaceFrameClockState>,
     visible_pending_frame_callback_count: usize,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
     visible_pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,

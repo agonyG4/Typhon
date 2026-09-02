@@ -16,7 +16,9 @@ use oblivion_one::compositor::{
 };
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
-use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PrimaryRefreshClaim,
+};
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},
     egl_gles::EglGlesDmabufFormat,
@@ -850,7 +852,7 @@ impl AtomicEglGbmScanout {
         // include protocol bookkeeping or diagnostics; everything after it is explicit
         // scene encoding, fence export, and GPU work owned by this output frame.
         let composite_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let callback_metrics = server.frame_callback_metrics();
+        let callback_timing = server.frame_callback_timing_for_batch(protocol_batch_id);
         let mut gpu_sampling_started = false;
         let (
             render_outcome,
@@ -1078,9 +1080,9 @@ impl AtomicEglGbmScanout {
             composite_started_at,
             fence_exported_at: rendered_at,
             rendered_at,
-            client_commit_ns: callback_metrics.last_callback_commit_ns,
-            callback_reaction_ns: callback_metrics.last_callback_admission_to_next_commit_ns,
-            callback_admission_ns: callback_metrics.last_callback_admission_ns,
+            client_commit_ns: callback_timing.map(|timing| timing.commit_ns),
+            callback_reaction_ns: callback_timing.and_then(|timing| timing.reaction_ns),
+            callback_admission_ns: callback_timing.and_then(|timing| timing.admission_ns),
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
@@ -1288,6 +1290,22 @@ impl AtomicEglGbmScanout {
         self.swapchain
             .as_mut()
             .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
+    }
+
+    pub(crate) fn note_physical_primary_presentation(
+        &mut self,
+        claim: PrimaryRefreshClaim,
+    ) -> io::Result<()> {
+        self.swapchain_mut()?
+            .note_physical_primary_presentation(claim)
+    }
+
+    pub(crate) fn validate_physical_primary_presentation(
+        &self,
+        claim: PrimaryRefreshClaim,
+    ) -> io::Result<()> {
+        self.swapchain()?
+            .validate_physical_primary_presentation(claim)
     }
 
     pub(crate) fn presented_direct_ownership(&self) -> &DirectPrimaryOwnership {

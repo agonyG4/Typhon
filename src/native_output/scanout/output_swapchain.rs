@@ -11,7 +11,9 @@ use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 #[cfg(test)]
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
-use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PrimaryRefreshClaim,
+};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
@@ -266,6 +268,7 @@ pub(crate) struct AtomicOutputSwapchain {
     next_frame_id: u64,
     presentation_serial: u64,
     current_framebuffer_id: Option<FramebufferId>,
+    last_presented_primary_claim: Option<PrimaryRefreshClaim>,
 }
 
 impl AtomicOutputSwapchain {
@@ -287,6 +290,7 @@ impl AtomicOutputSwapchain {
             next_frame_id: 1,
             presentation_serial: 0,
             current_framebuffer_id: None,
+            last_presented_primary_claim: None,
         })
     }
 
@@ -395,6 +399,12 @@ impl AtomicOutputSwapchain {
             clock_generation: self.pool_generation,
             estimated: true,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: self.next_frame_id,
+                presentation_time: now,
+                clock_generation: self.pool_generation,
+            },
+            selection_evidence: Default::default(),
         };
         static NEXT_TEST_SERVER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
@@ -522,6 +532,12 @@ impl AtomicOutputSwapchain {
                 clock_generation: self.pool_generation,
                 estimated: true,
                 predicted_unreachable: false,
+                physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                    sequence: frame_id,
+                    presentation_time: now,
+                    clock_generation: self.pool_generation,
+                },
+                selection_evidence: Default::default(),
             },
             submit_window: KmsSubmitWindow::try_new(now.get(), now.get(), 0, 0)
                 .expect("test ready frame has a reachable submit window"),
@@ -757,6 +773,11 @@ impl AtomicOutputSwapchain {
                 "an output Atomic commit is already owned by the worker or kernel",
             ));
         }
+        let ready = self
+            .ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        self.validate_later_primary_target(ready.target)?;
         self.ready
             .take()
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))
@@ -779,6 +800,7 @@ impl AtomicOutputSwapchain {
                 "submitted output frame does not match available pending ownership",
             ));
         }
+        self.validate_later_primary_target(frame.target)?;
         self.pending = Some(SubmittedOutputFrame {
             frame,
             token,
@@ -936,6 +958,7 @@ impl AtomicOutputSwapchain {
             ));
         }
         self.pool_generation = pool_generation;
+        self.last_presented_primary_claim = None;
         Ok(())
     }
 
@@ -994,6 +1017,54 @@ impl AtomicOutputSwapchain {
             new_current: self.current,
             presentation_serial: self.presentation_serial,
         })
+    }
+
+    /// Record the phase actually consumed by the primary pageflip.  The
+    /// planned claim remains immutable on the frame; a late physical pageflip
+    /// can therefore invalidate a successor without silently retargeting it.
+    pub(crate) fn note_physical_primary_presentation(
+        &mut self,
+        claim: PrimaryRefreshClaim,
+    ) -> io::Result<()> {
+        self.validate_physical_primary_presentation(claim)?;
+        self.last_presented_primary_claim = Some(claim);
+        Ok(())
+    }
+
+    pub(crate) fn validate_physical_primary_presentation(
+        &self,
+        claim: PrimaryRefreshClaim,
+    ) -> io::Result<()> {
+        if claim.clock_generation != self.pool_generation {
+            return Err(io::Error::other(
+                "physical primary claim belongs to an old output generation",
+            ));
+        }
+        if let Some(last_presented) = self.last_presented_primary_claim
+            && !is_strictly_later_claim(last_presented, claim)
+        {
+            return Err(io::Error::other(
+                "physical primary pageflip did not advance the physical claim frontier",
+            ));
+        }
+        if let Some(pending) = &self.pending
+            && !is_at_or_after_claim(claim, pending.frame.target.physical_claim())
+        {
+            return Err(io::Error::other(
+                "physical primary pageflip preceded its reserved physical claim",
+            ));
+        }
+        if let Some(worker) = &self.worker_queued {
+            validate_strictly_later_claim(claim, worker.frame.target.physical_claim())?;
+        }
+        if let Some(ready) = &self.ready {
+            validate_strictly_later_claim(claim, ready.target.physical_claim())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn last_presented_primary_claim(&self) -> Option<PrimaryRefreshClaim> {
+        self.last_presented_primary_claim
     }
 
     pub(crate) const fn current(&self) -> OutputSlotId {
@@ -1177,8 +1248,10 @@ impl AtomicOutputSwapchain {
         .into_iter()
         .flatten()
         {
+            self.validate_target_claim(frame.target)?;
             if frame.pool_generation != self.pool_generation
                 || frame.target.clock_generation != self.pool_generation
+                || frame.target.physical_claim().clock_generation != self.pool_generation
             {
                 return Err(io::Error::other(
                     "output frame belongs to an old swapchain generation",
@@ -1195,19 +1268,13 @@ impl AtomicOutputSwapchain {
             ]
             .into_iter()
             .flatten()
-            .map(|target| target.opportunity().id()),
+            .map(|target| target.physical_claim().opportunity_id()),
         )
         .map_err(|error| {
             io::Error::other(format!("presentation opportunity frontier: {error:?}"))
         })?;
         let _latest_claim = frontier.latest();
-        if let (Some(pending), Some(worker)) = (&self.pending, &self.worker_queued) {
-            validate_strictly_later_target(pending.frame.target, worker.frame.target)?;
-        }
-        if let Some(ready) = &self.ready {
-            self.validate_later_primary_target(ready.target)?;
-        }
-        Ok(())
+        self.validate_live_future_primary_claims()
     }
 
     pub(crate) fn validate_invariants_for(
@@ -1275,6 +1342,7 @@ impl AtomicOutputSwapchain {
         }
         if frame.pool_generation != self.pool_generation
             || frame.target.clock_generation != self.pool_generation
+            || frame.target.physical_claim().clock_generation != self.pool_generation
             || frame.slot == self.current
             || self.pending_slot() == Some(frame.slot)
             || self.quarantine_slot_id() == Some(frame.slot)
@@ -1284,6 +1352,10 @@ impl AtomicOutputSwapchain {
                 "worker-queued frame identity aliases another output owner",
             ));
         }
+        self.validate_target_claim(frame.target)?;
+        if let Some(last_presented) = self.last_presented_primary_claim {
+            validate_strictly_later_claim(last_presented, frame.target.physical_claim())?;
+        }
         if let Some(pending) = &self.pending {
             validate_strictly_later_target(pending.frame.target, frame.target)?;
         }
@@ -1291,6 +1363,10 @@ impl AtomicOutputSwapchain {
     }
 
     fn validate_later_primary_target(&self, target: PresentationTarget) -> io::Result<()> {
+        self.validate_target_claim(target)?;
+        if let Some(last_presented) = self.last_presented_primary_claim {
+            validate_strictly_later_claim(last_presented, target.physical_claim())?;
+        }
         if let Some(worker) = &self.worker_queued {
             validate_strictly_later_target(worker.frame.target, target)
         } else if let Some(pending) = &self.pending {
@@ -1298,6 +1374,51 @@ impl AtomicOutputSwapchain {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_live_future_primary_claims(&self) -> io::Result<()> {
+        if let Some(last_presented) = self.last_presented_primary_claim {
+            if let Some(worker) = &self.worker_queued {
+                validate_strictly_later_claim(
+                    last_presented,
+                    worker.frame.target.physical_claim(),
+                )?;
+            }
+            if let Some(pending) = &self.pending {
+                validate_strictly_later_claim(
+                    last_presented,
+                    pending.frame.target.physical_claim(),
+                )?;
+            }
+            if let Some(ready) = &self.ready {
+                validate_strictly_later_claim(last_presented, ready.target.physical_claim())?;
+            }
+        }
+        if let (Some(pending), Some(worker)) = (&self.pending, &self.worker_queued) {
+            validate_strictly_later_target(pending.frame.target, worker.frame.target)?;
+        }
+        if let Some(ready) = &self.ready {
+            self.validate_later_primary_target(ready.target)?;
+        }
+        Ok(())
+    }
+
+    fn validate_target_claim(&self, target: PresentationTarget) -> io::Result<()> {
+        let claim = target.physical_claim();
+        if claim.clock_generation != target.clock_generation {
+            return Err(io::Error::other(
+                "presentation target claim belongs to another clock generation",
+            ));
+        }
+        if target.is_binding()
+            && (claim.sequence != target.sequence
+                || claim.presentation_time != target.presentation_time)
+        {
+            return Err(io::Error::other(
+                "reserved presentation target claim does not match its target",
+            ));
+        }
+        Ok(())
     }
 
     fn slot_is_free(&self, slot: OutputSlotId) -> bool {
@@ -1314,15 +1435,34 @@ fn validate_strictly_later_target(
     earlier: PresentationTarget,
     later: PresentationTarget,
 ) -> io::Result<()> {
+    validate_strictly_later_claim(earlier.physical_claim(), later.physical_claim())
+}
+
+fn validate_strictly_later_claim(
+    earlier: PrimaryRefreshClaim,
+    later: PrimaryRefreshClaim,
+) -> io::Result<()> {
     if earlier.clock_generation != later.clock_generation
         || later.sequence <= earlier.sequence
         || later.presentation_time <= earlier.presentation_time
     {
         return Err(io::Error::other(
-            "later output primary target is not strictly ordered",
+            "later output primary physical claim is not strictly ordered",
         ));
     }
     Ok(())
+}
+
+fn is_strictly_later_claim(earlier: PrimaryRefreshClaim, later: PrimaryRefreshClaim) -> bool {
+    earlier.clock_generation == later.clock_generation
+        && later.sequence > earlier.sequence
+        && later.presentation_time > earlier.presentation_time
+}
+
+fn is_at_or_after_claim(current: PrimaryRefreshClaim, planned: PrimaryRefreshClaim) -> bool {
+    current.clock_generation == planned.clock_generation
+        && current.sequence >= planned.sequence
+        && current.presentation_time >= planned.presentation_time
 }
 
 #[cfg(test)]
@@ -1336,7 +1476,10 @@ mod tests {
 
     fn test_render_fence() -> NativeRenderFence {
         let mut pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
         unsafe { libc::close(pipe[1]) };
         NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) })
     }
@@ -1357,6 +1500,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence,
+                presentation_time,
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         }
     }
 
@@ -1430,7 +1579,12 @@ mod tests {
         .expect("test swapchain");
 
         let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
-        let predecessor = test_target(4, 40, PresentationTargetReason::ReactiveDouble);
+        let mut predecessor = test_target(4, 40, PresentationTargetReason::ReactiveDouble);
+        predecessor.physical_claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
         swapchain
             .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
             .expect("predecessor becomes ready");
@@ -1439,7 +1593,12 @@ mod tests {
             .expect("predecessor submits");
 
         let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
-        let successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        let mut successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        successor.physical_claim = PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        };
 
         swapchain
             .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
@@ -1447,5 +1606,188 @@ mod tests {
         swapchain
             .validate_invariants()
             .expect("claim-ordered predecessor and successor");
+    }
+
+    #[test]
+    fn reserved_claim_order_is_rejected_even_when_metadata_looks_later() {
+        let predecessor_claim = PrimaryRefreshClaim {
+            sequence: 4,
+            presentation_time: MonotonicTimestampNs::new(40),
+            clock_generation: 1,
+        };
+        let (mut swapchain, _) = swapchain_with_submitted_claim(predecessor_claim);
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+
+        let error = swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect_err("a reserved successor behind its predecessor must be rejected");
+        assert!(error.to_string().contains("physical claim"));
+    }
+
+    #[test]
+    fn duplicate_physical_claim_is_rejected() {
+        let predecessor_claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        let (mut swapchain, _) = swapchain_with_submitted_claim(predecessor_claim);
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let mut successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        successor.physical_claim = predecessor_claim;
+
+        let error = swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect_err("two live frames cannot claim the same physical refresh");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn physical_predecessor_miss_revalidates_ready_without_mutating_its_claim() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        let mut predecessor = test_target(4, 40, PresentationTargetReason::ReactiveDouble);
+        predecessor.physical_claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
+            .expect("predecessor ready");
+        let predecessor_token = PageFlipToken::new(20).expect("predecessor token");
+        swapchain
+            .submit_ready(predecessor_token, None)
+            .expect("predecessor submitted");
+
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let mut successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        successor.physical_claim = PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        };
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect("successor ready");
+        let ready_before_miss = swapchain.ready_identity().expect("ready identity");
+        swapchain
+            .complete_pageflip(predecessor_token, 1)
+            .expect("predecessor pageflip");
+
+        let error = swapchain
+            .note_physical_primary_presentation(PrimaryRefreshClaim {
+                sequence: 3,
+                presentation_time: MonotonicTimestampNs::new(30),
+                clock_generation: 1,
+            })
+            .expect_err("successor claim is overtaken by the physical miss");
+        assert!(error.to_string().contains("physical claim"));
+        assert_eq!(swapchain.ready_identity(), Some(ready_before_miss));
+    }
+
+    #[test]
+    fn physical_predecessor_miss_revalidates_worker_claim_without_duplicate_submit() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        let mut predecessor = test_target(4, 40, PresentationTargetReason::ReactiveDouble);
+        predecessor.physical_claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
+            .expect("predecessor ready");
+        let predecessor_token = PageFlipToken::new(21).expect("predecessor token");
+        swapchain
+            .submit_ready(predecessor_token, None)
+            .expect("predecessor submitted");
+
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let mut successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        successor.physical_claim = PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        };
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect("successor ready");
+        swapchain
+            .take_ready_for_worker(PageFlipToken::new(22).expect("worker token"), now(1))
+            .expect("successor worker queued");
+        let worker_before_miss = swapchain.worker_queued_identity().expect("worker identity");
+
+        let error = swapchain
+            .note_physical_primary_presentation(PrimaryRefreshClaim {
+                sequence: 3,
+                presentation_time: MonotonicTimestampNs::new(30),
+                clock_generation: 1,
+            })
+            .expect_err("worker successor claim collides with the physical miss");
+        assert!(error.to_string().contains("physical claim"));
+        assert_eq!(swapchain.worker_queued_identity(), Some(worker_before_miss));
+    }
+
+    fn swapchain_with_submitted_claim(
+        claim: PrimaryRefreshClaim,
+    ) -> (AtomicOutputSwapchain, PageFlipToken) {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        let mut predecessor = test_target(
+            claim.sequence,
+            claim.presentation_time.get(),
+            PresentationTargetReason::PredictedPressure,
+        );
+        predecessor.physical_claim = claim;
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
+            .expect("predecessor ready");
+        let token = PageFlipToken::new(30).expect("predecessor token");
+        swapchain
+            .submit_ready(token, None)
+            .expect("predecessor submits");
+        (swapchain, token)
+    }
+
+    const fn now(value: u64) -> MonotonicTimestampNs {
+        MonotonicTimestampNs::new(value)
     }
 }

@@ -104,6 +104,12 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             clock_generation: 1,
             estimated: true,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 70,
+                presentation_time: MonotonicTimestampNs::new(0),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         },
         validation_base: KmsValidationBase::Presented {
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(

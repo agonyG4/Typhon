@@ -106,10 +106,20 @@ pub struct FrameCallbackMetrics {
     pub callback_admission_to_next_commit_us: u64,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCallbackTimingEvidence {
+    pub surface_id: u32,
+    pub commit_ns: u64,
+    pub admission_ns: Option<u64>,
+    pub reaction_ns: Option<u64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct CompositorFrameBatch {
     pub(super) frame_id: u64,
     pub(super) callbacks: Vec<wl_callback::WlCallback>,
+    pub(super) callback_timing: Option<FrameCallbackTimingEvidence>,
     pub(super) callback_commit_ns: Option<u64>,
     pub(super) callback_render_completed_ns: Option<u64>,
     pub(super) callback_admission_ns: Option<u64>,

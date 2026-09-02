@@ -792,6 +792,12 @@ mod tests {
                 clock_generation: 1,
                 estimated: false,
                 predicted_unreachable: false,
+                physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                    sequence: 2,
+                    presentation_time: MonotonicTimestampNs::new(now_ns.saturating_add(1_000_000)),
+                    clock_generation: 1,
+                },
+                selection_evidence: Default::default(),
             }),
             predicted_total_cost: Duration::from_millis(10),
             now: MonotonicTimestampNs::new(now_ns),
@@ -1104,6 +1110,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(6_060_606),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         }));
 
         assert_eq!(scheduler.decision(101), SchedulerDecision::SubmitReady);
@@ -1122,6 +1134,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(18_181_818),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         };
         scheduler.note_ready_frame(Some(target));
 
@@ -1150,6 +1168,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(100),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         }));
 
         assert_eq!(scheduler.decision(101), SchedulerDecision::SubmitReadyLate);

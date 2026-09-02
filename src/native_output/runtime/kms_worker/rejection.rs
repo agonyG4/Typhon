@@ -600,6 +600,12 @@ mod ownership_tests {
             clock_generation: 1,
             estimated: true,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: token,
+                presentation_time: MonotonicTimestampNs::new(10),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         };
         let transaction = Arc::new(
             crate::native_output::OutputTransaction::composited(

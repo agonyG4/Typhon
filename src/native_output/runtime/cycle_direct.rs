@@ -153,6 +153,7 @@ pub(super) fn settle_direct_pageflip(
         submit_returned_ns: submit_returned_at.get(),
         reactive_double: target.reason == PresentationTargetReason::ReactiveDouble,
         target_reason: target.reason,
+        target_selection: target.selection_evidence(),
         previous_primary_sequence: None,
         client_commit_ns: None,
         callback_reaction_ns: None,

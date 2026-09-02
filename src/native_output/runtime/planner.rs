@@ -177,8 +177,9 @@ pub(super) fn plan_visual_target_for_budget(
 
 fn strictly_later_target(earlier: PresentationTarget, later: PresentationTarget) -> bool {
     earlier.clock_generation == later.clock_generation
-        && later.sequence > earlier.sequence
-        && later.presentation_time > earlier.presentation_time
+        && later.physical_claim().clock_generation == earlier.physical_claim().clock_generation
+        && later.physical_claim().sequence > earlier.physical_claim().sequence
+        && later.physical_claim().presentation_time > earlier.physical_claim().presentation_time
 }
 
 #[cfg(test)]
@@ -411,6 +412,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: now,
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         }
     }
 

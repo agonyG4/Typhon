@@ -429,6 +429,12 @@ mod tests {
             clock_generation: 1,
             estimated: false,
             predicted_unreachable: false,
+            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(submit_not_before + 1),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
         }
     }
 

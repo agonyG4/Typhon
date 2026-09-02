@@ -693,8 +693,11 @@ impl Drop for NativeRuntime {
             println!("{}", self.wake_authority.summary_line(&self.event_loop));
             println!(
                 "{}",
-                self.frame_pacing
-                    .summary_line(self.server.verbose_trace_dropped_entries())
+                self.frame_pacing.summary_line(
+                    self.server.verbose_trace_dropped_entries(),
+                    self.presentation_deadline
+                        .target_identity_reuse_after_abandonment(),
+                )
             );
             println!("{}", self.frame_pacing.content_summary_line());
             let transaction_counters = self.output_transactions.counters();
