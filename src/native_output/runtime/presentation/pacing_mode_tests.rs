@@ -133,6 +133,56 @@ fn reactive_advisory_pending_target_does_not_reserve_a_false_o1_frontier() {
 }
 
 #[test]
+fn advisory_predecessor_does_not_make_an_existing_o1_target_churn() {
+    let refresh = Duration::from_nanos(6_060_606);
+    let physical_presented_at = MonotonicTimestampNs::new(1_000_000_000);
+    let now = MonotonicTimestampNs::new(1_000_500_000);
+    let mut planner = PresentationDeadlinePlanner::new(refresh);
+    assert_eq!(planner.note_presented(physical_presented_at), 1);
+
+    let reactive = reactive_or_commit_timing_target(
+        &planner,
+        None,
+        None,
+        now,
+        Duration::from_millis(17),
+    )
+    .expect("reactive target");
+    assert_eq!(reactive.sequence, 4);
+
+    let scheduled = plan_visual_target_for_budget(
+        &mut planner,
+        true,
+        Some(reactive),
+        now,
+        Duration::from_millis(1),
+        true,
+        true,
+        false,
+        None,
+    )
+    .expect("O1 target");
+    assert_eq!(scheduled.sequence, 3);
+    assert_eq!(planner.pre_render_abandoned(), 0);
+
+    let repeated = plan_visual_target_for_budget(
+        &mut planner,
+        true,
+        Some(reactive),
+        now,
+        Duration::from_millis(1),
+        true,
+        true,
+        false,
+        Some(scheduled),
+    )
+    .expect("existing O1 target");
+
+    assert_eq!(repeated, scheduled);
+    assert_eq!(planner.pre_render_abandoned(), 0);
+}
+
+#[test]
 fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
     let refresh = Duration::from_nanos(6_060_606);
     let presented_at = MonotonicTimestampNs::new(1_000_000_000);

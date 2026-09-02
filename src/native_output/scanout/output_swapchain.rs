@@ -1324,3 +1324,128 @@ fn validate_strictly_later_target(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation, PresentedCursorDelivery,
+    };
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_render_fence() -> NativeRenderFence {
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { libc::close(pipe[1]) };
+        NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) })
+    }
+
+    fn test_target(
+        sequence: u64,
+        presentation_time: u64,
+        reason: PresentationTargetReason,
+    ) -> PresentationTarget {
+        let presentation_time = MonotonicTimestampNs::new(presentation_time);
+        PresentationTarget {
+            sequence,
+            presentation_time,
+            submit_not_before: presentation_time,
+            render_start_deadline: presentation_time,
+            refresh_interval: std::time::Duration::from_nanos(10),
+            reason,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        }
+    }
+
+    fn test_frame(
+        swapchain: &AtomicOutputSwapchain,
+        slot: OutputSlotId,
+        target: PresentationTarget,
+    ) -> RenderedOutputFrame {
+        let frame_id = swapchain.next_frame_id();
+        let now = MonotonicTimestampNs::new(frame_id);
+        static NEXT_BATCH: AtomicU64 = AtomicU64::new(1);
+        let batch_id = CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(NEXT_BATCH.fetch_add(1, Ordering::Relaxed))
+                .expect("test batch ID is nonzero"),
+        );
+        RenderedOutputFrame {
+            id: frame_id,
+            transaction_id: OutputTransactionId::new(
+                std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),
+            ),
+            slot,
+            framebuffer_id: FramebufferId::new(
+                frame_id.try_into().expect("test framebuffer ID fits"),
+            )
+            .expect("test framebuffer ID is nonzero"),
+            render_generation: 1,
+            pool_generation: 1,
+            target,
+            submit_window: KmsSubmitWindow::try_new(
+                target.presentation_time.get(),
+                target.submit_not_before().get(),
+                0,
+                0,
+            )
+            .expect("test submit window"),
+            render_fence: test_render_fence(),
+            scene_commit: EglSceneFrameCommit::empty_for_test(),
+            surface_damage: SurfaceDamagePresentation::default(),
+            protocol_batch_id: batch_id,
+            composite_started_at: now,
+            fence_exported_at: now,
+            rendered_at: now,
+            client_commit_ns: None,
+            callback_reaction_ns: None,
+            callback_admission_ns: None,
+            cpu_prepass_duration_ns: 0,
+            cpu_encode_duration_ns: 0,
+            frozen_cursor_plan: FrozenPrimaryCursorPlan {
+                delivery: PresentedCursorDelivery::Hidden,
+                primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy: FrozenCursorTestPolicy::Skip,
+            },
+            frozen_cursor_plane_owner: None,
+            o1_admission: None,
+        }
+    }
+
+    #[test]
+    fn advisory_predecessor_claim_allows_reserved_o1_successor_at_swapchain_boundary() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        let predecessor = test_target(4, 40, PresentationTargetReason::ReactiveDouble);
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
+            .expect("predecessor becomes ready");
+        swapchain
+            .submit_ready(PageFlipToken::new(10).expect("predecessor token"), None)
+            .expect("predecessor submits");
+
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect("advisory metadata must not reject physical claim order");
+        swapchain
+            .validate_invariants()
+            .expect("claim-ordered predecessor and successor");
+    }
+}
