@@ -326,6 +326,14 @@ impl NativeCursorOutputArbitration {
         self.deadline_ns
     }
 
+    /// Return the cursor response deadline only while it is still a future
+    /// temporal boundary.  Matured debt remains pending for disposition and
+    /// exact epoch settlement, but its old timestamp must not poll the owner
+    /// that now controls progress.
+    pub(crate) fn wake_deadline_ns(&self, now_ns: u64) -> Option<u64> {
+        self.deadline_ns.filter(|deadline_ns| *deadline_ns > now_ns)
+    }
+
     #[cfg(test)]
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch

@@ -598,7 +598,7 @@ impl NativeRuntime {
             ),
             explicit_sync_fallback_deadline_ns: self.acquire_watches.next_fallback_deadline_ns(),
             xwayland_timeout_deadline_ns: self.xwayland.next_deadline_ns(),
-            cursor_response_deadline_ns: self.cursor_output_arbitration.deadline_ns(),
+            cursor_response_deadline_ns: self.cursor_output_arbitration.wake_deadline_ns(now_ns),
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
             surface_pacing_deadline_ns: surface_pacing_deadline,

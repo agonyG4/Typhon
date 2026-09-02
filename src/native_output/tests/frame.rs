@@ -919,6 +919,7 @@ fn cursor_output_work_waits_for_the_next_output_deadline() {
     arbitration.request(1, 1_000, 2_000);
 
     assert_eq!(arbitration.deadline_ns(), Some(2_000));
+    assert_eq!(arbitration.wake_deadline_ns(1_999), Some(2_000));
     assert_eq!(
         arbitration.disposition(1_999, false, true),
         NativeCursorOutputDisposition::DeferForPrimary
@@ -927,6 +928,49 @@ fn cursor_output_work_waits_for_the_next_output_deadline() {
         arbitration.disposition(2_000, false, true),
         NativeCursorOutputDisposition::SubmitPlaneDelta
     );
+}
+
+#[test]
+fn matured_cursor_debt_keeps_primary_progress_authority_without_timer_polling() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(7, 1_000, 2_000);
+
+    assert!(arbitration.pending());
+    assert!(arbitration.due(2_000));
+    assert_eq!(
+        arbitration.disposition(2_000, true, true),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+    assert_eq!(arbitration.wake_deadline_ns(2_000), None);
+    assert!(arbitration.pending());
+}
+
+#[test]
+fn matured_hardware_cursor_debt_remains_actionable_without_a_timer() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(7, 1_000, 2_000);
+
+    assert_eq!(
+        arbitration.disposition(2_000, false, true),
+        NativeCursorOutputDisposition::SubmitPlaneDelta
+    );
+    assert_eq!(arbitration.wake_deadline_ns(2_000), None);
+    arbitration.consume(7);
+    assert!(!arbitration.pending());
+}
+
+#[test]
+fn matured_software_cursor_debt_progresses_without_a_timer() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(7, 1_000, 2_000);
+    arbitration.set_software_overlay_pending(true);
+
+    assert_eq!(
+        arbitration.disposition(2_000, false, false),
+        NativeCursorOutputDisposition::SoftwareOverlay
+    );
+    assert_eq!(arbitration.wake_deadline_ns(2_000), None);
+    assert!(arbitration.pending());
 }
 
 #[test]
@@ -980,6 +1024,8 @@ fn cursor_requests_coalesce_and_software_uses_the_same_deadline() {
 
     assert_eq!(arbitration.desired_epoch(), 2);
     assert_eq!(arbitration.deadline_ns(), Some(2_000));
+    assert_eq!(arbitration.wake_deadline_ns(1_999), Some(2_000));
+    assert_eq!(arbitration.wake_deadline_ns(2_000), None);
     assert_eq!(
         arbitration.disposition(2_000, false, false),
         NativeCursorOutputDisposition::SoftwareOverlay
@@ -1114,6 +1160,7 @@ fn busy_cursor_submission_moves_to_the_next_output_deadline() {
     arbitration.defer_after_busy(2_000, 3_000);
 
     assert_eq!(arbitration.deadline_ns(), Some(3_000));
+    assert_eq!(arbitration.wake_deadline_ns(2_000), Some(3_000));
     assert_eq!(
         arbitration.disposition(2_001, false, true),
         NativeCursorOutputDisposition::DeferForPrimary

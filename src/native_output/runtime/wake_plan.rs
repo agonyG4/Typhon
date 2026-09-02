@@ -355,6 +355,18 @@ const fn earliest_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_output::runtime::NativeCursorOutputArbitration;
+
+    fn cursor_wake_plan(
+        arbitration: &NativeCursorOutputArbitration,
+        now_ns: u64,
+    ) -> NativeWakePlan {
+        build_native_wake_plan(NativeWakePlanInputs {
+            now_ns,
+            cursor_response_deadline_ns: arbitration.wake_deadline_ns(now_ns),
+            ..NativeWakePlanInputs::default()
+        })
+    }
 
     #[test]
     fn expired_visual_deadline_is_not_selected_for_worker_blocker() {
@@ -437,6 +449,37 @@ mod tests {
                 .contains(NativeContinuationReason::XwaylandContinuation)
         );
         assert_eq!(plan.deadline, None);
+    }
+
+    #[test]
+    fn future_cursor_response_deadline_is_selected_for_wake() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request(1, 0, 200);
+
+        assert_eq!(
+            cursor_wake_plan(&arbitration, 100).deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorResponse,
+                at_ns: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn matured_cursor_debt_is_not_reinstalled_as_a_timer() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request(1, 0, 100);
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+
+        for _ in 0..128 {
+            let plan = cursor_wake_plan(&arbitration, 100);
+            metrics.observe_plan(plan, 100, None, None);
+            assert!(arbitration.pending());
+        }
+
+        assert_eq!(metrics.runtime_timer_arms, 0);
+        assert_eq!(metrics.past_deadline_arms, 0);
+        assert_eq!(metrics.stale_deadline_rearms, 0);
     }
 
     #[test]
