@@ -86,12 +86,14 @@ rtk cargo test --locked
 rtk git diff --check
 ```
 
-On this Windows host, the Cargo build/test commands stop in `wayland-sys
-v0.31.11` because the native `wayland-server` library and `pkg-config` are not
-available. Only the MSVC Rust target is installed, so a Linux-target run was
-not available. `cargo fmt --check` reports formatter drift only in unrelated
-user-modified frame/pacing/scanout files; the pointer-constraint files are
-formatted. `git diff --check` is clean for the task commits.
+On this Windows host, Cargo check and clippy stop in `wayland-sys v0.31.11`
+because the native `wayland-server` library and `pkg-config` are not
+available. The test run additionally reports missing `libudev` and the
+platform-specific `drm-sys` use of `libc::O_CLOEXEC`. Only the MSVC Rust target
+is installed, so a Linux-target run was not available. `cargo fmt --check`
+reports formatter drift only in unrelated user-modified frame/pacing/scanout
+files; the pointer-constraint files are formatted. `git diff --check` is clean
+for the task commits.
 
 ## Non-claims
 
@@ -99,4 +101,3 @@ This change closes the specified pointer-constraint transaction and timing
 association surface. It does not claim to resolve unrelated frame-clock or
 native-output work currently present in the worktree, nor does it claim that
 every independent input race outside this surface has been redesigned.
-
