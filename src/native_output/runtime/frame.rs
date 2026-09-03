@@ -621,6 +621,7 @@ pub(crate) struct NativePointerConstraintBackendAction {
     pub(crate) restore_position: Option<CompositorOutputPosition>,
     pub(crate) cursor_position: Option<CompositorOutputPosition>,
     pub(crate) cursor_visibility_changed: Option<bool>,
+    pub(crate) region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
 }
 
 impl NativePointerConstraintBackend {
@@ -664,9 +665,11 @@ impl NativePointerConstraintBackend {
             PointerConstraintBackendRequest::ActivateLocked { id } => {
                 self.activate_locked(id, cursor_position)
             }
-            PointerConstraintBackendRequest::ActivateConfined { id, region } => {
-                self.activate_confined(id, cursor_position, region)
-            }
+            PointerConstraintBackendRequest::ActivateConfined {
+                id,
+                region,
+                region_resolution_timing,
+            } => self.activate_confined(id, cursor_position, region, region_resolution_timing),
             PointerConstraintBackendRequest::UpdateConfinedRegion { id, region } => {
                 self.update_confined_region(id, cursor_position, region)
             }
@@ -757,6 +760,7 @@ impl NativePointerConstraintBackend {
         id: PointerConstraintBackendId,
         anchor: CompositorOutputPosition,
         region: OutputRegion,
+        region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
     ) -> NativePointerConstraintBackendAction {
         if let Some(active) = self.active.as_ref() {
             if active.id == id {
@@ -776,6 +780,7 @@ impl NativePointerConstraintBackend {
         self.active = Some(constraint.clone());
         NativePointerConstraintBackendAction {
             activated: Some(constraint),
+            region_resolution_timing,
             ..NativePointerConstraintBackendAction::default()
         }
     }

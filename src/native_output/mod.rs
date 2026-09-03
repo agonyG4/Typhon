@@ -37,6 +37,7 @@ use oblivion_one::compositor::{
     OutputPosition as CompositorOutputPosition, OutputPresentationMode, OutputRegion,
     OwnCompositorServer, PointerAxisComponent, PointerAxisFrame, PointerAxisSource,
     PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
+    PointerConstraintRegionResolutionTiming,
     PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, TearingPolicy, WindowId,

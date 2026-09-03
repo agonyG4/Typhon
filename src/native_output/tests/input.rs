@@ -20,14 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 use wayland_client::{
-    Connection, Dispatch, QueueHandle,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::{registry_queue_init, GlobalListContents},
     protocol::{
         wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
         wl_pointer as client_wl_pointer, wl_registry, wl_seat as client_wl_seat,
         wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
         wl_surface as client_wl_surface,
     },
+    Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,
@@ -1154,6 +1154,7 @@ fn native_pointer_constraint_backend_clamps_warp_when_confined() {
         PointerConstraintBackendRequest::ActivateConfined {
             id,
             region: region.clone(),
+            region_resolution_timing: None,
         },
         anchor,
     );
@@ -1185,6 +1186,7 @@ fn native_pointer_constraint_backend_activates_confined_with_region() {
         PointerConstraintBackendRequest::ActivateConfined {
             id,
             region: region.clone(),
+            region_resolution_timing: None,
         },
         CompositorOutputPosition { x: 10.0, y: 20.0 },
     );
@@ -1345,6 +1347,7 @@ fn native_pointer_constraint_backend_confined_deactivation_does_not_restore_anch
         PointerConstraintBackendRequest::ActivateConfined {
             id,
             region: OutputRegion::from_rect(OutputRect::new(10.0, 20.0, 100.0, 50.0).unwrap()),
+            region_resolution_timing: None,
         },
         CompositorOutputPosition { x: 30.0, y: 40.0 },
     );
@@ -1373,6 +1376,7 @@ fn native_pointer_constraint_backend_updates_confined_region_in_place() {
         PointerConstraintBackendRequest::ActivateConfined {
             id,
             region: OutputRegion::from_rect(OutputRect::new(10.0, 20.0, 100.0, 50.0).unwrap()),
+            region_resolution_timing: None,
         },
         CompositorOutputPosition { x: 30.0, y: 40.0 },
     );

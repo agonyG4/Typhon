@@ -209,7 +209,8 @@ use input::{
 pub use input::{
     OutputPosition, OutputRect, OutputRegion, PointerAxisComponent, PointerAxisFrame,
     PointerAxisSource, PointerConstraintBackendId, PointerConstraintBackendRequest,
-    PointerConstraintMode, PointerConstraintState, PointerMotionSample, RelativePointerMotion,
+    PointerConstraintMode, PointerConstraintRegionResolutionTiming, PointerConstraintState,
+    PointerMotionSample, RelativePointerMotion,
 };
 pub use interaction::X11MoveResizeBeginResult;
 use interaction::{

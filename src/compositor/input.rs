@@ -182,6 +182,12 @@ pub struct PointerConstraintBackendId {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerConstraintRegionResolutionTiming {
+    pub duration_ns: u64,
+    pub thread_cpu_ns: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointerConstraintBackendRequest {
     ActivateLocked {
@@ -190,6 +196,7 @@ pub enum PointerConstraintBackendRequest {
     ActivateConfined {
         id: PointerConstraintBackendId,
         region: OutputRegion,
+        region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
     },
     UpdateConfinedRegion {
         id: PointerConstraintBackendId,

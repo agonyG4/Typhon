@@ -1009,7 +1009,7 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
 }
 
 #[test]
-fn confined_pointer_activation_queues_backend_region_for_mapped_surface() {
+fn confined_pointer_activation_queues_sober_shaped_backend_region_without_area_scan() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -1032,7 +1032,7 @@ fn confined_pointer_activation_queues_backend_region_for_mapped_surface() {
     let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
         globals.bind(&qh, 1..=1, ()).unwrap();
     let (surface, _xdg_surface, _toplevel) =
-        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 40, 30).unwrap();
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 1_920, 929).unwrap();
     surface.commit();
     connection.flush().unwrap();
 
@@ -1075,8 +1075,8 @@ fn confined_pointer_activation_queues_backend_region_for_mapped_surface() {
     let rect = region.rects[0];
     assert_eq!(rect.x, f64::from(render::FIRST_SURFACE_OFFSET.0));
     assert_eq!(rect.y, f64::from(render::FIRST_SURFACE_OFFSET.1));
-    assert_eq!(rect.width, 40.0);
-    assert_eq!(rect.height, 30.0);
+    assert_eq!(rect.width, 1_920.0);
+    assert_eq!(rect.height, 929.0);
 }
 
 #[test]

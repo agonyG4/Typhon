@@ -2,6 +2,8 @@ use std::{
     io,
     sync::{Arc, Mutex},
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel};
 use wayland_server::{
@@ -358,6 +360,9 @@ pub(super) struct SurfaceData {
     input_region: Mutex<SurfaceInputRegionState>,
     opaque_region: Mutex<SurfaceInputRegionState>,
 }
+
+#[cfg(test)]
+static INPUT_REGION_SNAPSHOT_LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub(super) struct PendingSurfaceDamage {
@@ -766,6 +771,25 @@ impl SurfaceData {
         let changed = state.committed != pending;
         state.committed = pending;
         changed
+    }
+
+    pub(super) fn committed_input_region_snapshot(&self) -> SurfaceInputRegion {
+        #[cfg(test)]
+        INPUT_REGION_SNAPSHOT_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.input_region
+            .lock()
+            .map(|state| state.committed.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_input_region_snapshot_lock_count() {
+        INPUT_REGION_SNAPSHOT_LOCK_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn input_region_snapshot_lock_count() -> usize {
+        INPUT_REGION_SNAPSHOT_LOCK_COUNT.load(Ordering::Relaxed)
     }
 
     pub(super) fn input_region_contains(
@@ -1204,7 +1228,7 @@ pub(super) enum InputRegionOp {
 }
 
 impl InputRegionOp {
-    const fn rect(self) -> InputRegionRect {
+    pub(super) const fn rect(self) -> InputRegionRect {
         match self {
             Self::Add(rect) | Self::Subtract(rect) => rect,
         }
@@ -1233,10 +1257,16 @@ impl InputRegionRect {
     }
 
     fn contains(self, surface_x: f64, surface_y: f64) -> bool {
+        let right = i64::from(self.x).saturating_add(i64::from(self.width));
+        let bottom = i64::from(self.y).saturating_add(i64::from(self.height));
         surface_x >= f64::from(self.x)
             && surface_y >= f64::from(self.y)
-            && surface_x < f64::from(self.x.saturating_add(self.width))
-            && surface_y < f64::from(self.y.saturating_add(self.height))
+            && surface_x < right as f64
+            && surface_y < bottom as f64
+    }
+
+    pub(super) const fn coordinates(self) -> (i32, i32, i32, i32) {
+        (self.x, self.y, self.width, self.height)
     }
 }
 

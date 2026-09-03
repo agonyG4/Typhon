@@ -106,14 +106,29 @@ rtk cargo test: BLOCKED
   same existing pointer-constraint integration compilation errors
 ```
 
-The frame-pacing-specific test groups passed on the clean v2.1 tree before the
-unrelated pointer-constraint edits made the shared checkout uncompilable:
+The frame-pacing-specific test groups passed in a disposable worktree at the
+v2.1 commit. That worktree disabled only the baseline pointer-constraint test
+module, which references helpers absent from the committed baseline; no v2.1
+source was changed for the workaround:
 
 ```text
 rtk cargo test native_output::pacing: 30 passed
 rtk cargo test native_output::runtime::dmabuf_release: 32 passed
 rtk cargo test native_output::tests::presentation_transactions: 62 passed
 rtk git diff --check: PASS
+```
+
+The same disposable worktree produced a clean production compile and clippy
+run after suppressing that baseline test-module warning. The unmodified full
+suite then reached 2,007 passed tests, 1 unrelated native KMS failure, and 2
+ignored tests:
+
+```text
+rtk cargo check: PASS (1 pre-existing unused-import warning)
+rtk cargo clippy --all-targets --all-features -- -D warnings: PASS with the
+  disposable baseline test-module workaround
+rtk cargo test: 2007 passed, 1 failed, 2 ignored
+  failed: native::kms::tests::explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success
 ```
 
 ## Native qualification

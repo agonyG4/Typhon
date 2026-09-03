@@ -82,6 +82,8 @@ pub(crate) struct NativePointerPreReadObservation {
     pub(crate) constraint_activation_end: Option<NativePointerTimingPoint>,
     pub(crate) wayland_flush_start: Option<NativePointerTimingPoint>,
     pub(crate) wayland_flush_end: Option<NativePointerTimingPoint>,
+    pub(crate) constraint_region_resolution_duration_ns: Option<u64>,
+    pub(crate) constraint_region_resolution_thread_cpu_ns: Option<u64>,
     pub(crate) batch: Option<NativePointerTimingBatch>,
 }
 
@@ -153,6 +155,8 @@ struct NativePointerTimingRecord {
     wayland_flush_end_at_ns: Option<u64>,
     wayland_flush_start_thread_cpu_ns: Option<u64>,
     wayland_flush_end_thread_cpu_ns: Option<u64>,
+    constraint_region_resolution_duration_ns: Option<u64>,
+    constraint_region_resolution_thread_cpu_ns: Option<u64>,
     cursor_sync_start_at_ns: Option<u64>,
     cursor_sync_end_at_ns: Option<u64>,
     dispatch_return_at_ns: Option<u64>,
@@ -325,6 +329,10 @@ impl NativePointerTimingTrace {
             wayland_flush_end_thread_cpu_ns: pre_read
                 .wayland_flush_end
                 .and_then(|point| point.thread_cpu_ns),
+            constraint_region_resolution_duration_ns: pre_read
+                .constraint_region_resolution_duration_ns,
+            constraint_region_resolution_thread_cpu_ns: pre_read
+                .constraint_region_resolution_thread_cpu_ns,
             ..Default::default()
         });
         self.active_slot = Some(slot);
@@ -655,7 +663,7 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} routing_transition_thread_cpu_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} wayland_read_thread_cpu_ns={} pre_read_probe_duration_ns={} pre_read_probe_thread_cpu_ns={} probe_end_to_wayland_read_start_ns={} probe_end_to_wayland_read_start_thread_cpu_ns={} wayland_read_end_to_settlement_start_ns={} wayland_read_end_to_settlement_start_thread_cpu_ns={} constraint_settlement_duration_ns={} constraint_settlement_thread_cpu_ns={} constraint_activation_duration_ns={} constraint_activation_thread_cpu_ns={} wayland_flush_duration_ns={} wayland_flush_thread_cpu_ns={} settlement_end_to_transition_ns={} settlement_end_to_transition_thread_cpu_ns={} pre_read_probe_to_transition_ns={} pre_read_probe_to_transition_thread_cpu_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} routing_transition_thread_cpu_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} wayland_read_thread_cpu_ns={} pre_read_probe_duration_ns={} pre_read_probe_thread_cpu_ns={} probe_end_to_wayland_read_start_ns={} probe_end_to_wayland_read_start_thread_cpu_ns={} wayland_read_end_to_settlement_start_ns={} wayland_read_end_to_settlement_start_thread_cpu_ns={} constraint_settlement_duration_ns={} constraint_settlement_thread_cpu_ns={} constraint_activation_duration_ns={} constraint_activation_thread_cpu_ns={} wayland_flush_duration_ns={} wayland_flush_thread_cpu_ns={} constraint_region_resolution_duration_ns={} constraint_region_resolution_thread_cpu_ns={} settlement_end_to_transition_ns={} settlement_end_to_transition_thread_cpu_ns={} pre_read_probe_to_transition_ns={} pre_read_probe_to_transition_thread_cpu_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
         record.routing_transition_committed_at_ns,
         record
             .routing_transition_thread_cpu_ns
@@ -683,6 +691,14 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         constraint_activation_thread_cpu_ns,
         wayland_flush_duration_ns,
         wayland_flush_thread_cpu_ns,
+        record
+            .constraint_region_resolution_duration_ns
+            .map(|duration| duration.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        record
+            .constraint_region_resolution_thread_cpu_ns
+            .map(|duration| duration.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
         settlement_end_to_transition_ns,
         settlement_end_to_transition_thread_cpu_ns,
         pre_read_probe_to_transition_ns,
@@ -986,6 +1002,24 @@ mod tests {
         assert!(summary.contains("settlement_end_to_transition_thread_cpu_ns=20"));
         assert!(summary.contains("pre_read_probe_to_transition_ns=110"));
         assert!(summary.contains("pre_read_probe_to_transition_thread_cpu_ns=110"));
+    }
+
+    #[test]
+    fn timing_summary_keeps_constraint_region_resolution_evidence_with_transition() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read(
+            test_transition(),
+            200,
+            NativePointerPreReadObservation {
+                constraint_region_resolution_duration_ns: Some(37),
+                constraint_region_resolution_thread_cpu_ns: Some(19),
+                ..Default::default()
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("constraint_region_resolution_duration_ns=37"));
+        assert!(summary.contains("constraint_region_resolution_thread_cpu_ns=19"));
     }
 
     #[test]

@@ -211,22 +211,20 @@ fn abandon_overtaken_worker_queued(
         owner.frame.target,
         owner.frame.frame_id,
     ) {
-        KmsWorkerQueuedCancellation::Cancelled(job) => {
-            drop_queued_worker_job_with_reason_parts(
-                *job,
-                OutputTransactionDropReason::SafeAbandonment,
-                scene_history,
-                explicit,
-                frame_pacing,
-                frame_scheduler,
-                atomic_cursor,
-                cursor_output_arbitration,
-                atomic_commit_arbiter,
-                server,
-                output_transactions,
-                Some(worker),
-            )
-        }
+        KmsWorkerQueuedCancellation::Cancelled(job) => drop_queued_worker_job_with_reason_parts(
+            *job,
+            OutputTransactionDropReason::SafeAbandonment,
+            scene_history,
+            explicit,
+            frame_pacing,
+            frame_scheduler,
+            atomic_cursor,
+            cursor_output_arbitration,
+            atomic_commit_arbiter,
+            server,
+            output_transactions,
+            Some(worker),
+        ),
         KmsWorkerQueuedCancellation::NotQueued { phase } => Err(io::Error::other(format!(
             "overtaken worker primary crossed ownership boundary before cancellation: {phase:?}"
         ))

@@ -923,6 +923,10 @@ impl NativeRuntime {
                     constraint_activation_end: evidence.action_timing.activation_end,
                     wayland_flush_start: evidence.action_timing.wayland_flush_start,
                     wayland_flush_end: evidence.action_timing.wayland_flush_end,
+                    constraint_region_resolution_duration_ns: evidence
+                        .constraint_region_resolution_duration_ns,
+                    constraint_region_resolution_thread_cpu_ns: evidence
+                        .constraint_region_resolution_thread_cpu_ns,
                     ..Default::default()
                 },
             );
@@ -1352,11 +1356,17 @@ impl NativeRuntime {
             pre_read_observation.constraint_activation_end = evidence.action_timing.activation_end;
             pre_read_observation.wayland_flush_start = evidence.action_timing.wayland_flush_start;
             pre_read_observation.wayland_flush_end = evidence.action_timing.wayland_flush_end;
+            pre_read_observation.constraint_region_resolution_duration_ns = evidence
+                .constraint_region_resolution_duration_ns;
+            pre_read_observation.constraint_region_resolution_thread_cpu_ns = evidence
+                .constraint_region_resolution_thread_cpu_ns;
         } else {
             pre_read_observation.constraint_activation_start = None;
             pre_read_observation.constraint_activation_end = None;
             pre_read_observation.wayland_flush_start = None;
             pre_read_observation.wayland_flush_end = None;
+            pre_read_observation.constraint_region_resolution_duration_ns = None;
+            pre_read_observation.constraint_region_resolution_thread_cpu_ns = None;
         }
         redraw_requested |= final_settlement.redraw_requested;
         if routing_transition.is_none() {

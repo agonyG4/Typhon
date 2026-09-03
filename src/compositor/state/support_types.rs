@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(in crate::compositor) fn coalesce_output_row_rects(rects: Vec<OutputRect>) -> Vec<OutputRect> {
     let mut coalesced: Vec<OutputRect> = Vec::new();
     for rect in rects {

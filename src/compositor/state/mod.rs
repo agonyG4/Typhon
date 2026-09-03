@@ -101,6 +101,7 @@ pub(in crate::compositor) use output_membership::*;
 pub(in crate::compositor) use output_state::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use pointer_constraints::*;
+pub(in crate::compositor) use pointer_constraint_region::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
 pub(in crate::compositor) use roles::*;

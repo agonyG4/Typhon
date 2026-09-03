@@ -631,7 +631,8 @@ impl CompositorState {
                 PointerConstraintBackendRequest::ActivateLocked { id: backend_id }
             }
             PointerConstraintMode::Confined => {
-                let Some(region) = self.pointer_constraint_output_region(constraint_id) else {
+                let Some(resolved) = self.pointer_constraint_output_region_with_timing(constraint_id)
+                else {
                     pointer_debug_log(format!(
                         "constraint activation skipped id={} reason=region_unresolved mode={:?}",
                         constraint_id, mode
@@ -640,7 +641,8 @@ impl CompositorState {
                 };
                 PointerConstraintBackendRequest::ActivateConfined {
                     id: backend_id,
-                    region,
+                    region: resolved.region,
+                    region_resolution_timing: resolved.timing,
                 }
             }
             PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
@@ -712,6 +714,14 @@ impl CompositorState {
         &mut self,
         constraint_id: u64,
     ) -> Option<OutputRegion> {
+        self.pointer_constraint_output_region_with_timing(constraint_id)
+            .map(|resolved| resolved.region)
+    }
+
+    pub(in crate::compositor) fn pointer_constraint_output_region_with_timing(
+        &mut self,
+        constraint_id: u64,
+    ) -> Option<ResolvedPointerConstraintRegion> {
         let (surface_id, constraint_region, surface_resource) = self
             .pointer_constraints
             .get(&constraint_id)
@@ -731,61 +741,14 @@ impl CompositorState {
         let origin = self.surface_origin_cache.get(index).copied()?;
         let input_region = surface_resource
             .data::<SurfaceData>()
-            .map(|data| {
-                let mut rows = Vec::new();
-                for y in 0..renderable.height {
-                    let mut run_start = None;
-                    for x in 0..renderable.width {
-                        let surface_x = f64::from(x);
-                        let surface_y = f64::from(y);
-                        let contained = constraint_region.contains(
-                            surface_x,
-                            surface_y,
-                            renderable.width,
-                            renderable.height,
-                        ) && data.input_region_contains(
-                            surface_x,
-                            surface_y,
-                            renderable.width,
-                            renderable.height,
-                        );
-                        match (run_start, contained) {
-                            (None, true) => run_start = Some(x),
-                            (Some(start), false) => {
-                                if let Some(rect) = OutputRect::new(
-                                    f64::from(origin.0 + start as i32),
-                                    f64::from(origin.1 + y as i32),
-                                    f64::from(x - start),
-                                    1.0,
-                                ) {
-                                    rows.push(rect);
-                                }
-                                run_start = None;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some(start) = run_start
-                        && let Some(rect) = OutputRect::new(
-                            f64::from(origin.0 + start as i32),
-                            f64::from(origin.1 + y as i32),
-                            f64::from(renderable.width - start),
-                            1.0,
-                        )
-                    {
-                        rows.push(rect);
-                    }
-                }
-                rows
-            })
-            .unwrap_or_default();
-        if input_region.is_empty() {
-            None
-        } else {
-            Some(OutputRegion {
-                rects: coalesce_output_row_rects(input_region),
-            })
-        }
+            .map(SurfaceData::committed_input_region_snapshot)?;
+        resolve_pointer_constraint_output_region_with_timing(
+            &constraint_region,
+            &input_region,
+            renderable.width,
+            renderable.height,
+            origin,
+        )
     }
 
     pub(in crate::compositor) fn resolve_pointer_constraint_backend_request(

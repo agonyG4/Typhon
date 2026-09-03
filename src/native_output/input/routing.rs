@@ -1562,6 +1562,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                     &mut selected_transition,
                     transition,
                     action_timing,
+                    action.region_resolution_timing,
                 );
             }
             if let Some(visible) = action.cursor_visibility_changed {
@@ -1587,11 +1588,16 @@ fn select_pointer_transition_evidence(
     selected: &mut Option<NativePointerTransitionEvidence>,
     transition: NativeInputRoutingTransition,
     action_timing: NativePointerConstraintActionTiming,
+    region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
 ) {
     if selected.is_none() {
         *selected = Some(NativePointerTransitionEvidence {
             transition,
             action_timing,
+            constraint_region_resolution_duration_ns:
+                region_resolution_timing.map(|timing| timing.duration_ns),
+            constraint_region_resolution_thread_cpu_ns: region_resolution_timing
+                .and_then(|timing| timing.thread_cpu_ns),
         });
     }
 }
@@ -1634,6 +1640,8 @@ pub(crate) enum NativeInputRoutingTransition {
 pub(crate) struct NativePointerTransitionEvidence {
     pub(crate) transition: NativeInputRoutingTransition,
     pub(crate) action_timing: NativePointerConstraintActionTiming,
+    pub(crate) constraint_region_resolution_duration_ns: Option<u64>,
+    pub(crate) constraint_region_resolution_thread_cpu_ns: Option<u64>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1857,14 +1865,16 @@ mod routing_transition_tests {
         let timing_b = timing(200, 20);
         let mut selected = None;
 
-        select_pointer_transition_evidence(&mut selected, transition_a, timing_a);
-        select_pointer_transition_evidence(&mut selected, transition_b, timing_b);
+        select_pointer_transition_evidence(&mut selected, transition_a, timing_a, None);
+        select_pointer_transition_evidence(&mut selected, transition_b, timing_b, None);
 
         assert_eq!(
             selected,
             Some(NativePointerTransitionEvidence {
                 transition: transition_a,
                 action_timing: timing_a,
+                constraint_region_resolution_duration_ns: None,
+                constraint_region_resolution_thread_cpu_ns: None,
             })
         );
     }
@@ -1875,9 +1885,31 @@ mod routing_transition_tests {
         let action_timing = timing(200, 20);
         let mut selected = None;
 
-        select_pointer_transition_evidence(&mut selected, transition, action_timing);
+        select_pointer_transition_evidence(&mut selected, transition, action_timing, None);
 
         assert_eq!(selected.unwrap().action_timing, action_timing);
+    }
+
+    #[test]
+    fn selected_confined_activation_keeps_region_resolution_timing_with_transition() {
+        let transition = NativeInputRoutingTransition::ConfinedActivated(id(22, 4));
+        let mut selected = None;
+        select_pointer_transition_evidence(
+            &mut selected,
+            transition,
+            NativePointerConstraintActionTiming::default(),
+            Some(PointerConstraintRegionResolutionTiming {
+                duration_ns: 37,
+                thread_cpu_ns: Some(19),
+            }),
+        );
+
+        let selected = selected.expect("transition evidence");
+        assert_eq!(selected.constraint_region_resolution_duration_ns, Some(37));
+        assert_eq!(
+            selected.constraint_region_resolution_thread_cpu_ns,
+            Some(19)
+        );
     }
 
     #[test]
@@ -1909,6 +1941,7 @@ mod routing_transition_tests {
             PointerConstraintBackendRequest::ActivateConfined {
                 id: rejected_id,
                 region: OutputRegion::from_rect(OutputRect::new(0.0, 0.0, 10.0, 10.0).unwrap()),
+                region_resolution_timing: None,
             },
             CompositorOutputPosition { x: 1.0, y: 2.0 },
         );
@@ -1937,6 +1970,7 @@ mod routing_transition_tests {
             PointerConstraintBackendRequest::ActivateConfined {
                 id: constraint_id,
                 region: OutputRegion::from_rect(OutputRect::new(0.0, 0.0, 10.0, 10.0).unwrap()),
+                region_resolution_timing: None,
             },
             CompositorOutputPosition { x: 1.0, y: 2.0 },
         );
