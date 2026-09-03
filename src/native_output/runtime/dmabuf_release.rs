@@ -86,6 +86,7 @@ pub(crate) enum DmabufGpuReleaseOrigin {
     Uncorrelated,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DmabufCorrelationNoPageflipReason {
     SafeAbandonment,
@@ -284,13 +285,13 @@ impl DmabufGpuReleaseObservability {
     fn note_timestamp_unavailable(&mut self, origin: DmabufGpuReleaseOrigin) {
         self.summary.signal_timestamp_unavailable =
             self.summary.signal_timestamp_unavailable.saturating_add(1);
-        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
-            if self.correlations.remove(&transaction_id).is_some() {
-                self.summary.correlations_unpairable_signal_timestamp = self
-                    .summary
-                    .correlations_unpairable_signal_timestamp
-                    .saturating_add(1);
-            }
+        if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin
+            && self.correlations.remove(&transaction_id).is_some()
+        {
+            self.summary.correlations_unpairable_signal_timestamp = self
+                .summary
+                .correlations_unpairable_signal_timestamp
+                .saturating_add(1);
         }
     }
 

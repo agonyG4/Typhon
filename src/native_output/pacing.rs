@@ -1814,10 +1814,7 @@ impl NativeFramePacing {
             .zip(observation.callback_admission_ns)
             .is_some_and(
                 |(((_surface_id, reaction_ns), _commit_ns), _admission_ns)| {
-                    reaction_ns <= fast_client_threshold_ns
-                        && !callback_handoff_limited
-                        && previous_primary_sequence.is_some()
-                        && actual_primary_distance > 0
+                    reaction_ns <= fast_client_threshold_ns && !callback_handoff_limited
                 },
             );
         let fast_interval_us = self
