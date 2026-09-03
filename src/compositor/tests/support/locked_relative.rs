@@ -75,6 +75,7 @@ pub(in crate::compositor::tests) fn locked_relative_motion_survives_stale_hit_te
         &qh,
         (),
     );
+    parent.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -157,6 +158,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_targets_exact_sou
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -219,6 +221,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_falls_back_to_sam
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -280,6 +283,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_fallback_does_not
         &locked_qh,
         (),
     );
+    locked_surface.commit();
     locked_connection.flush()?;
     wait_for_server_commands(commands);
     locked_queue.roundtrip(&mut locked_state)?;
@@ -367,6 +371,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_dispatches_to_all
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -453,6 +458,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_shared_source_poi
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -530,6 +536,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_different_source_
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -620,6 +627,7 @@ pub(in crate::compositor::tests) fn run_multi_client_pointer_constraints_remain_
         &queue_a.handle(),
         (),
     );
+    surface_a.commit();
     connection_a.flush()?;
     wait_for_server_commands(commands);
     queue_a.roundtrip(&mut state_a)?;
@@ -651,6 +659,7 @@ pub(in crate::compositor::tests) fn run_multi_client_pointer_constraints_remain_
         &queue_b.handle(),
         (),
     );
+    surface_b.commit();
     connection_b.flush()?;
     wait_for_server_commands(commands);
     queue_b.roundtrip(&mut state_b)?;
@@ -746,6 +755,7 @@ pub(in crate::compositor::tests) fn run_locked_relative_motion_survives_surface_
         &qh,
         (),
     );
+    parent.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;

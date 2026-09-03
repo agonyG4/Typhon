@@ -175,6 +175,7 @@ fn confined_pointer_warp_clamps_before_compositor_and_backend_position_changes()
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -968,6 +969,7 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1053,6 +1055,7 @@ fn confined_pointer_activation_queues_backend_region_for_mapped_surface() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1123,6 +1126,7 @@ fn confined_pointer_motion_beyond_window_border_clamps_without_leave_or_unconfin
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1217,6 +1221,7 @@ fn confined_pointer_activation_region_intersects_constraint_and_input_regions() 
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1287,6 +1292,7 @@ fn confined_pointer_set_region_updates_backend_only_after_surface_commit() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     let requests = capture_pointer_constraint_backend_requests(&commands);
@@ -1382,6 +1388,7 @@ fn locked_pointer_destroy_restores_committed_cursor_position_hint() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1394,6 +1401,7 @@ fn locked_pointer_destroy_restores_committed_cursor_position_hint() {
     queue.roundtrip(&mut state).unwrap();
 
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1477,6 +1485,7 @@ fn locked_pointer_unlock_without_hint_restores_exact_activation_anchor() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1497,6 +1506,7 @@ fn locked_pointer_unlock_without_hint_restores_exact_activation_anchor() {
     queue.roundtrip(&mut state).unwrap();
 
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     let deactivation_requests = capture_pointer_constraint_backend_requests(&commands);
@@ -1572,6 +1582,7 @@ fn pending_uncommitted_cursor_hint_is_not_used_on_unlock() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1646,6 +1657,7 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1655,6 +1667,7 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
     lock.set_cursor_position_hint(120.0, 0.0);
     surface.commit();
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1775,6 +1788,7 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1784,6 +1798,7 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
     lock.set_cursor_position_hint(120.0, 0.0);
     surface.commit();
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1893,6 +1908,7 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1900,6 +1916,7 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     let _ = capture_pointer_constraint_backend_requests(&commands);
 
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1998,6 +2015,7 @@ fn invalid_cursor_position_hint_cannot_teleport_pointer() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -2006,6 +2024,7 @@ fn invalid_cursor_position_hint_cannot_teleport_pointer() {
     lock.set_cursor_position_hint(f64::NAN, f64::INFINITY);
     surface.commit();
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     let (reply, receiver) = mpsc::channel();
@@ -2072,6 +2091,7 @@ fn pointer_release_deactivates_locked_constraint() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -2140,6 +2160,7 @@ fn backend_pointer_constraint_failure_marks_constraint_defunct() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();

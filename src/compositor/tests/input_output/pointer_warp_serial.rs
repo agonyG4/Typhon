@@ -219,12 +219,14 @@ fn current_pointer_enter_serial_survives_repeated_lock_unlock_cycles() {
             &fixture.queue.handle(),
             (),
         );
+        fixture.surface.surface.commit();
         fixture.connection.flush().unwrap();
         fixture.process();
         activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
             .unwrap();
 
         lock.destroy();
+        fixture.surface.surface.commit();
         fixture.connection.flush().unwrap();
         fixture.process();
     }
@@ -391,6 +393,7 @@ fn v11_lock_restore_uses_warp_without_relative_motion() {
         &fixture.queue.handle(),
         (),
     );
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
@@ -400,6 +403,7 @@ fn v11_lock_restore_uses_warp_without_relative_motion() {
     lock.set_cursor_position_hint(restore_local.0, restore_local.1);
     fixture.surface.surface.commit();
     lock.destroy();
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     let requests = capture_pointer_constraint_backend_requests(&fixture.commands);
@@ -473,6 +477,7 @@ fn v11_client_warp_after_backend_ack_settles_unlock() {
         &fixture.queue.handle(),
         (),
     );
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
@@ -481,6 +486,7 @@ fn v11_client_warp_after_backend_ack_settles_unlock() {
     lock.set_cursor_position_hint(120.0, 0.0);
     fixture.surface.surface.commit();
     lock.destroy();
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
@@ -562,6 +568,7 @@ fn pending_unlock_accepts_same_client_cross_surface_warp() {
         &fixture.queue.handle(),
         (),
     );
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
@@ -570,6 +577,7 @@ fn pending_unlock_accepts_same_client_cross_surface_warp() {
     lock.set_cursor_position_hint(120.0, 0.0);
     fixture.surface.surface.commit();
     lock.destroy();
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
@@ -642,14 +650,15 @@ fn stale_backend_deactivation_cannot_settle_newer_constraint() {
         &fixture.queue.handle(),
         (),
     );
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     activate_backend_locked_pointer(&fixture.commands, &mut fixture.state, &mut fixture.queue)
         .unwrap();
 
     lock_one.set_cursor_position_hint(120.0, 0.0);
-    fixture.surface.surface.commit();
     lock_one.destroy();
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     let unlock_requests = capture_pointer_constraint_backend_requests(&fixture.commands);
@@ -669,6 +678,7 @@ fn stale_backend_deactivation_cannot_settle_newer_constraint() {
         &fixture.queue.handle(),
         (),
     );
+    fixture.surface.surface.commit();
     fixture.connection.flush().unwrap();
     fixture.process();
     let newer_requests = capture_pointer_constraint_backend_requests(&fixture.commands);

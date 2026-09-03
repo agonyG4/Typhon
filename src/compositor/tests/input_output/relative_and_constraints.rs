@@ -401,6 +401,7 @@ fn pre_read_native_input_epoch_keeps_old_delta_from_new_relative_pointer() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
 
     // This is the real-resource semantic-cut regression for the native
@@ -531,6 +532,7 @@ fn native_input_epoch_defers_mid_batch_wayland_progression() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
 
     commands
@@ -618,6 +620,7 @@ fn locked_activation_resolves_anchor_at_settlement_position() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -925,6 +928,7 @@ fn locked_relative_motion_ignores_destroyed_same_client_relative_pointer() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1106,6 +1110,7 @@ fn locked_constraint_activation_anchor_uses_settlement_position() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1132,6 +1137,7 @@ fn locked_constraint_activation_anchor_uses_settlement_position() {
     queue.roundtrip(&mut state).unwrap();
 
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     let deactivation_requests = capture_pointer_constraint_backend_requests(&commands);
@@ -1212,6 +1218,7 @@ fn locked_pointer_button_transitions_do_not_clear_relative_motion_route() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1319,6 +1326,7 @@ fn locked_relative_motion_does_not_wait_for_button_frame() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1482,12 +1490,14 @@ fn locked_pointer_destroy_clears_active_routing() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     activate_backend_locked_pointer(&commands, &mut state, &mut queue).unwrap();
 
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1581,6 +1591,7 @@ fn same_surface_lock_from_different_pointer_resource_is_rejected() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
 
@@ -1648,9 +1659,13 @@ fn pending_oneshot_locked_destroy_removes_queued_activation() {
         &qh,
         (),
     );
-    lock.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    lock.set_cursor_position_hint(70.0, 50.0);
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1729,9 +1744,13 @@ fn pending_oneshot_locked_destroy_uses_v11_warp_delivery() {
         &qh,
         (),
     );
-    lock.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    lock.set_cursor_position_hint(70.0, 50.0);
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1954,9 +1973,13 @@ fn pending_oneshot_committed_hint_destroy_warps_without_activation() {
         &qh,
         (),
     );
-    lock.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    lock.set_cursor_position_hint(70.0, 50.0);
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -2187,9 +2210,13 @@ fn pending_persistent_hint_destroy_is_not_reinterpreted_as_oneshot_warp() {
         &qh,
         (),
     );
-    lock.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    lock.set_cursor_position_hint(70.0, 50.0);
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
 
@@ -2255,12 +2282,14 @@ fn active_lock_then_oneshot_warp_fallback_does_not_block_next_lock() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     activate_backend_locked_pointer(&commands, &mut state, &mut queue).unwrap();
 
     lock_a.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -2279,9 +2308,13 @@ fn active_lock_then_oneshot_warp_fallback_does_not_block_next_lock() {
         &qh,
         (),
     );
-    lock_b.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    lock_b.set_cursor_position_hint(70.0, 50.0);
     lock_b.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -2306,6 +2339,7 @@ fn active_lock_then_oneshot_warp_fallback_does_not_block_next_lock() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();

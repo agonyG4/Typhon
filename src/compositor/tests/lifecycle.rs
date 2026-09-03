@@ -702,6 +702,7 @@ fn disconnect_removes_pointer_constraints_for_destroyed_surfaces() {
             &qh,
             (),
         );
+        surface.commit();
         connection.flush().unwrap();
         queue.roundtrip(&mut RegistryTestState::default()).unwrap();
         wait_for_server_commands(&commands);

@@ -419,6 +419,7 @@ pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_mo
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -538,6 +539,7 @@ pub(in crate::compositor::tests) fn late_pointer_lock_activate_and_receive_relat
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -621,6 +623,7 @@ pub(in crate::compositor::tests) fn lock_activation_repairs_missing_source_point
         &qh,
         (),
     );
+    surface.commit();
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;

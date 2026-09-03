@@ -483,7 +483,8 @@ impl CompositorState {
     ) -> bool {
         let surface_id = compositor_surface_id(&registration.surface);
         let existing = self.pointer_constraints.values().find(|constraint| {
-            !constraint.defunct && same_surface_resource(&constraint.surface, &registration.surface)
+            constraint.committed
+                && same_surface_resource(&constraint.surface, &registration.surface)
         });
         let pending_install = self
             .pending_pointer_constraint_surface_states
@@ -547,11 +548,7 @@ impl CompositorState {
                 committed_cursor_position_hint: None,
             },
         );
-        self.stage_pointer_constraint_install(
-            surface_id,
-            registration.id,
-            registration.region,
-        );
+        self.stage_pointer_constraint_install(surface_id, registration.id, registration.region);
         true
     }
 
@@ -1043,12 +1040,16 @@ impl CompositorState {
         }
         match mode {
             PointerConstraintMode::Locked => {
-                if let Some(resource) = &locked_resource && resource.is_alive() {
+                if let Some(resource) = &locked_resource
+                    && resource.is_alive()
+                {
                     resource.locked();
                 }
             }
             PointerConstraintMode::Confined => {
-                if let Some(resource) = &confined_resource && resource.is_alive() {
+                if let Some(resource) = &confined_resource
+                    && resource.is_alive()
+                {
                     resource.confined();
                 }
             }
@@ -1296,12 +1297,16 @@ impl CompositorState {
             if emit_event {
                 match mode {
                     PointerConstraintMode::Locked => {
-                        if let Some(resource) = &locked_resource && resource.is_alive() {
+                        if let Some(resource) = &locked_resource
+                            && resource.is_alive()
+                        {
                             resource.unlocked();
                         }
                     }
                     PointerConstraintMode::Confined => {
-                        if let Some(resource) = &confined_resource && resource.is_alive() {
+                        if let Some(resource) = &confined_resource
+                            && resource.is_alive()
+                        {
                             resource.unconfined();
                         }
                     }
@@ -1574,9 +1579,20 @@ impl CompositorState {
         else {
             return;
         };
+        let pending_backend_id = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .filter(|constraint| constraint.backend_pending)
+            .map(PointerConstraint::backend_id);
         if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
             constraint.locked_resource = None;
             constraint.confined_resource = None;
+            if committed {
+                constraint.defunct = true;
+            }
+        }
+        if let Some(backend_id) = pending_backend_id {
+            self.cancel_pending_pointer_constraint_backend_requests(backend_id);
         }
         self.stage_pointer_constraint_removal(surface_id, constraint_id);
         if !committed {

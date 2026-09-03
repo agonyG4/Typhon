@@ -59,6 +59,7 @@ fn locked_pointer_warp_is_ignored_while_active() {
         &qh,
         (),
     );
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -130,6 +131,7 @@ fn locked_pointer_warp_is_ignored_while_active() {
     lock.set_cursor_position_hint(70.0, 50.0);
     surface.commit();
     lock.destroy();
+    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
