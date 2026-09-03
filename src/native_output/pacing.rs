@@ -510,6 +510,17 @@ mod tests {
         );
         assert_eq!(pacing.fast_client_target_hit, 127);
 
+        let summary = pacing.content_summary_line();
+        for field in [
+            "fast_client_continuous_samples=127",
+            "fast_client_primary_present_interval_p50_us=6060",
+            "fast_client_actual_primary_distance_p50=1",
+            "fast_client_missed_refresh_1x=0",
+            "fast_client_target_hit=127",
+        ] {
+            assert!(summary.contains(field), "missing fast-client field {field}");
+        }
+
         let idle_presented_ns = base_ns + 128 * refresh_ns + 100 * refresh_ns;
         pacing.note_explicit_present(ExplicitPresentationObservation {
             planned_sequence: 129,
