@@ -53,6 +53,37 @@ pub(crate) enum OutputTransactionTerminal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputNoPageflipReason {
+    SafeAbandonment,
+    Superseded,
+    SubmissionRejected,
+    OutputDestroyed,
+    SessionSuspended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputPhysicalTerminal {
+    Presented,
+    NoPageflip { reason: OutputNoPageflipReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettledOutputTerminal {
+    transaction_id: OutputTransactionId,
+    physical_terminal: OutputPhysicalTerminal,
+}
+
+impl SettledOutputTerminal {
+    pub(crate) const fn transaction_id(self) -> OutputTransactionId {
+        self.transaction_id
+    }
+
+    pub(crate) const fn physical_terminal(self) -> OutputPhysicalTerminal {
+        self.physical_terminal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputTransactionDropReason {
     NoVisualChange,
     OutputDestroyed,
@@ -256,6 +287,7 @@ pub(crate) struct OutputTransactionLedger {
     active: HashMap<OutputTransactionId, OutputTransactionRecord>,
     obligation_owner: HashMap<CompositorFrameBatchId, OutputTransactionId>,
     recent_terminal: VecDeque<OutputTransactionRecord>,
+    settled_output_terminals: VecDeque<SettledOutputTerminal>,
     counters: OutputTransactionCounters,
     last_created: Option<OutputTransactionId>,
 }
@@ -284,6 +316,7 @@ impl OutputTransactionLedger {
             active: HashMap::new(),
             obligation_owner: HashMap::new(),
             recent_terminal: VecDeque::new(),
+            settled_output_terminals: VecDeque::new(),
             counters: OutputTransactionCounters::default(),
             last_created: None,
         }
@@ -730,7 +763,7 @@ impl OutputTransactionLedger {
                 transition_for_terminal(accepted.terminal),
             ));
         }
-        self.finish_settling(accepted.transaction_id, accepted.terminal)
+        self.finish_settling(accepted)
     }
 
     pub(crate) fn commit_prepared_terminal(&mut self, accepted: AcceptedTerminalTransition) {
@@ -750,7 +783,11 @@ impl OutputTransactionLedger {
                 Some(&accepted.transaction_id)
             );
         }
-        self.finish_settling_committed(accepted.transaction_id, accepted.terminal);
+        self.finish_settling_committed(
+            accepted.transaction_id,
+            Some(accepted.prior_state),
+            accepted.terminal,
+        );
     }
 
     pub(crate) fn fail_settlement(
@@ -778,7 +815,7 @@ impl OutputTransactionLedger {
             .get_mut(&accepted.transaction_id)
             .expect("settling transaction was observed above")
             .state = OutputTransactionState::Settling { terminal: failure };
-        self.finish_settling_inner(accepted.transaction_id, failure, false)
+        self.finish_settling_inner(accepted.transaction_id, None, failure, false)
     }
 
     pub(crate) fn cleanup_generation(
@@ -946,6 +983,10 @@ impl OutputTransactionLedger {
         &self.recent_terminal
     }
 
+    pub(crate) fn take_settled_output_terminals(&mut self) -> Vec<SettledOutputTerminal> {
+        self.settled_output_terminals.drain(..).collect()
+    }
+
     pub(crate) const fn counters(&self) -> OutputTransactionCounters {
         self.counters
     }
@@ -1065,15 +1106,20 @@ impl OutputTransactionLedger {
 
     fn finish_settling(
         &mut self,
-        id: OutputTransactionId,
-        terminal: OutputTransactionTerminal,
+        accepted: AcceptedTerminalTransition,
     ) -> Result<(), OutputTransactionError> {
-        self.finish_settling_inner(id, terminal, true)
+        self.finish_settling_inner(
+            accepted.transaction_id,
+            Some(accepted.prior_state),
+            accepted.terminal,
+            true,
+        )
     }
 
     fn finish_settling_inner(
         &mut self,
         id: OutputTransactionId,
+        prior_state: Option<OutputTransactionState>,
         terminal: OutputTransactionTerminal,
         validate_obligation_owner: bool,
     ) -> Result<(), OutputTransactionError> {
@@ -1091,15 +1137,25 @@ impl OutputTransactionLedger {
         {
             return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
         }
-        self.finish_settling_committed(id, terminal);
+        self.finish_settling_committed(id, prior_state, terminal);
         Ok(())
     }
 
     fn finish_settling_committed(
         &mut self,
         id: OutputTransactionId,
+        prior_state: Option<OutputTransactionState>,
         terminal: OutputTransactionTerminal,
     ) {
+        if let Some(physical_terminal) = physical_terminal_for(prior_state, terminal)
+            && !matches!(physical_terminal, OutputPhysicalTerminal::Presented)
+        {
+            self.settled_output_terminals
+                .push_back(SettledOutputTerminal {
+                    transaction_id: id,
+                    physical_terminal,
+                });
+        }
         let mut record = self
             .active
             .remove(&id)
@@ -1285,5 +1341,50 @@ const fn transition_for_terminal(
         OutputTransactionTerminal::Dropped { .. } => OutputTransactionTransitionKind::Dropped,
         OutputTransactionTerminal::Superseded { .. } => OutputTransactionTransitionKind::Superseded,
         OutputTransactionTerminal::Failed { .. } => OutputTransactionTransitionKind::Failed,
+    }
+}
+
+const fn physical_terminal_for(
+    prior_state: Option<OutputTransactionState>,
+    terminal: OutputTransactionTerminal,
+) -> Option<OutputPhysicalTerminal> {
+    match terminal {
+        OutputTransactionTerminal::Presented { .. } => Some(OutputPhysicalTerminal::Presented),
+        OutputTransactionTerminal::Dropped { reason, .. } => match reason {
+            OutputTransactionDropReason::OutputDestroyed => {
+                Some(OutputPhysicalTerminal::NoPageflip {
+                    reason: OutputNoPageflipReason::OutputDestroyed,
+                })
+            }
+            OutputTransactionDropReason::SessionSuspended => {
+                Some(OutputPhysicalTerminal::NoPageflip {
+                    reason: OutputNoPageflipReason::SessionSuspended,
+                })
+            }
+            OutputTransactionDropReason::SafeAbandonment => {
+                Some(OutputPhysicalTerminal::NoPageflip {
+                    reason: OutputNoPageflipReason::SafeAbandonment,
+                })
+            }
+            OutputTransactionDropReason::NoVisualChange => None,
+        },
+        OutputTransactionTerminal::Superseded { .. } => match prior_state {
+            Some(state) if !matches!(state, OutputTransactionState::Submitted { .. }) => {
+                Some(OutputPhysicalTerminal::NoPageflip {
+                    reason: OutputNoPageflipReason::Superseded,
+                })
+            }
+            _ => None,
+        },
+        OutputTransactionTerminal::Failed { .. } => match prior_state {
+            Some(
+                OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::Queued { .. },
+            ) => Some(OutputPhysicalTerminal::NoPageflip {
+                reason: OutputNoPageflipReason::SubmissionRejected,
+            }),
+            _ => None,
+        },
     }
 }

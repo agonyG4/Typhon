@@ -154,7 +154,6 @@ fn abandon_overtaken_ready(
     frame_scheduler: &mut NativeFrameScheduler,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
-    dmabuf_gpu_release_registry: &mut DmabufGpuReleaseRegistry,
     presented_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
     if explicit.swapchain()?.ready_identity() != Some(owner) {
@@ -168,7 +167,7 @@ fn abandon_overtaken_ready(
     if !explicit.swapchain_mut()?.suspend_abandon_ready()? {
         return Err(io::Error::other("overtaken READY disappeared before abandonment").into());
     }
-    let result = settle_dropped_output_transaction(
+    settle_dropped_output_transaction(
         output_transactions,
         owner.transaction_id,
         OutputTransactionDropReason::SafeAbandonment,
@@ -186,14 +185,7 @@ fn abandon_overtaken_ready(
             );
             Ok(())
         },
-    );
-    if result.is_ok() {
-        dmabuf_gpu_release_registry.retire_composited_without_pageflip(
-            owner.transaction_id,
-            DmabufCorrelationNoPageflipReason::SafeAbandonment,
-        );
-    }
-    result
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,7 +202,6 @@ fn abandon_overtaken_worker_queued(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
-    dmabuf_gpu_release_registry: &mut DmabufGpuReleaseRegistry,
 ) -> NativeResult<()> {
     match worker.cancel_queued_primary(
         owner.token,
@@ -221,7 +212,7 @@ fn abandon_overtaken_worker_queued(
         owner.frame.frame_id,
     ) {
         KmsWorkerQueuedCancellation::Cancelled(job) => {
-            let result = drop_queued_worker_job_with_reason_parts(
+            drop_queued_worker_job_with_reason_parts(
                 *job,
                 OutputTransactionDropReason::SafeAbandonment,
                 scene_history,
@@ -234,14 +225,7 @@ fn abandon_overtaken_worker_queued(
                 server,
                 output_transactions,
                 Some(worker),
-            );
-            if result.is_ok() {
-                dmabuf_gpu_release_registry.retire_composited_without_pageflip(
-                    owner.frame.transaction_id,
-                    DmabufCorrelationNoPageflipReason::SafeAbandonment,
-                );
-            }
-            result
+            )
         }
         KmsWorkerQueuedCancellation::NotQueued { phase } => Err(io::Error::other(format!(
             "overtaken worker primary crossed ownership boundary before cancellation: {phase:?}"
@@ -278,6 +262,7 @@ impl NativeRuntime {
             // before the DRM pageflip validation below runs.
             self.process_kms_worker_events()?;
         }
+        self.retire_settled_output_terminals();
         let deferred_worker_pageflip = self.deferred_worker_pageflip.take();
         let deferred_worker_completion = self.deferred_worker_completion.take();
         let worker_timeout_pending = self.worker_timeout_pending.take();
@@ -936,7 +921,6 @@ impl NativeRuntime {
                                     frame_scheduler,
                                     server,
                                     output_transactions,
-                                    dmabuf_gpu_release_registry,
                                     presented_at,
                                 )
                                 .is_ok();
@@ -974,7 +958,6 @@ impl NativeRuntime {
                                     atomic_commit_arbiter,
                                     server,
                                     output_transactions,
-                                    dmabuf_gpu_release_registry,
                                 )
                                 .is_ok();
                                 frame_pacing.note_physical_claim_overtake_recovery(recovered);
@@ -1000,6 +983,10 @@ impl NativeRuntime {
                             }
                         }
                     }
+                    retire_settled_output_terminals(
+                        output_transactions,
+                        dmabuf_gpu_release_registry,
+                    );
                     let CompositedPageflipCompletion {
                         presented: frame,
                         protocol_batch_id,

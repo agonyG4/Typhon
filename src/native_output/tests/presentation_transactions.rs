@@ -394,6 +394,129 @@ fn test_composited_transaction(
 }
 
 #[test]
+fn settled_safe_abandonment_emits_exact_physical_terminal_once() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(100), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+    ledger
+        .mark_dropped(
+            id,
+            super::OutputTransactionDropReason::SafeAbandonment,
+            MonotonicTimestampNs::new(20),
+        )
+        .expect("safe abandonment");
+
+    let terminals = ledger.take_settled_output_terminals();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].transaction_id(), id);
+    assert_eq!(
+        terminals[0].physical_terminal(),
+        super::OutputPhysicalTerminal::NoPageflip {
+            reason: super::OutputNoPageflipReason::SafeAbandonment,
+        }
+    );
+    assert!(ledger.take_settled_output_terminals().is_empty());
+}
+
+#[test]
+fn ordinary_no_visual_change_has_no_physical_terminal_notification() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(101), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+    ledger
+        .mark_no_visual_change(id, MonotonicTimestampNs::new(20))
+        .expect("no visual change");
+
+    assert!(ledger.take_settled_output_terminals().is_empty());
+}
+
+#[test]
+fn prephysical_failure_emits_submission_rejected_terminal() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(105), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+    ledger
+        .mark_ready(id, MonotonicTimestampNs::new(20))
+        .expect("ready transaction");
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(21),
+        )
+        .expect("prephysical failure");
+
+    let terminals = ledger.take_settled_output_terminals();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(
+        terminals[0].physical_terminal(),
+        super::OutputPhysicalTerminal::NoPageflip {
+            reason: super::OutputNoPageflipReason::SubmissionRejected,
+        }
+    );
+}
+
+#[test]
+fn exact_supersession_and_teardown_terminals_are_classified_without_noop_events() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let superseded = test_composited_transaction(&mut ledger, test_batch(102), 1);
+    let superseded_id = superseded.id();
+    ledger.insert(superseded).expect("superseded transaction");
+    ledger
+        .mark_superseded(
+            superseded_id,
+            None,
+            super::OutputTransactionSupersedeReason::NewerTransaction,
+            MonotonicTimestampNs::new(20),
+        )
+        .expect("superseded transaction");
+
+    let destroyed = test_composited_transaction(&mut ledger, test_batch(103), 1);
+    let destroyed_id = destroyed.id();
+    ledger.insert(destroyed).expect("destroyed transaction");
+    ledger
+        .mark_dropped(
+            destroyed_id,
+            super::OutputTransactionDropReason::OutputDestroyed,
+            MonotonicTimestampNs::new(21),
+        )
+        .expect("destroyed transaction");
+
+    let suspended = test_composited_transaction(&mut ledger, test_batch(104), 1);
+    let suspended_id = suspended.id();
+    ledger.insert(suspended).expect("suspended transaction");
+    ledger
+        .mark_dropped(
+            suspended_id,
+            super::OutputTransactionDropReason::SessionSuspended,
+            MonotonicTimestampNs::new(22),
+        )
+        .expect("suspended transaction");
+
+    let terminals = ledger.take_settled_output_terminals();
+    assert_eq!(
+        terminals
+            .iter()
+            .map(|terminal| terminal.physical_terminal())
+            .collect::<Vec<_>>(),
+        vec![
+            super::OutputPhysicalTerminal::NoPageflip {
+                reason: super::OutputNoPageflipReason::Superseded,
+            },
+            super::OutputPhysicalTerminal::NoPageflip {
+                reason: super::OutputNoPageflipReason::OutputDestroyed,
+            },
+            super::OutputPhysicalTerminal::NoPageflip {
+                reason: super::OutputNoPageflipReason::SessionSuspended,
+            },
+        ]
+    );
+}
+
+#[test]
 fn ready_transaction_can_be_worker_queued() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let batch = test_batch(101);

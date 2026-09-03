@@ -540,8 +540,10 @@ mod tests {
             },
             previous_primary_sequence: Some(128),
             client_commit_ns: Some(idle_presented_ns.saturating_sub(2_500_000)),
-            callback_reaction_ns: Some(500_000),
-            callback_admission_ns: Some(idle_presented_ns.saturating_sub(3_000_000)),
+            callback_reaction_ns: Some(
+                idle_presented_ns.saturating_sub(base_ns + 127 * refresh_ns),
+            ),
+            callback_admission_ns: Some(base_ns + 127 * refresh_ns),
             callback_surface_id: Some(7),
             callback_surface_is_exclusive: true,
             refresh_interval_ns: refresh_ns,
@@ -619,6 +621,63 @@ mod tests {
             pacing.fast_client_continuous_samples,
             continuous_before_exclusions
         );
+    }
+
+    #[test]
+    fn fast_client_population_keeps_outstanding_five_refresh_compositor_tail() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let refresh_ns = 6_060_606_u64;
+        let first_presented_ns = 1_000_000_000_u64;
+
+        let observation = |presented_ns: u64, commit_ns: u64, admission_ns: u64| {
+            ExplicitPresentationObservation {
+                planned_sequence: 1,
+                actual_sequence: 1,
+                target_ns: presented_ns,
+                presented_ns,
+                composite_started_ns: presented_ns.saturating_sub(2_000_000),
+                rendered_ns: presented_ns.saturating_sub(1_000_000),
+                submit_started_ns: presented_ns.saturating_sub(900_000),
+                submit_returned_ns: presented_ns.saturating_sub(700_000),
+                reactive_double: false,
+                target_reason:
+                    oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+                target_selection: TargetSelectionEvidence {
+                    earliest_feasible_sequence: 1,
+                    binding: false,
+                },
+                previous_primary_sequence: None,
+                client_commit_ns: Some(commit_ns),
+                callback_reaction_ns: Some(500_000),
+                callback_admission_ns: Some(admission_ns),
+                callback_surface_id: Some(7),
+                callback_surface_is_exclusive: true,
+                refresh_interval_ns: refresh_ns,
+                render_missed: false,
+                submit_missed: false,
+                kms_slipped: false,
+            }
+        };
+
+        pacing.note_explicit_present(observation(
+            first_presented_ns,
+            first_presented_ns.saturating_sub(2_500_000),
+            first_presented_ns.saturating_sub(3_000_000),
+        ));
+        pacing.note_explicit_present(observation(
+            first_presented_ns + 5 * refresh_ns,
+            first_presented_ns + 1_000_000,
+            first_presented_ns + 500_000,
+        ));
+
+        assert_eq!(pacing.fast_client_continuous_samples, 1);
+        assert_eq!(
+            pacing.fast_client_primary_present_intervals.percentiles(),
+            (30_303, 30_303, 30_303)
+        );
+        assert_eq!(pacing.fast_client_misses.missed_3x_or_more, 1);
+        assert_eq!(pacing.fast_client_samples, 2);
     }
 
     #[test]
@@ -1839,9 +1898,10 @@ impl NativeFramePacing {
                 .client_commit_ns
                 .zip(self.last_fast_client_commit_ns)
                 .is_some_and(|(current, previous)| current > previous)
-            && fast_interval_us.is_some_and(|interval_us| {
-                is_active_refresh_interval(interval_us, refresh_interval_ns / 1_000)
-            });
+            // The exact callback admission and next visual commit prove that
+            // useful demand remained outstanding. A long physical interval
+            // is therefore a compositor tail, not evidence of idle time.
+            && fast_interval_us.is_some();
         if continuous_fast_client {
             self.fast_client_continuous_samples =
                 self.fast_client_continuous_samples.saturating_add(1);

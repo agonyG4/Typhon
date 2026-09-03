@@ -175,6 +175,7 @@ impl NativeRuntime {
         if let Some(identity) = forced_identity {
             if safety.permits_release() {
                 self.settle_forced_shutdown_inflight(identity)?;
+                self.retire_settled_output_terminals();
             } else {
                 self.forced_shutdown_inflight = Some(identity);
             }
@@ -196,6 +197,7 @@ impl NativeRuntime {
         if let Some(transition) = self.shutdown.note_kms_teardown_complete(safety) {
             self.log_shutdown_transition(transition);
         }
+        self.retire_settled_output_terminals();
         self.install_native_wake_plan(NativeWakePlan::default(), monotonic_now_ns()?)?;
         Ok(())
     }

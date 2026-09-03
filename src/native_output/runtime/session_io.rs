@@ -366,6 +366,7 @@ impl NativeSessionIo for NativeRuntime {
                 },
             )?;
         }
+        self.retire_settled_output_terminals();
         self.pending_session_recovery = None;
         Ok(())
     }

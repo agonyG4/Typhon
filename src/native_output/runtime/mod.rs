@@ -66,9 +66,9 @@ mod xwayland_reactor_tests;
 
 pub(super) use dmabuf_release::arm_composited_dmabuf_release;
 pub(crate) use dmabuf_release::{
-    DmabufCorrelationNoPageflipReason, DmabufGpuReleaseMetrics, DmabufGpuReleaseOrigin,
-    DmabufGpuReleaseQualificationSummary, DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety,
-    DmabufReleaseRetryReason, dmabuf_gpu_release_safety,
+    DmabufGpuReleaseMetrics, DmabufGpuReleaseOrigin, DmabufGpuReleaseQualificationSummary,
+    DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety, DmabufReleaseRetryReason,
+    dmabuf_gpu_release_safety, retire_settled_output_terminals,
 };
 use metrics::NativeRenderTelemetry;
 pub(crate) use pointer_timing::{
@@ -819,6 +819,7 @@ impl Drop for NativeRuntime {
                 },
             );
         }
+        self.retire_settled_output_terminals();
 
         // Client buffers are released only after KMS ownership has ended and
         // the EGL/GBM renderer has been torn down, so shutdown cannot reuse a

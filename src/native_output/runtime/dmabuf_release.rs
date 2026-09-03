@@ -11,10 +11,12 @@ use oblivion_one::native::{
 };
 
 use crate::native_output::NativePerfField;
-use crate::native_output::OutputTransactionId;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 use crate::native_output::pacing::BoundedSamples;
 use crate::native_output::scanout::AtomicEglGbmScanout;
+use crate::native_output::{
+    OutputNoPageflipReason, OutputPhysicalTerminal, OutputTransactionId, OutputTransactionLedger,
+};
 
 const DMABUF_RELEASE_RETRY_BASE_DELAY_NS: u64 = 1_000_000;
 const DMABUF_RELEASE_RETRY_MAX_DELAY_NS: u64 = 250_000_000;
@@ -91,6 +93,9 @@ pub(crate) enum DmabufGpuReleaseOrigin {
 pub(crate) enum DmabufCorrelationNoPageflipReason {
     SafeAbandonment,
     Superseded,
+    SubmissionRejected,
+    OutputDestroyed,
+    SessionSuspended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +684,33 @@ impl DmabufGpuReleaseRegistry {
     }
 }
 
+pub(crate) fn retire_settled_output_terminals(
+    output_transactions: &mut OutputTransactionLedger,
+    registry: &mut DmabufGpuReleaseRegistry,
+) {
+    for terminal in output_transactions.take_settled_output_terminals() {
+        let OutputPhysicalTerminal::NoPageflip { reason } = terminal.physical_terminal() else {
+            continue;
+        };
+        let reason = match reason {
+            OutputNoPageflipReason::SafeAbandonment => {
+                DmabufCorrelationNoPageflipReason::SafeAbandonment
+            }
+            OutputNoPageflipReason::Superseded => DmabufCorrelationNoPageflipReason::Superseded,
+            OutputNoPageflipReason::SubmissionRejected => {
+                DmabufCorrelationNoPageflipReason::SubmissionRejected
+            }
+            OutputNoPageflipReason::OutputDestroyed => {
+                DmabufCorrelationNoPageflipReason::OutputDestroyed
+            }
+            OutputNoPageflipReason::SessionSuspended => {
+                DmabufCorrelationNoPageflipReason::SessionSuspended
+            }
+        };
+        registry.retire_composited_without_pageflip(terminal.transaction_id(), reason);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn arm_composited_dmabuf_release(
     registry: &mut DmabufGpuReleaseRegistry,
@@ -727,6 +759,13 @@ pub(crate) fn arm_composited_dmabuf_release(
 }
 
 impl super::NativeRuntime {
+    pub(super) fn retire_settled_output_terminals(&mut self) {
+        retire_settled_output_terminals(
+            &mut self.output_transactions,
+            &mut self.dmabuf_gpu_release_registry,
+        );
+    }
+
     pub(super) fn service_due_dmabuf_release_retry(
         &mut self,
         now_ns: u64,
@@ -854,6 +893,7 @@ impl super::NativeRuntime {
 #[cfg(test)]
 mod tests {
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::time::Duration;
 
     use super::*;
 
@@ -867,6 +907,104 @@ mod tests {
 
     fn lease_id(registry: &mut DmabufGpuReleaseRegistry) -> DmabufGpuReleaseLeaseId {
         registry.allocate_lease_id().unwrap()
+    }
+
+    fn test_target() -> oblivion_one::native::presentation_deadline::PresentationTarget {
+        let now = oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(10);
+        oblivion_one::native::presentation_deadline::PresentationTarget {
+            sequence: 2,
+            presentation_time: now,
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: Duration::from_millis(10),
+            reason:
+                oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time: now,
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
+        }
+    }
+
+    fn test_composited_transaction(
+        ledger: &mut crate::native_output::OutputTransactionLedger,
+        batch_id: oblivion_one::compositor::CompositorFrameBatchId,
+    ) -> crate::native_output::OutputTransaction {
+        let id = ledger.allocate_id().expect("transaction ID");
+        crate::native_output::OutputTransaction::composited(
+            id,
+            1,
+            oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(10),
+            test_target(),
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            id.get(),
+            12,
+            13,
+            crate::native_output::OutputSlotId::new(0).expect("slot zero"),
+            91,
+            None,
+            batch_id,
+        )
+        .expect("composited transaction")
+    }
+
+    #[test]
+    fn centralized_shutdown_terminal_drain_retires_only_its_queued_correlation() {
+        let mut ledger = crate::native_output::OutputTransactionLedger::with_capacities(8, 64);
+        let queued_batch = oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(700).expect("batch ID"),
+        );
+        let queued = test_composited_transaction(&mut ledger, queued_batch);
+        let queued_id = queued.id();
+        ledger.insert(queued).expect("queued transaction");
+        ledger
+            .mark_queued(
+                queued_id,
+                3,
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(20),
+            )
+            .expect("worker queue admission");
+        ledger
+            .mark_dropped(
+                queued_id,
+                crate::native_output::OutputTransactionDropReason::SafeAbandonment,
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(30),
+            )
+            .expect("shutdown safe abandonment");
+
+        let unrelated_batch = oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(701).expect("batch ID"),
+        );
+        let unrelated = test_composited_transaction(&mut ledger, unrelated_batch);
+        let unrelated_id = unrelated.id();
+        ledger.insert(unrelated).expect("unrelated transaction");
+        ledger
+            .mark_no_visual_change(
+                unrelated_id,
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(31),
+            )
+            .expect("unrelated no-visual terminal");
+
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        assert!(registry.observability.arm_composited(queued_id, 2, 1));
+        assert!(registry.observability.arm_composited(unrelated_id, 1, 1));
+
+        retire_settled_output_terminals(&mut ledger, &mut registry);
+        retire_settled_output_terminals(&mut ledger, &mut registry);
+        registry.observability.note_gpu_signal(queued_id, 40);
+        registry
+            .observability
+            .note_composited_pageflip(queued_id, 50);
+
+        let summary = registry.qualification_summary();
+        assert_eq!(summary.correlations_abandoned_without_pageflip, 1);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(summary.correlation_pending, 1);
     }
 
     #[test]
