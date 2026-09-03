@@ -158,6 +158,8 @@ pub(super) fn settle_direct_pageflip(
         client_commit_ns: None,
         callback_reaction_ns: None,
         callback_admission_ns: None,
+        callback_surface_id: None,
+        callback_surface_is_exclusive: false,
         refresh_interval_ns: u64::try_from(target.refresh_interval.as_nanos()).unwrap_or(u64::MAX),
         render_missed: false,
         submit_missed: false,

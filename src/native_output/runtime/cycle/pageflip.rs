@@ -154,6 +154,7 @@ fn abandon_overtaken_ready(
     frame_scheduler: &mut NativeFrameScheduler,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
+    dmabuf_gpu_release_registry: &mut DmabufGpuReleaseRegistry,
     presented_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
     if explicit.swapchain()?.ready_identity() != Some(owner) {
@@ -167,7 +168,7 @@ fn abandon_overtaken_ready(
     if !explicit.swapchain_mut()?.suspend_abandon_ready()? {
         return Err(io::Error::other("overtaken READY disappeared before abandonment").into());
     }
-    settle_dropped_output_transaction(
+    let result = settle_dropped_output_transaction(
         output_transactions,
         owner.transaction_id,
         OutputTransactionDropReason::SafeAbandonment,
@@ -185,7 +186,14 @@ fn abandon_overtaken_ready(
             );
             Ok(())
         },
-    )
+    );
+    if result.is_ok() {
+        dmabuf_gpu_release_registry.retire_composited_without_pageflip(
+            owner.transaction_id,
+            DmabufCorrelationNoPageflipReason::SafeAbandonment,
+        );
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,6 +210,7 @@ fn abandon_overtaken_worker_queued(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
+    dmabuf_gpu_release_registry: &mut DmabufGpuReleaseRegistry,
 ) -> NativeResult<()> {
     match worker.cancel_queued_primary(
         owner.token,
@@ -211,20 +220,29 @@ fn abandon_overtaken_worker_queued(
         owner.frame.target,
         owner.frame.frame_id,
     ) {
-        KmsWorkerQueuedCancellation::Cancelled(job) => drop_queued_worker_job_with_reason_parts(
-            *job,
-            OutputTransactionDropReason::SafeAbandonment,
-            scene_history,
-            explicit,
-            frame_pacing,
-            frame_scheduler,
-            atomic_cursor,
-            cursor_output_arbitration,
-            atomic_commit_arbiter,
-            server,
-            output_transactions,
-            Some(worker),
-        ),
+        KmsWorkerQueuedCancellation::Cancelled(job) => {
+            let result = drop_queued_worker_job_with_reason_parts(
+                *job,
+                OutputTransactionDropReason::SafeAbandonment,
+                scene_history,
+                explicit,
+                frame_pacing,
+                frame_scheduler,
+                atomic_cursor,
+                cursor_output_arbitration,
+                atomic_commit_arbiter,
+                server,
+                output_transactions,
+                Some(worker),
+            );
+            if result.is_ok() {
+                dmabuf_gpu_release_registry.retire_composited_without_pageflip(
+                    owner.frame.transaction_id,
+                    DmabufCorrelationNoPageflipReason::SafeAbandonment,
+                );
+            }
+            result
+        }
         KmsWorkerQueuedCancellation::NotQueued { phase } => Err(io::Error::other(format!(
             "overtaken worker primary crossed ownership boundary before cancellation: {phase:?}"
         ))
@@ -918,6 +936,7 @@ impl NativeRuntime {
                                     frame_scheduler,
                                     server,
                                     output_transactions,
+                                    dmabuf_gpu_release_registry,
                                     presented_at,
                                 )
                                 .is_ok();
@@ -955,6 +974,7 @@ impl NativeRuntime {
                                     atomic_commit_arbiter,
                                     server,
                                     output_transactions,
+                                    dmabuf_gpu_release_registry,
                                 )
                                 .is_ok();
                                 frame_pacing.note_physical_claim_overtake_recovery(recovered);
@@ -1217,6 +1237,18 @@ impl NativeRuntime {
                             proven_miss = classified_miss;
                         }
                     }
+                    render_journal.record_frame_service_observation(FrameTimingObservation {
+                        frame_id: frame.frame_id,
+                        target: frame.target,
+                        composite_started_at: frame.composite_started_at,
+                        fence_exported_at: frame.rendered_at,
+                        fence_signaled_at: frame.fence_signal,
+                        submit_started_at: Some(frame.submit_started_at),
+                        submit_returned_at: Some(frame.submit_returned_at),
+                    });
+                    if proven_miss.is_some() {
+                        render_journal.note_proven_deadline_miss();
+                    }
                     let desired_credit_before = adaptive_buffering.desired_credit();
                     let buffering_mode_before = adaptive_buffering.mode();
                     adaptive_buffering.observe_o1_outcome(proven_miss);
@@ -1246,6 +1278,8 @@ impl NativeRuntime {
                         client_commit_ns: frame.client_commit_ns,
                         callback_reaction_ns: frame.callback_reaction_ns,
                         callback_admission_ns: frame.callback_admission_ns,
+                        callback_surface_id: frame.callback_surface_id,
+                        callback_surface_is_exclusive: frame.callback_surface_is_exclusive,
                         refresh_interval_ns: 1_000_000_000 / u64::from((*refresh_hz).max(1)),
                         render_missed: matches!(
                             outcome,

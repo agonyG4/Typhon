@@ -66,9 +66,9 @@ mod xwayland_reactor_tests;
 
 pub(super) use dmabuf_release::arm_composited_dmabuf_release;
 pub(crate) use dmabuf_release::{
-    DmabufGpuReleaseMetrics, DmabufGpuReleaseOrigin, DmabufGpuReleaseQualificationSummary,
-    DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety, DmabufReleaseRetryReason,
-    dmabuf_gpu_release_safety,
+    DmabufCorrelationNoPageflipReason, DmabufGpuReleaseMetrics, DmabufGpuReleaseOrigin,
+    DmabufGpuReleaseQualificationSummary, DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety,
+    DmabufReleaseRetryReason, dmabuf_gpu_release_safety,
 };
 use metrics::NativeRenderTelemetry;
 pub(crate) use pointer_timing::{
@@ -857,9 +857,10 @@ impl Drop for NativeRuntime {
         );
         let dmabuf_qualification = self.dmabuf_gpu_release_qualification_summary();
         println!(
-            "typhon pacing: event=dmabuf_gpu_release_timing_summary composited_correlations_armed={} composited_correlations_paired={} release_before_pageflip_leases={} release_before_pageflip_obligations={} release_after_pageflip_leases={} release_after_pageflip_obligations={} release_same_timestamp_leases={} exact_signal_timestamps={} signal_timestamp_unavailable={} correlations_unpairable_signal_timestamp={} already_signaled_before_registration={} timestamp_order_anomalies={} correlation_pending={} correlation_overflows={} correlation_duplicates={} gpu_release_registry_wait_p50_us={} gpu_release_registry_wait_p95_us={} gpu_release_registry_wait_p99_us={} release_to_pageflip_lead_p50_us={} release_to_pageflip_lead_p95_us={} release_to_pageflip_lead_p99_us={} pageflip_to_release_lag_p50_us={} pageflip_to_release_lag_p95_us={} pageflip_to_release_lag_p99_us={}",
+            "typhon pacing: event=dmabuf_gpu_release_timing_summary composited_correlations_armed={} composited_correlations_paired={} correlations_abandoned_without_pageflip={} release_before_pageflip_leases={} release_before_pageflip_obligations={} release_after_pageflip_leases={} release_after_pageflip_obligations={} release_same_timestamp_leases={} exact_signal_timestamps={} signal_timestamp_unavailable={} correlations_unpairable_signal_timestamp={} already_signaled_before_registration={} timestamp_order_anomalies={} correlation_pending={} correlation_overflows={} correlation_duplicates={} gpu_release_registry_wait_p50_us={} gpu_release_registry_wait_p95_us={} gpu_release_registry_wait_p99_us={} release_to_pageflip_lead_p50_us={} release_to_pageflip_lead_p95_us={} release_to_pageflip_lead_p99_us={} pageflip_to_release_lag_p50_us={} pageflip_to_release_lag_p95_us={} pageflip_to_release_lag_p99_us={}",
             dmabuf_qualification.composited_correlations_armed,
             dmabuf_qualification.composited_correlations_paired,
+            dmabuf_qualification.correlations_abandoned_without_pageflip,
             dmabuf_qualification.release_before_pageflip_leases,
             dmabuf_qualification.release_before_pageflip_obligations,
             dmabuf_qualification.release_after_pageflip_leases,

@@ -87,6 +87,12 @@ pub(crate) enum DmabufGpuReleaseOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufCorrelationNoPageflipReason {
+    SafeAbandonment,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DmabufGpuReleaseCorrelation {
     obligation_count: usize,
     registered_at_ns: u64,
@@ -98,6 +104,7 @@ struct DmabufGpuReleaseCorrelation {
 pub(crate) struct DmabufGpuReleaseQualificationSummary {
     pub(crate) composited_correlations_armed: u64,
     pub(crate) composited_correlations_paired: u64,
+    pub(crate) correlations_abandoned_without_pageflip: u64,
     pub(crate) release_before_pageflip_leases: u64,
     pub(crate) release_before_pageflip_obligations: u64,
     pub(crate) release_after_pageflip_leases: u64,
@@ -182,6 +189,21 @@ impl DmabufGpuReleaseObservability {
         self.finish_if_paired(transaction_id);
     }
 
+    fn retire_composited_without_pageflip(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        _reason: DmabufCorrelationNoPageflipReason,
+    ) -> bool {
+        if self.correlations.remove(&transaction_id).is_none() {
+            return false;
+        }
+        self.summary.correlations_abandoned_without_pageflip = self
+            .summary
+            .correlations_abandoned_without_pageflip
+            .saturating_add(1);
+        true
+    }
+
     fn finish_if_paired(&mut self, transaction_id: OutputTransactionId) {
         let Some(correlation) = self.correlations.get(&transaction_id).copied() else {
             return;
@@ -263,11 +285,12 @@ impl DmabufGpuReleaseObservability {
         self.summary.signal_timestamp_unavailable =
             self.summary.signal_timestamp_unavailable.saturating_add(1);
         if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
-            self.correlations.remove(&transaction_id);
-            self.summary.correlations_unpairable_signal_timestamp = self
-                .summary
-                .correlations_unpairable_signal_timestamp
-                .saturating_add(1);
+            if self.correlations.remove(&transaction_id).is_some() {
+                self.summary.correlations_unpairable_signal_timestamp = self
+                    .summary
+                    .correlations_unpairable_signal_timestamp
+                    .saturating_add(1);
+            }
         }
     }
 
@@ -541,6 +564,15 @@ impl DmabufGpuReleaseRegistry {
     ) {
         self.observability
             .note_composited_pageflip(transaction_id, pageflip_ns);
+    }
+
+    pub(crate) fn retire_composited_without_pageflip(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        reason: DmabufCorrelationNoPageflipReason,
+    ) -> bool {
+        self.observability
+            .retire_composited_without_pageflip(transaction_id, reason)
     }
 
     #[cfg(test)]
@@ -1269,12 +1301,92 @@ mod tests {
 
         let summary = observability.summary();
         assert_eq!(summary.signal_timestamp_unavailable, 1);
-        assert_eq!(summary.correlations_unpairable_signal_timestamp, 1);
+        assert_eq!(summary.correlations_unpairable_signal_timestamp, 0);
         assert_eq!(summary.correlation_pending, 0);
         assert_eq!(summary.composited_correlations_paired, 0);
         assert_eq!(summary.release_before_pageflip_leases, 0);
         assert_eq!(summary.release_after_pageflip_leases, 0);
         assert_eq!(summary.release_same_timestamp_leases, 0);
+    }
+
+    #[test]
+    fn abandoned_correlation_is_terminal_and_duplicate_retirement_is_idempotent() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(604);
+        assert!(observability.arm_composited(transaction_id, 2, 1));
+
+        assert!(observability.retire_composited_without_pageflip(
+            transaction_id,
+            DmabufCorrelationNoPageflipReason::SafeAbandonment,
+        ));
+        assert!(!observability.retire_composited_without_pageflip(
+            transaction_id,
+            DmabufCorrelationNoPageflipReason::Superseded,
+        ));
+        observability.note_gpu_signal(transaction_id, 2);
+        observability.note_composited_pageflip(transaction_id, 3);
+
+        let summary = observability.summary();
+        assert_eq!(summary.correlations_abandoned_without_pageflip, 1);
+        assert_eq!(summary.correlation_pending, 0);
+        assert_eq!(summary.composited_correlations_paired, 0);
+    }
+
+    #[test]
+    fn correlation_retirement_accounts_for_each_terminal_event_order() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let paired = transaction_id(605);
+        let abandoned = transaction_id(606);
+        let unpairable = transaction_id(607);
+        let pending = transaction_id(608);
+        for id in [paired, abandoned, unpairable, pending] {
+            assert!(observability.arm_composited(id, 1, 1));
+        }
+
+        observability.note_gpu_signal(paired, 2);
+        observability.note_composited_pageflip(paired, 3);
+        assert!(observability.retire_composited_without_pageflip(
+            abandoned,
+            DmabufCorrelationNoPageflipReason::SafeAbandonment,
+        ));
+        observability.note_composited_pageflip(unpairable, 4);
+        observability.note_timestamp_unavailable(DmabufGpuReleaseOrigin::Composited {
+            transaction_id: unpairable,
+        });
+
+        let summary = observability.summary();
+        assert_eq!(summary.composited_correlations_armed, 4);
+        assert_eq!(summary.composited_correlations_paired, 1);
+        assert_eq!(summary.correlations_abandoned_without_pageflip, 1);
+        assert_eq!(summary.correlations_unpairable_signal_timestamp, 1);
+        assert_eq!(summary.correlation_pending, 1);
+        assert_eq!(
+            summary.composited_correlations_armed,
+            summary.composited_correlations_paired
+                + summary.correlations_abandoned_without_pageflip
+                + summary.correlations_unpairable_signal_timestamp
+                + summary.correlation_pending as u64
+        );
+    }
+
+    #[test]
+    fn pageflip_before_retirement_makes_retirement_a_noop() {
+        let mut observability = DmabufGpuReleaseObservability::default();
+        let transaction_id = transaction_id(609);
+        observability.arm_composited(transaction_id, 1, 1);
+        observability.note_composited_pageflip(transaction_id, 3);
+        observability.note_gpu_signal(transaction_id, 2);
+
+        assert!(!observability.retire_composited_without_pageflip(
+            transaction_id,
+            DmabufCorrelationNoPageflipReason::Superseded,
+        ));
+        assert_eq!(
+            observability
+                .summary()
+                .correlations_abandoned_without_pageflip,
+            0
+        );
     }
 
     #[test]
@@ -1353,6 +1465,51 @@ mod tests {
                 .composited_correlations_paired,
             1
         );
+        assert_eq!(event_loop.source_for_token(token), None);
+    }
+
+    #[test]
+    fn retiring_correlation_does_not_cancel_later_gpu_lease_completion() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let (read, write) = pipe();
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        let lease_id = lease_id(&mut registry);
+        let transaction_id = transaction_id(700);
+        let token = registry
+            .register_with_origin(
+                lease_id,
+                read,
+                &mut event_loop,
+                DmabufGpuReleaseOrigin::Composited { transaction_id },
+                2,
+                1_000,
+            )
+            .unwrap();
+        assert!(registry.retire_composited_without_pageflip(
+            transaction_id,
+            DmabufCorrelationNoPageflipReason::SafeAbandonment,
+        ));
+        unsafe { libc::write(write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+        let wakeup = event_loop.wait().unwrap();
+        let mut completions = 0;
+        registry
+            .service_ready_with_timestamp(
+                &wakeup.dmabuf_gpu_release_tokens,
+                &mut event_loop,
+                |_| Ok(Some(2_000)),
+                |_| {
+                    completions += 1;
+                    2
+                },
+            )
+            .unwrap();
+
+        assert_eq!(completions, 1);
+        assert_eq!(registry.metrics().obligations_completed, 2);
+        let summary = registry.qualification_summary();
+        assert_eq!(summary.correlations_abandoned_without_pageflip, 1);
+        assert_eq!(summary.composited_correlations_paired, 0);
+        assert_eq!(summary.correlation_pending, 0);
         assert_eq!(event_loop.source_for_token(token), None);
     }
 }

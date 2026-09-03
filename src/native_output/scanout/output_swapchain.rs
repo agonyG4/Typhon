@@ -181,6 +181,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) client_commit_ns: Option<u64>,
     pub(crate) callback_reaction_ns: Option<u64>,
     pub(crate) callback_admission_ns: Option<u64>,
+    pub(crate) callback_surface_id: Option<u32>,
     pub(crate) cpu_prepass_duration_ns: u64,
     pub(crate) cpu_encode_duration_ns: u64,
     pub(crate) frozen_cursor_plan: FrozenPrimaryCursorPlan,
@@ -461,6 +462,7 @@ impl AtomicOutputSwapchain {
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
+            callback_surface_id: None,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan: FrozenPrimaryCursorPlan {
@@ -571,6 +573,7 @@ impl AtomicOutputSwapchain {
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
+            callback_surface_id: None,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan,
@@ -1617,6 +1620,7 @@ mod tests {
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
+            callback_surface_id: None,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan: FrozenPrimaryCursorPlan {

@@ -1083,6 +1083,7 @@ impl AtomicEglGbmScanout {
             client_commit_ns: callback_timing.map(|timing| timing.commit_ns),
             callback_reaction_ns: callback_timing.and_then(|timing| timing.reaction_ns),
             callback_admission_ns: callback_timing.and_then(|timing| timing.admission_ns),
+            callback_surface_id: callback_timing.map(|timing| timing.surface_id),
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
@@ -1162,6 +1163,7 @@ impl AtomicEglGbmScanout {
             client_commit_ns,
             callback_reaction_ns,
             callback_admission_ns,
+            callback_surface_id,
             o1_admission,
             ..
         } = completed.frame;
@@ -1199,6 +1201,9 @@ impl AtomicEglGbmScanout {
                 client_commit_ns,
                 callback_reaction_ns,
                 callback_admission_ns,
+                callback_surface_id,
+                callback_surface_is_exclusive: callback_surface_id
+                    .is_some_and(|surface_id| surface_damage.is_exclusive_surface_id(surface_id)),
             },
             protocol_batch_id,
             surface_damage,
@@ -1465,6 +1470,8 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) client_commit_ns: Option<u64>,
     pub(crate) callback_reaction_ns: Option<u64>,
     pub(crate) callback_admission_ns: Option<u64>,
+    pub(crate) callback_surface_id: Option<u32>,
+    pub(crate) callback_surface_is_exclusive: bool,
     pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }

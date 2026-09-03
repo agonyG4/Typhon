@@ -430,6 +430,8 @@ mod tests {
             client_commit_ns: Some(1_009_500_000),
             callback_reaction_ns: Some(500_000),
             callback_admission_ns: None,
+            callback_surface_id: Some(7),
+            callback_surface_is_exclusive: true,
             refresh_interval_ns: 6_060_606,
             render_missed: false,
             submit_missed: false,
@@ -454,6 +456,158 @@ mod tests {
         ] {
             assert!(summary.contains(field), "missing content field {field}");
         }
+    }
+
+    #[test]
+    fn fast_client_population_requires_continuous_exact_surface_content() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let refresh_ns = 6_060_606_u64;
+        let base_ns = 1_000_000_000_u64;
+
+        for frame in 0..128_u64 {
+            let presented_ns = base_ns + frame * refresh_ns;
+            pacing.note_explicit_present(ExplicitPresentationObservation {
+                planned_sequence: frame + 1,
+                actual_sequence: frame + 1,
+                target_ns: presented_ns,
+                presented_ns,
+                composite_started_ns: presented_ns.saturating_sub(2_000_000),
+                rendered_ns: presented_ns.saturating_sub(1_000_000),
+                submit_started_ns: presented_ns.saturating_sub(900_000),
+                submit_returned_ns: presented_ns.saturating_sub(700_000),
+                reactive_double: false,
+                target_reason:
+                    oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+                target_selection: TargetSelectionEvidence {
+                    earliest_feasible_sequence: frame + 1,
+                    binding: false,
+                },
+                previous_primary_sequence: (frame > 0).then_some(frame),
+                client_commit_ns: Some(presented_ns.saturating_sub(2_500_000)),
+                callback_reaction_ns: Some(500_000),
+                callback_admission_ns: Some(presented_ns.saturating_sub(3_000_000)),
+                callback_surface_id: Some(7),
+                callback_surface_is_exclusive: true,
+                refresh_interval_ns: refresh_ns,
+                render_missed: false,
+                submit_missed: false,
+                kms_slipped: false,
+            });
+        }
+
+        let continuous_before_exclusions = pacing.fast_client_continuous_samples;
+        assert_eq!(continuous_before_exclusions, 127);
+        assert_eq!(
+            pacing.fast_client_primary_present_intervals.percentiles(),
+            (6_060, 6_060, 6_060)
+        );
+        assert_eq!(
+            pacing
+                .fast_client_actual_primary_distance_intervals
+                .percentiles(),
+            (1, 1, 1)
+        );
+        assert_eq!(pacing.fast_client_target_hit, 127);
+
+        let idle_presented_ns = base_ns + 128 * refresh_ns + 100 * refresh_ns;
+        pacing.note_explicit_present(ExplicitPresentationObservation {
+            planned_sequence: 129,
+            actual_sequence: 129,
+            target_ns: idle_presented_ns,
+            presented_ns: idle_presented_ns,
+            composite_started_ns: idle_presented_ns.saturating_sub(2_000_000),
+            rendered_ns: idle_presented_ns.saturating_sub(1_000_000),
+            submit_started_ns: idle_presented_ns.saturating_sub(900_000),
+            submit_returned_ns: idle_presented_ns.saturating_sub(700_000),
+            reactive_double: false,
+            target_reason:
+                oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+            target_selection: TargetSelectionEvidence {
+                earliest_feasible_sequence: 129,
+                binding: false,
+            },
+            previous_primary_sequence: Some(128),
+            client_commit_ns: Some(idle_presented_ns.saturating_sub(2_500_000)),
+            callback_reaction_ns: Some(500_000),
+            callback_admission_ns: Some(idle_presented_ns.saturating_sub(3_000_000)),
+            callback_surface_id: Some(7),
+            callback_surface_is_exclusive: true,
+            refresh_interval_ns: refresh_ns,
+            render_missed: false,
+            submit_missed: false,
+            kms_slipped: false,
+        });
+        assert_eq!(
+            pacing.fast_client_continuous_samples,
+            continuous_before_exclusions
+        );
+
+        let next_presented_ns = idle_presented_ns + refresh_ns;
+        pacing.note_explicit_present(ExplicitPresentationObservation {
+            planned_sequence: 130,
+            actual_sequence: 130,
+            target_ns: next_presented_ns,
+            presented_ns: next_presented_ns,
+            composite_started_ns: next_presented_ns.saturating_sub(2_000_000),
+            rendered_ns: next_presented_ns.saturating_sub(1_000_000),
+            submit_started_ns: next_presented_ns.saturating_sub(900_000),
+            submit_returned_ns: next_presented_ns.saturating_sub(700_000),
+            reactive_double: false,
+            target_reason:
+                oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+            target_selection: TargetSelectionEvidence {
+                earliest_feasible_sequence: 130,
+                binding: false,
+            },
+            previous_primary_sequence: Some(129),
+            client_commit_ns: Some(next_presented_ns.saturating_sub(2_500_000)),
+            callback_reaction_ns: Some(3_000_000),
+            callback_admission_ns: Some(next_presented_ns.saturating_sub(3_500_000)),
+            callback_surface_id: Some(7),
+            callback_surface_is_exclusive: true,
+            refresh_interval_ns: refresh_ns,
+            render_missed: false,
+            submit_missed: false,
+            kms_slipped: false,
+        });
+        assert_eq!(
+            pacing.fast_client_continuous_samples,
+            continuous_before_exclusions
+        );
+
+        let ambiguous_presented_ns = next_presented_ns + refresh_ns;
+        pacing.note_explicit_present(ExplicitPresentationObservation {
+            planned_sequence: 131,
+            actual_sequence: 131,
+            target_ns: ambiguous_presented_ns,
+            presented_ns: ambiguous_presented_ns,
+            composite_started_ns: ambiguous_presented_ns.saturating_sub(2_000_000),
+            rendered_ns: ambiguous_presented_ns.saturating_sub(1_000_000),
+            submit_started_ns: ambiguous_presented_ns.saturating_sub(900_000),
+            submit_returned_ns: ambiguous_presented_ns.saturating_sub(700_000),
+            reactive_double: false,
+            target_reason:
+                oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+            target_selection: TargetSelectionEvidence {
+                earliest_feasible_sequence: 131,
+                binding: false,
+            },
+            previous_primary_sequence: Some(130),
+            client_commit_ns: Some(ambiguous_presented_ns.saturating_sub(2_500_000)),
+            callback_reaction_ns: Some(500_000),
+            callback_admission_ns: Some(ambiguous_presented_ns.saturating_sub(3_000_000)),
+            callback_surface_id: Some(7),
+            callback_surface_is_exclusive: false,
+            refresh_interval_ns: refresh_ns,
+            render_missed: false,
+            submit_missed: false,
+            kms_slipped: false,
+        });
+        assert_eq!(
+            pacing.fast_client_continuous_samples,
+            continuous_before_exclusions
+        );
     }
 
     #[test]
@@ -917,12 +1071,21 @@ pub(crate) struct NativeFramePacing {
     submit_to_pageflip: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     selected_target_distance_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     actual_primary_distance_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    fast_client_primary_present_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    fast_client_actual_primary_distance_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     reactive_target_early_by_intervals: u64,
     predictive_target_early_by_intervals: u64,
     reactive_target_late_by_intervals: u64,
     predictive_target_late_by_intervals: u64,
     fast_client_samples: u64,
     slow_client_samples: u64,
+    fast_client_continuous_samples: u64,
+    fast_client_target_hit: u64,
+    fast_client_target_limited: u64,
+    fast_client_render_limited: u64,
+    fast_client_submit_limited: u64,
+    fast_client_kms_limited: u64,
+    fast_client_misses: RefreshMissBuckets,
     physical_claim_overtake_ready: u64,
     physical_claim_overtake_worker_queued: u64,
     physical_claim_overtake_recoveries: u64,
@@ -933,6 +1096,9 @@ pub(crate) struct NativeFramePacing {
     last_primary_sequence: Option<u64>,
     misses: RefreshMissBuckets,
     last_pageflip_ns: Option<u64>,
+    last_fast_client_surface_id: Option<u32>,
+    last_fast_client_commit_ns: Option<u64>,
+    last_fast_client_presented_ns: Option<u64>,
     idle_intervals_excluded: u64,
     early_presentation_count: u64,
     late_presentation_count: u64,
@@ -958,6 +1124,8 @@ pub(crate) struct ExplicitPresentationObservation {
     pub(crate) client_commit_ns: Option<u64>,
     pub(crate) callback_reaction_ns: Option<u64>,
     pub(crate) callback_admission_ns: Option<u64>,
+    pub(crate) callback_surface_id: Option<u32>,
+    pub(crate) callback_surface_is_exclusive: bool,
     pub(crate) refresh_interval_ns: u64,
     pub(crate) render_missed: bool,
     pub(crate) submit_missed: bool,
@@ -1066,12 +1234,21 @@ impl NativeFramePacing {
             submit_to_pageflip: BoundedSamples::default(),
             selected_target_distance_intervals: BoundedSamples::default(),
             actual_primary_distance_intervals: BoundedSamples::default(),
+            fast_client_primary_present_intervals: BoundedSamples::default(),
+            fast_client_actual_primary_distance_intervals: BoundedSamples::default(),
             reactive_target_early_by_intervals: 0,
             predictive_target_early_by_intervals: 0,
             reactive_target_late_by_intervals: 0,
             predictive_target_late_by_intervals: 0,
             fast_client_samples: 0,
             slow_client_samples: 0,
+            fast_client_continuous_samples: 0,
+            fast_client_target_hit: 0,
+            fast_client_target_limited: 0,
+            fast_client_render_limited: 0,
+            fast_client_submit_limited: 0,
+            fast_client_kms_limited: 0,
+            fast_client_misses: RefreshMissBuckets::default(),
             physical_claim_overtake_ready: 0,
             physical_claim_overtake_worker_queued: 0,
             physical_claim_overtake_recoveries: 0,
@@ -1082,6 +1259,9 @@ impl NativeFramePacing {
             last_primary_sequence: None,
             misses: RefreshMissBuckets::default(),
             last_pageflip_ns: None,
+            last_fast_client_surface_id: None,
+            last_fast_client_commit_ns: None,
+            last_fast_client_presented_ns: None,
             idle_intervals_excluded: 0,
             early_presentation_count: 0,
             late_presentation_count: 0,
@@ -1626,6 +1806,77 @@ impl NativeFramePacing {
             observation.submit_missed,
             observation.kms_slipped,
         );
+        let fast_client_candidate = observation
+            .callback_surface_id
+            .filter(|_| observation.callback_surface_is_exclusive)
+            .zip(observation.callback_reaction_ns)
+            .zip(observation.client_commit_ns)
+            .zip(observation.callback_admission_ns)
+            .is_some_and(
+                |(((_surface_id, reaction_ns), _commit_ns), _admission_ns)| {
+                    reaction_ns <= fast_client_threshold_ns
+                        && !callback_handoff_limited
+                        && previous_primary_sequence.is_some()
+                        && actual_primary_distance > 0
+                },
+            );
+        let fast_interval_us = self
+            .last_fast_client_presented_ns
+            .map(|previous| observation.presented_ns.saturating_sub(previous) / 1_000);
+        let continuous_fast_client = fast_client_candidate
+            && observation
+                .callback_surface_id
+                .is_some_and(|surface_id| self.last_fast_client_surface_id == Some(surface_id))
+            && observation
+                .client_commit_ns
+                .zip(self.last_fast_client_commit_ns)
+                .is_some_and(|(current, previous)| current > previous)
+            && fast_interval_us.is_some_and(|interval_us| {
+                is_active_refresh_interval(interval_us, refresh_interval_ns / 1_000)
+            });
+        if continuous_fast_client {
+            self.fast_client_continuous_samples =
+                self.fast_client_continuous_samples.saturating_add(1);
+            if let Some(interval_us) = fast_interval_us {
+                self.fast_client_primary_present_intervals
+                    .record(interval_us);
+                self.fast_client_misses
+                    .record(interval_us, refresh_interval_ns / 1_000);
+            }
+            self.fast_client_actual_primary_distance_intervals
+                .record(actual_primary_distance);
+            match attribution {
+                ContentCadenceAttribution::TargetHit => {
+                    self.fast_client_target_hit = self.fast_client_target_hit.saturating_add(1);
+                }
+                ContentCadenceAttribution::TargetLimited => {
+                    self.fast_client_target_limited =
+                        self.fast_client_target_limited.saturating_add(1);
+                }
+                ContentCadenceAttribution::RenderLimited => {
+                    self.fast_client_render_limited =
+                        self.fast_client_render_limited.saturating_add(1);
+                }
+                ContentCadenceAttribution::SubmitLimited => {
+                    self.fast_client_submit_limited =
+                        self.fast_client_submit_limited.saturating_add(1);
+                }
+                ContentCadenceAttribution::KmsLimited => {
+                    self.fast_client_kms_limited = self.fast_client_kms_limited.saturating_add(1);
+                }
+                ContentCadenceAttribution::CallbackHandoffLimited
+                | ContentCadenceAttribution::ClientLimited => {}
+            }
+        }
+        if fast_client_candidate {
+            self.last_fast_client_surface_id = observation.callback_surface_id;
+            self.last_fast_client_commit_ns = observation.client_commit_ns;
+            self.last_fast_client_presented_ns = Some(observation.presented_ns);
+        } else {
+            self.last_fast_client_surface_id = None;
+            self.last_fast_client_commit_ns = None;
+            self.last_fast_client_presented_ns = None;
+        }
         let attribution_index = attribution.index();
         self.content_attribution[attribution_index] =
             self.content_attribution[attribution_index].saturating_add(1);
@@ -1779,6 +2030,11 @@ impl NativeFramePacing {
         let (selected50, selected95, selected99) =
             self.selected_target_distance_intervals.percentiles();
         let (actual50, actual95, actual99) = self.actual_primary_distance_intervals.percentiles();
+        let (fast_primary50, fast_primary95, fast_primary99) =
+            self.fast_client_primary_present_intervals.percentiles();
+        let (fast_actual50, fast_actual95, fast_actual99) = self
+            .fast_client_actual_primary_distance_intervals
+            .percentiles();
         let prediction = self.last_prediction;
         pacing_line(
             "native_content_frame_clock_summary",
@@ -1825,6 +2081,51 @@ impl NativeFramePacing {
                 ),
                 PacingField::u64("fast_client_samples", self.fast_client_samples),
                 PacingField::u64("slow_client_samples", self.slow_client_samples),
+                PacingField::u64(
+                    "fast_client_continuous_samples",
+                    self.fast_client_continuous_samples,
+                ),
+                PacingField::u64(
+                    "fast_client_primary_present_interval_p50_us",
+                    fast_primary50,
+                ),
+                PacingField::u64(
+                    "fast_client_primary_present_interval_p95_us",
+                    fast_primary95,
+                ),
+                PacingField::u64(
+                    "fast_client_primary_present_interval_p99_us",
+                    fast_primary99,
+                ),
+                PacingField::u64("fast_client_actual_primary_distance_p50", fast_actual50),
+                PacingField::u64("fast_client_actual_primary_distance_p95", fast_actual95),
+                PacingField::u64("fast_client_actual_primary_distance_p99", fast_actual99),
+                PacingField::u64(
+                    "fast_client_missed_refresh_1x",
+                    self.fast_client_misses.missed_1x,
+                ),
+                PacingField::u64(
+                    "fast_client_missed_refresh_2x",
+                    self.fast_client_misses.missed_2x,
+                ),
+                PacingField::u64(
+                    "fast_client_missed_refresh_3x_or_more",
+                    self.fast_client_misses.missed_3x_or_more,
+                ),
+                PacingField::u64("fast_client_target_hit", self.fast_client_target_hit),
+                PacingField::u64(
+                    "fast_client_target_limited",
+                    self.fast_client_target_limited,
+                ),
+                PacingField::u64(
+                    "fast_client_render_limited",
+                    self.fast_client_render_limited,
+                ),
+                PacingField::u64(
+                    "fast_client_submit_limited",
+                    self.fast_client_submit_limited,
+                ),
+                PacingField::u64("fast_client_kms_limited", self.fast_client_kms_limited),
                 PacingField::u64(
                     "physical_claim_overtake_ready",
                     self.physical_claim_overtake_ready,
@@ -1917,6 +2218,18 @@ impl NativeFramePacing {
                 PacingField::u64(
                     "prediction_p95_target_slip_ns",
                     prediction.map_or(0, |value| value.p95_target_slip_ns),
+                ),
+                PacingField::u64(
+                    "prediction_paired_service_p95_ns",
+                    prediction.map_or(0, |value| value.paired_service_p95_ns),
+                ),
+                PacingField::u64(
+                    "prediction_paired_service_samples",
+                    prediction.map_or(0, |value| value.paired_service_samples as u64),
+                ),
+                PacingField::str(
+                    "prediction_estimator_mode",
+                    prediction.map_or("cold_start", |value| value.estimator_mode.as_str()),
                 ),
                 PacingField::u64(
                     "prediction_kms_dispatch_budget_ns",

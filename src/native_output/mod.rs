@@ -50,8 +50,8 @@ use oblivion_one::native::kms::{
 use oblivion_one::native::{
     adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
-        FenceTimestampQuality, ProvenDeadlineMiss, approximate_observation_is_late,
-        render_sample_duration_ns,
+        FenceTimestampQuality, FrameTimingObservation, ProvenDeadlineMiss,
+        approximate_observation_is_late, render_sample_duration_ns,
     },
     control::NativeControlServer,
     drm::{
