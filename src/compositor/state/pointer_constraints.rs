@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::input::ResolvedPointerConstraintBackendRequest;
 use crate::compositor::subsurface::CapturedPointerConstraintCommit;
 
 #[derive(Debug, Clone, Copy)]
@@ -640,9 +641,16 @@ impl CompositorState {
                     ));
                     return;
                 };
+                let Some(region) = resolved.region else {
+                    pointer_debug_log(format!(
+                        "constraint activation skipped id={} reason=region_empty mode={:?}",
+                        constraint_id, mode
+                    ));
+                    return;
+                };
                 PointerConstraintBackendRequest::ActivateConfined {
                     id: backend_id,
-                    region: resolved.region,
+                    region,
                     region_resolution_timing: resolved.timing,
                 }
             }
@@ -716,7 +724,7 @@ impl CompositorState {
         constraint_id: u64,
     ) -> Option<OutputRegion> {
         self.pointer_constraint_output_region_with_timing(constraint_id)
-            .map(|resolved| resolved.region)
+            .and_then(|resolved| resolved.region)
     }
 
     pub(in crate::compositor) fn pointer_constraint_output_region_with_timing(
@@ -756,9 +764,13 @@ impl CompositorState {
         &mut self,
         request: PointerConstraintBackendRequest,
         current_position: OutputPosition,
-    ) -> Option<(PointerConstraintBackendRequest, Option<OutputPosition>)> {
+    ) -> Option<ResolvedPointerConstraintBackendRequest> {
         let PointerConstraintBackendRequest::ActivateLocked { id } = request else {
-            return Some((request, None));
+            return Some(ResolvedPointerConstraintBackendRequest {
+                request,
+                locked_anchor: None,
+                region_resolution_timing: None,
+            });
         };
         if !self.pointer_constraint_backend_activation_current(id) {
             return None;
@@ -797,12 +809,13 @@ impl CompositorState {
             self.abort_pointer_constraint_backend_activation(id, "focus_client_or_root_changed");
             return None;
         }
-        let region = self.pointer_constraint_output_region(id.constraint_id);
-        let Some(anchor) = self.pointer_constraint_activation_anchor(
-            id.constraint_id,
-            region.as_ref(),
-            current_position,
-        ) else {
+        let resolved_region = self.pointer_constraint_output_region_with_timing(id.constraint_id);
+        let region = resolved_region
+            .as_ref()
+            .and_then(|resolved| resolved.region.as_ref());
+        let Some(anchor) =
+            self.pointer_constraint_activation_anchor(id.constraint_id, region, current_position)
+        else {
             self.abort_pointer_constraint_backend_activation(id, "anchor_unresolved");
             return None;
         };
@@ -826,10 +839,11 @@ impl CompositorState {
             anchor.x,
             anchor.y
         ));
-        Some((
-            PointerConstraintBackendRequest::ActivateLocked { id },
-            Some(anchor),
-        ))
+        Some(ResolvedPointerConstraintBackendRequest {
+            request: PointerConstraintBackendRequest::ActivateLocked { id },
+            locked_anchor: Some(anchor),
+            region_resolution_timing: resolved_region.and_then(|resolved| resolved.timing),
+        })
     }
 
     fn abort_pointer_constraint_backend_activation(

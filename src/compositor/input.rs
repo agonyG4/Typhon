@@ -214,6 +214,13 @@ pub enum PointerConstraintBackendRequest {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPointerConstraintBackendRequest {
+    pub request: PointerConstraintBackendRequest,
+    pub locked_anchor: Option<OutputPosition>,
+    pub region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
+}
+
 impl PointerConstraintBackendRequest {
     pub const fn id(&self) -> Option<PointerConstraintBackendId> {
         match self {

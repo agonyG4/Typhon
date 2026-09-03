@@ -3,7 +3,7 @@ use std::time::Instant;
 
 #[derive(Debug)]
 pub(in crate::compositor) struct ResolvedPointerConstraintRegion {
-    pub(in crate::compositor) region: OutputRegion,
+    pub(in crate::compositor) region: Option<OutputRegion>,
     pub(in crate::compositor) timing: Option<PointerConstraintRegionResolutionTiming>,
 }
 
@@ -98,6 +98,13 @@ struct SurfaceRectRegion {
     rects: Vec<SurfaceRect>,
 }
 
+#[derive(Debug)]
+struct SurfaceRectBand {
+    top: i64,
+    bottom: i64,
+    intervals: Vec<(i64, i64)>,
+}
+
 impl SurfaceRectRegion {
     fn empty() -> Self {
         Self::default()
@@ -183,11 +190,84 @@ impl SurfaceRectRegion {
             .sort_unstable_by_key(|rect| (rect.top, rect.left, rect.bottom, rect.right));
     }
 
+    fn canonicalized(&self) -> Self {
+        if self.rects.len() <= 1 {
+            return self.clone();
+        }
+
+        let mut y_edges = self
+            .rects
+            .iter()
+            .flat_map(|rect| [rect.top, rect.bottom])
+            .collect::<Vec<_>>();
+        y_edges.sort_unstable();
+        y_edges.dedup();
+
+        let mut bands = Vec::<SurfaceRectBand>::new();
+        for edge_pair in y_edges.windows(2) {
+            let [top, bottom] = *edge_pair else {
+                continue;
+            };
+            let mut intervals = self
+                .rects
+                .iter()
+                .filter_map(|rect| {
+                    record_region_operation();
+                    (rect.top <= top && rect.bottom >= bottom).then_some((rect.left, rect.right))
+                })
+                .collect::<Vec<_>>();
+            if intervals.is_empty() {
+                continue;
+            }
+
+            intervals.sort_unstable();
+            let mut merged_intervals: Vec<(i64, i64)> = Vec::with_capacity(intervals.len());
+            for (left, right) in intervals {
+                if let Some(previous) = merged_intervals.last_mut()
+                    && left <= previous.1
+                {
+                    previous.1 = previous.1.max(right);
+                } else {
+                    merged_intervals.push((left, right));
+                }
+            }
+
+            if let Some(previous) = bands.last_mut()
+                && previous.bottom == top
+                && previous.intervals == merged_intervals
+            {
+                previous.bottom = bottom;
+            } else {
+                bands.push(SurfaceRectBand {
+                    top,
+                    bottom,
+                    intervals: merged_intervals,
+                });
+            }
+        }
+
+        let rects = bands
+            .into_iter()
+            .flat_map(|band| {
+                band.intervals
+                    .into_iter()
+                    .map(move |(left, right)| SurfaceRect {
+                        left,
+                        top: band.top,
+                        right,
+                        bottom: band.bottom,
+                    })
+            })
+            .collect();
+        Self { rects }
+    }
+
     fn into_output_region(self, origin: (i32, i32)) -> Option<OutputRegion> {
-        if self.rects.is_empty() {
+        let canonical = self.canonicalized();
+        if canonical.rects.is_empty() {
             return None;
         }
-        let rects = self
+        let rects = canonical
             .rects
             .into_iter()
             .filter_map(|rect| {
@@ -225,8 +305,7 @@ pub(in crate::compositor) fn resolve_pointer_constraint_output_region_with_timin
     let timing_enabled = crate::pointer_debug::timing_trace_enabled();
     let start = timing_enabled.then(Instant::now);
     let thread_cpu_start = timing_enabled.then(region_resolution_thread_cpu_time_ns);
-    let region =
-        resolve_pointer_constraint_output_region(constraint, input, width, height, origin)?;
+    let region = resolve_pointer_constraint_output_region(constraint, input, width, height, origin);
     let timing = timing_enabled.then(|| PointerConstraintRegionResolutionTiming {
         duration_ns: start
             .and_then(|start| u64::try_from(start.elapsed().as_nanos()).ok())
@@ -414,6 +493,141 @@ mod tests {
 
         assert_region_membership_matches(result.output.as_ref(), oracle.as_ref(), 10, 10);
         assert!(result.operation_count > 0);
+    }
+
+    #[test]
+    fn adjacent_additions_have_canonical_geometry_and_closest_point_behavior() {
+        let single = region([InputRegionOp::Add(
+            InputRegionRect::new(0, 0, 2, 5).unwrap(),
+        )]);
+        let adjacent = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 2, 1).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(0, 1, 2, 4).unwrap()),
+        ]);
+        let single = resolve_pointer_constraint_region_for_test(
+            &single,
+            &SurfaceInputRegion::Default,
+            10,
+            10,
+        )
+        .output
+        .expect("single rectangle");
+        let adjacent = resolve_pointer_constraint_region_for_test(
+            &adjacent,
+            &SurfaceInputRegion::Default,
+            10,
+            10,
+        )
+        .output
+        .expect("adjacent rectangles");
+
+        assert_eq!(adjacent.rects, single.rects);
+        assert_eq!(
+            adjacent.closest_point(OutputPosition { x: 0.0, y: 0.5 }),
+            single.closest_point(OutputPosition { x: 0.0, y: 0.5 })
+        );
+    }
+
+    #[test]
+    fn canonicalization_work_is_independent_of_surface_area() {
+        let constraint = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 4).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(0, 4, 10, 6).unwrap()),
+        ]);
+        let small = resolve_pointer_constraint_region_for_test(
+            &constraint,
+            &SurfaceInputRegion::Default,
+            40,
+            30,
+        );
+        let large = resolve_pointer_constraint_region_for_test(
+            &constraint,
+            &SurfaceInputRegion::Default,
+            7_680,
+            4_320,
+        );
+
+        assert_eq!(small.operation_count, large.operation_count);
+        assert_eq!(small.output, large.output);
+    }
+
+    #[test]
+    fn equivalent_operation_histories_have_equal_canonical_regions_and_probes() {
+        let single = region([InputRegionOp::Add(
+            InputRegionRect::new(0, 0, 10, 10).unwrap(),
+        )]);
+        let adjacent = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 4).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(0, 4, 10, 6).unwrap()),
+        ]);
+        let hole = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 10).unwrap()),
+            InputRegionOp::Subtract(InputRegionRect::new(4, 4, 2, 2).unwrap()),
+        ]);
+        let hole_pieces = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 4).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(0, 6, 10, 4).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(0, 4, 4, 2).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(6, 4, 4, 2).unwrap()),
+        ]);
+
+        let resolve = |constraint: &SurfaceInputRegion| {
+            resolve_pointer_constraint_region_for_test(
+                constraint,
+                &SurfaceInputRegion::Default,
+                10,
+                10,
+            )
+            .output
+            .expect("non-empty region")
+        };
+        let single = resolve(&single);
+        let adjacent = resolve(&adjacent);
+        let hole = resolve(&hole);
+        let hole_pieces = resolve(&hole_pieces);
+
+        assert_eq!(single.rects, adjacent.rects);
+        assert_eq!(hole.rects, hole_pieces.rects);
+        for position in [
+            OutputPosition { x: 5.5, y: 5.5 },
+            OutputPosition { x: -2.0, y: 5.0 },
+            OutputPosition { x: 5.0, y: 5.0 },
+            OutputPosition { x: 20.0, y: 20.0 },
+        ] {
+            assert_eq!(
+                single.closest_point(position),
+                adjacent.closest_point(position),
+                "adjacent probe {position:?}"
+            );
+        }
+        for position in [
+            OutputPosition { x: 5.5, y: 5.0 },
+            OutputPosition { x: 5.0, y: 5.0 },
+            OutputPosition { x: -2.0, y: 5.0 },
+            OutputPosition { x: 20.0, y: 20.0 },
+        ] {
+            assert_eq!(
+                hole.closest_point(position),
+                hole_pieces.closest_point(position),
+                "hole probe {position:?}"
+            );
+        }
+
+        let islands = region([
+            InputRegionOp::Add(InputRegionRect::new(0, 0, 2, 2).unwrap()),
+            InputRegionOp::Add(InputRegionRect::new(4, 0, 2, 2).unwrap()),
+        ]);
+        let islands = resolve(&islands);
+        assert_eq!(islands.rects.len(), 2);
+        assert!(
+            !islands
+                .rects
+                .iter()
+                .any(|rect| { rect.x < 4.0 && rect.x + rect.width > 2.0 })
+        );
+        assert!(!hole.rects.iter().any(|rect| {
+            rect.x < 5.0 && rect.x + rect.width > 5.0 && rect.y < 5.0 && rect.y + rect.height > 5.0
+        }));
     }
 
     #[test]

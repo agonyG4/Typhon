@@ -40,7 +40,8 @@ use oblivion_one::compositor::{
     PointerConstraintRegionResolutionTiming, PointerMotionSample as CompositorPointerMotionSample,
     PresentationClock, RelativePointerMotion as CompositorRelativePointerMotion,
     RenderGenerationCause, RenderSceneElement, RenderSceneElementId, RenderableSurface,
-    TearingPolicy, WindowId, render_scene_elements_for_surfaces, resize_debug_log,
+    ResolvedPointerConstraintBackendRequest, TearingPolicy, WindowId,
+    render_scene_elements_for_surfaces, resize_debug_log,
 };
 use oblivion_one::native::kms::{
     AtomicCommitState, AtomicCompletion, AtomicCursorPlaneProperties, AtomicCursorVisualState,

@@ -73,7 +73,10 @@ use super::{
     SurfacePacingMetrics, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
     WindowFocusReason, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
     XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
-    input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
+    input::{
+        PointerConstraintBackendId, PointerConstraintBackendRequest,
+        ResolvedPointerConstraintBackendRequest,
+    },
 };
 #[derive(Debug)]
 pub struct OwnCompositorServer {
@@ -1352,7 +1355,7 @@ impl OwnCompositorServer {
         &mut self,
         request: PointerConstraintBackendRequest,
         current_position: OutputPosition,
-    ) -> Option<(PointerConstraintBackendRequest, Option<OutputPosition>)> {
+    ) -> Option<ResolvedPointerConstraintBackendRequest> {
         self.state
             .resolve_pointer_constraint_backend_request(request, current_position)
     }

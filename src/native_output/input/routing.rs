@@ -1468,11 +1468,16 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 });
                 continue;
             }
-            let Some((request, locked_anchor)) =
+            let Some(resolved_request) =
                 server.resolve_pointer_constraint_backend_request(request, cursor_position)
             else {
                 continue;
             };
+            let ResolvedPointerConstraintBackendRequest {
+                request,
+                locked_anchor,
+                region_resolution_timing,
+            } = resolved_request;
             native_pointer_debug_log_lazy(|| {
                 format!(
                     "pointer.constraint activation_resolved epoch={:?} anchor={:?} cursor=({},{})",
@@ -1562,7 +1567,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                     &mut selected_transition,
                     transition,
                     action_timing,
-                    action.region_resolution_timing,
+                    region_resolution_timing.or(action.region_resolution_timing),
                 );
             }
             if let Some(visible) = action.cursor_visibility_changed {
@@ -1910,6 +1915,55 @@ mod routing_transition_tests {
             selected.constraint_region_resolution_thread_cpu_ns,
             Some(19)
         );
+    }
+
+    #[test]
+    fn selected_locked_activation_keeps_region_resolution_timing() {
+        let transition = NativeInputRoutingTransition::LockedActivated(id(26, 1));
+        let resolved = ResolvedPointerConstraintBackendRequest {
+            request: PointerConstraintBackendRequest::ActivateLocked { id: id(26, 1) },
+            locked_anchor: Some(CompositorOutputPosition { x: 4.0, y: 5.0 }),
+            region_resolution_timing: Some(PointerConstraintRegionResolutionTiming {
+                duration_ns: 37,
+                thread_cpu_ns: Some(19),
+            }),
+        };
+        let mut selected = None;
+
+        select_pointer_transition_evidence(
+            &mut selected,
+            transition,
+            NativePointerConstraintActionTiming::default(),
+            resolved.region_resolution_timing,
+        );
+
+        let selected = selected.expect("locked activation evidence");
+        assert_eq!(
+            selected.transition,
+            NativeInputRoutingTransition::LockedActivated(id(26, 1))
+        );
+        assert_eq!(selected.constraint_region_resolution_duration_ns, Some(37));
+        assert_eq!(
+            selected.constraint_region_resolution_thread_cpu_ns,
+            Some(19)
+        );
+
+        let mut selected = None;
+        select_pointer_transition_evidence(
+            &mut selected,
+            NativeInputRoutingTransition::LockedDeactivated(id(26, 1)),
+            NativePointerConstraintActionTiming::default(),
+            None,
+        );
+        select_pointer_transition_evidence(
+            &mut selected,
+            NativeInputRoutingTransition::LockedActivated(id(27, 1)),
+            NativePointerConstraintActionTiming::default(),
+            resolved.region_resolution_timing,
+        );
+        let selected = selected.expect("deactivation evidence");
+        assert_eq!(selected.constraint_region_resolution_duration_ns, None);
+        assert_eq!(selected.constraint_region_resolution_thread_cpu_ns, None);
     }
 
     #[test]
