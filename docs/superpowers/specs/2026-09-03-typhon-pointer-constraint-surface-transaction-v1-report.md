@@ -128,7 +128,7 @@ The real Wayland-resource regression module covers:
 The reducer suite directly covers canceled install payloads, including the
 absence of unowned region and hint state.
 
-## GREEN results and verification limits
+## Historical v1.1 verification before region algebra
 
 The focused transaction suite passed with 7 tests, and the adjacent legacy
 pointer-constraint suite passed with 38 tests during implementation. Production
@@ -176,6 +176,138 @@ test invocation was blocked during test compilation by those edits. The
 subsequent library check and clippy reruns were also blocked by a missing
 `RenderPrediction` field initializer in that file. The pointer-constraint
 commits remain unchanged.
+
+## Region-algebra v1 closure
+
+This region-algebra follow-up started from:
+
+```text
+cc9fb1c196558bfad8c958c1483951c17cc61fa3
+```
+
+The implementation commit is `3c7abff`, followed by the formatting and
+warning-closure commit `1f5d5c1`. The final report commit records the ending
+HEAD below.
+
+The pre-fix defects and evidence were:
+
+- resource death prematurely invalidated current effective routing;
+- captured-but-unpublished installs escaped `AlreadyConstrained` ownership;
+- region/hint payloads lacked stable constraint identity;
+- the effective-region resolver rasterized every surface pixel and repeatedly
+  locked the committed input-region state.
+
+The old pointer-constraint effective-region resolver scaled with surface pixel
+area and acquired the committed input-region mutex from inside that area scan.
+For a `W × H` surface, the old candidate count was `W × H`: 1,783,680 points
+for the Sober-shaped 1920×929 case and 33,177,600 points for 7680×4320.
+`d665d3a` added the deterministic RED algebra tests before the resolver and
+snapshot API existed; they failed at compile time because the expected
+resolver and snapshot surface were absent. The subsequent implementation
+replaced that path without changing the accepted transaction architecture.
+
+The new resolver scales with region geometry complexity and snapshots
+committed input-region state once per resolution. `SurfaceRectRegion` uses
+positive-area, non-overlapping half-open rectangles with i64 edges. It applies
+ordered `wl_region.add` union and subtraction, intersects the committed
+constraint region with the committed input region, clips to
+`[0,width) × [0,height)`, and translates deterministically top-to-bottom and
+left-to-right into the existing `OutputRegion`/`OutputRect` types. Defaults
+are full-surface for constraints and effectively infinite-for-input before
+surface clipping; custom input regions start empty. The production geometry
+path has no area loop, row loop, or input-region mutex access.
+
+`SurfaceData::committed_input_region_snapshot` clones committed state under
+one lock and releases it before rectangle resolution. A poisoned lock remains
+fail-open as the default/infinite input region, matching existing hit-testing
+behavior. The test-only snapshot lock counter reports exactly one lock for a
+resolution snapshot.
+
+The implementation deliberately does not reuse `SurfaceOpaqueRegion` or its
+different defaults. Pixman was rejected: this is a small integer,
+surface-local set problem, and a pure Rust rectangle algebra avoids an
+additional dependency and conversion/lifetime boundary while preserving the
+required exact ordered operations.
+
+The algorithm follows the established Wayland-family region model represented
+by [wlroots committed input-region state](https://github.com/swaywm/wlroots/blob/master/include/wlr/types/wlr_surface.h),
+[wlroots pointer-constraint region handling](https://github.com/swaywm/wlroots/blob/master/rootston/cursor.c),
+and [Weston compositor region state](https://github.com/krh/weston/blob/master/src/compositor.c):
+regions are maintained as rectangle geometry, clipped in surface-local
+coordinates, and consumed at the constraint transition boundary.
+
+## Region RED and GREEN coverage
+
+The cfg(test)-only legacy raster oracle remains limited to small surfaces. It
+is used for membership and closest-point probes, including fractional probes
+and equal-distance ordering cases. The algebra suite covers defaults/custom
+constraint and input regions, union, ordered subtract, overlap and disjoint
+sets, clipping at negative and extreme i32 coordinates, holes, islands,
+empty results, deterministic rectangle ordering, and constant operation work
+at 40×30, 1920×929, and 7680×4320. The focused region suite is GREEN with 7
+tests.
+
+Real Wayland-resource coverage is also GREEN and retains the v1.1 regressions:
+
+- lock and confine requests without a commit;
+- active locked and confined destruction without a commit;
+- destroy plus commit and native deactivation queueing;
+- create and destroy before the first effective commit;
+- no events to destroyed resources and cancellation of stale backend
+  activation;
+- captured-but-unpublished `AlreadyConstrained`, including synchronized
+  subsurface ownership;
+- delayed constraint-scoped region and cursor-hint identity;
+- exact `wl_surface.commit` capture for constraint and input-region state;
+- synchronized/delayed commit ownership and the Sober-shaped 1920×929
+  default region.
+
+The real confined-pointer subset passed 5 tests, the pointer-constraint
+transaction subset passed 7 tests, and the full test command passed 3,290
+tests with 5 ignored. Existing active-confined-region updates use the same
+algebraic resolver, while activation carries optional resolver timing through
+the existing native request/action/evidence path.
+
+## Timing and non-claims
+
+`NativePointerTransitionEvidence` now carries
+`constraint_region_resolution_duration_ns` and
+`constraint_region_resolution_thread_cpu_ns`. The fields are selected with the
+same transition evidence as activation and are included in the existing
+timing summary. Resolver clocks are gated by the existing pointer timing trace
+switch; tracing disabled adds no resolver clocks, formatting, allocations, or
+operation counters. The routing-transition suite remains GREEN with 6 tests,
+and the pointer timing suite remains GREEN with 17 tests, including
+deactivation A followed by activation B and wall/thread-CPU association.
+
+The required repository verification on the current checkout is:
+
+```text
+rtk cargo fmt --check                                  BLOCKED: pre-existing
+                                                         import-order drift in
+                                                         src/native_output/tests/input.rs
+rtk cargo check --locked --all-targets                 GREEN
+rtk cargo clippy --locked --all-targets -- -D warnings GREEN
+rtk cargo test --locked                                GREEN: 3290 passed,
+                                                         5 ignored
+rtk git diff --check                                   GREEN
+```
+
+The formatting blocker is outside the pointer-constraint region change and
+was preserved with the concurrent native-pacing checkout. Linux-only
+dependency/target blockers (`wayland-server`, `libudev`, DRM, pkg-config, or
+the Linux target) did not occur for these checks.
+
+Protocol resource lifetime, committed surface constraint lifetime, and native effective routing lifetime are separate ownership domains.
+
+Captured pointer-constraint region and cursor-hint state can never be attributed to a different constraint identity.
+
+This task does not alter pointer motion semantics, Native Input Semantic Epoch semantics, pointer-constraint transaction ownership, or physical-event ordering.
+
+The current verification host is Linux; no Windows build or Windows-specific
+availability claim was made. Native Linux manual qualification against the
+physical input backend, including the Sober/Roblox scenario, was not run.
+This task does not claim the Sober/Roblox camera jump is fixed until native post-change qualification confirms it.
 
 ## Non-claims
 
