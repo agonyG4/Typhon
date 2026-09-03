@@ -1583,6 +1583,10 @@ fn same_surface_lock_from_different_pointer_resource_is_rejected() {
         &qh,
         (),
     );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
     let _lock_b = constraints.lock_pointer(
         &surface,
         &pointer_b,
@@ -1591,7 +1595,6 @@ fn same_surface_lock_from_different_pointer_resource_is_rejected() {
         &qh,
         (),
     );
-    surface.commit();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
 

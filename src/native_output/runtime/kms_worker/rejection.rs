@@ -7,14 +7,14 @@ use super::super::presentation_transactions::{
     settle_dropped_output_transaction, settle_failed_output_transaction,
 };
 use super::direct_rejection::WorkerRejectionKind;
-use crate::native_output::scanout::FrozenCursorPlaneOwner;
+use crate::native_output::scanout::{AtomicEglGbmScanout, FrozenCursorPlaneOwner};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn drop_queued_worker_job_with_reason_parts(
+pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_parts(
     job: KmsCommitJob,
     drop_reason: OutputTransactionDropReason,
     scene_history: &mut NativeSceneHistory,
-    scanout: &mut NativeScanoutBackend,
+    scanout: &mut AtomicEglGbmScanout,
     frame_pacing: &mut NativeFramePacing,
     frame_scheduler: &mut NativeFrameScheduler,
     atomic_cursor: &mut Option<NativeAtomicCursor>,
@@ -74,9 +74,10 @@ pub(super) fn drop_queued_worker_job_with_reason_parts(
     atomic_commit_arbiter.reject_worker_queued(job.token);
     if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
         if compatibility_primary {
-            scanout
-                .suspend_abandon_worker_compatibility(job.token)
-                .map_err(io::Error::other)?;
+            return Err(io::Error::other(
+                "Atomic compatibility worker requires native EGL/GBM scanout",
+            )
+            .into());
         } else {
             scanout
                 .suspend_abandon_worker_submission(job.token)

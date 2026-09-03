@@ -7,7 +7,8 @@ use super::super::presentation_transactions::{
 use super::super::*;
 use super::cycle_direct;
 use crate::native_output::kms_worker::{
-    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsWorkerQueuedCancellation,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
+    KmsWorkerQueuedCancellation,
 };
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
@@ -192,7 +193,7 @@ fn abandon_overtaken_worker_queued(
     worker: &KmsCommitWorkerHandle,
     owner: QueuedOutputFrameIdentitySnapshot,
     crtc_id: u32,
-    scanout: &mut NativeScanoutBackend,
+    explicit: &mut AtomicEglGbmScanout,
     scene_history: &mut NativeSceneHistory,
     frame_pacing: &mut NativeFramePacing,
     frame_scheduler: &mut NativeFrameScheduler,
@@ -211,10 +212,10 @@ fn abandon_overtaken_worker_queued(
         owner.frame.frame_id,
     ) {
         KmsWorkerQueuedCancellation::Cancelled(job) => drop_queued_worker_job_with_reason_parts(
-            job,
+            *job,
             OutputTransactionDropReason::SafeAbandonment,
             scene_history,
-            scanout,
+            explicit,
             frame_pacing,
             frame_scheduler,
             atomic_cursor,
@@ -945,7 +946,7 @@ impl NativeRuntime {
                                     worker,
                                     owner,
                                     target.crtc_id,
-                                    scanout,
+                                    explicit,
                                     scene_history,
                                     frame_pacing,
                                     frame_scheduler,

@@ -984,6 +984,7 @@ fn suspended_ready_slot_cannot_be_reused_before_fence_proof() {
     assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
 
     assert!(!swapchain.is_poisoned());
+    assert!(!swapchain.render_target_available_for_limit(2));
     assert!(swapchain.acquire_render_slot().is_err());
     assert!(swapchain.recover_suspended_slot(false).is_err());
     assert_eq!(swapchain.quarantine_slot_id(), Some(slot));

@@ -1768,7 +1768,7 @@ impl CompositorState {
                         self.pointer_constraints.remove(&id);
                     }
                 }
-                PointerConstraintLifecycleCommit::Install(id)
+                PointerConstraintLifecycleCommit::Install(_)
                 | PointerConstraintLifecycleCommit::NoChange => {
                     self.update_active_confined_pointer_region(id, "commit");
                     self.maybe_request_pointer_constraint_activation(id);

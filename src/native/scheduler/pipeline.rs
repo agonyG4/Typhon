@@ -196,6 +196,9 @@ impl NativeFrameScheduler {
             return SchedulerDecision::WaitForBuffer;
         }
         if self.visual_work_queued {
+            if pipeline.free_compositor_slots() == 0 {
+                return SchedulerDecision::WaitForBuffer;
+            }
             if context
                 .presentation_target
                 .is_some_and(|target| now_ns < target.render_start_deadline.get())
@@ -531,6 +534,24 @@ mod tests {
                 at_ns: 5_000_000,
             })
         );
+    }
+
+    #[test]
+    fn visual_work_waits_when_pipeline_has_no_renderable_slot() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        let pipeline = TestPipeline {
+            free_compositor_slots: 0,
+            ..TestPipeline::default()
+        };
+
+        let decision = scheduler.decision_with_pipeline_diagnostics(
+            context(5_000_000, Some(target(4_000_000, 6_000_000))),
+            &pipeline,
+        );
+
+        assert_eq!(decision.action, SchedulerDecision::WaitForBuffer);
+        assert_eq!(decision.wait_reason, Some(PipelineWaitReason::NoFreeSlot));
     }
 
     #[test]

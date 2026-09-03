@@ -219,7 +219,7 @@ pub(crate) enum KmsWorkerPhase {
 
 #[derive(Debug)]
 pub(crate) enum KmsWorkerQueuedCancellation {
-    Cancelled(KmsCommitJob),
+    Cancelled(Box<KmsCommitJob>),
     NotQueued { phase: KmsWorkerPhase },
     IdentityMismatch,
 }
@@ -443,7 +443,7 @@ impl WorkerShared {
             let job = state.queued.remove(index).expect("queued job index exists");
             drop(state);
             self.work_wakeup.notify_one();
-            return KmsWorkerQueuedCancellation::Cancelled(job);
+            return KmsWorkerQueuedCancellation::Cancelled(Box::new(job));
         }
         if state.queued.iter().any(|job| {
             job.kind.is_primary()

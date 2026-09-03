@@ -41,36 +41,6 @@ fn select_callback_timing(
     }
 }
 
-#[cfg(test)]
-mod callback_attribution_tests {
-    use super::*;
-
-    fn timing(surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
-        FrameCallbackTimingEvidence {
-            surface_id,
-            commit_ns,
-            admission_ns: Some(commit_ns.saturating_sub(10)),
-            reaction_ns: Some(10),
-        }
-    }
-
-    #[test]
-    fn one_surface_uses_the_latest_commit_for_that_surface() {
-        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(7, 120)]);
-
-        assert_eq!(selected, Some(timing(7, 120)));
-        assert!(!ambiguous);
-    }
-
-    #[test]
-    fn multiple_surfaces_are_not_attributed_to_an_arbitrary_callback() {
-        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(8, 120)]);
-
-        assert_eq!(selected, None);
-        assert!(ambiguous);
-    }
-}
-
 impl ShutdownDmabufReleaseSet {
     pub(in crate::compositor) fn push(&mut self, obligation: DmabufReleaseObligation) {
         if self
@@ -451,7 +421,6 @@ impl CompositorState {
                 frame_id,
                 callbacks,
                 callback_timing,
-                callback_timing_ambiguous,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
                 callback_admission_ns: None,
@@ -1772,5 +1741,35 @@ impl CompositorState {
             );
         }
         self.commit_ready_surface_tree_transactions();
+    }
+}
+
+#[cfg(test)]
+mod callback_attribution_tests {
+    use super::*;
+
+    fn timing(surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
+        FrameCallbackTimingEvidence {
+            surface_id,
+            commit_ns,
+            admission_ns: Some(commit_ns.saturating_sub(10)),
+            reaction_ns: Some(10),
+        }
+    }
+
+    #[test]
+    fn one_surface_uses_the_latest_commit_for_that_surface() {
+        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(7, 120)]);
+
+        assert_eq!(selected, Some(timing(7, 120)));
+        assert!(!ambiguous);
+    }
+
+    #[test]
+    fn multiple_surfaces_are_not_attributed_to_an_arbitrary_callback() {
+        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(8, 120)]);
+
+        assert_eq!(selected, None);
+        assert!(ambiguous);
     }
 }

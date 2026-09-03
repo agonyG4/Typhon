@@ -621,7 +621,12 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
         kernel_submitted,
         worker_queued_next,
         prepared,
-        free_compositor_slots: u8::try_from(swapchain.free_slot_count()).unwrap_or(u8::MAX),
+        free_compositor_slots: if swapchain.render_target_available_for_limit(future_primary_limit)
+        {
+            u8::try_from(swapchain.free_slot_count()).unwrap_or(u8::MAX)
+        } else {
+            0
+        },
         triple_capability,
     };
     snapshot
@@ -935,6 +940,39 @@ mod tests {
                 transaction_id: current.transaction_id(),
             })
         );
+    }
+
+    #[test]
+    fn recoverable_quarantine_exposes_no_renderable_pipeline_slots() {
+        let mut swapchain = swapchain();
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        swapchain
+            .finish_render(
+                slot,
+                1,
+                crate::egl_renderer::native_fence::NativeRenderFence::from_submission_fd(sync_fd()),
+            )
+            .expect("ready frame");
+        swapchain
+            .suspend_abandon_ready()
+            .expect("recoverable quarantine");
+
+        let snapshot = build_output_pipeline_snapshot_with_presented(
+            1,
+            7,
+            NativeOutputPacingMode::PredictiveTriple,
+            2,
+            &swapchain,
+            &OutputTransactionLedger::new(),
+            &AtomicCommitArbiter::new(),
+            None,
+            None,
+            TripleCapability::Capable,
+            PresentedPlaneSnapshot::legacy(None),
+        )
+        .expect("quarantine remains a valid pipeline state");
+
+        assert_eq!(snapshot.free_compositor_slots, 0);
     }
 
     #[test]

@@ -228,6 +228,7 @@ fn merge_damage(
 #[cfg(test)]
 mod window_geometry_tests {
     use super::*;
+    use crate::compositor::state_data::{InputRegionOp, InputRegionRect};
     use crate::compositor::{
         SurfaceContentType, SurfacePresentationHint, SurfacePresentationMetadata,
         SurfacePresentationState, XdgWindowGeometry,

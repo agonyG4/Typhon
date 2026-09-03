@@ -121,7 +121,6 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) frame_id: u64,
     pub(super) callbacks: Vec<wl_callback::WlCallback>,
     pub(super) callback_timing: Option<FrameCallbackTimingEvidence>,
-    pub(super) callback_timing_ambiguous: bool,
     pub(super) callback_commit_ns: Option<u64>,
     pub(super) callback_render_completed_ns: Option<u64>,
     pub(super) callback_admission_ns: Option<u64>,

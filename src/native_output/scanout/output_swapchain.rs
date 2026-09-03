@@ -249,7 +249,6 @@ pub(crate) struct QueuedOutputFrameIdentitySnapshot {
 pub(crate) enum PhysicalPrimaryClaimViolation {
     GenerationMismatch,
     Regression,
-    PrecedesPendingClaim,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,7 +357,7 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn render_target_available_for_limit(&self, future_primary_limit: u8) -> bool {
-        !self.is_poisoned()
+        self.quarantine.is_none()
             && self.rendering.is_none()
             && self.ready.is_none()
             && !(future_primary_limit < 2 && self.pending.is_some())
@@ -1041,7 +1040,11 @@ impl AtomicOutputSwapchain {
         token: PageFlipToken,
         pool_generation: u64,
     ) -> io::Result<CompletedOutputFrame> {
-        self.ensure_operational()?;
+        if self.is_poisoned() {
+            return Err(io::Error::other(
+                "fatal output quarantine blocks pageflip completion",
+            ));
+        }
         if pool_generation != self.pool_generation {
             return Err(io::Error::other("stale output pool generation pageflip"));
         }
@@ -1108,29 +1111,22 @@ impl AtomicOutputSwapchain {
                 PhysicalPrimaryClaimViolation::Regression,
             );
         }
-        if let Some(pending) = &self.pending
-            && !is_at_or_after_claim(claim, pending.frame.target.physical_claim())
+        if let Some(worker) = &self.worker_queued
+            && !is_strictly_later_claim(worker.frame.target.physical_claim(), claim)
         {
-            return PhysicalPrimaryClaimRevalidation::Fatal(
-                PhysicalPrimaryClaimViolation::PrecedesPendingClaim,
-            );
+            return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
+                owner: QueuedOutputFrameIdentitySnapshot {
+                    frame: (&worker.frame).into(),
+                    token: worker.token,
+                },
+            };
         }
-        if let Some(worker) = &self.worker_queued {
-            if !is_strictly_later_claim(worker.frame.target.physical_claim(), claim) {
-                return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
-                    owner: QueuedOutputFrameIdentitySnapshot {
-                        frame: (&worker.frame).into(),
-                        token: worker.token,
-                    },
-                };
-            }
-        }
-        if let Some(ready) = &self.ready {
-            if !is_strictly_later_claim(ready.target.physical_claim(), claim) {
-                return PhysicalPrimaryClaimRevalidation::OvertakesReady {
-                    owner: (&*ready).into(),
-                };
-            }
+        if let Some(ready) = &self.ready
+            && !is_strictly_later_claim(ready.target.physical_claim(), claim)
+        {
+            return PhysicalPrimaryClaimRevalidation::OvertakesReady {
+                owner: ready.into(),
+            };
         }
         PhysicalPrimaryClaimRevalidation::Valid
     }
@@ -1391,11 +1387,15 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    #[track_caller]
     fn ensure_operational(&self) -> io::Result<()> {
         if self.quarantine.is_some() {
-            return Err(io::Error::other(
-                "explicit output swapchain is quarantined and non-renderable",
-            ));
+            let caller = std::panic::Location::caller();
+            return Err(io::Error::other(format!(
+                "explicit output swapchain is quarantined and non-renderable at {}:{}",
+                caller.file(),
+                caller.line(),
+            )));
         }
         Ok(())
     }
@@ -1529,12 +1529,6 @@ fn is_strictly_later_claim(earlier: PrimaryRefreshClaim, later: PrimaryRefreshCl
     earlier.clock_generation == later.clock_generation
         && later.sequence > earlier.sequence
         && later.presentation_time > earlier.presentation_time
-}
-
-fn is_at_or_after_claim(current: PrimaryRefreshClaim, planned: PrimaryRefreshClaim) -> bool {
-    current.clock_generation == planned.clock_generation
-        && current.sequence >= planned.sequence
-        && current.presentation_time >= planned.presentation_time
 }
 
 #[cfg(test)]
@@ -1716,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_claim_revalidation_classifies_fatal_frontier_violations() {
+    fn physical_claim_revalidation_classifies_generation_and_regression_violations() {
         let claim = PrimaryRefreshClaim {
             sequence: 2,
             presentation_time: MonotonicTimestampNs::new(20),
@@ -1733,17 +1727,6 @@ mod tests {
                 PhysicalPrimaryClaimViolation::GenerationMismatch
             )
         );
-        assert_eq!(
-            swapchain.revalidate_physical_primary_presentation(PrimaryRefreshClaim {
-                sequence: 1,
-                presentation_time: MonotonicTimestampNs::new(10),
-                ..claim
-            }),
-            PhysicalPrimaryClaimRevalidation::Fatal(
-                PhysicalPrimaryClaimViolation::PrecedesPendingClaim
-            )
-        );
-
         swapchain
             .complete_pageflip(predecessor_token, 1)
             .expect("predecessor pageflip");
@@ -1754,6 +1737,32 @@ mod tests {
             swapchain.revalidate_physical_primary_presentation(claim),
             PhysicalPrimaryClaimRevalidation::Fatal(PhysicalPrimaryClaimViolation::Regression)
         );
+    }
+
+    #[test]
+    fn pending_claim_allows_physical_pageflip_before_predicted_time() {
+        let claim = PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        let target = test_target(1, 20, PresentationTargetReason::Normal);
+        let (mut swapchain, predecessor_token) = swapchain_with_submitted_target(target);
+
+        let actual_claim = PrimaryRefreshClaim {
+            presentation_time: MonotonicTimestampNs::new(10),
+            ..claim
+        };
+        assert_eq!(
+            swapchain.revalidate_physical_primary_presentation(actual_claim),
+            PhysicalPrimaryClaimRevalidation::Valid
+        );
+        swapchain
+            .complete_pageflip(predecessor_token, 1)
+            .expect("pending predecessor pageflip");
+        swapchain
+            .note_physical_primary_presentation(actual_claim)
+            .expect("first physical claim");
     }
 
     #[test]
@@ -1874,8 +1883,51 @@ mod tests {
         assert_eq!(swapchain.worker_queued_identity(), Some(worker_before_miss));
     }
 
+    #[test]
+    fn quarantined_successor_does_not_block_predecessor_pageflip_completion() {
+        let predecessor_claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        let (mut swapchain, predecessor_token) = swapchain_with_submitted_claim(predecessor_claim);
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        let mut successor = test_target(3, 30, PresentationTargetReason::PredictedPressure);
+        successor.physical_claim = PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        };
+        swapchain
+            .finish_render_owned(test_frame(&swapchain, successor_slot, successor))
+            .expect("successor ready");
+        let successor_token = PageFlipToken::new(22).expect("successor token");
+        swapchain
+            .take_ready_for_worker(successor_token, now(1))
+            .expect("successor worker queued");
+        swapchain
+            .suspend_abandon_worker_queued(successor_token)
+            .expect("successor quarantined");
+
+        swapchain
+            .complete_pageflip(predecessor_token, 1)
+            .expect("predecessor pageflip remains completable");
+    }
+
     fn swapchain_with_submitted_claim(
         claim: PrimaryRefreshClaim,
+    ) -> (AtomicOutputSwapchain, PageFlipToken) {
+        let mut predecessor = test_target(
+            claim.sequence,
+            claim.presentation_time.get(),
+            PresentationTargetReason::PredictedPressure,
+        );
+        predecessor.physical_claim = claim;
+        swapchain_with_submitted_target(predecessor)
+    }
+
+    fn swapchain_with_submitted_target(
+        predecessor: PresentationTarget,
     ) -> (AtomicOutputSwapchain, PageFlipToken) {
         let slots = OutputSlotSet::new([
             OutputSlotId::new(0).expect("slot 0"),
@@ -1890,12 +1942,6 @@ mod tests {
         )
         .expect("test swapchain");
         let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
-        let mut predecessor = test_target(
-            claim.sequence,
-            claim.presentation_time.get(),
-            PresentationTargetReason::PredictedPressure,
-        );
-        predecessor.physical_claim = claim;
         swapchain
             .finish_render_owned(test_frame(&swapchain, predecessor_slot, predecessor))
             .expect("predecessor ready");
