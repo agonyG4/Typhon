@@ -186,8 +186,9 @@ cc9fb1c196558bfad8c958c1483951c17cc61fa3
 ```
 
 The implementation commit is `3c7abff`, followed by the formatting and
-warning-closure commit `1f5d5c1`. The final report commit records the ending
-HEAD below.
+warning-closure commit `1f5d5c1`. The ending implementation HEAD before this
+report finalization is `1f5d5c1`; the final repository HEAD is the report
+commit that contains this record.
 
 The pre-fix defects and evidence were:
 
