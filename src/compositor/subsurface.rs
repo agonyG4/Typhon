@@ -23,14 +23,20 @@ pub(super) enum SubsurfaceSyncMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum PointerConstraintLifecycleCommit {
+    // Install/removal are synchronized with surface publication as Typhon
+    // policy, inspired by current KWin behavior; this is not an explicit
+    // pointer-constraints protocol requirement.
     #[default]
     NoChange,
-    Install(u64),
-    Remove(u64),
+    Install,
+    Remove,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) enum PointerConstraintRegionCommit {
+    // set_region is protocol-defined double-buffered state.  The captured
+    // mutation carries the producing constraint identity alongside it.
     #[default]
     NoChange,
     Set(SurfaceInputRegion),
@@ -38,27 +44,56 @@ pub(super) enum PointerConstraintRegionCommit {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) enum PointerConstraintHintCommit {
+    // set_cursor_position_hint is protocol-defined double-buffered state.
+    // The captured mutation carries the producing constraint identity.
     #[default]
     NoChange,
     Set((f64, f64)),
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct CapturedPointerConstraintSurfaceState {
+pub(super) struct CapturedPointerConstraintCommit {
+    pub(super) constraint_id: u64,
     pub(super) lifecycle: PointerConstraintLifecycleCommit,
     pub(super) region: PointerConstraintRegionCommit,
     pub(super) cursor_position_hint: PointerConstraintHintCommit,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) enum CapturedPointerConstraintSurfaceState {
+    #[default]
+    NoChange,
+    Mutation(CapturedPointerConstraintCommit),
+}
+
 impl CapturedPointerConstraintSurfaceState {
     pub(super) fn merge(self, newer: Self) -> Self {
-        Self {
-            lifecycle: merge_pointer_constraint_lifecycle(self.lifecycle, newer.lifecycle),
-            region: merge_pointer_constraint_region(self.region, newer.region),
-            cursor_position_hint: merge_pointer_constraint_hint(
-                self.cursor_position_hint,
-                newer.cursor_position_hint,
-            ),
+        match (self, newer) {
+            (Self::NoChange, newer) | (newer, Self::NoChange) => newer,
+            (Self::Mutation(older), Self::Mutation(newer)) => {
+                if older.constraint_id != newer.constraint_id {
+                    return Self::Mutation(newer);
+                }
+                let lifecycle =
+                    merge_pointer_constraint_lifecycle(older.lifecycle, newer.lifecycle);
+                if lifecycle == PointerConstraintLifecycleCommit::Cancel {
+                    return Self::Mutation(CapturedPointerConstraintCommit {
+                        constraint_id: newer.constraint_id,
+                        lifecycle,
+                        region: PointerConstraintRegionCommit::NoChange,
+                        cursor_position_hint: PointerConstraintHintCommit::NoChange,
+                    });
+                }
+                Self::Mutation(CapturedPointerConstraintCommit {
+                    constraint_id: newer.constraint_id,
+                    lifecycle,
+                    region: merge_pointer_constraint_region(older.region, newer.region),
+                    cursor_position_hint: merge_pointer_constraint_hint(
+                        older.cursor_position_hint,
+                        newer.cursor_position_hint,
+                    ),
+                })
+            }
         }
     }
 }
@@ -69,9 +104,11 @@ fn merge_pointer_constraint_lifecycle(
 ) -> PointerConstraintLifecycleCommit {
     match (older, newer) {
         (
-            PointerConstraintLifecycleCommit::Install(older_id),
-            PointerConstraintLifecycleCommit::Remove(newer_id),
-        ) if older_id == newer_id => PointerConstraintLifecycleCommit::NoChange,
+            PointerConstraintLifecycleCommit::Install,
+            PointerConstraintLifecycleCommit::Remove | PointerConstraintLifecycleCommit::Cancel,
+        ) => PointerConstraintLifecycleCommit::Cancel,
+        (PointerConstraintLifecycleCommit::Cancel, _) => PointerConstraintLifecycleCommit::Cancel,
+        (_, PointerConstraintLifecycleCommit::Cancel) => PointerConstraintLifecycleCommit::Cancel,
         (older, PointerConstraintLifecycleCommit::NoChange) => older,
         (_, newer) => newer,
     }
@@ -263,21 +300,24 @@ mod window_geometry_tests {
     }
 
     fn pointer_state(
+        constraint_id: u64,
         lifecycle: PointerConstraintLifecycleCommit,
         region: PointerConstraintRegionCommit,
         cursor_position_hint: PointerConstraintHintCommit,
     ) -> CapturedPointerConstraintSurfaceState {
-        CapturedPointerConstraintSurfaceState {
+        CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+            constraint_id,
             lifecycle,
             region,
             cursor_position_hint,
-        }
+        })
     }
 
     #[test]
     fn newer_region_replaces_older_region_but_no_change_preserves_it() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
         cached.pointer_constraint_state = pointer_state(
+            1,
             PointerConstraintLifecycleCommit::NoChange,
             PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
                 InputRegionOp::Add(InputRegionRect::new(1, 2, 3, 4).unwrap()),
@@ -286,6 +326,7 @@ mod window_geometry_tests {
         );
         let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
         newer.pointer_constraint_state = pointer_state(
+            1,
             PointerConstraintLifecycleCommit::NoChange,
             PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
                 InputRegionOp::Add(InputRegionRect::new(5, 6, 7, 8).unwrap()),
@@ -296,10 +337,15 @@ mod window_geometry_tests {
         cached.merge(newer);
 
         assert_eq!(
-            cached.pointer_constraint_state.region,
-            PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
-                InputRegionOp::Add(InputRegionRect::new(5, 6, 7, 8).unwrap()),
-            ]))
+            cached.pointer_constraint_state,
+            pointer_state(
+                1,
+                PointerConstraintLifecycleCommit::NoChange,
+                PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
+                    InputRegionOp::Add(InputRegionRect::new(5, 6, 7, 8).unwrap()),
+                ])),
+                PointerConstraintHintCommit::NoChange,
+            )
         );
     }
 
@@ -307,6 +353,7 @@ mod window_geometry_tests {
     fn explicit_default_region_is_not_treated_as_no_change() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
         cached.pointer_constraint_state = pointer_state(
+            1,
             PointerConstraintLifecycleCommit::NoChange,
             PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
                 InputRegionOp::Add(InputRegionRect::new(1, 2, 3, 4).unwrap()),
@@ -315,6 +362,7 @@ mod window_geometry_tests {
         );
         let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
         newer.pointer_constraint_state = pointer_state(
+            1,
             PointerConstraintLifecycleCommit::NoChange,
             PointerConstraintRegionCommit::Set(SurfaceInputRegion::Default),
             PointerConstraintHintCommit::NoChange,
@@ -323,8 +371,13 @@ mod window_geometry_tests {
         cached.merge(newer);
 
         assert_eq!(
-            cached.pointer_constraint_state.region,
-            PointerConstraintRegionCommit::Set(SurfaceInputRegion::Default)
+            cached.pointer_constraint_state,
+            pointer_state(
+                1,
+                PointerConstraintLifecycleCommit::NoChange,
+                PointerConstraintRegionCommit::Set(SurfaceInputRegion::Default),
+                PointerConstraintHintCommit::NoChange,
+            )
         );
     }
 
@@ -332,7 +385,8 @@ mod window_geometry_tests {
     fn install_then_remove_before_publication_collapses_without_activation() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
         cached.pointer_constraint_state = pointer_state(
-            PointerConstraintLifecycleCommit::Install(22),
+            22,
+            PointerConstraintLifecycleCommit::Install,
             PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
                 InputRegionOp::Add(InputRegionRect::new(11, 12, 13, 14).unwrap()),
             ])),
@@ -340,7 +394,8 @@ mod window_geometry_tests {
         );
         let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
         newer.pointer_constraint_state = pointer_state(
-            PointerConstraintLifecycleCommit::Remove(22),
+            22,
+            PointerConstraintLifecycleCommit::Remove,
             PointerConstraintRegionCommit::NoChange,
             PointerConstraintHintCommit::NoChange,
         );
@@ -348,45 +403,61 @@ mod window_geometry_tests {
         cached.merge(newer);
 
         assert_eq!(
-            cached.pointer_constraint_state.lifecycle,
-            PointerConstraintLifecycleCommit::NoChange
-        );
-        assert_eq!(
-            cached.pointer_constraint_state.region,
-            PointerConstraintRegionCommit::NoChange
-        );
-        assert_eq!(
-            cached.pointer_constraint_state.cursor_position_hint,
-            PointerConstraintHintCommit::NoChange
+            cached.pointer_constraint_state,
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id: 22,
+                lifecycle: PointerConstraintLifecycleCommit::Cancel,
+                region: PointerConstraintRegionCommit::NoChange,
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            })
         );
     }
 
     #[test]
     fn current_constraint_removal_survives_cached_commit_merge() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
-        cached.pointer_constraint_state.lifecycle = PointerConstraintLifecycleCommit::Remove(22);
+        cached.pointer_constraint_state = pointer_state(
+            22,
+            PointerConstraintLifecycleCommit::Remove,
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::NoChange,
+        );
         let newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
 
         cached.merge(newer);
 
         assert_eq!(
-            cached.pointer_constraint_state.lifecycle,
-            PointerConstraintLifecycleCommit::Remove(22)
+            cached.pointer_constraint_state,
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id: 22,
+                lifecycle: PointerConstraintLifecycleCommit::Remove,
+                region: PointerConstraintRegionCommit::NoChange,
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            })
         );
     }
 
     #[test]
     fn no_change_hint_preserves_captured_hint_until_a_new_hint_is_captured() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
-        cached.pointer_constraint_state.cursor_position_hint =
-            PointerConstraintHintCommit::Set((12.0, 18.0));
+        cached.pointer_constraint_state = pointer_state(
+            1,
+            PointerConstraintLifecycleCommit::NoChange,
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::Set((12.0, 18.0)),
+        );
         let newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
 
         cached.merge(newer);
 
         assert_eq!(
-            cached.pointer_constraint_state.cursor_position_hint,
-            PointerConstraintHintCommit::Set((12.0, 18.0))
+            cached.pointer_constraint_state,
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id: 1,
+                lifecycle: PointerConstraintLifecycleCommit::NoChange,
+                region: PointerConstraintRegionCommit::NoChange,
+                cursor_position_hint: PointerConstraintHintCommit::Set((12.0, 18.0)),
+            })
         );
     }
 

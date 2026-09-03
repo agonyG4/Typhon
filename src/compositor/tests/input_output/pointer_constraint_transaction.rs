@@ -138,11 +138,16 @@ fn active_locked_destroy_without_surface_commit_keeps_current_routing() {
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
 
-    assert!(before_commit_requests.iter().all(|request| !matches!(
-        request,
-        PointerConstraintBackendRequest::Deactivate { .. }
-    )));
+    assert!(
+        before_commit_requests
+            .iter()
+            .all(|request| !matches!(request, PointerConstraintBackendRequest::Deactivate { .. }))
+    );
     assert!(snapshot.committed);
+    assert!(!snapshot.protocol_resource_alive);
+    assert!(!snapshot.backend_pending);
+    assert!(!snapshot.surface_constraint_pending);
+    assert!(snapshot.lifecycle_removal_pending);
     assert!(!state.pointer_motion, "absolute motion must remain locked");
     assert_eq!(state.relative_motion_count, 1);
     assert_eq!(state.unlocked_count, 0);
@@ -225,11 +230,16 @@ fn active_confined_destroy_without_surface_commit_keeps_current_routing() {
     let before_commit_requests = capture_pointer_constraint_backend_requests(&commands);
     let snapshot = capture_pointer_constraint_snapshot(&commands, backend_id.constraint_id)
         .expect("destroyed protocol resource must retain current constraint ownership");
-    assert!(before_commit_requests.iter().all(|request| !matches!(
-        request,
-        PointerConstraintBackendRequest::Deactivate { .. }
-    )));
+    assert!(
+        before_commit_requests
+            .iter()
+            .all(|request| !matches!(request, PointerConstraintBackendRequest::Deactivate { .. }))
+    );
     assert!(snapshot.committed);
+    assert!(!snapshot.protocol_resource_alive);
+    assert!(!snapshot.backend_pending);
+    assert!(!snapshot.surface_constraint_pending);
+    assert!(snapshot.lifecycle_removal_pending);
     assert_eq!(state.unconfined_count, 0);
 
     surface.commit();
@@ -322,6 +332,10 @@ fn destroyed_pending_locked_activation_cannot_complete_as_ghost_lock() {
     assert_eq!(state.locked_count, 0);
     assert!(ids.contains(&activation.constraint_id));
     assert!(snapshot.committed);
+    assert!(!snapshot.protocol_resource_alive);
+    assert!(!snapshot.backend_pending);
+    assert!(!snapshot.surface_constraint_pending);
+    assert!(snapshot.lifecycle_removal_pending);
 }
 
 #[test]
@@ -362,6 +376,15 @@ fn create_and_destroy_before_first_effective_commit_has_no_activation() {
         &qh,
         (),
     );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let pre_commit_requests = capture_pointer_constraint_backend_requests(&commands);
+    let pre_commit_ids = capture_pointer_constraint_ids(&commands);
+    assert!(pre_commit_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ActivateLocked { .. }
+    )));
+    assert_eq!(pre_commit_ids.len(), 1);
     lock.destroy();
     surface.commit();
     connection.flush().unwrap();
@@ -402,7 +425,8 @@ fn synchronized_constraint_fixture(
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
-    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
@@ -449,7 +473,7 @@ fn captured_synchronized_install_remains_already_constrained() {
         OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
-    let mut fixture = synchronized_constraint_fixture(&socket_path, &commands);
+    let fixture = synchronized_constraint_fixture(&socket_path, &commands);
     let qh = fixture.queue.handle();
     let lock_a = fixture.constraints.lock_pointer(
         &fixture.child,
@@ -477,7 +501,10 @@ fn captured_synchronized_install_remains_already_constrained() {
     server_thread.join().unwrap();
     drop(lock_a);
 
-    assert!(result.is_err(), "captured install must reject a second lock");
+    assert!(
+        result.is_err(),
+        "captured install must reject a second lock"
+    );
     let error = fixture
         .connection
         .protocol_error()
@@ -530,7 +557,10 @@ fn delayed_removal_does_not_transfer_a_hint_to_constraint_b() {
     fixture.parent.commit();
     fixture.connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    fixture.queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    fixture
+        .queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
     let before_b_commit = capture_pointer_constraint_snapshot(&commands, b_id)
         .expect("constraint B must remain registered before its install commit");
     assert_eq!(before_b_commit.committed_cursor_position_hint, None);
@@ -541,14 +571,20 @@ fn delayed_removal_does_not_transfer_a_hint_to_constraint_b() {
     fixture.parent.commit();
     fixture.connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    fixture.queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    fixture
+        .queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
     let after_b_commit = capture_pointer_constraint_snapshot(&commands, b_id)
         .expect("constraint B must be current after its install commit");
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
     assert_eq!(after_b_commit.committed_cursor_position_hint, Some(hint_b));
-    assert_ne!(after_b_commit.committed_cursor_position_hint, Some((11.0, 12.0)));
+    assert_ne!(
+        after_b_commit.committed_cursor_position_hint,
+        Some((11.0, 12.0))
+    );
 }
 
 #[test]
@@ -598,25 +634,40 @@ fn delayed_removal_does_not_transfer_a_region_to_constraint_b() {
     fixture.parent.commit();
     fixture.connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    fixture.queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    fixture
+        .queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
     let before_b_commit = capture_pointer_constraint_snapshot(&commands, b_id)
         .expect("constraint B must remain registered before its install commit");
-    assert_eq!(before_b_commit.committed_region, SurfaceInputRegion::Default);
+    assert_eq!(
+        before_b_commit.committed_region,
+        SurfaceInputRegion::Default
+    );
 
     fixture.child.commit();
     fixture.parent.commit();
     fixture.connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    fixture.queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    fixture
+        .queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
     let after_b_commit = capture_pointer_constraint_snapshot(&commands, b_id)
         .expect("constraint B must be current after its install commit");
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
-    assert_eq!(after_b_commit.committed_region, SurfaceInputRegion::Custom(vec![
-        InputRegionOp::Add(InputRegionRect::new(30, 31, 12, 13).unwrap()),
-    ]));
-    assert_ne!(after_b_commit.committed_region, SurfaceInputRegion::Custom(vec![
-        InputRegionOp::Add(InputRegionRect::new(1, 2, 10, 11).unwrap()),
-    ]));
+    assert_eq!(
+        after_b_commit.committed_region,
+        SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+            InputRegionRect::new(30, 31, 12, 13).unwrap()
+        ),])
+    );
+    assert_ne!(
+        after_b_commit.committed_region,
+        SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+            InputRegionRect::new(1, 2, 10, 11).unwrap()
+        ),])
+    );
 }

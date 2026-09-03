@@ -1,103 +1,170 @@
-# Typhon Pointer Constraint Surface Transaction v1 — Closure Report
+# Typhon Pointer Constraint Surface Transaction v1.1 — Closure Report
 
 ## Result
 
-The pointer-constraint path now carries a commit-exact surface payload through
-subsurface transactions and pairs each selected native routing transition with
-the timing evidence from the native action that produced it.
+The v1.1 closure preserves the accepted causal transaction architecture:
 
-The implementation preserves the existing native input pipeline: no input
-thread, polling loop, sleep, mutex ingress queue, motion-value rewrite, or
-timestamp reorder was introduced.
+```text
+protocol requests
+    -> pending surface pointer state
+    -> exact wl_surface.commit capture
+    -> CachedSubsurfaceCommit
+    -> surface publication
+    -> native backend request
+    -> NativeInputEpoch-safe settlement
+```
 
-## Commit-exact change set
+The three reviewed defects are closed without changing the transition timing
+model, input thread model, scheduler, motion values, timestamps, or native
+acceleration behavior.
 
-The implementation is split into these commits:
+The previous defects were:
 
-- `23a2d3e` — associate pointer transition timing causally.
-- `45e9371` — capture pointer constraint state in surface commits.
-- `72eaf2e` — synchronize pointer constraint lifecycle.
+- resource death prematurely invalidated current effective routing;
+- captured-but-unpublished installs escaped `AlreadyConstrained` ownership;
+- region/hint payloads lacked stable constraint identity.
 
-The design and execution records are:
+## Lifecycle and ownership closure
 
-- `7564ab9` — pointer constraint surface transaction design.
-- `a976ba9` — pointer constraint surface transaction implementation plan.
+`PointerConstraint` now separates these state domains:
 
-The implementation boundary is:
+- `protocol_resource_alive` controls whether a protocol resource can produce
+  future state or receive an event;
+- `surface_constraint_pending` keeps protocol-pending and captured-but-
+  unpublished installs as requested ownership;
+- `committed` identifies the current committed surface constraint;
+- `lifecycle_removal_pending` records a current constraint whose destroyed
+  protocol resource has staged removal but whose removal commit is not yet
+  published;
+- `defunct` remains semantic defunctness for compositor-ended one-shot or
+  forced teardown, not ordinary client resource destruction;
+- `backend_pending` is cleared when activation work is canceled. Separate
+  cancellation evidence preserves the existing one-shot compatibility warp
+  without treating a canceled request as a live backend activation.
 
-1. Native settlement reports a single selected transition together with the
-   activation/deactivation timing for that same native action.
-2. `wl_surface.commit` captures immutable lifecycle, region, and cursor-hint
-   payloads as `CachedSubsurfaceCommit` data.
-3. Payload fields use explicit `NoChange` versus explicit region/default and
-   concrete hint states, with reducers for merge and replacement.
-4. The payload is applied to every tree node, including synchronized
-   subsurface children, after ordinary input-region, geometry, and mapping
-   state.
-5. Native activation and deactivation are permitted only at
-   `NativeInputEpoch::constraint_settlement_allowed()`.
-6. Pending installs participate in `AlreadyConstrained`; resource creation is
-   immediate but native activation waits for the matching commit.
-7. Client destruction is immediately dead-resource state, while committed
-   effective state remains until its staged removal is published by commit.
-   Forced teardown remains immediate.
-8. Create-and-destroy before the first commit collapses without activation,
-   events, or a ghost warp. Stale deactivation cannot remove a newer current
-   constraint.
-9. A hint and removal captured in one commit use that commit's hint for
-   restoration, while the existing one-shot warp/compositor-driven distinction
-   is preserved.
+Therefore:
+
+```text
+dead protocol resource + current committed constraint
+    -> no future protocol event
+    -> current routing remains effective
+    -> removal commit publishes the topology change
+    -> native deactivation follows the existing settlement boundary
+```
+
+Registration derives `AlreadyConstrained` from the explicit constraint record,
+not from the mutable pending surface-state map. A current constraint retains
+the surface slot while removal is pending; ownership is released only when
+that removal is published. A never-current install canceled before its first
+effective commit is removed and cannot activate.
+
+Protocol resource lifetime, committed surface constraint lifetime, and native effective routing lifetime are separate ownership domains.
+
+## Captured identity closure
+
+`CachedSubsurfaceCommit` carries a constraint-scoped
+`CapturedPointerConstraintCommit` containing:
+
+- `constraint_id`;
+- lifecycle mutation;
+- region mutation;
+- cursor-position-hint mutation.
+
+Merging preserves evidence only for the same constraint identity. An
+uncommitted `Install(A)` followed by `Remove(A)` becomes an explicit
+constraint-tagged cancellation whose region and hint are both `NoChange`.
+It cannot leave unowned surface-wide evidence behind. Publication applies
+region and hint only through the captured record's identity; there is no
+semantic `ids.first()` selection.
+
+Captured pointer-constraint region and cursor-hint state can never be attributed to a different constraint identity.
 
 ## Protocol and policy boundary
 
-The protocol source of truth is `wl_surface.commit`: pointer-constraint
-regions and cursor-position hints are double-buffered surface state and become
-current only when the surface commit is processed. Typhon's lifecycle rule is
-an explicit policy layered on that protocol behavior: install/removal of a
-constraint is synchronized with the corresponding committed surface payload.
+`set_region` and `set_cursor_position_hint` remain protocol-defined
+double-buffered state. Their values are captured by the exact
+`wl_surface.commit` that makes them current.
 
-Relevant source locations are:
+Commit-synchronized constraint install and removal remain Typhon architectural
+policy inspired by current KWin behavior. This synchronization is not claimed
+as an explicit pointer-constraints protocol statement. Focus changes continue
+to reevaluate already-current constraint state only.
 
-- `src/compositor/protocols/core.rs` — commit capture point.
-- `src/compositor/subsurface.rs` — captured payload and merge reducers.
-- `src/compositor/state/surface_transactions.rs` and
-  `src/compositor/state/subsurfaces.rs` — cached commit propagation.
-- `src/compositor/state/pointer_constraints.rs` — staged lifecycle and native
-  settlement.
-- `src/compositor/state/surface_focus.rs` — current-state reevaluation.
-- `src/native_output/input/routing.rs` and
-  `src/native_output/runtime/cycle_dispatch.rs` — causal transition timing.
+Native activation and deactivation continue to be issued only at the existing
+`NativeInputEpoch::constraint_settlement_allowed()` boundaries. Late-bound
+locked-pointer activation anchors and current-generation validation remain in
+place.
 
-## Tests and verification
+## RED regressions
 
-Regression coverage was updated for normal lock/confine activation, active
-removal, pending one-shot fallback, same-surface rejection, pointer-warp
-restore, relative-input helpers, repeated lock/unlock cycles, and disconnect
-cleanup. Payload unit tests cover reducer replacement, explicit default region,
-install/remove collapse, removal preservation, and hint preservation.
+Commit `66c4477` added deterministic RED coverage before the production closure.
+The pre-fix failures demonstrated:
 
-The following commands are the required final checks:
+- active locked routing disappeared immediately after resource destruction;
+- delayed hint and region payloads crossed from A to later B;
+- a captured synchronized install was accepted as a second constraint;
+- `Install(A) + Remove(A)` preserved A's region and hint instead of canceling
+  them.
+
+The real Wayland-resource regression module covers:
+
+- lock requested without a surface commit;
+- create and destroy before the first effective commit;
+- active locked destroy without commit;
+- active confined destroy without commit;
+- destroy plus commit and native deactivation;
+- no events to destroyed resources;
+- cancellation of stale backend activation;
+- captured-but-unpublished `AlreadyConstrained` on a synchronized subsurface;
+- delayed constraint-scoped hint and region publication.
+
+The reducer suite directly covers canceled install payloads, including the
+absence of unowned region and hint state.
+
+## GREEN results and verification limits
+
+The focused transaction suite passed with 7 tests, and the adjacent legacy
+pointer-constraint suite passed with 38 tests during implementation. Production
+library verification also passed:
 
 ```text
-rtk cargo fmt --check
+rtk cargo check --locked
+rtk cargo check --locked --lib
+rtk cargo clippy --locked --lib -- -D warnings
+```
+
+The exact required `rtk cargo test --locked` command built and ran 2,005 tests:
+2,004 passed and one unrelated native KMS test failed:
+`native::kms::tests::explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success`.
+
+The all-target check and clippy commands are currently blocked by unrelated
+working-tree edits in `src/native_output/runtime/dmabuf_release.rs`. Their
+tests reference methods and types absent from the corresponding production
+definitions. Those edits are outside this pointer-constraint closure and were
+preserved.
+
+Consequently, the following required commands cannot be reported as full
+GREEN until that unrelated mismatch is resolved:
+
+```text
 rtk cargo check --locked --all-targets
 rtk cargo clippy --locked --all-targets -- -D warnings
 rtk cargo test --locked
-rtk git diff --check
 ```
 
-On this Windows host, Cargo check and clippy stop in `wayland-sys v0.31.11`
-because the native `wayland-server` library and `pkg-config` are not
-available. The test run additionally reports missing `libudev` and the
-platform-specific `drm-sys` use of `libc::O_CLOEXEC`. Only the MSVC Rust target
-is installed, so a Linux-target run was not available. `cargo fmt --check`
-reports formatter drift only in unrelated user-modified frame/pacing/scanout
-files; the pointer-constraint files are formatted. `git diff --check` is clean
-for the task commits.
+`rtk cargo fmt --check` and `rtk git diff --check` pass.
+
+The current host is Linux rather than Windows, so no Windows-specific native
+availability claim is made. Full Linux native qualification involving the
+actual input backend remains not run here. The causal timing tests were
+rerun successfully: 5 native transition-evidence tests, including
+deactivation A followed by activation B and wall/thread-CPU association, and
+16 input-epoch dispatch tests passed. No timing semantics were changed.
 
 ## Non-claims
 
-This change closes the specified pointer-constraint transaction and timing
-association surface. It does not claim to resolve unrelated frame-clock or
-native-output work currently present in the worktree, nor does it claim that
-every independent input race outside this surface has been redesigned.
+This closure does not claim that the Sober/Roblox pointer jump is fixed. That
+claim requires manual native Linux qualification. It also does not introduce
+an input thread, scheduler changes, readiness probes, sleeps, timers, motion
+drops or clamps, timestamp filtering, application detection, or acceleration
+changes.

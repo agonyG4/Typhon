@@ -819,6 +819,14 @@ impl SurfaceDamagePresentation {
             .iter()
             .any(|(key, _)| key.surface_id == surface_id)
     }
+
+    pub fn is_exclusive_surface_id(&self, surface_id: u32) -> bool {
+        !self.sampled_commits.is_empty()
+            && self
+                .sampled_commits
+                .iter()
+                .all(|(key, _)| key.surface_id == surface_id)
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +934,10 @@ struct PointerConstraint {
     confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
     active: bool,
     backend_pending: bool,
+    canceled_backend_activation: bool,
+    protocol_resource_alive: bool,
+    surface_constraint_pending: bool,
+    lifecycle_removal_pending: bool,
     defunct: bool,
     committed: bool,
     committed_region: SurfaceInputRegion,

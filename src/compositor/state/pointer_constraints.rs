@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::subsurface::CapturedPointerConstraintCommit;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) enum PointerRepositionCause {
@@ -84,6 +85,7 @@ impl CompositorState {
                 constraint.committed
                     && !constraint.active
                     && !constraint.backend_pending
+                    && constraint.protocol_resource_alive
                     && !constraint.defunct
             })
             .map(|constraint| constraint.id)
@@ -446,11 +448,12 @@ impl CompositorState {
     ) {
         self.merge_pending_pointer_constraint_surface_state(
             surface_id,
-            CapturedPointerConstraintSurfaceState {
-                lifecycle: PointerConstraintLifecycleCommit::Install(constraint_id),
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id,
+                lifecycle: PointerConstraintLifecycleCommit::Install,
                 region: PointerConstraintRegionCommit::Set(region),
                 cursor_position_hint: PointerConstraintHintCommit::NoChange,
-            },
+            }),
         );
     }
 
@@ -470,10 +473,28 @@ impl CompositorState {
     ) {
         self.merge_pending_pointer_constraint_surface_state(
             surface_id,
-            CapturedPointerConstraintSurfaceState {
-                lifecycle: PointerConstraintLifecycleCommit::Remove(constraint_id),
-                ..Default::default()
-            },
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id,
+                lifecycle: PointerConstraintLifecycleCommit::Remove,
+                region: PointerConstraintRegionCommit::NoChange,
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            }),
+        );
+    }
+
+    pub(in crate::compositor) fn stage_pointer_constraint_cancellation(
+        &mut self,
+        surface_id: u32,
+        constraint_id: u64,
+    ) {
+        self.merge_pending_pointer_constraint_surface_state(
+            surface_id,
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id,
+                lifecycle: PointerConstraintLifecycleCommit::Cancel,
+                region: PointerConstraintRegionCommit::NoChange,
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            }),
         );
     }
 
@@ -483,33 +504,17 @@ impl CompositorState {
     ) -> bool {
         let surface_id = compositor_surface_id(&registration.surface);
         let existing = self.pointer_constraints.values().find(|constraint| {
-            constraint.committed
+            (constraint.committed
+                || constraint.surface_constraint_pending
+                || constraint.lifecycle_removal_pending)
                 && same_surface_resource(&constraint.surface, &registration.surface)
         });
-        let pending_install = self
-            .pending_pointer_constraint_surface_states
-            .get(&surface_id)
-            .and_then(|state| match state.lifecycle {
-                PointerConstraintLifecycleCommit::Install(id) => Some(id),
-                PointerConstraintLifecycleCommit::NoChange
-                | PointerConstraintLifecycleCommit::Remove(_) => None,
-            });
         if let Some(existing) = existing {
             pointer_debug_log(format!(
                 "constraint reject already_constrained existing={} requested={} surface={} pointer={}",
                 existing.id,
                 registration.id,
                 compositor_surface_id(&registration.surface),
-                registration.pointer.id().protocol_id()
-            ));
-            return false;
-        }
-        if let Some(existing) = pending_install {
-            pointer_debug_log(format!(
-                "constraint reject already_constrained pending={} requested={} surface={} pointer={}",
-                existing,
-                registration.id,
-                surface_id,
                 registration.pointer.id().protocol_id()
             ));
             return false;
@@ -542,6 +547,10 @@ impl CompositorState {
                 confined_resource: registration.confined_resource,
                 active: false,
                 backend_pending: false,
+                canceled_backend_activation: false,
+                protocol_resource_alive: true,
+                surface_constraint_pending: true,
+                lifecycle_removal_pending: false,
                 defunct: false,
                 committed: false,
                 committed_region: SurfaceInputRegion::Default,
@@ -574,6 +583,7 @@ impl CompositorState {
                     if !constraint.committed
                         || constraint.active
                         || constraint.backend_pending
+                        || !constraint.protocol_resource_alive
                         || constraint.defunct
                     {
                         return None;
@@ -641,7 +651,11 @@ impl CompositorState {
         let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
             return;
         };
-        if constraint.active || constraint.backend_pending || constraint.defunct {
+        if constraint.active
+            || constraint.backend_pending
+            || !constraint.protocol_resource_alive
+            || constraint.defunct
+        {
             return;
         }
         let backend_id = constraint.backend_id();
@@ -887,10 +901,16 @@ impl CompositorState {
         }
         let activation = {
             let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
+                self.pending_backend_constraint = None;
                 return;
             };
-            if constraint.generation != id.generation || !constraint.committed || constraint.defunct
+            if constraint.generation != id.generation
+                || !constraint.committed
+                || !constraint.protocol_resource_alive
+                || constraint.defunct
             {
+                constraint.backend_pending = false;
+                self.pending_backend_constraint = None;
                 return;
             }
             constraint.backend_pending = false;
@@ -1070,6 +1090,7 @@ impl CompositorState {
                         && constraint.committed
                         && constraint.backend_pending
                         && !constraint.active
+                        && constraint.protocol_resource_alive
                         && !constraint.defunct
                 })
     }
@@ -1179,6 +1200,11 @@ impl CompositorState {
         self.cancel_pending_locked_pointer_reveal_for_id(id, "constraint_backend_work_canceled");
         if self.pending_backend_constraint == Some(id) {
             self.pending_backend_constraint = None;
+        }
+        if let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id)
+            && constraint.generation == id.generation
+        {
+            constraint.backend_pending = false;
         }
     }
 
@@ -1567,35 +1593,45 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn remove_pointer_constraint(&mut self, constraint_id: u64) {
-        let Some((surface_id, committed)) =
-            self.pointer_constraints
-                .get(&constraint_id)
-                .map(|constraint| {
-                    (
-                        compositor_surface_id(&constraint.surface),
-                        constraint.committed,
-                    )
-                })
+        let Some((surface_id, committed, surface_constraint_pending, backend_pending_id)) = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .map(|constraint| {
+                (
+                    compositor_surface_id(&constraint.surface),
+                    constraint.committed,
+                    constraint.surface_constraint_pending,
+                    constraint
+                        .backend_pending
+                        .then_some(constraint.backend_id()),
+                )
+            })
         else {
             return;
         };
-        let pending_backend_id = self
-            .pointer_constraints
-            .get(&constraint_id)
-            .filter(|constraint| constraint.backend_pending)
-            .map(PointerConstraint::backend_id);
         if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
             constraint.locked_resource = None;
             constraint.confined_resource = None;
-            if committed {
-                constraint.defunct = true;
+            constraint.protocol_resource_alive = false;
+            if committed && backend_pending_id.is_some() {
+                constraint.canceled_backend_activation = true;
             }
         }
-        if let Some(backend_id) = pending_backend_id {
+        if let Some(backend_id) = backend_pending_id {
             self.cancel_pending_pointer_constraint_backend_requests(backend_id);
         }
-        self.stage_pointer_constraint_removal(surface_id, constraint_id);
-        if !committed {
+        if committed {
+            if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
+                constraint.lifecycle_removal_pending = true;
+            }
+            self.stage_pointer_constraint_removal(surface_id, constraint_id);
+        } else if surface_constraint_pending {
+            if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
+                constraint.surface_constraint_pending = false;
+            }
+            self.stage_pointer_constraint_cancellation(surface_id, constraint_id);
+            self.pointer_constraints.remove(&constraint_id);
+        } else {
             self.pointer_constraints.remove(&constraint_id);
         }
     }
@@ -1676,17 +1712,19 @@ impl CompositorState {
         let Some(surface_id) = self
             .pointer_constraints
             .get(&constraint_id)
-            .filter(|constraint| !constraint.defunct)
+            .filter(|constraint| constraint.protocol_resource_alive && !constraint.defunct)
             .map(|constraint| compositor_surface_id(&constraint.surface))
         else {
             return;
         };
         self.merge_pending_pointer_constraint_surface_state(
             surface_id,
-            CapturedPointerConstraintSurfaceState {
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id,
+                lifecycle: PointerConstraintLifecycleCommit::NoChange,
                 region: PointerConstraintRegionCommit::Set(region),
-                ..Default::default()
-            },
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            }),
         );
     }
 
@@ -1706,17 +1744,19 @@ impl CompositorState {
         let Some(surface_id) = self
             .pointer_constraints
             .get(&constraint_id)
-            .filter(|constraint| !constraint.defunct)
+            .filter(|constraint| constraint.protocol_resource_alive && !constraint.defunct)
             .map(|constraint| compositor_surface_id(&constraint.surface))
         else {
             return;
         };
         self.merge_pending_pointer_constraint_surface_state(
             surface_id,
-            CapturedPointerConstraintSurfaceState {
+            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
+                constraint_id,
+                lifecycle: PointerConstraintLifecycleCommit::NoChange,
+                region: PointerConstraintRegionCommit::NoChange,
                 cursor_position_hint: PointerConstraintHintCommit::Set((surface_x, surface_y)),
-                ..Default::default()
-            },
+            }),
         );
     }
 
@@ -1728,52 +1768,102 @@ impl CompositorState {
         if self.pointer_hit_instrumentation_enabled {
             self.pointer_hit_metrics.pointer_constraint_reconciliations += 1;
         }
-        let ids = self
-            .pointer_constraints
-            .values()
-            .filter(|constraint| {
-                compositor_surface_id(&constraint.surface) == surface_id && !constraint.defunct
-            })
-            .map(|constraint| constraint.id)
-            .collect::<Vec<_>>();
-        let target_id = match state.lifecycle {
-            PointerConstraintLifecycleCommit::Install(id)
-            | PointerConstraintLifecycleCommit::Remove(id) => Some(id),
-            PointerConstraintLifecycleCommit::NoChange => ids.first().copied(),
+        let CapturedPointerConstraintSurfaceState::Mutation(captured) = state else {
+            return;
         };
-        if let Some(id) = target_id {
+        let id = captured.constraint_id;
+        let Some(constraint) = self.pointer_constraints.get(&id) else {
+            return;
+        };
+        if compositor_surface_id(&constraint.surface) != surface_id {
+            return;
+        }
+        let lifecycle = captured.lifecycle;
+        if lifecycle == PointerConstraintLifecycleCommit::Cancel {
+            let backend_id = self
+                .pointer_constraints
+                .get(&id)
+                .filter(|constraint| constraint.backend_pending)
+                .map(PointerConstraint::backend_id);
+            if let Some(backend_id) = backend_id {
+                self.cancel_pending_pointer_constraint_backend_requests(backend_id);
+            }
+            let remove = self
+                .pointer_constraints
+                .get(&id)
+                .is_some_and(|constraint| !constraint.committed);
             if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
-                if state.lifecycle == PointerConstraintLifecycleCommit::Install(id) {
+                constraint.surface_constraint_pending = false;
+                constraint.lifecycle_removal_pending = false;
+            }
+            if remove {
+                self.pointer_constraints.remove(&id);
+            }
+            return;
+        }
+
+        if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
+            if let PointerConstraintRegionCommit::Set(region) = captured.region {
+                constraint.committed_region = region;
+            }
+            if let PointerConstraintHintCommit::Set(hint) = captured.cursor_position_hint {
+                constraint.committed_cursor_position_hint = Some(hint);
+            }
+        }
+
+        match lifecycle {
+            PointerConstraintLifecycleCommit::Install => {
+                if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
                     constraint.committed = true;
+                    constraint.surface_constraint_pending = false;
+                    constraint.lifecycle_removal_pending = false;
                 }
-                if let PointerConstraintRegionCommit::Set(region) = &state.region {
-                    constraint.committed_region = region.clone();
+                self.update_active_confined_pointer_region(id, "commit");
+                self.maybe_request_pointer_constraint_activation(id);
+            }
+            PointerConstraintLifecycleCommit::Remove => {
+                let Some((was_active, canceled_backend_activation, mode, lifetime, surface, hint)) =
+                    self.pointer_constraints.get(&id).map(|constraint| {
+                        (
+                            constraint.active,
+                            constraint.canceled_backend_activation,
+                            constraint.mode,
+                            constraint.lifetime,
+                            constraint.surface.clone(),
+                            constraint.committed_cursor_position_hint,
+                        )
+                    })
+                else {
+                    return;
+                };
+                if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
+                    constraint.committed = false;
+                    constraint.surface_constraint_pending = false;
+                    constraint.lifecycle_removal_pending = false;
+                    constraint.canceled_backend_activation = false;
+                    constraint.defunct = true;
                 }
-                if let PointerConstraintHintCommit::Set(hint) = state.cursor_position_hint {
-                    constraint.committed_cursor_position_hint = Some(hint);
+                self.deactivate_pointer_constraint_by_id(id, false, false, true);
+                if canceled_backend_activation
+                    && !was_active
+                    && mode == PointerConstraintMode::Locked
+                    && lifetime == PointerConstraintLifetime::Oneshot
+                    && let Some(position) = self.valid_cursor_hint_output_position(&surface, hint)
+                {
+                    self.apply_pointer_warp(
+                        position,
+                        PointerRepositionCause::PendingOneshotHintWarp,
+                    );
+                }
+                if !was_active {
+                    self.pointer_constraints.remove(&id);
                 }
             }
-            match state.lifecycle {
-                PointerConstraintLifecycleCommit::Remove(id) => {
-                    if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
-                        constraint.committed = false;
-                        constraint.defunct = true;
-                    }
-                    let was_active = self
-                        .pointer_constraints
-                        .get(&id)
-                        .is_some_and(|constraint| constraint.active);
-                    self.deactivate_pointer_constraint_by_id(id, false, false, true);
-                    if !was_active {
-                        self.pointer_constraints.remove(&id);
-                    }
-                }
-                PointerConstraintLifecycleCommit::Install(_)
-                | PointerConstraintLifecycleCommit::NoChange => {
-                    self.update_active_confined_pointer_region(id, "commit");
-                    self.maybe_request_pointer_constraint_activation(id);
-                }
+            PointerConstraintLifecycleCommit::NoChange => {
+                self.update_active_confined_pointer_region(id, "commit");
+                self.maybe_request_pointer_constraint_activation(id);
             }
+            PointerConstraintLifecycleCommit::Cancel => unreachable!(),
         }
     }
 
