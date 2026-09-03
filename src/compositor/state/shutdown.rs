@@ -63,6 +63,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         cached_at: Instant::now(),
         pacing: CapturedSurfacePacing::default(),
         presentation: CapturedSurfacePresentation::default(),
+        pointer_constraint_state: CapturedPointerConstraintSurfaceState::default(),
     }
 }
 

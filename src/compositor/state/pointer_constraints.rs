@@ -81,7 +81,10 @@ impl CompositorState {
             .pointer_constraints
             .values()
             .filter(|constraint| {
-                !constraint.active && !constraint.backend_pending && !constraint.defunct
+                constraint.committed
+                    && !constraint.active
+                    && !constraint.backend_pending
+                    && !constraint.defunct
             })
             .map(|constraint| constraint.id)
             .collect::<Vec<_>>();
@@ -422,18 +425,90 @@ impl CompositorState {
         }
     }
 
+    fn merge_pending_pointer_constraint_surface_state(
+        &mut self,
+        surface_id: u32,
+        newer: CapturedPointerConstraintSurfaceState,
+    ) {
+        let older = self
+            .pending_pointer_constraint_surface_states
+            .remove(&surface_id)
+            .unwrap_or_default();
+        self.pending_pointer_constraint_surface_states
+            .insert(surface_id, older.merge(newer));
+    }
+
+    pub(in crate::compositor) fn stage_pointer_constraint_install(
+        &mut self,
+        surface_id: u32,
+        constraint_id: u64,
+        region: SurfaceInputRegion,
+    ) {
+        self.merge_pending_pointer_constraint_surface_state(
+            surface_id,
+            CapturedPointerConstraintSurfaceState {
+                lifecycle: PointerConstraintLifecycleCommit::Install(constraint_id),
+                region: PointerConstraintRegionCommit::Set(region),
+                cursor_position_hint: PointerConstraintHintCommit::NoChange,
+            },
+        );
+    }
+
+    pub(in crate::compositor) fn take_pending_pointer_constraint_surface_state(
+        &mut self,
+        surface_id: u32,
+    ) -> CapturedPointerConstraintSurfaceState {
+        self.pending_pointer_constraint_surface_states
+            .remove(&surface_id)
+            .unwrap_or_default()
+    }
+
+    pub(in crate::compositor) fn stage_pointer_constraint_removal(
+        &mut self,
+        surface_id: u32,
+        constraint_id: u64,
+    ) {
+        self.merge_pending_pointer_constraint_surface_state(
+            surface_id,
+            CapturedPointerConstraintSurfaceState {
+                lifecycle: PointerConstraintLifecycleCommit::Remove(constraint_id),
+                ..Default::default()
+            },
+        );
+    }
+
     pub(in crate::compositor) fn register_pointer_constraint(
         &mut self,
         registration: PointerConstraintRegistration,
     ) -> bool {
-        if let Some(existing) = self.pointer_constraints.values().find(|constraint| {
+        let surface_id = compositor_surface_id(&registration.surface);
+        let existing = self.pointer_constraints.values().find(|constraint| {
             !constraint.defunct && same_surface_resource(&constraint.surface, &registration.surface)
-        }) {
+        });
+        let pending_install = self
+            .pending_pointer_constraint_surface_states
+            .get(&surface_id)
+            .and_then(|state| match state.lifecycle {
+                PointerConstraintLifecycleCommit::Install(id) => Some(id),
+                PointerConstraintLifecycleCommit::NoChange
+                | PointerConstraintLifecycleCommit::Remove(_) => None,
+            });
+        if let Some(existing) = existing {
             pointer_debug_log(format!(
                 "constraint reject already_constrained existing={} requested={} surface={} pointer={}",
                 existing.id,
                 registration.id,
                 compositor_surface_id(&registration.surface),
+                registration.pointer.id().protocol_id()
+            ));
+            return false;
+        }
+        if let Some(existing) = pending_install {
+            pointer_debug_log(format!(
+                "constraint reject already_constrained pending={} requested={} surface={} pointer={}",
+                existing,
+                registration.id,
+                surface_id,
                 registration.pointer.id().protocol_id()
             ));
             return false;
@@ -467,13 +542,16 @@ impl CompositorState {
                 active: false,
                 backend_pending: false,
                 defunct: false,
-                pending_region: registration.region.clone(),
-                committed_region: registration.region,
-                pending_cursor_position_hint: None,
+                committed: false,
+                committed_region: SurfaceInputRegion::Default,
                 committed_cursor_position_hint: None,
             },
         );
-        self.maybe_request_pointer_constraint_activation(registration.id);
+        self.stage_pointer_constraint_install(
+            surface_id,
+            registration.id,
+            registration.region,
+        );
         true
     }
 
@@ -496,7 +574,11 @@ impl CompositorState {
             self.pointer_constraints
                 .get(&constraint_id)
                 .and_then(|constraint| {
-                    if constraint.active || constraint.backend_pending || constraint.defunct {
+                    if !constraint.committed
+                        || constraint.active
+                        || constraint.backend_pending
+                        || constraint.defunct
+                    {
                         return None;
                     }
                     Some((constraint.pointer.clone(), constraint.surface.clone()))
@@ -810,7 +892,8 @@ impl CompositorState {
             let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
                 return;
             };
-            if constraint.generation != id.generation || constraint.defunct {
+            if constraint.generation != id.generation || !constraint.committed || constraint.defunct
+            {
                 return;
             }
             constraint.backend_pending = false;
@@ -960,12 +1043,12 @@ impl CompositorState {
         }
         match mode {
             PointerConstraintMode::Locked => {
-                if let Some(resource) = &locked_resource {
+                if let Some(resource) = &locked_resource && resource.is_alive() {
                     resource.locked();
                 }
             }
             PointerConstraintMode::Confined => {
-                if let Some(resource) = &confined_resource {
+                if let Some(resource) = &confined_resource && resource.is_alive() {
                     resource.confined();
                 }
             }
@@ -983,6 +1066,7 @@ impl CompositorState {
                 .get(&id.constraint_id)
                 .is_some_and(|constraint| {
                     constraint.generation == id.generation
+                        && constraint.committed
                         && constraint.backend_pending
                         && !constraint.active
                         && !constraint.defunct
@@ -1053,6 +1137,15 @@ impl CompositorState {
         }
         self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
         self.mark_pending_locked_pointer_backend_settled(id);
+        if self
+            .pointer_constraints
+            .get(&id.constraint_id)
+            .is_some_and(|constraint| {
+                constraint.defunct && !constraint.committed && !constraint.active
+            })
+        {
+            self.pointer_constraints.remove(&id.constraint_id);
+        }
     }
 
     pub(in crate::compositor) fn cancel_pending_pointer_constraint_backend_requests(
@@ -1203,12 +1296,12 @@ impl CompositorState {
             if emit_event {
                 match mode {
                     PointerConstraintMode::Locked => {
-                        if let Some(resource) = &locked_resource {
+                        if let Some(resource) = &locked_resource && resource.is_alive() {
                             resource.unlocked();
                         }
                     }
                     PointerConstraintMode::Confined => {
-                        if let Some(resource) = &confined_resource {
+                        if let Some(resource) = &confined_resource && resource.is_alive() {
                             resource.unconfined();
                         }
                     }
@@ -1469,32 +1562,25 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn remove_pointer_constraint(&mut self, constraint_id: u64) {
-        self.cancel_pending_locked_pointer_reveal_for_constraint(
-            constraint_id,
-            "constraint_removed",
-        );
-        let was_active = self
-            .pointer_constraints
-            .get(&constraint_id)
-            .is_some_and(|constraint| constraint.active || constraint.backend_pending);
-        if was_active {
-            if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
-                constraint.defunct = true;
-            }
-            self.deactivate_pointer_constraint_by_id(constraint_id, false, false, true);
+        let Some((surface_id, committed)) =
+            self.pointer_constraints
+                .get(&constraint_id)
+                .map(|constraint| {
+                    (
+                        compositor_surface_id(&constraint.surface),
+                        constraint.committed,
+                    )
+                })
+        else {
+            return;
+        };
+        if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
+            constraint.locked_resource = None;
+            constraint.confined_resource = None;
         }
-        self.pointer_constraints.remove(&constraint_id);
-        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id)
-            && self
-                .pending_locked_pointer_reveal
-                .as_ref()
-                .is_none_or(|pending| pending.backend_id.constraint_id != constraint_id)
-        {
-            self.cursor_visibility.lock_hidden_constraint_id = None;
-            if self.active_client_cursor_has_content() {
-                self.advance_render_generation(RenderGenerationCause::CursorState);
-            }
-            self.sync_cursor_visibility_request();
+        self.stage_pointer_constraint_removal(surface_id, constraint_id);
+        if !committed {
+            self.pointer_constraints.remove(&constraint_id);
         }
     }
 
@@ -1511,6 +1597,14 @@ impl CompositorState {
             .collect::<Vec<_>>();
         for id in ids {
             self.cancel_pending_locked_pointer_reveal_for_constraint(id, "pointer_destroyed");
+            if let Some(surface_id) = self
+                .pointer_constraints
+                .get(&id)
+                .map(|constraint| compositor_surface_id(&constraint.surface))
+            {
+                self.pending_pointer_constraint_surface_states
+                    .remove(&surface_id);
+            }
             if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
                 constraint.defunct = true;
             }
@@ -1524,6 +1618,8 @@ impl CompositorState {
         surface_id: u32,
         emit_event: bool,
     ) {
+        self.pending_pointer_constraint_surface_states
+            .remove(&surface_id);
         let ids = self
             .pointer_constraints
             .values()
@@ -1561,9 +1657,21 @@ impl CompositorState {
         constraint_id: u64,
         region: SurfaceInputRegion,
     ) {
-        if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
-            constraint.pending_region = region;
-        }
+        let Some(surface_id) = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .filter(|constraint| !constraint.defunct)
+            .map(|constraint| compositor_surface_id(&constraint.surface))
+        else {
+            return;
+        };
+        self.merge_pending_pointer_constraint_surface_state(
+            surface_id,
+            CapturedPointerConstraintSurfaceState {
+                region: PointerConstraintRegionCommit::Set(region),
+                ..Default::default()
+            },
+        );
     }
 
     pub(in crate::compositor) fn set_pointer_constraint_pending_cursor_position_hint(
@@ -1579,14 +1687,27 @@ impl CompositorState {
             ));
             return;
         }
-        if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
-            constraint.pending_cursor_position_hint = Some((surface_x, surface_y));
-        }
+        let Some(surface_id) = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .filter(|constraint| !constraint.defunct)
+            .map(|constraint| compositor_surface_id(&constraint.surface))
+        else {
+            return;
+        };
+        self.merge_pending_pointer_constraint_surface_state(
+            surface_id,
+            CapturedPointerConstraintSurfaceState {
+                cursor_position_hint: PointerConstraintHintCommit::Set((surface_x, surface_y)),
+                ..Default::default()
+            },
+        );
     }
 
-    pub(in crate::compositor) fn apply_pending_pointer_constraint_state_for_surface(
+    pub(in crate::compositor) fn apply_captured_pointer_constraint_surface_state(
         &mut self,
         surface_id: u32,
+        state: CapturedPointerConstraintSurfaceState,
     ) {
         if self.pointer_hit_instrumentation_enabled {
             self.pointer_hit_metrics.pointer_constraint_reconciliations += 1;
@@ -1594,15 +1715,66 @@ impl CompositorState {
         let ids = self
             .pointer_constraints
             .values()
-            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .filter(|constraint| {
+                compositor_surface_id(&constraint.surface) == surface_id && !constraint.defunct
+            })
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        let target_id = match state.lifecycle {
+            PointerConstraintLifecycleCommit::Install(id)
+            | PointerConstraintLifecycleCommit::Remove(id) => Some(id),
+            PointerConstraintLifecycleCommit::NoChange => ids.first().copied(),
+        };
+        if let Some(id) = target_id {
+            if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
+                if state.lifecycle == PointerConstraintLifecycleCommit::Install(id) {
+                    constraint.committed = true;
+                }
+                if let PointerConstraintRegionCommit::Set(region) = &state.region {
+                    constraint.committed_region = region.clone();
+                }
+                if let PointerConstraintHintCommit::Set(hint) = state.cursor_position_hint {
+                    constraint.committed_cursor_position_hint = Some(hint);
+                }
+            }
+            match state.lifecycle {
+                PointerConstraintLifecycleCommit::Remove(id) => {
+                    if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
+                        constraint.committed = false;
+                        constraint.defunct = true;
+                    }
+                    let was_active = self
+                        .pointer_constraints
+                        .get(&id)
+                        .is_some_and(|constraint| constraint.active);
+                    self.deactivate_pointer_constraint_by_id(id, false, false, true);
+                    if !was_active {
+                        self.pointer_constraints.remove(&id);
+                    }
+                }
+                PointerConstraintLifecycleCommit::Install(id)
+                | PointerConstraintLifecycleCommit::NoChange => {
+                    self.update_active_confined_pointer_region(id, "commit");
+                    self.maybe_request_pointer_constraint_activation(id);
+                }
+            }
+        }
+    }
+
+    pub(in crate::compositor) fn reevaluate_pointer_constraint_activation_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) {
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| {
+                compositor_surface_id(&constraint.surface) == surface_id && !constraint.defunct
+            })
             .map(|constraint| constraint.id)
             .collect::<Vec<_>>();
         for id in ids {
-            if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
-                constraint.committed_region = constraint.pending_region.clone();
-                constraint.committed_cursor_position_hint = constraint.pending_cursor_position_hint;
-            }
-            self.update_active_confined_pointer_region(id, "commit");
+            self.update_active_confined_pointer_region(id, "focus");
             self.maybe_request_pointer_constraint_activation(id);
         }
     }

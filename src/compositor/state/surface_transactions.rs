@@ -184,6 +184,7 @@ impl CompositorState {
             cached_at: _,
             pacing,
             presentation,
+            pointer_constraint_state,
         } = commit;
         self.apply_captured_surface_pacing(surface_id, commit_sequence, pacing);
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
@@ -306,6 +307,7 @@ impl CompositorState {
                 }
             }
         }
+        self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
         if input_region_changed {
             self.refresh_pointer_focus_at_last_position();
         }

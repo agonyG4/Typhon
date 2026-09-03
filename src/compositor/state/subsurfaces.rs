@@ -1050,7 +1050,6 @@ impl CompositorState {
         }
         self.begin_surface_tree_publication();
         self.apply_cached_subsurface_commit(root_id, root_commit);
-        self.apply_pending_pointer_constraint_state_for_surface(root_id);
         self.apply_pending_subsurface_parent_state(root_id);
         for (surface_id, commit) in commits {
             self.apply_pending_subsurface_parent_state(surface_id);

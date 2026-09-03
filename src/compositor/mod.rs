@@ -272,7 +272,11 @@ pub use state::{
     XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot,
 };
 use state_data::*;
-use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
+use subsurface::{
+    CachedSubsurfaceCommit, CapturedPointerConstraintSurfaceState, PointerConstraintHintCommit,
+    PointerConstraintLifecycleCommit, PointerConstraintRegionCommit, SubsurfaceSyncMode,
+    SubsurfaceTransactionState,
+};
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
@@ -605,6 +609,7 @@ pub struct CompositorState {
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,
     pointer_constraints: HashMap<u64, PointerConstraint>,
+    pending_pointer_constraint_surface_states: HashMap<u32, CapturedPointerConstraintSurfaceState>,
     next_internal_pointer_constraint_id: u64,
     next_pointer_constraint_generation: u64,
     active_locked_pointer_routing: Option<ActiveLockedPointerRouting>,
@@ -922,9 +927,8 @@ struct PointerConstraint {
     active: bool,
     backend_pending: bool,
     defunct: bool,
-    pending_region: SurfaceInputRegion,
+    committed: bool,
     committed_region: SurfaceInputRegion,
-    pending_cursor_position_hint: Option<(f64, f64)>,
     committed_cursor_position_hint: Option<(f64, f64)>,
 }
 #[derive(Debug, Clone)]

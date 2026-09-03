@@ -102,6 +102,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let commit_sequence = state.allocate_surface_commit_sequence();
                 let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
                 state.apply_pending_toplevel_constraints(surface_id);
+                let pointer_constraint_state =
+                    state.take_pending_pointer_constraint_surface_state(surface_id);
                 let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
@@ -234,6 +236,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     cached_at: Instant::now(),
                     pacing,
                     presentation,
+                    pointer_constraint_state,
                 };
                 state.commit_surface_tree_request(surface_id, commit);
             }

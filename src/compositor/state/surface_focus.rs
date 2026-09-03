@@ -101,7 +101,7 @@ impl CompositorState {
                 .field("focus_generation", self.focus_generation)
                 .field("changed", changed)
         });
-        self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
+        self.reevaluate_pointer_constraint_activation_for_surface(new_surface_id);
         if !self
             .layer_surfaces
             .contains_key(&self.root_surface_id_for_surface(new_surface_id))
