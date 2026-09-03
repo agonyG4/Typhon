@@ -145,10 +145,10 @@ The exact required `rtk cargo test --locked` command built and ran 2,005 tests:
 `native::kms::tests::explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success`.
 
 The all-target check and clippy commands are currently blocked by unrelated
-working-tree edits in `src/native_output/runtime/dmabuf_release.rs`. Their
-tests reference methods and types absent from the corresponding production
-definitions. Those edits are outside this pointer-constraint closure and were
-preserved.
+working-tree edits in `src/native/adaptive_buffering.rs` and
+`src/native_output/runtime/dmabuf_release.rs`. Their tests reference fields,
+methods, and types absent from the corresponding production definitions.
+Those edits are outside this pointer-constraint closure and were preserved.
 
 Consequently, the following required commands cannot be reported as full
 GREEN until that unrelated mismatch is resolved:
@@ -159,7 +159,9 @@ rtk cargo clippy --locked --all-targets -- -D warnings
 rtk cargo test --locked
 ```
 
-`rtk cargo fmt --check` and `rtk git diff --check` pass.
+At the final audit, `rtk git diff --check` passes. `rtk cargo fmt --check`
+reports formatting drift in the unrelated `src/native/adaptive_buffering.rs`.
+The pointer-constraint files remain formatted.
 
 The current host is Linux rather than Windows, so no Windows-specific native
 availability claim is made. Full Linux native qualification involving the
@@ -167,6 +169,13 @@ actual input backend remains not run here. The causal timing tests were
 rerun successfully: 5 native transition-evidence tests, including
 deactivation A followed by activation B and wall/thread-CPU association, and
 16 input-epoch dispatch tests passed. No timing semantics were changed.
+
+After those focused runs, the shared checkout received the unrelated
+`adaptive_buffering.rs` test edits noted above; a subsequent focused Cargo
+test invocation was blocked during test compilation by those edits. The
+subsequent library check and clippy reruns were also blocked by a missing
+`RenderPrediction` field initializer in that file. The pointer-constraint
+commits remain unchanged.
 
 ## Non-claims
 
