@@ -18,6 +18,7 @@ mod output_membership;
 mod output_state;
 mod override_redirect_stack;
 mod pointer_constraints;
+mod pointer_constraint_region;
 mod resize;
 mod roles;
 mod scene_order;
