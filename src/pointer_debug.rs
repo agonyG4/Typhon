@@ -1,12 +1,14 @@
 use std::sync::OnceLock;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+#[allow(dead_code)]
 static TIMING_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("TYPHON_POINTER_DEBUG").is_some())
 }
 
+#[allow(dead_code)]
 pub(crate) fn timing_trace_enabled() -> bool {
     *TIMING_TRACE_ENABLED.get_or_init(|| std::env::var_os("TYPHON_POINTER_TIMING_TRACE").is_some())
 }

@@ -17,8 +17,8 @@ mod input_resources;
 mod output_membership;
 mod output_state;
 mod override_redirect_stack;
-mod pointer_constraints;
 mod pointer_constraint_region;
+mod pointer_constraints;
 mod resize;
 mod roles;
 mod scene_order;
@@ -99,9 +99,9 @@ pub(in crate::compositor) use input_resources::*;
 pub(in crate::compositor) use output_membership::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use output_state::*;
+pub(in crate::compositor) use pointer_constraint_region::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use pointer_constraints::*;
-pub(in crate::compositor) use pointer_constraint_region::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
 pub(in crate::compositor) use roles::*;

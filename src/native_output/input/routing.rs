@@ -1594,8 +1594,8 @@ fn select_pointer_transition_evidence(
         *selected = Some(NativePointerTransitionEvidence {
             transition,
             action_timing,
-            constraint_region_resolution_duration_ns:
-                region_resolution_timing.map(|timing| timing.duration_ns),
+            constraint_region_resolution_duration_ns: region_resolution_timing
+                .map(|timing| timing.duration_ns),
             constraint_region_resolution_thread_cpu_ns: region_resolution_timing
                 .and_then(|timing| timing.thread_cpu_ns),
         });

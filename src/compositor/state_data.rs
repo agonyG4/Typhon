@@ -1,9 +1,9 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     io,
     sync::{Arc, Mutex},
 };
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel};
 use wayland_server::{

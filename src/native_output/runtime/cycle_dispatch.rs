@@ -1356,10 +1356,10 @@ impl NativeRuntime {
             pre_read_observation.constraint_activation_end = evidence.action_timing.activation_end;
             pre_read_observation.wayland_flush_start = evidence.action_timing.wayland_flush_start;
             pre_read_observation.wayland_flush_end = evidence.action_timing.wayland_flush_end;
-            pre_read_observation.constraint_region_resolution_duration_ns = evidence
-                .constraint_region_resolution_duration_ns;
-            pre_read_observation.constraint_region_resolution_thread_cpu_ns = evidence
-                .constraint_region_resolution_thread_cpu_ns;
+            pre_read_observation.constraint_region_resolution_duration_ns =
+                evidence.constraint_region_resolution_duration_ns;
+            pre_read_observation.constraint_region_resolution_thread_cpu_ns =
+                evidence.constraint_region_resolution_thread_cpu_ns;
         } else {
             pre_read_observation.constraint_activation_start = None;
             pre_read_observation.constraint_activation_end = None;

@@ -631,7 +631,8 @@ impl CompositorState {
                 PointerConstraintBackendRequest::ActivateLocked { id: backend_id }
             }
             PointerConstraintMode::Confined => {
-                let Some(resolved) = self.pointer_constraint_output_region_with_timing(constraint_id)
+                let Some(resolved) =
+                    self.pointer_constraint_output_region_with_timing(constraint_id)
                 else {
                     pointer_debug_log(format!(
                         "constraint activation skipped id={} reason=region_unresolved mode={:?}",
