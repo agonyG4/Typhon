@@ -309,6 +309,11 @@ mod tests {
             "repeated_immediate_timer_wake_count=0",
             "multiple_deadline_owner_violation_count=0",
             "target_identity_reuse_after_abandonment=0",
+            "physical_claim_overtake_ready=0",
+            "physical_claim_overtake_worker_queued=0",
+            "physical_claim_overtake_recoveries=0",
+            "physical_claim_overtake_recovery_failures=0",
+            "physical_claim_fatal_violations=0",
             "active_pageflip_interval_p50_us=0",
             "active_pageflip_interval_p95_us=0",
             "active_pageflip_interval_p99_us=0",
@@ -918,6 +923,11 @@ pub(crate) struct NativeFramePacing {
     predictive_target_late_by_intervals: u64,
     fast_client_samples: u64,
     slow_client_samples: u64,
+    physical_claim_overtake_ready: u64,
+    physical_claim_overtake_worker_queued: u64,
+    physical_claim_overtake_recoveries: u64,
+    physical_claim_overtake_recovery_failures: u64,
+    physical_claim_fatal_violations: u64,
     content_attribution: [u64; CONTENT_ATTRIBUTION_COUNT],
     last_prediction: Option<RenderPrediction>,
     last_primary_sequence: Option<u64>,
@@ -1062,6 +1072,11 @@ impl NativeFramePacing {
             predictive_target_late_by_intervals: 0,
             fast_client_samples: 0,
             slow_client_samples: 0,
+            physical_claim_overtake_ready: 0,
+            physical_claim_overtake_worker_queued: 0,
+            physical_claim_overtake_recoveries: 0,
+            physical_claim_overtake_recovery_failures: 0,
+            physical_claim_fatal_violations: 0,
             content_attribution: [0; CONTENT_ATTRIBUTION_COUNT],
             last_prediction: None,
             last_primary_sequence: None,
@@ -1078,6 +1093,39 @@ impl NativeFramePacing {
 
     pub(crate) const fn summary_enabled(&self) -> bool {
         self.summary_enabled
+    }
+
+    pub(crate) fn note_physical_claim_overtake_ready(&mut self) {
+        if self.enabled {
+            self.physical_claim_overtake_ready =
+                self.physical_claim_overtake_ready.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_physical_claim_overtake_worker_queued(&mut self) {
+        if self.enabled {
+            self.physical_claim_overtake_worker_queued =
+                self.physical_claim_overtake_worker_queued.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_physical_claim_overtake_recovery(&mut self, recovered: bool) {
+        if !self.enabled {
+            return;
+        }
+        let counter = if recovered {
+            &mut self.physical_claim_overtake_recoveries
+        } else {
+            &mut self.physical_claim_overtake_recovery_failures
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) fn note_physical_claim_fatal_violation(&mut self) {
+        if self.enabled {
+            self.physical_claim_fatal_violations =
+                self.physical_claim_fatal_violations.saturating_add(1);
+        }
     }
     pub(crate) fn queue_visual(&mut self, now_ns: u64, render_generation: u64) {
         if !self.enabled {
@@ -1368,6 +1416,22 @@ impl NativeFramePacing {
             ],
         );
     }
+
+    pub(crate) fn abandon_ready_frame(&mut self) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let Some(frame_id) = self.ready.take() else {
+            return false;
+        };
+        self.clear_ready_waiting_timing(Some(frame_id));
+        self.log(
+            "ready_frame_abandoned",
+            vec![frame_id_field(Some(frame_id))],
+        );
+        true
+    }
+
     pub(crate) fn note_pageflip(
         &mut self,
         now_ns: u64,
@@ -1762,6 +1826,26 @@ impl NativeFramePacing {
                 PacingField::u64("fast_client_samples", self.fast_client_samples),
                 PacingField::u64("slow_client_samples", self.slow_client_samples),
                 PacingField::u64(
+                    "physical_claim_overtake_ready",
+                    self.physical_claim_overtake_ready,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_worker_queued",
+                    self.physical_claim_overtake_worker_queued,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_recoveries",
+                    self.physical_claim_overtake_recoveries,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_recovery_failures",
+                    self.physical_claim_overtake_recovery_failures,
+                ),
+                PacingField::u64(
+                    "physical_claim_fatal_violations",
+                    self.physical_claim_fatal_violations,
+                ),
+                PacingField::u64(
                     "content_attribution_callback_handoff_limited",
                     self.content_attribution
                         [ContentCadenceAttribution::CallbackHandoffLimited.index()],
@@ -1975,12 +2059,28 @@ impl NativeFramePacing {
                     self.sync_file_info_approximate,
                 ),
                 PacingField::u64(
-                    "presentation_target_sequence_mutations",
+                    "target_identity_reuse_after_abandonment",
                     target_identity_reuse_after_abandonment,
                 ),
                 PacingField::u64(
-                    "target_identity_reuse_after_abandonment",
-                    target_identity_reuse_after_abandonment,
+                    "physical_claim_overtake_ready",
+                    self.physical_claim_overtake_ready,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_worker_queued",
+                    self.physical_claim_overtake_worker_queued,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_recoveries",
+                    self.physical_claim_overtake_recoveries,
+                ),
+                PacingField::u64(
+                    "physical_claim_overtake_recovery_failures",
+                    self.physical_claim_overtake_recovery_failures,
+                ),
+                PacingField::u64(
+                    "physical_claim_fatal_violations",
+                    self.physical_claim_fatal_violations,
                 ),
                 PacingField::u64("scheduler_wakeup_lateness_p50_us", wake50),
                 PacingField::u64("scheduler_wakeup_lateness_p95_us", wake95),

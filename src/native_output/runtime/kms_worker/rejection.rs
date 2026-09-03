@@ -9,6 +9,138 @@ use super::super::presentation_transactions::{
 use super::direct_rejection::WorkerRejectionKind;
 use crate::native_output::scanout::FrozenCursorPlaneOwner;
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drop_queued_worker_job_with_reason_parts(
+    job: KmsCommitJob,
+    drop_reason: OutputTransactionDropReason,
+    scene_history: &mut NativeSceneHistory,
+    scanout: &mut NativeScanoutBackend,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    atomic_cursor: &mut Option<NativeAtomicCursor>,
+    cursor_output_arbitration: &mut NativeCursorOutputArbitration,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    kms_commit_worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+) -> NativeResult<()> {
+    scene_history.discard_submission(job.token.get());
+    let sidecar_transaction_id = job
+        .owners
+        .cursor()
+        .filter(|owner| owner.sidecar_id.is_some())
+        .map(|owner| owner.transaction.id());
+    if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
+        && let Some(duration_ns) = job.test_only_duration_ns
+    {
+        scanout.note_direct_test_only(duration_ns, false);
+    }
+    let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+        && output_transactions
+            .transaction(job.transaction_id)
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.descriptor().planes().primary(),
+                    PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                )
+            });
+    if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
+        let cursor = atomic_cursor
+            .as_mut()
+            .ok_or_else(|| io::Error::other("queued cursor job has no cursor"))?;
+        cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+        cursor_output_arbitration.clear_pending();
+    } else {
+        if !frame_pacing.cancel_worker_submission(job.pacing_frame_id, job.ready_submit) {
+            return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
+        }
+        if compatibility_primary {
+            let scheduler_cancel = if drop_reason == OutputTransactionDropReason::SafeAbandonment {
+                frame_scheduler.abandon_worker_submission(job.token.get(), job.transaction_id.get())
+            } else {
+                frame_scheduler.cancel_worker_submission(job.token.get(), job.transaction_id.get())
+            };
+            if let Err(error) = scheduler_cancel {
+                if let Some(worker) = kms_commit_worker {
+                    worker.record_scheduler_cancel_mismatch();
+                }
+                return Err(io::Error::other(error).into());
+            }
+            if let Some(worker) = kms_commit_worker {
+                worker.record_scheduler_queued_cancellation();
+            }
+        }
+    }
+    atomic_commit_arbiter.reject_worker_queued(job.token);
+    if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
+        if compatibility_primary {
+            scanout
+                .suspend_abandon_worker_compatibility(job.token)
+                .map_err(io::Error::other)?;
+        } else {
+            scanout
+                .suspend_abandon_worker_submission(job.token)
+                .map_err(io::Error::other)?;
+        }
+    }
+    let direct_obligations = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+        Some(
+            output_transactions
+                .transaction(job.transaction_id)
+                .ok_or_else(|| io::Error::other("dropped direct transaction is missing"))?
+                .descriptor()
+                .obligations(),
+        )
+    } else {
+        None
+    };
+    let direct_callback_owner_leaks = direct_obligations.map(|obligations| {
+        direct_terminal_callback_owner_leaks(
+            server,
+            job.transaction_id,
+            obligations,
+            DirectTerminalCallbackDisposition::Abandoned,
+        )
+    });
+    settle_dropped_output_transaction(
+        output_transactions,
+        job.transaction_id,
+        drop_reason,
+        MonotonicTimestampNs::new(monotonic_now_ns()?),
+        |obligations| {
+            if let Some(batch_id) = obligations.frame_batch_id() {
+                server.complete_frame_batch_after_safe_abandonment(
+                    batch_id,
+                    FrameBatchDiscardReason::SuspendAbandonment,
+                );
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(sidecar_transaction_id) = sidecar_transaction_id {
+        settle_dropped_output_transaction(
+            output_transactions,
+            sidecar_transaction_id,
+            drop_reason,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            |obligations| {
+                debug_assert!(obligations.frame_batch_id().is_none());
+                debug_assert!(obligations.direct_surface_id().is_none());
+                Ok(())
+            },
+        )?;
+    }
+    if let Some(callback_owner_leaks) = direct_callback_owner_leaks {
+        scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
+    }
+    if drop_reason == OutputTransactionDropReason::SafeAbandonment
+        && let Some(worker) = kms_commit_worker
+    {
+        worker.record_shutdown_queued_job_settled();
+    }
+    Ok(())
+}
+
 fn take_embedded_cursor_owner(
     job: &mut KmsCommitJob,
 ) -> NativeResult<Option<FrozenCursorPlaneOwner>> {

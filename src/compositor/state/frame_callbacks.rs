@@ -7,13 +7,13 @@ pub(crate) struct SurfaceFrameClockState {
 }
 
 impl SurfaceFrameClockState {
-    fn note_commit(self, surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
+    fn note_commit(&mut self, surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
+        let admission_ns = self.last_admission_ns.take();
         FrameCallbackTimingEvidence {
             surface_id,
             commit_ns,
-            admission_ns: self.last_admission_ns,
-            reaction_ns: self
-                .last_admission_ns
+            admission_ns,
+            reaction_ns: admission_ns
                 .filter(|admission_ns| commit_ns >= *admission_ns)
                 .map(|admission_ns| commit_ns.saturating_sub(admission_ns)),
         }
@@ -44,6 +44,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn discard_frame_callbacks_for_surface(&mut self, surface_id: u32) {
+        self.surface_frame_clock.remove(&surface_id);
         let callback_ids = self
             .pending_frame_callback_surfaces
             .iter()
@@ -71,7 +72,6 @@ impl CompositorState {
             self.pending_frame_callback_surfaces.remove(callback_id);
             self.pending_frame_callback_timing.remove(callback_id);
         }
-        self.surface_frame_clock.remove(&surface_id);
         for batch in self.frame_batches.values_mut() {
             if batch.callback_terminal_ownership_checked {
                 continue;
@@ -892,5 +892,53 @@ mod tests {
 
         let surface_b_commit = CompositorState::surface_callback_commit_timing(&mut clocks, 2, 150);
         assert_eq!(surface_b_commit.reaction_ns, Some(50));
+    }
+
+    #[test]
+    fn callback_admission_is_consumed_by_the_next_commit_only() {
+        let mut clocks = HashMap::new();
+        CompositorState::surface_callback_admission(&mut clocks, 1, 100);
+
+        let first = CompositorState::surface_callback_commit_timing(&mut clocks, 1, 150);
+        let second = CompositorState::surface_callback_commit_timing(&mut clocks, 1, 170);
+
+        assert_eq!(first.reaction_ns, Some(50));
+        assert_eq!(second.reaction_ns, None);
+
+        CompositorState::surface_callback_admission(&mut clocks, 1, 200);
+        let third = CompositorState::surface_callback_commit_timing(&mut clocks, 1, 230);
+        assert_eq!(third.reaction_ns, Some(30));
+    }
+
+    #[test]
+    fn surface_frame_clock_is_removed_even_without_pending_callbacks() {
+        let mut state = CompositorState::default();
+        state
+            .surface_frame_clock
+            .entry(1)
+            .or_default()
+            .note_admission(100);
+
+        state.teardown_surface_resource(1, SurfaceTeardownReason::ExplicitDestroy);
+
+        assert!(!state.surface_frame_clock.contains_key(&1));
+    }
+
+    #[test]
+    fn client_disconnect_removes_all_surface_frame_clock_entries() {
+        let mut state = CompositorState::default();
+        for surface_id in [1, 2] {
+            state
+                .surface_frame_clock
+                .entry(surface_id)
+                .or_default()
+                .note_admission(100);
+        }
+
+        for surface_id in [1, 2] {
+            state.teardown_surface_resource(surface_id, SurfaceTeardownReason::ClientDisconnected);
+        }
+
+        assert!(state.surface_frame_clock.is_empty());
     }
 }

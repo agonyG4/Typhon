@@ -1292,6 +1292,28 @@ impl AtomicEglGbmScanout {
             .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
     }
 
+    pub(crate) fn suspended_ready_fence_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.swapchain()
+            .ok()
+            .and_then(AtomicOutputSwapchain::suspended_ready_fence_fd)
+    }
+
+    pub(crate) fn recover_suspended_ready_if_signaled(&mut self) -> io::Result<bool> {
+        if !self.swapchain()?.has_suspended_ready_frame() {
+            return Ok(false);
+        }
+        if !self.swapchain()?.suspended_ready_fence_signaled()? {
+            return Ok(false);
+        }
+        let abandoned = self.swapchain_mut()?.take_suspended_ready_frame();
+        self.swapchain_mut()?.recover_suspended_slot(true)?;
+        if let Some(frame) = abandoned {
+            self.scene.discard_rendered(frame.scene_commit);
+            drop(frame.surface_damage);
+        }
+        Ok(true)
+    }
+
     pub(crate) fn note_physical_primary_presentation(
         &mut self,
         claim: PrimaryRefreshClaim,
@@ -1300,12 +1322,13 @@ impl AtomicEglGbmScanout {
             .note_physical_primary_presentation(claim)
     }
 
-    pub(crate) fn validate_physical_primary_presentation(
+    pub(crate) fn revalidate_physical_primary_presentation(
         &self,
         claim: PrimaryRefreshClaim,
-    ) -> io::Result<()> {
-        self.swapchain()?
-            .validate_physical_primary_presentation(claim)
+    ) -> io::Result<PhysicalPrimaryClaimRevalidation> {
+        Ok(self
+            .swapchain()?
+            .revalidate_physical_primary_presentation(claim))
     }
 
     pub(crate) fn presented_direct_ownership(&self) -> &DirectPrimaryOwnership {

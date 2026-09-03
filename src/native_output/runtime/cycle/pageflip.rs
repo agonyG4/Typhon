@@ -1,11 +1,14 @@
 use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary_cursor_pageflip};
+use super::super::kms_worker::drop_queued_worker_job_with_reason_parts;
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presented_output_transaction,
-    prepare_presented_output_transaction,
+    prepare_presented_output_transaction, settle_dropped_output_transaction,
 };
 use super::super::*;
 use super::cycle_direct;
-use crate::native_output::kms_worker::{KmsCursorUpdate, KmsPrimaryCursorPresentation};
+use crate::native_output::kms_worker::{
+    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsWorkerQueuedCancellation,
+};
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
 };
@@ -141,6 +144,111 @@ fn select_cursor_promotion(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn abandon_overtaken_ready(
+    explicit: &mut AtomicEglGbmScanout,
+    owner: OutputFrameIdentitySnapshot,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    presented_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    if explicit.swapchain()?.ready_identity() != Some(owner) {
+        return Err(io::Error::other("overtaken READY identity no longer matches").into());
+    }
+    if !frame_pacing.abandon_ready_frame() {
+        return Err(io::Error::other("overtaken READY has no pacing owner").into());
+    }
+    scene_history.discard_ready();
+    frame_scheduler.discard_ready_frame();
+    if !explicit.swapchain_mut()?.suspend_abandon_ready()? {
+        return Err(io::Error::other("overtaken READY disappeared before abandonment").into());
+    }
+    settle_dropped_output_transaction(
+        output_transactions,
+        owner.transaction_id,
+        OutputTransactionDropReason::SafeAbandonment,
+        presented_at,
+        |obligations| {
+            if obligations.frame_batch_id() != Some(owner.protocol_batch_id) {
+                return Err(io::Error::other(
+                    "overtaken READY transaction owns a different frame batch",
+                )
+                .into());
+            }
+            server.complete_frame_batch_after_safe_abandonment(
+                owner.protocol_batch_id,
+                FrameBatchDiscardReason::SuspendAbandonment,
+            );
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn abandon_overtaken_worker_queued(
+    worker: &KmsCommitWorkerHandle,
+    owner: QueuedOutputFrameIdentitySnapshot,
+    crtc_id: u32,
+    scanout: &mut NativeScanoutBackend,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    atomic_cursor: &mut Option<NativeAtomicCursor>,
+    cursor_output_arbitration: &mut NativeCursorOutputArbitration,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+) -> NativeResult<()> {
+    match worker.cancel_queued_primary(
+        owner.token,
+        owner.frame.transaction_id,
+        owner.frame.pool_generation,
+        crtc_id,
+        owner.frame.target,
+        owner.frame.frame_id,
+    ) {
+        KmsWorkerQueuedCancellation::Cancelled(job) => drop_queued_worker_job_with_reason_parts(
+            job,
+            OutputTransactionDropReason::SafeAbandonment,
+            scene_history,
+            scanout,
+            frame_pacing,
+            frame_scheduler,
+            atomic_cursor,
+            cursor_output_arbitration,
+            atomic_commit_arbiter,
+            server,
+            output_transactions,
+            Some(worker),
+        ),
+        KmsWorkerQueuedCancellation::NotQueued { phase } => Err(io::Error::other(format!(
+            "overtaken worker primary crossed ownership boundary before cancellation: {phase:?}"
+        ))
+        .into()),
+        KmsWorkerQueuedCancellation::IdentityMismatch => Err(io::Error::other(
+            "overtaken worker primary identity does not match the queued job",
+        )
+        .into()),
+    }
+}
+
+fn register_suspended_ready_fence_if_needed(
+    explicit: &AtomicEglGbmScanout,
+    event_loop: &mut NativeEventLoop,
+    output_render_fence_token: &mut Option<ReactorToken>,
+) -> NativeResult<()> {
+    if output_render_fence_token.is_none()
+        && let Some(fd) = explicit.suspended_ready_fence_fd()
+    {
+        *output_render_fence_token =
+            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
+    }
+    Ok(())
+}
+
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
@@ -180,6 +288,7 @@ impl NativeRuntime {
             input_state: _,
             cursor_preference: _,
             cursor_render_mode: _,
+            cursor_output_arbitration,
             atomic_cursor,
             legacy_cursor: _,
             input_devices: _,
@@ -214,7 +323,7 @@ impl NativeRuntime {
             direct_fallback_tracker,
             last_refresh_sequence,
             scene_history,
-            queued_redraw_requested: _,
+            queued_redraw_requested,
             frame_index,
             known_toplevels: _,
             pending_launches: _,
@@ -259,6 +368,11 @@ impl NativeRuntime {
         if wakeup.reasons.output_render_fence() {
             if let Some(token) = output_render_fence_token.take() {
                 event_loop.unregister(token)?;
+            }
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
+                && explicit.recover_suspended_ready_if_signaled()?
+            {
+                *queued_redraw_requested = true;
             }
             if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
                 && let Some(timing) = explicit
@@ -667,8 +781,8 @@ impl NativeRuntime {
                 *last_primary_presented_at_ns = Some(presented_at_ns);
                 if direct_pending {
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
-                    let actual_logical_sequence =
-                        presentation_deadline.note_presented(presented_at);
+                    let prepared_physical = presentation_deadline.prepare_presented(presented_at);
+                    let actual_logical_sequence = prepared_physical.logical_sequence();
                     let transaction_id = match atomic_completion {
                         Some(AtomicCommitCompletion::Completed {
                             kind: AtomicCommitKind::DirectPrimary { transaction_id, .. },
@@ -727,6 +841,7 @@ impl NativeRuntime {
                         frame_pacing,
                         scheduled_presentation_target,
                     )?;
+                    presentation_deadline.commit_presented(prepared_physical);
                     if *kms_commit_worker_transport
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                     {
@@ -751,8 +866,8 @@ impl NativeRuntime {
                         event_loop.unregister(token)?;
                     }
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
-                    let actual_logical_sequence =
-                        presentation_deadline.note_presented(presented_at);
+                    let prepared_physical = presentation_deadline.prepare_presented(presented_at);
+                    let actual_logical_sequence = prepared_physical.logical_sequence();
                     let transaction_id = match atomic_completion {
                         Some(AtomicCommitCompletion::Completed {
                             kind: AtomicCommitKind::CompositedPrimary { transaction_id, .. },
@@ -766,6 +881,18 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("composited pageflip token is zero"))?;
+                    let pending_identity =
+                        explicit.swapchain()?.pending_identity().ok_or_else(|| {
+                            io::Error::other("composited pageflip has no pending identity")
+                        })?;
+                    if pending_identity.token != pageflip_token
+                        || pending_identity.frame.transaction_id != transaction_id
+                    {
+                        return Err(io::Error::other(
+                            "composited pageflip predecessor identity mismatch",
+                        )
+                        .into());
+                    }
                     let previous_assignment = presented_planes.primary;
                     let presented_transition = scene_history
                         .prepare_pageflip_transition(
@@ -776,25 +903,82 @@ impl NativeRuntime {
                         .ok_or_else(|| {
                             io::Error::other("composited pageflip has no matching scene transition")
                         })?;
-                    self.presentation_trace.push(
-                        PresentationTransactionEvent::PresentedTransition {
-                            transaction_id,
-                            timestamp_ns: monotonic_now_ns()?,
-                            token: pageflip_token.get(),
-                            previous_frame_id: presented_transition.previous_frame_id,
-                            current_frame_id: presented_transition.current_frame_id,
-                            transition_damage_signature: presented_transition
-                                .damage
-                                .identity_signature(),
-                        },
-                    );
-                    let physical_claim =
-                        oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
-                            sequence: actual_logical_sequence,
-                            presentation_time: presented_at,
-                            clock_generation: *drm_file_generation,
-                        };
-                    explicit.validate_physical_primary_presentation(physical_claim)?;
+                    let physical_claim = prepared_physical.claim();
+                    loop {
+                        match explicit.revalidate_physical_primary_presentation(physical_claim)? {
+                            PhysicalPrimaryClaimRevalidation::Valid => break,
+                            PhysicalPrimaryClaimRevalidation::OvertakesReady { owner } => {
+                                frame_pacing.note_physical_claim_overtake_ready();
+                                let recovered = abandon_overtaken_ready(
+                                    explicit,
+                                    owner,
+                                    scene_history,
+                                    frame_pacing,
+                                    frame_scheduler,
+                                    server,
+                                    output_transactions,
+                                    presented_at,
+                                )
+                                .is_ok();
+                                frame_pacing.note_physical_claim_overtake_recovery(recovered);
+                                if !recovered {
+                                    return Err(io::Error::other(
+                                        "failed to recover an overtaken READY primary",
+                                    )
+                                    .into());
+                                }
+                                *queued_redraw_requested = true;
+                                register_suspended_ready_fence_if_needed(
+                                    explicit,
+                                    event_loop,
+                                    output_render_fence_token,
+                                )?;
+                            }
+                            PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued { owner } => {
+                                frame_pacing.note_physical_claim_overtake_worker_queued();
+                                let worker = kms_commit_worker.as_ref().ok_or_else(|| {
+                                    io::Error::other(
+                                        "overtaken worker primary has no worker handle",
+                                    )
+                                })?;
+                                let recovered = abandon_overtaken_worker_queued(
+                                    worker,
+                                    owner,
+                                    target.crtc_id,
+                                    scanout,
+                                    scene_history,
+                                    frame_pacing,
+                                    frame_scheduler,
+                                    atomic_cursor,
+                                    cursor_output_arbitration,
+                                    atomic_commit_arbiter,
+                                    server,
+                                    output_transactions,
+                                )
+                                .is_ok();
+                                frame_pacing.note_physical_claim_overtake_recovery(recovered);
+                                if !recovered {
+                                    return Err(io::Error::other(
+                                        "failed to recover an overtaken queued primary",
+                                    )
+                                    .into());
+                                }
+                                *queued_redraw_requested = true;
+                                register_suspended_ready_fence_if_needed(
+                                    explicit,
+                                    event_loop,
+                                    output_render_fence_token,
+                                )?;
+                            }
+                            PhysicalPrimaryClaimRevalidation::Fatal(violation) => {
+                                frame_pacing.note_physical_claim_fatal_violation();
+                                return Err(io::Error::other(format!(
+                                    "physical primary claim violation: {violation:?}"
+                                ))
+                                .into());
+                            }
+                        }
+                    }
                     let CompositedPageflipCompletion {
                         presented: frame,
                         protocol_batch_id,
@@ -814,6 +998,19 @@ impl NativeRuntime {
                         .into());
                     }
                     explicit.note_physical_primary_presentation(physical_claim)?;
+                    presentation_deadline.commit_presented(prepared_physical);
+                    self.presentation_trace.push(
+                        PresentationTransactionEvent::PresentedTransition {
+                            transaction_id,
+                            timestamp_ns: monotonic_now_ns()?,
+                            token: pageflip_token.get(),
+                            previous_frame_id: presented_transition.previous_frame_id,
+                            current_frame_id: presented_transition.current_frame_id,
+                            transition_damage_signature: presented_transition
+                                .damage
+                                .identity_signature(),
+                        },
+                    );
                     dmabuf_gpu_release_registry
                         .note_composited_pageflip(transaction_id, presented_at_ns);
                     if !scene_history.promote_pageflip(pageflip_token.get()) {
@@ -1347,7 +1544,7 @@ impl NativeRuntime {
             pageflip_pending_at_tick: false,
             tick_us: 0,
             accepted: 0,
-            redraw_requested: false,
+            redraw_requested: *queued_redraw_requested,
             skipped_input_repaints: 0,
             input_drain_us: 0,
             raw_input_events: 0,

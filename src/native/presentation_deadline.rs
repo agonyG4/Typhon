@@ -190,6 +190,22 @@ pub struct PresentationDeadlinePlanner {
     last_abandoned_target_identity: Option<(u64, u64)>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedPhysicalPresentation {
+    claim: PrimaryRefreshClaim,
+}
+
+impl PreparedPhysicalPresentation {
+    pub const fn claim(self) -> PrimaryRefreshClaim {
+        self.claim
+    }
+
+    pub const fn logical_sequence(self) -> u64 {
+        self.claim.sequence
+    }
+}
+
 impl PresentationDeadlinePlanner {
     pub fn new(refresh_interval: Duration) -> Self {
         Self {
@@ -204,7 +220,10 @@ impl PresentationDeadlinePlanner {
         }
     }
 
-    pub fn note_presented(&mut self, presented_at: MonotonicTimestampNs) -> u64 {
+    pub fn prepare_presented(
+        &self,
+        presented_at: MonotonicTimestampNs,
+    ) -> PreparedPhysicalPresentation {
         let logical_sequence = self
             .last_presented_at
             .map(|previous| {
@@ -218,13 +237,28 @@ impl PresentationDeadlinePlanner {
                 self.last_presented_sequence.saturating_add(intervals)
             })
             .unwrap_or_else(|| self.last_presented_sequence.saturating_add(1));
+        PreparedPhysicalPresentation {
+            claim: PrimaryRefreshClaim {
+                sequence: logical_sequence,
+                presentation_time: presented_at,
+                clock_generation: self.clock_generation,
+            },
+        }
+    }
+
+    pub fn commit_presented(&mut self, prepared: PreparedPhysicalPresentation) -> u64 {
+        let logical_sequence = prepared.logical_sequence();
         self.last_presented_sequence = logical_sequence;
-        self.last_presented_at = Some(presented_at);
+        self.last_presented_at = Some(prepared.claim.presentation_time);
         if let Some(abandoned) = self.scheduled.take() {
             self.pre_render_abandoned = self.pre_render_abandoned.saturating_add(1);
             self.last_abandoned_target_identity = Some(abandoned.physical_claim().identity());
         }
         logical_sequence
+    }
+
+    pub fn note_presented(&mut self, presented_at: MonotonicTimestampNs) -> u64 {
+        self.commit_presented(self.prepare_presented(presented_at))
     }
 
     pub fn plan_normal(
@@ -859,6 +893,40 @@ mod tests {
             planner.note_presented(MonotonicTimestampNs::new(36_363_636)),
             6
         );
+    }
+
+    #[test]
+    fn prepared_presentation_is_side_effect_free_until_commit() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        let scheduled = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(101_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        let prepared = planner.prepare_presented(MonotonicTimestampNs::new(110_000_000));
+
+        assert_eq!(prepared.logical_sequence(), 2);
+        assert_eq!(planner.scheduled_target(), Some(scheduled));
+        assert_eq!(planner.pre_render_abandoned(), 0);
+    }
+
+    #[test]
+    fn committing_prepared_presentation_abandons_the_old_schedule_once() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        planner.plan_normal(
+            MonotonicTimestampNs::new(101_000_000),
+            Duration::from_millis(2),
+        );
+
+        let prepared = planner.prepare_presented(MonotonicTimestampNs::new(110_000_000));
+
+        assert_eq!(planner.commit_presented(prepared), 2);
+        assert_eq!(planner.scheduled_target(), None);
+        assert_eq!(planner.pre_render_abandoned(), 1);
     }
 
     #[test]

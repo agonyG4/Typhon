@@ -14,6 +14,63 @@ pub(in crate::compositor) struct ShutdownDmabufReleaseSet {
     obligations: Vec<DmabufReleaseObligation>,
 }
 
+fn select_callback_timing(
+    timings: impl IntoIterator<Item = FrameCallbackTimingEvidence>,
+) -> (Option<FrameCallbackTimingEvidence>, bool) {
+    let mut selected = None;
+    let mut selected_surface_id = None;
+    let mut ambiguous = false;
+    for timing in timings {
+        match selected_surface_id {
+            None => {
+                selected_surface_id = Some(timing.surface_id);
+                selected = Some(timing);
+            }
+            Some(surface_id) if surface_id == timing.surface_id => {
+                if selected.is_none_or(|current| timing.commit_ns > current.commit_ns) {
+                    selected = Some(timing);
+                }
+            }
+            Some(_) => ambiguous = true,
+        }
+    }
+    if ambiguous {
+        (None, true)
+    } else {
+        (selected, false)
+    }
+}
+
+#[cfg(test)]
+mod callback_attribution_tests {
+    use super::*;
+
+    fn timing(surface_id: u32, commit_ns: u64) -> FrameCallbackTimingEvidence {
+        FrameCallbackTimingEvidence {
+            surface_id,
+            commit_ns,
+            admission_ns: Some(commit_ns.saturating_sub(10)),
+            reaction_ns: Some(10),
+        }
+    }
+
+    #[test]
+    fn one_surface_uses_the_latest_commit_for_that_surface() {
+        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(7, 120)]);
+
+        assert_eq!(selected, Some(timing(7, 120)));
+        assert!(!ambiguous);
+    }
+
+    #[test]
+    fn multiple_surfaces_are_not_attributed_to_an_arbitrary_callback() {
+        let (selected, ambiguous) = select_callback_timing([timing(7, 100), timing(8, 120)]);
+
+        assert_eq!(selected, None);
+        assert!(ambiguous);
+    }
+}
+
 impl ShutdownDmabufReleaseSet {
     pub(in crate::compositor) fn push(&mut self, obligation: DmabufReleaseObligation) {
         if self
@@ -326,14 +383,20 @@ impl CompositorState {
         dmabuf_releases_to_complete_on_present.append(&mut self.pending_dmabuf_buffer_releases);
         let callbacks = self.take_visible_pending_frame_callbacks();
         let callback_count = callbacks.len();
-        let callback_timing = callbacks
-            .iter()
-            .filter_map(|callback| {
+        let (mut callback_timing, callback_timing_ambiguous) =
+            select_callback_timing(callbacks.iter().filter_map(|callback| {
                 self.pending_frame_callback_timing
                     .get(&callback.id())
                     .copied()
-            })
-            .max_by_key(|timing| (timing.commit_ns, timing.surface_id));
+            }));
+        if callback_timing_ambiguous {
+            callback_timing = None;
+            self.frame_callback_metrics
+                .content_callback_attribution_ambiguous = self
+                .frame_callback_metrics
+                .content_callback_attribution_ambiguous
+                .saturating_add(1);
+        }
         let callback_commit_ns = callback_timing.map(|timing| timing.commit_ns);
         if callback_count > 0 {
             self.frame_callback_metrics.callbacks_captured = self
@@ -388,6 +451,7 @@ impl CompositorState {
                 frame_id,
                 callbacks,
                 callback_timing,
+                callback_timing_ambiguous,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
                 callback_admission_ns: None,

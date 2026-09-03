@@ -8,9 +8,9 @@ use super::payload::{
 use super::queue::DequeuePause;
 use super::queue::{
     AttachablePrimary, AttachablePrimaryPhase, KmsWorkerFatalJob, KmsWorkerForcedShutdown,
-    KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerShutdownSnapshot, RESULT_EVENT_CAPACITY,
-    WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd,
-    notify_eventfd,
+    KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerQueuedCancellation, KmsWorkerShutdownSnapshot,
+    RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
+    drain_eventfd, notify_eventfd,
 };
 use super::{
     CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
@@ -186,6 +186,24 @@ impl KmsCommitWorkerHandle {
         &self,
     ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {
         self.shared.try_reserve()
+    }
+    pub(crate) fn cancel_queued_primary(
+        &self,
+        token: PageFlipToken,
+        transaction_id: OutputTransactionId,
+        output_generation: u64,
+        crtc_id: u32,
+        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+        frame_id: u64,
+    ) -> KmsWorkerQueuedCancellation {
+        self.shared.cancel_queued_primary(
+            token,
+            transaction_id,
+            output_generation,
+            crtc_id,
+            target,
+            frame_id,
+        )
     }
     pub(crate) fn event_fd(&self) -> i32 {
         self.shared.result_fd.as_raw_fd()

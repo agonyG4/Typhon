@@ -30,6 +30,7 @@ mod direct_rejection;
 #[allow(unused_imports)]
 pub(super) use direct_rejection::{WorkerRejectionKind, direct_rejection_policy};
 mod rejection;
+pub(super) use rejection::drop_queued_worker_job_with_reason_parts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FatalWorkerJobDisposition {

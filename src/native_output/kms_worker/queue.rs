@@ -217,6 +217,13 @@ pub(crate) enum KmsWorkerPhase {
     KernelInFlight,
 }
 
+#[derive(Debug)]
+pub(crate) enum KmsWorkerQueuedCancellation {
+    Cancelled(KmsCommitJob),
+    NotQueued { phase: KmsWorkerPhase },
+    IdentityMismatch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachablePrimaryPhase {
     Queued,
@@ -411,6 +418,57 @@ pub(crate) struct WorkerState {
 }
 
 impl WorkerShared {
+    pub(crate) fn cancel_queued_primary(
+        &self,
+        token: oblivion_one::native::kms::PageFlipToken,
+        transaction_id: crate::native_output::OutputTransactionId,
+        output_generation: u64,
+        crtc_id: u32,
+        target: PresentationTarget,
+        frame_id: u64,
+    ) -> KmsWorkerQueuedCancellation {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = state.queued.iter().position(|job| {
+            job.kind.is_primary()
+                && job.token == token
+                && job.transaction_id == transaction_id
+                && job.output_generation == output_generation
+                && job.crtc_id == crtc_id
+                && job.target == target
+                && job.primary_frame_id() == Some(frame_id)
+        }) {
+            let job = state.queued.remove(index).expect("queued job index exists");
+            drop(state);
+            self.work_wakeup.notify_one();
+            return KmsWorkerQueuedCancellation::Cancelled(job);
+        }
+        if state.queued.iter().any(|job| {
+            job.kind.is_primary()
+                && job.target == target
+                && job.output_generation == output_generation
+                && job.crtc_id == crtc_id
+        }) {
+            return KmsWorkerQueuedCancellation::IdentityMismatch;
+        }
+        if state.executing_bundle_identity.is_some_and(|identity| {
+            identity.token == token
+                && identity.primary_transaction_id == Some(transaction_id)
+                && identity.output_generation == output_generation
+                && identity.crtc_id == crtc_id
+        }) || state.inflight.as_ref().is_some_and(|inflight| {
+            inflight.transaction_id == transaction_id
+                && inflight.token == token
+                && inflight.output_generation == output_generation
+                && inflight.bundle.crtc_id == crtc_id
+        }) {
+            return KmsWorkerQueuedCancellation::NotQueued { phase: state.phase };
+        }
+        KmsWorkerQueuedCancellation::NotQueued { phase: state.phase }
+    }
+
     pub(crate) fn attachable_primary(
         &self,
         output_generation: u64,
@@ -1081,5 +1139,60 @@ pub(crate) fn drain_eventfd(fd: &OwnedFd) -> std::io::Result<()> {
             return Err(error);
         }
         return Err(std::io::Error::other("short eventfd read"));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::native_output::runtime::AtomicCommitKind;
+
+    fn composited_job(token: u64, frame_id: u64) -> KmsCommitJob {
+        let mut job = crate::native_output::kms_worker::tests::test_job(token);
+        job.kind = AtomicCommitKind::CompositedPrimary {
+            transaction_id: job.transaction_id,
+            frame_id,
+            framebuffer_id: 42,
+        };
+        job
+    }
+
+    #[test]
+    fn exact_queued_primary_cancellation_returns_job_and_restores_capacity() {
+        let shared = Arc::new(WorkerShared::new(create_eventfd().unwrap()));
+        let job = composited_job(901, 1901);
+        let token = job.token;
+        let transaction_id = job.transaction_id;
+        let target = job.target;
+        let permit = shared.try_reserve().unwrap();
+        permit.enqueue(job).unwrap();
+
+        let cancellation = shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 1901);
+        assert!(matches!(
+            cancellation,
+            KmsWorkerQueuedCancellation::Cancelled(_)
+        ));
+
+        let replacement = composited_job(902, 1902);
+        shared.try_reserve().unwrap().enqueue(replacement).unwrap();
+    }
+
+    #[test]
+    fn queued_primary_cancellation_rejects_wrong_identity_without_removing_owner() {
+        let shared = Arc::new(WorkerShared::new(create_eventfd().unwrap()));
+        let job = composited_job(903, 1903);
+        let token = job.token;
+        let transaction_id = job.transaction_id;
+        let target = job.target;
+        shared.try_reserve().unwrap().enqueue(job).unwrap();
+
+        assert!(matches!(
+            shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 9999),
+            KmsWorkerQueuedCancellation::IdentityMismatch
+        ));
+        assert!(matches!(
+            shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 1903),
+            KmsWorkerQueuedCancellation::Cancelled(_)
+        ));
     }
 }

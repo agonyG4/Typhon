@@ -237,6 +237,13 @@ impl KmsCommitJob {
             .unwrap_or(DrmContentType::Graphics)
     }
 
+    pub(crate) fn primary_frame_id(&self) -> Option<u64> {
+        match self.kind {
+            AtomicCommitKind::CompositedPrimary { frame_id, .. } => Some(frame_id),
+            AtomicCommitKind::DirectPrimary { .. } | AtomicCommitKind::PlaneDelta { .. } => None,
+        }
+    }
+
     pub(crate) fn identity(&self) -> KmsCommitBundleIdentity {
         KmsCommitBundleIdentity {
             id: self.bundle_id,

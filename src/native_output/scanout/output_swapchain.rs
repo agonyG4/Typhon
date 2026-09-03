@@ -245,6 +245,25 @@ pub(crate) struct QueuedOutputFrameIdentitySnapshot {
     pub(crate) token: PageFlipToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhysicalPrimaryClaimViolation {
+    GenerationMismatch,
+    Regression,
+    PrecedesPendingClaim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhysicalPrimaryClaimRevalidation {
+    Valid,
+    OvertakesReady {
+        owner: OutputFrameIdentitySnapshot,
+    },
+    OvertakesWorkerQueued {
+        owner: QueuedOutputFrameIdentitySnapshot,
+    },
+    Fatal(PhysicalPrimaryClaimViolation),
+}
+
 #[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
@@ -916,9 +935,15 @@ impl AtomicOutputSwapchain {
                 "fatal output quarantine cannot recover to normal operation",
             ));
         }
-        let Some(fence) = quarantine.timing_fence.as_ref() else {
-            return Ok(false);
-        };
+        if quarantine.timing_fence.is_none() {
+            return quarantine
+                .abandoned_frame
+                .as_ref()
+                .map_or(Ok(false), |frame| {
+                    frame.render_fence.is_signaled_nonblocking()
+                });
+        }
+        let fence = quarantine.timing_fence.as_ref().expect("checked above");
         let mut pollfd = libc::pollfd {
             fd: fence.as_raw_fd(),
             events: libc::POLLIN,
@@ -934,6 +959,32 @@ impl AtomicOutputSwapchain {
             ));
         }
         Ok(ready > 0 && pollfd.revents & libc::POLLIN != 0)
+    }
+
+    pub(crate) fn suspended_ready_fence_fd(&self) -> Option<RawFd> {
+        self.quarantine
+            .as_ref()
+            .filter(|quarantine| quarantine.reason == OutputQuarantineReason::SuspendAbandonment)
+            .and_then(|quarantine| {
+                quarantine
+                    .timing_fence
+                    .as_ref()
+                    .map(AsRawFd::as_raw_fd)
+                    .or_else(|| {
+                        quarantine
+                            .abandoned_frame
+                            .as_ref()
+                            .and_then(|frame| frame.render_fence.readiness_fd())
+                            .map(AsRawFd::as_raw_fd)
+                    })
+            })
+    }
+
+    pub(crate) fn has_suspended_ready_frame(&self) -> bool {
+        self.quarantine.as_ref().is_some_and(|quarantine| {
+            quarantine.reason == OutputQuarantineReason::SuspendAbandonment
+                && quarantine.abandoned_frame.is_some()
+        })
     }
 
     pub(crate) fn retire_pending_after_recovery(&mut self) -> Option<RenderedOutputFrame> {
@@ -1026,41 +1077,62 @@ impl AtomicOutputSwapchain {
         &mut self,
         claim: PrimaryRefreshClaim,
     ) -> io::Result<()> {
-        self.validate_physical_primary_presentation(claim)?;
-        self.last_presented_primary_claim = Some(claim);
-        Ok(())
+        match self.revalidate_physical_primary_presentation(claim) {
+            PhysicalPrimaryClaimRevalidation::Valid => {
+                self.last_presented_primary_claim = Some(claim);
+                Ok(())
+            }
+            PhysicalPrimaryClaimRevalidation::OvertakesReady { .. }
+            | PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued { .. } => Err(
+                io::Error::other("physical primary claim overtakes a future primary owner"),
+            ),
+            PhysicalPrimaryClaimRevalidation::Fatal(violation) => Err(io::Error::other(format!(
+                "physical primary claim violation: {violation:?}"
+            ))),
+        }
     }
 
-    pub(crate) fn validate_physical_primary_presentation(
+    pub(crate) fn revalidate_physical_primary_presentation(
         &self,
         claim: PrimaryRefreshClaim,
-    ) -> io::Result<()> {
+    ) -> PhysicalPrimaryClaimRevalidation {
         if claim.clock_generation != self.pool_generation {
-            return Err(io::Error::other(
-                "physical primary claim belongs to an old output generation",
-            ));
+            return PhysicalPrimaryClaimRevalidation::Fatal(
+                PhysicalPrimaryClaimViolation::GenerationMismatch,
+            );
         }
         if let Some(last_presented) = self.last_presented_primary_claim
             && !is_strictly_later_claim(last_presented, claim)
         {
-            return Err(io::Error::other(
-                "physical primary pageflip did not advance the physical claim frontier",
-            ));
+            return PhysicalPrimaryClaimRevalidation::Fatal(
+                PhysicalPrimaryClaimViolation::Regression,
+            );
         }
         if let Some(pending) = &self.pending
             && !is_at_or_after_claim(claim, pending.frame.target.physical_claim())
         {
-            return Err(io::Error::other(
-                "physical primary pageflip preceded its reserved physical claim",
-            ));
+            return PhysicalPrimaryClaimRevalidation::Fatal(
+                PhysicalPrimaryClaimViolation::PrecedesPendingClaim,
+            );
         }
         if let Some(worker) = &self.worker_queued {
-            validate_strictly_later_claim(claim, worker.frame.target.physical_claim())?;
+            if !is_strictly_later_claim(worker.frame.target.physical_claim(), claim) {
+                return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
+                    owner: QueuedOutputFrameIdentitySnapshot {
+                        frame: (&worker.frame).into(),
+                        token: worker.token,
+                    },
+                };
+            }
         }
         if let Some(ready) = &self.ready {
-            validate_strictly_later_claim(claim, ready.target.physical_claim())?;
+            if !is_strictly_later_claim(ready.target.physical_claim(), claim) {
+                return PhysicalPrimaryClaimRevalidation::OvertakesReady {
+                    owner: (&*ready).into(),
+                };
+            }
         }
-        Ok(())
+        PhysicalPrimaryClaimRevalidation::Valid
     }
 
     pub(crate) const fn last_presented_primary_claim(&self) -> Option<PrimaryRefreshClaim> {
@@ -1644,6 +1716,47 @@ mod tests {
     }
 
     #[test]
+    fn physical_claim_revalidation_classifies_fatal_frontier_violations() {
+        let claim = PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            clock_generation: 1,
+        };
+        let (mut swapchain, predecessor_token) = swapchain_with_submitted_claim(claim);
+
+        assert_eq!(
+            swapchain.revalidate_physical_primary_presentation(PrimaryRefreshClaim {
+                clock_generation: 2,
+                ..claim
+            }),
+            PhysicalPrimaryClaimRevalidation::Fatal(
+                PhysicalPrimaryClaimViolation::GenerationMismatch
+            )
+        );
+        assert_eq!(
+            swapchain.revalidate_physical_primary_presentation(PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(10),
+                ..claim
+            }),
+            PhysicalPrimaryClaimRevalidation::Fatal(
+                PhysicalPrimaryClaimViolation::PrecedesPendingClaim
+            )
+        );
+
+        swapchain
+            .complete_pageflip(predecessor_token, 1)
+            .expect("predecessor pageflip");
+        swapchain
+            .note_physical_primary_presentation(claim)
+            .expect("first physical claim");
+        assert_eq!(
+            swapchain.revalidate_physical_primary_presentation(claim),
+            PhysicalPrimaryClaimRevalidation::Fatal(PhysicalPrimaryClaimViolation::Regression)
+        );
+    }
+
+    #[test]
     fn physical_predecessor_miss_revalidates_ready_without_mutating_its_claim() {
         let slots = OutputSlotSet::new([
             OutputSlotId::new(0).expect("slot 0"),
@@ -1688,14 +1801,17 @@ mod tests {
             .complete_pageflip(predecessor_token, 1)
             .expect("predecessor pageflip");
 
-        let error = swapchain
-            .note_physical_primary_presentation(PrimaryRefreshClaim {
-                sequence: 3,
-                presentation_time: MonotonicTimestampNs::new(30),
-                clock_generation: 1,
-            })
-            .expect_err("successor claim is overtaken by the physical miss");
-        assert!(error.to_string().contains("physical claim"));
+        let result = swapchain.revalidate_physical_primary_presentation(PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        });
+        assert_eq!(
+            result,
+            PhysicalPrimaryClaimRevalidation::OvertakesReady {
+                owner: ready_before_miss
+            }
+        );
         assert_eq!(swapchain.ready_identity(), Some(ready_before_miss));
     }
 
@@ -1744,14 +1860,17 @@ mod tests {
             .expect("successor worker queued");
         let worker_before_miss = swapchain.worker_queued_identity().expect("worker identity");
 
-        let error = swapchain
-            .note_physical_primary_presentation(PrimaryRefreshClaim {
-                sequence: 3,
-                presentation_time: MonotonicTimestampNs::new(30),
-                clock_generation: 1,
-            })
-            .expect_err("worker successor claim collides with the physical miss");
-        assert!(error.to_string().contains("physical claim"));
+        let result = swapchain.revalidate_physical_primary_presentation(PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(30),
+            clock_generation: 1,
+        });
+        assert_eq!(
+            result,
+            PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
+                owner: worker_before_miss
+            }
+        );
         assert_eq!(swapchain.worker_queued_identity(), Some(worker_before_miss));
     }
 

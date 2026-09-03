@@ -1119,6 +1119,7 @@ impl CompositorState {
         reason: SurfaceTeardownReason,
     ) {
         self.remove_keyboard_shortcut_inhibitors_for_surface(surface_id);
+        self.surface_frame_clock.remove(&surface_id);
         if reason != SurfaceTeardownReason::ClientDisconnected {
             self.discard_frame_callbacks_for_surface(surface_id);
         }
