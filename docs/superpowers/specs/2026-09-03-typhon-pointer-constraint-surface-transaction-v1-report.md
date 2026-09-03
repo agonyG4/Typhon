@@ -18,6 +18,13 @@ The three reviewed defects are closed without changing the transition timing
 model, input thread model, scheduler, motion values, timestamps, or native
 acceleration behavior.
 
+The closure commits are:
+
+- `66c4477` — deterministic RED regressions and test seams;
+- `62bd409` — lifecycle, captured-identity, cancellation, and report closure.
+
+They build on the accepted prior commits `23a2d3e`, `45e9371`, and `72eaf2e`.
+
 The previous defects were:
 
 - resource death prematurely invalidated current effective routing;
