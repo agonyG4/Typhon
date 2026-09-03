@@ -245,8 +245,8 @@ and equal-distance ordering cases. The algebra suite covers defaults/custom
 constraint and input regions, union, ordered subtract, overlap and disjoint
 sets, clipping at negative and extreme i32 coordinates, holes, islands,
 empty results, deterministic rectangle ordering, and constant operation work
-at 40×30, 1920×929, and 7680×4320. The focused region suite is GREEN with 7
-tests.
+at 40×30, 1920×929, and 7680×4320. The original v1 focused region suite was
+GREEN with 7 tests; the v1.1 closure below adds the canonical-history tests.
 
 Real Wayland-resource coverage is also GREEN and retains the v1.1 regressions:
 
@@ -263,9 +263,9 @@ Real Wayland-resource coverage is also GREEN and retains the v1.1 regressions:
 - synchronized/delayed commit ownership and the Sober-shaped 1920×929
   default region.
 
-The real confined-pointer subset passed 5 tests, the pointer-constraint
-transaction subset passed 7 tests, and the full test command passed 3,290
-tests with 5 ignored. Existing active-confined-region updates use the same
+At the v1 closure revision, the real confined-pointer subset passed 5 tests,
+the pointer-constraint transaction subset passed 7 tests, and the full test
+command passed 3,290 tests with 5 ignored. Existing active-confined-region updates use the same
 algebraic resolver, while activation carries optional resolver timing through
 the existing native request/action/evidence path.
 
@@ -308,6 +308,114 @@ This task does not alter pointer motion semantics, Native Input Semantic Epoch s
 The current verification host is Linux; no Windows build or Windows-specific
 availability claim was made. Native Linux manual qualification against the
 physical input backend, including the Sober/Roblox scenario, was not run.
+This task does not claim the Sober/Roblox camera jump is fixed until native post-change qualification confirms it.
+
+## Region-algebra v1.1 canonical geometry and locked timing closure
+
+This v1.1 follow-up started from the clean v1 closure revision
+`8e24c60b03b214e57b61f12abce53009cf390a3e` and preserves the accepted
+constraint transaction and native settlement architecture.
+
+### Defect A: fragmentation-dependent behavior
+
+The review defect was that the v1 algebra preserved geometric membership but
+could preserve artificial rectangle fragmentation. The minimal reproduction
+was:
+
+```text
+Add(0, 0, 2, 1)
+Add(0, 1, 2, 4)
+```
+
+compared with `Add(0, 0, 2, 5)`. The two sets are identical, but the old
+fragmented `OutputRegion` made `OutputRect::closest_point()` observe separate
+integer-edge clamps at the fractional probe `(0.0, 0.5)`. Deterministic
+sorting could only make that wrong decomposition repeatable; it could not
+make equivalent geometry behaviorally equivalent.
+
+The resolver now canonicalizes from the geometric set after ordered algebra
+and intersection. It collects unique rectangle y-edges, derives merged x
+intervals for each vertical band, then merges vertically adjacent bands with
+identical intervals before constructing `OutputRegion`. The work and storage
+depend on rectangle/edge complexity, not physical surface rows or pixels.
+
+> Pointer-constraint effective geometry is canonicalized from the geometric set, not from wl_region operation history.
+
+Equivalent adjacent-add histories and equivalent hole histories now produce
+the same canonical rectangles and `closest_point()` results across integer,
+fractional, outside, between-island, and equal-distance probes. Separate
+islands remain disconnected and holes remain absent. The cfg(test) raster
+oracle continues to prove membership, clipping, and ordered set semantics;
+its incidental row decomposition is not treated as canonical output identity.
+The default constraint plus default input on a 1920×929 surface remains one
+rectangle with the one-rectangle fast path.
+
+### Defect B: locked resolver timing ownership
+
+The locked settlement path previously called the untimed region resolver, so
+`LockedActivated` evidence could report unknown resolver timing even though
+late-bound activation had just resolved the effective region and anchor. The
+internal `ResolvedPointerConstraintBackendRequest` now carries the unchanged
+semantic `ActivateLocked { id }` request, its late-bound anchor, and timing
+metadata from that exact resolution. The native settlement loop passes this
+metadata into the same selected `NativePointerTransitionEvidence` that owns
+`LockedActivated(id)`. Confined activation retains its existing action timing;
+deactivation remains unknown unless that exact action resolves a region.
+
+The locked regression uses wall `37ns` and thread CPU `19ns`, verifies both
+fields on `LockedActivated(A)`, and verifies that a later `ActivateLocked(B)`
+cannot attach to a preceding `Deactivate(A)` evidence record. Resolver clocks
+remain gated by `TYPHON_POINTER_TIMING_TRACE`; disabled tracing does not add
+timing clocks, formatting, timing-only allocations, or operation counters.
+
+> Locked pointer region-resolution timing is attached to the exact LockedActivated transition that consumed that resolution.
+
+### v1.1 verification
+
+Focused suites run through `rtk`:
+
+```text
+pointer_constraint_region::tests                 GREEN: 10 passed
+pointer_constraint_transaction                   GREEN: 7 passed
+confined_pointer                                 GREEN: 5 passed
+pointer_lock_warp                                GREEN: 1 passed
+native_pointer_constraint_backend                GREEN: 12 passed
+routing_transition_tests                          GREEN: 7 passed
+pointer_timing::tests                             GREEN: 17 passed
+epoch::tests                                      GREEN: 1 passed
+cycle_dispatch::tests                             GREEN: 16 passed
+relative_and_constraints                          GREEN: 38 passed
+```
+
+Required repository commands on the current Linux host:
+
+```text
+rtk cargo fmt --check                                  BLOCKED: unrelated
+                                                         import-order drift in
+                                                         src/native_output/tests/input.rs
+rtk cargo check --locked --all-targets                 GREEN
+rtk cargo clippy --locked --all-targets -- -D warnings GREEN
+rtk cargo test --locked                                GREEN: 3294 passed,
+                                                         5 ignored, 40 filtered
+                                                         out of 30 suites
+rtk git diff --check                                   GREEN
+```
+
+An earlier full-test run transiently observed the unrelated
+`native::event_loop::tests::xwayland_retiring_registration_tolerates_closed_fd_and_counts_it`
+failure at `src/native/event_loop.rs:1486` (`left: 0`, `right: 1`); the final
+exact rerun passed and the event-loop source was not modified. No Linux
+dependency or target blocker (`wayland-server`, `libudev`, DRM, pkg-config,
+or the Linux target) occurred. The current host is Linux, so no Windows build
+result is claimed, and manual physical-input/native Sober qualification was
+not run.
+
+The production audit confirms no area rasterization, per-row materialization,
+or input-region mutex acquisition inside the geometry loop, and the locked
+settlement path uses the timed resolver. No NativeInputEpoch, motion,
+acceleration, scheduling, readiness, cursor-restoration, or lifecycle
+semantics were changed.
+
 This task does not claim the Sober/Roblox camera jump is fixed until native post-change qualification confirms it.
 
 ## Non-claims
