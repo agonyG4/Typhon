@@ -331,15 +331,33 @@ mod window_geometry_tests {
     #[test]
     fn install_then_remove_before_publication_collapses_without_activation() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
-        cached.pointer_constraint_state.lifecycle = PointerConstraintLifecycleCommit::Install(22);
+        cached.pointer_constraint_state = pointer_state(
+            PointerConstraintLifecycleCommit::Install(22),
+            PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
+                InputRegionOp::Add(InputRegionRect::new(11, 12, 13, 14).unwrap()),
+            ])),
+            PointerConstraintHintCommit::Set((15.0, 16.0)),
+        );
         let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
-        newer.pointer_constraint_state.lifecycle = PointerConstraintLifecycleCommit::Remove(22);
+        newer.pointer_constraint_state = pointer_state(
+            PointerConstraintLifecycleCommit::Remove(22),
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::NoChange,
+        );
 
         cached.merge(newer);
 
         assert_eq!(
             cached.pointer_constraint_state.lifecycle,
             PointerConstraintLifecycleCommit::NoChange
+        );
+        assert_eq!(
+            cached.pointer_constraint_state.region,
+            PointerConstraintRegionCommit::NoChange
+        );
+        assert_eq!(
+            cached.pointer_constraint_state.cursor_position_hint,
+            PointerConstraintHintCommit::NoChange
         );
     }
 

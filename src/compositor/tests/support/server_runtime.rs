@@ -175,6 +175,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         Sender<(bool, Vec<PointerConstraintBackendRequest>)>,
     ),
     CapturePointerConstraintIds(Sender<Vec<u64>>),
+    CapturePointerConstraintSnapshot {
+        constraint_id: u64,
+        reply: Sender<Option<PointerConstraintSurfaceSnapshot>>,
+    },
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
     CaptureActiveLockedPointerAnchor(Sender<Option<(f64, f64)>>),
@@ -294,6 +298,13 @@ pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
     pub(in crate::compositor::tests) buffer_size: BufferSize,
     pub(in crate::compositor::tests) output_size: BufferSize,
     pub(in crate::compositor::tests) viewport_identity_metadata_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::compositor::tests) struct PointerConstraintSurfaceSnapshot {
+    pub(in crate::compositor::tests) committed: bool,
+    pub(in crate::compositor::tests) committed_region: SurfaceInputRegion,
+    pub(in crate::compositor::tests) committed_cursor_position_hint: Option<(f64, f64)>,
 }
 
 pub(in crate::compositor::tests) fn spawn_controllable_test_server(
@@ -799,6 +810,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePointerConstraintIds(reply) => {
                         let ids = server.state.pointer_constraints.keys().copied().collect();
                         let _ = reply.send(ids);
+                    }
+                    ServerCommand::CapturePointerConstraintSnapshot {
+                        constraint_id,
+                        reply,
+                    } => {
+                        let snapshot = server
+                            .state
+                            .pointer_constraints
+                            .get(&constraint_id)
+                            .map(|constraint| PointerConstraintSurfaceSnapshot {
+                                committed: constraint.committed,
+                                committed_region: constraint.committed_region.clone(),
+                                committed_cursor_position_hint: constraint
+                                    .committed_cursor_position_hint,
+                            });
+                        let _ = reply.send(snapshot);
                     }
                     ServerCommand::CaptureLastPointerPosition(reply) => {
                         let _ =

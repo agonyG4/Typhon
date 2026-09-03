@@ -341,6 +341,20 @@ pub(in crate::compositor::tests) fn capture_pointer_constraint_backend_requests(
     receiver.recv().unwrap()
 }
 
+pub(in crate::compositor::tests) fn capture_pointer_constraint_snapshot(
+    commands: &Sender<ServerCommand>,
+    constraint_id: u64,
+) -> Option<PointerConstraintSurfaceSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerConstraintSnapshot {
+            constraint_id,
+            reply,
+        })
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
 pub(in crate::compositor::tests) fn capture_pending_locked_pointer_reveal(
     commands: &Sender<ServerCommand>,
 ) -> bool {
