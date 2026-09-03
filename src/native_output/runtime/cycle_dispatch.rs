@@ -909,18 +909,20 @@ impl NativeRuntime {
             .then(capture_timing_point)
             .transpose()?;
         let mut redraw_requested = initial_settlement.redraw_requested;
-        let mut routing_transition = initial_settlement.routing_transition;
-        if timing_enabled && let Some(transition) = routing_transition {
+        let initial_transition_evidence = initial_settlement.selected_transition;
+        let mut routing_transition =
+            initial_transition_evidence.map(|evidence| evidence.transition);
+        if timing_enabled && let Some(evidence) = initial_transition_evidence {
             pointer_timing.record_routing_transition_committed_with_pre_read_timed(
-                timing_transition(transition),
+                timing_transition(evidence.transition),
                 capture_timing_point()?,
                 NativePointerPreReadObservation {
                     constraint_settlement_start: initial_settlement_start,
                     constraint_settlement_end: initial_settlement_end,
-                    constraint_activation_start: initial_settlement.timing.activation_start,
-                    constraint_activation_end: initial_settlement.timing.activation_end,
-                    wayland_flush_start: initial_settlement.timing.wayland_flush_start,
-                    wayland_flush_end: initial_settlement.timing.wayland_flush_end,
+                    constraint_activation_start: evidence.action_timing.activation_start,
+                    constraint_activation_end: evidence.action_timing.activation_end,
+                    wayland_flush_start: evidence.action_timing.wayland_flush_start,
+                    wayland_flush_end: evidence.action_timing.wayland_flush_end,
                     ..Default::default()
                 },
             );
@@ -1343,18 +1345,27 @@ impl NativeRuntime {
             .transpose()?;
         pre_read_observation.constraint_settlement_start = final_settlement_start;
         pre_read_observation.constraint_settlement_end = final_settlement_end;
-        pre_read_observation.constraint_activation_start = final_settlement.timing.activation_start;
-        pre_read_observation.constraint_activation_end = final_settlement.timing.activation_end;
-        pre_read_observation.wayland_flush_start = final_settlement.timing.wayland_flush_start;
-        pre_read_observation.wayland_flush_end = final_settlement.timing.wayland_flush_end;
+        let final_transition_evidence = final_settlement.selected_transition;
+        if let Some(evidence) = final_transition_evidence {
+            pre_read_observation.constraint_activation_start =
+                evidence.action_timing.activation_start;
+            pre_read_observation.constraint_activation_end = evidence.action_timing.activation_end;
+            pre_read_observation.wayland_flush_start = evidence.action_timing.wayland_flush_start;
+            pre_read_observation.wayland_flush_end = evidence.action_timing.wayland_flush_end;
+        } else {
+            pre_read_observation.constraint_activation_start = None;
+            pre_read_observation.constraint_activation_end = None;
+            pre_read_observation.wayland_flush_start = None;
+            pre_read_observation.wayland_flush_end = None;
+        }
         redraw_requested |= final_settlement.redraw_requested;
         if routing_transition.is_none() {
-            routing_transition = final_settlement.routing_transition;
+            routing_transition = final_transition_evidence.map(|evidence| evidence.transition);
         }
-        if timing_enabled && let Some(transition) = final_settlement.routing_transition {
+        if timing_enabled && let Some(evidence) = final_transition_evidence {
             let committed_at = capture_timing_point()?;
             pointer_timing.record_routing_transition_committed_with_pre_read_timed(
-                timing_transition(transition),
+                timing_transition(evidence.transition),
                 committed_at,
                 pre_read_observation,
             );

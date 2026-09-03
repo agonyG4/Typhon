@@ -1442,8 +1442,8 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     timing_enabled: bool,
 ) -> NativeResult<NativePointerConstraintSettlementOutcome> {
     let mut redraw_requested = false;
-    let mut routing_transition = None;
-    let mut timing = NativePointerConstraintSettlementTiming::default();
+    let mut selected_transition = None;
+    let mut settlement_timing = NativePointerConstraintSettlementTiming::default();
     loop {
         let requests = server.take_pointer_constraint_backend_requests();
         if requests.is_empty() {
@@ -1481,6 +1481,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             });
             let action = backend.handle_resolved_request(request, cursor_position, locked_anchor);
             let action_transition = native_pointer_routing_transition(&action);
+            let mut action_timing = NativePointerConstraintActionTiming::default();
             if let Some((id, reason)) = action.failed {
                 native_pointer_debug_log_lazy(|| {
                     format!(
@@ -1522,11 +1523,14 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 let flush_start = timing_enabled.then(capture_timing_point).transpose()?;
                 let _ = server.flush_wayland_clients();
                 let flush_end = timing_enabled.then(capture_timing_point).transpose()?;
-                if timing.activation_start.is_none() {
-                    timing.activation_start = activation_start;
-                    timing.activation_end = activation_end;
-                    timing.wayland_flush_start = flush_start;
-                    timing.wayland_flush_end = flush_end;
+                action_timing = NativePointerConstraintActionTiming {
+                    activation_start,
+                    activation_end,
+                    wayland_flush_start: flush_start,
+                    wayland_flush_end: flush_end,
+                };
+                if settlement_timing.activation_start.is_none() {
+                    settlement_timing = action_timing;
                 }
             }
             if let Some(restore_position) = action.restore_position {
@@ -1553,8 +1557,12 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 });
                 server.pointer_constraint_backend_deactivated(id);
             }
-            if routing_transition.is_none() {
-                routing_transition = action_transition;
+            if let Some(transition) = action_transition {
+                select_pointer_transition_evidence(
+                    &mut selected_transition,
+                    transition,
+                    action_timing,
+                );
             }
             if let Some(visible) = action.cursor_visibility_changed {
                 native_pointer_debug_log_lazy(|| {
@@ -1570,9 +1578,22 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     input_state.pointer_constraint = backend.active_constraint_state();
     Ok(NativePointerConstraintSettlementOutcome {
         redraw_requested,
-        routing_transition,
-        timing,
+        selected_transition,
+        settlement_timing,
     })
+}
+
+fn select_pointer_transition_evidence(
+    selected: &mut Option<NativePointerTransitionEvidence>,
+    transition: NativeInputRoutingTransition,
+    action_timing: NativePointerConstraintActionTiming,
+) {
+    if selected.is_none() {
+        *selected = Some(NativePointerTransitionEvidence {
+            transition,
+            action_timing,
+        });
+    }
 }
 
 fn native_pointer_routing_transition(
@@ -1609,20 +1630,28 @@ pub(crate) enum NativeInputRoutingTransition {
     ConfinedDeactivated(PointerConstraintBackendId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativePointerTransitionEvidence {
+    pub(crate) transition: NativeInputRoutingTransition,
+    pub(crate) action_timing: NativePointerConstraintActionTiming,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct NativePointerConstraintSettlementOutcome {
     pub(crate) redraw_requested: bool,
-    pub(crate) routing_transition: Option<NativeInputRoutingTransition>,
-    pub(crate) timing: NativePointerConstraintSettlementTiming,
+    pub(crate) selected_transition: Option<NativePointerTransitionEvidence>,
+    pub(crate) settlement_timing: NativePointerConstraintSettlementTiming,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct NativePointerConstraintSettlementTiming {
+pub(crate) struct NativePointerConstraintActionTiming {
     pub(crate) activation_start: Option<NativePointerTimingPoint>,
     pub(crate) activation_end: Option<NativePointerTimingPoint>,
     pub(crate) wayland_flush_start: Option<NativePointerTimingPoint>,
     pub(crate) wayland_flush_end: Option<NativePointerTimingPoint>,
 }
+
+pub(crate) type NativePointerConstraintSettlementTiming = NativePointerConstraintActionTiming;
 
 pub(crate) fn pointer_constraint_activation_request_id(
     request: &PointerConstraintBackendRequest,
@@ -1797,6 +1826,58 @@ mod routing_transition_tests {
             constraint_id,
             generation,
         }
+    }
+
+    fn timing(wall_ns: u64, thread_cpu_ns: u64) -> NativePointerConstraintActionTiming {
+        NativePointerConstraintActionTiming {
+            activation_start: Some(NativePointerTimingPoint {
+                wall_ns,
+                thread_cpu_ns: Some(thread_cpu_ns),
+            }),
+            activation_end: Some(NativePointerTimingPoint {
+                wall_ns: wall_ns + 1,
+                thread_cpu_ns: Some(thread_cpu_ns + 1),
+            }),
+            wayland_flush_start: Some(NativePointerTimingPoint {
+                wall_ns: wall_ns + 2,
+                thread_cpu_ns: Some(thread_cpu_ns + 2),
+            }),
+            wayland_flush_end: Some(NativePointerTimingPoint {
+                wall_ns: wall_ns + 3,
+                thread_cpu_ns: Some(thread_cpu_ns + 3),
+            }),
+        }
+    }
+
+    #[test]
+    fn deactivation_a_does_not_receive_activation_b_timing() {
+        let transition_a = NativeInputRoutingTransition::LockedDeactivated(id(22, 4));
+        let transition_b = NativeInputRoutingTransition::LockedActivated(id(23, 5));
+        let timing_a = NativePointerConstraintActionTiming::default();
+        let timing_b = timing(200, 20);
+        let mut selected = None;
+
+        select_pointer_transition_evidence(&mut selected, transition_a, timing_a);
+        select_pointer_transition_evidence(&mut selected, transition_b, timing_b);
+
+        assert_eq!(
+            selected,
+            Some(NativePointerTransitionEvidence {
+                transition: transition_a,
+                action_timing: timing_a,
+            })
+        );
+    }
+
+    #[test]
+    fn selected_activation_keeps_wall_and_thread_cpu_timing_from_same_action() {
+        let transition = NativeInputRoutingTransition::LockedActivated(id(22, 4));
+        let action_timing = timing(200, 20);
+        let mut selected = None;
+
+        select_pointer_transition_evidence(&mut selected, transition, action_timing);
+
+        assert_eq!(selected.unwrap().action_timing, action_timing);
     }
 
     #[test]
