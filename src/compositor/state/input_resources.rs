@@ -1,6 +1,32 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn ensure_keyboard_state(&mut self) {
+        if self.keyboard_state.is_none() {
+            self.keyboard_state = XkbKeyboardState::from_environment();
+            if self.keyboard_state.is_none() {
+                eprintln!("oblivion-one compositor: no usable libxkbcommon keyboard configuration");
+            }
+        }
+    }
+
+    fn keyboard_serialized_state(&self) -> KeyboardSerializedState {
+        self.keyboard_state
+            .as_ref()
+            .map(XkbKeyboardState::serialized_state)
+            .unwrap_or_default()
+    }
+
+    pub(in crate::compositor) fn send_keyboard_initial_state(
+        &mut self,
+        keyboard: &wl_keyboard::WlKeyboard,
+    ) {
+        self.ensure_keyboard_state();
+        if let Some(state) = self.keyboard_state.as_ref() {
+            state.send_initial_state(keyboard);
+        }
+    }
+
     pub(in crate::compositor) fn clear_pointer_button_state_for_removed_surfaces(
         &mut self,
         removed_surface_ids: &[u32],
@@ -293,7 +319,11 @@ impl CompositorState {
         } else {
             self.pressed_keys.remove(&key);
         }
-        let modifiers_changed = self.keyboard_modifiers.update_key(key, pressed);
+        self.ensure_keyboard_state();
+        let modifiers_changed = self
+            .keyboard_state
+            .as_mut()
+            .is_some_and(|state| state.update_key(key, pressed));
         let Some(surface) = self.focused_surface.clone() else {
             return;
         };
@@ -306,6 +336,7 @@ impl CompositorState {
 
         self.ensure_keyboard_focus(&surface);
 
+        let serialized_state = self.keyboard_serialized_state();
         let serial = self.next_configure_serial();
         self.remember_input_serial(
             serial,
@@ -325,7 +356,7 @@ impl CompositorState {
             });
         }
         if modifiers_changed {
-            self.send_keyboard_modifiers(&surface, serial);
+            self.send_keyboard_modifiers(&surface, serial, serialized_state);
         }
     }
 
@@ -371,6 +402,7 @@ impl CompositorState {
             }
         }
 
+        let serialized_state = self.keyboard_serialized_state();
         let serial = self.next_configure_serial();
         for keyboard in keyboards {
             let _ = keyboard.send_event(wl_keyboard::Event::Enter {
@@ -384,10 +416,10 @@ impl CompositorState {
             });
             let _ = keyboard.send_event(wl_keyboard::Event::Modifiers {
                 serial,
-                mods_depressed: self.keyboard_modifiers.mods_depressed(),
-                mods_latched: 0,
-                mods_locked: self.keyboard_modifiers.mods_locked(),
-                group: 0,
+                mods_depressed: serialized_state.depressed,
+                mods_latched: serialized_state.latched,
+                mods_locked: serialized_state.locked,
+                group: serialized_state.group,
             });
         }
         pointer_debug_log(format!(
@@ -403,6 +435,7 @@ impl CompositorState {
         &mut self,
         surface: &wl_surface::WlSurface,
         serial: u32,
+        serialized_state: KeyboardSerializedState,
     ) {
         self.keyboard_resources.retain(Resource::is_alive);
         for keyboard in self
@@ -412,10 +445,10 @@ impl CompositorState {
         {
             let _ = keyboard.send_event(wl_keyboard::Event::Modifiers {
                 serial,
-                mods_depressed: self.keyboard_modifiers.mods_depressed(),
-                mods_latched: 0,
-                mods_locked: self.keyboard_modifiers.mods_locked(),
-                group: 0,
+                mods_depressed: serialized_state.depressed,
+                mods_latched: serialized_state.latched,
+                mods_locked: serialized_state.locked,
+                group: serialized_state.group,
             });
         }
     }

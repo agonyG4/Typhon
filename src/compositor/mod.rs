@@ -83,6 +83,7 @@ pub mod gpu_protocol_capabilities;
 mod idle;
 mod input;
 mod interaction;
+mod keyboard;
 mod layer_shell;
 mod output;
 mod pacing;
@@ -202,9 +203,8 @@ pub use fullscreen::{
 };
 pub use idle::{IdleManager, IdleState};
 use input::{
-    InputSerial, InputSerialKind, KeyboardModifierState, PointerConstraintLifetime,
-    send_keyboard_initial_state, send_pointer_frame_if_supported, wayland_event_time,
-    wayland_event_time_from_usec,
+    InputSerial, InputSerialKind, PointerConstraintLifetime, send_pointer_frame_if_supported,
+    wayland_event_time, wayland_event_time_from_usec,
 };
 pub use input::{
     OutputPosition, OutputRect, OutputRegion, PointerAxisComponent, PointerAxisFrame,
@@ -227,6 +227,7 @@ pub use interaction::{
     WindowInteractionKind, WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
     WindowInteractionReleaseMetrics,
 };
+use keyboard::{KeyboardSerializedState, XkbKeyboardState};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -605,7 +606,7 @@ pub struct CompositorState {
     focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
     shortcut_inhibition: ShortcutInhibitionRegistry,
-    keyboard_modifiers: KeyboardModifierState,
+    keyboard_state: Option<XkbKeyboardState>,
     pressed_keys: HashSet<u32>,
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,

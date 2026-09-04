@@ -33,7 +33,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for CompositorState {
             }
             wl_seat::Request::GetKeyboard { id } => {
                 let keyboard = data_init.init(id, ());
-                send_keyboard_initial_state(&keyboard);
+                state.send_keyboard_initial_state(&keyboard);
                 state.register_keyboard(keyboard);
             }
             wl_seat::Request::GetTouch { .. } => {
