@@ -1142,6 +1142,50 @@ fn visible_cursor_state_uses_hotspot_subtraction_and_normal_geometry() {
 }
 
 #[test]
+fn cursor_plane_assignment_describes_the_exact_atomic_geometry() {
+    let pipeline = pipeline_with_cursor();
+    let assignment = cursor_plane_assignment(&pipeline, Some(&visible_cursor())).unwrap();
+
+    assert_eq!(
+        assignment,
+        AtomicCursorPlaneAssignment::Enabled {
+            plane_id: 4,
+            framebuffer_id: 99,
+            crtc_id: 2,
+            src_x: 0,
+            src_y: 0,
+            src_w: 64 << 16,
+            src_h: 64 << 16,
+            crtc_x: 20,
+            crtc_y: 33,
+            crtc_w: 64,
+            crtc_h: 64,
+            hotspot_x: 5,
+            hotspot_y: 7,
+            width: 64,
+            height: 64,
+            image_generation: 3,
+            rotation: None,
+            alpha: None,
+            pixel_blend_mode: None,
+        }
+    );
+}
+
+#[test]
+fn cursor_plane_assignment_preserves_disable_and_unavailable_semantics() {
+    assert_eq!(
+        cursor_plane_assignment(&pipeline_with_cursor(), None).unwrap(),
+        AtomicCursorPlaneAssignment::Disabled { plane_id: 4 }
+    );
+    assert_eq!(
+        cursor_plane_assignment(&explicit_fence_pipeline(), None).unwrap(),
+        AtomicCursorPlaneAssignment::Unavailable
+    );
+    assert!(cursor_plane_assignment(&explicit_fence_pipeline(), Some(&visible_cursor())).is_err());
+}
+
+#[test]
 fn cursor_plane_discovers_alpha_maximum() {
     assert_eq!(cursor_properties_with_blend().alpha_maximum, Some(65_535));
 }

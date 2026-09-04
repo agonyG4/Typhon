@@ -667,6 +667,35 @@ pub struct AtomicPipelineProperties {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicCursorPlaneAssignment {
+    Unavailable,
+    Disabled {
+        plane_id: u32,
+    },
+    Enabled {
+        plane_id: u32,
+        framebuffer_id: u32,
+        crtc_id: u32,
+        src_x: u64,
+        src_y: u64,
+        src_w: u64,
+        src_h: u64,
+        crtc_x: u64,
+        crtc_y: u64,
+        crtc_w: u64,
+        crtc_h: u64,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        width: u32,
+        height: u32,
+        image_generation: u64,
+        rotation: Option<(PlanePropertyId, u64)>,
+        alpha: Option<(PlanePropertyId, u64)>,
+        pixel_blend_mode: Option<(PlanePropertyId, u64)>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AtomicCursorPlaneSnapshot {
     pub fb_id: u64,
     pub crtc_id: u64,
@@ -779,11 +808,10 @@ fn append_cursor_plane_snapshot(
     Ok(())
 }
 
-pub fn append_cursor_plane_state(
-    request: &mut AtomicRequest,
+pub fn cursor_plane_assignment(
     pipeline: &AtomicPipelineProperties,
     cursor: Option<&AtomicCursorVisualState>,
-) -> Result<(), AtomicKmsError> {
+) -> Result<AtomicCursorPlaneAssignment, AtomicKmsError> {
     let Some(cursor_plane) = pipeline.cursor_plane.as_ref() else {
         if cursor.is_some_and(|cursor| cursor.visible) {
             return Err(AtomicKmsError::new(
@@ -791,14 +819,12 @@ pub fn append_cursor_plane_state(
                 "visible Atomic cursor requested without a compatible cursor plane",
             ));
         }
-        return Ok(());
+        return Ok(AtomicCursorPlaneAssignment::Unavailable);
     };
-    let plane = cursor_plane.plane_id();
-    let props = &cursor_plane.property_ids;
     let Some(cursor) = cursor.filter(|cursor| cursor.visible) else {
-        request.set_cursor_plane(plane, props.fb_id, 0)?;
-        request.set_cursor_plane(plane, props.crtc_id, 0)?;
-        return Ok(());
+        return Ok(AtomicCursorPlaneAssignment::Disabled {
+            plane_id: cursor_plane.plane_id().get(),
+        });
     };
     let framebuffer_id = cursor.framebuffer_id.ok_or_else(|| {
         AtomicKmsError::new(
@@ -818,37 +844,96 @@ pub fn append_cursor_plane_state(
             "cursor source height overflows unsigned 16.16",
         )
     })?;
-    request.set_cursor_plane(plane, props.fb_id, u64::from(framebuffer_id))?;
-    request.set_cursor_plane(plane, props.crtc_id, u64::from(cursor_plane.crtc_id))?;
-    request.set_cursor_plane(plane, props.src_x, 0)?;
-    request.set_cursor_plane(plane, props.src_y, 0)?;
-    request.set_cursor_plane(plane, props.src_w, src_w)?;
-    request.set_cursor_plane(plane, props.src_h, src_h)?;
-    request.set_cursor_plane(
-        plane,
-        props.crtc_x,
-        i64::from(cursor.x.saturating_sub(cursor.hotspot_x)) as u64,
-    )?;
-    request.set_cursor_plane(
-        plane,
-        props.crtc_y,
-        i64::from(cursor.y.saturating_sub(cursor.hotspot_y)) as u64,
-    )?;
-    request.set_cursor_plane(plane, props.crtc_w, u64::from(cursor.width))?;
-    request.set_cursor_plane(plane, props.crtc_h, u64::from(cursor.height))?;
-    if let Some(rotation) = props.rotation {
-        request.set_cursor_plane(plane, rotation, u64::from(drm_sys::DRM_MODE_ROTATE_0))?;
+    let props = &cursor_plane.property_ids;
+    Ok(AtomicCursorPlaneAssignment::Enabled {
+        plane_id: cursor_plane.plane_id().get(),
+        framebuffer_id,
+        crtc_id: cursor_plane.crtc_id,
+        src_x: 0,
+        src_y: 0,
+        src_w,
+        src_h,
+        crtc_x: i64::from(cursor.x.saturating_sub(cursor.hotspot_x)) as u64,
+        crtc_y: i64::from(cursor.y.saturating_sub(cursor.hotspot_y)) as u64,
+        crtc_w: u64::from(cursor.width),
+        crtc_h: u64::from(cursor.height),
+        hotspot_x: cursor.hotspot_x,
+        hotspot_y: cursor.hotspot_y,
+        width: cursor.width,
+        height: cursor.height,
+        image_generation: cursor.image_generation,
+        rotation: props
+            .rotation
+            .map(|property| (property, u64::from(drm_sys::DRM_MODE_ROTATE_0))),
+        alpha: cursor_plane
+            .alpha_maximum
+            .and_then(|value| props.alpha.map(|property| (property, value))),
+        pixel_blend_mode: cursor_plane
+            .pixel_blend_mode_premultiplied
+            .and_then(|value| props.pixel_blend_mode.map(|property| (property, value))),
+    })
+}
+
+pub fn append_cursor_plane_state(
+    request: &mut AtomicRequest,
+    pipeline: &AtomicPipelineProperties,
+    cursor: Option<&AtomicCursorVisualState>,
+) -> Result<(), AtomicKmsError> {
+    let assignment = cursor_plane_assignment(pipeline, cursor)?;
+    let Some(cursor_plane) = pipeline.cursor_plane.as_ref() else {
+        debug_assert!(matches!(
+            assignment,
+            AtomicCursorPlaneAssignment::Unavailable
+        ));
+        return Ok(());
+    };
+    let plane = cursor_plane.plane_id();
+    let props = &cursor_plane.property_ids;
+    match assignment {
+        AtomicCursorPlaneAssignment::Unavailable => Ok(()),
+        AtomicCursorPlaneAssignment::Disabled { .. } => {
+            request.set_cursor_plane(plane, props.fb_id, 0)?;
+            request.set_cursor_plane(plane, props.crtc_id, 0)?;
+            Ok(())
+        }
+        AtomicCursorPlaneAssignment::Enabled {
+            framebuffer_id,
+            crtc_id,
+            src_x,
+            src_y,
+            src_w,
+            src_h,
+            crtc_x,
+            crtc_y,
+            crtc_w,
+            crtc_h,
+            rotation,
+            alpha,
+            pixel_blend_mode,
+            ..
+        } => {
+            request.set_cursor_plane(plane, props.fb_id, u64::from(framebuffer_id))?;
+            request.set_cursor_plane(plane, props.crtc_id, u64::from(crtc_id))?;
+            request.set_cursor_plane(plane, props.src_x, src_x)?;
+            request.set_cursor_plane(plane, props.src_y, src_y)?;
+            request.set_cursor_plane(plane, props.src_w, src_w)?;
+            request.set_cursor_plane(plane, props.src_h, src_h)?;
+            request.set_cursor_plane(plane, props.crtc_x, crtc_x)?;
+            request.set_cursor_plane(plane, props.crtc_y, crtc_y)?;
+            request.set_cursor_plane(plane, props.crtc_w, crtc_w)?;
+            request.set_cursor_plane(plane, props.crtc_h, crtc_h)?;
+            if let Some((property, value)) = rotation {
+                request.set_cursor_plane(plane, property, value)?;
+            }
+            if let Some((property, value)) = alpha {
+                request.set_cursor_plane(plane, property, value)?;
+            }
+            if let Some((property, value)) = pixel_blend_mode {
+                request.set_cursor_plane(plane, property, value)?;
+            }
+            Ok(())
+        }
     }
-    if let (Some(alpha), Some(maximum)) = (props.alpha, cursor_plane.alpha_maximum) {
-        request.set_cursor_plane(plane, alpha, maximum)?;
-    }
-    if let (Some(blend), Some(premultiplied)) = (
-        props.pixel_blend_mode,
-        cursor_plane.pixel_blend_mode_premultiplied,
-    ) {
-        request.set_cursor_plane(plane, blend, premultiplied)?;
-    }
-    Ok(())
 }
 
 impl Default for AtomicRequest {
