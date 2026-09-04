@@ -1019,6 +1019,7 @@ impl NativeRuntime {
                         presented_at,
                     )? {
                         DeferredO1BindingResult::NotReady => {}
+                        DeferredO1BindingResult::WaitingForPredecessor => {}
                         DeferredO1BindingResult::Bound { advanced_intervals } => {
                             frame_pacing.note_predictive_binding_after_predecessor_pageflip(
                                 advanced_intervals,

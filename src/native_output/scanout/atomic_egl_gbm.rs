@@ -92,6 +92,7 @@ pub(crate) struct AtomicAsyncPolicyInputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredO1BindingResult {
     NotReady,
+    WaitingForPredecessor,
     Bound { advanced_intervals: u64 },
     Stale(DeferredO1BindingFailure),
 }
@@ -1161,7 +1162,8 @@ impl AtomicEglGbmScanout {
                             output_generation,
                             rendered_at,
                         )? {
-                            DeferredO1BindingResult::NotReady => (None, None),
+                            DeferredO1BindingResult::NotReady
+                            | DeferredO1BindingResult::WaitingForPredecessor => (None, None),
                             DeferredO1BindingResult::Bound { advanced_intervals } => {
                                 (Some(advanced_intervals), None)
                             }
@@ -1302,14 +1304,24 @@ impl AtomicEglGbmScanout {
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
-        if let Some(failure) = self
+        let readiness = self
             .swapchain()?
-            .deferred_o1_binding_failure(output_generation)
-        {
-            return Ok(DeferredO1BindingResult::Stale(failure));
+            .deferred_o1_binding_readiness(output_generation);
+        match readiness {
+            DeferredO1BindingReadiness::NotDeferred => {
+                return Ok(DeferredO1BindingResult::NotReady);
+            }
+            DeferredO1BindingReadiness::WaitingForPredecessor => {
+                return Ok(DeferredO1BindingResult::WaitingForPredecessor);
+            }
+            DeferredO1BindingReadiness::Stale(failure) => {
+                return Ok(DeferredO1BindingResult::Stale(failure));
+            }
+            DeferredO1BindingReadiness::Bindable { .. } => {}
         }
         let Some((transaction_id, target, submit_window, advanced_intervals)) =
-            self.swapchain()?.deferred_o1_binding_candidate(bind_at)?
+            self.swapchain()?
+                .deferred_o1_binding_candidate_for_readiness(readiness, bind_at)?
         else {
             return Ok(DeferredO1BindingResult::NotReady);
         };

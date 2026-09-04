@@ -286,6 +286,17 @@ pub(crate) enum DeferredO1BindingFailure {
     GenerationMismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredO1BindingReadiness {
+    NotDeferred,
+    WaitingForPredecessor,
+    Bindable {
+        predecessor: O1PredecessorAnchor,
+        actual_claim: PrimaryRefreshClaim,
+    },
+    Stale(DeferredO1BindingFailure),
+}
+
 #[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
@@ -1295,20 +1306,51 @@ impl AtomicOutputSwapchain {
         &self,
         output_generation: u64,
     ) -> Option<DeferredO1BindingFailure> {
-        let FramePresentationReservation::DeferredO1(intent) = self.ready.as_ref()?.reservation
-        else {
-            return None;
+        match self.deferred_o1_binding_readiness(output_generation) {
+            DeferredO1BindingReadiness::Stale(failure) => Some(failure),
+            DeferredO1BindingReadiness::NotDeferred
+            | DeferredO1BindingReadiness::WaitingForPredecessor
+            | DeferredO1BindingReadiness::Bindable { .. } => None,
+        }
+    }
+
+    pub(crate) fn deferred_o1_binding_readiness(
+        &self,
+        output_generation: u64,
+    ) -> DeferredO1BindingReadiness {
+        let Some(ready) = self.ready.as_ref() else {
+            return DeferredO1BindingReadiness::NotDeferred;
+        };
+        let FramePresentationReservation::DeferredO1(intent) = ready.reservation else {
+            return DeferredO1BindingReadiness::NotDeferred;
         };
         if intent.output_generation != output_generation
             || intent.predecessor.pool_generation != self.pool_generation
+            || intent.clock_generation != self.pool_generation
         {
-            return Some(DeferredO1BindingFailure::GenerationMismatch);
+            return DeferredO1BindingReadiness::Stale(DeferredO1BindingFailure::GenerationMismatch);
         }
-        let (predecessor, actual_claim) = self.last_presented_primary_anchor?;
+        let live_predecessor = self.deferred_o1_predecessor();
+        let Some((predecessor, actual_claim)) = self.last_presented_primary_anchor else {
+            return if live_predecessor == Some(intent.predecessor) {
+                DeferredO1BindingReadiness::WaitingForPredecessor
+            } else {
+                DeferredO1BindingReadiness::Stale(DeferredO1BindingFailure::IdentityMismatch)
+            };
+        };
         if intent.clock_generation != actual_claim.clock_generation {
-            return Some(DeferredO1BindingFailure::GenerationMismatch);
+            return DeferredO1BindingReadiness::Stale(DeferredO1BindingFailure::GenerationMismatch);
         }
-        (intent.predecessor != predecessor).then_some(DeferredO1BindingFailure::IdentityMismatch)
+        if intent.predecessor == predecessor {
+            DeferredO1BindingReadiness::Bindable {
+                predecessor,
+                actual_claim,
+            }
+        } else if live_predecessor == Some(intent.predecessor) {
+            DeferredO1BindingReadiness::WaitingForPredecessor
+        } else {
+            DeferredO1BindingReadiness::Stale(DeferredO1BindingFailure::IdentityMismatch)
+        }
     }
 
     pub(crate) fn deferred_o1_binding_candidate(
@@ -1322,23 +1364,41 @@ impl AtomicOutputSwapchain {
             u64,
         )>,
     > {
+        let readiness = self.deferred_o1_binding_readiness(self.pool_generation);
+        self.deferred_o1_binding_candidate_for_readiness(readiness, bind_at)
+    }
+
+    pub(crate) fn deferred_o1_binding_candidate_for_readiness(
+        &self,
+        readiness: DeferredO1BindingReadiness,
+        bind_at: MonotonicTimestampNs,
+    ) -> io::Result<
+        Option<(
+            OutputTransactionId,
+            PresentationTarget,
+            KmsSubmitWindow,
+            u64,
+        )>,
+    > {
+        let actual_claim = match readiness {
+            DeferredO1BindingReadiness::NotDeferred
+            | DeferredO1BindingReadiness::WaitingForPredecessor => return Ok(None),
+            DeferredO1BindingReadiness::Stale(_) => {
+                return Err(io::Error::other(
+                    "deferred O1 predecessor identity is stale at binding",
+                ));
+            }
+            DeferredO1BindingReadiness::Bindable {
+                predecessor: _,
+                actual_claim,
+            } => actual_claim,
+        };
         let Some(frame) = self.ready.as_ref() else {
             return Ok(None);
         };
         let FramePresentationReservation::DeferredO1(intent) = frame.reservation else {
             return Ok(None);
         };
-        let Some((predecessor, actual_claim)) = self.last_presented_primary_anchor else {
-            return Ok(None);
-        };
-        if intent.predecessor != predecessor
-            || intent.predecessor.pool_generation != self.pool_generation
-            || intent.clock_generation != actual_claim.clock_generation
-        {
-            return Err(io::Error::other(
-                "deferred O1 predecessor identity is stale at binding",
-            ));
-        }
         let earliest_submit_ns = bind_at
             .get()
             .max(actual_claim.presentation_time.get().saturating_add(100_000));
@@ -2089,6 +2149,187 @@ mod tests {
     }
 
     #[test]
+    fn deferred_o1_waits_for_live_pending_predecessor() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+
+        let first_slot = swapchain.acquire_render_slot().expect("first slot");
+        swapchain
+            .finish_render_owned(test_frame(
+                &swapchain,
+                first_slot,
+                predictive_test_target(1, 6_060_606),
+            ))
+            .expect("first frame ready");
+        let first_token = PageFlipToken::new(10).expect("first token");
+        swapchain
+            .submit_ready(first_token, None)
+            .expect("first frame submits");
+        complete_physical_predecessor(
+            &mut swapchain,
+            first_token,
+            PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(6_060_606),
+                clock_generation: 1,
+            },
+        );
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        swapchain
+            .finish_render_owned(test_frame(
+                &swapchain,
+                predecessor_slot,
+                predictive_test_target(2, 12_121_212),
+            ))
+            .expect("predecessor ready");
+        let predecessor_token = PageFlipToken::new(11).expect("predecessor token");
+        swapchain
+            .submit_ready(predecessor_token, None)
+            .expect("predecessor submits");
+        let predecessor = swapchain
+            .deferred_o1_predecessor()
+            .expect("live pending predecessor");
+
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        swapchain
+            .finish_render_owned(test_deferred_frame(
+                &swapchain,
+                successor_slot,
+                predictive_test_target(3, 18_181_818),
+                predecessor,
+            ))
+            .expect("successor becomes ready before predecessor pageflip");
+
+        assert_eq!(swapchain.deferred_o1_binding_failure(1), None);
+        assert_eq!(
+            swapchain.deferred_o1_binding_readiness(1),
+            DeferredO1BindingReadiness::WaitingForPredecessor
+        );
+        let ready_identity = swapchain
+            .ready_identity()
+            .expect("ready successor identity");
+        for attempt in 0..3 {
+            assert_eq!(
+                swapchain.deferred_o1_binding_readiness(1),
+                DeferredO1BindingReadiness::WaitingForPredecessor
+            );
+            assert_eq!(swapchain.deferred_o1_binding_failure(1), None);
+            assert!(
+                swapchain
+                    .deferred_o1_binding_candidate(now(18_000_000 + attempt))
+                    .expect("waiting candidate lookup")
+                    .is_none()
+            );
+            assert_eq!(swapchain.ready_identity(), Some(ready_identity));
+        }
+        assert!(swapchain.ready_is_deferred_o1());
+        assert!(
+            swapchain
+                .ready_identity()
+                .expect("ready successor")
+                .target
+                .is_none()
+        );
+        assert!(
+            swapchain
+                .take_ready_for_worker(PageFlipToken::new(12).expect("worker token"), now(1))
+                .is_err()
+        );
+        assert!(swapchain.take_ready_for_submission().is_err());
+        assert_eq!(swapchain.pending_token(), Some(predecessor_token));
+        assert_eq!(swapchain.worker_queued_token(), None);
+        assert_eq!(swapchain.quarantine_slot_id(), None);
+    }
+
+    #[test]
+    fn deferred_o1_waits_for_live_worker_queued_predecessor() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+
+        let first_slot = swapchain.acquire_render_slot().expect("first slot");
+        swapchain
+            .finish_render_owned(test_frame(
+                &swapchain,
+                first_slot,
+                predictive_test_target(1, 6_060_606),
+            ))
+            .expect("first frame ready");
+        let first_token = PageFlipToken::new(20).expect("first token");
+        swapchain
+            .submit_ready(first_token, None)
+            .expect("first frame submits");
+        complete_physical_predecessor(
+            &mut swapchain,
+            first_token,
+            PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: MonotonicTimestampNs::new(6_060_606),
+                clock_generation: 1,
+            },
+        );
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        swapchain
+            .finish_render_owned(test_frame(
+                &swapchain,
+                predecessor_slot,
+                predictive_test_target(2, 12_121_212),
+            ))
+            .expect("predecessor ready");
+        let predecessor_token = PageFlipToken::new(21).expect("predecessor token");
+        swapchain
+            .take_ready_for_worker(predecessor_token, now(12_000_000))
+            .expect("predecessor enters worker queue");
+        let predecessor = swapchain
+            .deferred_o1_predecessor()
+            .expect("live worker-queued predecessor");
+
+        let successor_slot = swapchain.acquire_render_slot().expect("successor slot");
+        swapchain
+            .finish_render_owned(test_deferred_frame(
+                &swapchain,
+                successor_slot,
+                predictive_test_target(3, 18_181_818),
+                predecessor,
+            ))
+            .expect("successor becomes ready before worker promotion");
+
+        assert_eq!(
+            swapchain.deferred_o1_binding_readiness(1),
+            DeferredO1BindingReadiness::WaitingForPredecessor
+        );
+        assert!(
+            swapchain
+                .deferred_o1_binding_candidate(now(18_000_000))
+                .expect("waiting candidate lookup")
+                .is_none()
+        );
+        assert!(swapchain.ready_is_deferred_o1());
+        assert_eq!(swapchain.worker_queued_token(), Some(predecessor_token));
+    }
+
+    #[test]
     fn deferred_o1_binds_when_predecessor_presents_before_render_completion() {
         let predecessor_claim = PrimaryRefreshClaim {
             sequence: 2,
@@ -2117,6 +2358,10 @@ mod tests {
             .deferred_o1_binding_candidate(now(12_200_000))
             .expect("binding candidate lookup")
             .expect("deferred frame should bind after render completion");
+        assert!(matches!(
+            swapchain.deferred_o1_binding_readiness(1),
+            DeferredO1BindingReadiness::Bindable { .. }
+        ));
         assert_eq!(target.physical_claim().sequence, 3);
     }
 
@@ -2187,6 +2432,10 @@ mod tests {
             },
             claim,
         ));
+        assert_eq!(
+            swapchain.deferred_o1_binding_readiness(1),
+            DeferredO1BindingReadiness::Stale(DeferredO1BindingFailure::IdentityMismatch)
+        );
         assert_eq!(
             swapchain.deferred_o1_binding_failure(1),
             Some(DeferredO1BindingFailure::IdentityMismatch)
