@@ -80,10 +80,11 @@ pub(super) fn submit_ready_frame(
     let repaint_present_start = Instant::now();
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let guard = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
-        explicit
-            .swapchain()?
-            .ready_identity()
-            .map(|identity| (identity.protocol_batch_id, identity.target))
+        explicit.swapchain()?.ready_identity().and_then(|identity| {
+            identity
+                .target
+                .map(|target| (identity.protocol_batch_id, target))
+        })
     } else {
         server.prepared_frame_batch_id().zip(compatibility_target)
     };

@@ -305,6 +305,7 @@ where
         }
         OutputTransactionState::Built
         | OutputTransactionState::Ready { .. }
+        | OutputTransactionState::ReadyUnbound { .. }
         | OutputTransactionState::Queued { .. }
         | OutputTransactionState::Settling { .. }
         | OutputTransactionState::Terminal(_) => return Ok(false),

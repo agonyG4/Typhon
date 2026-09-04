@@ -134,7 +134,10 @@ pub(super) fn queue_explicit_composited_frame(
             .into());
         }
     };
-    let target = transaction.descriptor().target();
+    let target = transaction
+        .descriptor()
+        .bound_target()
+        .ok_or_else(|| io::Error::other("worker composited queue transaction is unbound"))?;
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let kind = AtomicCommitKind::CompositedPrimary {

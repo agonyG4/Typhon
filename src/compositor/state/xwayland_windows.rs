@@ -42,6 +42,8 @@ impl CompositorState {
             self.surface_publications.remove(&retired_id);
             self.surface_damage_journals.remove(&retired_id);
             self.presented_surface_commits.remove(&retired_id);
+            self.presented_surface_commit_generations
+                .remove(&retired_id);
             self.surface_presentation_generations.remove(&retired_id);
             self.clear_resize_state_for_surfaces_with_reason(
                 &[retired_id],

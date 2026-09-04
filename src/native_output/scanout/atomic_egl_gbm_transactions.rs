@@ -14,6 +14,10 @@ impl AtomicEglGbmScanout {
             .swapchain()?
             .ready_transaction_id()
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        self.swapchain()?
+            .ready_identity()
+            .and_then(|identity| identity.target)
+            .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
         let (mut presentation_mode, content_type, async_validation_key) = {
             let transaction = output_transactions
                 .transaction(ready_transaction_id)
@@ -86,9 +90,12 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         if self.deadline_hints_enabled {
+            let target = frame
+                .bound_target()
+                .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
             match frame
                 .render_fence
-                .apply_deadline_hint(frame.target.presentation_time.get(), monotonic_now_ns()?)
+                .apply_deadline_hint(target.presentation_time.get(), monotonic_now_ns()?)
             {
                 Ok(Some(SyncFileDeadlineHint::Applied)) => {
                     self.counters.sync_file_deadline_hints_applied += 1;

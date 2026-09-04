@@ -511,7 +511,7 @@ impl CompositorState {
         surface_id: u32,
         commit_sequence: Option<SurfaceCommitSequence>,
         sampled: &mut HashSet<u32>,
-        sampled_commits: &mut Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
+        sampled_commits: &mut Vec<SurfaceDamageSample>,
     ) {
         if !sampled.insert(surface_id) {
             return;
@@ -533,19 +533,38 @@ impl CompositorState {
         let Some(commit) = commit else {
             return;
         };
+        let change = match (
+            self.presented_surface_commit_generations
+                .get(&surface_id)
+                .copied(),
+            self.presented_surface_commits.get(&surface_id).copied(),
+        ) {
+            (Some(presented_generation), Some(presented_commit))
+                if presented_generation == generation && commit > presented_commit =>
+            {
+                SurfacePresentationChange::Advanced
+            }
+            (Some(presented_generation), Some(presented_commit))
+                if presented_generation == generation && commit == presented_commit =>
+            {
+                SurfacePresentationChange::Unchanged
+            }
+            _ => SurfacePresentationChange::Unknown,
+        };
         let mut metrics = self.locality_metrics.get();
         metrics.presentation_journal_lookups =
             metrics.presentation_journal_lookups.saturating_add(1);
         metrics.presentation_sampled_entries =
             metrics.presentation_sampled_entries.saturating_add(1);
         self.locality_metrics.set(metrics);
-        sampled_commits.push((
-            SurfacePresentationKey {
+        sampled_commits.push(SurfaceDamageSample {
+            key: SurfacePresentationKey {
                 surface_id,
                 generation,
             },
             commit,
-        ));
+            change,
+        });
     }
 
     #[cfg(test)]
@@ -609,7 +628,12 @@ impl CompositorState {
             }
         }
         self.locality_metrics.set(metrics);
-        for (key, sampled_commit) in token.sampled_commits {
+        for sample in token.sampled_commits {
+            let SurfaceDamageSample {
+                key,
+                commit: sampled_commit,
+                ..
+            } = sample;
             let mut metrics = self.locality_metrics.get();
             metrics.presentation_settlement_entries =
                 metrics.presentation_settlement_entries.saturating_add(1);
@@ -634,6 +658,8 @@ impl CompositorState {
             }
             self.presented_surface_commits
                 .insert(key.surface_id, sampled_commit);
+            self.presented_surface_commit_generations
+                .insert(key.surface_id, key.generation);
             let mut metrics = self.locality_metrics.get();
             metrics.presentation_settlement_journal_lookups = metrics
                 .presentation_settlement_journal_lookups
@@ -1139,6 +1165,8 @@ impl CompositorState {
         self.commit_timer_resources.remove(&surface_id);
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);
+        self.presented_surface_commit_generations
+            .remove(&surface_id);
         self.surface_presentation_generations.remove(&surface_id);
         self.cancel_pending_surface_trees_for_surface(
             surface_id,
@@ -1472,13 +1500,14 @@ mod ordered_publication_tests {
             sampled = journal.record(RenderableSurfaceDamage::Full, 100, 80);
         }
         let token = SurfaceDamagePresentation {
-            sampled_commits: vec![(
-                SurfacePresentationKey {
+            sampled_commits: vec![SurfaceDamageSample {
+                key: SurfacePresentationKey {
                     surface_id: 7,
                     generation: 1,
                 },
-                sampled,
-            )],
+                commit: sampled,
+                change: SurfacePresentationChange::Unknown,
+            }],
         };
         let newer = journal.record(RenderableSurfaceDamage::Full, 100, 80);
         state.commit_surface_damage_presented(token);
@@ -1513,7 +1542,7 @@ mod ordered_publication_tests {
 
         let token = state
             .capture_surface_damage_presentation_for_surface_commit(7, SurfaceCommitSequence(41));
-        assert_eq!(token.sampled_commits[0].1, sampled);
+        assert_eq!(token.sampled_commits[0].commit, sampled);
         state.commit_surface_damage_presented(token);
 
         assert_eq!(state.presented_surface_commits.get(&7), Some(&sampled));
@@ -1651,8 +1680,8 @@ mod ordered_publication_tests {
             token.sampled_surface_ids_for_test(),
             vec![cursor_id, primary_id]
         );
-        assert_eq!(token.sampled_commits[0].1, cursor_commit);
-        assert_eq!(token.sampled_commits[1].1, primary_commit);
+        assert_eq!(token.sampled_commits[0].commit, cursor_commit);
+        assert_eq!(token.sampled_commits[1].commit, primary_commit);
 
         state
             .client_cursor_surfaces
@@ -1755,13 +1784,14 @@ mod ordered_publication_tests {
         let token = state.capture_surface_damage_presentation_for_surface(7);
         assert_eq!(
             token.sampled_commits,
-            vec![(
-                SurfacePresentationKey {
+            vec![SurfaceDamageSample {
+                key: SurfacePresentationKey {
                     surface_id: 7,
                     generation: 1,
                 },
-                direct_commit,
-            )]
+                commit: direct_commit,
+                change: SurfacePresentationChange::Unknown,
+            }]
         );
         assert!(
             state
@@ -1828,13 +1858,14 @@ mod ordered_publication_tests {
             journal
         });
         let stale = SurfaceDamagePresentation {
-            sampled_commits: vec![(
-                SurfacePresentationKey {
+            sampled_commits: vec![SurfaceDamageSample {
+                key: SurfacePresentationKey {
                     surface_id: 7,
                     generation: 1,
                 },
-                SurfaceCommitCounter(1),
-            )],
+                commit: SurfaceCommitCounter(1),
+                change: SurfacePresentationChange::Unknown,
+            }],
         };
 
         state.commit_surface_damage_presented(stale);
@@ -1854,12 +1885,136 @@ mod ordered_publication_tests {
         };
         let token = SurfaceDamagePresentation {
             sampled_commits: vec![
-                (first, SurfaceCommitCounter(3)),
-                (second, SurfaceCommitCounter(4)),
+                SurfaceDamageSample {
+                    key: first,
+                    commit: SurfaceCommitCounter(3),
+                    change: SurfacePresentationChange::Unknown,
+                },
+                SurfaceDamageSample {
+                    key: second,
+                    commit: SurfaceCommitCounter(4),
+                    change: SurfacePresentationChange::Unknown,
+                },
             ],
         };
 
         assert_ne!(first, second);
         assert_eq!(token.sampled_commits.len(), 2);
+    }
+
+    fn seed_presented_surface(state: &mut CompositorState, surface_id: u32) {
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(1)));
+        state.surface_presentation_generations.insert(surface_id, 1);
+        let mut journal = SurfaceDamageJournal::new(8);
+        let baseline = journal.record(RenderableSurfaceDamage::Full, 10, 10);
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 1);
+    }
+
+    fn advance_surface(state: &mut CompositorState, surface_id: u32) {
+        state
+            .surface_damage_journals
+            .get_mut(&surface_id)
+            .expect("test surface journal")
+            .record(RenderableSurfaceDamage::Full, 10, 10);
+    }
+
+    #[test]
+    fn fast_candidate_allows_static_competing_surfaces() {
+        let mut state = CompositorState::default();
+        seed_presented_surface(&mut state, 7);
+        seed_presented_surface(&mut state, 8);
+        seed_presented_surface(&mut state, 9);
+        advance_surface(&mut state, 7);
+
+        let token = state.capture_surface_damage_presentation_for_surface_ids([7, 8, 9]);
+
+        assert_eq!(
+            token.surface_change_for_id(7),
+            Some(SurfacePresentationChange::Advanced)
+        );
+        assert_eq!(
+            token.surface_change_for_id(8),
+            Some(SurfacePresentationChange::Unchanged)
+        );
+        assert!(token.is_exclusive_surface_id(7));
+    }
+
+    #[test]
+    fn fast_candidate_rejects_two_advanced_surfaces() {
+        let mut state = CompositorState::default();
+        seed_presented_surface(&mut state, 7);
+        seed_presented_surface(&mut state, 8);
+        advance_surface(&mut state, 7);
+        advance_surface(&mut state, 8);
+
+        let token = state.capture_surface_damage_presentation_for_surface_ids([7, 8]);
+
+        assert!(!token.is_exclusive_surface_id(7));
+    }
+
+    #[test]
+    fn fast_candidate_rejects_missing_presented_baseline_as_unknown() {
+        let mut state = CompositorState::default();
+        state.append_renderable_surface(test_cursor_surface(7, SurfaceCommitSequence(1)));
+        state.surface_presentation_generations.insert(7, 1);
+        let mut journal = SurfaceDamageJournal::new(8);
+        journal.record(RenderableSurfaceDamage::Full, 10, 10);
+        state.surface_damage_journals.insert(7, journal);
+
+        let token = state.capture_surface_damage_presentation_for_surface(7);
+
+        assert_eq!(
+            token.surface_change_for_id(7),
+            Some(SurfacePresentationChange::Unknown)
+        );
+        assert!(!token.is_exclusive_surface_id(7));
+    }
+
+    #[test]
+    fn fast_candidate_rejects_stale_presentation_generation_as_unknown() {
+        let mut state = CompositorState::default();
+        seed_presented_surface(&mut state, 7);
+        state.surface_presentation_generations.insert(7, 2);
+        advance_surface(&mut state, 7);
+
+        let token = state.capture_surface_damage_presentation_for_surface(7);
+
+        assert_eq!(
+            token.surface_change_for_id(7),
+            Some(SurfacePresentationChange::Unknown)
+        );
+        assert!(!token.is_exclusive_surface_id(7));
+    }
+
+    #[test]
+    fn unchanged_callback_surface_is_not_fast_candidate() {
+        let mut state = CompositorState::default();
+        seed_presented_surface(&mut state, 7);
+
+        let token = state.capture_surface_damage_presentation_for_surface(7);
+
+        assert_eq!(
+            token.surface_change_for_id(7),
+            Some(SurfacePresentationChange::Unchanged)
+        );
+        assert!(!token.is_exclusive_surface_id(7));
+    }
+
+    #[test]
+    fn hardware_cursor_does_not_compete_with_advanced_primary_surface() {
+        let mut state = CompositorState::default();
+        seed_presented_surface(&mut state, 7);
+        seed_presented_surface(&mut state, 8);
+        advance_surface(&mut state, 7);
+        advance_surface(&mut state, 8);
+
+        let token = state.capture_surface_damage_presentation_for_surface_ids([7, 8]);
+
+        assert!(!token.is_exclusive_surface_id(7));
+        assert!(token.is_exclusive_surface_id_excluding(7, Some(8)));
     }
 }

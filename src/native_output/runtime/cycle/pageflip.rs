@@ -146,7 +146,7 @@ fn select_cursor_promotion(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn abandon_overtaken_ready(
+pub(crate) fn abandon_overtaken_ready(
     explicit: &mut AtomicEglGbmScanout,
     owner: OutputFrameIdentitySnapshot,
     scene_history: &mut NativeSceneHistory,
@@ -203,12 +203,16 @@ fn abandon_overtaken_worker_queued(
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
 ) -> NativeResult<()> {
+    let owner_target = owner
+        .frame
+        .target
+        .ok_or_else(|| io::Error::other("queued worker frame is unbound"))?;
     match worker.cancel_queued_primary(
         owner.token,
         owner.frame.transaction_id,
         owner.frame.pool_generation,
         crtc_id,
-        owner.frame.target,
+        owner_target,
         owner.frame.frame_id,
     ) {
         KmsWorkerQueuedCancellation::Cancelled(job) => {
@@ -1009,6 +1013,44 @@ impl NativeRuntime {
                         .into());
                     }
                     explicit.note_physical_primary_presentation(physical_claim)?;
+                    match explicit.bind_ready_deferred_o1(
+                        output_transactions,
+                        *drm_file_generation,
+                        presented_at,
+                    )? {
+                        DeferredO1BindingResult::NotReady => {}
+                        DeferredO1BindingResult::Bound { advanced_intervals } => {
+                            frame_pacing.note_predictive_binding_after_predecessor_pageflip(
+                                advanced_intervals,
+                            );
+                        }
+                        DeferredO1BindingResult::Stale(failure) => {
+                            match failure {
+                                DeferredO1BindingFailure::IdentityMismatch => {
+                                    frame_pacing.note_predictive_unbound_abandoned_identity();
+                                }
+                                DeferredO1BindingFailure::GenerationMismatch => {
+                                    frame_pacing.note_predictive_unbound_abandoned_generation();
+                                }
+                            }
+                            let owner =
+                                explicit.swapchain()?.ready_identity().ok_or_else(|| {
+                                    io::Error::other(
+                                        "stale deferred O1 binding has no ready frame to abandon",
+                                    )
+                                })?;
+                            abandon_overtaken_ready(
+                                explicit,
+                                owner,
+                                scene_history,
+                                frame_pacing,
+                                frame_scheduler,
+                                server,
+                                output_transactions,
+                                presented_at,
+                            )?;
+                        }
+                    }
                     presentation_deadline.commit_presented(prepared_physical);
                     self.presentation_trace.push(
                         PresentationTransactionEvent::PresentedTransition {

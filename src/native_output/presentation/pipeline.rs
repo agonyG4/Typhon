@@ -168,6 +168,11 @@ pub(crate) enum PreparedCompositedState {
         target: PresentationTarget,
         fence_state: PreparedFenceState,
     },
+    ReadyUnbound {
+        transaction_id: OutputTransactionId,
+        slot: OutputSlotId,
+        fence_state: PreparedFenceState,
+    },
 }
 
 impl PreparedCompositedState {
@@ -178,7 +183,9 @@ impl PreparedCompositedState {
     const fn slot(self) -> Option<OutputSlotId> {
         match self {
             Self::None => None,
-            Self::Rendering { slot, .. } | Self::Ready { slot, .. } => Some(slot),
+            Self::Rendering { slot, .. }
+            | Self::Ready { slot, .. }
+            | Self::ReadyUnbound { slot, .. } => Some(slot),
         }
     }
 
@@ -186,6 +193,7 @@ impl PreparedCompositedState {
         match self {
             Self::None => None,
             Self::Rendering { target, .. } | Self::Ready { target, .. } => Some(target),
+            Self::ReadyUnbound { .. } => None,
         }
     }
 }
@@ -267,7 +275,10 @@ impl OutputPipelineSnapshot {
             .flatten()
             .filter(|commit| commit.kind.is_primary())
             .count() as u8;
-        queued.saturating_add(u8::from(self.prepared.is_present()))
+        queued.saturating_add(u8::from(matches!(
+            self.prepared,
+            PreparedCompositedState::Ready { .. }
+        )))
     }
 
     pub(crate) const fn worker_queue_occupied(&self) -> bool {
@@ -415,6 +426,7 @@ impl PresentationPipelineView for OutputPipelineSnapshot {
             PreparedCompositedState::Ready { target, .. } => {
                 SchedulerPreparedPrimary::Ready { target }
             }
+            PreparedCompositedState::ReadyUnbound { .. } => SchedulerPreparedPrimary::ReadyUnbound,
         }
     }
 

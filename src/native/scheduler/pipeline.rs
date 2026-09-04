@@ -15,6 +15,7 @@ pub struct ExplicitAtomicSchedulerContext {
 pub enum SchedulerPreparedPrimary {
     None,
     Rendering,
+    ReadyUnbound,
     Ready { target: PresentationTarget },
 }
 
@@ -124,7 +125,9 @@ impl NativeFrameScheduler {
         let prepared = pipeline.prepared_primary();
         let ready_target = match prepared {
             SchedulerPreparedPrimary::Ready { target } => Some(target),
-            SchedulerPreparedPrimary::None | SchedulerPreparedPrimary::Rendering => None,
+            SchedulerPreparedPrimary::None
+            | SchedulerPreparedPrimary::Rendering
+            | SchedulerPreparedPrimary::ReadyUnbound => None,
         };
 
         if pipeline.worker_primary_queued() {
@@ -194,6 +197,9 @@ impl NativeFrameScheduler {
         }
         if matches!(prepared, SchedulerPreparedPrimary::Rendering) {
             return SchedulerDecision::WaitForBuffer;
+        }
+        if matches!(prepared, SchedulerPreparedPrimary::ReadyUnbound) {
+            return SchedulerDecision::WaitForPageFlip;
         }
         if self.visual_work_queued {
             if pipeline.free_compositor_slots() == 0 {
@@ -339,7 +345,9 @@ fn ready_target_for_pipeline(
 ) -> Option<PresentationTarget> {
     match pipeline.prepared_primary() {
         SchedulerPreparedPrimary::Ready { target } => Some(target),
-        SchedulerPreparedPrimary::None | SchedulerPreparedPrimary::Rendering => None,
+        SchedulerPreparedPrimary::None
+        | SchedulerPreparedPrimary::Rendering
+        | SchedulerPreparedPrimary::ReadyUnbound => None,
     }
 }
 

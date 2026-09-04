@@ -40,6 +40,7 @@ use crate::native_output::runtime::{
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedAsyncValidationKey;
+use crate::native_output::presentation::transaction::O1PrepareIntent;
 
 #[cfg(test)]
 mod confirmed_pageflip_tests;
@@ -86,6 +87,13 @@ pub(crate) struct AtomicAsyncPolicyInputs {
     pub(crate) cursor_transition_pending: bool,
     pub(crate) kms_lane_free: bool,
     pub(crate) confirmed_content_type: oblivion_one::compositor::DrmContentType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredO1BindingResult {
+    NotReady,
+    Bound { advanced_intervals: u64 },
+    Stale(DeferredO1BindingFailure),
 }
 
 impl AtomicAsyncPolicyInputs {
@@ -725,6 +733,7 @@ impl AtomicEglGbmScanout {
         target: PresentationTarget,
         submit_window: KmsSubmitWindow,
         pacing_mode: NativeOutputPacingMode,
+        render_ahead: bool,
         future_primary_limit: u8,
         o1_admission: Option<O1AdmissionObservation>,
         cursor: Option<CursorPlaneAssignment>,
@@ -819,21 +828,53 @@ impl AtomicEglGbmScanout {
                 content_type,
             )
         });
-        let transaction = match OutputTransaction::composited_with_direct_equivalence(
-            transaction_id,
-            output_generation,
-            MonotonicTimestampNs::new(monotonic_now_ns()?),
-            target,
-            pacing_mode,
-            frame_id,
-            render_generation,
-            pool_generation,
-            slot,
-            framebuffer_id,
-            cursor,
-            protocol_batch_id,
-            equivalent_direct_key,
-        ) {
+        let prepare_intent = if render_ahead {
+            Some(O1PrepareIntent::from_target(
+                target,
+                output_generation,
+                self.swapchain()
+                    .ok()
+                    .and_then(AtomicOutputSwapchain::deferred_o1_predecessor)
+                    .ok_or_else(|| {
+                        io::Error::other("predictive render-ahead has no exact predecessor")
+                    })?,
+            ))
+        } else {
+            None
+        };
+        let transaction_result = if let Some(intent) = prepare_intent {
+            OutputTransaction::composited_deferred_o1(
+                transaction_id,
+                output_generation,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                intent,
+                pacing_mode,
+                frame_id,
+                render_generation,
+                pool_generation,
+                slot,
+                framebuffer_id,
+                cursor,
+                protocol_batch_id,
+            )
+        } else {
+            OutputTransaction::composited_with_direct_equivalence(
+                transaction_id,
+                output_generation,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                target,
+                pacing_mode,
+                frame_id,
+                render_generation,
+                pool_generation,
+                slot,
+                framebuffer_id,
+                cursor,
+                protocol_batch_id,
+                equivalent_direct_key,
+            )
+        };
+        let transaction = match transaction_result {
             Ok(transaction) => transaction
                 .with_presentation_state(presentation_mode, content_type)
                 .with_async_validation_key(async_validation_key),
@@ -860,6 +901,7 @@ impl AtomicEglGbmScanout {
             resolved_scene_signature,
             resolved_render_generation,
             surface_damage,
+            hardware_cursor_surface_id,
         ) = {
             let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
             let resolved_snapshot = resolved_scene.snapshot();
@@ -928,15 +970,21 @@ impl AtomicEglGbmScanout {
                             })
                     }),
                 );
+            let hardware_cursor_surface_id = (frozen_cursor_plan.delivery
+                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware)
+                .then(|| {
+                    frozen_cursor_plane_owner
+                        .as_ref()
+                        .and_then(|owner| owner.client_source_key)
+                        .map(|source_key| source_key.surface_id)
+                })
+                .flatten();
             let cursor_surface_id = match frozen_cursor_plan.delivery {
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Software => {
                     exact_cursor_commit.map(|(surface_id, _)| surface_id)
                 }
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
-                    frozen_cursor_plane_owner
-                        .as_ref()
-                        .and_then(|owner| owner.client_source_key)
-                        .map(|source_key| source_key.surface_id)
+                    hardware_cursor_surface_id
                 }
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
             };
@@ -964,6 +1012,7 @@ impl AtomicEglGbmScanout {
                 resolved_scene_signature,
                 resolved_scene.render_generation,
                 surface_damage,
+                hardware_cursor_surface_id,
             )
         };
         let parts = match render_outcome {
@@ -1071,7 +1120,12 @@ impl AtomicEglGbmScanout {
                 .ok_or_else(|| io::Error::other("atomic output framebuffer ID is zero"))?,
             render_generation,
             pool_generation,
-            target,
+            reservation: prepare_intent.map_or(
+                crate::native_output::presentation::transaction::FramePresentationReservation::Bound(
+                    target,
+                ),
+                crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1,
+            ),
             submit_window,
             render_fence: parts.render_fence,
             scene_commit: parts.scene_commit,
@@ -1084,6 +1138,7 @@ impl AtomicEglGbmScanout {
             callback_reaction_ns: callback_timing.and_then(|timing| timing.reaction_ns),
             callback_admission_ns: callback_timing.and_then(|timing| timing.admission_ns),
             callback_surface_id: callback_timing.map(|timing| timing.surface_id),
+            hardware_cursor_surface_id,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
@@ -1093,9 +1148,28 @@ impl AtomicEglGbmScanout {
         let framebuffer_slot = frame.slot.get();
         match self.swapchain_mut()?.finish_render_owned(frame) {
             Ok(frame_id) => {
-                output_transactions
-                    .mark_ready(transaction_id, rendered_at)
-                    .map_err(io::Error::other)?;
+                if prepare_intent.is_some() {
+                    output_transactions.mark_ready_unbound(transaction_id, rendered_at)
+                } else {
+                    output_transactions.mark_ready(transaction_id, rendered_at)
+                }
+                .map_err(io::Error::other)?;
+                let (deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure) =
+                    if prepare_intent.is_some() {
+                        match self.bind_ready_deferred_o1(
+                            output_transactions,
+                            output_generation,
+                            rendered_at,
+                        )? {
+                            DeferredO1BindingResult::NotReady => (None, None),
+                            DeferredO1BindingResult::Bound { advanced_intervals } => {
+                                (Some(advanced_intervals), None)
+                            }
+                            DeferredO1BindingResult::Stale(failure) => (None, Some(failure)),
+                        }
+                    } else {
+                        (None, None)
+                    };
                 server.mark_frame_callbacks_rendered(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,
@@ -1109,6 +1183,8 @@ impl AtomicEglGbmScanout {
                     repair_damage_signature,
                     resolved_render_generation,
                     framebuffer_slot,
+                    deferred_o1_binding_advanced_intervals,
+                    deferred_o1_binding_failure,
                 })
             }
             Err(error) => {
@@ -1153,7 +1229,7 @@ impl AtomicEglGbmScanout {
         let RenderedOutputFrame {
             id,
             transaction_id,
-            target,
+            reservation,
             submit_window,
             scene_commit,
             surface_damage,
@@ -1164,9 +1240,13 @@ impl AtomicEglGbmScanout {
             callback_reaction_ns,
             callback_admission_ns,
             callback_surface_id,
+            hardware_cursor_surface_id,
             o1_admission,
             ..
         } = completed.frame;
+        let target = reservation
+            .bound_target()
+            .ok_or_else(|| io::Error::other("completed pageflip frame is unbound"))?;
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
             timing_result.map(|sample| {
                 sample.map(|(timestamp, quality)| (MonotonicTimestampNs::new(timestamp), quality))
@@ -1202,8 +1282,10 @@ impl AtomicEglGbmScanout {
                 callback_reaction_ns,
                 callback_admission_ns,
                 callback_surface_id,
-                callback_surface_is_exclusive: callback_surface_id
-                    .is_some_and(|surface_id| surface_damage.is_exclusive_surface_id(surface_id)),
+                callback_surface_is_exclusive: callback_surface_id.is_some_and(|surface_id| {
+                    surface_damage
+                        .is_exclusive_surface_id_excluding(surface_id, hardware_cursor_surface_id)
+                }),
             },
             protocol_batch_id,
             surface_damage,
@@ -1212,6 +1294,31 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
         self.swapchain.as_ref()?.pending_timing_fd()
+    }
+
+    pub(crate) fn bind_ready_deferred_o1(
+        &mut self,
+        output_transactions: &mut OutputTransactionLedger,
+        output_generation: u64,
+        bind_at: MonotonicTimestampNs,
+    ) -> io::Result<DeferredO1BindingResult> {
+        if let Some(failure) = self
+            .swapchain()?
+            .deferred_o1_binding_failure(output_generation)
+        {
+            return Ok(DeferredO1BindingResult::Stale(failure));
+        }
+        let Some((transaction_id, target, submit_window, advanced_intervals)) =
+            self.swapchain()?.deferred_o1_binding_candidate(bind_at)?
+        else {
+            return Ok(DeferredO1BindingResult::NotReady);
+        };
+        output_transactions
+            .bind_deferred_o1(transaction_id, target)
+            .map_err(io::Error::other)?;
+        self.swapchain_mut()?
+            .commit_deferred_o1_binding(transaction_id, target, submit_window)?;
+        Ok(DeferredO1BindingResult::Bound { advanced_intervals })
     }
 
     pub(crate) fn ready_render_fence_is_signaled(&self) -> io::Result<bool> {
@@ -1244,7 +1351,9 @@ impl AtomicEglGbmScanout {
         };
         let timing = PendingFenceTiming {
             frame_id: frame.id,
-            target: frame.target,
+            target: frame
+                .bound_target()
+                .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
             submit_window: frame.submit_window,
             composite_started_at: frame.composite_started_at,
             signaled_at: MonotonicTimestampNs::new(signaled_at),
@@ -1421,6 +1530,8 @@ pub(crate) enum AtomicFrameRenderOutcome {
         repair_damage_signature: u64,
         resolved_render_generation: u64,
         framebuffer_slot: u8,
+        deferred_o1_binding_advanced_intervals: Option<u64>,
+        deferred_o1_binding_failure: Option<DeferredO1BindingFailure>,
     },
     Skipped {
         reason: FrameSkipReason,

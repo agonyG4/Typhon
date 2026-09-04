@@ -194,6 +194,23 @@ impl KmsSubmitWindow {
         self.apply_guard_ns
     }
 
+    pub(crate) fn rebind(
+        self,
+        target_presentation_ns: u64,
+        earliest_submit_ns: u64,
+    ) -> Result<Self, KmsSubmitWindowError> {
+        let rebound = Self::try_new(
+            target_presentation_ns,
+            earliest_submit_ns,
+            self.dispatch_budget_ns,
+            self.apply_guard_ns,
+        )?;
+        Ok(match self.mode_key {
+            Some(mode_key) => rebound.with_mode_key(mode_key),
+            None => rebound,
+        })
+    }
+
     pub(crate) const fn is_dispatch_miss_at(self, submit_returned_at_ns: u64) -> bool {
         submit_returned_at_ns > self.commit_complete_deadline_ns
     }

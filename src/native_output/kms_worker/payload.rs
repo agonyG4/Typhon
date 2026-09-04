@@ -282,7 +282,7 @@ impl KmsCommitJob {
         if self.output_generation != transaction.output_generation() {
             return Err(KmsCommitPayloadError::GenerationMismatch);
         }
-        if self.target != transaction.target() {
+        if Some(self.target) != transaction.bound_target() {
             return Err(KmsCommitPayloadError::TargetMismatch);
         }
         match self.validation_base {
@@ -321,7 +321,7 @@ impl KmsCommitJob {
                 if owner.output_generation() != self.output_generation {
                     return Err(KmsCommitPayloadError::OwnerGenerationMismatch);
                 }
-                if owner.target() != self.target {
+                if owner.bound_target() != Some(self.target) {
                     return Err(KmsCommitPayloadError::OwnerTargetMismatch);
                 }
             }

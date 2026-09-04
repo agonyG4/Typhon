@@ -125,6 +125,21 @@ mod tests {
     }
 
     #[test]
+    fn unbound_counters_only_track_predictive_unbound_lifecycle() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.note_ready_frame(2, true);
+        assert_eq!(pacing.predictive_unbound_created, 0);
+        assert_eq!(pacing.predictive_unbound_ready, 0);
+
+        pacing.note_predictive_unbound_created();
+        pacing.note_predictive_unbound_ready();
+        assert_eq!(pacing.predictive_unbound_created, 1);
+        assert_eq!(pacing.predictive_unbound_ready, 1);
+    }
+
+    #[test]
     fn predictive_ready_lifecycle_reconciles_safe_overtake_failure_and_shutdown() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -367,6 +382,13 @@ mod tests {
             "predictive_render_ahead_ready=0",
             "predictive_ready_submits=0",
             "predictive_ready_created=0",
+            "predictive_unbound_created=0",
+            "predictive_unbound_ready=0",
+            "predictive_bound_after_predecessor_pageflip=0",
+            "predictive_bound_after_render_completion=0",
+            "predictive_binding_advanced_intervals=0",
+            "predictive_unbound_abandoned_identity=0",
+            "predictive_unbound_abandoned_generation=0",
             "predictive_ready_submitted=0",
             "predictive_ready_overtaken_ready=0",
             "predictive_ready_overtaken_worker_queued=0",
@@ -1308,6 +1330,13 @@ pub(crate) struct NativeFramePacing {
     pub(crate) predictive_ready_submits: u64,
     pub(crate) predictive_ready_created: u64,
     pub(crate) predictive_ready_submitted: u64,
+    pub(crate) predictive_unbound_created: u64,
+    pub(crate) predictive_unbound_ready: u64,
+    pub(crate) predictive_bound_after_predecessor_pageflip: u64,
+    pub(crate) predictive_bound_after_render_completion: u64,
+    pub(crate) predictive_binding_advanced_intervals: u64,
+    pub(crate) predictive_unbound_abandoned_identity: u64,
+    pub(crate) predictive_unbound_abandoned_generation: u64,
     pub(crate) predictive_ready_overtaken_ready: u64,
     pub(crate) predictive_ready_overtaken_worker_queued: u64,
     pub(crate) predictive_ready_other_safe_abandonment: u64,
@@ -1491,6 +1520,13 @@ impl NativeFramePacing {
             predictive_ready_submits: 0,
             predictive_ready_created: 0,
             predictive_ready_submitted: 0,
+            predictive_unbound_created: 0,
+            predictive_unbound_ready: 0,
+            predictive_bound_after_predecessor_pageflip: 0,
+            predictive_bound_after_render_completion: 0,
+            predictive_binding_advanced_intervals: 0,
+            predictive_unbound_abandoned_identity: 0,
+            predictive_unbound_abandoned_generation: 0,
             predictive_ready_overtaken_ready: 0,
             predictive_ready_overtaken_worker_queued: 0,
             predictive_ready_other_safe_abandonment: 0,
@@ -1957,6 +1993,64 @@ impl NativeFramePacing {
     pub(crate) fn note_render_ahead_ready(&mut self, now_ns: u64) {
         self.note_ready_frame(now_ns, true);
     }
+
+    pub(crate) fn note_predictive_binding_after_predecessor_pageflip(
+        &mut self,
+        advanced_intervals: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.predictive_bound_after_predecessor_pageflip = self
+            .predictive_bound_after_predecessor_pageflip
+            .saturating_add(1);
+        self.predictive_binding_advanced_intervals = self
+            .predictive_binding_advanced_intervals
+            .saturating_add(advanced_intervals);
+    }
+
+    pub(crate) fn note_predictive_unbound_created(&mut self) {
+        if self.enabled {
+            self.predictive_unbound_created = self.predictive_unbound_created.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_predictive_unbound_ready(&mut self) {
+        if self.enabled {
+            self.predictive_unbound_ready = self.predictive_unbound_ready.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_predictive_binding_after_render_completion(
+        &mut self,
+        advanced_intervals: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.predictive_bound_after_render_completion = self
+            .predictive_bound_after_render_completion
+            .saturating_add(1);
+        self.predictive_binding_advanced_intervals = self
+            .predictive_binding_advanced_intervals
+            .saturating_add(advanced_intervals);
+    }
+
+    pub(crate) fn note_predictive_unbound_abandoned_identity(&mut self) {
+        if self.enabled {
+            self.predictive_unbound_abandoned_identity =
+                self.predictive_unbound_abandoned_identity.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_predictive_unbound_abandoned_generation(&mut self) {
+        if self.enabled {
+            self.predictive_unbound_abandoned_generation = self
+                .predictive_unbound_abandoned_generation
+                .saturating_add(1);
+        }
+    }
+
     pub(crate) fn note_ready_frame(&mut self, now_ns: u64, waits_for_target: bool) {
         if !self.enabled {
             return;
@@ -2826,6 +2920,31 @@ impl NativeFramePacing {
                 ),
                 PacingField::u64("predictive_ready_submits", self.predictive_ready_submits),
                 PacingField::u64("predictive_ready_created", self.predictive_ready_created),
+                PacingField::u64(
+                    "predictive_unbound_created",
+                    self.predictive_unbound_created,
+                ),
+                PacingField::u64("predictive_unbound_ready", self.predictive_unbound_ready),
+                PacingField::u64(
+                    "predictive_bound_after_predecessor_pageflip",
+                    self.predictive_bound_after_predecessor_pageflip,
+                ),
+                PacingField::u64(
+                    "predictive_bound_after_render_completion",
+                    self.predictive_bound_after_render_completion,
+                ),
+                PacingField::u64(
+                    "predictive_binding_advanced_intervals",
+                    self.predictive_binding_advanced_intervals,
+                ),
+                PacingField::u64(
+                    "predictive_unbound_abandoned_identity",
+                    self.predictive_unbound_abandoned_identity,
+                ),
+                PacingField::u64(
+                    "predictive_unbound_abandoned_generation",
+                    self.predictive_unbound_abandoned_generation,
+                ),
                 PacingField::u64(
                     "predictive_ready_submitted",
                     self.predictive_ready_submitted,

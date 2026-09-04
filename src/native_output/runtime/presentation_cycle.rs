@@ -1140,6 +1140,9 @@ impl NativeRuntime {
                             > 0)
                         .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
                         .transpose()?;
+                        if render_ahead {
+                            frame_pacing.note_predictive_unbound_created();
+                        }
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -1153,6 +1156,7 @@ impl NativeRuntime {
                             frame_target,
                             submit_window,
                             pacing_mode,
+                            render_ahead,
                             desired_credit,
                             o1_admission,
                             cursor_assignment,
@@ -1250,7 +1254,12 @@ impl NativeRuntime {
                                 });
                             }
                             #[rustfmt::skip]
-                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot } => {
+                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
+                                if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
+                                    frame_pacing.note_predictive_binding_after_render_completion(
+                                        advanced_intervals,
+                                    );
+                                }
                                 let _ = arm_composited_dmabuf_release(
                                     dmabuf_gpu_release_registry,
                                     server,
@@ -1301,9 +1310,43 @@ impl NativeRuntime {
                                     atomic_commit_arbiter.atomic_commit_pending(),
                                     can_queue_worker_next,
                                 );
-                                if waits_for_target {
+                                let mut deferred_o1_safely_abandoned = false;
+                                if let Some(failure) = deferred_o1_binding_failure {
+                                    debug_assert!(render_ahead && waits_for_target);
                                     server.note_frame_callbacks_deferred_ready(protocol_batch_id);
-                                    frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
+                                    frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                    match failure {
+                                        DeferredO1BindingFailure::IdentityMismatch => {
+                                            frame_pacing.note_predictive_unbound_abandoned_identity();
+                                        }
+                                        DeferredO1BindingFailure::GenerationMismatch => {
+                                            frame_pacing.note_predictive_unbound_abandoned_generation();
+                                        }
+                                    }
+                                    let owner = explicit.swapchain()?.ready_identity().ok_or_else(
+                                        || {
+                                            io::Error::other(
+                                                "stale deferred O1 binding has no ready frame to abandon",
+                                            )
+                                        },
+                                    )?;
+                                    super::cycle::abandon_overtaken_ready(
+                                        explicit,
+                                        owner,
+                                        scene_history,
+                                        frame_pacing,
+                                        frame_scheduler,
+                                        server,
+                                        output_transactions,
+                                        MonotonicTimestampNs::new(ready_at_ns),
+                                    )?;
+                                    deferred_o1_safely_abandoned = true;
+                                } else if waits_for_target {
+                                    server.note_frame_callbacks_deferred_ready(protocol_batch_id);
+                                    frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                    if render_ahead {
+                                        frame_pacing.note_predictive_unbound_ready();
+                                    }
                                 } else {
                                     #[rustfmt::skip] let async_render_fence_ready = super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)?;
                                     if !async_render_fence_ready {
@@ -1426,7 +1469,7 @@ impl NativeRuntime {
                                         PacingField::bool("render_ahead", render_ahead),
                                     ],
                                 );
-                                *queued_redraw_requested = false;
+                                *queued_redraw_requested = deferred_o1_safely_abandoned;
                                 *last_rendered_scene_generation = scene_generation;
                                 if !waits_for_target && !worker_mode {
                                     *last_submitted_cursor_epoch = cursor_epoch;

@@ -646,6 +646,7 @@ pub struct CompositorState {
     // Monotonic damage-accounting baseline. NoVisualChange may advance it
     // without asserting that a physical output presentation occurred.
     presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
+    presented_surface_commit_generations: HashMap<u32, u64>,
     surface_presentation_generations: HashMap<u32, u64>,
     next_surface_presentation_generation: u64,
     surface_publications: HashMap<u32, SurfacePublicationState>,
@@ -802,6 +803,18 @@ pub(crate) struct SurfacePresentationKey {
     generation: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfacePresentationChange {
+    Unchanged,
+    Advanced,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceDamageSample {
+    key: SurfacePresentationKey,
+    commit: SurfaceCommitCounter,
+    change: SurfacePresentationChange,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceDamageSettlement {
     Presented,
     NoVisualChange,
@@ -809,7 +822,7 @@ pub(crate) enum SurfaceDamageSettlement {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceDamagePresentation {
-    sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
+    sampled_commits: Vec<SurfaceDamageSample>,
 }
 
 impl SurfaceDamagePresentation {
@@ -820,15 +833,29 @@ impl SurfaceDamagePresentation {
     pub fn contains_surface_id(&self, surface_id: u32) -> bool {
         self.sampled_commits
             .iter()
-            .any(|(key, _)| key.surface_id == surface_id)
+            .any(|sample| sample.key.surface_id == surface_id)
     }
 
     pub fn is_exclusive_surface_id(&self, surface_id: u32) -> bool {
+        self.is_exclusive_surface_id_excluding(surface_id, None)
+    }
+
+    pub fn is_exclusive_surface_id_excluding(
+        &self,
+        surface_id: u32,
+        ignored_surface_id: Option<u32>,
+    ) -> bool {
         !self.sampled_commits.is_empty()
-            && self
-                .sampled_commits
-                .iter()
-                .all(|(key, _)| key.surface_id == surface_id)
+            && self.sampled_commits.iter().any(|sample| {
+                sample.key.surface_id == surface_id
+                    && sample.change == SurfacePresentationChange::Advanced
+            })
+            && self.sampled_commits.iter().all(|sample| {
+                sample.key.surface_id == ignored_surface_id.unwrap_or(u32::MAX)
+                    || (sample.key.surface_id == surface_id
+                        && sample.change == SurfacePresentationChange::Advanced)
+                    || sample.change == SurfacePresentationChange::Unchanged
+            })
     }
 }
 
@@ -837,8 +864,18 @@ impl SurfaceDamagePresentation {
     pub(crate) fn sampled_surface_ids_for_test(&self) -> Vec<u32> {
         self.sampled_commits
             .iter()
-            .map(|(key, _)| key.surface_id)
+            .map(|sample| sample.key.surface_id)
             .collect()
+    }
+
+    pub(crate) fn surface_change_for_id(
+        &self,
+        surface_id: u32,
+    ) -> Option<SurfacePresentationChange> {
+        self.sampled_commits
+            .iter()
+            .find(|sample| sample.key.surface_id == surface_id)
+            .map(|sample| sample.change)
     }
 }
 #[derive(Debug, Clone)]

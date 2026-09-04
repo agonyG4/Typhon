@@ -6,6 +6,7 @@ mod cycle_direct;
 pub(super) mod direct_fallback;
 #[path = "cycle/pageflip.rs"]
 mod pageflip;
+pub(super) use pageflip::abandon_overtaken_ready;
 pub fn run(
     server: OwnCompositorServer,
     app: Vec<String>,

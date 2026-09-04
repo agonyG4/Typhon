@@ -7,7 +7,11 @@ use oblivion_one::compositor::{
     SurfaceDamagePresentation,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
-use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use oblivion_one::native::kms::PageFlipToken;
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+    TargetSelectionEvidence,
+};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use super::async_validation::CompositedAsyncValidationKey;
@@ -107,6 +111,101 @@ pub(crate) enum OutputTransactionBuildError {
     DirectSurfaceForCompositedContent,
     DirectSurfaceForPlaneDelta,
     OverlayAssignmentsUnsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct O1PredecessorAnchor {
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) pool_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct O1PrepareIntent {
+    pub(crate) output_generation: u64,
+    pub(crate) predecessor: O1PredecessorAnchor,
+    pub(crate) predicted_sequence: u64,
+    pub(crate) predicted_presentation_time: MonotonicTimestampNs,
+    pub(crate) render_start_deadline: MonotonicTimestampNs,
+    pub(crate) refresh_interval: std::time::Duration,
+    pub(crate) reason: PresentationTargetReason,
+    pub(crate) clock_generation: u64,
+    pub(crate) estimated: bool,
+    pub(crate) predicted_unreachable: bool,
+    pub(crate) selection_evidence: TargetSelectionEvidence,
+}
+
+impl O1PrepareIntent {
+    pub(crate) const fn from_target(
+        target: PresentationTarget,
+        output_generation: u64,
+        predecessor: O1PredecessorAnchor,
+    ) -> Self {
+        Self {
+            output_generation,
+            predecessor,
+            predicted_sequence: target.sequence,
+            predicted_presentation_time: target.presentation_time,
+            render_start_deadline: target.render_start_deadline,
+            refresh_interval: target.refresh_interval,
+            reason: target.reason,
+            clock_generation: target.clock_generation,
+            estimated: target.estimated,
+            predicted_unreachable: target.predicted_unreachable,
+            selection_evidence: target.selection_evidence,
+        }
+    }
+
+    pub(crate) fn bind_target(
+        self,
+        claim: PrimaryRefreshClaim,
+        submit_not_before: MonotonicTimestampNs,
+    ) -> PresentationTarget {
+        PresentationTarget {
+            sequence: claim.sequence,
+            presentation_time: claim.presentation_time,
+            submit_not_before,
+            render_start_deadline: submit_not_before,
+            refresh_interval: self.refresh_interval,
+            reason: self.reason,
+            clock_generation: claim.clock_generation,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: claim,
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: claim.sequence,
+                binding: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePresentationReservation {
+    Bound(PresentationTarget),
+    DeferredO1(O1PrepareIntent),
+}
+
+impl FramePresentationReservation {
+    pub(crate) const fn bound_target(self) -> Option<PresentationTarget> {
+        match self {
+            Self::Bound(target) => Some(target),
+            Self::DeferredO1(_) => None,
+        }
+    }
+
+    pub(crate) const fn is_deferred_o1(self) -> bool {
+        matches!(self, Self::DeferredO1(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePresentationBindingError {
+    NotDeferred,
+    GenerationMismatch,
+    ClockGenerationMismatch,
+    PredecessorMismatch,
 }
 
 impl fmt::Display for OutputTransactionBuildError {
@@ -286,7 +385,7 @@ pub(crate) struct OutputTransaction {
     id: OutputTransactionId,
     output_generation: u64,
     created_at: MonotonicTimestampNs,
-    target: PresentationTarget,
+    reservation: FramePresentationReservation,
     pacing_mode: NativeOutputPacingMode,
     presentation_mode: OutputPresentationMode,
     content_type: DrmContentType,
@@ -351,7 +450,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            FramePresentationReservation::Bound(target),
             pacing_mode,
             OutputTransactionContent::Composited {
                 frame_id,
@@ -394,7 +493,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            FramePresentationReservation::Bound(target),
             pacing_mode,
             OutputTransactionContent::Direct { frame_id, key },
             OutputPlanePlan::new(
@@ -407,6 +506,49 @@ impl OutputTransaction {
             )?,
             OutputSynchronizationPlan::new(OutputAcquirePlan::ClientContentAlreadyReady, release),
             OutputProtocolObligations::direct(frame_batch_id, direct_surface_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn composited_deferred_o1(
+        id: OutputTransactionId,
+        output_generation: u64,
+        created_at: MonotonicTimestampNs,
+        intent: O1PrepareIntent,
+        pacing_mode: NativeOutputPacingMode,
+        frame_id: u64,
+        render_generation: u64,
+        pool_generation: u64,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        cursor: Option<CursorPlaneAssignment>,
+        frame_batch_id: CompositorFrameBatchId,
+    ) -> Result<Self, OutputTransactionBuildError> {
+        Self::build(
+            id,
+            output_generation,
+            created_at,
+            FramePresentationReservation::DeferredO1(intent),
+            pacing_mode,
+            OutputTransactionContent::Composited {
+                frame_id,
+                render_generation,
+                pool_generation,
+                equivalent_direct_key: None,
+            },
+            OutputPlanePlan::new(
+                PrimaryPlaneAssignment::CompositorFramebuffer {
+                    slot,
+                    framebuffer_id,
+                },
+                cursor.unwrap_or(CursorPlaneAssignment::Unchanged),
+                Vec::new(),
+            )?,
+            OutputSynchronizationPlan::new(
+                OutputAcquirePlan::RenderFence,
+                OutputReleasePlan::OutFenceThenPageflip,
+            ),
+            OutputProtocolObligations::composited(frame_batch_id),
         )
     }
 
@@ -427,7 +569,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            FramePresentationReservation::Bound(target),
             pacing_mode,
             OutputTransactionContent::Composited {
                 frame_id,
@@ -459,7 +601,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            FramePresentationReservation::Bound(target),
             pacing_mode,
             OutputTransactionContent::CompatibilityImmediate { frame_id },
             OutputPlanePlan::new(
@@ -516,7 +658,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            FramePresentationReservation::Bound(target),
             pacing_mode,
             OutputTransactionContent::PlaneDelta {
                 changed,
@@ -540,7 +682,7 @@ impl OutputTransaction {
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
-        target: PresentationTarget,
+        reservation: FramePresentationReservation,
         pacing_mode: NativeOutputPacingMode,
         content: OutputTransactionContent,
         planes: OutputPlanePlan,
@@ -609,7 +751,7 @@ impl OutputTransaction {
             id,
             output_generation,
             created_at,
-            target,
+            reservation,
             pacing_mode,
             presentation_mode: OutputPresentationMode::Vsync,
             content_type: DrmContentType::Graphics,
@@ -634,8 +776,30 @@ impl OutputTransaction {
         self.created_at
     }
 
-    pub(crate) const fn target(&self) -> PresentationTarget {
-        self.target
+    pub(crate) const fn reservation(&self) -> FramePresentationReservation {
+        self.reservation
+    }
+
+    pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
+        self.reservation.bound_target()
+    }
+
+    pub(crate) fn bind_deferred_o1(
+        &mut self,
+        claim: PrimaryRefreshClaim,
+        bind_at: MonotonicTimestampNs,
+    ) -> Result<(), FramePresentationBindingError> {
+        let FramePresentationReservation::DeferredO1(intent) = self.reservation else {
+            return Err(FramePresentationBindingError::NotDeferred);
+        };
+        if intent.output_generation != self.output_generation {
+            return Err(FramePresentationBindingError::GenerationMismatch);
+        }
+        if claim.clock_generation != intent.clock_generation {
+            return Err(FramePresentationBindingError::ClockGenerationMismatch);
+        }
+        self.reservation = FramePresentationReservation::Bound(intent.bind_target(claim, bind_at));
+        Ok(())
     }
 
     pub(crate) const fn pacing_mode(&self) -> NativeOutputPacingMode {
@@ -870,5 +1034,83 @@ pub(crate) fn classify_direct_content(
         DirectContentDisposition::MatchesQueuedOrSubmitted
     } else {
         DirectContentDisposition::NewContent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn target() -> PresentationTarget {
+        let presentation_time = MonotonicTimestampNs::new(12_121_212);
+        PresentationTarget {
+            sequence: 2,
+            presentation_time,
+            submit_not_before: MonotonicTimestampNs::new(11_621_212),
+            render_start_deadline: MonotonicTimestampNs::new(11_621_212),
+            refresh_interval: Duration::from_nanos(6_060_606),
+            reason: PresentationTargetReason::PredictedPressure,
+            clock_generation: 3,
+            estimated: true,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time,
+                clock_generation: 3,
+            },
+            selection_evidence: TargetSelectionEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn deferred_o1_binding_creates_exact_claim_once() {
+        let intent = O1PrepareIntent::from_target(
+            target(),
+            7,
+            O1PredecessorAnchor {
+                frame_id: 11,
+                transaction_id: OutputTransactionId::new(
+                    NonZeroU64::new(12).expect("test transaction ID"),
+                ),
+                token: PageFlipToken::new(13).expect("test pageflip token"),
+                pool_generation: 7,
+            },
+        );
+        let id = OutputTransactionId::new(NonZeroU64::new(14).expect("test transaction ID"));
+        let frame_batch_id =
+            CompositorFrameBatchId::new(NonZeroU64::new(15).expect("test frame batch ID"));
+        let mut transaction = OutputTransaction::composited_deferred_o1(
+            id,
+            7,
+            MonotonicTimestampNs::new(1),
+            intent,
+            NativeOutputPacingMode::PredictiveTriple,
+            16,
+            1,
+            7,
+            OutputSlotId::new(1).expect("test output slot"),
+            42,
+            None,
+            frame_batch_id,
+        )
+        .expect("deferred transaction");
+        assert!(transaction.bound_target().is_none());
+
+        let claim = PrimaryRefreshClaim {
+            sequence: 3,
+            presentation_time: MonotonicTimestampNs::new(18_181_818),
+            clock_generation: 3,
+        };
+        transaction
+            .bind_deferred_o1(claim, MonotonicTimestampNs::new(17_681_818))
+            .expect("deferred transaction binds");
+        assert_eq!(transaction.bound_target().unwrap().physical_claim(), claim);
+        assert_eq!(
+            transaction
+                .bind_deferred_o1(claim, MonotonicTimestampNs::new(17_681_818))
+                .unwrap_err(),
+            FramePresentationBindingError::NotDeferred
+        );
     }
 }

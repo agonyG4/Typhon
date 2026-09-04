@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use super::transaction::{OutputTransaction, OutputTransactionContent, OutputTransactionId};
+use super::transaction::{
+    FramePresentationBindingError, OutputTransaction, OutputTransactionContent, OutputTransactionId,
+};
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::OutputPresentationMode;
 use oblivion_one::compositor::SurfaceDamagePresentation;
@@ -15,6 +17,9 @@ pub(crate) const DEFAULT_OUTPUT_TRANSACTION_HISTORY_CAPACITY: usize = 512;
 pub(crate) enum OutputTransactionState {
     Built,
     Ready {
+        ready_at: MonotonicTimestampNs,
+    },
+    ReadyUnbound {
         ready_at: MonotonicTimestampNs,
     },
     Queued {
@@ -117,6 +122,7 @@ pub(crate) enum OutputTransactionFailureStage {
 pub(crate) enum OutputTransactionStateKind {
     Built,
     Ready,
+    ReadyUnbound,
     Queued,
     Submitted,
     Settling,
@@ -128,6 +134,7 @@ impl OutputTransactionState {
         match self {
             Self::Built => OutputTransactionStateKind::Built,
             Self::Ready { .. } => OutputTransactionStateKind::Ready,
+            Self::ReadyUnbound { .. } => OutputTransactionStateKind::ReadyUnbound,
             Self::Queued { .. } => OutputTransactionStateKind::Queued,
             Self::Submitted { .. } => OutputTransactionStateKind::Submitted,
             Self::Settling { .. } => OutputTransactionStateKind::Settling,
@@ -159,6 +166,7 @@ pub(crate) enum OutputTransactionError {
     },
     TokenMismatch,
     GenerationMismatch,
+    DeferredBindingRejected,
     FailureStageMismatch {
         state: OutputTransactionStateKind,
         stage: OutputTransactionFailureStage,
@@ -397,6 +405,53 @@ impl OutputTransactionLedger {
             Ok(())
         })?;
         self.counters.ready = self.counters.ready.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn mark_ready_unbound(
+        &mut self,
+        id: OutputTransactionId,
+        ready_at: MonotonicTimestampNs,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(state, OutputTransactionState::Built) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
+        }
+        self.transition(id, OutputTransactionTransitionKind::Ready, |state| {
+            *state = OutputTransactionState::ReadyUnbound { ready_at };
+            Ok(())
+        })?;
+        self.counters.ready = self.counters.ready.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn bind_deferred_o1(
+        &mut self,
+        id: OutputTransactionId,
+        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(state, OutputTransactionState::ReadyUnbound { .. }) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
+        }
+        let record = self
+            .active
+            .get_mut(&id)
+            .expect("ready-unbound transaction was observed above");
+        record
+            .descriptor
+            .bind_deferred_o1(target.physical_claim(), target.submit_not_before())
+            .map_err(|error| match error {
+                FramePresentationBindingError::GenerationMismatch
+                | FramePresentationBindingError::ClockGenerationMismatch
+                | FramePresentationBindingError::NotDeferred
+                | FramePresentationBindingError::PredecessorMismatch => {
+                    OutputTransactionError::DeferredBindingRejected
+                }
+            })?;
+        record.state = OutputTransactionState::Ready {
+            ready_at: target.render_start_deadline(),
+        };
         Ok(())
     }
 
@@ -1313,6 +1368,12 @@ const fn failure_stage_is_compatible(
             OutputTransactionFailureStage::KmsSubmit
                 | OutputTransactionFailureStage::BackendOwnershipTransfer
         ),
+        OutputTransactionStateKind::ReadyUnbound => matches!(
+            stage,
+            OutputTransactionFailureStage::OutputLost
+                | OutputTransactionFailureStage::SessionLost
+                | OutputTransactionFailureStage::ShutdownAbandonment
+        ),
         OutputTransactionStateKind::Queued => matches!(
             stage,
             OutputTransactionFailureStage::KmsSubmit
@@ -1380,6 +1441,7 @@ const fn physical_terminal_for(
             Some(
                 OutputTransactionState::Built
                 | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::ReadyUnbound { .. }
                 | OutputTransactionState::Queued { .. },
             ) => Some(OutputPhysicalTerminal::NoPageflip {
                 reason: OutputNoPageflipReason::SubmissionRejected,
