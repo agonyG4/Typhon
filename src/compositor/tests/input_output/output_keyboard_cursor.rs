@@ -1,4 +1,5 @@
 use super::*;
+use xkbcommon::xkb;
 #[test]
 fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
     let socket_name = unique_socket_name();
@@ -399,6 +400,8 @@ fn wayland_client_receives_keyboard_keymap_when_requested() {
     let state = state.unwrap();
     assert!(state.keyboard_keymap);
     assert!(state.keyboard_repeat_info);
+    assert_eq!(state.keyboard_repeat_rates, vec![25]);
+    assert_eq!(state.keyboard_repeat_delays, vec![600]);
 }
 
 #[test]
@@ -444,6 +447,9 @@ fn mapped_toplevel_receives_keyboard_focus_before_first_key() {
     let state = state.unwrap();
     assert_eq!(state.keyboard_enter_count, 1);
     assert!(!state.keyboard_key);
+    assert_eq!(state.keyboard_mods_latched, vec![0]);
+    assert_eq!(state.keyboard_mods_locked, vec![0]);
+    assert_eq!(state.keyboard_groups, vec![0]);
     assert_eq!(
         state
             .keyboard_event_log
@@ -471,8 +477,6 @@ fn tab_after_initial_focus_is_only_a_key_event() {
 
 #[test]
 fn wayland_client_receives_control_modifier_before_modified_key() {
-    const CONTROL_MODIFIER_MASK: u32 = 1 << 2;
-
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -483,11 +487,41 @@ fn wayland_client_receives_control_modifier_before_modified_key() {
 
     let state = state.unwrap();
     assert_eq!(state.keyboard_keys, vec![29, 30]);
+    let keymap_text = std::ffi::CStr::from_bytes_with_nul(&state.keyboard_keymap_bytes)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_text.to_string(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    let control_index = keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+    assert_ne!(control_index, xkb::MOD_INVALID);
+    let control_mask = 1u32.checked_shl(control_index).unwrap();
     assert!(
         state
             .keyboard_mods_depressed
-            .contains(&CONTROL_MODIFIER_MASK)
+            .iter()
+            .any(|mask| mask & control_mask != 0)
     );
+    let key_index = state
+        .keyboard_event_log
+        .iter()
+        .position(|event| *event == "keyboard_key")
+        .unwrap();
+    let modifiers_index = state
+        .keyboard_event_log
+        .iter()
+        .enumerate()
+        .skip(key_index + 1)
+        .find(|(_, event)| **event == "keyboard_modifiers")
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(key_index < modifiers_index);
 }
 
 #[test]
@@ -1241,5 +1275,19 @@ fn xkb_v1_keymap_is_nul_terminated() {
             &state.keyboard_keymap_bytes[..state.keyboard_keymap_bytes.len() - 1]
         )
         .contains("xkb_keymap")
+    );
+    let keymap_text = std::ffi::CStr::from_bytes_with_nul(&state.keyboard_keymap_bytes)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    assert!(
+        xkb::Keymap::new_from_string(
+            &context,
+            keymap_text.to_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .is_some()
     );
 }

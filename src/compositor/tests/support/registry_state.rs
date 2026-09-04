@@ -47,7 +47,12 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) keyboard_keymap_bytes: Vec<u8>,
     pub(in crate::compositor::tests) keyboard_keymap_size: u32,
     pub(in crate::compositor::tests) keyboard_mods_depressed: Vec<u32>,
+    pub(in crate::compositor::tests) keyboard_mods_latched: Vec<u32>,
+    pub(in crate::compositor::tests) keyboard_mods_locked: Vec<u32>,
+    pub(in crate::compositor::tests) keyboard_groups: Vec<u32>,
     pub(in crate::compositor::tests) keyboard_repeat_info: bool,
+    pub(in crate::compositor::tests) keyboard_repeat_rates: Vec<i32>,
+    pub(in crate::compositor::tests) keyboard_repeat_delays: Vec<i32>,
     pub(in crate::compositor::tests) pointer_enter: bool,
     pub(in crate::compositor::tests) pointer_enter_count: usize,
     pub(in crate::compositor::tests) pointer_leave_count: usize,
@@ -1059,6 +1064,7 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
             }
             client_wl_keyboard::Event::Keymap { fd, size, .. } => {
                 state.keyboard_keymap = true;
+                state.keyboard_event_log.push("keyboard_keymap");
                 state.keyboard_keymap_size = size;
                 let mut bytes = vec![0; size as usize];
                 let mut file = File::from(fd);
@@ -1071,15 +1077,27 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
                 state.keyboard_keys.push(key);
                 state.keyboard_event_log.push("keyboard_key");
             }
-            client_wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+            client_wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
                 state.keyboard_mods_depressed.push(mods_depressed);
+                state.keyboard_mods_latched.push(mods_latched);
+                state.keyboard_mods_locked.push(mods_locked);
+                state.keyboard_groups.push(group);
                 state.keyboard_event_log.push("keyboard_modifiers");
                 state
                     .event_timeline
                     .push(TestWaylandEvent::KeyboardModifiers);
             }
-            client_wl_keyboard::Event::RepeatInfo { .. } => {
+            client_wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.keyboard_repeat_info = true;
+                state.keyboard_repeat_rates.push(rate);
+                state.keyboard_repeat_delays.push(delay);
+                state.keyboard_event_log.push("keyboard_repeat_info");
             }
             _ => {}
         }
