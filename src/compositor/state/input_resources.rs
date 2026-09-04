@@ -1,30 +1,19 @@
 use super::*;
 
 impl CompositorState {
-    pub(in crate::compositor) fn ensure_keyboard_state(&mut self) {
-        if self.keyboard_state.is_none() {
-            self.keyboard_state = XkbKeyboardState::from_environment();
-            if self.keyboard_state.is_none() {
-                eprintln!("oblivion-one compositor: no usable libxkbcommon keyboard configuration");
-            }
-        }
+    pub(in crate::compositor) fn ensure_keyboard_state(&mut self) -> bool {
+        self.keyboard_state.ensure()
     }
 
     fn keyboard_serialized_state(&self) -> KeyboardSerializedState {
-        self.keyboard_state
-            .as_ref()
-            .map(XkbKeyboardState::serialized_state)
-            .unwrap_or_default()
+        self.keyboard_state.serialized_state().unwrap_or_default()
     }
 
     pub(in crate::compositor) fn send_keyboard_initial_state(
         &mut self,
         keyboard: &wl_keyboard::WlKeyboard,
-    ) {
-        self.ensure_keyboard_state();
-        if let Some(state) = self.keyboard_state.as_ref() {
-            state.send_initial_state(keyboard);
-        }
+    ) -> bool {
+        self.ensure_keyboard_state() && self.keyboard_state.send_initial_state(keyboard)
     }
 
     pub(in crate::compositor) fn clear_pointer_button_state_for_removed_surfaces(
@@ -314,16 +303,15 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
+        if !self.ensure_keyboard_state() {
+            return;
+        }
         if pressed {
             self.pressed_keys.insert(key);
         } else {
             self.pressed_keys.remove(&key);
         }
-        self.ensure_keyboard_state();
-        let modifiers_changed = self
-            .keyboard_state
-            .as_mut()
-            .is_some_and(|state| state.update_key(key, pressed));
+        let modifiers_changed = self.keyboard_state.update_key(key, pressed);
         let Some(surface) = self.focused_surface.clone() else {
             return;
         };

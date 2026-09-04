@@ -1,8 +1,11 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     env, fmt,
     fs::{self, File, OpenOptions},
     io::{self, Seek, Write},
     os::fd::AsFd,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use wayland_server::{Resource, WEnum, protocol::wl_keyboard};
@@ -29,8 +32,8 @@ impl Default for KeyboardConfig {
         Self {
             rules: None,
             model: None,
-            layout: "br".to_string(),
-            variant: Some("abnt2".to_string()),
+            layout: DEFAULT_LAYOUT.to_string(),
+            variant: Some(DEFAULT_VARIANT.to_string()),
             options: None,
             repeat_rate: 25,
             repeat_delay: 600,
@@ -41,11 +44,15 @@ impl Default for KeyboardConfig {
 impl KeyboardConfig {
     pub(super) fn from_env() -> Self {
         let default = Self::default();
+        let layout_override = env_override("OBLIVION_ONE_XKB_LAYOUT");
+        let variant_override = env_override("OBLIVION_ONE_XKB_VARIANT");
+        let (layout, variant) =
+            resolve_layout_variant(layout_override.as_deref(), variant_override.as_deref());
         Self {
             rules: optional_env("OBLIVION_ONE_XKB_RULES"),
             model: optional_env("OBLIVION_ONE_XKB_MODEL"),
-            layout: optional_env("OBLIVION_ONE_XKB_LAYOUT").unwrap_or(default.layout),
-            variant: optional_env("OBLIVION_ONE_XKB_VARIANT").or(default.variant),
+            layout,
+            variant,
             options: optional_env("OBLIVION_ONE_XKB_OPTIONS").or(default.options),
             repeat_rate: non_negative_env_i32("OBLIVION_ONE_XKB_REPEAT_RATE", default.repeat_rate),
             repeat_delay: non_negative_env_i32(
@@ -63,6 +70,26 @@ impl KeyboardConfig {
             ..Self::default()
         }
     }
+}
+
+const DEFAULT_LAYOUT: &str = "br";
+const DEFAULT_VARIANT: &str = "abnt2";
+
+fn resolve_layout_variant(
+    layout_override: Option<&str>,
+    variant_override: Option<&str>,
+) -> (String, Option<String>) {
+    let layout = layout_override.unwrap_or(DEFAULT_LAYOUT).to_string();
+    let variant = match variant_override {
+        Some(variant) => Some(variant.to_string()),
+        None if layout_override.is_none() => Some(DEFAULT_VARIANT.to_string()),
+        None => None,
+    };
+    (layout, variant)
+}
+
+fn env_override(name: &str) -> Option<String> {
+    env::var(name).ok()
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -94,11 +121,30 @@ pub(super) struct XkbKeyboardState {
     serialized_keymap_v1: Vec<u8>,
 }
 
-// SAFETY: the keymap and state are uniquely owned by CompositorState and are
-// accessed only by the compositor's single event thread. OwnCompositorServer
-// is constructed before that thread starts and then moved into it; no XKB
-// object is ever shared concurrently or accessed through a second owner.
-unsafe impl Send for XkbKeyboardState {}
+#[derive(Debug, Default)]
+pub(super) struct KeyboardStateHandle {
+    status: KeyboardStateStatus,
+}
+
+#[derive(Debug, Default)]
+enum KeyboardStateStatus {
+    #[default]
+    Uninitialized,
+    Ready(u64),
+    Failed,
+}
+
+static NEXT_KEYBOARD_STATE_ID: AtomicU64 = AtomicU64::new(1);
+
+// xkbcommon intentionally keeps its keymap and state wrappers !Send and !Sync.
+// Store the actual objects in the owning compositor thread's TLS and keep only
+// a sendable identity in CompositorState. The identity is created lazily after
+// a test/runtime server has reached its compositor thread; using it elsewhere
+// fails closed instead of moving an XKB object across threads.
+thread_local! {
+    static KEYBOARD_STATES: RefCell<HashMap<u64, XkbKeyboardState>> =
+        RefCell::new(HashMap::new());
+}
 
 impl fmt::Debug for XkbKeyboardState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -163,23 +209,35 @@ impl XkbKeyboardState {
         })
     }
 
-    pub(super) fn from_environment() -> Option<Self> {
+    pub(super) fn from_environment() -> Result<Self, String> {
         let requested = KeyboardConfig::from_env();
-        let candidates = [
+        Self::from_candidates([
             ("requested", requested),
             ("baseline", KeyboardConfig::default()),
             ("minimal us", KeyboardConfig::minimal_us()),
-        ];
+        ])
+    }
+
+    fn from_candidates<'a>(
+        candidates: impl IntoIterator<Item = (&'a str, KeyboardConfig)>,
+    ) -> Result<Self, String> {
+        let mut failures = Vec::new();
         for (label, config) in candidates {
             match Self::from_config(&config) {
-                Ok(state) => return Some(state),
-                Err(error) => eprintln!(
-                    "oblivion-one compositor: failed {label} keyboard configuration ({}): {error}",
-                    describe_config(&config)
-                ),
+                Ok(state) => return Ok(state),
+                Err(error) => {
+                    eprintln!(
+                        "oblivion-one compositor: failed {label} keyboard configuration ({}): {error}",
+                        describe_config(&config)
+                    );
+                    failures.push(format!("{label}: {error}"));
+                }
             }
         }
-        None
+        Err(format!(
+            "all XKB keyboard configurations failed: {}",
+            failures.join("; ")
+        ))
     }
 
     pub(super) fn update_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
@@ -221,7 +279,7 @@ impl XkbKeyboardState {
         Ok((file, size))
     }
 
-    pub(super) fn send_initial_state(&self, keyboard: &wl_keyboard::WlKeyboard) {
+    pub(super) fn send_initial_state(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
         match self.keymap_file() {
             Ok((file, size)) => {
                 let _ = keyboard.send_event(wl_keyboard::Event::Keymap {
@@ -232,6 +290,7 @@ impl XkbKeyboardState {
             }
             Err(error) => {
                 eprintln!("oblivion-one compositor: failed to create keyboard keymap: {error}");
+                return false;
             }
         }
 
@@ -241,6 +300,7 @@ impl XkbKeyboardState {
                 delay: self.config.repeat_delay,
             });
         }
+        true
     }
 
     #[cfg(test)]
@@ -272,6 +332,104 @@ impl XkbKeyboardState {
     }
 }
 
+impl KeyboardStateHandle {
+    pub(super) fn ensure(&mut self) -> bool {
+        self.ensure_with(XkbKeyboardState::from_environment)
+    }
+
+    fn ensure_with<F>(&mut self, initialize: F) -> bool
+    where
+        F: FnOnce() -> Result<XkbKeyboardState, String>,
+    {
+        match self.status {
+            KeyboardStateStatus::Failed => return false,
+            KeyboardStateStatus::Ready(id) => {
+                let present = KEYBOARD_STATES.with(|states| states.borrow().contains_key(&id));
+                if !present {
+                    self.status = KeyboardStateStatus::Failed;
+                    eprintln!(
+                        "oblivion-one compositor: keyboard state was used outside its owning thread"
+                    );
+                }
+                return present;
+            }
+            KeyboardStateStatus::Uninitialized => {}
+        }
+
+        match initialize() {
+            Ok(state) => {
+                let id = NEXT_KEYBOARD_STATE_ID.fetch_add(1, Ordering::Relaxed);
+                KEYBOARD_STATES.with(|states| {
+                    states.borrow_mut().insert(id, state);
+                });
+                self.status = KeyboardStateStatus::Ready(id);
+                true
+            }
+            Err(error) => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!("oblivion-one compositor: keyboard initialization disabled: {error}");
+                false
+            }
+        }
+    }
+
+    pub(super) fn serialized_state(&self) -> Option<KeyboardSerializedState> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return None;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map(XkbKeyboardState::serialized_state)
+        })
+    }
+
+    pub(super) fn update_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        let changed = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(|state| state.update_key(evdev_key, pressed))
+        });
+        match changed {
+            Some(changed) => changed,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                false
+            }
+        }
+    }
+
+    pub(super) fn send_initial_state(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .is_some_and(|state| state.send_initial_state(keyboard))
+        })
+    }
+}
+
+impl Drop for KeyboardStateHandle {
+    fn drop(&mut self) {
+        if let KeyboardStateStatus::Ready(id) = self.status {
+            KEYBOARD_STATES.with(|states| {
+                states.borrow_mut().remove(&id);
+            });
+        }
+    }
+}
+
 fn describe_config(config: &KeyboardConfig) -> String {
     format!(
         "rules={:?}, model={:?}, layout={:?}, variant={:?}, options={:?}",
@@ -297,6 +455,56 @@ mod tests {
     }
 
     #[test]
+    fn layout_variant_resolution_distinguishes_absent_and_empty_overrides() {
+        assert_eq!(
+            resolve_layout_variant(None, None),
+            ("br".to_string(), Some("abnt2".to_string()))
+        );
+        assert_eq!(
+            resolve_layout_variant(Some("us"), None),
+            ("us".to_string(), None)
+        );
+        assert_eq!(
+            resolve_layout_variant(Some("br"), Some("abnt2")),
+            ("br".to_string(), Some("abnt2".to_string()))
+        );
+        assert_eq!(
+            resolve_layout_variant(Some("br,us"), Some("abnt2,")),
+            ("br,us".to_string(), Some("abnt2,".to_string()))
+        );
+        assert_eq!(
+            resolve_layout_variant(Some("br"), Some("")),
+            ("br".to_string(), Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn layout_only_us_override_compiles_without_inherited_variant() {
+        let (layout, variant) = resolve_layout_variant(Some("us"), None);
+        let config = KeyboardConfig {
+            layout,
+            variant,
+            ..KeyboardConfig::default()
+        };
+        let state = XkbKeyboardState::from_config(&config).unwrap();
+        assert_eq!(state.config.layout, "us");
+        assert_eq!(state.config.variant, None);
+    }
+
+    #[test]
+    fn explicitly_empty_variant_compiles_without_a_variant() {
+        let (layout, variant) = resolve_layout_variant(Some("br"), Some(""));
+        let config = KeyboardConfig {
+            layout,
+            variant,
+            ..KeyboardConfig::default()
+        };
+        let state = XkbKeyboardState::from_config(&config).unwrap();
+        assert_eq!(state.config.layout, "br");
+        assert_eq!(state.config.variant.as_deref(), Some(""));
+    }
+
+    #[test]
     fn rmlvo_compiles_multiple_layouts_without_manual_include_syntax() {
         let config = KeyboardConfig {
             layout: "br,us".into(),
@@ -317,6 +525,51 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn invalid_requested_configuration_uses_the_fallback_chain() {
+        let invalid = KeyboardConfig {
+            layout: "invalid\0".into(),
+            ..KeyboardConfig::default()
+        };
+        let state = XkbKeyboardState::from_candidates([
+            ("requested", invalid),
+            ("baseline", KeyboardConfig::default()),
+            ("minimal us", KeyboardConfig::minimal_us()),
+        ])
+        .unwrap();
+        assert_eq!(state.config, KeyboardConfig::default());
+    }
+
+    #[test]
+    fn all_failed_configurations_are_reported() {
+        let invalid = KeyboardConfig {
+            layout: "invalid\0".into(),
+            ..KeyboardConfig::default()
+        };
+        let error = XkbKeyboardState::from_candidates([
+            ("requested", invalid.clone()),
+            ("baseline", invalid.clone()),
+            ("minimal us", invalid),
+        ])
+        .unwrap_err();
+        assert!(error.contains("all XKB keyboard configurations failed"));
+    }
+
+    #[test]
+    fn permanent_keyboard_initialization_failure_is_not_retried() {
+        let mut handle = KeyboardStateHandle::default();
+        let mut attempts = 0;
+        assert!(!handle.ensure_with(|| {
+            attempts += 1;
+            Err("deterministic test failure".to_string())
+        }));
+        assert!(!handle.ensure_with(|| {
+            attempts += 1;
+            panic!("permanent failure must not retry initialization")
+        }));
+        assert_eq!(attempts, 1);
     }
 
     #[test]

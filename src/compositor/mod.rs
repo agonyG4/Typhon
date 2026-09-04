@@ -227,7 +227,7 @@ pub use interaction::{
     WindowInteractionKind, WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
     WindowInteractionReleaseMetrics,
 };
-use keyboard::{KeyboardSerializedState, XkbKeyboardState};
+use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -606,7 +606,7 @@ pub struct CompositorState {
     focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
     shortcut_inhibition: ShortcutInhibitionRegistry,
-    keyboard_state: Option<XkbKeyboardState>,
+    keyboard_state: KeyboardStateHandle,
     pressed_keys: HashSet<u32>,
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,
