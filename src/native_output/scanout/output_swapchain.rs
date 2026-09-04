@@ -1318,6 +1318,8 @@ impl AtomicOutputSwapchain {
         &self,
         output_generation: u64,
     ) -> DeferredO1BindingReadiness {
+        // A historical last-presented mismatch is not stale while the exact
+        // expected predecessor remains a live physical owner.
         let Some(ready) = self.ready.as_ref() else {
             return DeferredO1BindingReadiness::NotDeferred;
         };
@@ -1355,6 +1357,7 @@ impl AtomicOutputSwapchain {
 
     pub(crate) fn deferred_o1_binding_candidate(
         &self,
+        output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<
         Option<(
@@ -1364,7 +1367,7 @@ impl AtomicOutputSwapchain {
             u64,
         )>,
     > {
-        let readiness = self.deferred_o1_binding_readiness(self.pool_generation);
+        let readiness = self.deferred_o1_binding_readiness(output_generation);
         self.deferred_o1_binding_candidate_for_readiness(readiness, bind_at)
     }
 
@@ -2060,7 +2063,7 @@ mod tests {
             },
         );
         let (transaction_id, target, submit_window, advanced_intervals) = swapchain
-            .deferred_o1_binding_candidate(now(12_200_000))
+            .deferred_o1_binding_candidate(1, now(12_200_000))
             .expect("binding candidate lookup")
             .expect("deferred frame should bind");
         assert_eq!(target.physical_claim().sequence, 3);
@@ -2107,7 +2110,7 @@ mod tests {
         );
 
         let (_, target, _, advanced_intervals) = swapchain
-            .deferred_o1_binding_candidate(now(18_200_000))
+            .deferred_o1_binding_candidate(1, now(18_200_000))
             .expect("binding candidate lookup")
             .expect("deferred frame should skip stale successor");
         assert_eq!(target.physical_claim().sequence, 4);
@@ -2141,7 +2144,7 @@ mod tests {
 
         complete_physical_predecessor(&mut swapchain, predecessor_token, predecessor_claim);
         let (_, target, _, advanced_intervals) = swapchain
-            .deferred_o1_binding_candidate(now(18_200_000))
+            .deferred_o1_binding_candidate(1, now(18_200_000))
             .expect("binding candidate lookup")
             .expect("deferred frame should bind after a multi-refresh miss");
         assert_eq!(target.physical_claim().sequence, 4);
@@ -2227,7 +2230,7 @@ mod tests {
             assert_eq!(swapchain.deferred_o1_binding_failure(1), None);
             assert!(
                 swapchain
-                    .deferred_o1_binding_candidate(now(18_000_000 + attempt))
+                    .deferred_o1_binding_candidate(1, now(18_000_000 + attempt))
                     .expect("waiting candidate lookup")
                     .is_none()
             );
@@ -2321,7 +2324,7 @@ mod tests {
         );
         assert!(
             swapchain
-                .deferred_o1_binding_candidate(now(18_000_000))
+                .deferred_o1_binding_candidate(1, now(18_000_000))
                 .expect("waiting candidate lookup")
                 .is_none()
         );
@@ -2355,7 +2358,7 @@ mod tests {
             ))
             .expect("deferred render completes after predecessor pageflip");
         let (_, target, _, _) = swapchain
-            .deferred_o1_binding_candidate(now(12_200_000))
+            .deferred_o1_binding_candidate(1, now(12_200_000))
             .expect("binding candidate lookup")
             .expect("deferred frame should bind after render completion");
         assert!(matches!(
