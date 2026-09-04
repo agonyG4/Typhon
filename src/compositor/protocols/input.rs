@@ -32,6 +32,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for CompositorState {
                 state.register_pointer(pointer);
             }
             wl_seat::Request::GetKeyboard { id } => {
+                if !state.ensure_keyboard_state() {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_seat::Error::MissingCapability,
+                        "Typhon does not advertise the wl_seat keyboard capability".to_string(),
+                    );
+                    return;
+                }
                 let keyboard = data_init.init(id, ());
                 if state.send_keyboard_initial_state(&keyboard) {
                     state.register_keyboard(keyboard);
