@@ -591,6 +591,13 @@ The relevant absolute-position mutation sites were traced as follows:
 - `src/native_output/runtime/frame.rs::deactivate` forwards only an explicit
   restore position and origin; it does not use `activation_anchor` as a
   fallback.
+- `src/native_output/input/state.rs::restore_cursor_position` is the native
+  absolute cursor mutation for accepted compositor restore/cursor-position
+  actions; ordinary `handle_pointer_motion` updates remain hardware-input
+  driven and locked motion does not update absolute position.
+- `src/compositor/state/hit_testing.rs::warp_pointer_protocol_request` and
+  `src/compositor/protocols/advanced.rs` are the explicit protocol-warp path;
+  it is serial/capability checked and tagged `PointerWarpProtocol`.
 - `src/native_output/input/routing.rs` records the request/action boundary and
   never synthesizes relative motion for a compositor warp.
 - native cursor processing remains in the existing pointer input state and
