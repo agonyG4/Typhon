@@ -22,6 +22,7 @@ The closure commits are:
 
 - `66c4477` — deterministic RED regressions and test seams;
 - `62bd409` — lifecycle, captured-identity, cancellation, and report closure.
+- `4dfb6e5` — locked-release restore ownership and transition provenance.
 
 They build on the accepted prior commits `23a2d3e`, `45e9371`, and `72eaf2e`.
 
@@ -511,6 +512,230 @@ No Linux dependency or target blocker (`wayland-server`, `libudev`, DRM,
 pkg-config, or the Linux target) occurred. The current host is Linux, so no
 Windows build result is claimed, and manual physical-input/native Sober
 qualification was not run.
+
+## Locked pointer release cursor-restore investigation v1
+
+This investigation starts from exact checkout HEAD `5911195` (`style: format
+keyboard action routing`) and is implemented by `4dfb6e5` (`fix: close locked
+pointer release restore ownership`). It preserves the accepted commit-exact
+surface transaction architecture and the existing NativeInputEpoch settlement
+boundaries.
+
+### Symptom and root cause
+
+The release path was found to treat the late-bound locked activation anchor as
+an implicit cursor-restoration target. When a locked pointer had no committed
+`cursor_position_hint`, release could therefore enqueue a native restore to
+the activation anchor. The compositor's logical pointer, the native cursor,
+the protocol resource, and the effective surface constraint were not all
+owned by the same transition, which made the resulting cursor relocation
+look like an input transition rather than a committed hint application.
+
+The corrected release decision is:
+
+```text
+committed hint for the exact active constraint generation
+    -> validate and apply that hint as the explicit restore target
+no committed hint
+    -> preserve the current logical pointer position; request no restore
+invalid or unresolved committed hint
+    -> preserve the current logical pointer position; request no restore
+```
+
+There is no activation-anchor fallback in the release path. A release restore
+is queued only when `locked_pointer_release_restore_decision()` accepts the
+committed hint for the exact current constraint. The native deactivation path
+also requires an explicit restore position and carries its
+`PointerWarpOrigin`; it cannot manufacture a target from an activation anchor.
+
+The protocol's double-buffered hint remains authoritative only after the exact
+`wl_surface.commit` that captured it. Commit-synchronized installation and
+removal remain Typhon architectural policy inspired by current KWin behavior,
+not a claim that the pointer-constraints protocol explicitly requires delayed
+lifecycle activation or removal.
+
+### State and mutation map
+
+The closure keeps these ownership domains distinct:
+
+- `PointerConstraint::protocol_resource_alive` controls protocol resource
+  usability and event delivery;
+- `surface_constraint_pending`, `committed`, and
+  `lifecycle_removal_pending` control requested/current surface topology;
+- `defunct` remains semantic one-shot/compositor-ended state rather than an
+  eager alias for ordinary client resource destruction;
+- `NativeInputEpoch` and the native backend action control when routing and
+  native activation/deactivation become effective;
+- the logical compositor pointer and the native cursor are observed and
+  traced separately.
+
+Protocol destruction clears the resource references and cancels backend-pending
+activation bookkeeping immediately, so a dead resource receives no future
+event and cannot produce ghost native activation. If the constraint was
+already committed, destruction instead stages removal while leaving the
+current constraint slot and effective routing intact. A later exact surface
+commit publishes the removal; native deactivation then follows the existing
+settlement boundary. A new constraint cannot overlap that pending removal.
+
+Protocol resource lifetime, committed surface constraint lifetime, and native effective routing lifetime are separate ownership domains.
+
+The relevant absolute-position mutation sites were traced as follows:
+
+- `src/compositor/state/hit_testing.rs::locked_pointer_release_restore_decision`
+  is the only locked-release restore decision. It updates logical compositor
+  position only for a valid committed hint and otherwise preserves it.
+- `src/compositor/state/pointer_constraints.rs::apply_pointer_warp` is the
+  compositor-originated pointer-warp queue. One-shot compatibility and
+  protocol warps carry explicit origins; locked-release hint warps carry
+  `LockedPointerCursorHint`.
+- `src/native_output/runtime/frame.rs::deactivate` forwards only an explicit
+  restore position and origin; it does not use `activation_anchor` as a
+  fallback.
+- `src/native_output/input/routing.rs` records the request/action boundary and
+  never synthesizes relative motion for a compositor warp.
+- native cursor processing remains in the existing pointer input state and
+  cursor-restore paths; no new input thread, scheduler, timer, readiness probe,
+  motion filter, clamp, or acceleration path was introduced. No Rust production
+  `XWarpPointer`/`warp_pointer` path was found in the reviewed pointer-input
+  surface.
+
+Locked-pointer activation anchors and cursor-restoration targets are separate ownership domains.
+
+### Transition evidence and origins
+
+`PointerWarpOrigin` now identifies the cause of each compositor/native warp:
+`LockedPointerCursorHint`, `OneshotCompatibility`, `PointerWarpProtocol`, or
+`ConfinedRegionCorrection`. The native transition evidence carries a
+`NativePointerTransitionContext` with the exact constraint id and generation,
+before/after active ids and generations, logical and native cursor positions,
+activation anchor, committed and pending hint presence/value, restore
+decision, requested/applied warp origin and target, cursor visibility, and
+focus surface. Unavailable values remain `unknown`; they are not zero-filled.
+
+The transition context is attached to the same evidence record that owns the
+native routing transition and remains gated by `TYPHON_POINTER_TIMING_TRACE`.
+The existing causal timing design, including wall/thread-CPU association and
+the deactivation-A/activation-B separation, is unchanged.
+
+A client-provided cursor position hint may influence release restoration only when it belongs to the exact committed active constraint generation.
+
+Compositor-induced cursor restoration must never generate synthetic relative pointer motion.
+
+### Mature-compositor comparison
+
+The protocol contract is consistent with the [pointer-constraints unstable v1
+XML](https://cgit.freedesktop.org/wayland/wayland-protocols/tree/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml):
+the hint is double-buffered by `wl_surface.commit`, a lock may be inactive,
+relative motion remains the locked-pointer channel, and release may use a
+committed hint without requiring a relative-motion event. The protocol does
+not prescribe Typhon's delayed lifecycle publication policy.
+
+KWin's current pointer-input implementation reads the committed
+`cursorPositionHint` when invalidating an active lock and warps only when that
+hint is valid; without a hint it does not substitute the activation anchor.
+Its resource-destruction path preserves the hint before the resource is gone.
+See [KWin pointer input](https://sources.debian.org/src/kwin/4:6.3.6-1/src/pointer_input.cpp)
+and the related [KWin cursor restoration commit](https://git.yourcmc.ru/vitalif/kwin/commit/054ccc389899acf1f15001105e8b03a4ffb203d0).
+The [wlroots pointer-constraints example](https://github.com/swaywm/wlroots/blob/master/examples/pointer-constraints.c)
+and [Sway cursor handling](https://github.com/swaywm/sway/blob/master/sway/input/cursor.c)
+likewise keep constraint and cursor state in compositor-owned state rather
+than treating an activation anchor as a release hint. [Weston's input path](https://code.tokarch.uk/mainnika/weston/src/commit/5580cb13c900a3af595f305daa390b5314fca963/libweston/input.c)
+also keeps committed constraint state and cursor motion policy distinct.
+
+These implementations are comparison evidence for ownership and hint
+semantics, not code copied into Typhon.
+
+### Constraint-scoped captured evidence
+
+`CapturedPointerConstraintCommit` stores the exact `constraint_id` beside its
+lifecycle mutation, region, and cursor hint. Cached synchronized commits and
+the transition snapshot use that identity directly; no surface iteration or
+`ids.first()` selects an owner. The lifecycle reducer also treats
+`Install(A) + Remove(A)` before first effective publication as cancellation,
+clearing region and hint mutations rather than leaving surface-wide evidence
+that a later B could consume.
+
+`AlreadyConstrained` is derived from explicit constraint lifecycle ownership,
+not from the mutable pending surface-state map. An install remains requested
+through protocol-pending, captured, cached, synchronized/explicit-sync delayed,
+and committed states. A current A whose protocol resource is destroyed still
+owns the slot while removal is pending; `AlreadyConstrained` stops counting A
+only after the removal commit is published and the lifecycle record is gone.
+This also preserves compositor-ended one-shot defunct semantics separately.
+
+Captured pointer-constraint region and cursor-hint state can never be attributed to a different constraint identity.
+
+### RED regressions and GREEN results
+
+The real Wayland-resource regressions cover the required lifecycle and delayed
+publication cases in
+`src/compositor/tests/input_output/pointer_constraint_transaction.rs`:
+
+- lock request without commit and create-plus-destroy before the first
+  effective commit;
+- active locked and active confined destruction without a surface commit,
+  including continued effective routing, locked relative routing/absolute
+  locking, confined pointer motion, and no premature native deactivation;
+- destroy plus commit, with removal becoming current only at publication;
+- destroyed-resource event counters and stale backend activation cancellation;
+- captured-but-unpublished `AlreadyConstrained` for the same surface/seat;
+- delayed hint and delayed region identity, including publication before B's
+  install is current;
+- synchronized/cached commit ownership.
+
+The reducer regression directly checks `Install(A)`, `Region(R_A)`,
+`Hint(H_A)`, then `Remove(A)`: the collapsed state contains neither an
+unowned region nor an unowned hint, not merely `lifecycle == NoChange`.
+Equivalent confinement coverage is included. The pointer cursor and relative
+constraint suites additionally assert that no-hint unlock preserves logical
+position without a generic warp, while an exact committed hint carries the
+`LockedPointerCursorHint` origin.
+
+The pre-change RED behavior was deterministic: no-hint unlock/deactivation
+restored the activation anchor, and the compositor release request carried a
+generic restore target despite the absence of a committed hint. The focused
+post-change suites are GREEN: pointer-constraint transaction `10 passed`,
+pointer cursor `26 passed`, relative-and-constraints `38 passed`, and the
+library-wide run `2058 passed, 2 ignored`. The full library check and clippy
+also pass with `-D warnings`.
+
+### Repository verification and remaining qualification
+
+On this checkout's Linux host, the required commands produced:
+
+```text
+rtk cargo fmt --check                                  BLOCKED: unrelated
+                                                         rustfmt drift in
+                                                         presentation/scanout files
+rtk cargo check --locked --all-targets                 BLOCKED: unrelated
+                                                         presentation transaction
+                                                         compile errors
+rtk cargo clippy --locked --all-targets -- -D warnings BLOCKED: same unrelated
+                                                         presentation/scanout errors
+rtk cargo test --locked                                BLOCKED: same unrelated
+                                                         presentation transaction
+                                                         compile errors
+rtk git diff --check                                   GREEN
+```
+
+The independently scoped commands `rtk cargo check --locked --lib`,
+`rtk cargo clippy --locked --lib -- -D warnings`, and `rtk cargo test
+--locked --lib` are GREEN. No `wayland-server`, `libudev`, DRM, pkg-config, or
+Linux-target availability blocker occurred. The current host is Linux, so no
+Windows verification result is claimed. The unrelated working-tree
+presentation/scanout changes were preserved and remain outside the two
+closure commits.
+
+Manual native qualification remains required: run Typhon on Linux with
+`TYPHON_POINTER_TIMING_TRACE=1`, exercise a persistent locked pointer with and
+without a committed hint, destroy before and after the removal commit, test
+confined release, and inspect the transition evidence for exact generation,
+origin, logical/native cursor, and relative-motion fields. Repeat with the
+native Sober/Roblox workload and record camera jump, cursor teleport, focus
+changes, and `session.log` evidence. No desktop automation or native Sober
+qualification was run here.
+
+The solved ~28 ms pointer-constraint region-resolution stall was not reopened by this task.
 
 ## Non-claims
 
