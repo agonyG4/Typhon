@@ -150,3 +150,26 @@ pre-render Atomic TEST_ONLY commit. The next native run should confirm
 nonzero submitted/presented Predictive O1 counts, exact terminal
 reconciliation, no normal-wait inflation, and the already accepted cadence,
 wake, DMA-BUF, transaction, protocol, and SafeDisable invariants.
+
+## Final worktree note
+
+After the source and report commits, the shared checkout still contained
+separate unstaged keyboard/input and KMS cursor edits. A final validation
+snapshot against that current worktree reported:
+
+```text
+rtk cargo fmt --check: BLOCKED by rustfmt layout in
+  src/native_output/tests/input_shortcut_inhibition.rs
+rtk cargo check: PASS
+rtk cargo clippy --lib --all-features -- -D warnings: PASS
+rtk cargo clippy --all-targets --all-features -- -D warnings: BLOCKED by 8
+  compile errors in the unstaged src/native/kms cursor edits
+rtk cargo test native_output::pacing --no-fail-fast: BLOCKED before execution
+  by 7 compile errors in the same unstaged src/native/kms cursor edits
+rtk git diff --check: PASS
+```
+
+The committed frame-pacing files were not changed by those edits. The earlier
+post-source focused run (49 passing tests) and all-target clippy pass remain
+the valid verification of this change set before the unrelated KMS edits were
+present in the shared worktree.
