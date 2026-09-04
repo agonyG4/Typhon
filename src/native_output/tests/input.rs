@@ -693,6 +693,32 @@ fn native_input_unbound_alt_z_replays_alt_before_key_and_releases_it() {
 }
 
 #[test]
+fn native_input_deferred_modifier_replay_does_not_double_update_xkb() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let alt_press = input.handle_key_event(KEY_LEFTALT, 1);
+    let z_press = input.handle_key_event(KEY_Z, 1);
+
+    assert_eq!(
+        alt_press.keyboard_actions,
+        vec![NativeKeyboardAction::State(NativeKeyboardEvent::new(
+            KEY_LEFTALT,
+            true,
+        ))]
+    );
+    assert_eq!(
+        z_press.keyboard_actions,
+        vec![
+            NativeKeyboardAction::ClientAfterStateChange(NativeKeyboardEvent::new(
+                KEY_LEFTALT,
+                true,
+            )),
+            NativeKeyboardAction::StateAndClient(NativeKeyboardEvent::new(KEY_Z, true)),
+        ]
+    );
+}
+
+#[test]
 fn native_input_unbound_super_z_replays_super_before_key_and_releases_it() {
     let mut input = NativeInputState::new(320, 200);
 

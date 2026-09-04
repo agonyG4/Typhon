@@ -373,8 +373,9 @@ impl CompositorState {
         &mut self,
         key: u32,
         pressed: bool,
+        modifiers_changed: bool,
     ) {
-        self.send_keyboard_key_after_state_update(key, pressed, false);
+        self.send_keyboard_key_after_state_update(key, pressed, modifiers_changed);
     }
 
     pub(in crate::compositor) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {

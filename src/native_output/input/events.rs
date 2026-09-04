@@ -313,6 +313,7 @@ pub(crate) enum NativeKeyboardAction {
     State(NativeKeyboardEvent),
     StateAndClient(NativeKeyboardEvent),
     Client(NativeKeyboardEvent),
+    ClientAfterStateChange(NativeKeyboardEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -411,11 +412,26 @@ impl NativeInputEffect {
                 self.keyboard_actions.get(index),
                 Some(NativeKeyboardAction::State(_))
             ));
-            self.keyboard_actions[index] = NativeKeyboardAction::StateAndClient(event);
+            let state_event = self.keyboard_actions.remove(index);
+            let NativeKeyboardAction::State(state_event) = state_event else {
+                unreachable!("current keyboard action must be a state transition");
+            };
+            debug_assert_eq!(state_event, event);
+            self.keyboard_actions
+                .push(NativeKeyboardAction::StateAndClient(event));
         } else {
             self.keyboard_actions
                 .push(NativeKeyboardAction::Client(event));
         }
+        self.keyboard_events.push(event);
+    }
+
+    pub(crate) fn forward_keyboard_event_after_state_change(
+        &mut self,
+        event: NativeKeyboardEvent,
+    ) {
+        self.keyboard_actions
+            .push(NativeKeyboardAction::ClientAfterStateChange(event));
         self.keyboard_events.push(event);
     }
 

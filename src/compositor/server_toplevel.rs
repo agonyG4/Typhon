@@ -155,9 +155,14 @@ impl OwnCompositorServer {
         let _ = self.flush_wayland_clients();
     }
 
-    pub fn send_keyboard_key_without_state_update(&mut self, key: u32, pressed: bool) {
+    pub fn send_keyboard_key_without_state_update(
+        &mut self,
+        key: u32,
+        pressed: bool,
+        modifiers_changed: bool,
+    ) {
         self.state
-            .send_keyboard_key_without_state_update(key, pressed);
+            .send_keyboard_key_without_state_update(key, pressed, modifiers_changed);
         let _ = self.flush_wayland_clients();
     }
 

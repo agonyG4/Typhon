@@ -1187,7 +1187,12 @@ pub(crate) fn apply_native_input_effect(
                 NativeKeyboardAction::Client(event) => {
                     context
                         .server
-                        .send_keyboard_key_without_state_update(event.key, event.pressed);
+                        .send_keyboard_key_without_state_update(event.key, event.pressed, false);
+                }
+                NativeKeyboardAction::ClientAfterStateChange(event) => {
+                    context
+                        .server
+                        .send_keyboard_key_without_state_update(event.key, event.pressed, true);
                 }
             }
         }

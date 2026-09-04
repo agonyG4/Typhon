@@ -201,6 +201,7 @@ impl NativeInputState {
                 code,
                 pressed,
                 repeated,
+                current_state_action,
                 &mut effect,
             );
             if !pressed
@@ -224,6 +225,7 @@ impl NativeInputState {
                 code,
                 pressed,
                 repeated,
+                current_state_action,
                 &mut effect,
             );
             if !pressed
@@ -499,7 +501,12 @@ impl NativeInputState {
             return;
         }
         self.forwarded_deferred_modifier_keys.push(code);
-        effect.forward_keyboard_event(NativeKeyboardEvent::new(code, true), current_state_action);
+        let event = NativeKeyboardEvent::new(code, true);
+        if current_state_action.is_some() {
+            effect.forward_keyboard_event(event, current_state_action);
+        } else {
+            effect.forward_keyboard_event_after_state_change(event);
+        }
         effect.request_redraw();
     }
 
@@ -564,12 +571,16 @@ impl NativeInputState {
         code: u16,
         pressed: bool,
         repeated: bool,
+        current_state_action: usize,
         effect: &mut NativeInputEffect,
     ) -> bool {
         if pressed || repeated || !self.release_forwarded_deferred_modifier_key(code) {
             return false;
         }
-        effect.forward_keyboard_event(NativeKeyboardEvent::new(code, false), None);
+        effect.forward_keyboard_event(
+            NativeKeyboardEvent::new(code, false),
+            Some(current_state_action),
+        );
         effect.request_redraw();
         true
     }
