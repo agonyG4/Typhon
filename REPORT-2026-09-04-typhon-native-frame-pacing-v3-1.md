@@ -106,8 +106,10 @@ Fresh full-suite result after the final source commit:
 
 ```text
 rtk cargo test
-cargo test: 3357 passed, 5 ignored, 40 filtered out (30 suites, 45.05s)
+cargo test: 3357 passed, 5 ignored, 40 filtered out (30 suites, 44.87s)
 ```
+
+The first post-report verification run exposed one unrelated parallel-harness failure in `one_child_exit_wakes_the_sigchld_signalfd_once` (`tests/sigchld.rs:53`, observed `left: 0`, `right: 1`). The test passed when isolated, including `--test-threads=1`, and the immediate full-suite rerun above passed without any source change. No SIGCHLD code was modified.
 
 Static verification:
 
