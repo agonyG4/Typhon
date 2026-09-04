@@ -1383,7 +1383,7 @@ impl AtomicOutputSwapchain {
             u64,
         )>,
     > {
-        let actual_claim = match readiness {
+        let (predecessor, actual_claim) = match readiness {
             DeferredO1BindingReadiness::NotDeferred
             | DeferredO1BindingReadiness::WaitingForPredecessor => return Ok(None),
             DeferredO1BindingReadiness::Stale(_) => {
@@ -1392,9 +1392,9 @@ impl AtomicOutputSwapchain {
                 ));
             }
             DeferredO1BindingReadiness::Bindable {
-                predecessor: _,
+                predecessor,
                 actual_claim,
-            } => actual_claim,
+            } => (predecessor, actual_claim),
         };
         let Some(frame) = self.ready.as_ref() else {
             return Ok(None);
@@ -1402,6 +1402,11 @@ impl AtomicOutputSwapchain {
         let FramePresentationReservation::DeferredO1(intent) = frame.reservation else {
             return Ok(None);
         };
+        if intent.predecessor != predecessor {
+            return Err(io::Error::other(
+                "deferred O1 predecessor identity changed before binding",
+            ));
+        }
         let earliest_submit_ns = bind_at
             .get()
             .max(actual_claim.presentation_time.get().saturating_add(100_000));
@@ -2250,9 +2255,25 @@ mod tests {
                 .is_err()
         );
         assert!(swapchain.take_ready_for_submission().is_err());
+        assert!(
+            swapchain
+                .suspend_abandon_ready()
+                .expect("waiting successor terminal settlement")
+        );
+        assert!(swapchain.ready_identity().is_none());
+        assert_eq!(swapchain.quarantine_slot_id(), Some(ready_identity.slot));
+        assert!(
+            swapchain
+                .take_suspended_ready_frame()
+                .expect("abandoned waiting successor")
+                .is_deferred_o1()
+        );
+        swapchain
+            .recover_suspended_slot(true)
+            .expect("waiting successor quarantine recovery");
+        assert_eq!(swapchain.quarantine_slot_id(), None);
         assert_eq!(swapchain.pending_token(), Some(predecessor_token));
         assert_eq!(swapchain.worker_queued_token(), None);
-        assert_eq!(swapchain.quarantine_slot_id(), None);
     }
 
     #[test]
