@@ -41,6 +41,7 @@ impl Xwm {
             surface_id: 1,
             kind: DesktopWindowKind::Managed,
             window_types: X11WindowTypes::default(),
+            decoration_hints: Default::default(),
             override_redirect: false,
             geometry: X11Geometry {
                 width: 640,

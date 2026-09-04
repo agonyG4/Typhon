@@ -20,6 +20,7 @@ pub use commands::XwmCommandOutcome;
 mod configure_timeline;
 mod connection;
 pub mod data_bridge;
+mod decoration;
 mod event_trace;
 mod event_types;
 mod events;
@@ -56,6 +57,7 @@ pub(crate) use configure_timeline::{
     ConfigureNotifyClassification, ConfigureNotifyResult, ConfigureTimelineMetrics,
     WindowConfigureTimeline,
 };
+pub use decoration::{X11DecorationHints, X11FrameExtents, X11MotifDecorationHint};
 pub use event_types::{X11AdmissionCancellationReason, XwmDrain, XwmEvent};
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
@@ -155,6 +157,7 @@ pub struct X11WindowSnapshot {
     pub surface_id: u32,
     pub kind: DesktopWindowKind,
     pub window_types: X11WindowTypes,
+    pub decoration_hints: X11DecorationHints,
     pub override_redirect: bool,
     pub geometry: X11Geometry,
     pub metadata: WindowMetadata,
@@ -180,6 +183,7 @@ pub enum X11MetadataDelta {
     Constraints(WindowConstraints),
     TransientFor(Option<X11WindowHandle>),
     WindowTypes(X11WindowTypes),
+    DecorationHints(X11DecorationHints),
     Kind(DesktopWindowKind),
     AcceptsInput(Option<bool>),
     Protocols {

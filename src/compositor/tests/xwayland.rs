@@ -25,6 +25,8 @@ use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_
 mod xwayland_admission;
 #[path = "xwayland_border_policy.rs"]
 mod xwayland_border_policy;
+#[path = "xwayland_decoration.rs"]
+mod xwayland_decoration;
 #[path = "xwayland_focus.rs"]
 mod xwayland_focus;
 #[path = "xwayland_geometry_ordering.rs"]
@@ -258,6 +260,7 @@ fn fake_snapshot() -> X11WindowSnapshot {
         surface_id: 7,
         kind: DesktopWindowKind::Managed,
         window_types: X11WindowTypes::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 0,
@@ -563,36 +566,6 @@ fn xwayland_first_buffer_before_window_is_retained() {
         fixture.initial_buffer_id
     );
     assert_eq!(fixture.server.take_xwayland_buffer_ready_events().len(), 1);
-}
-
-#[test]
-fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
-    let mut fixture = first_buffer_fixture();
-    let mut snapshot = fake_snapshot();
-    snapshot.surface_id = fixture.surface_id;
-    snapshot.geometry.x = 0;
-    snapshot.geometry.y = 0;
-
-    let commands = fixture
-        .server
-        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot.clone()));
-    let frame = fixture
-        .server
-        .state
-        .x11_authoritative_geometry(snapshot.handle)
-        .expect("admitted X11 geometry");
-
-    assert!(commands.iter().any(|command| matches!(
-        command,
-        XwmCommand::ConfigureFrame {
-            window,
-            geometry,
-            frame_extents,
-            ..
-        } if *window == snapshot.handle
-            && geometry == &frame
-            && *frame_extents == [0, 0, 26, 0]
-    )));
 }
 
 #[test]

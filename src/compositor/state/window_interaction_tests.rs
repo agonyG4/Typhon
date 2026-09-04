@@ -269,6 +269,7 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
         surface_id,
         kind: DesktopWindowKind::Managed,
         window_types: crate::xwayland::xwm::X11WindowTypes::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: crate::xwayland::xwm::X11Geometry {
             x: 10,

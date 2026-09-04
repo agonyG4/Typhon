@@ -65,6 +65,7 @@ pub(crate) enum XwmAtomName {
     NetWmSyncRequestCounter,
     XwaylandAllowCommits,
     MotifWmHints,
+    GtkFrameExtents,
     NetWmNameTyphon,
 }
 
@@ -131,6 +132,7 @@ impl XwmAtomName {
         Self::NetWmSyncRequestCounter,
         Self::XwaylandAllowCommits,
         Self::MotifWmHints,
+        Self::GtkFrameExtents,
         Self::NetWmNameTyphon,
     ];
 
@@ -197,6 +199,7 @@ impl XwmAtomName {
             Self::NetWmSyncRequestCounter => b"_NET_WM_SYNC_REQUEST_COUNTER",
             Self::XwaylandAllowCommits => b"_XWAYLAND_ALLOW_COMMITS",
             Self::MotifWmHints => b"_MOTIF_WM_HINTS",
+            Self::GtkFrameExtents => b"_GTK_FRAME_EXTENTS",
             Self::NetWmNameTyphon => b"Typhon",
         }
     }
@@ -240,6 +243,7 @@ impl XwmAtoms {
             XwmAtomName::NetDesktopViewport,
             XwmAtomName::NetWorkarea,
             XwmAtomName::NetFrameExtents,
+            XwmAtomName::GtkFrameExtents,
             XwmAtomName::WmChangeState,
             XwmAtomName::NetCloseWindow,
             XwmAtomName::NetWmState,

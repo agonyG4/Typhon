@@ -816,6 +816,7 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
         surface_id,
         kind: DesktopWindowKind::Managed,
         window_types: X11WindowTypes::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 0,

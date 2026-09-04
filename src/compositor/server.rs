@@ -567,17 +567,34 @@ impl OwnCompositorServer {
                         | crate::xwayland::xwm::X11MetadataDelta::Kind(_)
                 );
                 let old_policy = self.state.x11_placement_policy(window);
+                let old_decoration_mode = self.state.x11_effective_decoration_mode(window);
+                let old_frame_extents = self.state.x11_decoration_frame_extents(window);
                 self.state.apply_x11_metadata_delta(window, delta);
                 let new_policy = self.state.x11_placement_policy(window);
+                let new_decoration_mode = self.state.x11_effective_decoration_mode(window);
+                let new_frame_extents = self.state.x11_decoration_frame_extents(window);
+                let decoration_changed = old_decoration_mode != new_decoration_mode
+                    || old_frame_extents != new_frame_extents;
                 let mut commands = Vec::new();
-                if old_policy != new_policy
+                let mut configure_frame_emitted = false;
+                if (old_policy != new_policy || decoration_changed)
                     && let Some(geometry) = self.state.x11_authoritative_geometry(window)
                 {
                     commands.push(XwmCommand::ConfigureFrame {
                         window,
                         geometry,
-                        frame_extents: self.state.x11_decoration_frame_extents(window),
+                        frame_extents: new_frame_extents,
                     });
+                    configure_frame_emitted = true;
+                }
+                if decoration_changed {
+                    self.state.reconcile_x11_decoration_transition(
+                        window,
+                        old_decoration_mode,
+                        new_decoration_mode,
+                    );
+                    self.state
+                        .advance_render_generation(RenderGenerationCause::WindowDecoration);
                 }
                 if prior_focused
                     && prior_id.is_some_and(|id| {
@@ -597,6 +614,17 @@ impl OwnCompositorServer {
                         .field("source", "compositor")
                         .field("xid", window.xid())
                         .field("metadata_delta", delta_debug)
+                        .field(
+                            "old_effective_decoration_mode",
+                            format!("{old_decoration_mode:?}"),
+                        )
+                        .field(
+                            "new_effective_decoration_mode",
+                            format!("{new_decoration_mode:?}"),
+                        )
+                        .field("old_server_frame_extents", format!("{old_frame_extents:?}"))
+                        .field("new_server_frame_extents", format!("{new_frame_extents:?}"))
+                        .field("configure_frame_emitted", configure_frame_emitted)
                         .optional("focus_before", focus_before)
                         .optional("focus_after", self.focused_x11_window_xid())
                         .field("focus_repaired", prior_focused)

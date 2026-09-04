@@ -563,6 +563,9 @@ impl CompositorState {
                     .map(crate::compositor::desktop_window::x11_stack_layer)
                     .unwrap_or(DesktopStackLayer::Normal);
             }
+            crate::xwayland::xwm::X11MetadataDelta::DecorationHints(decoration_hints) => {
+                window.x11_decoration_hints = decoration_hints;
+            }
             crate::xwayland::xwm::X11MetadataDelta::Kind(kind) => {
                 window.kind = kind;
                 window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(

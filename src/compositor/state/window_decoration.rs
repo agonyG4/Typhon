@@ -9,9 +9,9 @@ use super::super::decoration::{
     },
 };
 use super::super::{
-    BeginWindowInteraction, DecorationRenderInstance, RenderGenerationCause, RenderableSurface,
-    ResizeEdges, ToplevelMode, WindowBackend, WindowId, WindowInteractionKind,
-    WindowInteractionSource,
+    BeginWindowInteraction, DecorationRenderInstance, DesktopWindow, DesktopWindowKind,
+    RenderGenerationCause, RenderableSurface, ResizeEdges, ToplevelMode, WindowBackend, WindowId,
+    WindowInteractionKind, WindowInteractionSource,
 };
 use super::hit_testing::PointerSceneHit;
 use super::surface_focus::WindowFocusReason;
@@ -58,7 +58,91 @@ impl WindowDecorationState {
     }
 }
 
+fn effective_x11_decoration_mode(window: &DesktopWindow, mode: ToplevelMode) -> DecorationMode {
+    if !matches!(window.backend, WindowBackend::X11(_))
+        || window.kind != DesktopWindowKind::Managed
+        || !window.is_normal_x11_role()
+    {
+        return DecorationMode::None;
+    }
+    if mode == ToplevelMode::Fullscreen {
+        return DecorationMode::None;
+    }
+    if window
+        .x11_decoration_hints
+        .gtk_frame_extents
+        .is_some_and(|extents| extents.is_non_zero())
+    {
+        return DecorationMode::ClientSide;
+    }
+    if window.x11_decoration_hints.motif
+        == crate::xwayland::xwm::X11MotifDecorationHint::Undecorated
+    {
+        return DecorationMode::None;
+    }
+    DecorationMode::ServerSide
+}
+
 impl super::super::CompositorState {
+    pub(in crate::compositor) fn x11_effective_decoration_mode(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> DecorationMode {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return DecorationMode::None;
+        };
+        self.window(window_id)
+            .map_or(DecorationMode::None, |window| {
+                effective_x11_decoration_mode(window, window.state.mode())
+            })
+    }
+
+    pub(in crate::compositor) fn reconcile_x11_decoration_transition(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        old_mode: DecorationMode,
+        new_mode: DecorationMode,
+    ) {
+        if old_mode == new_mode {
+            return;
+        }
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return;
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return;
+        };
+        self.decoration_button_capture = self
+            .decoration_button_capture
+            .filter(|capture| capture.root_surface_id != root_surface_id);
+        self.decoration_button_hover = self
+            .decoration_button_hover
+            .filter(|(hover_window_id, _)| *hover_window_id != window_id);
+        self.decoration_titlebar_click_capture = self
+            .decoration_titlebar_click_capture
+            .filter(|(captured_window_id, _)| *captured_window_id != window_id);
+        self.decoration_last_titlebar_click = self
+            .decoration_last_titlebar_click
+            .filter(|(clicked_window_id, _, _, _)| *clicked_window_id != window_id);
+
+        let interaction_is_decoration_owned =
+            self.window_interaction_debug_snapshot()
+                .is_some_and(|interaction| {
+                    interaction.root_surface_id == root_surface_id
+                        && interaction.source == WindowInteractionSource::NativeBinding
+                        && matches!(
+                            interaction.kind,
+                            WindowInteractionKind::Move | WindowInteractionKind::Resize(_)
+                        )
+                });
+        if new_mode != DecorationMode::ServerSide && interaction_is_decoration_owned {
+            self.clear_window_interaction_state(
+                super::super::WindowInteractionEndReason::ModeTransition,
+            );
+        }
+    }
+
     pub(in crate::compositor) fn surface_uses_server_side_decorations(
         &self,
         surface_id: u32,
@@ -77,9 +161,7 @@ impl super::super::CompositorState {
             return decoration_state.preference().effective_mode(true, false)
                 == DecorationMode::ServerSide;
         }
-        matches!(window.backend, WindowBackend::X11(_))
-            && window.is_normal_x11_role()
-            && !window.x11_window_types.no_decorations
+        effective_x11_decoration_mode(window, mode) == DecorationMode::ServerSide
     }
 
     pub(in crate::compositor) fn update_decoration_hover(&mut self) {
@@ -123,15 +205,8 @@ impl super::super::CompositorState {
                 decoration_state
                     .preference()
                     .effective_mode(true, fullscreen)
-            } else if matches!(window.backend, WindowBackend::X11(_))
-                && window.is_normal_x11_role()
-                && !window.x11_window_types.no_decorations
-            {
-                if fullscreen {
-                    DecorationMode::None
-                } else {
-                    DecorationMode::ServerSide
-                }
+            } else if matches!(window.backend, WindowBackend::X11(_)) {
+                effective_x11_decoration_mode(window, mode)
             } else {
                 return None;
             };
@@ -416,15 +491,8 @@ impl super::super::CompositorState {
                     decoration_state
                         .preference()
                         .effective_mode(true, fullscreen)
-                } else if matches!(window.backend, WindowBackend::X11(_))
-                    && window.is_normal_x11_role()
-                    && !window.x11_window_types.no_decorations
-                {
-                    if fullscreen {
-                        DecorationMode::None
-                    } else {
-                        DecorationMode::ServerSide
-                    }
+                } else if matches!(window.backend, WindowBackend::X11(_)) {
+                    effective_x11_decoration_mode(window, mode)
                 } else {
                     return None;
                 };
@@ -499,10 +567,8 @@ impl super::super::CompositorState {
         let Some(window) = self.window(window_id) else {
             return [0; 4];
         };
-        if !matches!(window.backend, WindowBackend::X11(_))
-            || !window.is_normal_x11_role()
-            || window.x11_window_types.no_decorations
-        {
+        let decoration_mode = effective_x11_decoration_mode(window, window.state.mode());
+        if decoration_mode != DecorationMode::ServerSide {
             return [0; 4];
         }
         let mode = window.state.mode();
@@ -514,11 +580,7 @@ impl super::super::CompositorState {
         let Some(layout) = DecorationLayout::for_window_with_chrome_policy(
             1,
             1,
-            if mode == ToplevelMode::Fullscreen {
-                DecorationMode::None
-            } else {
-                DecorationMode::ServerSide
-            },
+            decoration_mode,
             mode == ToplevelMode::Maximized,
             mode == ToplevelMode::Fullscreen,
             chrome_policy,

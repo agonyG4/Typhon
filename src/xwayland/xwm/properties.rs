@@ -11,7 +11,7 @@ use x11rb::{
 
 use super::focus::{FocusModel, focus_model};
 use super::{
-    X11PublishedState, X11WindowHandle, Xwm, XwmError,
+    X11FrameExtents, X11MotifDecorationHint, X11PublishedState, X11WindowHandle, Xwm, XwmError,
     atoms::XwmAtomName,
     window::{
         AuxiliaryReconciliation, X11PropertySnapshot, X11WindowRecord, X11WindowType,
@@ -55,10 +55,11 @@ pub(crate) enum PropertyKind {
     WmClientLeader,
     NetWmUserTimeWindow,
     MotifWmHints,
+    GtkFrameExtents,
 }
 
 impl PropertyKind {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::NetWmName,
         Self::WmName,
         Self::WmClass,
@@ -76,6 +77,7 @@ impl PropertyKind {
         Self::WmClientLeader,
         Self::NetWmUserTimeWindow,
         Self::MotifWmHints,
+        Self::GtkFrameExtents,
     ];
 
     const fn bit(self) -> u32 {
@@ -97,6 +99,7 @@ impl PropertyKind {
             Self::WmClientLeader => 1 << 14,
             Self::NetWmUserTimeWindow => 1 << 15,
             Self::MotifWmHints => 1u32 << 16,
+            Self::GtkFrameExtents => 1u32 << 17,
         }
     }
 
@@ -119,12 +122,14 @@ impl PropertyKind {
             Self::WmClientLeader => XwmAtomName::WmClientLeader,
             Self::NetWmUserTimeWindow => XwmAtomName::NetWmUserTimeWindow,
             Self::MotifWmHints => XwmAtomName::MotifWmHints,
+            Self::GtkFrameExtents => XwmAtomName::GtkFrameExtents,
         })
     }
 
     const fn max_items(self) -> u32 {
         match self {
             Self::NetWmName | Self::WmName | Self::WmClass => MAX_PROPERTY_ITEMS_TEXT,
+            Self::GtkFrameExtents => 4,
             _ => MAX_PROPERTY_ITEMS_SCALAR,
         }
     }
@@ -160,7 +165,8 @@ enum ParsedProperty {
         accepts_input: Option<bool>,
         urgency: bool,
     },
-    MotifNoDecorations(bool),
+    MotifDecorationHint(X11MotifDecorationHint),
+    GtkFrameExtents(Option<X11FrameExtents>),
 }
 
 pub(crate) fn begin_initial(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -750,6 +756,7 @@ fn commit_property(
     record: &mut X11WindowRecord,
     kind: PropertyKind,
 ) -> Option<super::X11MetadataDelta> {
+    let old_decoration_hints = record.properties.decoration_hints.clone();
     match kind {
         PropertyKind::NetWmName | PropertyKind::WmName => {
             record.properties.net_wm_name = record.staging_properties.net_wm_name.clone();
@@ -803,10 +810,15 @@ fn commit_property(
             record.properties.user_time_window = record.staging_properties.user_time_window;
         }
         PropertyKind::MotifWmHints => {
-            record.properties.window_types.no_decorations =
-                record.staging_properties.window_types.no_decorations;
+            record.properties.decoration_hints.motif =
+                record.staging_properties.decoration_hints.motif;
+        }
+        PropertyKind::GtkFrameExtents => {
+            record.properties.decoration_hints.gtk_frame_extents =
+                record.staging_properties.decoration_hints.gtk_frame_extents;
         }
     }
+    let decoration_changed = old_decoration_hints != record.properties.decoration_hints;
     let was_admitted = record.snapshot.is_some();
     update_snapshot(record);
     if !was_admitted {
@@ -837,6 +849,9 @@ fn commit_property(
             supports_delete: record.properties.supports_delete,
             supports_take_focus: record.properties.supports_take_focus,
         }),
+        PropertyKind::MotifWmHints | PropertyKind::GtkFrameExtents => decoration_changed.then_some(
+            super::X11MetadataDelta::DecorationHints(record.properties.decoration_hints.clone()),
+        ),
         _ => None,
     }
 }
@@ -851,6 +866,7 @@ fn update_snapshot(record: &mut X11WindowRecord) {
     snapshot.constraints = record.properties.constraints;
     snapshot.transient_for = record.properties.transient_for;
     snapshot.window_types = record.properties.window_types.clone();
+    snapshot.decoration_hints = record.properties.decoration_hints.clone();
     snapshot.override_redirect =
         record.kind == crate::compositor::DesktopWindowKind::OverrideRedirect;
     snapshot.supports_delete = record.properties.supports_delete;
@@ -910,8 +926,11 @@ fn apply_parsed(
             properties.accepts_input = accepts_input;
             properties.urgency = urgency;
         }
-        ParsedProperty::MotifNoDecorations(value) => {
-            properties.window_types.no_decorations = value;
+        ParsedProperty::MotifDecorationHint(value) => {
+            properties.decoration_hints.motif = value;
+        }
+        ParsedProperty::GtkFrameExtents(value) => {
+            properties.decoration_hints.gtk_frame_extents = value;
         }
     }
     if matches!(kind, PropertyKind::NetWmName | PropertyKind::WmName) {
@@ -945,7 +964,10 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         },
         PropertyKind::NetWmSyncRequestCounter => ParsedProperty::SyncCounter(None),
         PropertyKind::NetWmState => ParsedProperty::State(Default::default()),
-        PropertyKind::MotifWmHints => ParsedProperty::MotifNoDecorations(false),
+        PropertyKind::MotifWmHints => {
+            ParsedProperty::MotifDecorationHint(X11MotifDecorationHint::Unspecified)
+        }
+        PropertyKind::GtkFrameExtents => ParsedProperty::GtkFrameExtents(None),
     }
 }
 
@@ -996,6 +1018,7 @@ fn parse(
         }),
         PropertyKind::NetWmState => parse_state(reply, xwm),
         PropertyKind::MotifWmHints => parse_motif_hints(reply),
+        PropertyKind::GtkFrameExtents => parse_gtk_frame_extents(reply),
     }
 }
 
@@ -1019,16 +1042,43 @@ fn expected_type(kind: PropertyKind, xwm: &Xwm) -> Option<u32> {
         PropertyKind::WmNormalHints => u32::from(xproto::AtomEnum::WM_SIZE_HINTS),
         PropertyKind::WmHints => u32::from(xproto::AtomEnum::WM_HINTS),
         PropertyKind::MotifWmHints => return None,
+        PropertyKind::GtkFrameExtents => u32::from(xproto::AtomEnum::CARDINAL),
     })
 }
 
 fn parse_motif_hints(reply: &xproto::GetPropertyReply) -> Option<ParsedProperty> {
+    if reply.bytes_after != 0 {
+        return None;
+    }
     let values = parse_u32s(reply)?;
     let flags = *values.first()?;
-    let decorations = values.get(2).copied().unwrap_or_default();
-    Some(ParsedProperty::MotifNoDecorations(
-        flags & (1 << 1) != 0 && decorations == 0,
-    ))
+    let hint = if flags & (1 << 1) == 0 {
+        X11MotifDecorationHint::Unspecified
+    } else {
+        let decorations = *values.get(2)?;
+        if decorations == 0 {
+            X11MotifDecorationHint::Undecorated
+        } else {
+            X11MotifDecorationHint::Decorated
+        }
+    };
+    Some(ParsedProperty::MotifDecorationHint(hint))
+}
+
+fn parse_gtk_frame_extents(reply: &xproto::GetPropertyReply) -> Option<ParsedProperty> {
+    if reply.bytes_after != 0 {
+        return None;
+    }
+    let values = parse_u32s(reply)?;
+    if values.len() != 4 {
+        return None;
+    }
+    Some(ParsedProperty::GtkFrameExtents(Some(X11FrameExtents {
+        left: values[0],
+        right: values[1],
+        top: values[2],
+        bottom: values[3],
+    })))
 }
 
 fn parse_window_type(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProperty> {
@@ -1189,6 +1239,10 @@ fn all_mask() -> u32 {
 }
 
 #[cfg(test)]
+#[path = "properties_decoration_tests.rs"]
+mod decoration_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU64;
@@ -1337,6 +1391,7 @@ mod tests {
             surface_id: 7,
             kind: DesktopWindowKind::Managed,
             window_types: X11WindowTypes::default(),
+            decoration_hints: Default::default(),
             override_redirect: false,
             geometry: Default::default(),
             metadata: crate::compositor::WindowMetadata {
@@ -1378,6 +1433,7 @@ mod tests {
             surface_id: 8,
             kind: DesktopWindowKind::Managed,
             window_types: X11WindowTypes::default(),
+            decoration_hints: Default::default(),
             override_redirect: false,
             geometry: Default::default(),
             metadata: Default::default(),

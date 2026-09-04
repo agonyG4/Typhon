@@ -5,7 +5,9 @@ use std::io;
 use crate::core::WindowId;
 use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
-use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes};
+use crate::xwayland::xwm::{
+    X11DecorationHints, X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes,
+};
 
 use super::{SurfacePlacement, WindowGeometry, WindowState};
 
@@ -107,6 +109,7 @@ pub struct DesktopWindow {
     pub x11_placement_policy: Option<X11PlacementPolicy>,
     pub(crate) stack_layer: DesktopStackLayer,
     pub x11_window_types: X11WindowTypes,
+    pub x11_decoration_hints: X11DecorationHints,
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
     pub(super) x11_geometry: Option<X11GeometryState>,
@@ -176,6 +179,7 @@ impl DesktopWindow {
             x11_placement_policy: None,
             stack_layer: DesktopStackLayer::Normal,
             x11_window_types: X11WindowTypes::default(),
+            x11_decoration_hints: X11DecorationHints::default(),
             x11_accepts_input: None,
             x11_transient_for: None,
             x11_geometry: None,
@@ -207,6 +211,7 @@ impl DesktopWindow {
             x11_placement_policy: Some(x11_placement_policy(role)),
             stack_layer: x11_stack_layer(role),
             x11_window_types: snapshot.window_types,
+            x11_decoration_hints: snapshot.decoration_hints,
             x11_accepts_input: snapshot.accepts_input,
             x11_transient_for: snapshot.transient_for,
             x11_geometry: Some(X11GeometryState {

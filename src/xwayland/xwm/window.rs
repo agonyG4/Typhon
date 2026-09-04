@@ -53,6 +53,7 @@ pub(crate) struct X11PropertySnapshot {
     pub(crate) app_id: Option<String>,
     pub(crate) pid: Option<u32>,
     pub(crate) window_types: X11WindowTypes,
+    pub(crate) decoration_hints: super::X11DecorationHints,
     pub(crate) accepts_input: Option<bool>,
     pub(crate) constraints: WindowConstraints,
     pub(crate) state: X11PublishedState,
@@ -188,6 +189,7 @@ impl X11WindowRegistry {
             supports_sync_request: snapshot.supports_sync_request,
             sync_counter: snapshot.sync_counter,
             window_types: snapshot.window_types.clone(),
+            decoration_hints: snapshot.decoration_hints.clone(),
             ..X11PropertySnapshot::default()
         };
         self.records.insert(
@@ -426,6 +428,7 @@ impl X11WindowRegistry {
             surface_id: association.surface_id,
             kind: record.kind,
             window_types: record.properties.window_types.clone(),
+            decoration_hints: record.properties.decoration_hints.clone(),
             override_redirect: record.kind == DesktopWindowKind::OverrideRedirect,
             geometry: record.geometry,
             metadata: WindowMetadata {

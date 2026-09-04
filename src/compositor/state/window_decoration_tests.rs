@@ -5,6 +5,7 @@ use crate::compositor::decoration::{
     types::{DecorationHit, DecorationMode, DecorationPreference},
 };
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
+use crate::xwayland::xwm::{X11FrameExtents, X11MotifDecorationHint};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 use std::{num::NonZeroU64, time::Instant};
 
@@ -80,8 +81,145 @@ fn x11_state(surface: RenderableSurface) -> CompositorState {
     state
 }
 
+fn x11_test_handle() -> X11WindowHandle {
+    X11WindowHandle::new(
+        XwaylandGeneration::new(NonZeroU64::new(1).expect("generation")),
+        0x100,
+    )
+}
+
 fn decoration_instances(state: &CompositorState) -> Vec<DecorationRenderInstance> {
     state.native_decoration_render_instances(&state.renderable_surfaces)
+}
+
+#[test]
+fn x11_decoration_mode_precedence_controls_rendering_hit_testing_and_extents() {
+    let mut state = x11_state(test_surface(50));
+    let handle = x11_test_handle();
+    let window_id = state.window_id_for_x11_handle(handle).expect("X11 window");
+
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ServerSide
+    );
+    assert_eq!(state.x11_decoration_frame_extents(handle), [0, 0, 26, 0]);
+    assert_eq!(decoration_instances(&state).len(), 1);
+    assert!(matches!(
+        state.decoration_hit_for_root_at(50, (0, 0), 100.0, -10.0),
+        Some(DecorationHit::Titlebar)
+    ));
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .gtk_frame_extents = Some(X11FrameExtents {
+        left: 1,
+        right: 0,
+        top: 0,
+        bottom: 0,
+    });
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ClientSide
+    );
+    assert_eq!(state.x11_decoration_frame_extents(handle), [0; 4]);
+    assert!(decoration_instances(&state).is_empty());
+    assert!(
+        state
+            .decoration_hit_for_root_at(50, (0, 0), 100.0, -10.0)
+            .is_none()
+    );
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .motif = X11MotifDecorationHint::Undecorated;
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ClientSide
+    );
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .gtk_frame_extents = None;
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::None
+    );
+
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .x11_decoration_hints
+        .motif = X11MotifDecorationHint::Decorated;
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::ServerSide
+    );
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Fullscreen);
+    assert_eq!(
+        state.x11_effective_decoration_mode(handle),
+        DecorationMode::None
+    );
+}
+
+#[test]
+fn x11_decoration_transition_clears_stale_native_interaction_state() {
+    let mut state = x11_state(test_surface(51));
+    let handle = x11_test_handle();
+    let window_id = state.window_id_for_x11_handle(handle).expect("X11 window");
+
+    state.decoration_button_capture = Some(DecorationButtonCapture {
+        window_id,
+        root_surface_id: 51,
+        kind: crate::compositor::decoration::types::DecorationButtonKind::Close,
+        button: 0x110,
+    });
+    state.decoration_button_hover = Some((
+        window_id,
+        crate::compositor::decoration::types::DecorationButtonKind::Close,
+    ));
+    state.decoration_titlebar_click_capture = Some((window_id, 0x110));
+    state.decoration_last_titlebar_click = Some((window_id, Instant::now(), 10.0, 10.0));
+    state.window_interaction = Some(WindowInteraction {
+        id: WindowInteractionId::new(1),
+        window_id,
+        root_surface_id: 51,
+        kind: WindowInteractionKind::Move,
+        source: WindowInteractionSource::NativeBinding,
+        trigger_button: Some(0x110),
+        trigger_serial: None,
+        pointer_motion_surface_id: None,
+        start_pointer_x: 10.0,
+        start_pointer_y: 10.0,
+        start_placement: SurfacePlacement::root(),
+        start_width: 300,
+        start_height: 200,
+        drag_committed: false,
+        resize_interaction_id: None,
+        tiled_resize: false,
+    });
+    assert!(state.window_interaction_debug_snapshot().is_some());
+
+    state.reconcile_x11_decoration_transition(
+        handle,
+        DecorationMode::ServerSide,
+        DecorationMode::ClientSide,
+    );
+
+    assert!(state.decoration_button_capture.is_none());
+    assert!(state.decoration_button_hover.is_none());
+    assert!(state.decoration_titlebar_click_capture.is_none());
+    assert!(state.decoration_last_titlebar_click.is_none());
+    assert!(state.window_interaction_debug_snapshot().is_none());
 }
 
 #[test]

@@ -12,6 +12,7 @@ use crate::xwayland::XwaylandGeneration;
 fn advertised_atoms_are_a_unique_implemented_subset() {
     let names = XwmAtoms::advertised_names();
     assert!(!names.is_empty());
+    assert!(names.contains(&XwmAtomName::GtkFrameExtents));
     for (index, name) in names.iter().enumerate() {
         assert!(XwmAtomName::ALL.contains(name));
         assert!(!names[..index].contains(name));

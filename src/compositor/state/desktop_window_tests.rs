@@ -3,8 +3,8 @@ use crate::wm::{
     LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation, WorkspaceSwitchOutcome,
 };
 use crate::xwayland::xwm::{
-    X11Geometry, X11MetadataDelta, X11PublishedState, X11StackMode, X11WindowSnapshot,
-    X11WindowType, X11WindowTypes,
+    X11DecorationHints, X11FrameExtents, X11Geometry, X11MetadataDelta, X11MotifDecorationHint,
+    X11PublishedState, X11StackMode, X11WindowSnapshot, X11WindowType, X11WindowTypes,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 use std::num::NonZeroU64;
@@ -15,6 +15,7 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
         surface_id,
         kind: DesktopWindowKind::Managed,
         window_types: X11WindowTypes::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 10,
@@ -98,6 +99,31 @@ fn managed_x11_toplevel_joins_the_active_workspace_as_floating() {
         .expect("managed X11 window has management state");
     assert_eq!(management.regular_workspace().unwrap().get(), 1);
     assert_eq!(management.layout(), LayoutMembership::Floating);
+}
+
+#[test]
+fn admitted_x11_window_preserves_decoration_hints_without_changing_management() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(2).expect("generation"));
+    let mut snapshot = x11_snapshot(generation, 201, 202);
+    snapshot.decoration_hints = X11DecorationHints {
+        motif: X11MotifDecorationHint::Undecorated,
+        gtk_frame_extents: Some(X11FrameExtents {
+            left: 1,
+            right: 2,
+            top: 3,
+            bottom: 4,
+        }),
+    };
+    let expected_hints = snapshot.decoration_hints.clone();
+    let expected_types = snapshot.window_types.clone();
+    let id = insert_x11(&mut state, snapshot);
+    let window = state.window(id).expect("window");
+
+    assert_eq!(window.x11_decoration_hints, expected_hints);
+    assert_eq!(window.kind, DesktopWindowKind::Managed);
+    assert!(window.management.is_some());
+    assert_eq!(window.x11_window_types, expected_types);
 }
 
 #[test]

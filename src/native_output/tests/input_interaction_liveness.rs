@@ -241,6 +241,7 @@ fn client_owned_x11_release_uses_production_native_routing() {
         surface_id,
         kind: DesktopWindowKind::Managed,
         window_types: X11WindowTypes::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 80,
