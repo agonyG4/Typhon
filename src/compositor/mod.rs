@@ -607,6 +607,7 @@ pub struct CompositorState {
     focused_window_id: Option<WindowId>,
     focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
+    keyboard_surface_to_restore: Option<wl_surface::WlSurface>,
     shortcut_inhibition: ShortcutInhibitionRegistry,
     keyboard_state: KeyboardStateHandle,
     pressed_keys: HashSet<u32>,

@@ -182,6 +182,12 @@ impl OwnCompositorServer {
     pub fn clear_keyboard_transient_state_for_session_switch(&mut self) {
         self.state
             .clear_keyboard_transient_state_for_session_switch();
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn restore_keyboard_focus_after_session_switch(&mut self) {
+        self.state.restore_keyboard_focus_after_session_switch();
+        let _ = self.flush_wayland_clients();
     }
 
     pub fn send_pointer_motion(&mut self, x: f64, y: f64) {

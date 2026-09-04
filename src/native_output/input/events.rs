@@ -23,6 +23,8 @@ pub(crate) const KEY_F: u16 = 33;
 pub(crate) const KEY_V: u16 = 47;
 pub(crate) const KEY_LEFTSHIFT: u16 = 42;
 #[cfg(test)]
+pub(crate) const KEY_CAPSLOCK: u16 = 58;
+#[cfg(test)]
 pub(crate) const KEY_Z: u16 = 44;
 pub(crate) const KEY_C: u16 = 46;
 pub(crate) const KEY_RIGHTSHIFT: u16 = 54;

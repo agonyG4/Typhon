@@ -32,6 +32,8 @@ pub(super) enum ClientEvent {
         keymap: Vec<u8>,
         keys: Vec<(u32, bool)>,
         modifiers: Vec<(u32, u32, u32, u32)>,
+        enters: Vec<Vec<u32>>,
+        leaves: usize,
     },
 }
 

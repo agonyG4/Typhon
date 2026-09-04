@@ -410,11 +410,37 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn clear_keyboard_transient_state_for_session_switch(&mut self) {
+        if self.keyboard_surface.is_some() {
+            self.keyboard_surface_to_restore = self.keyboard_surface.clone();
+            self.clear_keyboard_focus();
+        }
         self.keyboard_state.clear_transient_key_state();
         self.pressed_keys.clear();
     }
 
+    pub(in crate::compositor) fn restore_keyboard_focus_after_session_switch(&mut self) {
+        let Some(surface) = self.keyboard_surface_to_restore.take() else {
+            return;
+        };
+        if !surface.is_alive()
+            || !self
+                .focused_surface
+                .as_ref()
+                .is_some_and(|focused| same_surface_resource(focused, &surface))
+        {
+            return;
+        }
+        self.ensure_keyboard_focus(&surface);
+    }
+
     pub(in crate::compositor) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {
+        if self
+            .keyboard_surface_to_restore
+            .as_ref()
+            .is_some_and(|remembered| !same_surface_resource(remembered, surface))
+        {
+            self.keyboard_surface_to_restore = None;
+        }
         if self.pointer_hit_instrumentation_enabled {
             self.pointer_hit_metrics.keyboard_focus_reconciliations += 1;
         }

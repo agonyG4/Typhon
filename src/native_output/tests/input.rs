@@ -1784,6 +1784,213 @@ fn apply_native_keyboard_events(
     }
 }
 
+struct NativeKeyboardStateSnapshot {
+    keymap: Vec<u8>,
+    keys: Vec<(u32, bool)>,
+    modifiers: Vec<(u32, u32, u32, u32)>,
+    enters: Vec<Vec<u32>>,
+    leaves: usize,
+}
+
+fn capture_native_keyboard_state(
+    server: &mut OwnCompositorServer,
+    client_commands: &mpsc::Sender<ClientCommand>,
+    client_events: &mpsc::Receiver<ClientEvent>,
+) -> NativeKeyboardStateSnapshot {
+    client_commands
+        .send(ClientCommand::CaptureKeyboardState)
+        .unwrap();
+    match pump_native_input_server_until(server, client_events) {
+        ClientEvent::KeyboardState {
+            keymap,
+            keys,
+            modifiers,
+            enters,
+            leaves,
+        } => NativeKeyboardStateSnapshot {
+            keymap,
+            keys,
+            modifiers,
+            enters,
+            leaves,
+        },
+        event => panic!("expected keyboard state, got {event:?}"),
+    }
+}
+
+fn reset_native_keyboard_session(server: &mut OwnCompositorServer, input: &mut NativeInputState) {
+    server.clear_keyboard_transient_state_for_session_switch();
+    input.clear_pressed_state_for_session_switch();
+    server.restore_keyboard_focus_after_session_switch();
+}
+
+fn native_keyboard_modifier_mask(keymap_bytes: &[u8], modifier: &str) -> u32 {
+    let keymap_text = std::ffi::CStr::from_bytes_with_nul(keymap_bytes)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_text.to_string(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    1u32.checked_shl(keymap.mod_get_index(modifier)).unwrap()
+}
+
+#[test]
+fn native_input_session_reset_reconciles_forwarded_ctrl_and_held_key() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = format!(
+        "typhon-native-input-session-reset-forwarded-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let mut input = NativeInputState::new(320, 200);
+    apply_native_keyboard_events(&mut server, &mut input, &[(KEY_LEFTCTRL, 1)]);
+
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    let ctrl_mask = native_keyboard_modifier_mask(&state.keymap, xkb::MOD_NAME_CTRL);
+    assert!(state.keys.contains(&(u32::from(KEY_LEFTCTRL), true)));
+    assert!(
+        state
+            .modifiers
+            .iter()
+            .any(|(depressed, _, _, _)| depressed & ctrl_mask != 0)
+    );
+
+    reset_native_keyboard_session(&mut server, &mut input);
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert!(state.leaves >= 1);
+    assert_eq!(state.enters.last(), Some(&Vec::new()));
+    assert_eq!(
+        state.modifiers.last().map(|state| state.0 & ctrl_mask),
+        Some(0)
+    );
+
+    apply_native_keyboard_events(&mut server, &mut input, &[(KEY_Z, 1)]);
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert!(state.keys.contains(&(u32::from(KEY_Z), true)));
+    reset_native_keyboard_session(&mut server, &mut input);
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert!(state.leaves >= 2);
+    assert_eq!(state.enters.last(), Some(&Vec::new()));
+    assert_eq!(state.modifiers.last().map(|state| state.0), Some(0));
+
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+}
+
+#[test]
+fn native_input_session_reset_retains_caps_lock_without_transient_depressed_keys() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = format!(
+        "typhon-native-input-session-reset-caps-lock-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let mut input = NativeInputState::new(320, 200);
+    apply_native_keyboard_events(
+        &mut server,
+        &mut input,
+        &[(KEY_CAPSLOCK, 1), (KEY_CAPSLOCK, 0)],
+    );
+
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    let caps_mask = native_keyboard_modifier_mask(&state.keymap, xkb::MOD_NAME_CAPS);
+    assert!(
+        state
+            .modifiers
+            .iter()
+            .any(|(_, _, locked, _)| locked & caps_mask != 0)
+    );
+
+    reset_native_keyboard_session(&mut server, &mut input);
+    let state = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    let last_modifiers = state.modifiers.last().copied().unwrap();
+    assert!(state.leaves >= 1);
+    assert_eq!(state.enters.last(), Some(&Vec::new()));
+    assert_eq!(last_modifiers.0, 0);
+    assert_eq!(last_modifiers.2 & caps_mask, caps_mask);
+
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+}
+
 #[test]
 fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
@@ -1830,6 +2037,7 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
             keymap,
             keys,
             modifiers,
+            ..
         } => (keymap, keys, modifiers),
         event => panic!("expected keyboard state, got {event:?}"),
     };
@@ -1940,6 +2148,7 @@ fn native_input_deferred_alt_projection_does_not_leak_or_stick_alt() {
                 keymap,
                 keys,
                 modifiers,
+                ..
             } => (keymap, keys, modifiers),
             event => panic!("expected keyboard state, got {event:?}"),
         };
@@ -2269,6 +2478,8 @@ pub(super) struct NativeInputClientState {
     pub(super) keyboard_keymap: Vec<u8>,
     pub(super) keyboard_keys: Vec<(u32, bool)>,
     pub(super) keyboard_modifiers: Vec<(u32, u32, u32, u32)>,
+    pub(super) keyboard_enters: Vec<Vec<u32>>,
+    pub(super) keyboard_leaves: usize,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
@@ -2348,6 +2559,14 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for NativeInputClientState {
                     ),
                 ));
             }
+            client_wl_keyboard::Event::Enter { keys, .. } => {
+                state.keyboard_enters.push(
+                    keys.chunks_exact(4)
+                        .map(|key| u32::from_ne_bytes([key[0], key[1], key[2], key[3]]))
+                        .collect(),
+                );
+            }
+            client_wl_keyboard::Event::Leave { .. } => state.keyboard_leaves += 1,
             client_wl_keyboard::Event::Modifiers {
                 mods_depressed,
                 mods_latched,
@@ -2586,6 +2805,8 @@ pub(super) fn spawn_native_input_keyboard_client(
                             keymap: state.keyboard_keymap.clone(),
                             keys: state.keyboard_keys.clone(),
                             modifiers: state.keyboard_modifiers.clone(),
+                            enters: state.keyboard_enters.clone(),
+                            leaves: state.keyboard_leaves,
                         })
                         .unwrap();
                 }

@@ -1,4 +1,4 @@
-# Typhon Keyboard Layout Core v1 (v1.2 closure)
+# Typhon Keyboard Layout Core v1 (v1.3 closure)
 
 ## Goal
 
@@ -98,6 +98,38 @@ clears transient physical and client key state while retaining global lock and
 layout state. Existing XWayland behavior remains covered by the current
 harness; no second keymap or independently configured XKB stack is
 introduced.
+
+## v1.3 closure addendum
+
+The physical XKB state remains the only authoritative server state. The
+client-visible state is an explicitly non-authoritative slave projection. It
+keeps an ordered ledger of client-visible pressed evdev keys. Whenever the
+physical state changes the global modifier/layout components, the projection
+is rebuilt from the same keymap: `xkb_state_update_mask` supplies the physical
+latched/locked modifier and layout components, then the ordered client ledger
+is replayed with `xkb_state_update_key`. The projection is never used to drive
+physical input or treated as a second server state. This is the documented
+server/client split supported by libxkbcommon and prevents a modifier such as
+Right Alt from being interpreted under a stale effective group.
+
+Session suspension is a protocol boundary. Before transient state is cleared,
+the compositor sends `wl_keyboard.leave` for the current keyboard focus and
+remembers that surface. It clears the physical/client ledgers and transient
+XKB key state without resetting physical locked modifiers or layout. After
+successful input recovery, the remembered surface is restored only if it is
+still the focused surface; `wl_keyboard.enter` carries an empty pressed-key
+list and the current projected modifier/group snapshot. A changed focus or a
+destroyed surface discards the remembered target and follows normal focus
+reconciliation.
+
+The v1.3 regression suite parses the published Text V1 keymap and verifies
+group-sensitive Right Alt behavior for `us,br` with `br(abnt2)` and
+`grp:alt_shift_toggle` in both group directions. It also exercises a real
+Wayland client across forwarded Ctrl plus VT/session reset, an ordinary held Z,
+and Caps Lock; transient keys must disappear from leave/enter state while the
+Caps Lock locked mask remains set. Existing deferred Alt/Super, consumed group
+switch, repeat, inhibition, focus, fallback, raw-keycode, and event-ordering
+coverage remains required.
 
 ## Non-goals
 

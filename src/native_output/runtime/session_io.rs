@@ -468,6 +468,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn resume_input(&mut self) -> NativeResult<()> {
         self.input_devices.resume_after_session()?;
+        self.server.restore_keyboard_focus_after_session_switch();
         self.server.reconcile_window_interaction_trigger(false);
         Ok(())
     }

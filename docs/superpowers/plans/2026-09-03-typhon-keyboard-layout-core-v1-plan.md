@@ -397,3 +397,98 @@ git commit -m "fix: close keyboard layout core verification gaps"
   keycode and modifier semantics, keymap/repeat/fallback behavior, tests,
   exact verification commands/results, and remaining physical LED/layout-v2
   follow-up work.
+
+## v1.3 closure plan
+
+**Goal:** Close the two remaining v1 correctness gaps without changing the
+accepted physical/client action architecture: client modifier projection must
+follow the physical effective group, and session suspension must reset the
+Wayland client's logical keyboard state.
+
+**Architecture:** Keep `physical_state` as the only authoritative server XKB
+state. Turn `client_state` into an explicitly non-authoritative slave
+projection rebuilt from physical serialized modifier/layout components and an
+ordered client-visible pressed-key ledger. Use `xkb_state_update_mask` only to
+seed that slave projection and replay client keys with `xkb_state_update_key`;
+never use the projection to drive physical input. Treat session suspend as a
+Wayland keyboard-focus boundary by sending leave before clearing transient
+state and restoring enter plus projected modifiers after resume.
+
+### Task 5: Rebase the client projection on physical global state
+
+**Files:**
+- Modify: `src/compositor/keyboard.rs`
+- Modify: `src/compositor/state/input_resources.rs` only if projection
+  publication needs a new state-change hook
+- Test: `src/compositor/keyboard.rs`
+- Test: `src/native_output/tests/input.rs`
+
+- [ ] **Step 1: Preserve client key press order.** Replace the unordered
+  client pressed-key set with an ordered ledger that removes the matching
+  evdev key on release and does not duplicate repeated presses.
+
+- [ ] **Step 2: Add the slave projection rebuild.** Construct a fresh
+  `xkb::State` from the cached keymap, call `update_mask` with physical
+  depressed base `0`, physical latched/locked modifier masks, and physical
+  depressed/latched/locked layout indices, then replay each ordered client
+  key with `update_key`. Store the rebuilt state only as the client
+  projection and keep the physical state on the `update_key` server path.
+
+- [ ] **Step 3: Rebuild after physical global changes.** Run the projection
+  rebuild after each physical update before serializing Wayland state so a
+  physical group switch rebases held client-visible modifiers immediately.
+
+- [ ] **Step 4: Add the `us,br` AltGr regression.** Configure
+  `layout=us,br`, `variant=,abnt2`, and
+  `options=grp:alt_shift_toggle`; switch to group 1, forward Right Alt,
+  parse the received Text V1 keymap, and compare the published depressed mask
+  to the group-1 XKB behavior. Switch back to group 0 and repeat the semantic
+  check without fixed Mod1/Mod5 masks.
+
+- [ ] **Step 5: Re-run the existing projection matrix.** Keep deferred
+  Alt/Shift, hidden Super, consumed Super+Space, focus-enter, repeat, and
+  event-ordering tests green.
+
+### Task 6: Reconcile Wayland keyboard focus across session suspension
+
+**Files:**
+- Modify: `src/compositor/mod.rs`
+- Modify: `src/compositor/state/input_resources.rs`
+- Modify: `src/compositor/server_toplevel.rs`
+- Modify: `src/native_output/runtime/session_io.rs`
+- Test: `src/native_output/tests/input.rs`
+
+- [ ] **Step 1: Remember the pre-suspend keyboard focus.** Add a compositor
+  field for the keyboard surface to restore. The suspend helper must send a
+  protocol `leave`, clear the keyboard focus, clear transient state, and clear
+  only the client-visible pressed-key ledger.
+
+- [ ] **Step 2: Restore focus after input recovery.** Add a server method
+  called by `NativeRuntime::resume_input`. If the remembered surface is still
+  the focused live surface, call normal focus reconciliation so the client
+  receives `enter` with an empty key list and the current projected
+  modifiers/group; otherwise discard the target.
+
+- [ ] **Step 3: Test forwarded Ctrl and an ordinary Z.** With a real Wayland
+  keyboard client, forward Ctrl and press Z in separate cases, invoke the
+  suspend/reset/resume boundary, then capture enter keys and modifiers. Assert
+  no Ctrl or Z remains logically pressed, using modifier indices obtained from
+  the parsed keymap.
+
+- [ ] **Step 4: Test persistent Caps Lock.** Toggle Caps Lock before the
+  transient reset, then assert the resumed modifier snapshot has no depressed
+  transient keys but retains the XKB locked Caps mask.
+
+### Task 7: Final v1.3 verification
+
+- [ ] **Step 1:** Run focused keyboard, native-input, session, and compositor
+  keyboard tests in the repository checkout so Cargo uses the local target
+  directory.
+- [ ] **Step 2:** Run `rtk cargo fmt --check`, `rtk cargo test`, and
+  `rtk cargo clippy --all-targets -- -D warnings`; report unrelated baseline
+  failures separately and do not stage unrelated worktree changes.
+- [ ] **Step 3:** Audit for stale client-group assumptions, unpaired session
+  focus reset, fixed modifier masks, `value=2` XKB updates, duplicate physical
+  transitions, and non-English Markdown.
+- [ ] **Step 4:** Run `rtk git diff --check`, inspect the staged file list, and
+  commit the v1.3 closure separately from unrelated pacing changes.
