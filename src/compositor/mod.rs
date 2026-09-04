@@ -202,16 +202,17 @@ pub use fullscreen::{
     FullscreenPresentationRejection, FullscreenPresentationState, FullscreenRenderPlanMetrics,
 };
 pub use idle::{IdleManager, IdleState};
+pub use input::{
+    CursorRevealAuthority, OutputPosition, OutputRect, OutputRegion, PointerAxisComponent,
+    PointerAxisFrame, PointerAxisSource, PointerConstraintBackendId,
+    PointerConstraintBackendRequest, PointerConstraintMode,
+    PointerConstraintRegionResolutionTiming, PointerConstraintState,
+    PointerConstraintTransitionSnapshot, PointerMotionSample, PointerRestoreDecision,
+    PointerWarpOrigin, RelativePointerMotion, ResolvedPointerConstraintBackendRequest,
+};
 use input::{
     InputSerial, InputSerialKind, PointerConstraintLifetime, send_pointer_frame_if_supported,
     wayland_event_time, wayland_event_time_from_usec,
-};
-pub use input::{
-    OutputPosition, OutputRect, OutputRegion, PointerAxisComponent, PointerAxisFrame,
-    PointerAxisSource, PointerConstraintBackendId, PointerConstraintBackendRequest,
-    PointerConstraintMode, PointerConstraintRegionResolutionTiming, PointerConstraintState,
-    PointerConstraintTransitionSnapshot, PointerMotionSample, PointerRestoreDecision,
-    PointerWarpOrigin, RelativePointerMotion, ResolvedPointerConstraintBackendRequest,
 };
 pub use interaction::X11MoveResizeBeginResult;
 use interaction::{
@@ -622,6 +623,7 @@ pub struct CompositorState {
     active_backend_constraint: Option<PointerConstraintBackendId>,
     pending_backend_constraint: Option<PointerConstraintBackendId>,
     pending_locked_pointer_reveal: Option<PendingLockedPointerReveal>,
+    last_cursor_reveal_authority: Option<CursorRevealAuthority>,
     pending_pointer_constraint_backend_requests: Vec<PointerConstraintBackendRequest>,
     cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,

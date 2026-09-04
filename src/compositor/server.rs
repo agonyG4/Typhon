@@ -63,12 +63,12 @@ mod server_shortcut_inhibition;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
-    CoreComplianceMetrics, DecorationRenderInstance, DirectScanoutFeedbackCapabilities,
-    DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
-    FrameCallbackTimingEvidence, FramePacingProtocolCapabilities, FramePresentation,
-    FullscreenRenderPlanMetrics, InputProtocolCapabilities, InteractionUpdateOutcome,
-    OutputPosition, OutputRect, PendingProcessLaunch, PointerAxisFrame,
+    CoreComplianceMetrics, CursorRevealAuthority, DecorationRenderInstance,
+    DirectScanoutFeedbackCapabilities, DirectScanoutSceneBlockers, DirectScanoutSceneCandidate,
+    DirectScanoutSceneRejection, ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics,
+    FrameCallbackTime, FrameCallbackTimingEvidence, FramePacingProtocolCapabilities,
+    FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
+    InteractionUpdateOutcome, OutputPosition, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PointerConstraintTransitionSnapshot, PresentationClock, PresentationProtocolCapabilities,
     ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
@@ -1131,6 +1131,10 @@ impl OwnCompositorServer {
 
     pub fn cursor_visibility_requested(&self) -> bool {
         self.state.cursor_visibility.visible
+    }
+
+    pub fn cursor_reveal_authority(&self) -> Option<CursorRevealAuthority> {
+        self.state.last_cursor_reveal_authority
     }
 
     pub fn last_pointer_position(&self) -> (f64, f64) {

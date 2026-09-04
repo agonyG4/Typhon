@@ -169,6 +169,38 @@ pub struct PointerConstraintBackendId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorRevealAuthority {
+    pub constraint: PointerConstraintBackendId,
+    pub final_position: OutputPosition,
+    pub visibility_requested: bool,
+}
+
+#[cfg(test)]
+mod cursor_reveal_tests {
+    use super::{CursorRevealAuthority, OutputPosition, PointerConstraintBackendId};
+
+    #[test]
+    fn reveal_authority_keeps_constraint_identity_and_final_position() {
+        let authority = CursorRevealAuthority {
+            constraint: PointerConstraintBackendId {
+                constraint_id: 17,
+                generation: 19,
+            },
+            final_position: OutputPosition { x: 321.0, y: 123.0 },
+            visibility_requested: true,
+        };
+
+        assert_eq!(authority.constraint.constraint_id, 17);
+        assert_eq!(authority.constraint.generation, 19);
+        assert_eq!(
+            authority.final_position,
+            OutputPosition { x: 321.0, y: 123.0 }
+        );
+        assert!(authority.visibility_requested);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PointerConstraintTransitionSnapshot {
     pub constraint_id: u64,
     pub generation: u64,

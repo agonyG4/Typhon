@@ -1046,7 +1046,11 @@ impl CompositorState {
         let applied_position =
             self.apply_pointer_warp(position, PointerWarpOrigin::PointerWarpProtocol);
         if matches_pending_unlock && let Some(applied_position) = applied_position {
-            self.record_pending_locked_pointer_client_warp(applied_position);
+            self.record_pending_locked_pointer_client_warp(
+                position,
+                applied_position,
+                PointerWarpOrigin::PointerWarpProtocol,
+            );
             self.try_settle_pending_locked_pointer_reveal("matching_client_warp");
         }
     }

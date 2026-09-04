@@ -99,6 +99,7 @@ impl CompositorState {
         fallback_position: Option<OutputPosition>,
         fallback_origin: Option<PointerWarpOrigin>,
     ) {
+        self.last_cursor_reveal_authority = None;
         pointer_debug_log(format!(
             "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_kept_hidden=true",
             backend_id.constraint_id,
@@ -108,6 +109,23 @@ impl CompositorState {
                 .unwrap_or_else(|| "none".to_string()),
             self.dispatch_epoch
         ));
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=unlock_reveal_begin constraint={}/{} dispatch_epoch={} fallback_position={} fallback=({},{}) fallback_origin={} pointer_position=({},{}) lock_hidden_constraint={}",
+                backend_id.constraint_id,
+                backend_id.generation,
+                self.dispatch_epoch,
+                fallback_position.is_some(),
+                fallback_position.map_or(0.0, |position| position.x),
+                fallback_position.map_or(0.0, |position| position.y),
+                fallback_origin.map_or("none", PointerWarpOrigin::as_str),
+                self.last_pointer_x,
+                self.last_pointer_y,
+                self.cursor_visibility
+                    .lock_hidden_constraint_id
+                    .map_or_else(|| "none".to_string(), |id| id.to_string())
+            )
+        });
         self.pending_locked_pointer_reveal = Some(PendingLockedPointerReveal {
             backend_id,
             pointer,
@@ -186,21 +204,45 @@ impl CompositorState {
             "pointer.unlock backend_restore_settled id={} generation={} epoch={}",
             id.constraint_id, id.generation, self.dispatch_epoch
         ));
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=unlock_backend_settled constraint={}/{} dispatch_epoch={}",
+                id.constraint_id, id.generation, self.dispatch_epoch
+            )
+        });
         self.try_settle_pending_locked_pointer_reveal("backend_restore_settled");
     }
 
     pub(in crate::compositor) fn record_pending_locked_pointer_client_warp(
         &mut self,
-        position: OutputPosition,
+        requested_position: OutputPosition,
+        accepted_position: OutputPosition,
+        origin: PointerWarpOrigin,
     ) {
         let Some(pending) = self.pending_locked_pointer_reveal.as_mut() else {
             return;
         };
-        pending.client_warp_position = Some(position);
+        pending.client_warp_position = Some(accepted_position);
         pointer_debug_log(format!(
             "pointer.unlock client_warp_position=({}, {}) id={} generation={}",
-            position.x, position.y, pending.backend_id.constraint_id, pending.backend_id.generation
+            accepted_position.x,
+            accepted_position.y,
+            pending.backend_id.constraint_id,
+            pending.backend_id.generation
         ));
+        let backend_id = pending.backend_id;
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=unlock_client_warp_observed constraint={}/{} warp_origin={} requested=({},{}) accepted=({},{})",
+                backend_id.constraint_id,
+                backend_id.generation,
+                origin.as_str(),
+                requested_position.x,
+                requested_position.y,
+                accepted_position.x,
+                accepted_position.y
+            )
+        });
     }
 
     pub(in crate::compositor) fn try_settle_pending_locked_pointer_reveal(&mut self, reason: &str) {
@@ -250,6 +292,12 @@ impl CompositorState {
                 x: self.last_pointer_x,
                 y: self.last_pointer_y,
             });
+        let visibility_requested = self.cursor_visibility.desired_visible();
+        self.last_cursor_reveal_authority = Some(CursorRevealAuthority {
+            constraint: pending.backend_id,
+            final_position,
+            visibility_requested,
+        });
         pointer_debug_log(format!(
             "pointer.unlock transition_finalize reason={} id={} generation={} final=({},{}) visibility_request={} epoch={}",
             reason,
@@ -260,6 +308,26 @@ impl CompositorState {
             self.cursor_visibility.desired_visible(),
             self.dispatch_epoch
         ));
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=unlock_reveal_finalize reason={} constraint={}/{} client_warp=({}) fallback=({}) final=({},{}) cursor_visibility_requested={} dispatch_epoch={}",
+                reason,
+                pending.backend_id.constraint_id,
+                pending.backend_id.generation,
+                pending.client_warp_position.map_or_else(
+                    || "none".to_string(),
+                    |position| format!("{},{}", position.x, position.y)
+                ),
+                pending.fallback_position.map_or_else(
+                    || "none".to_string(),
+                    |position| format!("{},{}", position.x, position.y)
+                ),
+                final_position.x,
+                final_position.y,
+                visibility_requested,
+                self.dispatch_epoch
+            )
+        });
         self.sync_cursor_visibility_request();
     }
 
@@ -1396,6 +1464,14 @@ impl CompositorState {
     ) -> Option<OutputPosition> {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log("pointer warp ignored reason=active_lock");
+            crate::pointer_debug::cursor_presentation_log_lazy(|| {
+                format!(
+                    "event=pointer_warp origin={} requested=({},{}) accepted=false applied=false reason=active_lock",
+                    origin.as_str(),
+                    requested.x,
+                    requested.y
+                )
+            });
             return None;
         }
         let constraint = if let Some(active) = self.active_confined_pointer_binding() {
@@ -1433,6 +1509,17 @@ impl CompositorState {
             constraint.y,
             origin.as_str()
         ));
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=pointer_warp origin={} requested=({},{}) accepted=({},{}) applied=true pending_reveal={}",
+                origin.as_str(),
+                requested.x,
+                requested.y,
+                constraint.x,
+                constraint.y,
+                self.pending_locked_pointer_reveal.is_some()
+            )
+        });
         self.pending_pointer_constraint_backend_requests.push(
             PointerConstraintBackendRequest::WarpPointer {
                 position: constraint,
