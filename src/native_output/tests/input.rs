@@ -20,14 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 use wayland_client::{
-    globals::{registry_queue_init, GlobalListContents},
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
         wl_pointer as client_wl_pointer, wl_registry, wl_seat as client_wl_seat,
         wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
         wl_surface as client_wl_surface,
     },
-    Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,

@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn consumed_xwayland_deadline_is_not_rearmed_at_the_wake_plan_boundary() {
-        let deadline_ns = 100_000;
+        let deadline_ns: u64 = 100_000;
         let initial = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: deadline_ns.saturating_sub(1),
             xwayland_timeout_deadline_ns: Some(deadline_ns),
