@@ -857,6 +857,69 @@ impl XwaylandService {
             Some(XwmStartup::new(generation, startup_stream).expect("test XWM startup transport"));
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_running_xwm_focus_fixture_for_tests(
+        &mut self,
+        generation: XwaylandGeneration,
+        xid: u32,
+        issued_at_ns: u64,
+    ) -> Option<UnixStream> {
+        let state = std::mem::replace(&mut self.state, ServiceState::Disabled);
+        let ServiceState::Starting(resources) = state else {
+            self.state = state;
+            return None;
+        };
+        if resources.generation != generation {
+            self.state = ServiceState::Starting(resources);
+            return None;
+        }
+        let (mut xwm, peer) = crate::xwayland::xwm::test_fixture_for_tests(generation);
+        xwm.install_focus_fixture_for_tests(xid, issued_at_ns);
+        let mut readiness = self.snapshot_for_starting(&resources);
+        readiness.xwm_connected = true;
+        readiness.xwm_capabilities_validated = true;
+        readiness.root_initialized = true;
+        readiness.readiness_complete = true;
+        self.last_readiness = Some(readiness);
+        self.state = ServiceState::Running(Box::new(RunningResources {
+            generation: resources.generation,
+            process: resources.process,
+            private_wayland: resources.private_wayland,
+            xwm,
+            xwm_reactor_token: None,
+            stderr: resources.stderr,
+        }));
+        self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        Some(peer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_focus_for_tests(
+        &mut self,
+        generation: XwaylandGeneration,
+        xid: u32,
+        sequence: u16,
+    ) {
+        if let ServiceState::Running(resources) = &mut self.state
+            && resources.generation == generation
+        {
+            resources.xwm.confirm_focus_for_tests(xid, sequence);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn destroy_focus_target_for_tests(
+        &mut self,
+        generation: XwaylandGeneration,
+        xid: u32,
+    ) {
+        if let ServiceState::Running(resources) = &mut self.state
+            && resources.generation == generation
+        {
+            resources.xwm.destroy_focus_target_for_tests(xid);
+        }
+    }
+
     pub fn authorize_private_client(
         &mut self,
         generation: XwaylandGeneration,

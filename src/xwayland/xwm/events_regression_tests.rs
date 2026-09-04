@@ -35,6 +35,27 @@ fn read_fixture_requests(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn aggregate_deadline_handler_services_focus_and_adoption_due_together() {
+    let generation = generation(40);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    xwm.install_focus_fixture_for_tests(140, 10);
+    let focus_deadline = 10 + super::super::focus::FOCUS_CONFIRMATION_TIMEOUT_NS;
+    xwm.adoption.observe(
+        super::super::X11WindowHandle::new(generation, 140),
+        super::super::adoption::AdoptionWait::MapToAssociation,
+        focus_deadline,
+    );
+
+    assert_eq!(xwm.next_deadline_ns(), Some(focus_deadline));
+    let outcome = xwm.handle_deadlines(focus_deadline);
+    assert!(outcome.adoption_timeout_summary);
+    assert_eq!(outcome.adoption_metrics.waits_expired, 1);
+    assert!(outcome.error.is_none());
+    assert_ne!(xwm.next_deadline_ns(), Some(focus_deadline));
+    assert!(!read_fixture_requests(&mut peer).is_empty());
+}
+
 fn request_opcodes(bytes: &[u8]) -> Vec<u8> {
     let mut opcodes = Vec::new();
     let mut offset: usize = 0;
@@ -104,6 +125,7 @@ fn sync_snapshot(handle: super::X11WindowHandle, counter: u64) -> X11WindowSnaps
         surface_id: 42,
         kind: DesktopWindowKind::Managed,
         window_types: Default::default(),
+        decoration_hints: Default::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 100,

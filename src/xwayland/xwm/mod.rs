@@ -40,6 +40,8 @@ pub(crate) mod shape;
 pub(crate) mod startup;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use events::tests::test_fixture as test_fixture_for_tests;
 mod window;
 mod window_runtime;
 mod window_types;

@@ -110,7 +110,70 @@ mod tests {
         assert_eq!(pacing.predictive_render_ahead_attempts, 1);
         assert_eq!(pacing.predictive_render_ahead_ready, 1);
         assert_eq!(pacing.predictive_ready_submits, 1);
+        assert_eq!(pacing.predictive_ready_created, 1);
+        assert_eq!(pacing.predictive_ready_submitted, 1);
+        assert_eq!(
+            pacing.predictive_ready_created,
+            pacing.predictive_ready_submitted
+                + pacing.predictive_ready_overtaken_ready
+                + pacing.predictive_ready_overtaken_worker_queued
+                + pacing.predictive_ready_other_safe_abandonment
+                + pacing.predictive_ready_failed
+                + pacing.predictive_ready_current_at_shutdown
+        );
         assert!(pacing.predictive_render_ahead_ready <= pacing.predictive_render_ahead_attempts);
+    }
+
+    #[test]
+    fn predictive_ready_lifecycle_reconciles_safe_overtake_failure_and_shutdown() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(2, true);
+        assert!(pacing.abandon_ready_frame());
+
+        pacing.queue_visual(3, 2);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(4, true);
+        pacing.note_predictive_ready_overtaken_worker_queued();
+
+        pacing.queue_visual(5, 3);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(6, true);
+        pacing.note_predictive_ready_other_safe_abandonment();
+
+        pacing.queue_visual(7, 4);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(8, true);
+        let reserved = pacing
+            .reserve_worker_submission(true)
+            .expect("reserve predictive ready worker submission")
+            .expect("predictive ready frame identity");
+        assert!(pacing.cancel_worker_submission(Some(reserved), true));
+
+        pacing.queue_visual(9, 5);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(10, true);
+        pacing.note_predictive_ready_current_at_shutdown();
+
+        assert_eq!(pacing.predictive_ready_created, 5);
+        assert_eq!(pacing.predictive_ready_submitted, 0);
+        assert_eq!(pacing.predictive_ready_overtaken_ready, 1);
+        assert_eq!(pacing.predictive_ready_overtaken_worker_queued, 1);
+        assert_eq!(pacing.predictive_ready_other_safe_abandonment, 1);
+        assert_eq!(pacing.predictive_ready_failed, 1);
+        assert_eq!(pacing.predictive_ready_current_at_shutdown, 1);
+        assert_eq!(
+            pacing.predictive_ready_created,
+            pacing.predictive_ready_submitted
+                + pacing.predictive_ready_overtaken_ready
+                + pacing.predictive_ready_overtaken_worker_queued
+                + pacing.predictive_ready_other_safe_abandonment
+                + pacing.predictive_ready_failed
+                + pacing.predictive_ready_current_at_shutdown
+        );
     }
 
     #[test]
@@ -303,6 +366,13 @@ mod tests {
             "predictive_render_ahead_attempts=0",
             "predictive_render_ahead_ready=0",
             "predictive_ready_submits=0",
+            "predictive_ready_created=0",
+            "predictive_ready_submitted=0",
+            "predictive_ready_overtaken_ready=0",
+            "predictive_ready_overtaken_worker_queued=0",
+            "predictive_ready_other_safe_abandonment=0",
+            "predictive_ready_failed=0",
+            "predictive_ready_current_at_shutdown=0",
             "normal_ready_wait_count=0",
             "scheduled_normal_target_count=0",
             "expired_deadline_wait_count=0",
@@ -451,6 +521,9 @@ mod tests {
             "actual_primary_distance_intervals_p50=1",
             "reactive_target_late_by_intervals=1",
             "fast_client_samples=1",
+            "fast_candidate_seen=1",
+            "fast_candidate_qualified=0",
+            "fast_candidate_rejected_missing_admission=1",
             "content_attribution_target_hit=1",
             "prediction_total_cost_ns=0",
         ] {
@@ -513,6 +586,10 @@ mod tests {
         let summary = pacing.content_summary_line();
         for field in [
             "fast_client_continuous_samples=127",
+            "fast_candidate_seen=128",
+            "fast_candidate_qualified=128",
+            "fast_continuity_seeded=1",
+            "fast_continuity_sampled=127",
             "fast_client_primary_present_interval_p50_us=6060",
             "fast_client_actual_primary_distance_p50=1",
             "fast_client_missed_refresh_1x=0",
@@ -620,6 +697,111 @@ mod tests {
         assert_eq!(
             pacing.fast_client_continuous_samples,
             continuous_before_exclusions
+        );
+    }
+
+    #[test]
+    fn fast_candidate_diagnostics_account_for_qualification_and_continuity_outcomes() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let refresh_ns = 6_060_606_u64;
+        let mut observation = ExplicitPresentationObservation {
+            planned_sequence: 1,
+            actual_sequence: 1,
+            target_ns: 10_000_000,
+            presented_ns: 10_000_000,
+            composite_started_ns: 8_000_000,
+            rendered_ns: 9_000_000,
+            submit_started_ns: 9_100_000,
+            submit_returned_ns: 9_300_000,
+            reactive_double: false,
+            target_reason:
+                oblivion_one::native::presentation_deadline::PresentationTargetReason::Normal,
+            target_selection: TargetSelectionEvidence {
+                earliest_feasible_sequence: 1,
+                binding: false,
+            },
+            previous_primary_sequence: None,
+            client_commit_ns: Some(7_500_000),
+            callback_reaction_ns: Some(500_000),
+            callback_admission_ns: Some(7_000_000),
+            callback_surface_id: Some(7),
+            callback_surface_is_exclusive: true,
+            refresh_interval_ns: refresh_ns,
+            render_missed: false,
+            submit_missed: false,
+            kms_slipped: false,
+        };
+
+        observation.callback_surface_id = None;
+        pacing.note_explicit_present(observation);
+        observation.callback_surface_id = Some(7);
+        observation.callback_surface_is_exclusive = false;
+        pacing.note_explicit_present(observation);
+        observation.callback_surface_is_exclusive = true;
+        observation.client_commit_ns = None;
+        pacing.note_explicit_present(observation);
+        observation.client_commit_ns = Some(7_500_000);
+        observation.callback_admission_ns = None;
+        pacing.note_explicit_present(observation);
+
+        pacing.note_pageflip(1_000_000, 1_000_000, 1, refresh_ns / 1_000);
+        observation.callback_admission_ns = Some(8_000_000);
+        observation.client_commit_ns = Some(8_500_000);
+        pacing.note_explicit_present(observation);
+
+        pacing.last_pageflip_ns = None;
+        observation.presented_ns = 20_000_000;
+        observation.target_ns = observation.presented_ns;
+        observation.callback_admission_ns = Some(17_000_000);
+        observation.client_commit_ns = Some(16_500_000);
+        pacing.note_explicit_present(observation);
+        observation.callback_surface_id = Some(8);
+        observation.presented_ns = 30_000_000;
+        observation.target_ns = observation.presented_ns;
+        observation.callback_admission_ns = Some(27_000_000);
+        observation.client_commit_ns = Some(26_500_000);
+        pacing.note_explicit_present(observation);
+        observation.presented_ns = 35_000_000;
+        observation.target_ns = observation.presented_ns;
+        observation.callback_admission_ns = Some(32_000_000);
+        observation.client_commit_ns = Some(31_500_000);
+        pacing.note_explicit_present(observation);
+        observation.presented_ns = 40_000_000;
+        observation.target_ns = observation.presented_ns;
+        observation.client_commit_ns = Some(31_500_000);
+        observation.callback_admission_ns = Some(37_000_000);
+        pacing.note_explicit_present(observation);
+
+        pacing.last_fast_client_surface_id = Some(8);
+        pacing.last_fast_client_commit_ns = Some(26_500_000);
+        pacing.last_fast_client_presented_ns = None;
+        observation.presented_ns = 50_000_000;
+        observation.target_ns = observation.presented_ns;
+        observation.client_commit_ns = Some(46_500_000);
+        observation.callback_admission_ns = Some(47_000_000);
+        pacing.note_explicit_present(observation);
+
+        assert_eq!(pacing.fast_candidate_seen, 10);
+        assert_eq!(pacing.fast_candidate_qualified, 5);
+        assert_eq!(pacing.fast_candidate_rejected_missing_surface, 1);
+        assert_eq!(pacing.fast_candidate_rejected_nonexclusive_surface, 1);
+        assert_eq!(pacing.fast_candidate_rejected_missing_commit, 1);
+        assert_eq!(pacing.fast_candidate_rejected_missing_admission, 1);
+        assert_eq!(pacing.fast_candidate_rejected_callback_handoff, 1);
+        assert_eq!(pacing.fast_continuity_seeded, 1);
+        assert_eq!(pacing.fast_continuity_sampled, 1);
+        assert_eq!(pacing.fast_continuity_broken_surface_change, 1);
+        assert_eq!(pacing.fast_continuity_broken_nonmonotonic_commit, 1);
+        assert_eq!(pacing.fast_continuity_broken_missing_previous_present, 1);
+        assert_eq!(
+            pacing.fast_candidate_seen,
+            pacing.fast_candidate_qualified
+                + pacing.fast_candidate_rejected_missing_surface
+                + pacing.fast_candidate_rejected_nonexclusive_surface
+                + pacing.fast_candidate_rejected_missing_commit
+                + pacing.fast_candidate_rejected_missing_admission
+                + pacing.fast_candidate_rejected_callback_handoff
         );
     }
 
@@ -1040,6 +1222,27 @@ pub(crate) fn classify_content_frame(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastClientCandidateOutcome {
+    NotSeen,
+    MissingSurface,
+    NonExclusiveSurface,
+    MissingCommit,
+    MissingAdmission,
+    CallbackHandoff,
+    Qualified,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PredictiveReadyTerminal {
+    Submitted,
+    OvertakenReady,
+    OvertakenWorkerQueued,
+    OtherSafeAbandonment,
+    Failed,
+    CurrentAtShutdown,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WorkerPacingReservation {
     frame_id: NativeOutputFrameId,
@@ -1103,6 +1306,13 @@ pub(crate) struct NativeFramePacing {
     pub(crate) predictive_render_ahead_attempts: u64,
     pub(crate) predictive_render_ahead_ready: u64,
     pub(crate) predictive_ready_submits: u64,
+    pub(crate) predictive_ready_created: u64,
+    pub(crate) predictive_ready_submitted: u64,
+    pub(crate) predictive_ready_overtaken_ready: u64,
+    pub(crate) predictive_ready_overtaken_worker_queued: u64,
+    pub(crate) predictive_ready_other_safe_abandonment: u64,
+    pub(crate) predictive_ready_failed: u64,
+    pub(crate) predictive_ready_current_at_shutdown: u64,
     pub(crate) normal_ready_wait_count: u64,
     pub(crate) scheduled_normal_target_count: u64,
     pub(crate) expired_deadline_wait_count: u64,
@@ -1149,6 +1359,18 @@ pub(crate) struct NativeFramePacing {
     predictive_target_late_by_intervals: u64,
     fast_client_samples: u64,
     slow_client_samples: u64,
+    pub(crate) fast_candidate_seen: u64,
+    pub(crate) fast_candidate_qualified: u64,
+    pub(crate) fast_candidate_rejected_missing_surface: u64,
+    pub(crate) fast_candidate_rejected_nonexclusive_surface: u64,
+    pub(crate) fast_candidate_rejected_missing_commit: u64,
+    pub(crate) fast_candidate_rejected_missing_admission: u64,
+    pub(crate) fast_candidate_rejected_callback_handoff: u64,
+    pub(crate) fast_continuity_seeded: u64,
+    pub(crate) fast_continuity_sampled: u64,
+    pub(crate) fast_continuity_broken_surface_change: u64,
+    pub(crate) fast_continuity_broken_nonmonotonic_commit: u64,
+    pub(crate) fast_continuity_broken_missing_previous_present: u64,
     fast_client_continuous_samples: u64,
     fast_client_target_hit: u64,
     fast_client_target_limited: u64,
@@ -1175,6 +1397,7 @@ pub(crate) struct NativeFramePacing {
     ready_waiting_for_target_count: u64,
     ready_waiting_started_ns: Option<u64>,
     last_immediate_timer_deadline: Option<u64>,
+    predictive_ready_frame_id: Option<NativeOutputFrameId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1266,6 +1489,13 @@ impl NativeFramePacing {
             predictive_render_ahead_attempts: 0,
             predictive_render_ahead_ready: 0,
             predictive_ready_submits: 0,
+            predictive_ready_created: 0,
+            predictive_ready_submitted: 0,
+            predictive_ready_overtaken_ready: 0,
+            predictive_ready_overtaken_worker_queued: 0,
+            predictive_ready_other_safe_abandonment: 0,
+            predictive_ready_failed: 0,
+            predictive_ready_current_at_shutdown: 0,
             normal_ready_wait_count: 0,
             scheduled_normal_target_count: 0,
             expired_deadline_wait_count: 0,
@@ -1312,6 +1542,18 @@ impl NativeFramePacing {
             predictive_target_late_by_intervals: 0,
             fast_client_samples: 0,
             slow_client_samples: 0,
+            fast_candidate_seen: 0,
+            fast_candidate_qualified: 0,
+            fast_candidate_rejected_missing_surface: 0,
+            fast_candidate_rejected_nonexclusive_surface: 0,
+            fast_candidate_rejected_missing_commit: 0,
+            fast_candidate_rejected_missing_admission: 0,
+            fast_candidate_rejected_callback_handoff: 0,
+            fast_continuity_seeded: 0,
+            fast_continuity_sampled: 0,
+            fast_continuity_broken_surface_change: 0,
+            fast_continuity_broken_nonmonotonic_commit: 0,
+            fast_continuity_broken_missing_previous_present: 0,
             fast_client_continuous_samples: 0,
             fast_client_target_hit: 0,
             fast_client_target_limited: 0,
@@ -1338,6 +1580,7 @@ impl NativeFramePacing {
             ready_waiting_for_target_count: 0,
             ready_waiting_started_ns: None,
             last_immediate_timer_deadline: None,
+            predictive_ready_frame_id: None,
         }
     }
 
@@ -1468,6 +1711,11 @@ impl NativeFramePacing {
                 NativeOutputPacingMode::PredictiveTriple => self.predictive_ready_submits += 1,
                 NativeOutputPacingMode::ReactiveDouble => self.normal_ready_wait_count += 1,
             }
+            if pacing_mode == NativeOutputPacingMode::PredictiveTriple
+                && self.predictive_ready_frame_id == id
+            {
+                self.note_predictive_ready_terminal(PredictiveReadyTerminal::Submitted);
+            }
             if self.ready_waiting_frame_id == id {
                 if let Some(started_at) = self.ready_waiting_started_ns.take() {
                     self.ready_waiting_for_target
@@ -1494,6 +1742,73 @@ impl NativeFramePacing {
                 PacingField::bool("ready_submit", ready_submit),
             ],
         );
+    }
+
+    fn note_predictive_ready_terminal(&mut self, terminal: PredictiveReadyTerminal) {
+        let Some(frame_id) = self.predictive_ready_frame_id.take() else {
+            return;
+        };
+        match terminal {
+            PredictiveReadyTerminal::Submitted => {
+                self.predictive_ready_submitted = self.predictive_ready_submitted.saturating_add(1)
+            }
+            PredictiveReadyTerminal::OvertakenReady => {
+                self.predictive_ready_overtaken_ready =
+                    self.predictive_ready_overtaken_ready.saturating_add(1)
+            }
+            PredictiveReadyTerminal::OvertakenWorkerQueued => {
+                self.predictive_ready_overtaken_worker_queued = self
+                    .predictive_ready_overtaken_worker_queued
+                    .saturating_add(1)
+            }
+            PredictiveReadyTerminal::OtherSafeAbandonment => {
+                self.predictive_ready_other_safe_abandonment = self
+                    .predictive_ready_other_safe_abandonment
+                    .saturating_add(1)
+            }
+            PredictiveReadyTerminal::Failed => {
+                self.predictive_ready_failed = self.predictive_ready_failed.saturating_add(1)
+            }
+            PredictiveReadyTerminal::CurrentAtShutdown => {
+                self.predictive_ready_current_at_shutdown =
+                    self.predictive_ready_current_at_shutdown.saturating_add(1)
+            }
+        }
+        self.log(
+            "predictive_ready_terminal",
+            vec![
+                frame_id_field(Some(frame_id)),
+                PacingField::str(
+                    "terminal",
+                    match terminal {
+                        PredictiveReadyTerminal::Submitted => "submitted",
+                        PredictiveReadyTerminal::OvertakenReady => "overtaken_ready",
+                        PredictiveReadyTerminal::OvertakenWorkerQueued => "overtaken_worker_queued",
+                        PredictiveReadyTerminal::OtherSafeAbandonment => "other_safe_abandonment",
+                        PredictiveReadyTerminal::Failed => "failed",
+                        PredictiveReadyTerminal::CurrentAtShutdown => "current_at_shutdown",
+                    },
+                ),
+            ],
+        );
+    }
+
+    pub(crate) fn note_predictive_ready_overtaken_worker_queued(&mut self) {
+        if self.enabled {
+            self.note_predictive_ready_terminal(PredictiveReadyTerminal::OvertakenWorkerQueued);
+        }
+    }
+
+    pub(crate) fn note_predictive_ready_other_safe_abandonment(&mut self) {
+        if self.enabled {
+            self.note_predictive_ready_terminal(PredictiveReadyTerminal::OtherSafeAbandonment);
+        }
+    }
+
+    pub(crate) fn note_predictive_ready_current_at_shutdown(&mut self) {
+        if self.enabled {
+            self.note_predictive_ready_terminal(PredictiveReadyTerminal::CurrentAtShutdown);
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1594,6 +1909,9 @@ impl NativeFramePacing {
         if current.is_none() {
             return false;
         }
+        if ready_submit {
+            self.note_predictive_ready_terminal(PredictiveReadyTerminal::Failed);
+        }
         self.clear_ready_waiting_timing(current);
         self.log(
             "worker_submit_cancelled",
@@ -1647,6 +1965,10 @@ impl NativeFramePacing {
         if waits_for_target {
             self.render_ahead_successes += 1;
             self.predictive_render_ahead_ready += 1;
+            if let Some(frame_id) = ready {
+                self.predictive_ready_created = self.predictive_ready_created.saturating_add(1);
+                self.predictive_ready_frame_id = Some(frame_id);
+            }
             self.ready_waiting_started_ns = None;
             self.ready_waiting_frame_id = None;
         } else {
@@ -1674,6 +1996,7 @@ impl NativeFramePacing {
         let Some(frame_id) = self.ready.take() else {
             return false;
         };
+        self.note_predictive_ready_terminal(PredictiveReadyTerminal::OvertakenReady);
         self.clear_ready_waiting_timing(Some(frame_id));
         self.log(
             "ready_frame_abandoned",
@@ -1759,6 +2082,102 @@ impl NativeFramePacing {
             self.last_immediate_timer_deadline = None;
         }
     }
+
+    fn classify_fast_client_candidate(
+        &mut self,
+        observation: ExplicitPresentationObservation,
+        fast_client_threshold_ns: u64,
+        callback_handoff_limited: bool,
+    ) -> FastClientCandidateOutcome {
+        let Some(reaction_ns) = observation.callback_reaction_ns else {
+            return FastClientCandidateOutcome::NotSeen;
+        };
+        if reaction_ns > fast_client_threshold_ns {
+            return FastClientCandidateOutcome::NotSeen;
+        }
+        self.fast_candidate_seen = self.fast_candidate_seen.saturating_add(1);
+        let outcome = if observation.callback_surface_id.is_none() {
+            FastClientCandidateOutcome::MissingSurface
+        } else if !observation.callback_surface_is_exclusive {
+            FastClientCandidateOutcome::NonExclusiveSurface
+        } else if observation.client_commit_ns.is_none() {
+            FastClientCandidateOutcome::MissingCommit
+        } else if observation.callback_admission_ns.is_none() {
+            FastClientCandidateOutcome::MissingAdmission
+        } else if callback_handoff_limited {
+            FastClientCandidateOutcome::CallbackHandoff
+        } else {
+            FastClientCandidateOutcome::Qualified
+        };
+        match outcome {
+            FastClientCandidateOutcome::MissingSurface => {
+                self.fast_candidate_rejected_missing_surface = self
+                    .fast_candidate_rejected_missing_surface
+                    .saturating_add(1);
+            }
+            FastClientCandidateOutcome::NonExclusiveSurface => {
+                self.fast_candidate_rejected_nonexclusive_surface = self
+                    .fast_candidate_rejected_nonexclusive_surface
+                    .saturating_add(1);
+            }
+            FastClientCandidateOutcome::MissingCommit => {
+                self.fast_candidate_rejected_missing_commit = self
+                    .fast_candidate_rejected_missing_commit
+                    .saturating_add(1);
+            }
+            FastClientCandidateOutcome::MissingAdmission => {
+                self.fast_candidate_rejected_missing_admission = self
+                    .fast_candidate_rejected_missing_admission
+                    .saturating_add(1);
+            }
+            FastClientCandidateOutcome::CallbackHandoff => {
+                self.fast_candidate_rejected_callback_handoff = self
+                    .fast_candidate_rejected_callback_handoff
+                    .saturating_add(1);
+            }
+            FastClientCandidateOutcome::Qualified => {
+                self.fast_candidate_qualified = self.fast_candidate_qualified.saturating_add(1);
+            }
+            FastClientCandidateOutcome::NotSeen => {}
+        }
+        outcome
+    }
+
+    fn note_fast_client_continuity(
+        &mut self,
+        observation: ExplicitPresentationObservation,
+        candidate: FastClientCandidateOutcome,
+    ) {
+        if candidate != FastClientCandidateOutcome::Qualified {
+            return;
+        }
+        let previous_surface = self.last_fast_client_surface_id;
+        let previous_commit = self.last_fast_client_commit_ns;
+        let previous_present = self.last_fast_client_presented_ns;
+        if previous_present.is_none() {
+            if previous_surface.is_none() && previous_commit.is_none() {
+                self.fast_continuity_seeded = self.fast_continuity_seeded.saturating_add(1);
+            } else {
+                self.fast_continuity_broken_missing_previous_present = self
+                    .fast_continuity_broken_missing_previous_present
+                    .saturating_add(1);
+            }
+        } else if observation.callback_surface_id != previous_surface {
+            self.fast_continuity_broken_surface_change =
+                self.fast_continuity_broken_surface_change.saturating_add(1);
+        } else if observation
+            .client_commit_ns
+            .zip(previous_commit)
+            .is_none_or(|(current, previous)| current <= previous)
+        {
+            self.fast_continuity_broken_nonmonotonic_commit = self
+                .fast_continuity_broken_nonmonotonic_commit
+                .saturating_add(1);
+        } else {
+            self.fast_continuity_sampled = self.fast_continuity_sampled.saturating_add(1);
+        }
+    }
+
     pub(crate) fn note_explicit_present(&mut self, observation: ExplicitPresentationObservation) {
         if !self.enabled {
             return;
@@ -1876,21 +2295,16 @@ impl NativeFramePacing {
             observation.submit_missed,
             observation.kms_slipped,
         );
-        let fast_client_candidate = observation
-            .callback_surface_id
-            .filter(|_| observation.callback_surface_is_exclusive)
-            .zip(observation.callback_reaction_ns)
-            .zip(observation.client_commit_ns)
-            .zip(observation.callback_admission_ns)
-            .is_some_and(
-                |(((_surface_id, reaction_ns), _commit_ns), _admission_ns)| {
-                    reaction_ns <= fast_client_threshold_ns && !callback_handoff_limited
-                },
-            );
+        let fast_client_candidate = self.classify_fast_client_candidate(
+            observation,
+            fast_client_threshold_ns,
+            callback_handoff_limited,
+        );
+        self.note_fast_client_continuity(observation, fast_client_candidate);
         let fast_interval_us = self
             .last_fast_client_presented_ns
             .map(|previous| observation.presented_ns.saturating_sub(previous) / 1_000);
-        let continuous_fast_client = fast_client_candidate
+        let continuous_fast_client = fast_client_candidate == FastClientCandidateOutcome::Qualified
             && observation
                 .callback_surface_id
                 .is_some_and(|surface_id| self.last_fast_client_surface_id == Some(surface_id))
@@ -1936,7 +2350,7 @@ impl NativeFramePacing {
                 | ContentCadenceAttribution::ClientLimited => {}
             }
         }
-        if fast_client_candidate {
+        if fast_client_candidate == FastClientCandidateOutcome::Qualified {
             self.last_fast_client_surface_id = observation.callback_surface_id;
             self.last_fast_client_commit_ns = observation.client_commit_ns;
             self.last_fast_client_presented_ns = Some(observation.presented_ns);
@@ -2149,6 +2563,42 @@ impl NativeFramePacing {
                 ),
                 PacingField::u64("fast_client_samples", self.fast_client_samples),
                 PacingField::u64("slow_client_samples", self.slow_client_samples),
+                PacingField::u64("fast_candidate_seen", self.fast_candidate_seen),
+                PacingField::u64("fast_candidate_qualified", self.fast_candidate_qualified),
+                PacingField::u64(
+                    "fast_candidate_rejected_missing_surface",
+                    self.fast_candidate_rejected_missing_surface,
+                ),
+                PacingField::u64(
+                    "fast_candidate_rejected_nonexclusive_surface",
+                    self.fast_candidate_rejected_nonexclusive_surface,
+                ),
+                PacingField::u64(
+                    "fast_candidate_rejected_missing_commit",
+                    self.fast_candidate_rejected_missing_commit,
+                ),
+                PacingField::u64(
+                    "fast_candidate_rejected_missing_admission",
+                    self.fast_candidate_rejected_missing_admission,
+                ),
+                PacingField::u64(
+                    "fast_candidate_rejected_callback_handoff",
+                    self.fast_candidate_rejected_callback_handoff,
+                ),
+                PacingField::u64("fast_continuity_seeded", self.fast_continuity_seeded),
+                PacingField::u64("fast_continuity_sampled", self.fast_continuity_sampled),
+                PacingField::u64(
+                    "fast_continuity_broken_surface_change",
+                    self.fast_continuity_broken_surface_change,
+                ),
+                PacingField::u64(
+                    "fast_continuity_broken_nonmonotonic_commit",
+                    self.fast_continuity_broken_nonmonotonic_commit,
+                ),
+                PacingField::u64(
+                    "fast_continuity_broken_missing_previous_present",
+                    self.fast_continuity_broken_missing_previous_present,
+                ),
                 PacingField::u64(
                     "fast_client_continuous_samples",
                     self.fast_client_continuous_samples,
@@ -2375,6 +2825,28 @@ impl NativeFramePacing {
                     self.predictive_render_ahead_ready,
                 ),
                 PacingField::u64("predictive_ready_submits", self.predictive_ready_submits),
+                PacingField::u64("predictive_ready_created", self.predictive_ready_created),
+                PacingField::u64(
+                    "predictive_ready_submitted",
+                    self.predictive_ready_submitted,
+                ),
+                PacingField::u64(
+                    "predictive_ready_overtaken_ready",
+                    self.predictive_ready_overtaken_ready,
+                ),
+                PacingField::u64(
+                    "predictive_ready_overtaken_worker_queued",
+                    self.predictive_ready_overtaken_worker_queued,
+                ),
+                PacingField::u64(
+                    "predictive_ready_other_safe_abandonment",
+                    self.predictive_ready_other_safe_abandonment,
+                ),
+                PacingField::u64("predictive_ready_failed", self.predictive_ready_failed),
+                PacingField::u64(
+                    "predictive_ready_current_at_shutdown",
+                    self.predictive_ready_current_at_shutdown,
+                ),
                 PacingField::u64("normal_ready_wait_count", self.normal_ready_wait_count),
                 PacingField::u64(
                     "scheduled_normal_target_count",

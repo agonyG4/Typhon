@@ -465,6 +465,44 @@ mod tests {
     }
 
     #[test]
+    fn consumed_xwayland_deadline_is_not_rearmed_at_the_wake_plan_boundary() {
+        let deadline_ns = 100_000;
+        let initial = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: deadline_ns.saturating_sub(1),
+            xwayland_timeout_deadline_ns: Some(deadline_ns),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            initial.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::XwaylandTimeout,
+                at_ns: deadline_ns,
+            })
+        );
+
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        metrics.observe_plan(initial, deadline_ns.saturating_sub(1), None, None);
+        let consumed = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: deadline_ns,
+            xwayland_timeout_deadline_ns: None,
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(consumed.deadline, None);
+        metrics.observe_plan(consumed, deadline_ns, Some(deadline_ns), Some(deadline_ns));
+
+        assert_eq!(
+            metrics.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::XwaylandTimeout)],
+            0
+        );
+        assert_eq!(
+            metrics.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::XwaylandTimeout)],
+            0
+        );
+    }
+
+    #[test]
     fn input_backlog_is_continuation_not_now_deadline() {
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns: 10_000_000,

@@ -689,6 +689,8 @@ impl Drop for NativeRuntime {
         } else {
             let _ = oblivion_one::xwayland::trace::take_recent_lifecycle_trace();
         }
+        self.frame_pacing
+            .note_predictive_ready_current_at_shutdown();
         if self.frame_pacing.summary_enabled() {
             println!("{}", self.wake_authority.summary_line(&self.event_loop));
             println!(

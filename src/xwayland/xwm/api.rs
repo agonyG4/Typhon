@@ -2,12 +2,92 @@ use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 
 impl Xwm {
+    pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
+        self.next_resize_sync_deadline_ns()
+            .into_iter()
+            .chain(self.next_focus_deadline_ns())
+            .chain(self.next_adoption_deadline_ns())
+            .min()
+    }
+
     pub(crate) fn next_resize_sync_deadline_ns(&self) -> Option<u64> {
         self.resize_sync.next_deadline_ns()
     }
 
     pub(crate) fn next_focus_deadline_ns(&self) -> Option<u64> {
         self.focus.next_focus_deadline_ns()
+    }
+
+    pub(crate) fn handle_deadlines(&mut self, now_ns: u64) -> XwmDeadlineOutcome {
+        let adoption_timeout_summary = self.collect_adoption_expirations(now_ns);
+        let resize_error = self.handle_resize_sync_deadline(now_ns).err();
+        let focus_error = self.handle_focus_deadline(now_ns).err();
+        XwmDeadlineOutcome {
+            adoption_timeout_summary,
+            adoption_metrics: self.adoption_metrics(),
+            error: resize_error.or(focus_error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_focus_fixture_for_tests(
+        &mut self,
+        xid: u32,
+        issued_at_ns: u64,
+    ) -> focus::FocusTransitionId {
+        let handle = X11WindowHandle::new(self.generation, xid);
+        self.register_snapshot(X11WindowSnapshot {
+            handle,
+            surface_id: 1,
+            kind: DesktopWindowKind::Managed,
+            window_types: X11WindowTypes::default(),
+            override_redirect: false,
+            geometry: X11Geometry {
+                width: 640,
+                height: 480,
+                ..X11Geometry::default()
+            },
+            metadata: WindowMetadata::default(),
+            constraints: WindowConstraints::default(),
+            state: X11PublishedState::default(),
+            transient_for: None,
+            supports_delete: false,
+            supports_take_focus: true,
+            accepts_input: Some(true),
+            window_role: None,
+            startup_id: None,
+            user_time: None,
+            urgency: false,
+            supports_sync_request: false,
+            sync_counter: None,
+        })
+        .expect("install XWM focus fixture snapshot");
+        let transition = self.note_focus_command(Some(handle), focus::FocusModel::Input, 1);
+        self.focus.note_focus_request_issued_at_for_tests(
+            transition,
+            Some(1),
+            true,
+            false,
+            issued_at_ns,
+        );
+        transition
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_focus_for_tests(&mut self, xid: u32, sequence: u16) {
+        self.focus.note_focus_in_event_with_root(
+            self.generation,
+            Some(self.root),
+            xid,
+            sequence,
+            0,
+            0,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn destroy_focus_target_for_tests(&mut self, xid: u32) {
+        self.note_focus_destroyed(xid);
     }
 
     pub fn note_x11_surface_serial(
@@ -220,4 +300,11 @@ impl Xwm {
     pub(crate) fn next_adoption_deadline_ns(&self) -> Option<u64> {
         self.adoption.next_deadline_ns()
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct XwmDeadlineOutcome {
+    pub(crate) adoption_timeout_summary: bool,
+    pub(crate) adoption_metrics: adoption::AdoptionMetrics,
+    pub(crate) error: Option<XwmError>,
 }

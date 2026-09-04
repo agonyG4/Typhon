@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, Read},
     num::NonZeroU64,
     os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixStream,
@@ -351,6 +352,112 @@ fn service_at_root_with_sleeping_binary(
     config.display_min = 1;
     let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
     (root, service, ChildSupervisor::new())
+}
+
+fn read_fixture_requests(peer: &mut UnixStream) -> Vec<u8> {
+    peer.set_nonblocking(true)
+        .expect("nonblocking XWM fixture peer");
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match peer.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("read XWM fixture requests: {error}"),
+        }
+    }
+    bytes
+}
+
+#[test]
+fn timer_only_focus_deadline_is_consumed_by_the_service_timer_api() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "focus-deadline-timer");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start XWayland generation");
+    let generation = service.generation().expect("starting generation");
+    let issued_at_ns = 1_000_000;
+    let mut peer = service
+        .install_running_xwm_focus_fixture_for_tests(generation, 41, issued_at_ns)
+        .expect("install running XWM fixture");
+    let deadline = issued_at_ns + super::xwm::focus::FOCUS_CONFIRMATION_TIMEOUT_NS;
+
+    assert_eq!(service.next_deadline_ns(), Some(deadline));
+    service
+        .handle_deadline(deadline, &mut supervisor)
+        .expect("timer-only XWayland focus deadline");
+    let first_repair = read_fixture_requests(&mut peer);
+    assert!(!first_repair.is_empty(), "focus timeout emitted no repair");
+    assert_ne!(service.next_deadline_ns(), Some(deadline));
+
+    service
+        .handle_deadline(deadline, &mut supervisor)
+        .expect("duplicate timer-only focus deadline");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn focus_confirmation_before_timeout_removes_the_timer_deadline() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "focus-deadline-confirm");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start XWayland generation");
+    let generation = service.generation().expect("starting generation");
+    let issued_at_ns = 2_000_000;
+    let mut peer = service
+        .install_running_xwm_focus_fixture_for_tests(generation, 42, issued_at_ns)
+        .expect("install running XWM fixture");
+    let deadline = issued_at_ns + super::xwm::focus::FOCUS_CONFIRMATION_TIMEOUT_NS;
+
+    service.confirm_focus_for_tests(generation, 42, 1);
+    assert_eq!(service.next_deadline_ns(), None);
+    service
+        .handle_deadline(deadline, &mut supervisor)
+        .expect("confirmed focus timer");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn destroyed_focus_target_cancels_the_timer_deadline_without_repair() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "focus-deadline-destroy");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start XWayland generation");
+    let generation = service.generation().expect("starting generation");
+    let issued_at_ns = 3_000_000;
+    let mut peer = service
+        .install_running_xwm_focus_fixture_for_tests(generation, 43, issued_at_ns)
+        .expect("install running XWM fixture");
+    let deadline = issued_at_ns + super::xwm::focus::FOCUS_CONFIRMATION_TIMEOUT_NS;
+
+    service.destroy_focus_target_for_tests(generation, 43);
+    assert_eq!(service.next_deadline_ns(), None);
+    service
+        .handle_deadline(deadline, &mut supervisor)
+        .expect("destroyed focus timer");
+    assert!(read_fixture_requests(&mut peer).is_empty());
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
 }
 
 fn service_at_root_with_displayfd_writer(

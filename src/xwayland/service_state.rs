@@ -36,13 +36,7 @@ impl XwaylandService {
         match &self.state {
             ServiceState::Starting(resources) => Some(resources.deadline_ns),
             ServiceState::Backoff { deadline_ns, .. } => Some(*deadline_ns),
-            ServiceState::Running(resources) => resources
-                .xwm
-                .next_resize_sync_deadline_ns()
-                .into_iter()
-                .chain(resources.xwm.next_focus_deadline_ns())
-                .chain(resources.xwm.next_adoption_deadline_ns())
-                .min(),
+            ServiceState::Running(resources) => resources.xwm.next_deadline_ns(),
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::RunningBase(_)

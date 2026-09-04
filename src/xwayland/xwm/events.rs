@@ -596,7 +596,7 @@ fn stack_mode(mode: xproto::StackMode) -> Option<X11StackMode> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::HashMap, io::Write, num::NonZeroU64, os::unix::net::UnixStream};
 
     use crate::xwayland::XwaylandAssociationEvent;

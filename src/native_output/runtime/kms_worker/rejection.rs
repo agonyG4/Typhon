@@ -51,6 +51,9 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
         cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
         cursor_output_arbitration.clear_pending();
     } else {
+        if drop_reason == OutputTransactionDropReason::SafeAbandonment && job.ready_submit {
+            frame_pacing.note_predictive_ready_other_safe_abandonment();
+        }
         if !frame_pacing.cancel_worker_submission(job.pacing_frame_id, job.ready_submit) {
             return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
         }

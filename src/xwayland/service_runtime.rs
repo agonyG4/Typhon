@@ -160,23 +160,21 @@ impl XwaylandService {
                 });
             }
         }
-        let (adoption_metrics, timeout_summary, resize_sync_error) =
+        let (adoption_metrics, timeout_summary, deadline_error) =
             if let ServiceState::Running(resources) = &mut self.state {
                 let adoption_started = std::time::Instant::now();
-                let timeout_summary = resources.xwm.collect_adoption_expirations(now_ns);
-                let adoption_metrics = resources.xwm.adoption_metrics();
-                let resize_sync_error = resources
-                    .xwm
-                    .handle_resize_sync_deadline(now_ns)
-                    .err()
-                    .map(io::Error::other);
+                let outcome = resources.xwm.handle_deadlines(now_ns);
                 self.metrics.adoption_deadline_max_us = self.metrics.adoption_deadline_max_us.max(
                     adoption_started
                         .elapsed()
                         .as_micros()
                         .min(u128::from(u64::MAX)) as u64,
                 );
-                (Some(adoption_metrics), timeout_summary, resize_sync_error)
+                (
+                    Some(outcome.adoption_metrics),
+                    outcome.adoption_timeout_summary,
+                    outcome.error.map(io::Error::other),
+                )
             } else {
                 (None, false, None)
             };
@@ -193,7 +191,7 @@ impl XwaylandService {
                     self.metrics.adoption_timeout_summaries.saturating_add(1);
             }
         }
-        if let Some(error) = resize_sync_error {
+        if let Some(error) = deadline_error {
             self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandFlush, error);
         }
         let startup_timed_out = matches!(

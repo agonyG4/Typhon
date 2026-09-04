@@ -352,6 +352,24 @@ impl FocusTracker {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn note_focus_request_issued_at_for_tests(
+        &mut self,
+        transition: FocusTransitionId,
+        request_sequence: Option<u64>,
+        sent_set_input_focus: bool,
+        sent_take_focus: bool,
+        issued_at_ns: u64,
+    ) {
+        self.note_focus_request_issued_at(
+            transition,
+            request_sequence,
+            sent_set_input_focus,
+            sent_take_focus,
+            issued_at_ns,
+        );
+    }
+
     pub(crate) fn next_focus_deadline_ns(&self) -> Option<u64> {
         self.pending_focus.and_then(|pending| {
             (pending.target.is_some()
