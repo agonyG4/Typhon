@@ -809,13 +809,22 @@ impl CompositorState {
             self.abort_pointer_constraint_backend_activation(id, "focus_client_or_root_changed");
             return None;
         }
-        let resolved_region = self.pointer_constraint_output_region_with_timing(id.constraint_id);
-        let region = resolved_region
-            .as_ref()
-            .and_then(|resolved| resolved.region.as_ref());
-        let Some(anchor) =
-            self.pointer_constraint_activation_anchor(id.constraint_id, region, current_position)
+        let Some(resolved_region) =
+            self.pointer_constraint_output_region_with_timing(id.constraint_id)
         else {
+            self.abort_pointer_constraint_backend_activation(id, "region_unresolved");
+            return None;
+        };
+        let ResolvedPointerConstraintRegion { region, timing } = resolved_region;
+        let Some(region) = region.as_ref() else {
+            self.abort_pointer_constraint_backend_activation(id, "region_empty");
+            return None;
+        };
+        let Some(anchor) = self.pointer_constraint_activation_anchor(
+            id.constraint_id,
+            Some(region),
+            current_position,
+        ) else {
             self.abort_pointer_constraint_backend_activation(id, "anchor_unresolved");
             return None;
         };
@@ -842,7 +851,7 @@ impl CompositorState {
         Some(ResolvedPointerConstraintBackendRequest {
             request: PointerConstraintBackendRequest::ActivateLocked { id },
             locked_anchor: Some(anchor),
-            region_resolution_timing: resolved_region.and_then(|resolved| resolved.timing),
+            region_resolution_timing: timing,
         })
     }
 

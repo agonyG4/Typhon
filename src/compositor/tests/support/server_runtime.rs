@@ -170,6 +170,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CompleteProtocolOnlyFrameTick(Sender<ProtocolOnlyCompletion>),
     CaptureIdleInhibited(Sender<bool>),
     CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
+    SettlePointerConstraintBackendRequests,
     CapturePendingLockedPointerReveal(Sender<bool>),
     CapturePendingLockedPointerRevealAndBackendRequests(
         Sender<(bool, Vec<PointerConstraintBackendRequest>)>,
@@ -802,6 +803,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CapturePointerConstraintBackendRequests(reply) => {
                         let _ = reply.send(server.take_pointer_constraint_backend_requests());
+                    }
+                    ServerCommand::SettlePointerConstraintBackendRequests => {
+                        let (x, y) = server.last_pointer_position();
+                        let current_position = OutputPosition { x, y };
+                        for request in server.take_pointer_constraint_backend_requests() {
+                            let Some(resolved) = server.resolve_pointer_constraint_backend_request(
+                                request,
+                                current_position,
+                            ) else {
+                                continue;
+                            };
+                            if let PointerConstraintBackendRequest::ActivateLocked { id } =
+                                resolved.request
+                                && let Some(anchor) = resolved.locked_anchor
+                            {
+                                server.pointer_constraint_backend_activated_at(id, anchor);
+                            }
+                        }
                     }
                     ServerCommand::CapturePendingLockedPointerReveal(reply) => {
                         let _ = reply.send(server.state.pending_locked_pointer_reveal.is_some());

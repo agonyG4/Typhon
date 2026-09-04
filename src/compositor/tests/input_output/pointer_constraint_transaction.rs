@@ -46,6 +46,223 @@ fn activate_confined_backend(
 }
 
 #[test]
+fn empty_locked_constraint_region_does_not_activate() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 100).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 5.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 5.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let region = compositor.create_region(&qh, ());
+    region.add(200, 200, 10, 10);
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        Some(&region),
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let constraint_id = *capture_pointer_constraint_ids(&commands)
+        .first()
+        .expect("empty locked constraint must be registered");
+
+    commands
+        .send(ServerCommand::SettlePointerConstraintBackendRequests)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id).unwrap();
+    let active_anchor = capture_active_locked_pointer_anchor(&commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.locked_count, 0);
+    assert!(!snapshot.backend_pending);
+    assert_eq!(active_anchor, None);
+}
+
+#[test]
+fn empty_locked_constraint_input_intersection_does_not_activate() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 100).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 55.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 55.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let input_region = compositor.create_region(&qh, ());
+    input_region.add(50, 50, 10, 10);
+    surface.set_input_region(Some(&input_region));
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let constraint_region = compositor.create_region(&qh, ());
+    constraint_region.add(0, 0, 10, 10);
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        Some(&constraint_region),
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let constraint_id = *capture_pointer_constraint_ids(&commands)
+        .first()
+        .expect("empty intersection constraint must be registered");
+
+    commands
+        .send(ServerCommand::SettlePointerConstraintBackendRequests)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id).unwrap();
+    let active_anchor = capture_active_locked_pointer_anchor(&commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.locked_count, 0);
+    assert!(!snapshot.backend_pending);
+    assert_eq!(active_anchor, None);
+}
+
+#[test]
+fn default_locked_constraint_region_activates_at_current_pointer() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 100).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let pointer_position = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 35.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 45.0,
+    );
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_position.0,
+            y: pointer_position.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::SettlePointerConstraintBackendRequests)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let active_anchor = capture_active_locked_pointer_anchor(&commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.locked_count, 1);
+    assert_eq!(active_anchor, Some(pointer_position));
+}
+
+#[test]
 fn active_locked_destroy_without_surface_commit_keeps_current_routing() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {

@@ -418,6 +418,100 @@ semantics were changed.
 
 This task does not claim the Sober/Roblox camera jump is fixed until native post-change qualification confirms it.
 
+## Region-algebra v1.2 empty locked-region activation closure
+
+This narrow closure starts from `3c6036c43cbfdd943852b3458f2ed781b219cfe6`.
+The Region Algebra v1.1 canonicalization and locked resolver timing
+architecture remain unchanged.
+
+The defect was that the locked activation caller collapsed two different
+resolver outcomes into the anchor helper's unrestricted `None` input:
+
+```text
+resolver result with empty effective region
+    -> region: None
+    -> current pointer position anchor
+    -> LockedActivated
+```
+
+The locked path now keeps the resolver result intact. An unavailable result
+aborts with `region_unresolved`; a successfully evaluated empty effective
+region aborts with `region_empty`; only a non-empty `OutputRegion` is passed
+to the existing late-bound anchor helper. Successful non-empty locked
+resolutions continue to carry their exact wall and thread-CPU timing to the
+same `LockedActivated` transition evidence. No anchor API semantics were
+changed broadly.
+
+The final invariant is:
+
+```text
+current committed constraint
+        -> resolve effective geometry
+        -> unavailable: no activation
+        -> empty: no activation
+        -> non-empty: late-bound anchor, backend activation, LockedActivated
+```
+
+A successfully evaluated empty effective pointer-constraint region is
+distinct from a default/null protocol region and cannot activate a locked
+pointer. Default/null constraint and input regions still materialize through
+the region algebra as the full mapped surface geometry, so a pointer inside
+that surface continues to activate at its current valid position.
+
+### v1.2 RED and GREEN coverage
+
+Before the production change, the new real Wayland-resource regressions failed
+because both an explicit region outside a 100x100 surface and a disjoint
+constraint/input-region intersection activated (`locked_count == 1`). The
+tests use a test-only deterministic backend-settlement seam that drains the
+queued request, invokes the real locked resolver, and settles only a resolved
+activation; they do not use desktop automation or native timing changes.
+
+After the fix, the real-resource suite covers:
+
+- an empty locked constraint region that produces no lock event, active locked
+  routing, or active anchor;
+- an empty effective intersection between committed constraint and input
+  regions;
+- the default/null control, which activates successfully at the current
+  pointer position;
+- the existing v1.1 real-resource lifecycle, ownership, identity, delayed
+  publication, cancellation, and synchronized-subsurface regressions.
+
+The existing canonical geometry, resolver timing, transition evidence,
+`NativeInputEpoch`, and deactivation-A/activation-B timing regressions remain
+covered by their prior focused suites.
+
+The v1.2 focused transaction suite passed with 10 tests. The exact repository
+commands below were run against the current shared checkout. The all-target
+check, all-target clippy, and full test are blocked by unrelated uncommitted
+Xwayland metadata edits; those files were preserved. Formatting is also
+blocked by unrelated formatting drift, while `git diff --check` is GREEN.
+
+### v1.2 repository verification
+
+```text
+rtk cargo fmt --check                                  BLOCKED: unrelated drift
+                                                         in Xwayland/native-pacing
+                                                         files, including
+                                                         src/native_output/tests/input.rs
+rtk cargo check --locked --all-targets                 BLOCKED: 25 unrelated
+                                                         Xwayland compile errors
+rtk cargo clippy --locked --all-targets -- -D warnings BLOCKED: 18 unrelated
+                                                         Xwayland compile errors
+rtk cargo test --locked                                BLOCKED: same unrelated
+                                                         Xwayland compile mismatch
+rtk git diff --check                                   GREEN
+```
+
+The current Xwayland blocker is the unrelated uncommitted addition of
+`X11MetadataDelta::DecorationHints` and `X11DecorationHints` fields without
+the corresponding existing snapshot fields, match arms, and test initializers.
+No Linux dependency or target blocker (`wayland-server`, `libudev`, DRM,
+pkg-config, or the Linux target) occurred. The current host is Linux, so no
+Windows build result is claimed, and manual physical-input/native Sober
+qualification was not run.
+
 ## Non-claims
 
 This closure does not claim that the Sober/Roblox pointer jump is fixed. That
