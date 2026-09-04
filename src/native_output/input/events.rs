@@ -295,6 +295,7 @@ pub(crate) struct NativeInputEffect {
     pub(crate) cursor_moved: bool,
     pub(crate) cursor_position: Option<(i32, i32)>,
     pub(crate) keyboard_events: Vec<NativeKeyboardEvent>,
+    pub(crate) keyboard_actions: Vec<NativeKeyboardAction>,
     pub(crate) pointer_motion: Option<(f64, f64)>,
     pub(crate) pointer_motion_usec: Option<u64>,
     pub(crate) relative_motion: Option<RelativeMotion>,
@@ -305,6 +306,13 @@ pub(crate) struct NativeInputEffect {
     pub(crate) launch_command: Option<Vec<String>>,
     pub(crate) launch_source: Option<NativeLaunchSource>,
     pub(crate) vt_switch: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeKeyboardAction {
+    State(NativeKeyboardEvent),
+    StateAndClient(NativeKeyboardEvent),
+    Client(NativeKeyboardEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -344,7 +352,24 @@ impl NativeInputEffect {
         if other.cursor_position.is_some() {
             self.cursor_position = other.cursor_position;
         }
+        if self.keyboard_actions.is_empty() && !self.keyboard_events.is_empty() {
+            self.keyboard_actions = self
+                .keyboard_events
+                .iter()
+                .copied()
+                .map(NativeKeyboardAction::StateAndClient)
+                .collect();
+        }
+        if other.keyboard_actions.is_empty() && !other.keyboard_events.is_empty() {
+            other.keyboard_actions = other
+                .keyboard_events
+                .iter()
+                .copied()
+                .map(NativeKeyboardAction::StateAndClient)
+                .collect();
+        }
         self.keyboard_events.append(&mut other.keyboard_events);
+        self.keyboard_actions.append(&mut other.keyboard_actions);
         if other.pointer_motion.is_some() {
             self.pointer_motion = other.pointer_motion;
         }
@@ -367,6 +392,33 @@ impl NativeInputEffect {
         if other.vt_switch.is_some() {
             self.vt_switch = other.vt_switch;
         }
+    }
+
+    pub(crate) fn record_keyboard_state_event(
+        &mut self,
+        event: NativeKeyboardEvent,
+    ) -> usize {
+        let index = self.keyboard_actions.len();
+        self.keyboard_actions.push(NativeKeyboardAction::State(event));
+        index
+    }
+
+    pub(crate) fn forward_keyboard_event(
+        &mut self,
+        event: NativeKeyboardEvent,
+        current_state_action: Option<usize>,
+    ) {
+        if let Some(index) = current_state_action {
+            debug_assert!(matches!(
+                self.keyboard_actions.get(index),
+                Some(NativeKeyboardAction::State(_))
+            ));
+            self.keyboard_actions[index] = NativeKeyboardAction::StateAndClient(event);
+        } else {
+            self.keyboard_actions
+                .push(NativeKeyboardAction::Client(event));
+        }
+        self.keyboard_events.push(event);
     }
 
     pub(crate) fn request_redraw(&mut self) {

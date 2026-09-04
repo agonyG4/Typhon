@@ -5,6 +5,11 @@ impl CompositorState {
         self.keyboard_state.ensure()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_keyboard_state_for_test(&mut self) {
+        self.keyboard_state.fail_for_test();
+    }
+
     fn keyboard_serialized_state(&self) -> KeyboardSerializedState {
         self.keyboard_state.serialized_state().unwrap_or_default()
     }
@@ -303,6 +308,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
+        let modifiers_changed = self.update_keyboard_state(key, pressed);
+        self.send_keyboard_key_after_state_update(key, pressed, modifiers_changed);
+    }
+
+    pub(in crate::compositor) fn update_keyboard_state(&mut self, key: u32, pressed: bool) -> bool {
+        if !self.ensure_keyboard_state() {
+            return false;
+        }
+        self.keyboard_state.update_key(key, pressed)
+    }
+
+    pub(in crate::compositor) fn send_keyboard_key_after_state_update(
+        &mut self,
+        key: u32,
+        pressed: bool,
+        modifiers_changed: bool,
+    ) {
         if !self.ensure_keyboard_state() {
             return;
         }
@@ -311,7 +333,6 @@ impl CompositorState {
         } else {
             self.pressed_keys.remove(&key);
         }
-        let modifiers_changed = self.keyboard_state.update_key(key, pressed);
         let Some(surface) = self.focused_surface.clone() else {
             return;
         };
@@ -346,6 +367,14 @@ impl CompositorState {
         if modifiers_changed {
             self.send_keyboard_modifiers(&surface, serial, serialized_state);
         }
+    }
+
+    pub(in crate::compositor) fn send_keyboard_key_without_state_update(
+        &mut self,
+        key: u32,
+        pressed: bool,
+    ) {
+        self.send_keyboard_key_after_state_update(key, pressed, false);
     }
 
     pub(in crate::compositor) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {

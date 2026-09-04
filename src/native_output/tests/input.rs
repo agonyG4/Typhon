@@ -24,7 +24,8 @@ use wayland_client::{
     globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
-        wl_pointer as client_wl_pointer, wl_registry, wl_seat as client_wl_seat,
+        wl_keyboard as client_wl_keyboard, wl_pointer as client_wl_pointer, wl_registry,
+        wl_seat as client_wl_seat,
         wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
         wl_surface as client_wl_surface,
     },
@@ -1666,6 +1667,94 @@ fn native_input_window_interaction_motion_routes_through_compositor_owner() {
 }
 
 #[test]
+fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "grp:alt_shift_toggle");
+    }
+
+    let socket_name = format!("typhon-native-input-group-switch-{}", std::process::id());
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady { .. }
+    ));
+
+    let mut input = NativeInputState::new(320, 200);
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    for (code, value) in [
+        (KEY_LEFTALT, 1),
+        (KEY_LEFTSHIFT, 1),
+        (KEY_LEFTSHIFT, 0),
+        (KEY_LEFTALT, 0),
+        (KEY_LEFTALT, 1),
+        (KEY_LEFTSHIFT, 1),
+        (KEY_LEFTSHIFT, 0),
+        (KEY_LEFTALT, 0),
+    ] {
+        apply_native_input_effect(
+            input.handle_key_event(code, value),
+            NativeInputApplyContext {
+                server: &mut server,
+                perf: NativePerfLogger::from_env(),
+                resize_perf: &mut resize_perf,
+                cursor_mode: NativeCursorRenderMode::Software,
+                app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+                seat_session: None,
+                process_supervisor: &mut process_supervisor,
+                xwayland: None,
+            },
+        )
+        .unwrap();
+    }
+
+    client_commands.send(ClientCommand::CaptureKeyboard).unwrap();
+    let groups = match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::KeyboardGroups { groups } => groups,
+        event => panic!("expected keyboard groups, got {event:?}"),
+    };
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+
+    assert!(groups.windows(2).any(|pair| pair == [0, 1]));
+    assert!(groups.windows(2).any(|pair| pair == [1, 0]));
+}
+
+#[test]
 fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion() {
     let socket_name = format!("typhon-native-input-interaction-{}", std::process::id());
     let socket_path =
@@ -1849,6 +1938,7 @@ pub(super) struct NativeInputClientState {
     pub(super) last_button_press_serial: Option<u32>,
     pub(super) pointer_button_press_count: usize,
     pub(super) pointer_button_release_count: usize,
+    pub(super) keyboard_groups: Vec<u32>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
@@ -1881,13 +1971,39 @@ macro_rules! native_input_noop_dispatch {
 
 native_input_noop_dispatch!(client_wl_compositor::WlCompositor);
 native_input_noop_dispatch!(client_wl_surface::WlSurface);
-native_input_noop_dispatch!(client_wl_seat::WlSeat);
 native_input_noop_dispatch!(client_wl_shm::WlShm);
 native_input_noop_dispatch!(client_wl_shm_pool::WlShmPool);
 native_input_noop_dispatch!(client_wl_buffer::WlBuffer);
 native_input_noop_dispatch!(client_xdg_toplevel::XdgToplevel);
 native_input_noop_dispatch!(client_xwayland_shell_v1::XwaylandShellV1);
 native_input_noop_dispatch!(client_xwayland_surface_v1::XwaylandSurfaceV1);
+
+impl Dispatch<client_wl_seat::WlSeat, ()> for NativeInputClientState {
+    fn event(
+        _: &mut Self,
+        _: &client_wl_seat::WlSeat,
+        _: client_wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for NativeInputClientState {
+    fn event(
+        state: &mut Self,
+        _: &client_wl_keyboard::WlKeyboard,
+        event: client_wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let client_wl_keyboard::Event::Modifiers { group, .. } = event {
+            state.keyboard_groups.push(group);
+        }
+    }
+}
 
 impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
     fn event(
@@ -1976,6 +2092,7 @@ pub(super) fn spawn_native_input_resize_client(
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
         let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+        let _keyboard = seat.get_keyboard(&qh, ());
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
         let pointer = seat.get_pointer(&qh, ());
         let surface = compositor.create_surface(&qh, ());
@@ -2031,6 +2148,14 @@ pub(super) fn spawn_native_input_resize_client(
                         .send(ClientEvent::Buttons {
                             pressed_count: state.pointer_button_press_count,
                             released_count: state.pointer_button_release_count,
+                        })
+                        .unwrap();
+                }
+                ClientCommand::CaptureKeyboard => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::KeyboardGroups {
+                            groups: state.keyboard_groups.clone(),
                         })
                         .unwrap();
                 }

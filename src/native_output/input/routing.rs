@@ -1158,10 +1158,39 @@ pub(crate) fn apply_native_input_effect(
                 .update_pointer_position_without_client_dispatch(x, y)
         }
     });
-    for event in effect.keyboard_events {
-        context
-            .server
-            .send_keyboard_key_without_publication(event.key, event.pressed);
+    if effect.keyboard_actions.is_empty() {
+        for event in effect.keyboard_events {
+            context
+                .server
+                .send_keyboard_key_without_publication(event.key, event.pressed);
+        }
+    } else {
+        for action in effect.keyboard_actions {
+            match action {
+                NativeKeyboardAction::State(event) => {
+                    context
+                        .server
+                        .update_keyboard_state_without_publication(event.key, event.pressed);
+                }
+                NativeKeyboardAction::StateAndClient(event) => {
+                    let modifiers_changed = context
+                        .server
+                        .update_keyboard_state_without_publication(event.key, event.pressed);
+                    context
+                        .server
+                        .send_keyboard_key_after_state_update_without_publication(
+                            event.key,
+                            event.pressed,
+                            modifiers_changed,
+                        );
+                }
+                NativeKeyboardAction::Client(event) => {
+                    context
+                        .server
+                        .send_keyboard_key_without_state_update(event.key, event.pressed);
+                }
+            }
+        }
     }
     if context.server.window_interaction_active() {
         if let Some((x, y)) = effect.pointer_motion {

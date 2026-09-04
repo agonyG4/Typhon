@@ -25,6 +25,9 @@ pub(super) enum ClientEvent {
         pointer_enter_count: usize,
         pointer_leave_count: usize,
     },
+    KeyboardGroups {
+        groups: Vec<u32>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,5 +36,6 @@ pub(super) enum ClientCommand {
     CaptureActive,
     BeginXdgMove,
     CaptureButtons,
+    CaptureKeyboard,
     Finish,
 }

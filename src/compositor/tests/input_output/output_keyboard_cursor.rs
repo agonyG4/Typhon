@@ -226,6 +226,22 @@ fn wayland_client_receives_output_and_seat_capabilities() {
 }
 
 #[test]
+fn wayland_client_receives_pointer_only_seat_when_keyboard_init_failed() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.fail_keyboard_state_for_test();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let state = bind_output_and_seat(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.seat_has_pointer);
+    assert!(!state.seat_has_keyboard);
+}
+
+#[test]
 fn wl_output_v1_bind_receives_only_v1_events() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

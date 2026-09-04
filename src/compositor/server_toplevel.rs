@@ -135,6 +135,32 @@ impl OwnCompositorServer {
         let _ = self.flush_wayland_clients();
     }
 
+    pub fn update_keyboard_state_without_publication(&mut self, key: u32, pressed: bool) -> bool {
+        self.state.update_keyboard_state(key, pressed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_keyboard_state_for_test(&mut self) {
+        self.state.fail_keyboard_state_for_test();
+    }
+
+    pub fn send_keyboard_key_after_state_update_without_publication(
+        &mut self,
+        key: u32,
+        pressed: bool,
+        modifiers_changed: bool,
+    ) {
+        self.state
+            .send_keyboard_key_after_state_update(key, pressed, modifiers_changed);
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn send_keyboard_key_without_state_update(&mut self, key: u32, pressed: bool) {
+        self.state
+            .send_keyboard_key_without_state_update(key, pressed);
+        let _ = self.flush_wayland_clients();
+    }
+
     pub fn send_pointer_motion(&mut self, x: f64, y: f64) {
         self.state.send_pointer_motion(x, y);
         self.publish_astrea_toplevel_updates();

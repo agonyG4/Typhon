@@ -8,11 +8,14 @@ bindings and Wayland input protocol behavior.
 
 **Architecture:** Add a focused `compositor::keyboard` module that compiles
 RMLVO into an immutable keymap, owns the mutable server state, serializes
-modifier/group state, and caches Text V1 bytes. `CompositorState` owns an
-optional lazily initialized instance so `CompositorState::default()` remains
-non-panicking if the runtime XKB database is unavailable; normal startup uses
-requested configuration, baseline `br(abnt2)`, then `us` fallback. Keyboard
-resource publication and forwarded key events consume that same instance.
+modifier/group state, and caches Text V1 bytes. `CompositorState` owns a
+sendable `KeyboardStateHandle`; the handle owns only a unique identity while
+the actual `XkbKeyboardState` lives in compositor-thread TLS. This keeps
+`CompositorState::default()` non-panicking and makes cross-thread use fail
+closed. Normal startup uses requested configuration, baseline `br(abnt2)`,
+then `us` fallback, preserving the requested repeat rate and delay across
+fallback. Keyboard resource publication and forwarded key events consume that
+same TLS-owned instance.
 
 **Tech Stack:** Rust 2024, `xkbcommon` 0.9 safe bindings, libxkbcommon,
 Wayland server/client protocol bindings, existing cargo test harness, `rtk`
@@ -22,8 +25,11 @@ for command output filtering.
 
 - Preserve physical Linux keycodes for `AstreaBindingManager` and
   `wl_keyboard::key`.
-- Update XKB with `evdev keycode + 8` only for events forwarded through
-  `CompositorState::send_keyboard_key`.
+- Update XKB exactly once for every physical key transition with `evdev
+  keycode + 8`, including transitions that are consumed or deferred.
+- Keep XKB state transitions separate from client-visible key forwarding so a
+  replayed deferred modifier never updates XKB twice; publish a changed
+  modifier snapshot after the corresponding visible key.
 - Serialize masks and effective group from the compiled XKB state; use no
   fixed modifier bit positions and no hardcoded group zero.
 - Publish cached XKB Text V1 bytes as a NUL-terminated `XkbV1` keymap.
@@ -32,6 +38,11 @@ for command output filtering.
   routing.
 - Pass RMLVO values to libxkbcommon without sanitizing or hand-building XKB
   include syntax.
+- Preserve explicit empty-vs-absent layout/variant values and let native XKB
+  options such as `grp:alt_shift_toggle` produce group changes.
+- Advertise `wl_seat` Keyboard only after compositor-thread XKB initialization;
+  failed initialization advertises Pointer only and rejects unexpected
+  `get_keyboard` requests with `MissingCapability`.
 - Do not modify unrelated pre-existing worktree changes.
 
 ---
@@ -50,8 +61,10 @@ for command output filtering.
   `XkbKeyboardState` for compositor state and protocol code.
 - `XkbKeyboardState::from_config(&KeyboardConfig) -> Result<Self, String>`
   compiles RMLVO with `xkbcommon::xkb::Keymap::new_from_names`.
-- `XkbKeyboardState::from_environment() -> Option<Self>` attempts requested,
-  baseline, and `us` configurations with diagnostics.
+- `XkbKeyboardState::from_environment() -> Result<Self, String>` attempts
+  requested, baseline, and `us` configurations with diagnostics. The fallback
+  configurations inherit only the requested repeat rate/delay; their RMLVO is
+  still the documented baseline or minimal `us` configuration.
 - `XkbKeyboardState::update_key(evdev_key: u32, pressed: bool) -> bool`
   performs checked `+8` conversion and reports serialized-state changes.
 - `XkbKeyboardState::serialized_state() -> KeyboardSerializedState` and
@@ -135,7 +148,7 @@ fn update_key_uses_xkb_offset_but_keeps_evdev_api() {
 
   Try the requested config, then default `br(abnt2)`, then `us` with no
   variant/options. Emit one precise diagnostic per failed requested/fallback
-  compile and return `None` only if all three fail. Run
+  compile and return an error only if all three fail. Run
   `rtk cargo test keyboard::tests -- --nocapture`; expected: PASS.
 
 - [ ] **Step 8: Commit the self-contained module.**
@@ -155,9 +168,10 @@ git commit -m "feat: add libxkbcommon keyboard state core"
 - Test: `src/compositor/keyboard.rs` and existing input tests
 
 **Interfaces:**
-- `CompositorState` owns `keyboard_state: Option<XkbKeyboardState>`.
-- `CompositorState::ensure_keyboard_state()` lazily initializes the state
-  without panicking during `Default` construction.
+- `CompositorState` owns `keyboard_state: KeyboardStateHandle`.
+- `CompositorState::ensure_keyboard_state()` lazily initializes the TLS-owned
+  state without panicking during `Default` construction; a missing owner or
+  failed initialization permanently disables keyboard state for that handle.
 - `CompositorState::keyboard_serialized_state()` returns the current complete
   state or all-zero state when initialization is unavailable.
 - `CompositorState::send_keyboard_initial_state(&wl_keyboard::WlKeyboard)`
@@ -192,10 +206,12 @@ fn caps_lock_changes_xkb_locked_mask_without_manual_modifier_state() {
 
 - [ ] **Step 4: Add the seat-owned state and lazy initialization.**
 
-  Replace `keyboard_modifiers` with `keyboard_state: Option<XkbKeyboardState>`
-  in `CompositorState`. `ensure_keyboard_state` calls
+  Replace `keyboard_modifiers` with `keyboard_state: KeyboardStateHandle` in
+  `CompositorState`. `ensure_keyboard_state` calls
   `XkbKeyboardState::from_environment`, logs a clean unavailable-state
-  diagnostic, and never panics. Keep this value on the compositor thread.
+  diagnostic, and never panics. Keep the handle in compositor state and keep
+  the actual XKB object in the owning compositor thread's TLS; a failed or
+  cross-thread handle does not retry.
 
 - [ ] **Step 5: Rewire `get_keyboard` initialization.**
 
@@ -206,12 +222,14 @@ fn caps_lock_changes_xkb_locked_mask_without_manual_modifier_state() {
 
 - [ ] **Step 6: Rewire forwarded key events and focus events.**
 
-  In `send_keyboard_key`, keep raw `pressed_keys` bookkeeping, call
-  `update_key(key, pressed)` with the checked internal offset, ensure focus,
+  Keep raw `pressed_keys` bookkeeping only for client-visible keys. Apply the
+  native action stream so each physical event calls `update_key(key, pressed)`
+  once with the checked internal offset. For a visible event, ensure focus,
   publish `wl_keyboard::key { key }` with the raw evdev value, then publish
-  complete serialized modifiers/group only if those values changed. Update
-  focus enter and modifier publication to use the same snapshot and never
-  reconstruct masks from `pressed_keys`.
+  complete serialized modifiers/group only if that transition changed state.
+  Update focus enter and modifier publication to use the same snapshot and
+  never reconstruct masks from `pressed_keys`. Deferred Alt/Super replay is a
+  client-only action because its physical XKB transition already happened.
 
 - [ ] **Step 7: Run focused existing tests and new unit tests.**
 

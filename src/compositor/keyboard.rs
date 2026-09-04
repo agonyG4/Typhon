@@ -70,6 +70,12 @@ impl KeyboardConfig {
             ..Self::default()
         }
     }
+
+    fn with_repeat_from(mut self, requested: &Self) -> Self {
+        self.repeat_rate = requested.repeat_rate;
+        self.repeat_delay = requested.repeat_delay;
+        self
+    }
 }
 
 const DEFAULT_LAYOUT: &str = "br";
@@ -211,10 +217,12 @@ impl XkbKeyboardState {
 
     pub(super) fn from_environment() -> Result<Self, String> {
         let requested = KeyboardConfig::from_env();
+        let baseline = KeyboardConfig::default().with_repeat_from(&requested);
+        let minimal_us = KeyboardConfig::minimal_us().with_repeat_from(&requested);
         Self::from_candidates([
             ("requested", requested),
-            ("baseline", KeyboardConfig::default()),
-            ("minimal us", KeyboardConfig::minimal_us()),
+            ("baseline", baseline),
+            ("minimal us", minimal_us),
         ])
     }
 
@@ -418,6 +426,11 @@ impl KeyboardStateHandle {
                 .is_some_and(|state| state.send_initial_state(keyboard))
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn fail_for_test(&mut self) {
+        self.status = KeyboardStateStatus::Failed;
+    }
 }
 
 impl Drop for KeyboardStateHandle {
@@ -531,15 +544,26 @@ mod tests {
     fn invalid_requested_configuration_uses_the_fallback_chain() {
         let invalid = KeyboardConfig {
             layout: "invalid\0".into(),
+            repeat_rate: 41,
+            repeat_delay: 710,
             ..KeyboardConfig::default()
         };
         let state = XkbKeyboardState::from_candidates([
-            ("requested", invalid),
-            ("baseline", KeyboardConfig::default()),
-            ("minimal us", KeyboardConfig::minimal_us()),
+            ("requested", invalid.clone()),
+            (
+                "baseline",
+                KeyboardConfig::default().with_repeat_from(&invalid),
+            ),
+            (
+                "minimal us",
+                KeyboardConfig::minimal_us().with_repeat_from(&invalid),
+            ),
         ])
         .unwrap();
-        assert_eq!(state.config, KeyboardConfig::default());
+        assert_eq!(state.config.layout, KeyboardConfig::default().layout);
+        assert_eq!(state.config.variant, KeyboardConfig::default().variant);
+        assert_eq!(state.config.repeat_rate, 41);
+        assert_eq!(state.config.repeat_delay, 710);
     }
 
     #[test]
@@ -570,6 +594,48 @@ mod tests {
             panic!("permanent failure must not retry initialization")
         }));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn uninitialized_keyboard_handle_initializes_on_current_thread() {
+        let mut handle = KeyboardStateHandle::default();
+        assert!(handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default())));
+        assert!(handle.serialized_state().is_some());
+    }
+
+    #[test]
+    fn ready_keyboard_handle_fails_closed_on_a_different_thread() {
+        let handle = std::thread::spawn(|| {
+            let mut handle = KeyboardStateHandle::default();
+            assert!(
+                handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default()))
+            );
+            assert!(handle.serialized_state().is_some());
+            handle
+        })
+        .join()
+        .unwrap();
+
+        let mut handle = handle;
+        assert!(!handle.ensure());
+        assert!(handle.serialized_state().is_none());
+    }
+
+    #[test]
+    fn keyboard_state_handles_get_distinct_tls_ids() {
+        let mut first = KeyboardStateHandle::default();
+        let mut second = KeyboardStateHandle::default();
+        assert!(first.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default())));
+        assert!(second.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default())));
+        let first_id = match &first.status {
+            KeyboardStateStatus::Ready(id) => *id,
+            _ => panic!("first keyboard handle did not initialize"),
+        };
+        let second_id = match &second.status {
+            KeyboardStateStatus::Ready(id) => *id,
+            _ => panic!("second keyboard handle did not initialize"),
+        };
+        assert_ne!(first_id, second_id);
     }
 
     #[test]

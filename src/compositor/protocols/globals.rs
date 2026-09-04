@@ -186,7 +186,7 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for CompositorState {
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for CompositorState {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<wl_seat::WlSeat>,
@@ -200,9 +200,11 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for CompositorState {
             });
         }
         let _ = seat.send_event(wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(
-                wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard,
-            ),
+            capabilities: WEnum::Value(if state.ensure_keyboard_state() {
+                wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard
+            } else {
+                wl_seat::Capability::Pointer
+            }),
         });
     }
 }
