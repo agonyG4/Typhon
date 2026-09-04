@@ -1,25 +1,12 @@
 use super::*;
+use crate::compositor::PointerWarpOrigin;
 use crate::compositor::input::ResolvedPointerConstraintBackendRequest;
-use crate::compositor::subsurface::CapturedPointerConstraintCommit;
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::compositor) enum PointerRepositionCause {
-    ClientWarp,
-    ActiveLockedPointerRestore,
-    PendingOneshotHintWarp,
-}
+use crate::compositor::subsurface::{
+    CapturedPointerConstraintCommit, CapturedPointerConstraintSurfaceState,
+    PointerConstraintHintCommit,
+};
 
 const WL_POINTER_WARP_SINCE: u32 = 11;
-
-impl PointerRepositionCause {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::ClientWarp => "client_warp",
-            Self::ActiveLockedPointerRestore => "active_locked_pointer_restore",
-            Self::PendingOneshotHintWarp => "pending_oneshot_hint_warp",
-        }
-    }
-}
 
 impl CompositorState {
     #[cfg(test)]
@@ -110,6 +97,7 @@ impl CompositorState {
         pointer: wl_pointer::WlPointer,
         surface: wl_surface::WlSurface,
         fallback_position: Option<OutputPosition>,
+        fallback_origin: Option<PointerWarpOrigin>,
     ) {
         pointer_debug_log(format!(
             "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_kept_hidden=true",
@@ -125,6 +113,7 @@ impl CompositorState {
             pointer,
             surface,
             fallback_position,
+            fallback_origin,
             backend_restore_settled: false,
             backend_settled_dispatch_epoch: None,
             client_warp_position: None,
@@ -234,10 +223,11 @@ impl CompositorState {
             self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback");
             return;
         };
-        self.deliver_pointer_reposition(
-            position,
-            PointerRepositionCause::ActiveLockedPointerRestore,
-        );
+        let Some(origin) = pending.fallback_origin else {
+            self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback_without_origin");
+            return;
+        };
+        self.deliver_pointer_reposition(position, origin);
         self.finalize_pending_locked_pointer_reveal("dispatch_cycle_fallback");
     }
 
@@ -657,6 +647,7 @@ impl CompositorState {
             PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
                 id: backend_id,
                 restore_position: None,
+                restore_origin: None,
             },
         };
         let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
@@ -1267,7 +1258,11 @@ impl CompositorState {
             .is_some_and(|active| active.constraint_id == constraint_id)
         {
             let restore_position = if mode == PointerConstraintMode::Locked {
-                self.restore_locked_pointer_position(&surface, cursor_position_hint)
+                self.locked_pointer_release_restore_decision(
+                    backend_id,
+                    &surface,
+                    cursor_position_hint,
+                )
             } else {
                 None
             };
@@ -1291,6 +1286,9 @@ impl CompositorState {
         } else {
             None
         };
+        let restore_origin = restore_position
+            .is_some()
+            .then_some(PointerWarpOrigin::LockedPointerCursorHint);
         if was_active {
             self.clear_pointer_constraint();
             let locked_unlock_transition = mode == PointerConstraintMode::Locked
@@ -1304,6 +1302,7 @@ impl CompositorState {
                     PointerConstraintBackendRequest::Deactivate {
                         id: backend_id,
                         restore_position,
+                        restore_origin,
                     },
                 );
             }
@@ -1332,6 +1331,7 @@ impl CompositorState {
                     pointer,
                     surface.clone(),
                     restore_position,
+                    restore_origin,
                 );
             }
         } else if was_pending {
@@ -1348,7 +1348,7 @@ impl CompositorState {
                     "oneshot compatibility warp selected id={} generation={} output=({},{})",
                     backend_id.constraint_id, backend_id.generation, position.x, position.y
                 ));
-                self.apply_pointer_warp(position, PointerRepositionCause::PendingOneshotHintWarp);
+                self.apply_pointer_warp(position, PointerWarpOrigin::OneshotCompatibility);
             } else if mode == PointerConstraintMode::Locked
                 && lifetime == PointerConstraintLifetime::Oneshot
             {
@@ -1392,7 +1392,7 @@ impl CompositorState {
     pub(in crate::compositor) fn apply_pointer_warp(
         &mut self,
         requested: OutputPosition,
-        cause: PointerRepositionCause,
+        origin: PointerWarpOrigin,
     ) -> Option<OutputPosition> {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log("pointer warp ignored reason=active_lock");
@@ -1401,8 +1401,8 @@ impl CompositorState {
         let constraint = if let Some(active) = self.active_confined_pointer_binding() {
             let final_position = active.region.closest_point(requested);
             pointer_debug_log(format!(
-                "pointer.reposition request cause={} constraint=confined requested=({},{}) final=({},{})",
-                cause.as_str(),
+                "pointer.reposition request origin={} constraint=confined requested=({},{}) final=({},{})",
+                origin.as_str(),
                 requested.x,
                 requested.y,
                 final_position.x,
@@ -1411,8 +1411,8 @@ impl CompositorState {
             final_position
         } else {
             pointer_debug_log(format!(
-                "pointer.reposition request cause={} constraint=none requested=({},{}) final=({},{})",
-                cause.as_str(),
+                "pointer.reposition request origin={} constraint=none requested=({},{}) final=({},{})",
+                origin.as_str(),
                 requested.x,
                 requested.y,
                 requested.x,
@@ -1426,31 +1426,32 @@ impl CompositorState {
         };
         self.update_pointer_position(constraint.x, constraint.y);
         pointer_debug_log(format!(
-            "pointer warp compositor before=({},{}) after=({},{}) cause={}",
+            "pointer warp compositor before=({},{}) after=({},{}) origin={}",
             before.x,
             before.y,
             constraint.x,
             constraint.y,
-            cause.as_str()
+            origin.as_str()
         ));
         self.pending_pointer_constraint_backend_requests.push(
             PointerConstraintBackendRequest::WarpPointer {
                 position: constraint,
+                origin,
             },
         );
-        self.deliver_pointer_reposition(constraint, cause);
+        self.deliver_pointer_reposition(constraint, origin);
         Some(constraint)
     }
 
     pub(in crate::compositor) fn deliver_pointer_reposition(
         &mut self,
         position: OutputPosition,
-        cause: PointerRepositionCause,
+        origin: PointerWarpOrigin,
     ) {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log(format!(
-                "pointer.reposition delivery suppressed cause={} reason=active_lock",
-                cause.as_str()
+                "pointer.reposition delivery suppressed origin={} reason=active_lock",
+                origin.as_str()
             ));
             return;
         }
@@ -1460,19 +1461,19 @@ impl CompositorState {
                 self.pointer_target_for_surface_at_output(&active.surface, position.x, position.y)
             else {
                 pointer_debug_log(format!(
-                    "pointer.reposition delivery dropped cause={} reason=confined_local_unresolved",
-                    cause.as_str()
+                    "pointer.reposition delivery dropped origin={} reason=confined_local_unresolved",
+                    origin.as_str()
                 ));
                 return;
             };
             self.send_pointer_enter_if_needed(&target);
-            self.send_pointer_reposition_to_resources(&target, cause);
+            self.send_pointer_reposition_to_resources(&target, origin);
             return;
         }
-        if self.send_implicit_pointer_grab_reposition(position.x, position.y, cause) {
+        if self.send_implicit_pointer_grab_reposition(position.x, position.y, origin) {
             pointer_debug_log(format!(
-                "pointer.reposition delivery cause={} focus=implicit_grab",
-                cause.as_str()
+                "pointer.reposition delivery origin={} focus=implicit_grab",
+                origin.as_str()
             ));
             return;
         }
@@ -1492,19 +1493,19 @@ impl CompositorState {
         if focus_changed {
             self.send_pointer_enter_if_needed(&target);
             pointer_debug_log(format!(
-                "pointer.reposition delivery cause={} focus=crossing event=enter",
-                cause.as_str()
+                "pointer.reposition delivery origin={} focus=crossing event=enter",
+                origin.as_str()
             ));
             return;
         }
         self.send_pointer_enter_if_needed(&target);
-        self.send_pointer_reposition_to_resources(&target, cause);
+        self.send_pointer_reposition_to_resources(&target, origin);
     }
 
     fn send_pointer_reposition_to_resources(
         &mut self,
         target: &PointerTarget,
-        cause: PointerRepositionCause,
+        origin: PointerWarpOrigin,
     ) {
         let time = wayland_event_time();
         for pointer in self
@@ -1515,15 +1516,15 @@ impl CompositorState {
             if !self.pointer_resource_entered_surface(pointer, &target.surface) {
                 continue;
             }
-            if matches!(cause, PointerRepositionCause::ActiveLockedPointerRestore)
+            if matches!(origin, PointerWarpOrigin::LockedPointerCursorHint)
                 && pointer.version() < WL_POINTER_WARP_SINCE
             {
                 continue;
             }
             let event = if pointer.version() >= WL_POINTER_WARP_SINCE {
                 pointer_debug_log(format!(
-                    "pointer.reposition delivery cause={} focus=same pointer={} version={} event=warp local=({},{})",
-                    cause.as_str(),
+                    "pointer.reposition delivery origin={} focus=same pointer={} version={} event=warp local=({},{})",
+                    origin.as_str(),
                     pointer.id().protocol_id(),
                     pointer.version(),
                     target.surface_x,
@@ -1535,8 +1536,8 @@ impl CompositorState {
                 }
             } else {
                 pointer_debug_log(format!(
-                    "pointer.reposition delivery cause={} focus=same pointer={} version={} event=legacy_motion local=({},{})",
-                    cause.as_str(),
+                    "pointer.reposition delivery origin={} focus=same pointer={} version={} event=legacy_motion local=({},{})",
+                    origin.as_str(),
                     pointer.id().protocol_id(),
                     pointer.version(),
                     target.surface_x,
@@ -1557,7 +1558,7 @@ impl CompositorState {
         &mut self,
         x: f64,
         y: f64,
-        cause: PointerRepositionCause,
+        origin: PointerWarpOrigin,
     ) -> bool {
         let Some(surface) = self.implicit_pointer_grab_surface("surface-destroyed") else {
             return false;
@@ -1569,13 +1570,13 @@ impl CompositorState {
             return true;
         };
         pointer_debug_log(format!(
-            "pointer.reposition delivery cause={} focus=implicit_grab surface={} local=({},{})",
-            cause.as_str(),
+            "pointer.reposition delivery origin={} focus=implicit_grab surface={} local=({},{})",
+            origin.as_str(),
             compositor_surface_id(&surface),
             target.surface_x,
             target.surface_y
         ));
-        self.send_pointer_reposition_to_resources(&target, cause);
+        self.send_pointer_reposition_to_resources(&target, origin);
         true
     }
 
@@ -1837,10 +1838,7 @@ impl CompositorState {
                     && lifetime == PointerConstraintLifetime::Oneshot
                     && let Some(position) = self.valid_cursor_hint_output_position(&surface, hint)
                 {
-                    self.apply_pointer_warp(
-                        position,
-                        PointerRepositionCause::PendingOneshotHintWarp,
-                    );
+                    self.apply_pointer_warp(position, PointerWarpOrigin::OneshotCompatibility);
                 }
                 if !was_active {
                     self.pointer_constraints.remove(&id);
@@ -1935,5 +1933,46 @@ impl CompositorState {
     #[allow(dead_code)] // Used by the native-output binary; the library target omits that runtime.
     pub(in crate::compositor) fn pointer_constraint_backend_request_count(&self) -> usize {
         self.pending_pointer_constraint_backend_requests.len()
+    }
+
+    pub(in crate::compositor) fn pointer_constraint_transition_snapshot(
+        &self,
+        constraint_id: u64,
+    ) -> Option<PointerConstraintTransitionSnapshot> {
+        let constraint = self.pointer_constraints.get(&constraint_id)?;
+        let surface_id = compositor_surface_id(&constraint.surface);
+        let captured_hint = |state: &CapturedPointerConstraintSurfaceState| match state {
+            CapturedPointerConstraintSurfaceState::Mutation(captured)
+                if captured.constraint_id == constraint_id =>
+            {
+                match &captured.cursor_position_hint {
+                    PointerConstraintHintCommit::Set(hint) => Some(*hint),
+                    PointerConstraintHintCommit::NoChange => None,
+                }
+            }
+            _ => None,
+        };
+        let pending_hint = self
+            .pending_pointer_constraint_surface_states
+            .get(&surface_id)
+            .and_then(captured_hint)
+            .or_else(|| {
+                self.pending_surface_tree_transactions
+                    .iter()
+                    .rev()
+                    .flat_map(|transaction| transaction.nodes.iter().rev())
+                    .filter(|(node_surface_id, _)| *node_surface_id == surface_id)
+                    .find_map(|(_, commit)| captured_hint(&commit.pointer_constraint_state))
+            })
+            .or_else(|| {
+                self.subsurface_transactions
+                    .cached_pointer_constraint_hint(surface_id, constraint_id)
+            });
+        Some(PointerConstraintTransitionSnapshot {
+            constraint_id,
+            generation: constraint.generation,
+            committed_cursor_position_hint: constraint.committed_cursor_position_hint,
+            pending_cursor_position_hint: pending_hint,
+        })
     }
 }

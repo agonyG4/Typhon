@@ -210,7 +210,8 @@ pub use input::{
     OutputPosition, OutputRect, OutputRegion, PointerAxisComponent, PointerAxisFrame,
     PointerAxisSource, PointerConstraintBackendId, PointerConstraintBackendRequest,
     PointerConstraintMode, PointerConstraintRegionResolutionTiming, PointerConstraintState,
-    PointerMotionSample, RelativePointerMotion, ResolvedPointerConstraintBackendRequest,
+    PointerConstraintTransitionSnapshot, PointerMotionSample, PointerRestoreDecision,
+    PointerWarpOrigin, RelativePointerMotion, ResolvedPointerConstraintBackendRequest,
 };
 pub use interaction::X11MoveResizeBeginResult;
 use interaction::{
@@ -275,7 +276,7 @@ pub use state::{
 };
 use state_data::*;
 use subsurface::{
-    CachedSubsurfaceCommit, CapturedPointerConstraintSurfaceState, PointerConstraintHintCommit,
+    CachedSubsurfaceCommit, CapturedPointerConstraintSurfaceState,
     PointerConstraintLifecycleCommit, PointerConstraintRegionCommit, SubsurfaceSyncMode,
     SubsurfaceTransactionState,
 };
@@ -875,6 +876,7 @@ struct PendingLockedPointerReveal {
     pointer: wl_pointer::WlPointer,
     surface: wl_surface::WlSurface,
     fallback_position: Option<OutputPosition>,
+    fallback_origin: Option<PointerWarpOrigin>,
     backend_restore_settled: bool,
     backend_settled_dispatch_epoch: Option<u64>,
     client_warp_position: Option<OutputPosition>,

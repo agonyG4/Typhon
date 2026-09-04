@@ -927,6 +927,7 @@ impl NativeRuntime {
                         .constraint_region_resolution_duration_ns,
                     constraint_region_resolution_thread_cpu_ns: evidence
                         .constraint_region_resolution_thread_cpu_ns,
+                    transition_context: evidence.transition_context,
                     ..Default::default()
                 },
             );
@@ -1360,6 +1361,7 @@ impl NativeRuntime {
                 evidence.constraint_region_resolution_duration_ns;
             pre_read_observation.constraint_region_resolution_thread_cpu_ns =
                 evidence.constraint_region_resolution_thread_cpu_ns;
+            pre_read_observation.transition_context = evidence.transition_context;
         } else {
             pre_read_observation.constraint_activation_start = None;
             pre_read_observation.constraint_activation_end = None;
@@ -1367,6 +1369,7 @@ impl NativeRuntime {
             pre_read_observation.wayland_flush_end = None;
             pre_read_observation.constraint_region_resolution_duration_ns = None;
             pre_read_observation.constraint_region_resolution_thread_cpu_ns = None;
+            pre_read_observation.transition_context = None;
         }
         redraw_requested |= final_settlement.redraw_requested;
         if routing_transition.is_none() {

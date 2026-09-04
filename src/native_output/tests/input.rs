@@ -3,7 +3,7 @@ use super::*;
 use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
-use oblivion_one::compositor::InteractionUpdateOutcome;
+use oblivion_one::compositor::{InteractionUpdateOutcome, PointerWarpOrigin};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -1136,6 +1136,7 @@ fn native_pointer_constraint_backend_ignores_warp_while_locked() {
     let action = backend.handle_request(
         PointerConstraintBackendRequest::WarpPointer {
             position: warp_position,
+            origin: PointerWarpOrigin::PointerWarpProtocol,
         },
         anchor,
     );
@@ -1154,7 +1155,10 @@ fn native_pointer_constraint_backend_warps_when_unlocked() {
     let position = CompositorOutputPosition { x: 240.0, y: 160.0 };
 
     let action = backend.handle_request(
-        PointerConstraintBackendRequest::WarpPointer { position },
+        PointerConstraintBackendRequest::WarpPointer {
+            position,
+            origin: PointerWarpOrigin::PointerWarpProtocol,
+        },
         CompositorOutputPosition { x: 100.0, y: 80.0 },
     );
 
@@ -1188,6 +1192,7 @@ fn native_pointer_constraint_backend_clamps_warp_when_confined() {
     let action = backend.handle_request(
         PointerConstraintBackendRequest::WarpPointer {
             position: requested,
+            origin: PointerWarpOrigin::PointerWarpProtocol,
         },
         anchor,
     );
@@ -1249,6 +1254,7 @@ fn native_pointer_constraint_backend_mismatched_deactivation_cannot_unlock_newer
         PointerConstraintBackendRequest::Deactivate {
             id: stale,
             restore_position: Some(CompositorOutputPosition { x: 40.0, y: 50.0 }),
+            restore_origin: Some(PointerWarpOrigin::LockedPointerCursorHint),
         },
         CompositorOutputPosition { x: 99.0, y: 99.0 },
     );
@@ -1258,7 +1264,7 @@ fn native_pointer_constraint_backend_mismatched_deactivation_cannot_unlock_newer
 }
 
 #[test]
-fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
+fn native_pointer_constraint_backend_deactivation_restores_only_explicit_hint() {
     let mut backend = NativePointerConstraintBackend::new();
     let id = PointerConstraintBackendId {
         constraint_id: 10,
@@ -1273,6 +1279,7 @@ fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
         PointerConstraintBackendRequest::Deactivate {
             id,
             restore_position: Some(CompositorOutputPosition { x: 30.0, y: 40.0 }),
+            restore_origin: Some(PointerWarpOrigin::LockedPointerCursorHint),
         },
         CompositorOutputPosition { x: 99.0, y: 99.0 },
     );
@@ -1292,18 +1299,16 @@ fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
         PointerConstraintBackendRequest::Deactivate {
             id,
             restore_position: None,
+            restore_origin: None,
         },
         CompositorOutputPosition { x: 99.0, y: 99.0 },
     );
 
-    assert_eq!(
-        action.restore_position,
-        Some(CompositorOutputPosition { x: 10.0, y: 20.0 })
-    );
+    assert_eq!(action.restore_position, None);
 }
 
 #[test]
-fn native_pointer_constraint_backend_preserves_fractional_activation_anchor() {
+fn native_pointer_constraint_backend_does_not_restore_fractional_activation_anchor() {
     let mut backend = NativePointerConstraintBackend::new();
     let id = PointerConstraintBackendId {
         constraint_id: 12,
@@ -1322,11 +1327,12 @@ fn native_pointer_constraint_backend_preserves_fractional_activation_anchor() {
         PointerConstraintBackendRequest::Deactivate {
             id,
             restore_position: None,
+            restore_origin: None,
         },
         CompositorOutputPosition { x: 0.0, y: 0.0 },
     );
 
-    assert_eq!(action.restore_position, Some(anchor));
+    assert_eq!(action.restore_position, None);
 }
 
 #[test]
@@ -1382,6 +1388,7 @@ fn native_pointer_constraint_backend_confined_deactivation_does_not_restore_anch
         PointerConstraintBackendRequest::Deactivate {
             id,
             restore_position: None,
+            restore_origin: None,
         },
         CompositorOutputPosition { x: 99.0, y: 99.0 },
     );

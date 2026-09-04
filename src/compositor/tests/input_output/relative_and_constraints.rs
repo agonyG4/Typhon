@@ -1059,7 +1059,7 @@ fn locked_relative_motion_different_same_client_source_pointers_each_get_frame()
 }
 
 #[test]
-fn locked_constraint_activation_anchor_uses_settlement_position() {
+fn locked_constraint_activation_anchor_is_not_release_restore_target() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -1155,11 +1155,16 @@ fn locked_constraint_activation_anchor_uses_settlement_position() {
         matches!(
             request,
             PointerConstraintBackendRequest::Deactivate {
-                restore_position: Some(OutputPosition { x, y }),
+                restore_position: None,
                 ..
-            } if (*x, *y) == moved
+            }
         )
     }));
+    assert!(
+        !deactivation_requests.iter().any(|request| {
+            matches!(request, PointerConstraintBackendRequest::WarpPointer { .. })
+        })
+    );
 }
 
 #[test]
@@ -1687,7 +1692,8 @@ fn pending_oneshot_locked_destroy_removes_queued_activation() {
     assert!(requests.iter().any(|request| matches!(
         request,
         PointerConstraintBackendRequest::WarpPointer {
-            position: OutputPosition { x, y }
+            position: OutputPosition { x, y },
+            ..
         } if (*x, *y) == (
             f64::from(render::FIRST_SURFACE_OFFSET.0) + 70.0,
             f64::from(render::FIRST_SURFACE_OFFSET.1) + 50.0,
@@ -1776,7 +1782,8 @@ fn pending_oneshot_locked_destroy_uses_v11_warp_delivery() {
     assert!(requests.iter().any(|request| matches!(
         request,
         PointerConstraintBackendRequest::WarpPointer {
-            position: OutputPosition { x, y }
+            position: OutputPosition { x, y },
+            ..
         } if (*x, *y) == (
             f64::from(render::FIRST_SURFACE_OFFSET.0) + 70.0,
             f64::from(render::FIRST_SURFACE_OFFSET.1) + 50.0,
@@ -2005,7 +2012,8 @@ fn pending_oneshot_committed_hint_destroy_warps_without_activation() {
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == expected
         )
     }));

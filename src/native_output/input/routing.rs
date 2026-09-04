@@ -1,9 +1,12 @@
 use super::*;
 use crate::native_output::runtime::{
-    NativePointerConstraintBackendAction, NativePointerTimingPoint, capture_timing_point,
+    NativePointerConstraintBackendAction, NativePointerTimingPoint, NativePointerTransitionContext,
+    capture_timing_point,
 };
 use ::input::AsRaw;
-use oblivion_one::compositor::InteractionUpdateOutcome;
+use oblivion_one::compositor::{
+    InteractionUpdateOutcome, PointerRestoreDecision, PointerWarpOrigin,
+};
 
 #[inline]
 fn libinput_event_type_is_pending(event_type: ::input::ffi::libinput_event_type) -> bool {
@@ -1488,6 +1491,44 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             break;
         }
         for request in requests {
+            let request_id = request.id();
+            let logical_pointer_before = timing_enabled.then(|| server.last_pointer_position());
+            let native_cursor_before = timing_enabled.then(|| {
+                let position = input_state.cursor_position_f64();
+                (position.x, position.y)
+            });
+            let focus_surface_before = timing_enabled
+                .then(|| server.pointer_focus_surface_id())
+                .flatten();
+            let cursor_visible_before = timing_enabled.then(|| input_state.cursor_visible());
+            let active_id_before = timing_enabled
+                .then(|| backend.active_backend_id())
+                .flatten();
+            let activation_anchor_before = timing_enabled
+                .then(|| match backend.active_constraint_state() {
+                    NativePointerConstraintState::Locked { anchor } => Some(anchor),
+                    _ => None,
+                })
+                .flatten();
+            let transition_snapshot = timing_enabled
+                .then(|| {
+                    request_id.and_then(|id| {
+                        server.pointer_constraint_transition_snapshot(id.constraint_id)
+                    })
+                })
+                .flatten();
+            let (requested_restore_position, requested_restore_origin, requested_warp_origin) =
+                match &request {
+                    PointerConstraintBackendRequest::Deactivate {
+                        restore_position,
+                        restore_origin,
+                        ..
+                    } => (*restore_position, *restore_origin, *restore_origin),
+                    PointerConstraintBackendRequest::WarpPointer { origin, .. } => {
+                        (None, None, Some(*origin))
+                    }
+                    _ => (None, None, None),
+                };
             let cursor_position = input_state.cursor_position_f64();
             native_pointer_debug_log_lazy(|| {
                 format!(
@@ -1524,6 +1565,16 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             });
             let action = backend.handle_resolved_request(request, cursor_position, locked_anchor);
             let action_transition = native_pointer_routing_transition(&action);
+            let activation_anchor = action
+                .activated
+                .as_ref()
+                .map(|constraint| (constraint.anchor.x, constraint.anchor.y));
+            let action_restore_position = action.restore_position;
+            let action_restore_origin = action.restore_origin;
+            let action_cursor_position = action.cursor_position;
+            let action_cursor_position_origin = action.cursor_position_origin;
+            let action_deactivated = action.deactivated;
+            let action_deactivated_mode = action.deactivated_mode;
             let mut action_timing = NativePointerConstraintActionTiming::default();
             if let Some((id, reason)) = action.failed {
                 native_pointer_debug_log_lazy(|| {
@@ -1600,14 +1651,6 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 });
                 server.pointer_constraint_backend_deactivated(id);
             }
-            if let Some(transition) = action_transition {
-                select_pointer_transition_evidence(
-                    &mut selected_transition,
-                    transition,
-                    action_timing,
-                    region_resolution_timing.or(action.region_resolution_timing),
-                );
-            }
             if let Some(visible) = action.cursor_visibility_changed {
                 native_pointer_debug_log_lazy(|| {
                     format!("cursor visibility native visible={}", visible)
@@ -1616,6 +1659,101 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 if cursor_mode.is_software() && changed {
                     redraw_requested = true;
                 }
+            }
+            if let Some(transition) = action_transition {
+                let transition_id = transition.id();
+                let restore_decision = match action_deactivated_mode {
+                    Some(PointerConstraintMode::Locked) => Some(
+                        if requested_restore_origin
+                            == Some(PointerWarpOrigin::LockedPointerCursorHint)
+                        {
+                            PointerRestoreDecision::ApplyCommittedCursorPositionHint
+                        } else {
+                            PointerRestoreDecision::PreserveCurrentLogicalPosition
+                        },
+                    ),
+                    _ => None,
+                };
+                let warp_requested = match request_id {
+                    Some(_) if requested_restore_position.is_some() => Some(true),
+                    Some(_) if action_deactivated.is_some() => Some(false),
+                    None if requested_warp_origin.is_some() => Some(true),
+                    _ => None,
+                };
+                let warp_origin = requested_restore_origin
+                    .or(requested_warp_origin)
+                    .or(action_restore_origin)
+                    .or(action_cursor_position_origin);
+                let warp_target = requested_restore_position
+                    .map(|position| (position.x, position.y))
+                    .or_else(|| action_restore_position.map(|position| (position.x, position.y)))
+                    .or_else(|| action_cursor_position.map(|position| (position.x, position.y)));
+                let warp_accepted = match request_id {
+                    Some(_) if requested_restore_position.is_some() => {
+                        Some(action_restore_position.is_some())
+                    }
+                    None if requested_warp_origin.is_some() => {
+                        Some(action_cursor_position.is_some())
+                    }
+                    _ => None,
+                };
+                let warp_applied = match request_id {
+                    Some(_) => Some(action_restore_position.is_some()),
+                    None if requested_warp_origin.is_some() => {
+                        Some(action_cursor_position.is_some())
+                    }
+                    _ => action_cursor_position.map(|_| true),
+                };
+                let context = NativePointerTransitionContext {
+                    constraint_id: Some(transition_id.constraint_id),
+                    generation: Some(transition_id.generation),
+                    active_id_before: active_id_before.map(|id| id.constraint_id),
+                    active_generation_before: active_id_before.map(|id| id.generation),
+                    active_id_after: backend.active_backend_id().map(|id| id.constraint_id),
+                    active_generation_after: backend.active_backend_id().map(|id| id.generation),
+                    logical_pointer_before,
+                    logical_pointer_after: timing_enabled.then(|| server.last_pointer_position()),
+                    native_cursor_before,
+                    native_cursor_after: timing_enabled.then(|| {
+                        let position = input_state.cursor_position_f64();
+                        (position.x, position.y)
+                    }),
+                    activation_anchor: activation_anchor.or_else(|| {
+                        activation_anchor_before.map(|position| (position.x, position.y))
+                    }),
+                    committed_cursor_hint_present: transition_snapshot
+                        .map(|snapshot| snapshot.committed_cursor_position_hint.is_some()),
+                    committed_cursor_hint: transition_snapshot
+                        .and_then(|snapshot| snapshot.committed_cursor_position_hint),
+                    pending_cursor_hint_present: transition_snapshot
+                        .map(|snapshot| snapshot.pending_cursor_position_hint.is_some()),
+                    pending_cursor_hint: transition_snapshot
+                        .and_then(|snapshot| snapshot.pending_cursor_position_hint),
+                    restore_decision,
+                    warp_requested,
+                    warp_origin,
+                    warp_target,
+                    warp_accepted,
+                    warp_applied,
+                    warp_applied_target: action_restore_position
+                        .map(|position| (position.x, position.y))
+                        .or_else(|| {
+                            action_cursor_position.map(|position| (position.x, position.y))
+                        }),
+                    cursor_visible_before,
+                    cursor_visible_after: timing_enabled.then(|| input_state.cursor_visible()),
+                    focus_surface_before,
+                    focus_surface_after: timing_enabled
+                        .then(|| server.pointer_focus_surface_id())
+                        .flatten(),
+                };
+                select_pointer_transition_evidence(
+                    &mut selected_transition,
+                    transition,
+                    action_timing,
+                    region_resolution_timing.or(action.region_resolution_timing),
+                    Some(context),
+                );
             }
         }
     }
@@ -1632,6 +1770,7 @@ fn select_pointer_transition_evidence(
     transition: NativeInputRoutingTransition,
     action_timing: NativePointerConstraintActionTiming,
     region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
+    transition_context: Option<NativePointerTransitionContext>,
 ) {
     if selected.is_none() {
         *selected = Some(NativePointerTransitionEvidence {
@@ -1641,6 +1780,7 @@ fn select_pointer_transition_evidence(
                 .map(|timing| timing.duration_ns),
             constraint_region_resolution_thread_cpu_ns: region_resolution_timing
                 .and_then(|timing| timing.thread_cpu_ns),
+            transition_context,
         });
     }
 }
@@ -1679,15 +1819,27 @@ pub(crate) enum NativeInputRoutingTransition {
     ConfinedDeactivated(PointerConstraintBackendId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl NativeInputRoutingTransition {
+    fn id(self) -> PointerConstraintBackendId {
+        match self {
+            Self::LockedActivated(id)
+            | Self::LockedDeactivated(id)
+            | Self::ConfinedActivated(id)
+            | Self::ConfinedDeactivated(id) => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NativePointerTransitionEvidence {
     pub(crate) transition: NativeInputRoutingTransition,
     pub(crate) action_timing: NativePointerConstraintActionTiming,
     pub(crate) constraint_region_resolution_duration_ns: Option<u64>,
     pub(crate) constraint_region_resolution_thread_cpu_ns: Option<u64>,
+    pub(crate) transition_context: Option<NativePointerTransitionContext>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct NativePointerConstraintSettlementOutcome {
     pub(crate) redraw_requested: bool,
     pub(crate) selected_transition: Option<NativePointerTransitionEvidence>,
@@ -1908,8 +2060,8 @@ mod routing_transition_tests {
         let timing_b = timing(200, 20);
         let mut selected = None;
 
-        select_pointer_transition_evidence(&mut selected, transition_a, timing_a, None);
-        select_pointer_transition_evidence(&mut selected, transition_b, timing_b, None);
+        select_pointer_transition_evidence(&mut selected, transition_a, timing_a, None, None);
+        select_pointer_transition_evidence(&mut selected, transition_b, timing_b, None, None);
 
         assert_eq!(
             selected,
@@ -1918,6 +2070,7 @@ mod routing_transition_tests {
                 action_timing: timing_a,
                 constraint_region_resolution_duration_ns: None,
                 constraint_region_resolution_thread_cpu_ns: None,
+                transition_context: None,
             })
         );
     }
@@ -1928,7 +2081,7 @@ mod routing_transition_tests {
         let action_timing = timing(200, 20);
         let mut selected = None;
 
-        select_pointer_transition_evidence(&mut selected, transition, action_timing, None);
+        select_pointer_transition_evidence(&mut selected, transition, action_timing, None, None);
 
         assert_eq!(selected.unwrap().action_timing, action_timing);
     }
@@ -1945,6 +2098,7 @@ mod routing_transition_tests {
                 duration_ns: 37,
                 thread_cpu_ns: Some(19),
             }),
+            None,
         );
 
         let selected = selected.expect("transition evidence");
@@ -1973,6 +2127,7 @@ mod routing_transition_tests {
             transition,
             NativePointerConstraintActionTiming::default(),
             resolved.region_resolution_timing,
+            None,
         );
 
         let selected = selected.expect("locked activation evidence");
@@ -1992,12 +2147,14 @@ mod routing_transition_tests {
             NativeInputRoutingTransition::LockedDeactivated(id(26, 1)),
             NativePointerConstraintActionTiming::default(),
             None,
+            None,
         );
         select_pointer_transition_evidence(
             &mut selected,
             NativeInputRoutingTransition::LockedActivated(id(27, 1)),
             NativePointerConstraintActionTiming::default(),
             resolved.region_resolution_timing,
+            None,
         );
         let selected = selected.expect("deactivation evidence");
         assert_eq!(selected.constraint_region_resolution_duration_ns, None);
@@ -2041,6 +2198,7 @@ mod routing_transition_tests {
             PointerConstraintBackendRequest::Deactivate {
                 id: rejected_id,
                 restore_position: None,
+                restore_origin: None,
             },
             CompositorOutputPosition { x: 1.0, y: 2.0 },
         );
@@ -2070,6 +2228,7 @@ mod routing_transition_tests {
             PointerConstraintBackendRequest::Deactivate {
                 id: constraint_id,
                 restore_position: None,
+                restore_origin: None,
             },
             CompositorOutputPosition { x: 1.0, y: 2.0 },
         );

@@ -447,6 +447,15 @@ fn active_confined_destroy_without_surface_commit_keeps_current_routing() {
     let before_commit_requests = capture_pointer_constraint_backend_requests(&commands);
     let snapshot = capture_pointer_constraint_snapshot(&commands, backend_id.constraint_id)
         .expect("destroyed protocol resource must retain current constraint ownership");
+    state.pointer_motion = false;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 300.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 250.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     assert!(
         before_commit_requests
             .iter()
@@ -457,6 +466,7 @@ fn active_confined_destroy_without_surface_commit_keeps_current_routing() {
     assert!(!snapshot.backend_pending);
     assert!(!snapshot.surface_constraint_pending);
     assert!(snapshot.lifecycle_removal_pending);
+    assert!(state.pointer_motion, "confined routing must remain current");
     assert_eq!(state.unconfined_count, 0);
 
     surface.commit();

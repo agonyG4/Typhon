@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::PointerWarpOrigin;
 #[test]
 fn pointer_warp_global_is_capability_gated() {
     let baseline_socket = unique_socket_name();
@@ -111,7 +112,8 @@ fn valid_pointer_warp_moves_pointer_and_sends_absolute_motion_without_relative_m
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == expected
         )
     }));
@@ -219,7 +221,8 @@ fn confined_pointer_warp_clamps_before_compositor_and_backend_position_changes()
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == expected
         )
     }));
@@ -377,7 +380,8 @@ fn pointer_warp_rejects_a_stale_enter_serial_after_pointer_focus_moves() {
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == expected
         )
     }));
@@ -1427,6 +1431,7 @@ fn locked_pointer_destroy_restores_committed_cursor_position_hint() {
             request,
             PointerConstraintBackendRequest::Deactivate {
                 restore_position: Some(OutputPosition { x, y }),
+                restore_origin: Some(PointerWarpOrigin::LockedPointerCursorHint),
                 ..
             } if *x == f64::from(render::FIRST_SURFACE_OFFSET.0) + 9.0
                 && *y == f64::from(render::FIRST_SURFACE_OFFSET.1) + 11.0
@@ -1435,7 +1440,7 @@ fn locked_pointer_destroy_restores_committed_cursor_position_hint() {
 }
 
 #[test]
-fn locked_pointer_unlock_without_hint_restores_exact_activation_anchor() {
+fn locked_pointer_unlock_without_hint_preserves_logical_position_without_warp() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -1524,11 +1529,16 @@ fn locked_pointer_unlock_without_hint_restores_exact_activation_anchor() {
         matches!(
             request,
             PointerConstraintBackendRequest::Deactivate {
-                restore_position: Some(OutputPosition { x, y }),
+                restore_position: None,
                 ..
-            } if (*x, *y) == anchor
+            }
         )
     }));
+    assert!(
+        !deactivation_requests.iter().any(|request| {
+            matches!(request, PointerConstraintBackendRequest::WarpPointer { .. })
+        })
+    );
 }
 
 #[test]
@@ -1723,7 +1733,8 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == (origin_x + 30.0, origin_y)
         )
     });

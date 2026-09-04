@@ -1,5 +1,6 @@
 use super::*;
 use crate::compositor::decoration::types::DecorationHit;
+use crate::compositor::{PointerRestoreDecision, PointerWarpOrigin};
 
 #[derive(Debug, Clone)]
 pub(in crate::compositor) enum PointerSceneHit {
@@ -809,52 +810,58 @@ impl CompositorState {
         self.send_pointer_enter_if_needed(&target);
     }
 
-    pub(in crate::compositor) fn restore_locked_pointer_position(
+    pub(in crate::compositor) fn locked_pointer_release_restore_decision(
         &mut self,
+        backend_id: PointerConstraintBackendId,
         surface: &wl_surface::WlSurface,
         cursor_position_hint: Option<(f64, f64)>,
     ) -> Option<OutputPosition> {
-        if let Some((surface_x, surface_y)) = cursor_position_hint {
-            if !surface_x.is_finite() || !surface_y.is_finite() {
-                pointer_debug_log(format!(
-                    "pointer.unlock restore_source=committed_hint ignored reason=non_finite hint=({},{})",
-                    surface_x, surface_y
-                ));
-            } else if let Some((output_x, output_y)) =
-                self.output_position_for_valid_cursor_hint(surface, surface_x, surface_y)
-            {
-                self.last_pointer_x = output_x;
-                self.last_pointer_y = output_y;
-                pointer_debug_log(format!(
-                    "pointer.unlock restore_source=committed_hint hint=({surface_x},{surface_y}) restore_output=({output_x},{output_y})"
-                ));
-                return Some(OutputPosition {
-                    x: output_x,
-                    y: output_y,
-                });
-            } else {
-                pointer_debug_log(format!(
-                    "pointer.unlock restore_source=committed_hint ignored reason=unresolved hint=({surface_x},{surface_y})"
-                ));
-            }
-        }
-
-        let fallback_position = self
-            .active_locked_pointer_routing
-            .as_ref()
-            .filter(|active| same_surface_resource(&active.surface, surface))
-            .map(|active| active.activation_anchor);
-        let Some(position) = fallback_position else {
-            pointer_debug_log("pointer.unlock restore_source=none restore_output=unchanged");
+        let Some((surface_x, surface_y)) = cursor_position_hint else {
+            pointer_debug_log(format!(
+                "pointer.unlock restore_decision={} id={} generation={} restore_output=unchanged",
+                PointerRestoreDecision::PreserveCurrentLogicalPosition.as_str(),
+                backend_id.constraint_id,
+                backend_id.generation
+            ));
             return None;
         };
-        self.last_pointer_x = position.x;
-        self.last_pointer_y = position.y;
+        if !surface_x.is_finite() || !surface_y.is_finite() {
+            pointer_debug_log(format!(
+                "pointer.unlock restore_decision={} id={} generation={} reason=non_finite hint=({},{}) restore_output=unchanged",
+                PointerRestoreDecision::PreserveCurrentLogicalPosition.as_str(),
+                backend_id.constraint_id,
+                backend_id.generation,
+                surface_x,
+                surface_y
+            ));
+            return None;
+        }
+        let Some((output_x, output_y)) =
+            self.output_position_for_valid_cursor_hint(surface, surface_x, surface_y)
+        else {
+            pointer_debug_log(format!(
+                "pointer.unlock restore_decision={} id={} generation={} reason=unresolved hint=({},{}) restore_output=unchanged",
+                PointerRestoreDecision::PreserveCurrentLogicalPosition.as_str(),
+                backend_id.constraint_id,
+                backend_id.generation,
+                surface_x,
+                surface_y
+            ));
+            return None;
+        };
+        self.last_pointer_x = output_x;
+        self.last_pointer_y = output_y;
         pointer_debug_log(format!(
-            "pointer.unlock restore_source=activation_anchor restore_output=({},{})",
-            position.x, position.y
+            "pointer.unlock restore_decision={} origin={} id={} generation={} hint=({surface_x},{surface_y}) restore_output=({output_x},{output_y})",
+            PointerRestoreDecision::ApplyCommittedCursorPositionHint.as_str(),
+            PointerWarpOrigin::LockedPointerCursorHint.as_str(),
+            backend_id.constraint_id,
+            backend_id.generation,
         ));
-        Some(position)
+        Some(OutputPosition {
+            x: output_x,
+            y: output_y,
+        })
     }
 
     pub(in crate::compositor) fn output_position_for_valid_cursor_hint(
@@ -1037,7 +1044,7 @@ impl CompositorState {
         ));
         let matches_pending_unlock = self.pending_locked_pointer_reveal_matches(&pointer, &surface);
         let applied_position =
-            self.apply_pointer_warp(position, PointerRepositionCause::ClientWarp);
+            self.apply_pointer_warp(position, PointerWarpOrigin::PointerWarpProtocol);
         if matches_pending_unlock && let Some(applied_position) = applied_position {
             self.record_pending_locked_pointer_client_warp(applied_position);
             self.try_settle_pending_locked_pointer_reveal("matching_client_warp");

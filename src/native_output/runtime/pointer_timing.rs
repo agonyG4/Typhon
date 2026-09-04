@@ -1,5 +1,6 @@
 use std::{io, sync::OnceLock};
 
+use oblivion_one::compositor::{PointerRestoreDecision, PointerWarpOrigin};
 use oblivion_one::native::event_loop::monotonic_now_ns;
 
 const TIMING_RING_CAPACITY: usize = 8;
@@ -39,6 +40,36 @@ pub(crate) struct NativePointerTimingPoint {
     pub(crate) thread_cpu_ns: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct NativePointerTransitionContext {
+    pub(crate) constraint_id: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) active_id_before: Option<u64>,
+    pub(crate) active_generation_before: Option<u64>,
+    pub(crate) active_id_after: Option<u64>,
+    pub(crate) active_generation_after: Option<u64>,
+    pub(crate) logical_pointer_before: Option<(f64, f64)>,
+    pub(crate) logical_pointer_after: Option<(f64, f64)>,
+    pub(crate) native_cursor_before: Option<(f64, f64)>,
+    pub(crate) native_cursor_after: Option<(f64, f64)>,
+    pub(crate) activation_anchor: Option<(f64, f64)>,
+    pub(crate) committed_cursor_hint_present: Option<bool>,
+    pub(crate) committed_cursor_hint: Option<(f64, f64)>,
+    pub(crate) pending_cursor_hint_present: Option<bool>,
+    pub(crate) pending_cursor_hint: Option<(f64, f64)>,
+    pub(crate) restore_decision: Option<PointerRestoreDecision>,
+    pub(crate) warp_requested: Option<bool>,
+    pub(crate) warp_origin: Option<PointerWarpOrigin>,
+    pub(crate) warp_target: Option<(f64, f64)>,
+    pub(crate) warp_accepted: Option<bool>,
+    pub(crate) warp_applied: Option<bool>,
+    pub(crate) warp_applied_target: Option<(f64, f64)>,
+    pub(crate) cursor_visible_before: Option<bool>,
+    pub(crate) cursor_visible_after: Option<bool>,
+    pub(crate) focus_surface_before: Option<u32>,
+    pub(crate) focus_surface_after: Option<u32>,
+}
+
 pub(crate) fn capture_timing_point() -> io::Result<NativePointerTimingPoint> {
     Ok(NativePointerTimingPoint {
         wall_ns: monotonic_now_ns()?,
@@ -68,7 +99,7 @@ pub(crate) fn thread_cpu_time_ns() -> Option<u64> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct NativePointerPreReadObservation {
     pub(crate) probe_performed: bool,
     pub(crate) input_promoted: bool,
@@ -84,6 +115,7 @@ pub(crate) struct NativePointerPreReadObservation {
     pub(crate) wayland_flush_end: Option<NativePointerTimingPoint>,
     pub(crate) constraint_region_resolution_duration_ns: Option<u64>,
     pub(crate) constraint_region_resolution_thread_cpu_ns: Option<u64>,
+    pub(crate) transition_context: Option<NativePointerTransitionContext>,
     pub(crate) batch: Option<NativePointerTimingBatch>,
 }
 
@@ -172,6 +204,7 @@ struct NativePointerTimingRecord {
     pre_read_probe: bool,
     pre_read_input_promoted: bool,
     pre_transition_input: Option<NativePointerTimingBatch>,
+    transition_context: Option<NativePointerTransitionContext>,
     complete: bool,
     summary_emitted: bool,
 }
@@ -289,6 +322,7 @@ impl NativePointerTimingTrace {
             pre_read_probe: pre_read.probe_performed,
             pre_read_input_promoted: pre_read.input_promoted,
             pre_transition_input: pre_read.batch,
+            transition_context: pre_read.transition_context,
             wayland_read_start_at_ns: pre_read.wayland_read_start.map(|point| point.wall_ns),
             wayland_read_end_at_ns: pre_read.wayland_read_end.map(|point| point.wall_ns),
             wayland_read_start_thread_cpu_ns: pre_read
@@ -661,9 +695,10 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         format_duration(record.cursor_sync_start_at_ns, record.cursor_sync_end_at_ns);
     let reactor_wait_ns =
         format_duration(record.cycle_return_at_ns, record.next_reactor_wake_at_ns);
+    let transition_context = format_transition_context(record.transition_context);
 
     format!(
-        "transition={transition} routing_transition_committed_at_ns={} routing_transition_thread_cpu_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} wayland_read_thread_cpu_ns={} pre_read_probe_duration_ns={} pre_read_probe_thread_cpu_ns={} probe_end_to_wayland_read_start_ns={} probe_end_to_wayland_read_start_thread_cpu_ns={} wayland_read_end_to_settlement_start_ns={} wayland_read_end_to_settlement_start_thread_cpu_ns={} constraint_settlement_duration_ns={} constraint_settlement_thread_cpu_ns={} constraint_activation_duration_ns={} constraint_activation_thread_cpu_ns={} wayland_flush_duration_ns={} wayland_flush_thread_cpu_ns={} constraint_region_resolution_duration_ns={} constraint_region_resolution_thread_cpu_ns={} settlement_end_to_transition_ns={} settlement_end_to_transition_thread_cpu_ns={} pre_read_probe_to_transition_ns={} pre_read_probe_to_transition_thread_cpu_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase}",
+        "transition={transition} routing_transition_committed_at_ns={} routing_transition_thread_cpu_ns={} transition_to_dispatch_return_ns={} transition_to_cycle_return_ns={} transition_to_next_reactor_wake_ns={} transition_to_first_input_service_attempt_ns={} reactor_wait_ns={} first_nonempty_input_service_duration_ns={} libinput_dispatch_duration_ns={} queue_drain_duration_ns={} wayland_read_duration_ns={} wayland_read_thread_cpu_ns={} pre_read_probe_duration_ns={} pre_read_probe_thread_cpu_ns={} probe_end_to_wayland_read_start_ns={} probe_end_to_wayland_read_start_thread_cpu_ns={} wayland_read_end_to_settlement_start_ns={} wayland_read_end_to_settlement_start_thread_cpu_ns={} constraint_settlement_duration_ns={} constraint_settlement_thread_cpu_ns={} constraint_activation_duration_ns={} constraint_activation_thread_cpu_ns={} wayland_flush_duration_ns={} wayland_flush_thread_cpu_ns={} constraint_region_resolution_duration_ns={} constraint_region_resolution_thread_cpu_ns={} settlement_end_to_transition_ns={} settlement_end_to_transition_thread_cpu_ns={} pre_read_probe_to_transition_ns={} pre_read_probe_to_transition_thread_cpu_ns={} cursor_sync_duration_ns={} pre_read_probe={} pre_read_input_promoted={} pre_transition_input_raw={} pre_transition_input_coalesced={} pre_transition_input_hw_span_us={} raw={} coalesced={} hw_span_us={} checkpoint_count={} first_serviceable_checkpoint={} fresh_input_microturn={} superseded_incomplete_transition_observations={} largest_phase={largest_phase} transition_context={transition_context}",
         record.routing_transition_committed_at_ns,
         record
             .routing_transition_thread_cpu_ns
@@ -720,6 +755,73 @@ fn format_summary(record: &NativePointerTimingRecord) -> String {
         record.fresh_input_microturn,
         record.superseded_incomplete_transition_observations,
     )
+}
+
+fn format_transition_context(context: Option<NativePointerTransitionContext>) -> String {
+    let Some(context) = context else {
+        return "unknown".to_owned();
+    };
+    format!(
+        "constraint_id={} generation={} active_id_before={} active_generation_before={} active_id_after={} active_generation_after={} logical_pointer_before={} logical_pointer_after={} native_cursor_before={} native_cursor_after={} activation_anchor={} committed_cursor_hint_present={} committed_cursor_hint={} pending_cursor_hint_present={} pending_cursor_hint={} restore_decision={} warp_requested={} warp_origin={} warp_target={} warp_accepted={} warp_applied={} warp_applied_target={} cursor_visible_before={} cursor_visible_after={} focus_surface_before={} focus_surface_after={}",
+        format_option_u64(context.constraint_id),
+        format_option_u64(context.generation),
+        format_option_u64(context.active_id_before),
+        format_option_u64(context.active_generation_before),
+        format_option_u64(context.active_id_after),
+        format_option_u64(context.active_generation_after),
+        format_option_position(context.logical_pointer_before),
+        format_option_position(context.logical_pointer_after),
+        format_option_position(context.native_cursor_before),
+        format_option_position(context.native_cursor_after),
+        format_option_position(context.activation_anchor),
+        format_option_bool(context.committed_cursor_hint_present),
+        format_option_position(context.committed_cursor_hint),
+        format_option_bool(context.pending_cursor_hint_present),
+        format_option_position(context.pending_cursor_hint),
+        context
+            .restore_decision
+            .map(PointerRestoreDecision::as_str)
+            .unwrap_or("unknown"),
+        format_option_bool(context.warp_requested),
+        context
+            .warp_origin
+            .map(PointerWarpOrigin::as_str)
+            .unwrap_or("unknown"),
+        format_option_position(context.warp_target),
+        format_option_bool(context.warp_accepted),
+        format_option_bool(context.warp_applied),
+        format_option_position(context.warp_applied_target),
+        format_option_bool(context.cursor_visible_before),
+        format_option_bool(context.cursor_visible_after),
+        format_option_u32(context.focus_surface_before),
+        format_option_u32(context.focus_surface_after),
+    )
+}
+
+fn format_option_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn format_option_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn format_option_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn format_option_position(value: Option<(f64, f64)>) -> String {
+    value
+        .map(|(x, y)| format!("({x},{y})"))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn format_transition_duration(at_ns: Option<u64>, record: &NativePointerTimingRecord) -> String {
@@ -1020,6 +1122,41 @@ mod tests {
         let summary = format_summary(&trace.records[0].expect("active record"));
         assert!(summary.contains("constraint_region_resolution_duration_ns=37"));
         assert!(summary.contains("constraint_region_resolution_thread_cpu_ns=19"));
+    }
+
+    #[test]
+    fn timing_summary_carries_pointer_transition_ownership_without_zero_fill() {
+        let mut trace = NativePointerTimingTrace::enabled_for_test();
+        trace.record_routing_transition_committed_with_pre_read(
+            NativePointerTimingTransition::LockedDeactivated,
+            200,
+            NativePointerPreReadObservation {
+                transition_context: Some(NativePointerTransitionContext {
+                    constraint_id: Some(7),
+                    generation: Some(3),
+                    logical_pointer_before: Some((10.0, 20.0)),
+                    logical_pointer_after: Some((10.0, 20.0)),
+                    activation_anchor: Some((4.0, 5.0)),
+                    committed_cursor_hint_present: Some(false),
+                    restore_decision: Some(PointerRestoreDecision::PreserveCurrentLogicalPosition),
+                    warp_requested: Some(false),
+                    warp_accepted: Some(false),
+                    warp_applied: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let summary = format_summary(&trace.records[0].expect("active record"));
+        assert!(summary.contains("constraint_id=7 generation=3"));
+        assert!(summary.contains("logical_pointer_before=(10,20)"));
+        assert!(summary.contains("activation_anchor=(4,5)"));
+        assert!(summary.contains("committed_cursor_hint_present=false"));
+        assert!(summary.contains("restore_decision=preserve_current_logical_position"));
+        assert!(summary.contains("warp_requested=false"));
+        assert!(summary.contains("warp_origin=unknown"));
+        assert!(summary.contains("warp_target=unknown"));
     }
 
     #[test]

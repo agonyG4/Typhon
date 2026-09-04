@@ -168,6 +168,48 @@ pub struct PointerConstraintBackendId {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerConstraintTransitionSnapshot {
+    pub constraint_id: u64,
+    pub generation: u64,
+    pub committed_cursor_position_hint: Option<(f64, f64)>,
+    pub pending_cursor_position_hint: Option<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerWarpOrigin {
+    LockedPointerCursorHint,
+    OneshotCompatibility,
+    PointerWarpProtocol,
+    ConfinedRegionCorrection,
+}
+
+impl PointerWarpOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LockedPointerCursorHint => "locked_pointer_cursor_hint",
+            Self::OneshotCompatibility => "oneshot_compatibility",
+            Self::PointerWarpProtocol => "pointer_warp_protocol",
+            Self::ConfinedRegionCorrection => "confined_region_correction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerRestoreDecision {
+    PreserveCurrentLogicalPosition,
+    ApplyCommittedCursorPositionHint,
+}
+
+impl PointerRestoreDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreserveCurrentLogicalPosition => "preserve_current_logical_position",
+            Self::ApplyCommittedCursorPositionHint => "apply_committed_cursor_position_hint",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerConstraintRegionResolutionTiming {
     pub duration_ns: u64,
@@ -191,9 +233,11 @@ pub enum PointerConstraintBackendRequest {
     Deactivate {
         id: PointerConstraintBackendId,
         restore_position: Option<OutputPosition>,
+        restore_origin: Option<PointerWarpOrigin>,
     },
     WarpPointer {
         position: OutputPosition,
+        origin: PointerWarpOrigin,
     },
     ApplyCursorVisibility {
         visible: bool,

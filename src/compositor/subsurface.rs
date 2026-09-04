@@ -642,6 +642,28 @@ impl SubsurfaceTransactionState {
             .is_some_and(|role| !role.cached_commits.is_empty())
     }
 
+    pub(super) fn cached_pointer_constraint_hint(
+        &self,
+        surface_id: u32,
+        constraint_id: u64,
+    ) -> Option<(f64, f64)> {
+        self.roles
+            .get(&surface_id)
+            .into_iter()
+            .flat_map(|role| role.cached_commits.iter().rev())
+            .find_map(|commit| match &commit.pointer_constraint_state {
+                CapturedPointerConstraintSurfaceState::Mutation(captured)
+                    if captured.constraint_id == constraint_id =>
+                {
+                    match &captured.cursor_position_hint {
+                        PointerConstraintHintCommit::Set(hint) => Some(*hint),
+                        PointerConstraintHintCommit::NoChange => None,
+                    }
+                }
+                _ => None,
+            })
+    }
+
     pub(super) fn cached_node_count(&self) -> usize {
         self.roles
             .values()

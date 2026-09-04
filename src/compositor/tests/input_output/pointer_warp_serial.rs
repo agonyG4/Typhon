@@ -532,7 +532,8 @@ fn v11_client_warp_after_backend_ack_settles_unlock() {
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
-                position: OutputPosition { x, y }
+                position: OutputPosition { x, y },
+                ..
             } if (*x, *y) == (
                 f64::from(render::FIRST_SURFACE_OFFSET.0) + 30.0,
                 f64::from(render::FIRST_SURFACE_OFFSET.1),
@@ -610,7 +611,7 @@ fn pending_unlock_accepts_same_client_cross_surface_warp() {
         capture_pending_locked_pointer_reveal_and_backend_requests(&fixture.commands);
     assert!(!pending_after_ack);
     let client_warp_position = warp_requests.iter().find_map(|request| match request {
-        PointerConstraintBackendRequest::WarpPointer { position } => Some(*position),
+        PointerConstraintBackendRequest::WarpPointer { position, .. } => Some(*position),
         _ => None,
     });
     let final_pointer_position = fixture.last_pointer_position();

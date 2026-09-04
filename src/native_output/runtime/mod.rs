@@ -74,7 +74,7 @@ use metrics::NativeRenderTelemetry;
 pub(crate) use pointer_timing::{
     NativePointerPreReadObservation, NativePointerTimingBatch, NativePointerTimingPhase,
     NativePointerTimingPoint, NativePointerTimingTrace, NativePointerTimingTransition,
-    capture_timing_point,
+    NativePointerTransitionContext, capture_timing_point,
 };
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,

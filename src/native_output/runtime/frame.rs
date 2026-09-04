@@ -3,6 +3,7 @@ use std::borrow::Cow;
 
 use oblivion_one::compositor::{
     DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
+    PointerWarpOrigin,
 };
 
 #[derive(Debug)]
@@ -619,7 +620,9 @@ pub(crate) struct NativePointerConstraintBackendAction {
     pub(crate) deactivated_mode: Option<PointerConstraintMode>,
     pub(crate) failed: Option<(PointerConstraintBackendId, &'static str)>,
     pub(crate) restore_position: Option<CompositorOutputPosition>,
+    pub(crate) restore_origin: Option<PointerWarpOrigin>,
     pub(crate) cursor_position: Option<CompositorOutputPosition>,
+    pub(crate) cursor_position_origin: Option<PointerWarpOrigin>,
     pub(crate) cursor_visibility_changed: Option<bool>,
     pub(crate) region_resolution_timing: Option<PointerConstraintRegionResolutionTiming>,
 }
@@ -636,6 +639,10 @@ impl NativePointerConstraintBackend {
         self.active
             .as_ref()
             .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked)
+    }
+
+    pub(crate) fn active_backend_id(&self) -> Option<PointerConstraintBackendId> {
+        self.active.as_ref().map(|constraint| constraint.id)
     }
 
     pub(crate) fn active_constraint_state(&self) -> NativePointerConstraintState {
@@ -676,8 +683,9 @@ impl NativePointerConstraintBackend {
             PointerConstraintBackendRequest::Deactivate {
                 id,
                 restore_position,
-            } => self.deactivate(id, restore_position),
-            PointerConstraintBackendRequest::WarpPointer { position } => {
+                restore_origin,
+            } => self.deactivate(id, restore_position, restore_origin),
+            PointerConstraintBackendRequest::WarpPointer { position, origin } => {
                 if self.active_locked() {
                     native_pointer_debug_log_lazy(|| {
                         format!(
@@ -697,6 +705,7 @@ impl NativePointerConstraintBackend {
                 });
                 NativePointerConstraintBackendAction {
                     cursor_position: Some(final_position),
+                    cursor_position_origin: Some(origin),
                     ..NativePointerConstraintBackendAction::default()
                 }
             }
@@ -789,6 +798,7 @@ impl NativePointerConstraintBackend {
         &mut self,
         id: PointerConstraintBackendId,
         restore_position: Option<CompositorOutputPosition>,
+        restore_origin: Option<PointerWarpOrigin>,
     ) -> NativePointerConstraintBackendAction {
         let Some(active) = self.active.as_ref().cloned() else {
             return NativePointerConstraintBackendAction::default();
@@ -798,11 +808,17 @@ impl NativePointerConstraintBackend {
         }
         self.active = None;
         let restore_position = (active.mode == PointerConstraintMode::Locked)
-            .then(|| restore_position.unwrap_or(active.anchor));
+            .then_some(restore_position)
+            .flatten();
+        let restore_origin = restore_position
+            .is_some()
+            .then_some(restore_origin)
+            .flatten();
         NativePointerConstraintBackendAction {
             deactivated: Some(id),
             deactivated_mode: Some(active.mode),
             restore_position,
+            restore_origin,
             ..NativePointerConstraintBackendAction::default()
         }
     }
@@ -823,6 +839,8 @@ impl NativePointerConstraintBackend {
         let constrained = region.closest_point(cursor_position);
         NativePointerConstraintBackendAction {
             cursor_position: (constrained != cursor_position).then_some(constrained),
+            cursor_position_origin: (constrained != cursor_position)
+                .then_some(PointerWarpOrigin::ConfinedRegionCorrection),
             ..NativePointerConstraintBackendAction::default()
         }
     }

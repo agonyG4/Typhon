@@ -16,7 +16,9 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
-use crate::compositor::{ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics};
+use crate::compositor::{
+    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
+};
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
@@ -66,13 +68,14 @@ use super::{
     ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
     FrameCallbackTimingEvidence, FramePacingProtocolCapabilities, FramePresentation,
     FullscreenRenderPlanMetrics, InputProtocolCapabilities, InteractionUpdateOutcome,
-    OutputPosition, OutputRect, PendingProcessLaunch, PointerAxisFrame, PresentationClock,
-    PresentationProtocolCapabilities, ProtocolOnlyCompletion, RenderGenerationCause,
-    RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    SurfacePacingMetrics, SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome,
-    WindowFocusReason, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
-    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    OutputPosition, OutputRect, PendingProcessLaunch, PointerAxisFrame,
+    PointerConstraintTransitionSnapshot, PresentationClock, PresentationProtocolCapabilities,
+    ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
+    SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePresentationMetadata,
+    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
+    XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
         ResolvedPointerConstraintBackendRequest,
@@ -1132,6 +1135,21 @@ impl OwnCompositorServer {
 
     pub fn last_pointer_position(&self) -> (f64, f64) {
         (self.state.last_pointer_x, self.state.last_pointer_y)
+    }
+
+    pub fn pointer_focus_surface_id(&self) -> Option<u32> {
+        self.state
+            .pointer_surface
+            .as_ref()
+            .map(compositor_surface_id)
+    }
+
+    pub fn pointer_constraint_transition_snapshot(
+        &self,
+        constraint_id: u64,
+    ) -> Option<PointerConstraintTransitionSnapshot> {
+        self.state
+            .pointer_constraint_transition_snapshot(constraint_id)
     }
 
     pub fn render_generation(&self) -> u64 {
