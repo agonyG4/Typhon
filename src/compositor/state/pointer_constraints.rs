@@ -100,6 +100,7 @@ impl CompositorState {
         fallback_origin: Option<PointerWarpOrigin>,
     ) {
         self.last_cursor_reveal_authority = None;
+        self.cursor_reveal_first_visible_reported = false;
         pointer_debug_log(format!(
             "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_kept_hidden=true",
             backend_id.constraint_id,

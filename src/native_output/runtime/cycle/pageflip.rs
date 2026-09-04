@@ -1,5 +1,6 @@
 use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary_cursor_pageflip};
 use super::super::kms_worker::drop_queued_worker_job_with_reason_parts;
+use super::super::presentation_cursor::trace_presented_cursor;
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presented_output_transaction,
     prepare_presented_output_transaction, settle_dropped_output_transaction,
@@ -665,17 +666,20 @@ impl NativeRuntime {
                     let token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
                     let identity = pageflip_identity(token, *drm_file_generation, target.crtc_id);
+                    let previous_cursor = presented_planes.cursor;
+                    let presented_cursor = cursor.presented_plane_state();
                     if !presented_planes.promote_bundle(
                         identity,
                         identity,
                         None,
-                        Some(cursor.presented_plane_state()),
+                        Some(presented_cursor),
                     ) {
                         return Err(io::Error::other(
                             "cursor pageflip promotion identity mismatch",
                         )
                         .into());
                     }
+                    trace_presented_cursor(server, identity, previous_cursor, presented_cursor);
                 }
             }
             let direct_pending = matches!(
@@ -858,18 +862,28 @@ impl NativeRuntime {
                     {
                         let identity =
                             pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        let previous_cursor = presented_planes.cursor;
+                        let presented_cursor = atomic_cursor
+                            .as_ref()
+                            .map(NativeAtomicCursor::presented_plane_state);
                         if !presented_planes.promote_bundle(
                             identity,
                             identity,
                             presented_planes.primary,
-                            atomic_cursor
-                                .as_ref()
-                                .map(NativeAtomicCursor::presented_plane_state),
+                            presented_cursor,
                         ) {
                             return Err(io::Error::other(
                                 "direct pageflip promotion identity mismatch",
                             )
                             .into());
+                        }
+                        if let Some(presented_cursor) = presented_cursor {
+                            trace_presented_cursor(
+                                server,
+                                identity,
+                                previous_cursor,
+                                presented_cursor,
+                            );
                         }
                     }
                 } else if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
@@ -1185,18 +1199,28 @@ impl NativeRuntime {
                     {
                         let identity =
                             pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        let previous_cursor = presented_planes.cursor;
+                        let presented_cursor = atomic_cursor
+                            .as_ref()
+                            .map(NativeAtomicCursor::presented_plane_state);
                         if !presented_planes.promote_bundle(
                             identity,
                             identity,
                             presented_primary,
-                            atomic_cursor
-                                .as_ref()
-                                .map(NativeAtomicCursor::presented_plane_state),
+                            presented_cursor,
                         ) {
                             return Err(io::Error::other(
                                 "composited pageflip promotion identity mismatch",
                             )
                             .into());
+                        }
+                        if let Some(presented_cursor) = presented_cursor {
+                            trace_presented_cursor(
+                                server,
+                                identity,
+                                previous_cursor,
+                                presented_cursor,
+                            );
                         }
                     }
                     render_journal.note_matching_presentation(presented_at);
@@ -1577,6 +1601,8 @@ impl NativeRuntime {
                                 frozen_primary_cursor_presentation(primary_cursor_presentation)
                             }),
                         );
+                        let previous_cursor = presented_planes.cursor;
+                        let cursor_for_trace = cursor;
                         if (primary.is_some() || cursor.is_some())
                             && !presented_planes.promote_bundle(identity, identity, primary, cursor)
                         {
@@ -1584,6 +1610,9 @@ impl NativeRuntime {
                                 "worker pageflip promotion identity mismatch",
                             )
                             .into());
+                        }
+                        if let Some(cursor) = cursor_for_trace {
+                            trace_presented_cursor(server, identity, previous_cursor, cursor);
                         }
                         if let Some(worker) = kms_commit_worker.as_ref() {
                             worker.set_established_presented_base(

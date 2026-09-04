@@ -81,6 +81,7 @@ pub(super) fn queue_plane_delta(
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
     cursor_surface_damage: Option<SurfaceDamagePresentation>,
+    cursor_reveal: Option<(u64, u64)>,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -234,6 +235,25 @@ pub(super) fn queue_plane_delta(
         test_policy: KmsCommitTestPolicy::from_cursor(scheduled_kms_test_policy(cursor)),
         ready_submit: false,
     };
+    if let Some((constraint_id, constraint_generation)) = cursor_reveal {
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=cursor_freeze constraint={}/{} output_transaction_id={} pageflip_token={} desired_epoch={} frozen_revision={:?} cursor_kms_update={:?} cursor_state={:?} client_source_key=not_available capability_key={:?} framebuffer_pin={:?}",
+                constraint_id,
+                constraint_generation,
+                transaction_id.get(),
+                token.get(),
+                cursor_epoch,
+                owned_revision,
+                job.cursor,
+                desired,
+                job.owners.cursor().and_then(|owner| owner.capability_key),
+                job.cursor_pin
+                    .as_ref()
+                    .map(|pin| pin.framebuffer_id().get())
+            )
+        });
+    }
     let descriptor = output_transactions
         .transaction(transaction_id)
         .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?;

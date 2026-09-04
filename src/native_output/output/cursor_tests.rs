@@ -141,6 +141,33 @@ fn queueing_cursor_job_does_not_advance_last_submitted_epoch() {
 }
 
 #[test]
+fn cursor_trace_snapshot_exposes_submitted_and_queued_state_identity() {
+    let mut cursor = test_cursor();
+    cursor.set_hardware_path_active(true);
+    cursor.set_position(100, 200);
+    cursor.set_visible(true);
+    let epoch = cursor.desired_epoch();
+    let revision = cursor.desired_revision();
+    let state = cursor.desired().clone();
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(78).expect("test transaction ID is nonzero"),
+    );
+    let token = PageFlipToken::new(78).unwrap();
+
+    cursor
+        .queue_owned_worker_submission(transaction_id, token, epoch, revision, state.clone())
+        .unwrap();
+
+    assert_eq!(cursor.submitted_state(), cursor.current());
+    assert_eq!(cursor.submitted_epoch(), INITIAL_CURSOR_EPOCH);
+    let queued = cursor.worker_queued_submission().expect("queued state");
+    assert_eq!(queued.cursor_epoch, epoch);
+    assert_eq!(queued.revision, revision);
+    assert_eq!(queued.visual_state, state);
+    assert_eq!(queued.token, token);
+}
+
+#[test]
 fn worker_queue_rejects_a_stale_cursor_epoch() {
     let mut cursor = test_cursor();
     let stale_epoch = cursor.desired_epoch();
@@ -841,6 +868,131 @@ fn hidden_to_visible_submits_latest_position() {
     assert!(cursor.needs_submission());
     assert_eq!(cursor.desired().x, 100);
     assert_eq!(cursor.desired().y, 200);
+}
+
+#[test]
+fn hidden_position_update_is_the_first_visible_presentation() {
+    let mut cursor = test_cursor();
+    cursor.desired.visible = true;
+    cursor.desired.framebuffer_id = Some(91);
+    cursor.desired.x = 10;
+    cursor.desired.y = 20;
+    cursor.current = cursor.desired.clone();
+
+    cursor.set_visible(false);
+    let hidden_epoch = cursor.desired_epoch();
+    let mut hidden_state = cursor.desired().clone();
+    hidden_state.framebuffer_id = None;
+    cursor.begin_submission_at_revision_with_capability_key(
+        PageFlipToken::new(79).unwrap(),
+        hidden_state,
+        hidden_epoch,
+        cursor.desired_revision(),
+        None,
+    );
+    cursor
+        .complete_submission(PageFlipToken::new(79).unwrap(), 1)
+        .unwrap();
+
+    cursor.set_position(300, 400);
+    cursor.set_visible(true);
+    let first_visible_epoch = cursor.desired_epoch();
+    let first_visible_revision = cursor.desired_revision();
+    let first_visible_state = cursor.desired().clone();
+
+    assert_eq!((first_visible_state.x, first_visible_state.y), (300, 400));
+    assert!(first_visible_state.visible);
+    cursor.begin_submission_at_revision_with_capability_key(
+        PageFlipToken::new(80).unwrap(),
+        first_visible_state.clone(),
+        first_visible_epoch,
+        first_visible_revision,
+        None,
+    );
+    cursor
+        .complete_submission(PageFlipToken::new(80).unwrap(), 1)
+        .unwrap();
+
+    assert_eq!(cursor.current(), &first_visible_state);
+    assert_eq!(cursor.presented_revision(), first_visible_revision);
+    assert_ne!(cursor.current().x, 10);
+    assert_ne!(cursor.current().y, 20);
+}
+
+#[test]
+fn hidden_show_with_unchanged_pointer_preserves_the_same_first_visible_state() {
+    let mut cursor = test_cursor();
+    cursor.desired.visible = true;
+    cursor.desired.framebuffer_id = Some(91);
+    cursor.desired.x = 30;
+    cursor.desired.y = 40;
+    cursor.current = cursor.desired.clone();
+
+    cursor.set_visible(false);
+    let hidden_epoch = cursor.desired_epoch();
+    let mut hidden_state = cursor.desired().clone();
+    hidden_state.framebuffer_id = None;
+    cursor.begin_submission_at_revision_with_capability_key(
+        PageFlipToken::new(81).unwrap(),
+        hidden_state,
+        hidden_epoch,
+        cursor.desired_revision(),
+        None,
+    );
+    cursor
+        .complete_submission(PageFlipToken::new(81).unwrap(), 1)
+        .unwrap();
+
+    cursor.set_visible(true);
+    assert_eq!((cursor.desired().x, cursor.desired().y), (30, 40));
+    assert_eq!(cursor.desired().framebuffer_id, Some(91));
+}
+
+#[test]
+fn hidden_image_hotspot_and_position_changes_are_one_visible_assignment() {
+    let mut cursor = test_cursor();
+    cursor.desired.visible = true;
+    cursor.desired.framebuffer_id = Some(91);
+    cursor.current = cursor.desired.clone();
+
+    cursor.set_visible(false);
+    let hidden_epoch = cursor.desired_epoch();
+    let mut hidden_state = cursor.desired().clone();
+    hidden_state.framebuffer_id = None;
+    cursor.begin_submission_at_revision_with_capability_key(
+        PageFlipToken::new(82).unwrap(),
+        hidden_state,
+        hidden_epoch,
+        cursor.desired_revision(),
+        None,
+    );
+    cursor
+        .complete_submission(PageFlipToken::new(82).unwrap(), 1)
+        .unwrap();
+
+    cursor.desired.hotspot_x = 7;
+    cursor.desired.hotspot_y = 9;
+    cursor.desired.width = 32;
+    cursor.desired.height = 48;
+    cursor.desired.framebuffer_id = Some(92);
+    cursor.desired.image_generation = 2;
+    cursor.set_position(300, 400);
+    cursor.set_visible(true);
+    let first_visible = cursor.desired().clone();
+
+    assert_eq!(
+        (
+            first_visible.x,
+            first_visible.y,
+            first_visible.hotspot_x,
+            first_visible.hotspot_y,
+            first_visible.width,
+            first_visible.height,
+            first_visible.framebuffer_id,
+            first_visible.image_generation,
+        ),
+        (300, 400, 7, 9, 32, 48, Some(92), 2)
+    );
 }
 
 #[test]

@@ -182,6 +182,7 @@ impl NativeRuntime {
                 cursor_manager,
                 perf,
             );
+            trace_cursor_desired_state(server, cursor);
             let plan = apply_cursor_policy_with_runtime_inputs(
                 CursorPolicyContext {
                     cursor,
@@ -205,6 +206,7 @@ impl NativeRuntime {
                 atomic_commit_arbiter.atomic_commit_pending(),
                 perf,
             );
+            trace_cursor_plane_plan(server, cursor, &plan, presented_planes.cursor);
             client_cursor_hardware_usable = plan_uses_hardware_cursor(&plan);
             runtime_plane_plan = Some(plan);
         } else if client_cursor_active {
@@ -792,6 +794,12 @@ impl NativeRuntime {
                     cursor_epoch,
                     atomic_cursor.as_ref(),
                 )?;
+                trace_cursor_freeze(
+                    server,
+                    atomic_cursor.as_ref(),
+                    frozen_cursor.0.as_ref(),
+                    frozen_cursor.1.as_ref(),
+                );
                 Some((frame_target, submit_window, frozen_cursor))
             } else {
                 None
@@ -1123,6 +1131,12 @@ impl NativeRuntime {
                                 cursor_epoch,
                                 atomic_cursor.as_ref(),
                             )?;
+                            trace_cursor_freeze(
+                                server,
+                                atomic_cursor.as_ref(),
+                                frozen_cursor.0.as_ref(),
+                                frozen_cursor.1.as_ref(),
+                            );
                             (frame_target, submit_window, frozen_cursor)
                         };
                         let o1_admission = Some(admission_observation_for_frame(

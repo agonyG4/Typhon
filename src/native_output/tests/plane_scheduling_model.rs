@@ -213,6 +213,16 @@ fn cursor_delta_classification_separates_position_visual_visibility_and_delivery
         ),
         CursorDeltaClass::DeliveryModeTransition
     );
+    assert_eq!(
+        classify_cursor_delta(
+            CursorDeliveryMode::Hidden,
+            CursorDeliveryMode::Hardware,
+            None,
+            Some(&moved),
+            true,
+        ),
+        CursorDeltaClass::Visibility
+    );
 }
 
 #[test]

@@ -36,6 +36,7 @@ pub(super) enum ClientEvent {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(super) enum ClientCommand {
     SetCursor,
     CaptureActive,

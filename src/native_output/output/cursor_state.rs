@@ -87,6 +87,10 @@ impl CursorRevisionTracker {
         self.presented
     }
 
+    pub(crate) const fn submitted(self) -> CursorRevision {
+        self.submitted
+    }
+
     pub(crate) fn advance_image(&mut self) {
         self.desired = self.desired.advance_image();
     }

@@ -50,7 +50,33 @@ pub(crate) struct CursorSidecarMailbox {
 
 impl CursorSidecarMailbox {
     pub(crate) fn offer(&mut self, sidecar: CursorSidecar) -> Option<CursorSidecar> {
-        self.pending.replace(sidecar)
+        let incoming_assignment = sidecar.assignment.clone();
+        let incoming = (
+            sidecar.id,
+            sidecar.transaction.id(),
+            sidecar.revision,
+            sidecar.cursor_delivery,
+            incoming_assignment,
+        );
+        let replaced = self.pending.replace(sidecar);
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=cursor_sidecar_replacement incoming_id={} incoming_transaction_id={} incoming_revision={:?} incoming_delivery={:?} incoming_assignment={:?} replaced={:?}",
+                incoming.0.get(),
+                incoming.1.get(),
+                incoming.2,
+                incoming.3,
+                incoming.4,
+                replaced.as_ref().map(|sidecar| (
+                    sidecar.id.get(),
+                    sidecar.transaction.id().get(),
+                    sidecar.revision,
+                    sidecar.cursor_delivery,
+                    &sidecar.assignment,
+                ))
+            )
+        });
+        replaced
     }
 
     pub(crate) fn pending(&self) -> Option<&CursorSidecar> {

@@ -723,6 +723,11 @@ fn collect_cursor_sidecar_before_freeze(
 }
 
 fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
+    let sidecar_id = sidecar.id;
+    let sidecar_transaction_id = sidecar.transaction.id();
+    let sidecar_revision = sidecar.revision;
+    let sidecar_delivery = sidecar.cursor_delivery;
+    let sidecar_assignment = sidecar.assignment.clone();
     job.cursor = match &sidecar.assignment {
         crate::native_output::CursorPlaneAssignment::Atomic {
             state: Some(state), ..
@@ -740,6 +745,19 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
         capability_key: sidecar.capability_key,
     });
     job.test_policy.cursor = sidecar.test_policy;
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        format!(
+            "event=cursor_sidecar_selected sidecar_id={} sidecar_transaction_id={} sidecar_revision={:?} sidecar_delivery={:?} sidecar_assignment={:?} selected_transaction_id={} selected_token={} selected_cursor={:?}",
+            sidecar_id.get(),
+            sidecar_transaction_id.get(),
+            sidecar_revision,
+            sidecar_delivery,
+            sidecar_assignment,
+            job.transaction_id.get(),
+            job.token.get(),
+            job.cursor
+        )
+    });
 }
 
 fn publish_terminal_sidecar_return(

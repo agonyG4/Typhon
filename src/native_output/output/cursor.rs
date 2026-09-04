@@ -212,6 +212,14 @@ impl NativeAtomicCursor {
         &self.current
     }
 
+    pub(crate) fn submitted_state(&self) -> &AtomicCursorVisualState {
+        &self.submitted
+    }
+
+    pub(crate) fn worker_queued_submission(&self) -> Option<&WorkerQueuedCursorSubmission> {
+        self.worker_queued.as_ref()
+    }
+
     pub(crate) fn needs_output_liveness(&self) -> bool {
         self.needs_output_liveness_for(Some(&self.desired))
     }
@@ -272,9 +280,20 @@ impl NativeAtomicCursor {
         self.revisions.desired()
     }
 
-    #[cfg(test)]
     pub(crate) const fn submitted_epoch(&self) -> u64 {
         self.submitted_epoch
+    }
+
+    pub(crate) const fn submitted_revision(
+        &self,
+    ) -> crate::native_output::presentation::plane::CursorRevision {
+        self.revisions.submitted()
+    }
+
+    pub(crate) const fn presented_revision(
+        &self,
+    ) -> crate::native_output::presentation::plane::CursorRevision {
+        self.revisions.presented()
     }
 
     #[cfg(test)]

@@ -584,6 +584,7 @@ pub(super) fn queue_plane_delta_for_presentation(
     cursor_action: crate::native_output::presentation::plane_policy::CursorPlaneAction,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
+    cursor_reveal: Option<(u64, u64)>,
 ) -> NativeResult<SchedulerDecision> {
     match queue_plane_delta(
         worker,
@@ -604,6 +605,7 @@ pub(super) fn queue_plane_delta_for_presentation(
         cursor_action,
         cursor_delivery,
         cursor_surface_damage,
+        cursor_reveal,
     )? {
         WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
             Ok(SchedulerDecision::WaitForPageFlip)
@@ -687,6 +689,12 @@ pub(super) fn present_cursor_for_presentation(
             ),
             cursor_delivery,
             cursor_surface_damage,
+            server.cursor_reveal_authority().map(|reveal| {
+                (
+                    reveal.constraint.constraint_id,
+                    reveal.constraint.generation,
+                )
+            }),
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }

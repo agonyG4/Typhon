@@ -87,6 +87,47 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
         theme_cursor_visible,
     );
     let cursor_visible = !matches!(resolved_cursor_source, NativeResolvedCursorSource::Hidden);
+    if server.cursor_reveal_authority().is_some() {
+        let (pointer_x, pointer_y) = server.last_pointer_position();
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            let reveal = server.cursor_reveal_authority();
+            let client = client_cursor.map(|client| {
+                (
+                    client.surface.surface_id,
+                    client.surface.buffer_id().get(),
+                    client.surface.commit_sequence.0,
+                    client.logical_x,
+                    client.logical_y,
+                    client.surface.x,
+                    client.surface.y,
+                    client.hotspot_x,
+                    client.hotspot_y,
+                    client
+                        .logical_x
+                        .saturating_add(client.surface.x)
+                        .saturating_add(client.hotspot_x),
+                    client
+                        .logical_y
+                        .saturating_add(client.surface.y)
+                        .saturating_add(client.hotspot_y),
+                )
+            });
+            format!(
+                "event=cursor_source_resolved constraint={}/{} source={:?} cursor_visible={} logical_pointer=({},{}) client_cursor_active={} client_cursor_explicitly_hidden={} interaction_override_active={} theme_cursor_visible={} client_surface={:?}",
+                reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+                reveal.map_or(0, |reveal| reveal.constraint.generation),
+                resolved_cursor_source,
+                cursor_visible,
+                pointer_x,
+                pointer_y,
+                client_cursor_active,
+                server.client_cursor_explicitly_hidden(),
+                server.interaction_cursor_override_active(),
+                theme_cursor_visible,
+                client
+            )
+        });
+    }
     (client_cursor, client_cursor_active, cursor_visible)
 }
 
@@ -257,6 +298,45 @@ pub(super) struct RuntimePlanePlan {
     pub(super) primary_cursor_presentation: KmsPrimaryCursorPresentation,
 }
 
+pub(super) fn trace_cursor_plane_plan(
+    server: &OwnCompositorServer,
+    cursor: &NativeAtomicCursor,
+    plan: &RuntimePlanePlan,
+    presented_cursor: crate::native_output::presentation::plane::PresentedCursorState,
+) {
+    if server.cursor_reveal_authority().is_none() {
+        return;
+    }
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        let reveal = server.cursor_reveal_authority();
+        let desired = cursor.desired();
+        format!(
+            "event=cursor_plane_plan constraint={}/{} previous_delivery={:?} next_delivery={:?} delta_class={:?} cursor_action={:?} primary_action={:?} test_policy={:?} decision_reason={:?} desired_epoch={} cursor_revision={:?} desired_visible={} desired_position=({},{}) presented_delivery={:?} presented_visible={} presented_position=({},{}) presented_revision={:?} position_only_guard={}",
+            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            presented_cursor.delivery,
+            plan.decision.delivery,
+            plan.delta_class,
+            plan.decision.cursor_action,
+            plan.decision.primary_action,
+            plan.decision.test_policy,
+            plan.decision.reason,
+            cursor.desired_epoch(),
+            cursor.desired_revision(),
+            desired.visible,
+            desired.x,
+            desired.y,
+            presented_cursor.delivery,
+            presented_cursor.visible,
+            presented_cursor.output_position.x,
+            presented_cursor.output_position.y,
+            presented_cursor.revision,
+            plan.delta_class != CursorDeltaClass::PositionOnly
+                || presented_cursor.kms_equivalent_to(cursor.current())
+        )
+    });
+}
+
 pub(super) fn plan_primary_cursor_presentation(
     plan: Option<&RuntimePlanePlan>,
 ) -> KmsPrimaryCursorPresentation {
@@ -322,6 +402,54 @@ pub(super) fn freeze_cursor_plane_owner(
     }))
 }
 
+pub(super) fn trace_cursor_desired_state(
+    server: &OwnCompositorServer,
+    cursor: &NativeAtomicCursor,
+) {
+    if server.cursor_reveal_authority().is_none() {
+        return;
+    }
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        let reveal = server.cursor_reveal_authority();
+        let desired = cursor.desired();
+        let queued = cursor.worker_queued_submission();
+        let revision = cursor.desired_revision();
+        format!(
+            "event=cursor_desired constraint={}/{} desired_epoch={} submitted_epoch={} revision_image={} revision_motion={} revision_visibility={} submitted_revision={:?} presented_revision={:?} source={} desired_visible={} desired_position=({},{}) hotspot=({},{}) size={}x{} framebuffer_id={:?} image_generation={} submitted={:?} current={:?} worker_queued_epoch={:?} worker_queued_revision={:?} worker_queued_state={:?} pending_token={:?} pending_is_primary={}",
+            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            cursor.desired_epoch(),
+            cursor.submitted_epoch(),
+            revision.image.get(),
+            revision.motion.get(),
+            revision.visibility.get(),
+            cursor.submitted_revision(),
+            cursor.presented_revision(),
+            if cursor.client_source_key().is_some() {
+                "client"
+            } else {
+                "theme"
+            },
+            desired.visible,
+            desired.x,
+            desired.y,
+            desired.hotspot_x,
+            desired.hotspot_y,
+            desired.width,
+            desired.height,
+            desired.framebuffer_id,
+            desired.image_generation,
+            cursor.submitted_state(),
+            cursor.current(),
+            queued.map(|queued| queued.cursor_epoch),
+            queued.map(|queued| queued.revision),
+            queued.map(|queued| &queued.visual_state),
+            cursor.pending_token(),
+            cursor.pending_is_primary()
+        )
+    });
+}
+
 pub(super) fn freeze_cursor_assignment_for_render(
     effective_cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
@@ -336,6 +464,102 @@ pub(super) fn freeze_cursor_assignment_for_render(
     });
     let owner = freeze_cursor_plane_owner(assignment.as_ref(), cursor)?;
     Ok((assignment, owner))
+}
+
+pub(super) fn trace_cursor_freeze(
+    server: &OwnCompositorServer,
+    cursor: Option<&NativeAtomicCursor>,
+    assignment: Option<&CursorPlaneAssignment>,
+    owner: Option<&FrozenCursorPlaneOwner>,
+) {
+    if server.cursor_reveal_authority().is_none() {
+        return;
+    }
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        let reveal = server.cursor_reveal_authority();
+        format!(
+            "event=cursor_freeze constraint={}/{} output_transaction_id=none pageflip_token=none desired_epoch={} frozen_revision={:?} cursor_assignment={:?} cursor_state={:?} client_source_key={:?} capability_key={:?} framebuffer_pin={:?}",
+            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            cursor.map_or(0, NativeAtomicCursor::desired_epoch),
+            owner.map(|owner| owner.revision),
+            assignment,
+            assignment.and_then(|assignment| match assignment {
+                CursorPlaneAssignment::Atomic { state, .. } => state.as_ref(),
+                CursorPlaneAssignment::Disabled | CursorPlaneAssignment::Unchanged => None,
+            }),
+            owner.and_then(|owner| owner.client_source_key),
+            owner.and_then(|owner| owner.capability_key),
+            owner
+                .and_then(|owner| owner.pin.as_ref())
+                .map(|pin| pin.framebuffer_id().get())
+        )
+    });
+}
+
+pub(super) fn trace_presented_cursor(
+    server: &mut OwnCompositorServer,
+    identity: crate::native_output::presentation::plane::PlanePageflipIdentity,
+    previous: crate::native_output::presentation::plane::PresentedCursorState,
+    cursor: crate::native_output::presentation::plane::PresentedCursorState,
+) {
+    if server.cursor_reveal_authority().is_none()
+        || !crate::pointer_debug::cursor_presentation_trace_enabled()
+    {
+        return;
+    }
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        let reveal = server.cursor_reveal_authority();
+        format!(
+            "event=cursor_presented constraint={}/{} pageflip_token={} output_generation={} crtc_id={} revision={:?} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?}",
+            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            identity.token.get(),
+            identity.output_generation,
+            identity.crtc_id,
+            cursor.revision,
+            cursor.delivery,
+            cursor.coupling,
+            cursor.visible,
+            cursor.output_position.x,
+            cursor.output_position.y,
+            cursor.hotspot.x,
+            cursor.hotspot.y,
+            cursor.framebuffer_id
+        )
+    });
+    let newly_visible = previous.delivery
+        == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+        && cursor.delivery
+            != crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
+    if !newly_visible || !server.take_cursor_reveal_first_visible_slot() {
+        return;
+    }
+    crate::pointer_debug::cursor_presentation_log_lazy(|| {
+        let reveal = server.cursor_reveal_authority();
+        let authority = reveal.map(|reveal| reveal.final_position);
+        let matches_authority = authority.is_some_and(|position| {
+            cursor.output_position.x == position.x.round() as i32
+                && cursor.output_position.y == position.y.round() as i32
+        });
+        format!(
+            "event=first_visible_cursor_presentation constraint={}/{} pageflip_token={} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?} authoritative_position={:?} match={}",
+            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
+            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            identity.token.get(),
+            cursor.delivery,
+            cursor.coupling,
+            cursor.visible,
+            cursor.output_position.x,
+            cursor.output_position.y,
+            cursor.hotspot.x,
+            cursor.hotspot.y,
+            cursor.framebuffer_id,
+            authority,
+            matches_authority
+        )
+    });
+    server.complete_cursor_reveal_trace();
 }
 
 pub(super) fn frozen_revision(
