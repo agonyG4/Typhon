@@ -426,10 +426,7 @@ impl NativeInputEffect {
         self.keyboard_events.push(event);
     }
 
-    pub(crate) fn forward_keyboard_event_after_state_change(
-        &mut self,
-        event: NativeKeyboardEvent,
-    ) {
+    pub(crate) fn forward_keyboard_event_after_state_change(&mut self, event: NativeKeyboardEvent) {
         self.keyboard_actions
             .push(NativeKeyboardAction::ClientAfterStateChange(event));
         self.keyboard_events.push(event);
