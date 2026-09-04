@@ -1170,35 +1170,37 @@ pub(crate) fn apply_native_input_effect(
     } else {
         for action in effect.keyboard_actions {
             match action {
-                NativeKeyboardAction::State(event) => {
-                    context
+                NativeKeyboardAction::PhysicalOnly(event) => {
+                    if context
                         .server
-                        .update_keyboard_state_without_publication(event.key, event.pressed);
+                        .update_keyboard_state_without_publication(event.key, event.pressed)
+                    {
+                        context.server.send_keyboard_modifiers_without_key();
+                    }
                 }
-                NativeKeyboardAction::StateAndClient(event) => {
-                    let modifiers_changed = context
+                NativeKeyboardAction::PhysicalAndClient(event) => {
+                    let physical_changed = context
                         .server
                         .update_keyboard_state_without_publication(event.key, event.pressed);
+                    let client_changed = context
+                        .server
+                        .update_keyboard_client_state_without_publication(event.key, event.pressed);
                     context
                         .server
                         .send_keyboard_key_after_state_update_without_publication(
                             event.key,
                             event.pressed,
-                            modifiers_changed,
+                            physical_changed || client_changed,
                         );
                 }
-                NativeKeyboardAction::Client(event) => {
+                NativeKeyboardAction::ClientOnly(event) => {
+                    let modifiers_changed = context
+                        .server
+                        .update_keyboard_client_state_without_publication(event.key, event.pressed);
                     context.server.send_keyboard_key_without_state_update(
                         event.key,
                         event.pressed,
-                        false,
-                    );
-                }
-                NativeKeyboardAction::ClientAfterStateChange(event) => {
-                    context.server.send_keyboard_key_without_state_update(
-                        event.key,
-                        event.pressed,
-                        true,
+                        modifiers_changed,
                     );
                 }
             }

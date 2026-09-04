@@ -28,6 +28,11 @@ pub(super) enum ClientEvent {
     KeyboardGroups {
         groups: Vec<u32>,
     },
+    KeyboardState {
+        keymap: Vec<u8>,
+        keys: Vec<(u32, bool)>,
+        modifiers: Vec<(u32, u32, u32, u32)>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,5 +42,6 @@ pub(super) enum ClientCommand {
     BeginXdgMove,
     CaptureButtons,
     CaptureKeyboard,
+    CaptureKeyboardState,
     Finish,
 }

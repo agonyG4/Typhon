@@ -310,10 +310,9 @@ pub(crate) struct NativeInputEffect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeKeyboardAction {
-    State(NativeKeyboardEvent),
-    StateAndClient(NativeKeyboardEvent),
-    Client(NativeKeyboardEvent),
-    ClientAfterStateChange(NativeKeyboardEvent),
+    PhysicalOnly(NativeKeyboardEvent),
+    PhysicalAndClient(NativeKeyboardEvent),
+    ClientOnly(NativeKeyboardEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -358,7 +357,7 @@ impl NativeInputEffect {
                 .keyboard_events
                 .iter()
                 .copied()
-                .map(NativeKeyboardAction::StateAndClient)
+                .map(NativeKeyboardAction::PhysicalAndClient)
                 .collect();
         }
         if other.keyboard_actions.is_empty() && !other.keyboard_events.is_empty() {
@@ -366,7 +365,7 @@ impl NativeInputEffect {
                 .keyboard_events
                 .iter()
                 .copied()
-                .map(NativeKeyboardAction::StateAndClient)
+                .map(NativeKeyboardAction::PhysicalAndClient)
                 .collect();
         }
         self.keyboard_events.append(&mut other.keyboard_events);
@@ -395,10 +394,10 @@ impl NativeInputEffect {
         }
     }
 
-    pub(crate) fn record_keyboard_state_event(&mut self, event: NativeKeyboardEvent) -> usize {
+    pub(crate) fn record_keyboard_physical_event(&mut self, event: NativeKeyboardEvent) -> usize {
         let index = self.keyboard_actions.len();
         self.keyboard_actions
-            .push(NativeKeyboardAction::State(event));
+            .push(NativeKeyboardAction::PhysicalOnly(event));
         index
     }
 
@@ -410,25 +409,25 @@ impl NativeInputEffect {
         if let Some(index) = current_state_action {
             debug_assert!(matches!(
                 self.keyboard_actions.get(index),
-                Some(NativeKeyboardAction::State(_))
+                Some(NativeKeyboardAction::PhysicalOnly(_))
             ));
             let state_event = self.keyboard_actions.remove(index);
-            let NativeKeyboardAction::State(state_event) = state_event else {
-                unreachable!("current keyboard action must be a state transition");
+            let NativeKeyboardAction::PhysicalOnly(state_event) = state_event else {
+                unreachable!("current keyboard action must be a physical transition");
             };
             debug_assert_eq!(state_event, event);
             self.keyboard_actions
-                .push(NativeKeyboardAction::StateAndClient(event));
+                .push(NativeKeyboardAction::PhysicalAndClient(event));
         } else {
             self.keyboard_actions
-                .push(NativeKeyboardAction::Client(event));
+                .push(NativeKeyboardAction::ClientOnly(event));
         }
         self.keyboard_events.push(event);
     }
 
-    pub(crate) fn forward_keyboard_event_after_state_change(&mut self, event: NativeKeyboardEvent) {
+    pub(crate) fn forward_keyboard_event_client_only(&mut self, event: NativeKeyboardEvent) {
         self.keyboard_actions
-            .push(NativeKeyboardAction::ClientAfterStateChange(event));
+            .push(NativeKeyboardAction::ClientOnly(event));
         self.keyboard_events.push(event);
     }
 

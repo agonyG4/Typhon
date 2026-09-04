@@ -136,7 +136,15 @@ impl OwnCompositorServer {
     }
 
     pub fn update_keyboard_state_without_publication(&mut self, key: u32, pressed: bool) -> bool {
-        self.state.update_keyboard_state(key, pressed)
+        self.state.update_keyboard_physical_state(key, pressed)
+    }
+
+    pub fn update_keyboard_client_state_without_publication(
+        &mut self,
+        key: u32,
+        pressed: bool,
+    ) -> bool {
+        self.state.update_keyboard_client_state(key, pressed)
     }
 
     #[cfg(test)]
@@ -164,6 +172,16 @@ impl OwnCompositorServer {
         self.state
             .send_keyboard_key_without_state_update(key, pressed, modifiers_changed);
         let _ = self.flush_wayland_clients();
+    }
+
+    pub fn send_keyboard_modifiers_without_key(&mut self) {
+        self.state.send_keyboard_modifiers_without_key();
+        let _ = self.flush_wayland_clients();
+    }
+
+    pub fn clear_keyboard_transient_state_for_session_switch(&mut self) {
+        self.state
+            .clear_keyboard_transient_state_for_session_switch();
     }
 
     pub fn send_pointer_motion(&mut self, x: f64, y: f64) {

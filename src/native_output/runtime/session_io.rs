@@ -167,6 +167,8 @@ impl NativeSessionIo for NativeRuntime {
 
     fn suspend_input(&mut self) -> NativeResult<()> {
         self.server.cancel_window_interaction_for_session_suspend();
+        self.server
+            .clear_keyboard_transient_state_for_session_switch();
         self.input_devices.suspend_for_session();
         self.input_state.clear_pressed_state_for_session_switch();
         Ok(())

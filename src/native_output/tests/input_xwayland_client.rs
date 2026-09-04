@@ -76,7 +76,8 @@ pub(super) fn spawn_native_input_xwayland_client(
                 ClientCommand::SetCursor
                 | ClientCommand::CaptureActive
                 | ClientCommand::BeginXdgMove
-                | ClientCommand::CaptureKeyboard => panic!("unexpected XWayland test command"),
+                | ClientCommand::CaptureKeyboard
+                | ClientCommand::CaptureKeyboardState => panic!("unexpected XWayland test command"),
             }
         }
     });

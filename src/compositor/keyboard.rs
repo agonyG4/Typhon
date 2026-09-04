@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fmt,
     fs::{self, File, OpenOptions},
     io::{self, Seek, Write},
@@ -122,7 +122,10 @@ pub(super) struct KeyboardSerializedState {
 
 pub(super) struct XkbKeyboardState {
     keymap: xkb::Keymap,
-    state: xkb::State,
+    physical_state: xkb::State,
+    client_state: xkb::State,
+    physical_pressed_keys: HashSet<u32>,
+    client_pressed_keys: HashSet<u32>,
     config: KeyboardConfig,
     serialized_keymap_v1: Vec<u8>,
 }
@@ -206,10 +209,14 @@ impl XkbKeyboardState {
             ));
         }
 
-        let state = xkb::State::new(&keymap);
+        let physical_state = xkb::State::new(&keymap);
+        let client_state = xkb::State::new(&keymap);
         Ok(Self {
             keymap,
-            state,
+            physical_state,
+            client_state,
+            physical_pressed_keys: HashSet::new(),
+            client_pressed_keys: HashSet::new(),
             config: config.clone(),
             serialized_keymap_v1,
         })
@@ -248,26 +255,76 @@ impl XkbKeyboardState {
         ))
     }
 
-    pub(super) fn update_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+    pub(super) fn update_physical_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+        self.update_state_key(evdev_key, pressed, false)
+    }
+
+    pub(super) fn update_client_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+        self.update_state_key(evdev_key, pressed, true)
+    }
+
+    fn update_state_key(&mut self, evdev_key: u32, pressed: bool, client: bool) -> bool {
         let Some(keycode) = self.keycode_for_evdev(evdev_key) else {
             return false;
         };
-        let before = self.serialized_state();
+        let before = self.wayland_serialized_state();
         let direction = if pressed {
             xkb::KeyDirection::Down
         } else {
             xkb::KeyDirection::Up
         };
-        self.state.update_key(keycode, direction);
-        self.serialized_state() != before
+        let (state, pressed_keys) = if client {
+            (&mut self.client_state, &mut self.client_pressed_keys)
+        } else {
+            (&mut self.physical_state, &mut self.physical_pressed_keys)
+        };
+        state.update_key(keycode, direction);
+        if pressed {
+            pressed_keys.insert(evdev_key);
+        } else {
+            pressed_keys.remove(&evdev_key);
+        }
+        self.wayland_serialized_state() != before
     }
 
-    pub(super) fn serialized_state(&self) -> KeyboardSerializedState {
+    pub(super) fn wayland_serialized_state(&self) -> KeyboardSerializedState {
         KeyboardSerializedState {
-            depressed: self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            latched: self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
-            locked: self.state.serialize_mods(xkb::STATE_MODS_LOCKED),
-            group: self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+            depressed: self.client_state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched: self.physical_state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked: self.physical_state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            group: self
+                .physical_state
+                .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn physical_serialized_state(&self) -> KeyboardSerializedState {
+        KeyboardSerializedState {
+            depressed: self
+                .physical_state
+                .serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched: self.physical_state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked: self.physical_state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            group: self
+                .physical_state
+                .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        }
+    }
+
+    pub(super) fn clear_transient_key_state(&mut self) {
+        let physical_keys = self.physical_pressed_keys.drain().collect::<Vec<_>>();
+        for evdev_key in physical_keys {
+            if let Some(keycode) = self.keycode_for_evdev(evdev_key) {
+                self.physical_state
+                    .update_key(keycode, xkb::KeyDirection::Up);
+            }
+        }
+        let client_keys = self.client_pressed_keys.drain().collect::<Vec<_>>();
+        for evdev_key in client_keys {
+            if let Some(keycode) = self.keycode_for_evdev(evdev_key) {
+                self.client_state.update_key(keycode, xkb::KeyDirection::Up);
+            }
         }
     }
 
@@ -324,7 +381,7 @@ impl XkbKeyboardState {
 
     #[cfg(test)]
     fn led_active(&self, name: &str) -> bool {
-        self.state.led_name_is_active(name)
+        self.physical_state.led_name_is_active(name)
     }
 
     fn keycode_for_evdev(&self, evdev_key: u32) -> Option<xkb::Keycode> {
@@ -381,7 +438,7 @@ impl KeyboardStateHandle {
         }
     }
 
-    pub(super) fn serialized_state(&self) -> Option<KeyboardSerializedState> {
+    pub(super) fn wayland_serialized_state(&self) -> Option<KeyboardSerializedState> {
         let KeyboardStateStatus::Ready(id) = self.status else {
             return None;
         };
@@ -389,11 +446,11 @@ impl KeyboardStateHandle {
             states
                 .borrow()
                 .get(&id)
-                .map(XkbKeyboardState::serialized_state)
+                .map(XkbKeyboardState::wayland_serialized_state)
         })
     }
 
-    pub(super) fn update_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+    pub(super) fn update_physical_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
         let KeyboardStateStatus::Ready(id) = self.status else {
             return false;
         };
@@ -401,7 +458,7 @@ impl KeyboardStateHandle {
             states
                 .borrow_mut()
                 .get_mut(&id)
-                .map(|state| state.update_key(evdev_key, pressed))
+                .map(|state| state.update_physical_key(evdev_key, pressed))
         });
         match changed {
             Some(changed) => changed,
@@ -412,6 +469,44 @@ impl KeyboardStateHandle {
                 );
                 false
             }
+        }
+    }
+
+    pub(super) fn update_client_key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        let changed = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(|state| state.update_client_key(evdev_key, pressed))
+        });
+        match changed {
+            Some(changed) => changed,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                false
+            }
+        }
+    }
+
+    pub(super) fn clear_transient_key_state(&mut self) {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return;
+        };
+        let present = KEYBOARD_STATES.with(|states| {
+            states.borrow_mut().get_mut(&id).is_some_and(|state| {
+                state.clear_transient_key_state();
+                true
+            })
+        });
+        if !present {
+            self.status = KeyboardStateStatus::Failed;
+            eprintln!("oblivion-one compositor: keyboard state was used outside its owning thread");
         }
     }
 
@@ -600,7 +695,7 @@ mod tests {
     fn uninitialized_keyboard_handle_initializes_on_current_thread() {
         let mut handle = KeyboardStateHandle::default();
         assert!(handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default())));
-        assert!(handle.serialized_state().is_some());
+        assert!(handle.wayland_serialized_state().is_some());
     }
 
     #[test]
@@ -610,7 +705,7 @@ mod tests {
             assert!(
                 handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default()))
             );
-            assert!(handle.serialized_state().is_some());
+            assert!(handle.wayland_serialized_state().is_some());
             handle
         })
         .join()
@@ -618,7 +713,7 @@ mod tests {
 
         let mut handle = handle;
         assert!(!handle.ensure());
-        assert!(handle.serialized_state().is_none());
+        assert!(handle.wayland_serialized_state().is_none());
     }
 
     #[test]
@@ -639,20 +734,21 @@ mod tests {
     }
 
     #[test]
-    fn update_key_uses_xkb_offset_but_keeps_evdev_api() {
+    fn update_physical_key_uses_xkb_offset_but_keeps_evdev_api() {
         let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
-        assert!(!state.update_key(30, true));
-        assert!(state.update_key(42, true));
+        assert!(!state.update_physical_key(30, true));
+        assert!(!state.update_physical_key(42, true));
+        assert_ne!(state.physical_serialized_state().depressed, 0);
         assert_eq!(state.keymap_keycode_for_evdev(30), Some(38));
     }
 
     #[test]
     fn caps_lock_changes_xkb_locked_mask_without_manual_modifier_state() {
         let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
-        assert_eq!(state.serialized_state().locked, 0);
-        state.update_key(58, true);
-        state.update_key(58, false);
-        assert_ne!(state.serialized_state().locked, 0);
+        assert_eq!(state.wayland_serialized_state().locked, 0);
+        state.update_physical_key(58, true);
+        state.update_physical_key(58, false);
+        assert_ne!(state.wayland_serialized_state().locked, 0);
         assert!(state.led_active(xkb::LED_NAME_CAPS));
     }
 
@@ -661,13 +757,13 @@ mod tests {
         let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
         let level_three = state.keymap.mod_get_index(xkb::MOD_NAME_ISO_LEVEL3_SHIFT);
         assert_ne!(level_three, xkb::MOD_INVALID);
-        state.update_key(100, true);
+        state.update_physical_key(100, true);
         assert!(
             state
-                .state
+                .physical_state
                 .mod_index_is_active(level_three, xkb::STATE_MODS_DEPRESSED)
         );
-        assert_ne!(state.serialized_state().depressed, 0);
+        assert_ne!(state.physical_serialized_state().depressed, 0);
     }
 
     #[test]
@@ -679,12 +775,55 @@ mod tests {
             ..KeyboardConfig::default()
         };
         let mut state = XkbKeyboardState::from_config(&config).unwrap();
-        assert_eq!(state.serialized_state().group, 0);
-        state.update_key(56, true);
-        state.update_key(42, true);
-        state.update_key(42, false);
-        state.update_key(56, false);
-        assert_eq!(state.serialized_state().group, 1);
+        assert_eq!(state.wayland_serialized_state().group, 0);
+        state.update_physical_key(56, true);
+        state.update_physical_key(42, true);
+        state.update_physical_key(42, false);
+        state.update_physical_key(56, false);
+        assert_eq!(state.wayland_serialized_state().group, 1);
+    }
+
+    #[test]
+    fn wayland_projection_excludes_physical_only_depressed_modifiers() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        let alt_index = state.keymap.mod_get_index(xkb::MOD_NAME_ALT);
+        let shift_index = state.keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+        assert_ne!(alt_index, xkb::MOD_INVALID);
+        assert_ne!(shift_index, xkb::MOD_INVALID);
+
+        state.update_physical_key(56, true);
+        state.update_physical_key(42, true);
+        state.update_client_key(42, true);
+        let projected = state.wayland_serialized_state();
+        let alt_mask = 1u32.checked_shl(alt_index).unwrap();
+        let shift_mask = 1u32.checked_shl(shift_index).unwrap();
+        assert_eq!(
+            state.physical_serialized_state().depressed & alt_mask,
+            alt_mask
+        );
+        assert_eq!(projected.depressed & alt_mask, 0);
+        assert_eq!(projected.depressed & shift_mask, shift_mask);
+
+        state.update_physical_key(42, false);
+        state.update_client_key(42, false);
+        state.update_physical_key(56, false);
+        assert_eq!(state.wayland_serialized_state().depressed, 0);
+    }
+
+    #[test]
+    fn clearing_transient_keys_releases_both_states_without_resetting_locks() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        state.update_physical_key(56, true);
+        state.update_client_key(42, true);
+        state.update_physical_key(58, true);
+        let locked = state.wayland_serialized_state().locked;
+        assert_ne!(locked, 0);
+
+        state.clear_transient_key_state();
+
+        assert_eq!(state.physical_serialized_state().depressed, 0);
+        assert_eq!(state.wayland_serialized_state().depressed, 0);
+        assert_eq!(state.wayland_serialized_state().locked, locked);
     }
 
     #[test]

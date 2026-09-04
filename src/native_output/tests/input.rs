@@ -6,7 +6,7 @@ use crate::native_output::runtime::{
 use oblivion_one::compositor::{InteractionUpdateOutcome, PointerWarpOrigin};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::{
         fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
@@ -37,6 +37,7 @@ use wayland_protocols::xwayland::shell::v1::client::{
     xwayland_shell_v1 as client_xwayland_shell_v1,
     xwayland_surface_v1 as client_xwayland_surface_v1,
 };
+use xkbcommon::xkb;
 
 #[path = "input_shortcut_inhibition.rs"]
 mod input_shortcut_inhibition;
@@ -348,6 +349,70 @@ fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
         AstreaShortcutPhase::Pressed
     );
     assert!(repeated.shortcut_events.is_empty());
+}
+
+#[test]
+fn native_input_repeat_is_not_a_keyboard_state_transition() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let pressed = input.handle_key_event(KEY_Z, 1);
+    let repeated = input.handle_key_event(KEY_Z, 2);
+    let released = input.handle_key_event(KEY_Z, 0);
+
+    assert_eq!(
+        pressed.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_Z, true,)
+        )]
+    );
+    assert!(repeated.keyboard_actions.is_empty());
+    assert!(repeated.keyboard_events.is_empty());
+    assert_eq!(
+        released.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_Z, false,)
+        )]
+    );
+}
+
+#[test]
+fn raw_evdev_repeat_notifications_do_not_create_keyboard_actions() {
+    let mut input = NativeInputState::new(320, 200);
+    let mut action_counts = Vec::new();
+
+    for value in [1, 2, 2, 0] {
+        let event = LinuxInputEvent {
+            _time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: EV_KEY,
+            code: KEY_Z,
+            value,
+        };
+        let event = NativeHardwareInputEvent::from_linux_event(event).unwrap();
+        action_counts.push(
+            input
+                .handle_hardware_input_event(event)
+                .keyboard_actions
+                .len(),
+        );
+    }
+
+    assert_eq!(action_counts, vec![1, 0, 0, 1]);
+}
+
+#[test]
+fn native_input_caps_lock_repeat_does_not_create_an_extra_transition() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let press = input.handle_key_event(58, 1);
+    let repeat = input.handle_key_event(58, 2);
+    let release = input.handle_key_event(58, 0);
+
+    assert_eq!(press.keyboard_actions.len(), 1);
+    assert!(repeat.keyboard_actions.is_empty());
+    assert_eq!(release.keyboard_actions.len(), 1);
 }
 
 #[test]
@@ -701,19 +766,15 @@ fn native_input_deferred_modifier_replay_does_not_double_update_xkb() {
 
     assert_eq!(
         alt_press.keyboard_actions,
-        vec![NativeKeyboardAction::State(NativeKeyboardEvent::new(
-            KEY_LEFTALT,
-            true,
-        ))]
+        vec![NativeKeyboardAction::PhysicalOnly(
+            NativeKeyboardEvent::new(KEY_LEFTALT, true,)
+        )]
     );
     assert_eq!(
         z_press.keyboard_actions,
         vec![
-            NativeKeyboardAction::ClientAfterStateChange(NativeKeyboardEvent::new(
-                KEY_LEFTALT,
-                true,
-            )),
-            NativeKeyboardAction::StateAndClient(NativeKeyboardEvent::new(KEY_Z, true)),
+            NativeKeyboardAction::ClientOnly(NativeKeyboardEvent::new(KEY_LEFTALT, true,)),
+            NativeKeyboardAction::PhysicalAndClient(NativeKeyboardEvent::new(KEY_Z, true)),
         ]
     );
 }
@@ -1698,6 +1759,31 @@ fn native_input_window_interaction_motion_routes_through_compositor_owner() {
     assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
 }
 
+fn apply_native_keyboard_events(
+    server: &mut OwnCompositorServer,
+    input: &mut NativeInputState,
+    events: &[(u16, i32)],
+) {
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    for &(code, value) in events {
+        apply_native_input_effect(
+            input.handle_key_event(code, value),
+            NativeInputApplyContext {
+                server,
+                perf: NativePerfLogger::from_env(),
+                resize_perf: &mut resize_perf,
+                cursor_mode: NativeCursorRenderMode::Software,
+                app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+                seat_session: None,
+                process_supervisor: &mut process_supervisor,
+                xwayland: None,
+            },
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
@@ -1721,40 +1807,31 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
         ClientEvent::ReadyForPointer
     ));
     let mut input = NativeInputState::new(320, 200);
-    let mut process_supervisor = ChildSupervisor::new();
-    let mut resize_perf = NativeResizePerfState::default();
-    for (code, value) in [
-        (KEY_LEFTALT, 1),
-        (KEY_LEFTSHIFT, 1),
-        (KEY_LEFTSHIFT, 0),
-        (KEY_LEFTALT, 0),
-        (KEY_LEFTALT, 1),
-        (KEY_LEFTSHIFT, 1),
-        (KEY_LEFTSHIFT, 0),
-        (KEY_LEFTALT, 0),
-    ] {
-        apply_native_input_effect(
-            input.handle_key_event(code, value),
-            NativeInputApplyContext {
-                server: &mut server,
-                perf: NativePerfLogger::from_env(),
-                resize_perf: &mut resize_perf,
-                cursor_mode: NativeCursorRenderMode::Software,
-                app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
-                seat_session: None,
-                process_supervisor: &mut process_supervisor,
-                xwayland: None,
-            },
-        )
-        .unwrap();
-    }
+    apply_native_keyboard_events(
+        &mut server,
+        &mut input,
+        &[
+            (KEY_LEFTALT, 1),
+            (KEY_LEFTSHIFT, 1),
+            (KEY_LEFTSHIFT, 0),
+            (KEY_LEFTALT, 0),
+            (KEY_LEFTALT, 1),
+            (KEY_LEFTSHIFT, 1),
+            (KEY_LEFTSHIFT, 0),
+            (KEY_LEFTALT, 0),
+        ],
+    );
 
     client_commands
-        .send(ClientCommand::CaptureKeyboard)
+        .send(ClientCommand::CaptureKeyboardState)
         .unwrap();
-    let groups = match pump_native_input_server_until(&mut server, &client_events) {
-        ClientEvent::KeyboardGroups { groups } => groups,
-        event => panic!("expected keyboard groups, got {event:?}"),
+    let keyboard_state = match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::KeyboardState {
+            keymap,
+            keys,
+            modifiers,
+        } => (keymap, keys, modifiers),
+        event => panic!("expected keyboard state, got {event:?}"),
     };
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
@@ -1778,8 +1855,230 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
         }
     }
 
+    let (keymap, keys, modifiers) = keyboard_state;
+    let keymap_text = std::ffi::CStr::from_bytes_with_nul(&keymap)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_text.to_string(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    let alt_mask = 1u32
+        .checked_shl(keymap.mod_get_index(xkb::MOD_NAME_ALT))
+        .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            (u32::from(KEY_LEFTSHIFT), true),
+            (u32::from(KEY_LEFTSHIFT), false),
+            (u32::from(KEY_LEFTSHIFT), true),
+            (u32::from(KEY_LEFTSHIFT), false),
+        ]
+    );
+    assert!(
+        modifiers
+            .iter()
+            .all(|(depressed, _, _, _)| depressed & alt_mask == 0)
+    );
+    let groups = modifiers
+        .iter()
+        .map(|(_, _, _, group)| *group)
+        .collect::<Vec<_>>();
     assert!(groups.windows(2).any(|pair| pair == [0, 1]));
     assert!(groups.windows(2).any(|pair| pair == [1, 0]));
+    assert_eq!(modifiers.last().map(|state| state.0), Some(0));
+}
+
+#[test]
+fn native_input_deferred_alt_projection_does_not_leak_or_stick_alt() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = format!(
+        "typhon-native-input-deferred-alt-projection-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let mut input = NativeInputState::new(320, 200);
+    apply_native_keyboard_events(
+        &mut server,
+        &mut input,
+        &[
+            (KEY_LEFTALT, 1),
+            (KEY_LEFTSHIFT, 1),
+            (KEY_LEFTSHIFT, 0),
+            (KEY_LEFTALT, 0),
+        ],
+    );
+
+    client_commands
+        .send(ClientCommand::CaptureKeyboardState)
+        .unwrap();
+    let (keymap, keys, modifiers) =
+        match pump_native_input_server_until(&mut server, &client_events) {
+            ClientEvent::KeyboardState {
+                keymap,
+                keys,
+                modifiers,
+            } => (keymap, keys, modifiers),
+            event => panic!("expected keyboard state, got {event:?}"),
+        };
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+
+    let keymap_text = std::ffi::CStr::from_bytes_with_nul(&keymap)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_text.to_string(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    let alt_mask = 1u32
+        .checked_shl(keymap.mod_get_index(xkb::MOD_NAME_ALT))
+        .unwrap();
+    let shift_mask = 1u32
+        .checked_shl(keymap.mod_get_index(xkb::MOD_NAME_SHIFT))
+        .unwrap();
+
+    assert_eq!(
+        keys,
+        vec![
+            (u32::from(KEY_LEFTSHIFT), true),
+            (u32::from(KEY_LEFTSHIFT), false),
+        ]
+    );
+    assert!(
+        modifiers
+            .iter()
+            .all(|(depressed, _, _, _)| depressed & alt_mask == 0)
+    );
+    assert!(
+        modifiers
+            .iter()
+            .any(|(depressed, _, _, _)| depressed & shift_mask != 0)
+    );
+    assert_eq!(modifiers.last().map(|state| state.0), Some(0));
+}
+
+#[test]
+fn native_input_consumed_super_space_publishes_xkb_group_without_key_leak() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "grp:win_space_toggle");
+    }
+
+    let socket_name = format!(
+        "typhon-native-input-consumed-group-switch-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let mut input = NativeInputState::new(320, 200);
+    apply_native_keyboard_events(
+        &mut server,
+        &mut input,
+        &[
+            (KEY_LEFTMETA, 1),
+            (KEY_SPACE, 1),
+            (KEY_SPACE, 0),
+            (KEY_LEFTMETA, 0),
+        ],
+    );
+
+    client_commands
+        .send(ClientCommand::CaptureKeyboardState)
+        .unwrap();
+    let (keys, modifiers) = match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::KeyboardState {
+            keys, modifiers, ..
+        } => (keys, modifiers),
+        event => panic!("expected keyboard state, got {event:?}"),
+    };
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+
+    assert!(keys.is_empty());
+    let groups = modifiers
+        .iter()
+        .map(|(_, _, _, group)| *group)
+        .collect::<Vec<_>>();
+    assert!(groups.windows(2).any(|pair| pair == [0, 1]));
+    assert!(modifiers.iter().all(|(depressed, _, _, _)| *depressed == 0));
 }
 
 #[test]
@@ -1967,6 +2266,9 @@ pub(super) struct NativeInputClientState {
     pub(super) pointer_button_press_count: usize,
     pub(super) pointer_button_release_count: usize,
     pub(super) keyboard_groups: Vec<u32>,
+    pub(super) keyboard_keymap: Vec<u8>,
+    pub(super) keyboard_keys: Vec<(u32, bool)>,
+    pub(super) keyboard_modifiers: Vec<(u32, u32, u32, u32)>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
@@ -2027,8 +2329,38 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for NativeInputClientState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let client_wl_keyboard::Event::Modifiers { group, .. } = event {
-            state.keyboard_groups.push(group);
+        match event {
+            client_wl_keyboard::Event::Keymap { fd, size, .. } => {
+                let mut bytes = vec![0; size as usize];
+                fs::File::from(fd).read_exact(&mut bytes).unwrap();
+                state.keyboard_keymap = bytes;
+            }
+            client_wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
+                state.keyboard_keys.push((
+                    key,
+                    matches!(
+                        key_state,
+                        wayland_client::WEnum::Value(client_wl_keyboard::KeyState::Pressed)
+                    ),
+                ));
+            }
+            client_wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                state.keyboard_groups.push(group);
+                state
+                    .keyboard_modifiers
+                    .push((mods_depressed, mods_latched, mods_locked, group));
+            }
+            _ => {}
         }
     }
 }
@@ -2186,6 +2518,9 @@ pub(super) fn spawn_native_input_resize_client(
                         })
                         .unwrap();
                 }
+                ClientCommand::CaptureKeyboardState => {
+                    panic!("keyboard state capture is unsupported")
+                }
                 ClientCommand::Finish => {
                     queue.roundtrip(&mut state).unwrap();
                     events_sender
@@ -2241,6 +2576,16 @@ pub(super) fn spawn_native_input_keyboard_client(
                     events_sender
                         .send(ClientEvent::KeyboardGroups {
                             groups: state.keyboard_groups.clone(),
+                        })
+                        .unwrap();
+                }
+                ClientCommand::CaptureKeyboardState => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::KeyboardState {
+                            keymap: state.keyboard_keymap.clone(),
+                            keys: state.keyboard_keys.clone(),
+                            modifiers: state.keyboard_modifiers.clone(),
                         })
                         .unwrap();
                 }

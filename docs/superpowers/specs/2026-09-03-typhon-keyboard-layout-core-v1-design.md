@@ -1,4 +1,4 @@
-# Typhon Keyboard Layout Core v1
+# Typhon Keyboard Layout Core v1 (v1.2 closure)
 
 ## Goal
 
@@ -10,9 +10,13 @@ codes, client isolation, and client-side repeat behavior.
 ## Architecture
 
 Add `src/compositor/keyboard.rs` containing `KeyboardConfig`,
-`KeyboardSerializedState`, and `XkbKeyboardState`. The state owns the compiled
-`xkbcommon::xkb::Keymap`, its mutable `xkb::State`, the validated RMLVO config,
-cached NUL-terminated XKB Text V1 serialization, and repeat configuration.
+`KeyboardSerializedState`, and `XkbKeyboardState`. The state owns one compiled
+`xkbcommon::xkb::Keymap`, two mutable states over that same keymap, the
+validated RMLVO config, cached NUL-terminated XKB Text V1 serialization, and
+repeat configuration. `physical_state` receives every real hardware
+transition and owns global XKB group, latch, lock, and LED semantics.
+`client_state` receives only transitions in the logical `wl_keyboard.key`
+stream; these are not independent keyboard configurations.
 `Default` constructs the baseline `br`/`abnt2` map without panicking; requested
 environment configuration is attempted first and falls back to the baseline,
 then to `us` if necessary, with diagnostics containing the rejected values.
@@ -22,15 +26,21 @@ The handle lazily creates a unique identity and stores the actual
 `XkbKeyboardState` in compositor-thread TLS. A handle used after crossing to a
 different thread fails closed, and a failed handle never retries. The native
 input path remains responsible for physical binding decisions, but every
-physical key transition produces exactly one XKB state action. Client
+physical key transition produces exactly one physical XKB state action. Client
 forwarding is a separate action: deferred or consumed Alt/Super transitions
-still update XKB, while only the client-visible action publishes
-`wl_keyboard.key`. For a visible transition, the compositor updates XKB first,
-publishes the raw evdev key, and publishes a complete
-`wl_keyboard.modifiers` event afterward when serialized state changed. This
-keeps key-before-modifiers ordering without double-updating XKB. Focus enter
-uses raw client-visible pressed keys and the current XKB serialization; it
-never rebuilds modifier state from the pressed-key set.
+still update `physical_state`, while only the client-visible action updates
+`client_state` and publishes `wl_keyboard.key`. Actions are explicitly
+`PhysicalOnly`, `PhysicalAndClient`, or `ClientOnly`; replayed modifiers are
+client-only and never update the physical state again. The Wayland projection
+is `client_state` depressed modifiers plus `physical_state` latched, locked,
+and effective group state. A visible transition updates the relevant states,
+publishes the raw evdev key, and publishes a complete projected
+`wl_keyboard.modifiers` event afterward when that projection changed. A
+physical-only transition may publish a standalone projected modifiers event
+when global group/lock state changed. This keeps key-before-modifiers ordering
+without double-updating either state. Focus enter uses raw client-visible
+pressed keys and the same projected serialization; it never rebuilds modifier
+state from the physical pressed-key set.
 
 `wl_seat.get_keyboard` sends the shared cached Text V1 keymap and configured
 repeat info (only for protocol versions that support it), then registers the
@@ -54,11 +64,12 @@ include syntax remains.
 
 ## Protocol semantics
 
-Modifier masks come only from `xkb_state_serialize_mods` for depressed,
-latched, and locked components, and the group comes from
-`xkb_state_serialize_layout(STATE_LAYOUT_EFFECTIVE)`. This preserves dynamic
-modifier indices, Caps/Num/Scroll lock actions, AltGr, latching, and multiple
-layout groups. The published keymap is serialized explicitly with
+`mods_depressed` comes from `client_state` via `xkb_state_serialize_mods`.
+`mods_latched`, `mods_locked`, and the effective group come from
+`physical_state` via the corresponding libxkbcommon serialization calls. This
+preserves dynamic modifier indices, Caps/Num/Scroll lock actions, AltGr,
+latching, and multiple layout groups while preventing hidden compositor-owned
+modifiers from leaking into the client projection. The published keymap is serialized explicitly with
 `KEYMAP_FORMAT_TEXT_V1`, remains NUL-terminated, and is sent as
 `wl_keyboard::KeymapFormat::XkbV1`.
 
@@ -80,9 +91,13 @@ Shift/Control/Caps/AltGr behavior, multi-layout group changes through the
 native input pipeline, focus-enter state, v1 repeat gating, repeat
 suppression, client isolation, physical bindings, and shortcut inhibition.
 They also cover seat capability failure, repeat preservation through fallback,
-TLS ownership, permanent failure, and unique state identities. Existing
-XWayland behavior remains covered by the current harness; no second XKB stack
-is introduced.
+TLS ownership, permanent failure, unique state identities, deferred Alt
+projection, consumed Super+Space group publication, client-only replay, and
+raw evdev `value=2` repeat suppression including Caps Lock. Session suspend
+clears transient physical and client key state while retaining global lock and
+layout state. Existing XWayland behavior remains covered by the current
+harness; no second keymap or independently configured XKB stack is
+introduced.
 
 ## Non-goals
 
