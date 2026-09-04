@@ -25,8 +25,7 @@ use wayland_client::{
     protocol::{
         wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
         wl_keyboard as client_wl_keyboard, wl_pointer as client_wl_pointer, wl_registry,
-        wl_seat as client_wl_seat,
-        wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
+        wl_seat as client_wl_seat, wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
         wl_surface as client_wl_surface,
     },
 };
@@ -1683,17 +1682,11 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
     let socket_path =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
-    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
     assert!(matches!(
         pump_native_input_server_until(&mut server, &client_events),
         ClientEvent::ReadyForPointer
     ));
-    client_commands.send(ClientCommand::SetCursor).unwrap();
-    assert!(matches!(
-        pump_native_input_server_until(&mut server, &client_events),
-        ClientEvent::CursorReady { .. }
-    ));
-
     let mut input = NativeInputState::new(320, 200);
     let mut process_supervisor = ChildSupervisor::new();
     let mut resize_perf = NativeResizePerfState::default();
@@ -1723,7 +1716,9 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
         .unwrap();
     }
 
-    client_commands.send(ClientCommand::CaptureKeyboard).unwrap();
+    client_commands
+        .send(ClientCommand::CaptureKeyboard)
+        .unwrap();
     let groups = match pump_native_input_server_until(&mut server, &client_events) {
         ClientEvent::KeyboardGroups { groups } => groups,
         event => panic!("expected keyboard groups, got {event:?}"),
@@ -2092,7 +2087,6 @@ pub(super) fn spawn_native_input_resize_client(
         let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
         let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
-        let _keyboard = seat.get_keyboard(&qh, ());
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
         let pointer = seat.get_pointer(&qh, ());
         let surface = compositor.create_surface(&qh, ());
@@ -2173,6 +2167,69 @@ pub(super) fn spawn_native_input_resize_client(
                     break;
                 }
                 ClientCommand::SetCursor => panic!("cursor was already set"),
+            }
+        }
+    });
+    (commands_sender, events_receiver)
+}
+
+pub(super) fn spawn_native_input_keyboard_client(
+    socket_path: PathBuf,
+) -> (mpsc::Sender<ClientCommand>, mpsc::Receiver<ClientEvent>) {
+    let (commands_sender, commands_receiver) = mpsc::channel();
+    let (events_sender, events_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let stream = UnixStream::connect(socket_path).unwrap();
+        let connection = Connection::from_socket(stream).unwrap();
+        let (globals, mut queue) =
+            registry_queue_init::<NativeInputClientState>(&connection).unwrap();
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+        let _keyboard = seat.get_keyboard(&qh, ());
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        let mut state = NativeInputClientState::default();
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        attach_native_input_test_buffer(&surface, &shm, &qh, 160, 120);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        events_sender.send(ClientEvent::ReadyForPointer).unwrap();
+        loop {
+            match commands_receiver.recv().unwrap() {
+                ClientCommand::CaptureKeyboard => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::KeyboardGroups {
+                            groups: state.keyboard_groups.clone(),
+                        })
+                        .unwrap();
+                }
+                ClientCommand::Finish => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::Finished {
+                            pointer_motion_count: 0,
+                            pointer_surface_x: None,
+                            pointer_surface_y: None,
+                            pointer_enter_count: 0,
+                            pointer_leave_count: 0,
+                        })
+                        .unwrap();
+                    break;
+                }
+                ClientCommand::SetCursor
+                | ClientCommand::CaptureActive
+                | ClientCommand::BeginXdgMove
+                | ClientCommand::CaptureButtons => {
+                    panic!("unexpected keyboard test client command")
+                }
             }
         }
     });

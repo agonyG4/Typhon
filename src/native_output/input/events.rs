@@ -394,12 +394,10 @@ impl NativeInputEffect {
         }
     }
 
-    pub(crate) fn record_keyboard_state_event(
-        &mut self,
-        event: NativeKeyboardEvent,
-    ) -> usize {
+    pub(crate) fn record_keyboard_state_event(&mut self, event: NativeKeyboardEvent) -> usize {
         let index = self.keyboard_actions.len();
-        self.keyboard_actions.push(NativeKeyboardAction::State(event));
+        self.keyboard_actions
+            .push(NativeKeyboardAction::State(event));
         index
     }
 

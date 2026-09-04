@@ -172,9 +172,8 @@ impl NativeInputState {
         let pressed = value != 0;
         let repeated = value == 2;
         let mut effect = NativeInputEffect::default();
-        let current_state_action = effect.record_keyboard_state_event(
-            NativeKeyboardEvent::new(code, pressed),
-        );
+        let current_state_action =
+            effect.record_keyboard_state_event(NativeKeyboardEvent::new(code, pressed));
 
         if !pressed && self.release_suppressed_vt_switch_key(code) {
             return effect;
@@ -213,11 +212,7 @@ impl NativeInputState {
                 return effect;
             }
             if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed && !repeated {
-                self.forward_deferred_modifier_key(
-                    code,
-                    &mut effect,
-                    Some(current_state_action),
-                );
+                self.forward_deferred_modifier_key(code, &mut effect, Some(current_state_action));
             }
             return effect;
         }
@@ -239,11 +234,7 @@ impl NativeInputState {
                 self.apply_binding_action(action, phase, None, &mut effect);
             }
             if !reconciled_release && self.keyboard_shortcuts_inhibited && pressed && !repeated {
-                self.forward_deferred_modifier_key(
-                    code,
-                    &mut effect,
-                    Some(current_state_action),
-                );
+                self.forward_deferred_modifier_key(code, &mut effect, Some(current_state_action));
             }
             return effect;
         }
@@ -508,10 +499,7 @@ impl NativeInputState {
             return;
         }
         self.forwarded_deferred_modifier_keys.push(code);
-        effect.forward_keyboard_event(
-            NativeKeyboardEvent::new(code, true),
-            current_state_action,
-        );
+        effect.forward_keyboard_event(NativeKeyboardEvent::new(code, true), current_state_action);
         effect.request_redraw();
     }
 
@@ -526,10 +514,8 @@ impl NativeInputState {
             if !self.forwarded_client_keys.contains(&code) {
                 self.forwarded_client_keys.push(code);
             }
-            effect.forward_keyboard_event(
-                NativeKeyboardEvent::new(code, true),
-                current_state_action,
-            );
+            effect
+                .forward_keyboard_event(NativeKeyboardEvent::new(code, true), current_state_action);
             effect.request_redraw();
             return;
         }
@@ -541,10 +527,7 @@ impl NativeInputState {
             return;
         };
         self.forwarded_client_keys.swap_remove(index);
-        effect.forward_keyboard_event(
-            NativeKeyboardEvent::new(code, false),
-            current_state_action,
-        );
+        effect.forward_keyboard_event(NativeKeyboardEvent::new(code, false), current_state_action);
         effect.request_redraw();
     }
 
