@@ -117,6 +117,14 @@ rtk cargo test: 2066 passed, 1 failed, 2 ignored
 isolated rerun: 1 passed
 ```
 
+The final post-report verification repeated the same pattern:
+
+```text
+rtk cargo test: 2065 passed, 1 failed, 2 ignored
+  failed once: native::kms::tests::explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure
+isolated rerun: 1 passed
+```
+
 The full suite therefore has not produced a clean single-run result in this
 environment; the failures were outside the touched files and did not recur in
 isolated reruns. The release build passed:
