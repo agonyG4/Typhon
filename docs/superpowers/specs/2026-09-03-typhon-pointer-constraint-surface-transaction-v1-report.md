@@ -602,8 +602,8 @@ The relevant absolute-position mutation sites were traced as follows:
   never synthesizes relative motion for a compositor warp.
 - native cursor processing remains in the existing pointer input state and
   cursor-restore paths; no new input thread, scheduler, timer, readiness probe,
-  motion filter, clamp, or acceleration path was introduced. No Rust production
-  `XWarpPointer`/`warp_pointer` path was found in the reviewed pointer-input
+  motion filter, clamp, or acceleration path was introduced. No XWayland/X11
+  production `XWarpPointer` path was found in the reviewed pointer-input
   surface.
 
 Locked-pointer activation anchors and cursor-restoration targets are separate ownership domains.
