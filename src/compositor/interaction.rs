@@ -43,6 +43,7 @@ pub(super) struct WindowFrameHit {
     pub(super) window_id: WindowId,
     pub(super) root_surface_id: u32,
     pub(super) kind: WindowInteractionKind,
+    pub(super) decoration_owned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +277,7 @@ pub(super) struct WindowInteraction {
     pub(super) drag_committed: bool,
     pub(super) resize_interaction_id: Option<ResizeInteractionId>,
     pub(super) tiled_resize: bool,
+    pub(super) decoration_owned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -292,6 +294,7 @@ pub struct WindowInteractionDebugSnapshot {
     pub drag_committed: bool,
     pub start_pointer_x: f64,
     pub start_pointer_y: f64,
+    pub decoration_owned: bool,
 }
 
 impl WindowInteraction {
@@ -312,6 +315,7 @@ impl WindowInteraction {
             drag_committed: self.drag_committed,
             start_pointer_x: self.start_pointer_x,
             start_pointer_y: self.start_pointer_y,
+            decoration_owned: self.decoration_owned,
         }
     }
 }
@@ -961,6 +965,7 @@ mod tests {
             drag_committed: true,
             resize_interaction_id: Some(ResizeInteractionId::new(1)),
             tiled_resize: false,
+            decoration_owned: false,
         }
     }
 

@@ -206,6 +206,7 @@ fn x11_decoration_transition_clears_stale_native_interaction_state() {
         drag_committed: false,
         resize_interaction_id: None,
         tiled_resize: false,
+        decoration_owned: true,
     });
     assert!(state.window_interaction_debug_snapshot().is_some());
 
@@ -220,6 +221,40 @@ fn x11_decoration_transition_clears_stale_native_interaction_state() {
     assert!(state.decoration_titlebar_click_capture.is_none());
     assert!(state.decoration_last_titlebar_click.is_none());
     assert!(state.window_interaction_debug_snapshot().is_none());
+}
+
+#[test]
+fn x11_decoration_transition_preserves_native_client_content_interaction() {
+    let mut state = x11_state(test_surface(52));
+    let handle = x11_test_handle();
+    let window_id = state.window_id_for_x11_handle(handle).expect("X11 window");
+    state.window_interaction = Some(WindowInteraction {
+        id: WindowInteractionId::new(2),
+        window_id,
+        root_surface_id: 52,
+        kind: WindowInteractionKind::Move,
+        source: WindowInteractionSource::NativeBinding,
+        trigger_button: Some(0x110),
+        trigger_serial: None,
+        pointer_motion_surface_id: Some(52),
+        start_pointer_x: 10.0,
+        start_pointer_y: 10.0,
+        start_placement: SurfacePlacement::root(),
+        start_width: 300,
+        start_height: 200,
+        drag_committed: false,
+        resize_interaction_id: None,
+        tiled_resize: false,
+        decoration_owned: false,
+    });
+
+    state.reconcile_x11_decoration_transition(
+        handle,
+        DecorationMode::ServerSide,
+        DecorationMode::ClientSide,
+    );
+
+    assert!(state.window_interaction_debug_snapshot().is_some());
 }
 
 #[test]

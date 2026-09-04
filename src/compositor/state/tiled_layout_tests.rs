@@ -419,6 +419,7 @@ fn active_tiled_resize_migration_commits_inside_one_outer_layout_batch() {
         drag_committed: true,
         resize_interaction_id: Some(ResizeInteractionId::new(900)),
         tiled_resize: true,
+        decoration_owned: false,
     });
     state.install_tiled_resize_session(
         interaction_id,

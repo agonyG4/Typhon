@@ -151,21 +151,23 @@ impl OwnCompositorServer {
                             deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                             final_pending: false,
                         })
-                    } else {
+                    } else if position_only {
                         Some(XwmCommand::Configure {
                             window: handle,
                             geometry: x11_geometry,
-                            fields: if position_only {
-                                crate::xwayland::xwm::X11ConfigureFlags {
-                                    x: true,
-                                    y: true,
-                                    ..Default::default()
-                                }
-                            } else {
-                                crate::xwayland::xwm::X11ConfigureFlags::all()
+                            fields: crate::xwayland::xwm::X11ConfigureFlags {
+                                x: true,
+                                y: true,
+                                ..Default::default()
                             },
                             source: ConfigureSource::Compositor,
                             border_width: 0,
+                        })
+                    } else {
+                        Some(XwmCommand::ConfigureFrame {
+                            window: handle,
+                            geometry: x11_geometry,
+                            frame_extents: self.state.x11_decoration_frame_extents(handle),
                         })
                     }
                 }

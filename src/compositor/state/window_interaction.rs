@@ -15,6 +15,7 @@ pub(in crate::compositor) struct BeginWindowInteraction {
     pub(super) trigger_button: Option<u32>,
     pub(super) trigger_serial: Option<u32>,
     pub(super) pointer_motion_surface_id: Option<u32>,
+    pub(super) decoration_owned: bool,
 }
 
 #[cfg(test)]
@@ -38,6 +39,7 @@ impl BeginWindowInteraction {
             trigger_button: None,
             trigger_serial: None,
             pointer_motion_surface_id,
+            decoration_owned: false,
         }
     }
 }
@@ -69,6 +71,7 @@ impl CompositorState {
                 trigger_button: (trigger_button != 0).then_some(trigger_button),
                 trigger_serial: None,
                 pointer_motion_surface_id: None,
+                decoration_owned: true,
             }),
             PointerSceneHit::Client { .. } => self.begin_window_interaction_from_scene_hit(
                 x,
@@ -109,6 +112,7 @@ impl CompositorState {
                 trigger_button: (trigger_button != 0).then_some(trigger_button),
                 trigger_serial: None,
                 pointer_motion_surface_id: None,
+                decoration_owned: true,
             }),
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
@@ -131,6 +135,7 @@ impl CompositorState {
                     trigger_button: (trigger_button != 0).then_some(trigger_button),
                     trigger_serial: None,
                     pointer_motion_surface_id: Some(surface_id),
+                    decoration_owned: false,
                 })
             }
             PointerSceneHit::Decoration { .. } | PointerSceneHit::None => {
@@ -169,6 +174,7 @@ impl CompositorState {
             trigger_button: None,
             trigger_serial: None,
             pointer_motion_surface_id: None,
+            decoration_owned: hit.decoration_owned,
         })
     }
 
@@ -231,6 +237,7 @@ impl CompositorState {
             trigger_button,
             trigger_serial,
             pointer_motion_surface_id: Some(surface_id),
+            decoration_owned: false,
         })
     }
 
@@ -262,6 +269,7 @@ impl CompositorState {
             trigger_button: Some(press.button),
             trigger_serial: Some(press.serial),
             pointer_motion_surface_id: Some(compositor_surface_id(&press.surface)),
+            decoration_owned: false,
         })
     }
 
@@ -294,6 +302,7 @@ impl CompositorState {
             trigger_button: Some(press.button),
             trigger_serial: Some(press.serial),
             pointer_motion_surface_id: Some(compositor_surface_id(&press.surface)),
+            decoration_owned: false,
         })
     }
 
@@ -390,6 +399,7 @@ impl CompositorState {
             trigger_button: Some(trigger_button),
             trigger_serial: Some(trigger_serial),
             pointer_motion_surface_id: Some(pointer_motion_surface_id),
+            decoration_owned: false,
         });
         self.log_x11_move_resize_result(
             handle,
@@ -497,6 +507,7 @@ impl CompositorState {
             trigger_button,
             trigger_serial,
             pointer_motion_surface_id,
+            decoration_owned,
         } = begin;
         let Some(root_surface) = self
             .renderable_surfaces
@@ -659,6 +670,7 @@ impl CompositorState {
             drag_committed: false,
             resize_interaction_id,
             tiled_resize,
+            decoration_owned,
         });
         if let Some(preparation) = tiled_resize_data.as_ref() {
             self.install_tiled_resize_session(
@@ -873,6 +885,7 @@ impl CompositorState {
                 window_id,
                 root_surface_id,
                 kind,
+                decoration_owned: true,
             });
         }
         if let Some(hit) = self.root_surface_hit_at(x, y) {
@@ -892,6 +905,7 @@ impl CompositorState {
                 window_id: hit.window_id,
                 root_surface_id: hit.root_surface_id,
                 kind,
+                decoration_owned: false,
             });
         }
 

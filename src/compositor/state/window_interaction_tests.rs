@@ -209,6 +209,7 @@ fn test_window_interaction_with_target(
         resize_interaction_id: matches!(kind, WindowInteractionKind::Resize(_))
             .then_some(ResizeInteractionId::new(id)),
         tiled_resize: false,
+        decoration_owned: false,
     }
 }
 
@@ -228,6 +229,7 @@ fn test_begin_window_interaction(
         trigger_button: None,
         trigger_serial: None,
         pointer_motion_surface_id,
+        decoration_owned: false,
     }
 }
 

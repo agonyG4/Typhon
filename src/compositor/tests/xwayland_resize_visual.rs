@@ -541,7 +541,11 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
     let fullscreen = fixture.server.state.fullscreen_window_geometry();
     assert!(backend_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::Configure { window, geometry, fields, .. }
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        }
             if *window == handle
                 && *geometry == crate::xwayland::xwm::X11Geometry {
                     x: fullscreen.placement.local_x,
@@ -549,7 +553,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
                     width: fullscreen.width,
                     height: fullscreen.height,
                 }
-                && *fields == crate::xwayland::xwm::X11ConfigureFlags::all()
+                && *frame_extents == [0; 4]
     )));
     assert!(backend_commands.iter().any(|command| matches!(
         command,
@@ -608,7 +612,11 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
     let restore_commands = fixture.server.take_xwayland_backend_commands(0);
     assert!(restore_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::Configure { window, geometry, .. }
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        }
             if *window == handle
                 && *geometry == crate::xwayland::xwm::X11Geometry {
                     x: floating.placement.local_x,
@@ -616,6 +624,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
                     width: floating.width,
                     height: floating.height,
                 }
+                && *frame_extents == [0, 0, 26, 0]
     )));
     assert_eq!(
         fixture
@@ -652,7 +661,11 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
     let fullscreen = fixture.server.state.fullscreen_window_geometry();
     assert!(enter_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::Configure { window, geometry, fields, .. }
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        }
             if *window == handle
                 && *geometry == X11Geometry {
                     x: fullscreen.placement.local_x,
@@ -660,7 +673,7 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
                     width: fullscreen.width,
                     height: fullscreen.height,
                 }
-                && *fields == X11ConfigureFlags::all()
+                && *frame_extents == [0; 4]
     )));
     assert!(enter_commands.iter().any(|command| matches!(
         command,
@@ -679,7 +692,11 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
     let exit_commands = fixture.server.take_xwayland_backend_commands(0);
     assert!(exit_commands.iter().any(|command| matches!(
         command,
-        XwmCommand::Configure { window, geometry, fields, .. }
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            frame_extents,
+        }
             if *window == handle
                 && *geometry == X11Geometry {
                     x: floating.placement.local_x,
@@ -687,7 +704,7 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
                     width: floating.width,
                     height: floating.height,
                 }
-                && *fields == X11ConfigureFlags::all()
+                && *frame_extents == [0, 0, 26, 0]
     )));
     assert!(exit_commands.iter().any(|command| matches!(
         command,

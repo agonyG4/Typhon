@@ -131,6 +131,7 @@ impl super::super::CompositorState {
                 .is_some_and(|interaction| {
                     interaction.root_surface_id == root_surface_id
                         && interaction.source == WindowInteractionSource::NativeBinding
+                        && interaction.decoration_owned
                         && matches!(
                             interaction.kind,
                             WindowInteractionKind::Move | WindowInteractionKind::Resize(_)
@@ -377,6 +378,7 @@ impl super::super::CompositorState {
                     trigger_button: Some(button),
                     trigger_serial: None,
                     pointer_motion_surface_id: None,
+                    decoration_owned: true,
                 });
                 return true;
             }
@@ -408,6 +410,7 @@ impl super::super::CompositorState {
                         trigger_button: Some(button),
                         trigger_serial: None,
                         pointer_motion_surface_id: None,
+                        decoration_owned: true,
                     });
                     true
                 }

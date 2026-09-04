@@ -587,12 +587,14 @@ impl CompositorState {
             }
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
-        let active_workspace = self.workspace_manager.active_workspace();
-        if let Some(window) = self.window_mut(window_id) {
-            window.refresh_workspace_membership(active_workspace);
+        if structure_dirty {
+            let active_workspace = self.workspace_manager.active_workspace();
+            if let Some(window) = self.window_mut(window_id) {
+                window.refresh_workspace_membership(active_workspace);
+            }
+            self.rebuild_x11_transient_relationships();
+            self.reconcile_workspace_inheritance();
         }
-        self.rebuild_x11_transient_relationships();
-        self.reconcile_workspace_inheritance();
         let new_scene_visibility = self
             .window(window_id)
             .is_some_and(|window| self.surface_is_visible_in_active_scene(window.root_surface_id));
