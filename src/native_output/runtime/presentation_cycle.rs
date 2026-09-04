@@ -1332,14 +1332,6 @@ impl NativeRuntime {
                                     debug_assert!(render_ahead && waits_for_target);
                                     server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                     frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
-                                    match failure {
-                                        DeferredO1BindingFailure::IdentityMismatch => {
-                                            frame_pacing.note_predictive_unbound_abandoned_identity();
-                                        }
-                                        DeferredO1BindingFailure::GenerationMismatch => {
-                                            frame_pacing.note_predictive_unbound_abandoned_generation();
-                                        }
-                                    }
                                     let owner = explicit.swapchain()?.ready_identity().ok_or_else(
                                         || {
                                             io::Error::other(
@@ -1347,6 +1339,18 @@ impl NativeRuntime {
                                             )
                                         },
                                     )?;
+                                    match failure {
+                                        DeferredO1BindingFailure::IdentityMismatch => {
+                                            frame_pacing.note_predictive_unbound_abandoned_identity(
+                                                Some(owner.frame_id),
+                                            );
+                                        }
+                                        DeferredO1BindingFailure::GenerationMismatch => {
+                                            frame_pacing.note_predictive_unbound_abandoned_generation(
+                                                Some(owner.frame_id),
+                                            );
+                                        }
+                                    }
                                     super::cycle::abandon_overtaken_ready(
                                         explicit,
                                         owner,

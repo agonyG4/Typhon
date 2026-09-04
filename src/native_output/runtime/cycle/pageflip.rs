@@ -218,7 +218,8 @@ fn abandon_overtaken_worker_queued(
     ) {
         KmsWorkerQueuedCancellation::Cancelled(job) => {
             if job.ready_submit {
-                frame_pacing.note_predictive_ready_overtaken_worker_queued();
+                frame_pacing
+                    .note_predictive_ready_overtaken_worker_queued(Some(owner.frame.frame_id));
             }
             drop_queued_worker_job_with_reason_parts(
                 *job,
@@ -1040,20 +1041,24 @@ impl NativeRuntime {
                             );
                         }
                         DeferredO1BindingResult::Stale(failure) => {
-                            match failure {
-                                DeferredO1BindingFailure::IdentityMismatch => {
-                                    frame_pacing.note_predictive_unbound_abandoned_identity();
-                                }
-                                DeferredO1BindingFailure::GenerationMismatch => {
-                                    frame_pacing.note_predictive_unbound_abandoned_generation();
-                                }
-                            }
                             let owner =
                                 explicit.swapchain()?.ready_identity().ok_or_else(|| {
                                     io::Error::other(
                                         "stale deferred O1 binding has no ready frame to abandon",
                                     )
                                 })?;
+                            match failure {
+                                DeferredO1BindingFailure::IdentityMismatch => {
+                                    frame_pacing.note_predictive_unbound_abandoned_identity(Some(
+                                        owner.frame_id,
+                                    ));
+                                }
+                                DeferredO1BindingFailure::GenerationMismatch => {
+                                    frame_pacing.note_predictive_unbound_abandoned_generation(
+                                        Some(owner.frame_id),
+                                    );
+                                }
+                            }
                             abandon_overtaken_ready(
                                 explicit,
                                 owner,

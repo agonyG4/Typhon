@@ -153,12 +153,14 @@ mod tests {
         pacing.queue_visual(3, 2);
         pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
         pacing.note_ready_frame(4, true);
-        pacing.note_predictive_ready_overtaken_worker_queued();
+        let worker_overtaken = pacing.ready.expect("worker-overtaken ready frame").get();
+        pacing.note_predictive_ready_overtaken_worker_queued(Some(worker_overtaken));
 
         pacing.queue_visual(5, 3);
         pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
         pacing.note_ready_frame(6, true);
-        pacing.note_predictive_ready_other_safe_abandonment();
+        let safely_abandoned = pacing.ready.expect("safely abandoned ready frame").get();
+        pacing.note_predictive_ready_other_safe_abandonment(Some(safely_abandoned));
 
         pacing.queue_visual(7, 4);
         pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
@@ -448,6 +450,51 @@ mod tests {
     }
 
     #[test]
+    fn reactive_ready_wait_then_submit_counts_one_wait() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::ReactiveDouble, false);
+        pacing.note_ready_frame(2, true);
+        pacing.note_submit(41, 3, true, NativeOutputPacingMode::ReactiveDouble);
+
+        assert_eq!(pacing.normal_ready_wait_count, 1);
+    }
+
+    #[test]
+    fn repeated_submit_observation_does_not_recount_ready_wait() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::ReactiveDouble, false);
+        pacing.note_ready_frame(2, true);
+        pacing.note_submit(41, 3, true, NativeOutputPacingMode::ReactiveDouble);
+        pacing.note_submit(42, 4, true, NativeOutputPacingMode::ReactiveDouble);
+
+        assert_eq!(pacing.normal_ready_wait_count, 1);
+    }
+
+    #[test]
+    fn multiple_normal_ready_waits_count_each_frame_once() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        for sequence in 1..=3 {
+            pacing.queue_visual(sequence * 10, sequence);
+            pacing.note_render_started(NativeOutputPacingMode::ReactiveDouble, false);
+            pacing.note_ready_frame(sequence * 10 + 1, true);
+            pacing.note_submit(
+                sequence * 10 + 2,
+                sequence * 10 + 2,
+                true,
+                NativeOutputPacingMode::ReactiveDouble,
+            );
+        }
+
+        assert_eq!(pacing.normal_ready_wait_count, 3);
+    }
+
+    #[test]
     fn predictive_and_normal_ready_waits_reconcile_independently() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -548,6 +595,101 @@ mod tests {
     }
 
     #[test]
+    fn ready_terminal_does_not_choose_older_worker_entry() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(2, true);
+        let older_worker = pacing
+            .reserve_worker_submission(true)
+            .unwrap()
+            .expect("older worker reservation");
+
+        pacing.queue_visual(3, 2);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(4, true);
+        let newer_ready = pacing.ready.expect("newer ready frame").get();
+
+        pacing.note_predictive_ready_other_safe_abandonment(Some(newer_ready));
+
+        assert_eq!(pacing.predictive_o1_other_safe_abandonment, 1);
+        assert!(
+            pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(older_worker))
+        );
+        assert!(
+            !pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(newer_ready))
+        );
+    }
+
+    #[test]
+    fn worker_terminal_does_not_choose_newer_ready_entry() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(2, true);
+        let older_worker = pacing
+            .reserve_worker_submission(true)
+            .unwrap()
+            .expect("older worker reservation");
+
+        pacing.queue_visual(3, 2);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(4, true);
+        let newer_ready = pacing.ready.expect("newer ready frame").get();
+
+        pacing.note_predictive_ready_overtaken_worker_queued(Some(older_worker));
+
+        assert_eq!(pacing.predictive_o1_other_safe_abandonment, 1);
+        assert!(
+            !pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(older_worker))
+        );
+        assert!(
+            pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(newer_ready))
+        );
+    }
+
+    #[test]
+    fn unknown_predictive_terminal_id_does_not_mutate_live_entry() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+        pacing.note_ready_frame(2, true);
+        let live = pacing.ready.expect("live ready frame").get();
+
+        pacing.note_predictive_ready_other_safe_abandonment(Some(live.saturating_add(999)));
+
+        assert_eq!(pacing.predictive_o1_other_safe_abandonment, 0);
+        assert!(
+            pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(live))
+        );
+
+        pacing.note_predictive_ready_other_safe_abandonment(Some(live));
+
+        assert_eq!(pacing.predictive_o1_other_safe_abandonment, 1);
+        assert!(
+            !pacing
+                .predictive_o1_lifecycle
+                .contains(NativeOutputFrameId(live))
+        );
+    }
+
+    #[test]
     fn newer_predictive_ready_can_terminalize_before_older_pageflip() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -611,7 +753,8 @@ mod tests {
         pacing.queue_visual(1, 1);
         pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
         pacing.note_ready_frame(2, true);
-        pacing.note_predictive_unbound_abandoned_generation();
+        let frame_id = pacing.ready.map(NativeOutputFrameId::get);
+        pacing.note_predictive_unbound_abandoned_generation(frame_id);
 
         assert_eq!(pacing.predictive_unbound_abandoned_generation, 1);
         assert!(
@@ -628,7 +771,8 @@ mod tests {
         pacing.queue_visual(1, 1);
         pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
         pacing.note_ready_frame(2, true);
-        pacing.note_predictive_unbound_abandoned_identity();
+        let frame_id = pacing.ready.map(NativeOutputFrameId::get);
+        pacing.note_predictive_unbound_abandoned_identity(frame_id);
 
         assert_eq!(pacing.predictive_unbound_abandoned_identity, 1);
         assert!(
@@ -1686,6 +1830,8 @@ const fn stage_transition_is_valid(from: PredictiveO1Stage, to: PredictiveO1Stag
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictiveReadyTerminal {
     Presented,
+    AbandonedIdentity,
+    AbandonedGeneration,
     OvertakenReady,
     OvertakenWorkerQueued,
     OtherSafeAbandonment,
@@ -2220,8 +2366,6 @@ impl NativeFramePacing {
                     self.predictive_ready_submitted =
                         self.predictive_ready_submitted.saturating_add(1);
                 }
-            } else if pacing_mode == NativeOutputPacingMode::ReactiveDouble {
-                self.normal_ready_wait_count += 1;
             }
             if self.ready_waiting_frame_id == id {
                 if let Some(started_at) = self.ready_waiting_started_ns.take() {
@@ -2302,13 +2446,6 @@ impl NativeFramePacing {
         }
     }
 
-    fn predictive_terminal_identity(&self) -> Option<NativeOutputFrameId> {
-        self.worker_reservation
-            .map(|reservation| reservation.frame_id)
-            .or(self.ready)
-            .or(self.active)
-    }
-
     fn terminalize_predictive_frame(
         &mut self,
         frame_id: NativeOutputFrameId,
@@ -2320,6 +2457,19 @@ impl NativeFramePacing {
         match terminal {
             PredictiveReadyTerminal::Presented => {
                 // Presented is counted at the physical pageflip stage.
+            }
+            PredictiveReadyTerminal::AbandonedIdentity => {
+                self.predictive_unbound_abandoned_identity =
+                    self.predictive_unbound_abandoned_identity.saturating_add(1);
+                self.predictive_o1_abandoned_identity =
+                    self.predictive_o1_abandoned_identity.saturating_add(1);
+            }
+            PredictiveReadyTerminal::AbandonedGeneration => {
+                self.predictive_unbound_abandoned_generation = self
+                    .predictive_unbound_abandoned_generation
+                    .saturating_add(1);
+                self.predictive_o1_abandoned_generation =
+                    self.predictive_o1_abandoned_generation.saturating_add(1);
             }
             PredictiveReadyTerminal::OvertakenReady => {
                 self.predictive_ready_overtaken_ready =
@@ -2354,6 +2504,8 @@ impl NativeFramePacing {
                     "terminal",
                     match terminal {
                         PredictiveReadyTerminal::Presented => "presented",
+                        PredictiveReadyTerminal::AbandonedIdentity => "abandoned_identity",
+                        PredictiveReadyTerminal::AbandonedGeneration => "abandoned_generation",
                         PredictiveReadyTerminal::OvertakenReady => "overtaken_ready",
                         PredictiveReadyTerminal::OvertakenWorkerQueued => "overtaken_worker_queued",
                         PredictiveReadyTerminal::OtherSafeAbandonment => "other_safe_abandonment",
@@ -2365,22 +2517,32 @@ impl NativeFramePacing {
         true
     }
 
-    fn note_predictive_ready_terminal(&mut self, terminal: PredictiveReadyTerminal) {
-        let Some(frame_id) = self.predictive_terminal_identity() else {
-            return;
+    fn note_predictive_terminal_exact(
+        &mut self,
+        frame_id: Option<u64>,
+        terminal: PredictiveReadyTerminal,
+    ) -> bool {
+        let Some(frame_id) = frame_id else {
+            return false;
         };
-        self.terminalize_predictive_frame(frame_id, terminal);
+        self.terminalize_predictive_frame(NativeOutputFrameId(frame_id), terminal)
     }
 
-    pub(crate) fn note_predictive_ready_overtaken_worker_queued(&mut self) {
+    pub(crate) fn note_predictive_ready_overtaken_worker_queued(&mut self, frame_id: Option<u64>) {
         if self.enabled {
-            self.note_predictive_ready_terminal(PredictiveReadyTerminal::OvertakenWorkerQueued);
+            self.note_predictive_terminal_exact(
+                frame_id,
+                PredictiveReadyTerminal::OvertakenWorkerQueued,
+            );
         }
     }
 
-    pub(crate) fn note_predictive_ready_other_safe_abandonment(&mut self) {
+    pub(crate) fn note_predictive_ready_other_safe_abandonment(&mut self, frame_id: Option<u64>) {
         if self.enabled {
-            self.note_predictive_ready_terminal(PredictiveReadyTerminal::OtherSafeAbandonment);
+            self.note_predictive_terminal_exact(
+                frame_id,
+                PredictiveReadyTerminal::OtherSafeAbandonment,
+            );
         }
     }
 
@@ -2623,30 +2785,21 @@ impl NativeFramePacing {
         }
     }
 
-    pub(crate) fn note_predictive_unbound_abandoned_identity(&mut self) {
+    pub(crate) fn note_predictive_unbound_abandoned_identity(&mut self, frame_id: Option<u64>) {
         if self.enabled {
-            self.predictive_unbound_abandoned_identity =
-                self.predictive_unbound_abandoned_identity.saturating_add(1);
-            if let Some(frame_id) = self.ready
-                && self.predictive_o1_lifecycle.remove(frame_id)
-            {
-                self.predictive_o1_abandoned_identity =
-                    self.predictive_o1_abandoned_identity.saturating_add(1);
-            }
+            self.note_predictive_terminal_exact(
+                frame_id,
+                PredictiveReadyTerminal::AbandonedIdentity,
+            );
         }
     }
 
-    pub(crate) fn note_predictive_unbound_abandoned_generation(&mut self) {
+    pub(crate) fn note_predictive_unbound_abandoned_generation(&mut self, frame_id: Option<u64>) {
         if self.enabled {
-            self.predictive_unbound_abandoned_generation = self
-                .predictive_unbound_abandoned_generation
-                .saturating_add(1);
-            if let Some(frame_id) = self.ready
-                && self.predictive_o1_lifecycle.remove(frame_id)
-            {
-                self.predictive_o1_abandoned_generation =
-                    self.predictive_o1_abandoned_generation.saturating_add(1);
-            }
+            self.note_predictive_terminal_exact(
+                frame_id,
+                PredictiveReadyTerminal::AbandonedGeneration,
+            );
         }
     }
 
