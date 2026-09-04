@@ -972,7 +972,9 @@ impl NativeRuntime {
                 );
                 *queued_redraw_requested = false;
             } else {
-                frame_pacing.note_render_started(pacing_mode, render_ahead);
+                frame_pacing
+                    .note_render_started(pacing_mode, render_ahead)
+                    .map_err(io::Error::other)?;
                 let render_observed_at_ns = monotonic_now_ns()?;
                 let render_begin_fields = build_render_begin_fields(
                     frame_pacing.active,
@@ -1140,9 +1142,6 @@ impl NativeRuntime {
                             > 0)
                         .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
                         .transpose()?;
-                        if render_ahead {
-                            frame_pacing.note_predictive_unbound_created();
-                        }
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -1171,13 +1170,16 @@ impl NativeRuntime {
                             frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
                             release_safety,
                             dmabuf_gpu_release_lease_id,
-                        )?;
+                        ).inspect_err(|_| {
+                            frame_pacing.note_predictive_o1_failed();
+                        })?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped {
                                 reason,
                                 render_us,
                                 dmabuf_gpu_release,
                             } => {
+                                frame_pacing.note_predictive_o1_other_safe_abandonment();
                                 if let Some((lease_id, release_fence)) = dmabuf_gpu_release {
                                     let completion_fd = release_fence.duplicate_completion_fd();
                                     match completion_fd {
@@ -1255,6 +1257,7 @@ impl NativeRuntime {
                             }
                             #[rustfmt::skip]
                             AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
+                                frame_pacing.note_render_ready();
                                 if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
                                     frame_pacing.note_predictive_binding_after_render_completion(
                                         advanced_intervals,
