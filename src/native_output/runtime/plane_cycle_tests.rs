@@ -4,9 +4,10 @@ use crate::native_output::kms_worker::{
     KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerSubmission, KmsWorkerSubmitFailure,
 };
 use crate::native_output::output::test_cursor_for_worker;
+use crate::native_output::presentation::cursor_trace::CursorRevealTraceSnapshot;
 use crate::native_output::presentation::plane::{
-    CursorRevision, CursorSidecarId, KmsCommitBundleId, PresentedCursorDelivery,
-    PresentedPlaneSnapshot,
+    CursorCoupling, CursorPlanePoint, CursorRevision, CursorSidecarId, CursorSource,
+    KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
 use crate::native_output::presentation::trace::PresentationTransactionTraceRing;
 use crate::native_output::runtime::NativeOutputPacingMode;
@@ -105,6 +106,72 @@ fn independent_hidden_sidecar(validation_base: KmsValidationBase) -> CursorSidec
         trace_reveal: None,
         validation_base,
     }
+}
+
+fn frozen_worker_cursor_reveal_snapshot() -> CursorRevealTraceSnapshot {
+    CursorRevealTraceSnapshot::from_presented(
+        oblivion_one::compositor::CursorRevealAuthority {
+            constraint: oblivion_one::compositor::PointerConstraintBackendId {
+                constraint_id: 17,
+                generation: 117,
+            },
+            final_position: oblivion_one::compositor::OutputPosition { x: 100.0, y: 80.0 },
+            visibility_requested: true,
+        },
+        Some(23),
+        PresentedCursorState {
+            revision: CursorRevision::initial(),
+            coupling: CursorCoupling::IndependentPlane,
+            delivery: PresentedCursorDelivery::Hardware,
+            framebuffer_id: Some(91),
+            image_generation: Some(7),
+            source: Some(CursorSource::Client),
+            visible: true,
+            output_position: CursorPlanePoint { x: 90, y: 75 },
+            hotspot: CursorPlanePoint { x: 10, y: 5 },
+        },
+    )
+}
+
+#[test]
+fn independent_plane_delta_preparation_retains_frozen_reveal_without_sidecar() {
+    let worker = KmsCommitWorkerHandle::start(Arc::new(AcceptingExecutor)).unwrap();
+    let snapshot = frozen_worker_cursor_reveal_snapshot();
+    let mut cursor = test_cursor_for_worker();
+    let mut transactions = OutputTransactionLedger::new();
+    let mut trace = PresentationTransactionTraceRing::disabled(8);
+    let validation_base = KmsValidationBase::Presented {
+        snapshot: PresentedPlaneSnapshot::legacy(None),
+        output_generation: 1,
+        crtc_id: 7,
+    };
+    let preparation = prepare_plane_delta(
+        &worker,
+        &mut cursor,
+        None,
+        &mut transactions,
+        &mut trace,
+        target(),
+        7,
+        1,
+        NativeOutputPacingMode::ReactiveDouble,
+        23,
+        validation_base,
+        None,
+        CursorPlaneAction::Independent,
+        PresentedCursorDelivery::Hardware,
+        None,
+        Some(snapshot),
+    )
+    .unwrap();
+
+    let PlaneDeltaPreparation::Submit(preparation) = preparation else {
+        panic!("independent cursor update without an attachable primary must submit");
+    };
+    assert_eq!(preparation.cursor_reveal_trace, Some(snapshot));
+
+    worker.request_quiesce();
+    worker.join().unwrap();
 }
 
 #[test]
