@@ -273,4 +273,56 @@ mod tests {
 
         assert_eq!(lifecycle.state(), NativeSessionState::Suspended);
     }
+
+    struct FakeSeat {
+        failure: bool,
+    }
+
+    impl NativeSeatSwitch for FakeSeat {
+        fn switch_session_request(&self, _session: i32) -> std::io::Result<()> {
+            if self.failure {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn failed_vt_request_is_nonfatal_and_not_reported_as_requested() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        let outcome = request_native_vt_switch(&FakeSeat { failure: true }, 3, || Ok(false))
+            .expect("pending seat events should remain consumable");
+
+        assert_eq!(outcome.status, NativeVtSwitchRequestStatus::Failed);
+        assert!(!outcome.disabled_observed);
+        assert!(lifecycle.permits_output());
+        lifecycle.cancel_resume_for_shutdown();
+    }
+
+    #[test]
+    fn reentrant_disable_is_consumed_even_when_switch_request_fails() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        let outcome = request_native_vt_switch(&FakeSeat { failure: true }, 3, || {
+            assert_eq!(
+                lifecycle.begin_for_event(NativeSeatEvent::Disabled),
+                Some(NativeSessionTransition::BeginSuspend)
+            );
+            Ok(true)
+        })
+        .expect("reentrant seat events should be consumed");
+
+        assert_eq!(outcome.status, NativeVtSwitchRequestStatus::Failed);
+        assert!(outcome.disabled_observed);
+        assert!(!lifecycle.permits_output());
+    }
+
+    #[test]
+    fn successful_vt_request_reports_requested_after_consuming_events() {
+        let outcome = request_native_vt_switch(&FakeSeat { failure: false }, 4, || Ok(false))
+            .expect("successful request should return an outcome");
+
+        assert_eq!(outcome.status, NativeVtSwitchRequestStatus::Requested);
+        assert!(!outcome.disabled_observed);
+    }
 }

@@ -521,6 +521,44 @@ fn main_thread_admission_returns_immediately_when_full() {
 }
 
 #[test]
+fn pre_revoke_authority_waits_for_active_submit_and_closes_admission() {
+    let executor = Arc::new(BarrierExecutor {
+        started: Barrier::new(2),
+        release: Barrier::new(2),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(60).kind)
+        .enqueue(test_job(60))
+        .unwrap();
+    executor.started.wait();
+
+    let authority = handle.quiesce_authority();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            authority.request_quiesce();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(10)).is_err());
+
+        executor.release.wait();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pre-revoke authority should complete after submit returns");
+    });
+
+    assert!(matches!(
+        handle.try_reserve_admission(test_job(61).kind),
+        Err(KmsWorkerAdmissionError::Quiescing)
+    ));
+    handle
+        .ack_pageflip(test_job(60).token, test_job(60).transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
 fn idle_worker_has_only_one_reserved_ready_slot() {
     let executor = Arc::new(ScriptedExecutor {
         outcomes: Mutex::new(VecDeque::new()),

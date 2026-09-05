@@ -577,6 +577,7 @@ mod tests {
         PageflipQuarantine,
         DrmUnregister,
         CursorDisable,
+        CursorSessionRetire,
         DisableAck,
         KmsRecovery,
         PageflipRetire,
@@ -811,6 +812,15 @@ mod tests {
                 Operation::DisableAck,
             ]
         );
+    }
+
+    #[test]
+    fn session_suspend_retires_cursor_without_physical_clear() {
+        let mut recorder = Recorder::default();
+        quiesce_without_seat(&mut recorder);
+
+        assert!(recorder.operations.contains(&Operation::CursorSessionRetire));
+        assert!(!recorder.operations.contains(&Operation::CursorDisable));
     }
 
     #[test]
