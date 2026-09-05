@@ -15,8 +15,8 @@ use crate::control::{
 };
 use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
-    DecorationThemeSnapshot, DoctorSnapshot, OutputListSnapshot, PerformanceSnapshot,
-    StatusSnapshot, VersionSnapshot, WindowListSnapshot,
+    DecorationThemeSnapshot, DoctorSnapshot, KeyboardLayoutSnapshot, OutputListSnapshot,
+    PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -86,6 +86,11 @@ fn decode_command_result(
         "active-window" => {
             serde_json::from_value::<ActiveWindowSnapshot>(value).map(AstreactlResult::ActiveWindow)
         }
+        "keyboard.layout.get"
+        | "keyboard.layout.next"
+        | "keyboard.layout.previous"
+        | "keyboard.layout.set" => serde_json::from_value::<KeyboardLayoutSnapshot>(value)
+            .map(AstreactlResult::KeyboardLayout),
         "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
             serde_json::from_value::<CursorSnapshot>(value)
                 .and_then(|snapshot| {

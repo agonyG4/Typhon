@@ -1,10 +1,26 @@
 use serde_json::json;
 
 use crate::control::{
-    ControlCodecError, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
-    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, decode_request, decode_response, encode_request,
-    encode_response,
+    ControlCodecError, ControlCommand, ControlError, ControlErrorCode, ControlRequest,
+    ControlResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, decode_request, decode_response,
+    encode_request, encode_response,
 };
+
+#[test]
+fn keyboard_layout_commands_use_the_v2_wire_names() {
+    for (wire_name, command) in [
+        ("keyboard.layout.get", ControlCommand::KeyboardLayoutGet),
+        ("keyboard.layout.next", ControlCommand::KeyboardLayoutNext),
+        (
+            "keyboard.layout.previous",
+            ControlCommand::KeyboardLayoutPrevious,
+        ),
+        ("keyboard.layout.set", ControlCommand::KeyboardLayoutSet),
+    ] {
+        assert_eq!(ControlCommand::parse(wire_name), Some(command));
+        assert_eq!(command.as_str(), wire_name);
+    }
+}
 
 #[test]
 fn request_codec_round_trips_the_v1_envelope() {

@@ -32,6 +32,18 @@ fn valid_result(command: &str) -> serde_json::Value {
         "outputs" => serde_json::json!({"outputs": [], "total": 0, "truncated": false}),
         "windows" => serde_json::json!({"windows": [], "total": 0, "truncated": false}),
         "activewindow" | "active-window" => serde_json::json!({"window": null}),
+        "keyboard.layout.get"
+        | "keyboard.layout.next"
+        | "keyboard.layout.previous"
+        | "keyboard.layout.set" => serde_json::json!({
+            "effectiveIndex": 1,
+            "lockedIndex": 1,
+            "layoutCount": 2,
+            "layouts": [
+                {"index": 0, "name": "Portuguese (Brazil)"},
+                {"index": 1, "name": "English (US)"}
+            ]
+        }),
         "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
             serde_json::json!({
                 "desiredTheme": "default",
@@ -316,6 +328,53 @@ fn typed_cursor_results_are_validated_for_every_cursor_command() {
 }
 
 #[test]
+fn typed_keyboard_layout_results_are_validated_for_every_keyboard_command() {
+    let commands = [
+        ("keyboard.layout.get", vec!["keyboard", "layout"]),
+        ("keyboard.layout.next", vec!["keyboard", "next"]),
+        ("keyboard.layout.previous", vec!["keyboard", "previous"]),
+        ("keyboard.layout.set", vec!["keyboard", "set", "1"]),
+    ];
+    for (wire_command, cli_args) in commands {
+        let valid = run_socket_once_args(&cli_args, envelope(valid_result(wire_command)));
+        assert_eq!(valid.status.code(), Some(0), "command={wire_command}");
+        for result in [serde_json::json!({}), serde_json::Value::Null] {
+            assert_eq!(
+                run_socket_once_args(&cli_args, envelope(result))
+                    .status
+                    .code(),
+                Some(6),
+                "command={wire_command}"
+            );
+        }
+        let mut missing = valid_result(wire_command);
+        missing.as_object_mut().unwrap().remove("layouts");
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(missing))
+                .status
+                .code(),
+            Some(6)
+        );
+        let mut wrong_type = valid_result(wire_command);
+        wrong_type["lockedIndex"] = serde_json::json!("locked");
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(wrong_type))
+                .status
+                .code(),
+            Some(6)
+        );
+        let mut unknown = valid_result(wire_command);
+        unknown["unknownField"] = serde_json::json!(true);
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(unknown))
+                .status
+                .code(),
+            Some(6)
+        );
+    }
+}
+
+#[test]
 fn cursor_cli_rejects_invalid_values_and_duplicate_options_locally() {
     for args in [
         vec!["cursor", "set-theme", "bad/theme"],
@@ -331,6 +390,23 @@ fn cursor_cli_rejects_invalid_values_and_duplicate_options_locally() {
             "cursor", "set", "--theme", "default", "--size", "24", "--size", "32",
         ],
         vec!["cursor", "unknown"],
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "args={args:?}");
+    }
+}
+
+#[test]
+fn keyboard_cli_rejects_invalid_values_locally() {
+    for args in [
+        vec!["keyboard"],
+        vec!["keyboard", "layout", "extra"],
+        vec!["keyboard", "next", "extra"],
+        vec!["keyboard", "previous", "extra"],
+        vec!["keyboard", "set"],
+        vec!["keyboard", "set", "-1"],
+        vec!["keyboard", "set", "not-an-index"],
+        vec!["keyboard", "unknown"],
     ] {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(2), "args={args:?}");

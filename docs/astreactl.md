@@ -1,6 +1,6 @@
 # astreactl
 
-`astreactl` is Typhon's local, read-only control client. Each invocation sends
+`astreactl` is Typhon's local control client. Each invocation sends
 one versioned request to the per-instance Unix socket and accepts exactly one
 newline-terminated response. Responses are capped at 1 MiB; the client never
 reads an unbounded stream or waits for server EOF after a complete frame.
@@ -14,6 +14,10 @@ astreactl doctor
 astreactl outputs
 astreactl windows
 astreactl activewindow
+astreactl keyboard layout
+astreactl keyboard next
+astreactl keyboard previous
+astreactl keyboard set INDEX
 astreactl cursor get
 astreactl cursor set-theme THEME
 astreactl cursor set-size PIXELS
@@ -143,12 +147,27 @@ Cursor persistence and runtime behavior are documented in
 [`cursor-control.md`](cursor-control.md). Existing client-owned Wayland cursor
 surfaces are outside the compositor-owned cursor authority and may not reload.
 
+Keyboard layout commands query or change the compositor's ephemeral locked XKB
+layout for the current seat. `keyboard layout`, `keyboard next`, `keyboard
+previous`, and `keyboard set INDEX` use the exact wire commands
+`keyboard.layout.get`, `keyboard.layout.next`, `keyboard.layout.previous`, and
+`keyboard.layout.set`. Successful responses contain `effectiveIndex`,
+`lockedIndex`, `layoutCount`, and the configured layout names with stable
+numeric indices. Layout changes do not recompile or resend the keymap, and are
+not persisted across compositor restarts. Invalid or extra arguments are local
+usage errors for the CLI and `invalid_argument` responses for the control
+protocol.
+
+Human keyboard output shows effective and locked indices plus a sanitized list
+of numeric layout identities; JSON output preserves the validated names.
+
 ## Scope
 
 Window commands remain read-only: M3 does not activate, minimize, restore, or
 close windows; or provide subscriptions, remote access, DBus, or Dock
-integration. M4 adds only the cursor commands listed above; it does not add
-wallpaper control, window mutation, process launch, or streaming events.
+integration. Runtime keyboard layout control changes only the ephemeral locked
+XKB layout. It does not add wallpaper control, window mutation, process launch,
+or streaming events.
 
 ## Packaging
 

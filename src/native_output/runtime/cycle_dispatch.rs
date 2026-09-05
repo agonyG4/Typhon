@@ -119,6 +119,16 @@ fn settle_native_pointer_constraint_backend_requests(
 struct EmptyCursorArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyKeyboardLayoutArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyboardLayoutSetArgs {
+    index: u32,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CursorThemeArgs {
     theme: String,
@@ -473,6 +483,43 @@ impl NativeRuntime {
             ControlCommand::ActiveWindow => serde_json::to_value(ActiveWindowSnapshot {
                 window: self.server.control_active_window_snapshot(),
             }),
+            ControlCommand::KeyboardLayoutGet => {
+                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                    return Some(keyboard_layout_argument_failure(request.id));
+                }
+                match self.server.keyboard_layout_snapshot() {
+                    Ok(snapshot) => serde_json::to_value(snapshot),
+                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
+                }
+            }
+            ControlCommand::KeyboardLayoutNext => {
+                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                    return Some(keyboard_layout_argument_failure(request.id));
+                }
+                match self.server.next_keyboard_layout() {
+                    Ok(snapshot) => serde_json::to_value(snapshot),
+                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
+                }
+            }
+            ControlCommand::KeyboardLayoutPrevious => {
+                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                    return Some(keyboard_layout_argument_failure(request.id));
+                }
+                match self.server.previous_keyboard_layout() {
+                    Ok(snapshot) => serde_json::to_value(snapshot),
+                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
+                }
+            }
+            ControlCommand::KeyboardLayoutSet => {
+                let args = match serde_json::from_value::<KeyboardLayoutSetArgs>(request.args) {
+                    Ok(args) => args,
+                    Err(_) => return Some(keyboard_layout_argument_failure(request.id)),
+                };
+                match self.server.set_keyboard_layout(args.index) {
+                    Ok(snapshot) => serde_json::to_value(snapshot),
+                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
+                }
+            }
             ControlCommand::CursorGet => {
                 if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                     self.cursor_manager.note_validation_failure();
@@ -1426,10 +1473,12 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativePreReadInputDecision, decide_native_pre_read_input,
-        input_requires_full_server_progression, promote_native_input_before_wayland_read,
+        EmptyKeyboardLayoutArgs, KeyboardLayoutSetArgs, NativePreReadInputDecision,
+        decide_native_pre_read_input, input_requires_full_server_progression,
+        keyboard_layout_failure, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
+    use oblivion_one::compositor::KeyboardLayoutControlError;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintMode {
@@ -1443,6 +1492,42 @@ mod tests {
         ActivateLocked(u64),
         ActivateConfined(u64),
         Deactivate,
+    }
+
+    #[test]
+    fn keyboard_layout_control_arguments_are_strict() {
+        assert!(serde_json::from_value::<EmptyKeyboardLayoutArgs>(serde_json::json!({})).is_ok());
+        assert!(
+            serde_json::from_value::<EmptyKeyboardLayoutArgs>(serde_json::json!({"extra": true}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<KeyboardLayoutSetArgs>(serde_json::json!({"index": 1}))
+                .is_ok()
+        );
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"index": 1, "extra": true}),
+            serde_json::json!({"index": -1}),
+        ] {
+            assert!(serde_json::from_value::<KeyboardLayoutSetArgs>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn keyboard_layout_errors_keep_protocol_categories() {
+        let invalid = keyboard_layout_failure(
+            7,
+            KeyboardLayoutControlError::InvalidIndex { index: 3, count: 2 },
+        );
+        assert_eq!(invalid.error.unwrap().code.as_str(), "invalid_argument");
+        let unavailable = keyboard_layout_failure(
+            8,
+            KeyboardLayoutControlError::Unavailable("keyboard state unavailable"),
+        );
+        let error = unavailable.error.unwrap();
+        assert_eq!(error.code.as_str(), "internal");
+        assert_eq!(error.detail.as_deref(), Some("keyboard_state_unavailable"));
     }
 
     fn settle_if_allowed(
@@ -1830,6 +1915,45 @@ fn cursor_argument_failure(id: u64) -> ControlResponse {
         )
         .with_detail("invalid_cursor_arguments"),
     )
+}
+
+fn keyboard_layout_argument_failure(id: u64) -> ControlResponse {
+    ControlResponse::failure(
+        id,
+        ControlError::new(
+            ControlErrorCode::InvalidArgument,
+            "invalid keyboard layout arguments",
+        )
+        .with_detail("invalid_keyboard_layout_arguments"),
+    )
+}
+
+fn keyboard_layout_failure(
+    id: u64,
+    error: oblivion_one::compositor::KeyboardLayoutControlError,
+) -> ControlResponse {
+    match error {
+        oblivion_one::compositor::KeyboardLayoutControlError::InvalidIndex { index, count } => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(
+                    ControlErrorCode::InvalidArgument,
+                    format!("keyboard layout index {index} is out of range for {count} layouts"),
+                )
+                .with_detail("invalid_keyboard_layout_index"),
+            )
+        }
+        oblivion_one::compositor::KeyboardLayoutControlError::Unavailable(_) => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(ControlErrorCode::Internal, "keyboard state unavailable")
+                    .with_detail("keyboard_state_unavailable"),
+            )
+        }
+        oblivion_one::compositor::KeyboardLayoutControlError::Internal(message) => {
+            ControlResponse::failure(id, ControlError::new(ControlErrorCode::Internal, message))
+        }
+    }
 }
 
 fn cursor_snapshot_response(runtime: &NativeRuntime, id: u64) -> ControlResponse {

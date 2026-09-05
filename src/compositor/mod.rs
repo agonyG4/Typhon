@@ -232,7 +232,7 @@ pub use interaction::{
 use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum KeyboardLayoutControlError {
+pub enum KeyboardLayoutControlError {
     Unavailable(&'static str),
     InvalidIndex { index: u32, count: u32 },
     Internal(&'static str),

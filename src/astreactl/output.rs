@@ -146,7 +146,7 @@ fn format_keyboard_layout(snapshot: &KeyboardLayoutSnapshot) -> String {
         } else {
             sanitize_terminal_text(&layout.name)
         };
-        format!("{} {:>2}  {}", marker, layout.index, name)
+        format!("{} {}  {}", marker, layout.index, name)
     }));
     lines.join("\n")
 }
@@ -222,8 +222,8 @@ pub fn sanitize_terminal_text(value: &str) -> String {
 mod tests {
     use super::human;
     use crate::control_snapshots::{
-        AstreactlResult, ControlWindowId, VersionSnapshot, WindowKindSnapshot, WindowListSnapshot,
-        WindowSnapshot,
+        AstreactlResult, ControlWindowId, KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot,
+        VersionSnapshot, WindowKindSnapshot, WindowListSnapshot, WindowSnapshot,
     };
 
     #[test]
@@ -328,6 +328,29 @@ mod tests {
         assert_eq!(
             human(&window_result("Normal Unicode — title", "org.example.App")),
             "ID\tSTATE\tAPP\tTITLE\n7\tmapped\torg.example.App\tNormal Unicode — title"
+        );
+    }
+
+    #[test]
+    fn keyboard_layout_human_output_is_stable_and_sanitized() {
+        let value = AstreactlResult::KeyboardLayout(KeyboardLayoutSnapshot {
+            effective_index: 1,
+            locked_index: 1,
+            layout_count: 2,
+            layouts: vec![
+                KeyboardLayoutEntrySnapshot {
+                    index: 0,
+                    name: "Portuguese\n(Brazil)".to_string(),
+                },
+                KeyboardLayoutEntrySnapshot {
+                    index: 1,
+                    name: "English (US)".to_string(),
+                },
+            ],
+        });
+        assert_eq!(
+            human(&value),
+            "Effective: 1\nLocked: 1\n\n  0  Portuguese (Brazil)\n* 1  English (US)"
         );
     }
 }

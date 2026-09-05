@@ -86,7 +86,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|cursor ...|decoration ...|wallpaper get|wallpaper list|wallpaper set PATH_OR_ID|wallpaper import PATH|wallpaper reset|wallpaper default>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|wallpaper get|wallpaper list|wallpaper set PATH_OR_ID|wallpaper import PATH|wallpaper reset|wallpaper default>"
                 );
                 return Ok(0);
             }
@@ -183,6 +183,13 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             ));
         }
         parse_decoration_command(&positionals[1..])?
+    } else if command == "keyboard" {
+        if cursor_theme.is_some() || cursor_size.is_some() || wallpaper_fit.is_some() {
+            return Err(AstreactlError::Usage(
+                "keyboard commands do not accept cursor or wallpaper options".to_string(),
+            ));
+        }
+        parse_keyboard_command(&positionals[1..])?
     } else {
         if positionals.len() != 1
             || cursor_theme.is_some()
@@ -218,6 +225,57 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(7);
     }
     Ok(0)
+}
+
+fn parse_keyboard_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    let subcommand = positionals
+        .first()
+        .ok_or_else(|| AstreactlError::Usage("missing keyboard subcommand".to_string()))?;
+    match subcommand.as_str() {
+        "layout" => {
+            if positionals.len() != 1 {
+                return Err(AstreactlError::Usage(
+                    "keyboard layout takes no extra arguments".to_string(),
+                ));
+            }
+            Ok(("keyboard", "keyboard.layout.get", serde_json::json!({})))
+        }
+        "next" | "previous" => {
+            if positionals.len() != 1 {
+                return Err(AstreactlError::Usage(
+                    "keyboard next/previous takes no extra arguments".to_string(),
+                ));
+            }
+            let wire = if subcommand == "next" {
+                "keyboard.layout.next"
+            } else {
+                "keyboard.layout.previous"
+            };
+            Ok(("keyboard", wire, serde_json::json!({})))
+        }
+        "set" => {
+            if positionals.len() != 2 {
+                return Err(AstreactlError::Usage(
+                    "keyboard set requires exactly one non-negative index".to_string(),
+                ));
+            }
+            let index = positionals[1].parse::<u32>().map_err(|_| {
+                AstreactlError::Usage(
+                    "keyboard layout index must be a non-negative integer".to_string(),
+                )
+            })?;
+            Ok((
+                "keyboard",
+                "keyboard.layout.set",
+                serde_json::json!({"index": index}),
+            ))
+        }
+        _ => Err(AstreactlError::Usage(format!(
+            "unknown keyboard subcommand {subcommand}"
+        ))),
+    }
 }
 
 fn parse_wallpaper_command(
@@ -453,7 +511,7 @@ fn exit_code(error: &AstreactlError) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_wallpaper_command;
+    use super::{parse_keyboard_command, parse_wallpaper_command};
     use oblivion_one::astreactl::wallpaper::DEFAULT_WALLPAPER_TIMEOUT;
     use oblivion_one::control_snapshots::AstreactlResult;
 
@@ -503,5 +561,38 @@ mod tests {
                 .unwrap();
         assert_eq!(action, "import");
         assert_eq!(args["path"], "/tmp/source.png");
+    }
+
+    #[test]
+    fn keyboard_parser_maps_runtime_layout_commands() {
+        let (display, wire, args) = parse_keyboard_command(&["layout".to_string()]).unwrap();
+        assert_eq!((display, wire), ("keyboard", "keyboard.layout.get"));
+        assert_eq!(args, serde_json::json!({}));
+
+        let (_, wire, args) = parse_keyboard_command(&["next".to_string()]).unwrap();
+        assert_eq!(wire, "keyboard.layout.next");
+        assert_eq!(args, serde_json::json!({}));
+
+        let (_, wire, args) = parse_keyboard_command(&["previous".to_string()]).unwrap();
+        assert_eq!(wire, "keyboard.layout.previous");
+        assert_eq!(args, serde_json::json!({}));
+
+        let (_, wire, args) =
+            parse_keyboard_command(&["set".to_string(), "1".to_string()]).unwrap();
+        assert_eq!(wire, "keyboard.layout.set");
+        assert_eq!(args, serde_json::json!({"index": 1}));
+    }
+
+    #[test]
+    fn keyboard_parser_rejects_invalid_arity_and_indices() {
+        for args in [
+            vec!["layout".to_string(), "extra".to_string()],
+            vec!["next".to_string(), "extra".to_string()],
+            vec!["set".to_string()],
+            vec!["set".to_string(), "-1".to_string()],
+            vec!["set".to_string(), "one".to_string()],
+        ] {
+            assert!(parse_keyboard_command(&args).is_err(), "args={args:?}");
+        }
     }
 }
