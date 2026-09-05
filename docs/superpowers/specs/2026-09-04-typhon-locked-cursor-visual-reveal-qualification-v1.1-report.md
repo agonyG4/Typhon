@@ -1,85 +1,164 @@
-# Typhon Locked Cursor Visual Reveal Qualification v1.1 Report
+# Typhon Locked Cursor Visual Reveal Qualification v1.2 Report
 
 ## Result
 
-v1.1 Gate 1 observability closure is implemented in commit `b067ff4` on top of
-the v1 report state `cafd18e901b564b3d3cee650c1506a9f91d49dab`.
+v1.2 Gate 1 observability closure is implemented from starting `HEAD`
+`d15470e7c3a2f6921e3c257b19d655c59e4636f`. The final implementation HEAD before
+this report-only commit is `493708087f72ddae06aa430bec3b1a22fc2933cc`; the report is the superseding qualification
+record for that implementation.
 
-The implementation freezes reveal ownership against the exact physical
-submission identity `(output_generation, crtc_id, PageFlipToken)` before an
-asynchronous boundary is crossed. Pageflip processing consumes that identity
-from a trace-only bounded ledger; it never infers ownership from the mutable
-current compositor reveal. A no-visibility reveal is terminally recorded and
-cannot claim an unrelated visible cursor.
+v1.1 closed pageflip-time attribution with the exact physical identity
+`(output_generation, crtc_id, PageFlipToken)`. v1.2 closes the remaining gap at
+freeze time: reveal ownership, cursor revision, and cursor source are frozen at
+the same semantic boundary as the cursor presentation state, then carried
+through render-ahead, ready-frame delay, worker admission, sidecars,
+synchronous submission, KMS evidence, pageflip, and presented-cursor matching.
 
 No Gate 2 semantic cursor correction was implemented. Cursor placement,
 scheduling, visibility policy, pointer coordinates, worker selection, sidecar
-replacement, and KMS ordering remain outside this qualification.
+replacement policy, KMS ordering, and input behavior remain outside this
+qualification. The underlying cursor teleport is therefore not claimed fixed.
 
 ## Delivered
 
-- Added one shared atomic cursor-plane assignment description, generated from
-  the same helper that writes the real cursor properties. It preserves exact
-  source geometry, hotspot-adjusted CRTC position, dimensions, framebuffer,
-  disable, unavailable-plane, and unsupported-visible semantics.
-- Added canonical `cursor_kms_submit` evidence for worker and synchronous
-  cursor-only and primary-plus-cursor submissions. The payload reports the
-  physical token, output/CRTC identity, transaction when available, epoch and
-  revision when available, transport, delivery, and exact known KMS fields.
-- Added a trace-only `CursorRevealTraceLedger` with FIFO capacity 32 for both
-  physical submission entries and reveal lifecycle slots. Overflow emits an
-  explicit diagnostic and retires only trace state.
-- Carried frozen reveal snapshots through worker cursor owners and sidecars,
-  binding them when the main runtime observes the submitted physical identity.
-  Synchronous paths bind after the backend submission returns its token.
-- Replaced the compositor-global first-visible slot with per-reveal state.
-  First-visible evidence compares position, revision, delivery, hotspot,
-  framebuffer, image generation, source, visual state, and overall state using
-  `true`, `false`, or `unknown`.
-- Added explicit `superseded_by_new_reveal` and
-  `no_visible_cursor_requested` terminal evidence.
-- Constructed all new ledger/snapshot state only when
-  `TYPHON_CURSOR_PRESENTATION_TRACE=1`; the disabled path has no new ledger
-  allocation or formatting work.
+- Kept the v1.1 trace-only bounded ledger and exact key
+  `(output_generation, crtc_id, PageFlipToken)`.
+- Made `CursorRevealTraceSnapshot` a presentation-plane carrier and stored it on
+  `RenderedOutputFrame` at render freeze. Ready-frame submission no longer
+  reconstructs reveal identity from mutable current server/cursor state.
+- Carried the frozen snapshot into `KmsBundleOwners`, retaining it on the
+  primary owner when no cursor-plane owner exists. Worker pageflip binding uses
+  the owner snapshot; a replacement sidecar replaces its cursor state and trace
+  snapshot together.
+- Changed presented-state snapshot construction so `PresentedCursorState.source`
+  is authoritative. A later mutable `cursor.client_source_key()` cannot
+  override a source already frozen into the presentation.
+- Preserved frozen epoch and revision for synchronous primary KMS evidence, and
+  used frozen owner metadata for worker primary and direct-primary evidence.
+- Captured immediate cursor-only and direct-worker snapshots before their
+  physical submission boundary; token binding only adds the physical identity.
+- Added `cursor_submission_bound` evidence containing the frozen reveal/source
+  fields and physical output/CRTC/token identity.
+- Kept no-visible reveals terminal: `no_visible_cursor_requested` is emitted
+  when tracing is enabled and the active trace authority is retired, so a later
+  visible reveal cannot inherit its first-visible slot.
+- Made trace-disabled construction neutral: no trace-only reveal authority,
+  snapshot, hidden-state trace clone, owner propagation, or sidecar trace is
+  created when `TYPHON_CURSOR_PRESENTATION_TRACE` is not enabled.
+- Preserved exact atomic request writes while extending the canonical KMS
+  vocabulary. Human geometry now uses `pointer_position`, `hotspot`, and
+  `plane_origin_signed`; raw DRM values are labeled `CRTC_X_RAW` and
+  `CRTC_Y_RAW`.
+
+The required closure claims are explicit:
+
+> Reveal ownership is frozen at the same boundary as the cursor presentation state it describes.
+
+> Physical token binding never consults mutable current reveal or current cursor-source state for an already-frozen cursor presentation.
+
+> With cursor presentation tracing disabled, no trace-only reveal authority or reveal snapshot is created or propagated through cursor/KMS ownership.
+
+> `pointer_position` denotes the cursor hotspot position; `plane_origin_signed` denotes the cursor-plane top-left; raw `CRTC_X/Y` remain the exact DRM atomic property representation.
+
+> No Gate 2 semantic cursor correction was implemented.
+
+## KMS geometry qualification
+
+The assignment helper continues to compute the signed plane origin as pointer
+position minus hotspot, then preserves the exact raw representation submitted
+to DRM as `i64::from(origin) as u64`.
+
+- `(100,80)` with hotspot `(10,5)` reports
+  `pointer_position=(100,80)`, `hotspot=(10,5)`,
+  `plane_origin_signed=(90,75)`, `CRTC_X_RAW=90`, and `CRTC_Y_RAW=75`.
+- `(2,3)` with hotspot `(8,9)` reports
+  `plane_origin_signed=(-6,-6)` while raw values remain `(-6i64) as u64`.
+- Disabled and unavailable assignments report unknown geometry rather than
+  inventing pointer or plane coordinates.
+
+## Causal reconstruction boundary
+
+The trace chain is now attributable as:
+
+```text
+cursor state/reveal freeze
+  -> frozen frame or immediate cursor snapshot
+  -> cursor_submission_bound + cursor_kms_submit
+  -> pageflip identity lookup
+  -> presented cursor comparison / first-visible attribution
+```
+
+For delayed primary submission, the frame snapshot is the source of reveal,
+epoch, revision, delivery, visual state, and source. The physical token is
+attached only after KMS submission returns or the worker reports its immutable
+job ownership. For cursor-only paths, the same fields are captured before the
+submission call. The four overlapping A/B orderings are represented by the
+bounded identity ledger and cannot claim a newer reveal merely because it is
+current when an older token is allocated or completed.
 
 ## Verification
 
-The implementation was compiled and tested in the checkout's normal local
-target directory.
+All commands ran in the checkout's normal local target directory through
+`rtk`.
 
-RED proof before the shared assignment helper existed:
+RED proof before the v1.2 production changes:
 
 ```text
-rtk cargo test --locked cursor_plane_assignment_describes_the_exact_atomic_geometry
-failed: 7 compile errors
+rtk cargo test --locked cursor_trace
+failed: 10 compile errors
 ```
 
-GREEN and regression evidence:
+The failures were the intentionally changed freeze-safe presented snapshot
+constructor and the new raw/signed coordinate fields.
+
+Focused GREEN evidence:
 
 ```text
-rtk cargo test --locked cursor_plane_assignment
+rtk cargo test --locked cursor_trace -- --test-threads=1
+10 passed
+
+rtk cargo test --locked ready_frame_carries_frozen_cursor_reveal_through_worker_queue -- --test-threads=1
+1 passed
+
+rtk cargo test --locked cursor_plane_assignment -- --test-threads=1
 2 passed
 
-rtk cargo test --locked cursor_trace
-9 passed
+rtk cargo test --locked scanout -- --test-threads=1
+240 passed
 
-rtk cargo test --locked overlapping_reveals_keep_submission_identity
+rtk cargo test --locked worker -- --test-threads=1
+187 passed
+
+rtk cargo test --locked sidecar -- --test-threads=1
+17 passed
+
+rtk cargo test --locked disabled -- --test-threads=1
+23 passed
+
+rtk cargo test --locked no_visible -- --test-threads=1
+2 passed
+
+rtk cargo test --locked cursor_reveal -- --test-threads=1
+2 passed
+
+rtk cargo test --locked synchronous -- --test-threads=1
+4 passed
+
+rtk cargo test --locked synchronous_kms_payload_uses_canonical_exact_fields -- --test-threads=1
 1 passed
 
-rtk cargo test --locked cursor_trace_snapshot_exposes_submitted_and_queued_state_identity
+rtk cargo test --locked visible_cursor_geometry_preserves_negative_partially_offscreen_coordinates -- --test-threads=1
 1 passed
 
-rtk cargo test --locked v11_client_warp_after_backend_ack_settles_unlock
+rtk cargo test --locked plane_delta_pageflip_ack_releases_worker_inflight -- --test-threads=1
 1 passed
+```
 
-rtk cargo test --locked cursor_job_keeps_immutable_presented_or_predecessor_validation_base
-1 passed
+Fresh full verification:
 
-rtk cargo test --locked sidecar_offered_before_freeze_is_attached_to_exact_primary_bundle
-1 passed
-
-rtk cargo test --locked plane_delta_pageflip_ack_releases_worker_inflight
-1 passed
+```text
+rtk cargo fmt --check
+passed
 
 rtk cargo check --locked --all-targets
 passed
@@ -88,22 +167,17 @@ rtk cargo clippy --locked --all-targets -- -D warnings
 passed
 
 rtk cargo test --locked
-3400 passed, 5 ignored
+3404 passed, 5 ignored
 
 rtk git diff --check
 passed
 ```
 
-The focused tests cover overlapping reveal identity, independent first-visible
-slots, no-visible terminal neutrality, stale same-position visual mismatch,
-exact known visual matching, disabled state neutrality, bounded overflow,
-canonical synchronous payload fields, exact cursor assignment semantics,
-worker ownership, sidecar handoff, pageflip acknowledgement, and unlock
-settlement.
+## Qualification boundary and next step
 
-## Remaining qualification
-
+This report qualifies the causal observability and attribution closure only.
 Native A/B capture with `OBLIVION_ONE_CURSOR=hardware` and software cursor
 presentation, both with `TYPHON_CURSOR_PRESENTATION_TRACE=1`, remains the next
-step. This report therefore qualifies the causal observability and attribution
-closure only; it does not claim that the underlying cursor teleport is fixed.
+step. That capture may determine whether the observed teleport is a real
+semantic cursor-placement defect, a presentation-path mismatch, or a trace
+interpretation issue; v1.2 does not claim that result in advance.
