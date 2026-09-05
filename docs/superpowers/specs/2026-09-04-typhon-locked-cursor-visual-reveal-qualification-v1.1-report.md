@@ -1,4 +1,4 @@
-# Typhon Locked Cursor Visual Reveal Qualification v1.2 Report
+# Typhon Locked Cursor Visual Reveal Qualification v1.2.1 Report
 
 ## Result
 
@@ -13,6 +13,11 @@ freeze time: reveal ownership, cursor revision, and cursor source are frozen at
 the same semantic boundary as the cursor presentation state, then carried
 through render-ahead, ready-frame delay, worker admission, sidecars,
 synchronous submission, KMS evidence, pageflip, and presented-cursor matching.
+
+The v1.2.1 follow-up was implemented from starting `HEAD`
+`798f5ef62aea6f23d41a356db5b55e146b561c9d`. It closes the remaining worker
+cursor-only propagation hole: an already-captured reveal snapshot now survives
+both sidecar selection and independent cursor-only preparation.
 
 No Gate 2 semantic cursor correction was implemented. Cursor placement,
 scheduling, visibility policy, pointer coordinates, worker selection, sidecar
@@ -59,6 +64,32 @@ The required closure claims are explicit:
 > With cursor presentation tracing disabled, no trace-only reveal authority or reveal snapshot is created or propagated through cursor/KMS ownership.
 
 > `pointer_position` denotes the cursor hotspot position; `plane_origin_signed` denotes the cursor-plane top-left; raw `CRTC_X/Y` remain the exact DRM atomic property representation.
+
+> No Gate 2 semantic cursor correction was implemented.
+
+## v1.2.1 worker cursor-only retention closure
+
+The worker cursor-only path already captured the diagnostic snapshot before
+worker admission and preserved it when the update became a `CursorSidecar`.
+The independent no-sidecar branch in `prepare_plane_delta()` previously
+discarded that value while constructing `PlaneDeltaPreparationSubmit`. It now
+forwards the exact existing `Option<CursorRevealTraceSnapshot>` unchanged.
+
+> A worker cursor-only reveal snapshot survives both possible transport selections: sidecar ownership and independent cursor-only submission.
+
+> Failure to attach a cursor update as a sidecar cannot discard its already-frozen reveal identity.
+
+The existing `queue_plane_delta()` owner transfer then carries the same value
+into `KmsBundleOwners`, so a worker `Submitted` event can bind the exact
+physical `(output_generation, crtc_id, PageFlipToken)` identity before the
+pageflip. This keeps the first hidden-to-visible worker cursor pageflip
+eligible for the existing full-field first-visible comparison.
+
+> The first hidden-to-visible worker cursor pageflip retains exact reveal attribution.
+
+An absent input snapshot remains absent through independent preparation and
+worker ownership; no reveal ownership is fabricated when tracing is disabled.
+Sidecar creation and promoted-sidecar ownership are unchanged.
 
 > No Gate 2 semantic cursor correction was implemented.
 
