@@ -1526,4 +1526,76 @@ mod tests {
         .expect("cursor churn must not invalidate the physically current primary");
         assert_eq!(snapshot.presented_planes.primary, Some(current));
     }
+
+    #[test]
+    fn session_recovery_rebase_retires_primary_and_advances_revision() {
+        let (swapchain, ledger, arbiter, current) = completed_composed_fixture(1);
+        let mut presented = PresentedPlaneSnapshot::legacy(Some(current));
+        let cursor = PresentedPlaneSnapshot::legacy(None).cursor;
+        let revision_before = presented.revision;
+
+        assert!(
+            build_output_pipeline_snapshot_with_presented(
+                1,
+                7,
+                NativeOutputPacingMode::ReactiveDouble,
+                1,
+                &swapchain,
+                &ledger,
+                &arbiter,
+                None,
+                None,
+                TripleCapability::Capable,
+                presented,
+            )
+            .is_ok()
+        );
+
+        presented.rebase_after_session_recovery(cursor);
+
+        assert_eq!(presented.primary, None);
+        assert_eq!(presented.cursor, cursor);
+        assert_ne!(presented.revision, revision_before);
+        assert!(
+            build_output_pipeline_snapshot_with_presented(
+                2,
+                7,
+                NativeOutputPacingMode::ReactiveDouble,
+                1,
+                &swapchain,
+                &ledger,
+                &arbiter,
+                None,
+                None,
+                TripleCapability::Capable,
+                presented,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stale_g1_primary_is_rejected_at_the_g2_boundary() {
+        let (swapchain, ledger, arbiter, current) = completed_composed_fixture(1);
+        assert_eq!(
+            build_output_pipeline_snapshot_with_presented(
+                2,
+                7,
+                NativeOutputPacingMode::ReactiveDouble,
+                1,
+                &swapchain,
+                &ledger,
+                &arbiter,
+                None,
+                None,
+                TripleCapability::Capable,
+                PresentedPlaneSnapshot::legacy(Some(current)),
+            ),
+            Err(PipelineSnapshotError::IdentityMismatch {
+                owner: "current_composed",
+                field: "output_generation",
+                transaction_id: current.transaction_id(),
+            })
+        );
+    }
 }
