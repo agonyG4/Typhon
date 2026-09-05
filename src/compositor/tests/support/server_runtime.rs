@@ -61,6 +61,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
         index: u32,
         reply: Sender<bool>,
     },
+    NextKeyboardLayout {
+        reply: Sender<bool>,
+    },
+    PreviousKeyboardLayout {
+        reply: Sender<bool>,
+    },
     SetShortcutInhibitorPolicy {
         surface_id: u32,
         enabled: bool,
@@ -331,6 +337,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::SetKeyboardLayout { index, reply } => {
                         let _ = reply.send(server.set_keyboard_layout(index).is_ok());
+                    }
+                    ServerCommand::NextKeyboardLayout { reply } => {
+                        let _ = reply.send(server.next_keyboard_layout().is_ok());
+                    }
+                    ServerCommand::PreviousKeyboardLayout { reply } => {
+                        let _ = reply.send(server.previous_keyboard_layout().is_ok());
                     }
                     ServerCommand::SetShortcutInhibitorPolicy {
                         surface_id,
