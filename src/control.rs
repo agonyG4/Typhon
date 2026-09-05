@@ -52,6 +52,8 @@ pub enum ControlCommand {
     KeyboardLayoutNext,
     KeyboardLayoutPrevious,
     KeyboardLayoutSet,
+    KeyboardConfigurationGet,
+    KeyboardConfigurationSet,
     CursorGet,
     CursorSetTheme,
     CursorSetSize,
@@ -81,6 +83,8 @@ impl ControlCommand {
             Self::KeyboardLayoutNext => "keyboard.layout.next",
             Self::KeyboardLayoutPrevious => "keyboard.layout.previous",
             Self::KeyboardLayoutSet => "keyboard.layout.set",
+            Self::KeyboardConfigurationGet => "keyboard.config.get",
+            Self::KeyboardConfigurationSet => "keyboard.config.set",
             Self::CursorGet => "cursor.get",
             Self::CursorSetTheme => "cursor.set-theme",
             Self::CursorSetSize => "cursor.set-size",
@@ -110,6 +114,8 @@ impl ControlCommand {
             "keyboard.layout.next" => Self::KeyboardLayoutNext,
             "keyboard.layout.previous" => Self::KeyboardLayoutPrevious,
             "keyboard.layout.set" => Self::KeyboardLayoutSet,
+            "keyboard.config.get" => Self::KeyboardConfigurationGet,
+            "keyboard.config.set" => Self::KeyboardConfigurationSet,
             "cursor.get" => Self::CursorGet,
             "cursor.set-theme" => Self::CursorSetTheme,
             "cursor.set-size" => Self::CursorSetSize,
@@ -347,5 +353,26 @@ mod tests {
             Some(ControlCommand::Performance)
         );
         assert_eq!(ControlCommand::Performance.as_str(), "performance");
+    }
+
+    #[test]
+    fn keyboard_configuration_commands_are_strictly_named() {
+        assert_eq!(
+            ControlCommand::parse("keyboard.config.get"),
+            Some(ControlCommand::KeyboardConfigurationGet)
+        );
+        assert_eq!(
+            ControlCommand::parse("keyboard.config.set"),
+            Some(ControlCommand::KeyboardConfigurationSet)
+        );
+        assert_eq!(
+            ControlCommand::KeyboardConfigurationGet.as_str(),
+            "keyboard.config.get"
+        );
+        assert_eq!(
+            ControlCommand::KeyboardConfigurationSet.as_str(),
+            "keyboard.config.set"
+        );
+        assert_eq!(ControlCommand::parse("keyboard.config"), None);
     }
 }

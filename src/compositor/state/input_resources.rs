@@ -1,5 +1,9 @@
 use super::*;
-use crate::control_snapshots::{KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot};
+use crate::control_snapshots::{
+    KeyboardConfigurationPersistence, KeyboardConfigurationSnapshot, KeyboardConfigurationSource,
+    KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot,
+};
+use crate::keyboard_persistence::KeyboardConfigurationValue;
 
 fn project_keyboard_layout_snapshot(
     state: crate::compositor::keyboard::KeyboardLayoutState,
@@ -36,6 +40,16 @@ fn map_keyboard_layout_error(
         crate::compositor::keyboard::KeyboardLayoutError::FfiFailed => {
             KeyboardLayoutControlError::Internal("keyboard layout update failed")
         }
+    }
+}
+
+fn map_keyboard_configuration_error(error: String) -> KeyboardConfigurationControlError {
+    match error.as_str() {
+        "keyboard state unavailable" => {
+            KeyboardConfigurationControlError::Unavailable("keyboard state unavailable")
+        }
+        "keyboard configuration mutation is busy" => KeyboardConfigurationControlError::Busy,
+        _ => KeyboardConfigurationControlError::InvalidArgument(error),
     }
 }
 
@@ -129,6 +143,156 @@ impl CompositorState {
             snapshot: project_keyboard_layout_snapshot(change.snapshot),
             changed: change.changed,
         })
+    }
+
+    pub(crate) fn initialize_keyboard_state_with_config(
+        &mut self,
+        config: crate::compositor::keyboard::KeyboardConfig,
+        source: KeyboardConfigurationSource,
+        persistence: KeyboardConfigurationPersistence,
+        environment_override_active: bool,
+    ) -> Result<(), KeyboardConfigurationControlError> {
+        if !self.keyboard_state.ensure_with_config(config) {
+            return Err(KeyboardConfigurationControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        self.keyboard_configuration_source = source;
+        self.keyboard_configuration_persistence = persistence;
+        self.keyboard_environment_override_active = environment_override_active;
+        Ok(())
+    }
+
+    pub(crate) fn keyboard_configuration_snapshot(
+        &mut self,
+    ) -> Result<KeyboardConfigurationSnapshot, KeyboardConfigurationControlError> {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardConfigurationControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        let config = self.keyboard_state.configuration().ok_or(
+            KeyboardConfigurationControlError::Unavailable("keyboard state unavailable"),
+        )?;
+        let layout = self
+            .keyboard_state
+            .layout_snapshot()
+            .map(project_keyboard_layout_snapshot)
+            .map_err(|error| {
+                KeyboardConfigurationControlError::Internal(match error {
+                    crate::compositor::keyboard::KeyboardLayoutError::Unavailable(reason) => reason,
+                    _ => "keyboard layout snapshot failed",
+                })
+            })?;
+        Ok(KeyboardConfigurationSnapshot {
+            generation: self.keyboard_state.configuration_generation().unwrap_or(0),
+            source: self.keyboard_configuration_source,
+            persistence: self.keyboard_configuration_persistence,
+            environment_override_active: self.keyboard_environment_override_active,
+            pending: self.keyboard_state.has_pending_configuration(),
+            configuration: KeyboardConfigurationValue::from(&config),
+            layout,
+        })
+    }
+
+    pub(crate) fn prepare_keyboard_configuration(
+        &mut self,
+        config: crate::compositor::keyboard::KeyboardConfig,
+    ) -> Result<
+        crate::compositor::keyboard::KeyboardConfigurationPreparation,
+        KeyboardConfigurationControlError,
+    > {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardConfigurationControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        let active_matches = self
+            .keyboard_state
+            .configuration()
+            .is_some_and(|active| active == config);
+        let already_persisted = self.keyboard_configuration_source
+            == KeyboardConfigurationSource::Persisted
+            && self.keyboard_configuration_persistence
+                == KeyboardConfigurationPersistence::Persisted;
+        let preparation = if active_matches && !already_persisted {
+            self.keyboard_state.prepare_persistence_only(config)
+        } else {
+            self.keyboard_state.prepare_configuration(config)
+        };
+        preparation.map_err(map_keyboard_configuration_error)
+    }
+
+    pub(crate) fn mark_keyboard_configuration_persisted(
+        &mut self,
+    ) -> Result<(), KeyboardConfigurationControlError> {
+        self.keyboard_state
+            .mark_pending_configuration_persisted()
+            .map_err(|_| KeyboardConfigurationControlError::Internal("keyboard state unavailable"))
+    }
+
+    pub(crate) fn abort_keyboard_configuration(&mut self) -> bool {
+        self.keyboard_state.abort_prepared_configuration()
+    }
+
+    pub(crate) fn keyboard_configuration_pending(&self) -> bool {
+        self.keyboard_state.has_pending_configuration()
+    }
+
+    pub(crate) fn keyboard_configuration_pending_is_persisted(&self) -> bool {
+        self.keyboard_state.pending_configuration_is_persisted()
+    }
+
+    pub(crate) fn keyboard_reconfiguration_is_quiescent(&self) -> bool {
+        self.keyboard_state.keyboard_physical_keys_quiescent() && self.pressed_keys.is_empty()
+    }
+
+    pub(crate) fn commit_keyboard_configuration(
+        &mut self,
+    ) -> Result<KeyboardConfigurationMutation, KeyboardConfigurationControlError> {
+        if !self.keyboard_reconfiguration_is_quiescent() {
+            return Err(KeyboardConfigurationControlError::Busy);
+        }
+        let old_config = self.keyboard_state.configuration().ok_or(
+            KeyboardConfigurationControlError::Unavailable("keyboard state unavailable"),
+        )?;
+        let before_state = self.keyboard_serialized_state();
+        self.keyboard_state
+            .commit_prepared_configuration()
+            .map_err(|_| KeyboardConfigurationControlError::Internal("keyboard commit failed"))?;
+        let new_config = self.keyboard_state.configuration().ok_or(
+            KeyboardConfigurationControlError::Unavailable("keyboard state unavailable"),
+        )?;
+        self.keyboard_configuration_source = KeyboardConfigurationSource::Persisted;
+        self.keyboard_configuration_persistence = KeyboardConfigurationPersistence::Persisted;
+        let snapshot = self.keyboard_configuration_snapshot()?;
+        Ok(KeyboardConfigurationMutation {
+            snapshot,
+            keymap_changed: old_config.has_rmlvo_difference(&new_config),
+            repeat_changed: old_config.repeat_rate != new_config.repeat_rate
+                || old_config.repeat_delay != new_config.repeat_delay,
+            modifiers_changed: before_state != self.keyboard_serialized_state(),
+        })
+    }
+
+    pub(crate) fn publish_keyboard_keymap(&mut self) {
+        if !self.ensure_keyboard_state() {
+            return;
+        }
+        self.keyboard_resources.retain(Resource::is_alive);
+        for keyboard in &self.keyboard_resources {
+            let _ = self.keyboard_state.send_keymap(keyboard);
+        }
+    }
+
+    pub(crate) fn publish_keyboard_repeat_info(&mut self) {
+        if !self.ensure_keyboard_state() {
+            return;
+        }
+        self.keyboard_resources.retain(Resource::is_alive);
+        for keyboard in &self.keyboard_resources {
+            self.keyboard_state.send_repeat_info(keyboard);
+        }
     }
 
     pub(in crate::compositor) fn clear_pointer_button_state_for_removed_surfaces(

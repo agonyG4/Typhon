@@ -33,15 +33,34 @@ mod xkb_compat {
         ) -> c_int;
     }
 
-    pub(super) fn set_locked_layout(state: &xkb::State, index: i32) -> bool {
+    pub(super) fn update_latched_locked(
+        state: &xkb::State,
+        affect_locked_mods: u32,
+        locked_mods: u32,
+        index: i32,
+    ) -> Option<bool> {
         // SAFETY: `state.get_raw_ptr()` points to this live compositor-thread
         // XKB state; libxkbcommon does not retain it, the state outlives this
         // call, no concurrent access exists, the index was validated before
         // entry, and this declaration matches xkbcommon.h on >= 1.10.0.
         unsafe {
-            xkb_state_update_latched_locked(state.get_raw_ptr(), 0, 0, false, 0, 0, 0, true, index)
-                != 0
+            let result = xkb_state_update_latched_locked(
+                state.get_raw_ptr(),
+                0,
+                0,
+                false,
+                0,
+                affect_locked_mods,
+                locked_mods,
+                true,
+                index,
+            );
+            (result >= 0).then_some(result != 0)
         }
+    }
+
+    pub(super) fn set_locked_layout(state: &xkb::State, index: i32) -> bool {
+        update_latched_locked(state, 0, 0, index).is_some_and(|changed| changed)
     }
 }
 
@@ -49,14 +68,15 @@ const WL_KEYBOARD_REPEAT_INFO_SINCE: u32 = 4;
 const XKB_EVDEV_OFFSET: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct KeyboardConfig {
-    pub(super) rules: Option<String>,
-    pub(super) model: Option<String>,
-    pub(super) layout: String,
-    pub(super) variant: Option<String>,
-    pub(super) options: Option<String>,
-    pub(super) repeat_rate: i32,
-    pub(super) repeat_delay: i32,
+pub struct KeyboardConfig {
+    pub rules: Option<String>,
+    pub model: Option<String>,
+    pub layout: String,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+    pub repeat_rate: i32,
+    pub repeat_delay: i32,
+    pub default_layout_index: u32,
 }
 
 impl Default for KeyboardConfig {
@@ -69,29 +89,105 @@ impl Default for KeyboardConfig {
             options: None,
             repeat_rate: 25,
             repeat_delay: 600,
+            default_layout_index: 0,
         }
     }
 }
 
 impl KeyboardConfig {
-    pub(super) fn from_env() -> Self {
-        let default = Self::default();
+    pub fn select_startup(
+        persisted: Option<Self>,
+    ) -> Result<
+        (
+            Self,
+            crate::control_snapshots::KeyboardConfigurationSource,
+            bool,
+        ),
+        String,
+    > {
+        XkbKeyboardState::select_startup(persisted)
+    }
+
+    pub(crate) fn validate_structure(&self) -> Result<(), String> {
+        const MAX_FIELD_BYTES: usize = 4096;
+        const MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
+        let fields = [
+            ("rules", self.rules.as_deref()),
+            ("model", self.model.as_deref()),
+            ("layout", Some(self.layout.as_str())),
+            ("variant", self.variant.as_deref()),
+            ("options", self.options.as_deref()),
+        ];
+        if self.layout.is_empty() {
+            return Err("keyboard layout must not be empty".to_string());
+        }
+        if self.repeat_rate < 0 || self.repeat_delay < 0 {
+            return Err("keyboard repeat values must not be negative".to_string());
+        }
+        let mut total = 0usize;
+        for (name, value) in fields {
+            if let Some(value) = value {
+                if value.contains('\0') {
+                    return Err(format!("keyboard {name} contains NUL byte"));
+                }
+                if value.len() > MAX_FIELD_BYTES {
+                    return Err(format!("keyboard {name} exceeds {MAX_FIELD_BYTES} bytes"));
+                }
+                total = total.saturating_add(value.len());
+            }
+        }
+        total = total.saturating_add(std::mem::size_of::<i32>() * 2 + std::mem::size_of::<u32>());
+        if total > MAX_CONFIGURATION_BYTES {
+            return Err("keyboard configuration exceeds the bounded size".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_rmlvo_difference(&self, other: &Self) -> bool {
+        self.rules != other.rules
+            || self.model != other.model
+            || self.layout != other.layout
+            || self.variant != other.variant
+            || self.options != other.options
+    }
+
+    pub(crate) fn apply_environment_overrides(mut self) -> (Self, bool) {
         let layout_override = env_override("OBLIVION_ONE_XKB_LAYOUT");
         let variant_override = env_override("OBLIVION_ONE_XKB_VARIANT");
-        let (layout, variant) =
-            resolve_layout_variant(layout_override.as_deref(), variant_override.as_deref());
-        Self {
-            rules: optional_env("OBLIVION_ONE_XKB_RULES"),
-            model: optional_env("OBLIVION_ONE_XKB_MODEL"),
-            layout,
-            variant,
-            options: optional_env("OBLIVION_ONE_XKB_OPTIONS").or(default.options),
-            repeat_rate: non_negative_env_i32("OBLIVION_ONE_XKB_REPEAT_RATE", default.repeat_rate),
-            repeat_delay: non_negative_env_i32(
-                "OBLIVION_ONE_XKB_REPEAT_DELAY",
-                default.repeat_delay,
-            ),
-        }
+        let (layout, variant) = match (layout_override.as_deref(), variant_override.as_deref()) {
+            (None, None) => (self.layout.clone(), self.variant.clone()),
+            (None, Some(variant)) => (self.layout.clone(), Some(variant.to_string())),
+            (Some(layout), variant) => (layout.to_string(), variant.map(str::to_string)),
+        };
+        self.rules = optional_env("OBLIVION_ONE_XKB_RULES").or(self.rules);
+        self.model = optional_env("OBLIVION_ONE_XKB_MODEL").or(self.model);
+        self.layout = layout;
+        self.variant = variant;
+        self.options = optional_env("OBLIVION_ONE_XKB_OPTIONS").or(self.options);
+        self.repeat_rate = non_negative_env_i32("OBLIVION_ONE_XKB_REPEAT_RATE", self.repeat_rate);
+        self.repeat_delay =
+            non_negative_env_i32("OBLIVION_ONE_XKB_REPEAT_DELAY", self.repeat_delay);
+        self.default_layout_index = non_negative_env_u32(
+            "OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX",
+            self.default_layout_index,
+        );
+        let active = [
+            "OBLIVION_ONE_XKB_RULES",
+            "OBLIVION_ONE_XKB_MODEL",
+            "OBLIVION_ONE_XKB_LAYOUT",
+            "OBLIVION_ONE_XKB_VARIANT",
+            "OBLIVION_ONE_XKB_OPTIONS",
+            "OBLIVION_ONE_XKB_REPEAT_RATE",
+            "OBLIVION_ONE_XKB_REPEAT_DELAY",
+            "OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX",
+        ]
+        .into_iter()
+        .any(|name| env::var_os(name).is_some());
+        (self, active)
+    }
+
+    pub(super) fn from_env() -> Self {
+        Self::default().apply_environment_overrides().0
     }
 
     fn minimal_us() -> Self {
@@ -106,6 +202,7 @@ impl KeyboardConfig {
     fn with_repeat_from(mut self, requested: &Self) -> Self {
         self.repeat_rate = requested.repeat_rate;
         self.repeat_delay = requested.repeat_delay;
+        self.default_layout_index = requested.default_layout_index;
         self
     }
 }
@@ -113,6 +210,7 @@ impl KeyboardConfig {
 const DEFAULT_LAYOUT: &str = "br";
 const DEFAULT_VARIANT: &str = "abnt2";
 
+#[cfg(test)]
 fn resolve_layout_variant(
     layout_override: Option<&str>,
     variant_override: Option<&str>,
@@ -141,6 +239,16 @@ fn non_negative_env_i32(name: &str, default: i32) -> i32 {
     {
         Some(value) if value >= 0 => value,
         _ => default,
+    }
+}
+
+fn non_negative_env_u32(name: &str, default: u32) -> u32 {
+    match env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        Some(value) => value,
+        None => default,
     }
 }
 
@@ -185,6 +293,30 @@ pub(super) struct XkbKeyboardState {
     physical_pressed_keys: HashSet<u32>,
     config: KeyboardConfig,
     serialized_keymap_v1: Vec<u8>,
+    pending_configuration: Option<PendingKeyboardConfiguration>,
+    configuration_generation: u64,
+}
+
+pub(super) struct PreparedKeyboardConfiguration {
+    pub(super) config: KeyboardConfig,
+    pub(super) keymap: xkb::Keymap,
+    pub(super) serialized_keymap_v1: Vec<u8>,
+}
+
+struct PendingKeyboardConfiguration {
+    config: KeyboardConfig,
+    candidate: Option<PreparedKeyboardConfiguration>,
+    persisted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardConfigurationPreparation {
+    NoOp,
+    PersistOnly,
+    RepeatOnly,
+    DefaultOnly,
+    RepeatAndDefault,
+    Full,
 }
 
 #[derive(Debug, Default)]
@@ -224,6 +356,7 @@ impl fmt::Debug for XkbKeyboardState {
 
 impl XkbKeyboardState {
     pub(super) fn from_config(config: &KeyboardConfig) -> Result<Self, String> {
+        config.validate_structure()?;
         if let Some(value) = [
             config.rules.as_deref(),
             config.model.as_deref(),
@@ -253,6 +386,19 @@ impl XkbKeyboardState {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .ok_or_else(|| format!("libxkbcommon rejected {}", describe_config(config)))?;
+        if keymap.num_layouts() == 0 {
+            return Err(format!(
+                "libxkbcommon returned no layouts for {}",
+                describe_config(config)
+            ));
+        }
+        if config.default_layout_index >= keymap.num_layouts() {
+            return Err(format!(
+                "default layout index {} is out of range for {} layouts",
+                config.default_layout_index,
+                keymap.num_layouts()
+            ));
+        }
         let mut serialized_keymap_v1 = keymap
             .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
             .into_bytes();
@@ -267,13 +413,240 @@ impl XkbKeyboardState {
         }
 
         let physical_state = xkb::State::new(&keymap);
+        let default_layout = i32::try_from(config.default_layout_index)
+            .map_err(|_| "default layout index is not representable".to_string())?;
+        if xkb_compat::update_latched_locked(&physical_state, 0, 0, default_layout).is_none() {
+            return Err("initial keyboard layout update failed".to_string());
+        }
         Ok(Self {
             keymap,
             physical_state,
             physical_pressed_keys: HashSet::new(),
             config: config.clone(),
             serialized_keymap_v1,
+            pending_configuration: None,
+            configuration_generation: 1,
         })
+    }
+
+    fn compile_candidate(config: &KeyboardConfig) -> Result<PreparedKeyboardConfiguration, String> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            config.rules.as_deref().unwrap_or(""),
+            config.model.as_deref().unwrap_or(""),
+            &config.layout,
+            config.variant.as_deref().unwrap_or(""),
+            config.options.clone(),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| format!("libxkbcommon rejected {}", describe_config(config)))?;
+        if keymap.num_layouts() == 0 {
+            return Err("compiled keyboard keymap has no layouts".to_string());
+        }
+        if config.default_layout_index >= keymap.num_layouts() {
+            return Err(format!(
+                "default layout index {} is out of range for {} layouts",
+                config.default_layout_index,
+                keymap.num_layouts()
+            ));
+        }
+        let mut serialized_keymap_v1 = keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            .into_bytes();
+        if serialized_keymap_v1.last().copied() != Some(0) {
+            serialized_keymap_v1.push(0);
+        }
+        if serialized_keymap_v1.len() <= 1 || serialized_keymap_v1.len() > 1024 * 1024 {
+            return Err("compiled keyboard keymap has an invalid Text V1 size".to_string());
+        }
+        if serialized_keymap_v1[..serialized_keymap_v1.len() - 1].contains(&0) {
+            return Err("compiled keyboard keymap contains an embedded NUL".to_string());
+        }
+        Ok(PreparedKeyboardConfiguration {
+            config: config.clone(),
+            keymap,
+            serialized_keymap_v1,
+        })
+    }
+
+    pub(super) fn configuration(&self) -> KeyboardConfig {
+        self.config.clone()
+    }
+
+    pub(super) fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    pub(super) fn prepare_configuration(
+        &mut self,
+        config: KeyboardConfig,
+    ) -> Result<KeyboardConfigurationPreparation, String> {
+        if self.pending_configuration.is_some() {
+            return Err("keyboard configuration mutation is busy".to_string());
+        }
+        config.validate_structure()?;
+        if config == self.config {
+            return Ok(KeyboardConfigurationPreparation::NoOp);
+        }
+
+        let rmlvo_changed = config.has_rmlvo_difference(&self.config);
+        let repeat_changed = config.repeat_rate != self.config.repeat_rate
+            || config.repeat_delay != self.config.repeat_delay;
+        let default_changed = config.default_layout_index != self.config.default_layout_index;
+        let preparation = if rmlvo_changed {
+            let candidate = Self::compile_candidate(&config)?;
+            self.pending_configuration = Some(PendingKeyboardConfiguration {
+                config,
+                candidate: Some(candidate),
+                persisted: false,
+            });
+            KeyboardConfigurationPreparation::Full
+        } else if default_changed {
+            if config.default_layout_index >= self.keymap.num_layouts() {
+                return Err(format!(
+                    "default layout index {} is out of range for {} layouts",
+                    config.default_layout_index,
+                    self.keymap.num_layouts()
+                ));
+            }
+            self.pending_configuration = Some(PendingKeyboardConfiguration {
+                config,
+                candidate: None,
+                persisted: false,
+            });
+            if repeat_changed {
+                KeyboardConfigurationPreparation::RepeatAndDefault
+            } else {
+                KeyboardConfigurationPreparation::DefaultOnly
+            }
+        } else {
+            debug_assert!(repeat_changed);
+            self.pending_configuration = Some(PendingKeyboardConfiguration {
+                config,
+                candidate: None,
+                persisted: false,
+            });
+            KeyboardConfigurationPreparation::RepeatOnly
+        };
+        Ok(preparation)
+    }
+
+    pub(super) fn prepare_persistence_only(
+        &mut self,
+        config: KeyboardConfig,
+    ) -> Result<KeyboardConfigurationPreparation, String> {
+        if self.pending_configuration.is_some() {
+            return Err("keyboard configuration mutation is busy".to_string());
+        }
+        config.validate_structure()?;
+        if config != self.config {
+            return Err("keyboard active configuration changed unexpectedly".to_string());
+        }
+        self.pending_configuration = Some(PendingKeyboardConfiguration {
+            config,
+            candidate: None,
+            persisted: false,
+        });
+        Ok(KeyboardConfigurationPreparation::PersistOnly)
+    }
+
+    pub(super) fn has_pending_configuration(&self) -> bool {
+        self.pending_configuration.is_some()
+    }
+
+    pub(super) fn pending_configuration_is_persisted(&self) -> bool {
+        self.pending_configuration
+            .as_ref()
+            .is_some_and(|pending| pending.persisted)
+    }
+
+    pub(super) fn mark_pending_configuration_persisted(&mut self) -> Result<(), String> {
+        let Some(pending) = self.pending_configuration.as_mut() else {
+            return Err("keyboard configuration transaction is not pending".to_string());
+        };
+        pending.persisted = true;
+        Ok(())
+    }
+
+    pub(super) fn abort_prepared_configuration(&mut self) -> bool {
+        self.pending_configuration.take().is_some()
+    }
+
+    pub(super) fn commit_prepared_configuration(&mut self) -> Result<bool, String> {
+        let Some(pending) = self.pending_configuration.as_ref() else {
+            return Err("keyboard configuration transaction is not pending".to_string());
+        };
+        if !pending.persisted {
+            return Err("keyboard configuration persistence is not complete".to_string());
+        }
+        if !self.physical_pressed_keys.is_empty() {
+            return Err("keyboard configuration commit requires a quiescent keyboard".to_string());
+        }
+        let pending = self
+            .pending_configuration
+            .take()
+            .expect("pending keyboard configuration checked above");
+        let PendingKeyboardConfiguration {
+            config,
+            candidate,
+            persisted: _,
+        } = pending;
+        if let Some(candidate) = candidate {
+            debug_assert_eq!(candidate.config, config);
+            let locked_names = self.locked_modifier_names();
+            let new_state = xkb::State::new(&candidate.keymap);
+            let locked_mask = locked_names.into_iter().fold(0u32, |mask, name| {
+                let index = candidate.keymap.mod_get_index(&name);
+                if index < 32 {
+                    mask | (1u32 << index)
+                } else {
+                    mask
+                }
+            });
+            let layout = i32::try_from(config.default_layout_index)
+                .map_err(|_| "default layout index is not representable".to_string())?;
+            let affect_locked_mods = if candidate.keymap.num_mods() >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << candidate.keymap.num_mods()) - 1
+            };
+            if xkb_compat::update_latched_locked(
+                &new_state,
+                affect_locked_mods,
+                locked_mask,
+                layout,
+            )
+            .is_none()
+            {
+                return Err("replacement keyboard state update failed".to_string());
+            }
+            self.keymap = candidate.keymap;
+            self.physical_state = new_state;
+            self.serialized_keymap_v1 = candidate.serialized_keymap_v1;
+        } else if config.default_layout_index != self.config.default_layout_index {
+            let layout = i32::try_from(config.default_layout_index)
+                .map_err(|_| "default layout index is not representable".to_string())?;
+            if !xkb_compat::set_locked_layout(&self.physical_state, layout) {
+                return Err("keyboard default layout update failed".to_string());
+            }
+        }
+        let changed = config != self.config;
+        if changed {
+            self.config = config;
+            self.configuration_generation = self.configuration_generation.saturating_add(1);
+        }
+        Ok(changed)
+    }
+
+    fn locked_modifier_names(&self) -> Vec<String> {
+        (0..self.keymap.num_mods())
+            .filter(|index| {
+                self.physical_state
+                    .mod_index_is_active(*index, xkb::STATE_MODS_LOCKED)
+            })
+            .map(|index| self.keymap.mod_get_name(index).to_string())
+            .collect()
     }
 
     pub(super) fn from_environment() -> Result<Self, String> {
@@ -285,6 +658,81 @@ impl XkbKeyboardState {
             ("baseline", baseline),
             ("minimal us", minimal_us),
         ])
+    }
+
+    pub fn select_startup(
+        persisted: Option<KeyboardConfig>,
+    ) -> Result<
+        (
+            KeyboardConfig,
+            crate::control_snapshots::KeyboardConfigurationSource,
+            bool,
+        ),
+        String,
+    > {
+        let default = KeyboardConfig::default();
+        let persisted_base = persisted.clone().unwrap_or_else(|| default.clone());
+        let (environment, environment_override_active) =
+            persisted_base.clone().apply_environment_overrides();
+        let (default_environment, _) = default.clone().apply_environment_overrides();
+        let environment_index_fallback = (environment_override_active
+            && env::var_os("OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX").is_none())
+        .then(|| KeyboardConfig {
+            default_layout_index: 0,
+            ..environment.clone()
+        });
+        let mut candidates = Vec::new();
+        candidates.push((
+            environment,
+            if environment_override_active {
+                crate::control_snapshots::KeyboardConfigurationSource::Environment
+            } else if persisted.is_some() {
+                crate::control_snapshots::KeyboardConfigurationSource::Persisted
+            } else {
+                crate::control_snapshots::KeyboardConfigurationSource::Default
+            },
+        ));
+        if let Some(environment_index_fallback) = environment_index_fallback {
+            candidates.push((
+                environment_index_fallback,
+                crate::control_snapshots::KeyboardConfigurationSource::Environment,
+            ));
+        }
+        if environment_override_active {
+            if persisted.is_some() {
+                candidates.push((
+                    persisted_base,
+                    crate::control_snapshots::KeyboardConfigurationSource::Persisted,
+                ));
+            }
+            candidates.push((
+                default_environment,
+                crate::control_snapshots::KeyboardConfigurationSource::Environment,
+            ));
+        }
+        candidates.push((
+            default.clone(),
+            crate::control_snapshots::KeyboardConfigurationSource::Default,
+        ));
+        candidates.push((
+            KeyboardConfig::minimal_us().with_repeat_from(&default),
+            crate::control_snapshots::KeyboardConfigurationSource::Default,
+        ));
+
+        let mut failures = Vec::new();
+        for (config, source) in candidates {
+            match Self::from_config(&config) {
+                Ok(state) => {
+                    drop(state);
+                    return Ok((config, source, environment_override_active));
+                }
+                Err(error) => failures.push(format!("{}: {error}", describe_config(&config))),
+            }
+        }
+        Err(format!(
+            "all startup keyboard configurations failed: {}",
+            failures.join("; ")
+        ))
     }
 
     fn from_candidates<'a>(
@@ -430,7 +878,7 @@ impl XkbKeyboardState {
         Ok((file, size))
     }
 
-    pub(super) fn send_initial_state(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
+    pub(super) fn send_keymap(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
         match self.keymap_file() {
             Ok((file, size)) => {
                 let _ = keyboard.send_event(wl_keyboard::Event::Keymap {
@@ -445,12 +893,23 @@ impl XkbKeyboardState {
             }
         }
 
+        true
+    }
+
+    pub(super) fn send_repeat_info(&self, keyboard: &wl_keyboard::WlKeyboard) {
         if keyboard.version() >= WL_KEYBOARD_REPEAT_INFO_SINCE {
             let _ = keyboard.send_event(wl_keyboard::Event::RepeatInfo {
                 rate: self.config.repeat_rate,
                 delay: self.config.repeat_delay,
             });
         }
+    }
+
+    pub(super) fn send_initial_state(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
+        if !self.send_keymap(keyboard) {
+            return false;
+        }
+        self.send_repeat_info(keyboard);
         true
     }
 
@@ -486,6 +945,10 @@ impl XkbKeyboardState {
 impl KeyboardStateHandle {
     pub(super) fn ensure(&mut self) -> bool {
         self.ensure_with(XkbKeyboardState::from_environment)
+    }
+
+    pub(super) fn ensure_with_config(&mut self, config: KeyboardConfig) -> bool {
+        self.ensure_with(|| XkbKeyboardState::from_config(&config))
     }
 
     fn ensure_with<F>(&mut self, initialize: F) -> bool
@@ -533,6 +996,169 @@ impl KeyboardStateHandle {
                 .borrow()
                 .get(&id)
                 .map(XkbKeyboardState::wayland_serialized_state)
+        })
+    }
+
+    pub(super) fn send_keymap(&self, keyboard: &wl_keyboard::WlKeyboard) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .is_some_and(|state| state.send_keymap(keyboard))
+        })
+    }
+
+    pub(super) fn send_repeat_info(&self, keyboard: &wl_keyboard::WlKeyboard) {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return;
+        };
+        KEYBOARD_STATES.with(|states| {
+            if let Some(state) = states.borrow().get(&id) {
+                state.send_repeat_info(keyboard);
+            }
+        });
+    }
+
+    pub(super) fn configuration(&self) -> Option<KeyboardConfig> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return None;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map(XkbKeyboardState::configuration)
+        })
+    }
+
+    pub(super) fn configuration_generation(&self) -> Option<u64> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return None;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map(XkbKeyboardState::configuration_generation)
+        })
+    }
+
+    pub(super) fn prepare_configuration(
+        &mut self,
+        config: KeyboardConfig,
+    ) -> Result<KeyboardConfigurationPreparation, String> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err("keyboard state unavailable".to_string());
+        };
+        let result = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(|state| state.prepare_configuration(config))
+        });
+        match result {
+            Some(result) => result,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                Err("keyboard state unavailable".to_string())
+            }
+        }
+    }
+
+    pub(super) fn prepare_persistence_only(
+        &mut self,
+        config: KeyboardConfig,
+    ) -> Result<KeyboardConfigurationPreparation, String> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err("keyboard state unavailable".to_string());
+        };
+        let result = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(|state| state.prepare_persistence_only(config))
+        });
+        match result {
+            Some(result) => result,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                Err("keyboard state unavailable".to_string())
+            }
+        }
+    }
+
+    pub(super) fn has_pending_configuration(&self) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .is_some_and(XkbKeyboardState::has_pending_configuration)
+        })
+    }
+
+    pub(super) fn pending_configuration_is_persisted(&self) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .is_some_and(XkbKeyboardState::pending_configuration_is_persisted)
+        })
+    }
+
+    pub(super) fn mark_pending_configuration_persisted(&mut self) -> Result<(), String> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err("keyboard state unavailable".to_string());
+        };
+        KEYBOARD_STATES.with(|states| {
+            states.borrow_mut().get_mut(&id).map_or_else(
+                || Err("keyboard state unavailable".to_string()),
+                XkbKeyboardState::mark_pending_configuration_persisted,
+            )
+        })
+    }
+
+    pub(super) fn abort_prepared_configuration(&mut self) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .is_some_and(XkbKeyboardState::abort_prepared_configuration)
+        })
+    }
+
+    pub(super) fn keyboard_physical_keys_quiescent(&self) -> bool {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return false;
+        };
+        KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .is_some_and(|state| state.physical_pressed_keys.is_empty())
+        })
+    }
+
+    pub(super) fn commit_prepared_configuration(&mut self) -> Result<bool, String> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err("keyboard state unavailable".to_string());
+        };
+        KEYBOARD_STATES.with(|states| {
+            states.borrow_mut().get_mut(&id).map_or_else(
+                || Err("keyboard state unavailable".to_string()),
+                XkbKeyboardState::commit_prepared_configuration,
+            )
         })
     }
 
@@ -731,6 +1357,208 @@ mod tests {
         assert_eq!(config.options, None);
         assert_eq!(config.repeat_rate, 25);
         assert_eq!(config.repeat_delay, 600);
+        assert_eq!(config.default_layout_index, 0);
+    }
+
+    #[test]
+    fn keyboard_config_json_preserves_nullable_rmlvo_fields_and_default_index() {
+        let value = crate::keyboard_persistence::KeyboardConfigurationValue {
+            rules: None,
+            model: Some(String::new()),
+            layout: "br,us".to_string(),
+            variant: Some("abnt2,".to_string()),
+            options: None,
+            repeat_rate: 40,
+            repeat_delay: 300,
+            default_layout_index: 1,
+        };
+        let encoded = serde_json::to_value(&value).expect("keyboard config JSON");
+        assert_eq!(encoded["model"], serde_json::json!(""));
+        assert_eq!(encoded["variant"], serde_json::json!("abnt2,"));
+        assert_eq!(encoded["defaultLayoutIndex"], serde_json::json!(1));
+
+        let decoded: crate::keyboard_persistence::KeyboardConfigurationValue =
+            serde_json::from_value(encoded).expect("keyboard config JSON round trip");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn keyboard_config_json_rejects_unknown_fields_and_wrong_version() {
+        let unknown = serde_json::json!({
+            "version": 1,
+            "rules": null,
+            "model": null,
+            "layout": "us",
+            "variant": null,
+            "options": null,
+            "repeatRate": 25,
+            "repeatDelay": 600,
+            "defaultLayoutIndex": 0,
+            "compiledKeymap": "must not persist"
+        });
+        assert!(
+            serde_json::from_value::<crate::keyboard_persistence::KeyboardConfigurationDocument>(
+                unknown
+            )
+            .is_err()
+        );
+
+        let wrong_version = serde_json::json!({
+            "version": 2,
+            "rules": null,
+            "model": null,
+            "layout": "us",
+            "variant": null,
+            "options": null,
+            "repeatRate": 25,
+            "repeatDelay": 600,
+            "defaultLayoutIndex": 0
+        });
+        let parsed = serde_json::from_value::<
+            crate::keyboard_persistence::KeyboardConfigurationDocument,
+        >(wrong_version)
+        .expect("wrong version remains syntactically readable");
+        assert!(parsed.into_config().is_err());
+    }
+
+    #[test]
+    fn runtime_configuration_candidate_is_validated_before_active_swap() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        let active_bytes = state.keymap_text_v1().to_string();
+        let invalid = KeyboardConfig {
+            layout: "not-a-real-layout".to_string(),
+            variant: None,
+            ..KeyboardConfig::default()
+        };
+        assert!(state.prepare_configuration(invalid).is_err());
+        assert!(!state.has_pending_configuration());
+        assert_eq!(state.keymap_text_v1(), active_bytes);
+
+        let replacement = KeyboardConfig {
+            layout: "us".to_string(),
+            variant: None,
+            ..KeyboardConfig::default()
+        };
+        assert!(matches!(
+            state.prepare_configuration(replacement.clone()),
+            Ok(KeyboardConfigurationPreparation::Full)
+        ));
+        assert_eq!(state.configuration(), KeyboardConfig::default());
+        state.mark_pending_configuration_persisted().unwrap();
+        assert!(state.commit_prepared_configuration().unwrap());
+        assert_eq!(state.configuration(), replacement);
+        assert_ne!(state.keymap_text_v1(), active_bytes);
+        assert!(!state.has_pending_configuration());
+    }
+
+    #[test]
+    fn startup_restoration_applies_the_persisted_default_layout_index() {
+        let config = KeyboardConfig {
+            layout: "br,us".to_string(),
+            variant: Some("abnt2,".to_string()),
+            default_layout_index: 1,
+            ..KeyboardConfig::default()
+        };
+        let state = XkbKeyboardState::from_config(&config).unwrap();
+        assert_eq!(state.layout_snapshot().unwrap().locked_index, 1);
+    }
+
+    #[test]
+    fn invalid_variant_options_and_default_index_leave_active_keymap_untouched() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        let active = state.keymap_text_v1().to_string();
+        for candidate in [
+            KeyboardConfig {
+                layout: "us".to_string(),
+                variant: Some("not-a-real-variant".to_string()),
+                ..KeyboardConfig::default()
+            },
+            KeyboardConfig {
+                options: Some("grp:\0".to_string()),
+                ..KeyboardConfig::default()
+            },
+            KeyboardConfig {
+                default_layout_index: 1,
+                ..KeyboardConfig::default()
+            },
+        ] {
+            assert!(state.prepare_configuration(candidate).is_err());
+            assert_eq!(state.keymap_text_v1(), active);
+            assert_eq!(state.configuration(), KeyboardConfig::default());
+        }
+    }
+
+    #[test]
+    fn repeat_and_default_only_configuration_changes_do_not_recompile() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig {
+            layout: "br,us".to_string(),
+            variant: Some("abnt2,".to_string()),
+            ..KeyboardConfig::default()
+        })
+        .unwrap();
+        let keymap_before = state.keymap_text_v1().to_string();
+        let same = state.configuration();
+        assert!(matches!(
+            state.prepare_persistence_only(same),
+            Ok(KeyboardConfigurationPreparation::PersistOnly)
+        ));
+        state.mark_pending_configuration_persisted().unwrap();
+        assert!(!state.commit_prepared_configuration().unwrap());
+        assert_eq!(state.keymap_text_v1(), keymap_before);
+
+        let repeat = KeyboardConfig {
+            repeat_rate: 40,
+            repeat_delay: 300,
+            ..state.configuration()
+        };
+        assert!(matches!(
+            state.prepare_configuration(repeat),
+            Ok(KeyboardConfigurationPreparation::RepeatOnly)
+        ));
+        state.mark_pending_configuration_persisted().unwrap();
+        assert!(state.commit_prepared_configuration().unwrap());
+        assert_eq!(state.keymap_text_v1(), keymap_before);
+
+        let default_layout = KeyboardConfig {
+            default_layout_index: 1,
+            ..state.configuration()
+        };
+        assert!(matches!(
+            state.prepare_configuration(default_layout),
+            Ok(KeyboardConfigurationPreparation::DefaultOnly)
+        ));
+        state.mark_pending_configuration_persisted().unwrap();
+        assert!(state.commit_prepared_configuration().unwrap());
+        assert_eq!(state.keymap_text_v1(), keymap_before);
+        assert_eq!(state.layout_snapshot().unwrap().locked_index, 1);
+    }
+
+    #[test]
+    fn full_configuration_commit_migrates_named_locks_and_clears_transient_state() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        state.update_physical_key(58, true);
+        state.update_physical_key(58, false);
+        state.update_physical_key(42, true);
+        assert!(state.led_active(xkb::LED_NAME_CAPS));
+
+        let replacement = KeyboardConfig {
+            layout: "us".to_string(),
+            variant: None,
+            ..KeyboardConfig::default()
+        };
+        assert!(matches!(
+            state.prepare_configuration(replacement),
+            Ok(KeyboardConfigurationPreparation::Full)
+        ));
+        state.mark_pending_configuration_persisted().unwrap();
+        assert!(state.commit_prepared_configuration().is_err());
+        state.update_physical_key(42, false);
+        assert!(state.commit_prepared_configuration().unwrap());
+        assert!(state.led_active(xkb::LED_NAME_CAPS));
+        let serialized = state.wayland_serialized_state();
+        assert_eq!(serialized.depressed, 0);
+        assert_eq!(serialized.latched, 0);
+        assert!(state.physical_pressed_keys.is_empty());
     }
 
     #[test]
@@ -1252,5 +2080,50 @@ mod tests {
         }
         assert_eq!(config.repeat_rate, 25);
         assert_eq!(config.repeat_delay, 600);
+    }
+
+    #[test]
+    fn startup_environment_layout_override_retries_persisted_index_at_zero() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_layout = env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+        let previous_variant = env::var_os("OBLIVION_ONE_XKB_VARIANT");
+        let previous_default_index = env::var_os("OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX");
+        // SAFETY: the test serializes process-wide environment changes.
+        unsafe {
+            env::set_var("OBLIVION_ONE_XKB_LAYOUT", "us");
+            env::remove_var("OBLIVION_ONE_XKB_VARIANT");
+            env::remove_var("OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX");
+        }
+        let persisted = KeyboardConfig {
+            layout: "br,us".to_string(),
+            variant: Some("abnt2,".to_string()),
+            default_layout_index: 1,
+            ..KeyboardConfig::default()
+        };
+        let (selected, source, environment_active) =
+            KeyboardConfig::select_startup(Some(persisted)).expect("startup configuration");
+        // SAFETY: restore the process-wide environment after the serialized test.
+        unsafe {
+            match previous_layout {
+                Some(value) => env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+                None => env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+            }
+            match previous_variant {
+                Some(value) => env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+                None => env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+            }
+            match previous_default_index {
+                Some(value) => env::set_var("OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX", value),
+                None => env::remove_var("OBLIVION_ONE_XKB_DEFAULT_LAYOUT_INDEX"),
+            }
+        }
+        assert_eq!(selected.layout, "us");
+        assert_eq!(selected.variant, None);
+        assert_eq!(selected.default_layout_index, 0);
+        assert_eq!(
+            source,
+            crate::control_snapshots::KeyboardConfigurationSource::Environment
+        );
+        assert!(environment_active);
     }
 }

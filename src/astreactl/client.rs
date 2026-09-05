@@ -16,8 +16,8 @@ use crate::control::{
 };
 use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
-    DecorationThemeSnapshot, DoctorSnapshot, KeyboardLayoutSnapshot, OutputListSnapshot,
-    PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
+    DecorationThemeSnapshot, DoctorSnapshot, KeyboardConfigurationSnapshot, KeyboardLayoutSnapshot,
+    OutputListSnapshot, PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -96,6 +96,23 @@ fn decode_command_result(
                 Ok(snapshot)
             })
             .map(AstreactlResult::KeyboardLayout),
+        "keyboard.config.get" | "keyboard.config.set" => {
+            serde_json::from_value::<KeyboardConfigurationSnapshot>(value)
+                .and_then(|snapshot| {
+                    validate_keyboard_layout_snapshot(&snapshot.layout)?;
+                    let configuration = &snapshot.configuration;
+                    if configuration.layout.is_empty()
+                        || configuration.repeat_rate < 0
+                        || configuration.repeat_delay < 0
+                    {
+                        return Err(serde_json::Error::custom(
+                            "invalid keyboard configuration values",
+                        ));
+                    }
+                    Ok(snapshot)
+                })
+                .map(AstreactlResult::KeyboardConfiguration)
+        }
         "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
             serde_json::from_value::<CursorSnapshot>(value)
                 .and_then(|snapshot| {
@@ -483,6 +500,57 @@ mod tests {
         invalid["lockedIndex"] = serde_json::json!(2);
         assert!(matches!(
             decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+    }
+
+    #[test]
+    fn keyboard_configuration_result_decoding_validates_nested_layout_and_values() {
+        let valid = serde_json::json!({
+            "generation": 3,
+            "source": "persisted",
+            "persistence": "persisted",
+            "environmentOverrideActive": false,
+            "pending": false,
+            "configuration": {
+                "rules": null,
+                "model": null,
+                "layout": "br,us",
+                "variant": "abnt2,",
+                "options": null,
+                "repeatRate": 25,
+                "repeatDelay": 600,
+                "defaultLayoutIndex": 0
+            },
+            "layout": {
+                "effectiveIndex": 0,
+                "lockedIndex": 0,
+                "layoutCount": 2,
+                "layouts": [
+                    {"index": 0, "name": "Portuguese (Brazil)"},
+                    {"index": 1, "name": "English (US)"}
+                ]
+            }
+        });
+        assert!(matches!(
+            decode_command_result(
+                "keyboard.config.get",
+                ControlResponse::success(1, valid.clone())
+            ),
+            Ok(AstreactlResult::KeyboardConfiguration(_))
+        ));
+
+        let mut invalid = valid.clone();
+        invalid["configuration"]["layout"] = serde_json::json!("");
+        assert!(matches!(
+            decode_command_result("keyboard.config.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+
+        let mut invalid = valid;
+        invalid["layout"]["lockedIndex"] = serde_json::json!(2);
+        assert!(matches!(
+            decode_command_result("keyboard.config.get", ControlResponse::success(1, invalid)),
             Err(AstreactlError::MalformedResponse)
         ));
     }

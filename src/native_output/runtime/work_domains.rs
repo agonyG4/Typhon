@@ -136,7 +136,9 @@ impl NativeWorkDomains {
                 .continuation
                 .contains(NativeContinuationReason::CommitTimingPlanning);
         let cursor = reasons.cursor_io_worker()
+            || reasons.keyboard_persistence_worker()
             || !wakeup.cursor_io_events.is_empty()
+            || !wakeup.keyboard_persistence_events.is_empty()
             || state.cursor_only_due;
         let wayland_dispatch = wayland_protocol;
         let surface_pacing = state.pacing_due;
@@ -220,6 +222,7 @@ mod tests {
             xwayland_events: Vec::new(),
             control_events: Vec::new(),
             cursor_io_events: Vec::new(),
+            keyboard_persistence_events: Vec::new(),
         }
     }
 

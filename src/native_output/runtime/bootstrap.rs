@@ -1,18 +1,37 @@
 use super::kms_worker_startup::start_kms_commit_worker;
 use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerHandle, KmsCommitWorkerPolicy};
+use oblivion_one::compositor::KeyboardConfig;
 use oblivion_one::compositor::gpu_protocol_capabilities::{
     GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
 };
+use oblivion_one::control_snapshots::KeyboardConfigurationPersistence;
 use oblivion_one::cursor_manager::{CursorThemeManager, SystemCursorThemeLoader};
 use oblivion_one::cursor_persistence::CursorConfigurationStore;
 use oblivion_one::cursor_theme::{CompositorCursorImage, install_shared_compositor_cursor};
+use oblivion_one::keyboard_persistence::{
+    KeyboardConfigurationStore, KeyboardPersistenceError, KeyboardPersistenceWorker,
+};
 use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
 use std::{
     fs::OpenOptions,
     os::{fd::AsFd, unix::fs::MetadataExt},
     sync::Arc,
 };
+
+fn keyboard_persistence_snapshot(
+    result: Result<KeyboardConfig, KeyboardPersistenceError>,
+) -> (Option<KeyboardConfig>, KeyboardConfigurationPersistence) {
+    match result {
+        Ok(config) => (Some(config), KeyboardConfigurationPersistence::Persisted),
+        Err(KeyboardPersistenceError::Missing) => (None, KeyboardConfigurationPersistence::Missing),
+        Err(KeyboardPersistenceError::Invalid) => (None, KeyboardConfigurationPersistence::Invalid),
+        Err(KeyboardPersistenceError::Insecure) => {
+            (None, KeyboardConfigurationPersistence::Insecure)
+        }
+        Err(_) => (None, KeyboardConfigurationPersistence::Unavailable),
+    }
+}
 pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
     bootstrap: &NativeOutputBootstrap,
@@ -167,6 +186,7 @@ fn build_native_kms_startup_plan(
 }
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
+    keyboard_store: KeyboardConfigurationStore,
     cursor_image: Arc<CompositorCursorImage>,
     cursor_manager: CursorThemeManager,
     perf: NativePerfLogger,
@@ -201,6 +221,7 @@ impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
             mut server,
+            keyboard_store,
             cursor_image,
             mut cursor_manager,
             perf,
@@ -398,6 +419,16 @@ impl NativeRuntime {
             cursor_io_worker.event_fd(),
             NativeEventSource::CursorIoWorker,
         )?);
+        let keyboard_persistence_worker = KeyboardPersistenceWorker::new(keyboard_store).ok();
+        let keyboard_persistence_worker_reactor_token = keyboard_persistence_worker
+            .as_ref()
+            .map(|worker| {
+                event_loop.register(
+                    worker.event_fd(),
+                    NativeEventSource::KeyboardPersistenceWorker,
+                )
+            })
+            .transpose()?;
         let mut xwayland = XwaylandService::bootstrap()?;
         let mut xwayland_reactor_tokens = Vec::new();
         sync_xwayland_bootstrap_sources(
@@ -642,6 +673,10 @@ impl NativeRuntime {
             cursor_io_worker_reactor_token,
             pending_cursor_job: None,
             next_cursor_job_id: 1,
+            keyboard_persistence_worker,
+            keyboard_persistence_worker_reactor_token,
+            pending_keyboard_job: None,
+            next_keyboard_job_id: 1,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
             kms_commit_worker_startup,
@@ -719,6 +754,20 @@ impl NativeRuntime {
             app,
             app_gpu_preference,
         } = config;
+        let keyboard_store = KeyboardConfigurationStore::from_environment()
+            .unwrap_or_else(KeyboardConfigurationStore::unavailable);
+        let (persisted_keyboard_config, keyboard_persistence) =
+            keyboard_persistence_snapshot(keyboard_store.read());
+        let (keyboard_config, keyboard_source, environment_override_active) =
+            KeyboardConfig::select_startup(persisted_keyboard_config).map_err(io::Error::other)?;
+        server
+            .initialize_keyboard_state_with_config(
+                keyboard_config,
+                keyboard_source,
+                keyboard_persistence,
+                environment_override_active,
+            )
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
         let perf = NativePerfLogger::from_env();
         let startup_app = (!app.is_empty()).then_some(app);
         let bootstrap = NativeOutputBootstrap::discover();
@@ -1404,6 +1453,7 @@ impl NativeRuntime {
         });
         Self::finish_bootstrap(NativeRuntimeBootstrapTail {
             server,
+            keyboard_store,
             cursor_image,
             cursor_manager,
             perf,

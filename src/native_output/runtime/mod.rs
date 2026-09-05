@@ -282,6 +282,7 @@ mod microturn_tests {
                 xwayland_events: Vec::new(),
                 control_events: Vec::new(),
                 cursor_io_events: Vec::new(),
+                keyboard_persistence_events: Vec::new(),
             },
             work_class: NativeWorkClass::ProtocolOnly,
             fast_path_completed: true,
@@ -361,6 +362,12 @@ struct PendingCursorJob {
     token: ReactorToken,
     request_id: u64,
     job_id: oblivion_one::cursor_manager::CursorJobId,
+}
+
+struct PendingKeyboardJob {
+    token: ReactorToken,
+    request_id: u64,
+    job_id: oblivion_one::keyboard_persistence::KeyboardJobId,
 }
 
 pub(crate) struct NativeRuntimeConfig {
@@ -504,6 +511,11 @@ pub(crate) struct NativeRuntime {
     cursor_io_worker_reactor_token: Option<ReactorToken>,
     pending_cursor_job: Option<PendingCursorJob>,
     next_cursor_job_id: u64,
+    keyboard_persistence_worker:
+        Option<oblivion_one::keyboard_persistence::KeyboardPersistenceWorker>,
+    keyboard_persistence_worker_reactor_token: Option<ReactorToken>,
+    pending_keyboard_job: Option<PendingKeyboardJob>,
+    next_keyboard_job_id: u64,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
     kms_commit_worker_startup: super::kms_worker::KmsCommitWorkerStartup,
@@ -673,6 +685,11 @@ impl Drop for NativeRuntime {
         }
         self.pending_cursor_job = None;
         self.cursor_io_worker.take();
+        if let Some(token) = self.keyboard_persistence_worker_reactor_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        self.pending_keyboard_job = None;
+        self.keyboard_persistence_worker.take();
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
                 let _ = self.event_loop.unregister(token);

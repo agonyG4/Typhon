@@ -12,6 +12,7 @@ pub enum NativeEventSource {
     Drm,
     KmsCommitWorker,
     CursorIoWorker,
+    KeyboardPersistenceWorker,
     Seat,
     WaylandListener,
     WaylandClients,
@@ -77,6 +78,7 @@ impl WakeReasons {
     const DRM: u32 = 1 << 0;
     const KMS_COMMIT_WORKER: u32 = 1 << 13;
     const CURSOR_IO_WORKER: u32 = 1 << 15;
+    const KEYBOARD_PERSISTENCE_WORKER: u32 = 1 << 18;
     const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
@@ -103,6 +105,10 @@ impl WakeReasons {
 
     pub const fn cursor_io_worker(self) -> bool {
         self.0 & Self::CURSOR_IO_WORKER != 0
+    }
+
+    pub const fn keyboard_persistence_worker(self) -> bool {
+        self.0 & Self::KEYBOARD_PERSISTENCE_WORKER != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -170,6 +176,7 @@ impl WakeReasons {
             NativeEventSource::Drm => Self::DRM,
             NativeEventSource::KmsCommitWorker => Self::KMS_COMMIT_WORKER,
             NativeEventSource::CursorIoWorker => Self::CURSOR_IO_WORKER,
+            NativeEventSource::KeyboardPersistenceWorker => Self::KEYBOARD_PERSISTENCE_WORKER,
             NativeEventSource::Seat => Self::SEAT,
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
@@ -211,6 +218,12 @@ pub struct CursorIoReadyEvent {
     pub flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardPersistenceReadyEvent {
+    pub token: ReactorToken,
+    pub flags: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWakeup {
     pub reasons: WakeReasons,
@@ -223,6 +236,7 @@ pub struct NativeWakeup {
     pub xwayland_events: Vec<XwaylandReadyEvent>,
     pub control_events: Vec<ControlReadyEvent>,
     pub cursor_io_events: Vec<CursorIoReadyEvent>,
+    pub keyboard_persistence_events: Vec<KeyboardPersistenceReadyEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -596,6 +610,7 @@ impl NativeEventLoop {
         let mut xwayland_events = Vec::new();
         let mut control_events = Vec::new();
         let mut cursor_io_events = Vec::new();
+        let mut keyboard_persistence_events = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
@@ -621,6 +636,7 @@ impl NativeEventLoop {
                 if is_xwayland_source(registration_source)
                     || is_control_source(registration_source)
                     || registration_source == NativeEventSource::CursorIoWorker
+                    || registration_source == NativeEventSource::KeyboardPersistenceWorker
                     || registration_source == NativeEventSource::DmabufGpuRelease
                 {
                     reasons.insert(registration_source);
@@ -631,6 +647,11 @@ impl NativeEventLoop {
                         });
                     } else if registration_source == NativeEventSource::CursorIoWorker {
                         cursor_io_events.push(CursorIoReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    } else if registration_source == NativeEventSource::KeyboardPersistenceWorker {
+                        keyboard_persistence_events.push(KeyboardPersistenceReadyEvent {
                             token,
                             flags: event_flags,
                         });
@@ -680,6 +701,12 @@ impl NativeEventLoop {
                             flags: event_flags,
                         });
                     }
+                    NativeEventSource::KeyboardPersistenceWorker => {
+                        keyboard_persistence_events.push(KeyboardPersistenceReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -713,6 +740,7 @@ impl NativeEventLoop {
             xwayland_events,
             control_events,
             cursor_io_events,
+            keyboard_persistence_events,
         })
     }
 

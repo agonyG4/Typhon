@@ -243,6 +243,77 @@ pub struct KeyboardLayoutEntrySnapshot {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum KeyboardConfigurationSource {
+    #[default]
+    Default,
+    Persisted,
+    Environment,
+}
+
+impl KeyboardConfigurationSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Persisted => "persisted",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum KeyboardConfigurationPersistence {
+    #[default]
+    Missing,
+    Persisted,
+    Invalid,
+    Insecure,
+    Unavailable,
+}
+
+impl KeyboardConfigurationPersistence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Persisted => "persisted",
+            Self::Invalid => "invalid",
+            Self::Insecure => "insecure",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardConfigurationValue {
+    pub rules: Option<String>,
+    pub model: Option<String>,
+    pub layout: String,
+    pub variant: Option<String>,
+    pub options: Option<String>,
+    pub repeat_rate: i32,
+    pub repeat_delay: i32,
+    pub default_layout_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardConfigurationSnapshot {
+    pub generation: u64,
+    pub source: KeyboardConfigurationSource,
+    pub persistence: KeyboardConfigurationPersistence,
+    pub environment_override_active: bool,
+    pub pending: bool,
+    pub configuration: KeyboardConfigurationValue,
+    pub layout: KeyboardLayoutSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -676,6 +747,7 @@ pub enum AstreactlResult {
     Windows(WindowListSnapshot),
     ActiveWindow(ActiveWindowSnapshot),
     KeyboardLayout(KeyboardLayoutSnapshot),
+    KeyboardConfiguration(KeyboardConfigurationSnapshot),
     Cursor(CursorSnapshot),
     Performance(Box<PerformanceSnapshot>),
     DecorationTheme(DecorationThemeSnapshot),

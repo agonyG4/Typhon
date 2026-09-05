@@ -44,6 +44,32 @@ fn valid_result(command: &str) -> serde_json::Value {
                 {"index": 1, "name": "English (US)"}
             ]
         }),
+        "keyboard.config.get" | "keyboard.config.set" => serde_json::json!({
+            "generation": 3,
+            "source": "persisted",
+            "persistence": "persisted",
+            "environmentOverrideActive": false,
+            "pending": false,
+            "configuration": {
+                "rules": null,
+                "model": null,
+                "layout": "br,us",
+                "variant": "abnt2,",
+                "options": null,
+                "repeatRate": 25,
+                "repeatDelay": 600,
+                "defaultLayoutIndex": 0
+            },
+            "layout": {
+                "effectiveIndex": 0,
+                "lockedIndex": 0,
+                "layoutCount": 2,
+                "layouts": [
+                    {"index": 0, "name": "Portuguese (Brazil)"},
+                    {"index": 1, "name": "English (US)"}
+                ]
+            }
+        }),
         "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
             serde_json::json!({
                 "desiredTheme": "default",
@@ -405,11 +431,40 @@ fn typed_keyboard_layout_results_are_validated_for_every_keyboard_command() {
 }
 
 #[test]
+fn typed_keyboard_configuration_results_are_validated() {
+    let valid = run_socket_once_args(
+        &["keyboard", "config"],
+        envelope(valid_result("keyboard.config.get")),
+    );
+    assert_eq!(valid.status.code(), Some(0));
+
+    for result in [serde_json::json!({}), serde_json::Value::Null] {
+        assert_eq!(
+            run_socket_once_args(&["keyboard", "config"], envelope(result))
+                .status
+                .code(),
+            Some(6)
+        );
+    }
+
+    let mut unknown = valid_result("keyboard.config.get");
+    unknown["unknownField"] = serde_json::json!(true);
+    assert_eq!(
+        run_socket_once_args(&["keyboard", "config"], envelope(unknown))
+            .status
+            .code(),
+        Some(6)
+    );
+}
+
+#[test]
 fn help_lists_the_runtime_keyboard_layout_commands() {
     let output = run(&["--help"]);
     assert_eq!(output.status.code(), Some(0));
     let help = String::from_utf8_lossy(&output.stdout);
     for command in [
+        "keyboard config",
+        "keyboard configure",
         "keyboard layout",
         "keyboard next",
         "keyboard previous",
@@ -451,6 +506,10 @@ fn keyboard_cli_rejects_invalid_values_locally() {
         vec!["keyboard", "set"],
         vec!["keyboard", "set", "-1"],
         vec!["keyboard", "set", "not-an-index"],
+        vec!["keyboard", "configure", "extra"],
+        vec!["keyboard", "configure", "--repeat-rate", "invalid"],
+        vec!["keyboard", "configure", "--default-layout", "invalid"],
+        vec!["keyboard", "configure", "--rules", "x", "--clear-rules"],
         vec!["keyboard", "unknown"],
     ] {
         let output = run(&args);

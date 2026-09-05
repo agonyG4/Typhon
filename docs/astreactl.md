@@ -14,10 +14,12 @@ astreactl doctor
 astreactl outputs
 astreactl windows
 astreactl activewindow
+astreactl keyboard config
 astreactl keyboard layout
 astreactl keyboard next
 astreactl keyboard previous
 astreactl keyboard set INDEX
+astreactl keyboard configure [--rules VALUE|--model VALUE|--layout VALUE|--variant VALUE|--options VALUE|--repeat-rate RATE|--repeat-delay MS|--default-layout INDEX|--default-layout-index INDEX|--clear-rules|--clear-model|--clear-variant|--clear-options]
 astreactl cursor get
 astreactl cursor set-theme THEME
 astreactl cursor set-size PIXELS
@@ -33,6 +35,11 @@ running compositor.
 Global options are `--json`, `--instance NAME`, `--socket ABSOLUTE_PATH`, and
 `--timeout 250ms|2s`. The default timeout is two seconds and the maximum is
 sixty seconds.
+
+Keyboard configuration options are typed flags on `keyboard configure`. The
+command first reads the active configuration, merges only supplied flags, and
+then submits one complete configuration transaction. Nullable RMLVO fields can
+be cleared explicitly; a field cannot be set and cleared in the same command.
 
 Socket discovery uses explicit `--socket`, then `--instance`, then
 `WAYLAND_DISPLAY`, then a single valid Typhon instance under
@@ -161,13 +168,35 @@ protocol.
 Human keyboard output shows effective and locked indices plus a sanitized list
 of numeric layout identities; JSON output preserves the validated names.
 
+`keyboard config` returns the complete typed runtime configuration, including
+RMLVO, repeat settings, default layout index, generation, source, persistence
+state, pending state, and the effective/locked layout projection. The exact
+wire commands are `keyboard.config.get` and `keyboard.config.set`; the latter
+requires every typed field in the request and rejects unknown fields.
+
+Configuration changes are transactional. Typhon validates and compiles a real
+XKB candidate on the compositor thread, persists the desired configuration in
+`$XDG_CONFIG_HOME/AstreaOS/input/keyboard.json` (or
+`$HOME/.config/AstreaOS/input/keyboard.json`) using a bounded versioned JSON
+document, and publishes only after persistence completes and all physical and
+compositor key state is quiescent. A pending configuration is not reported as
+active, and a successful response is not sent before commit. Restart restores
+the last successfully persisted candidate; invalid, missing, insecure, or
+unavailable persistence falls back safely to the compiled default chain.
+Environment overrides are applied at startup and reported explicitly in the
+configuration snapshot. Repeat-only and default-layout-only changes avoid
+keymap recompilation; full RMLVO changes migrate same-name locked modifiers,
+clear transient depressed/latched state, and publish the appropriate Wayland
+keymap/repeat/modifier events.
+
 ## Scope
 
 Window commands remain read-only: M3 does not activate, minimize, restore, or
 close windows; or provide subscriptions, remote access, DBus, or Dock
-integration. Runtime keyboard layout control changes only the ephemeral locked
-XKB layout. It does not add wallpaper control, window mutation, process launch,
-or streaming events.
+integration. Runtime keyboard layout control remains available for ephemeral
+locked-layout changes, while v3 adds typed transactional RMLVO/repeat
+configuration. It does not add window mutation, process launch, or streaming
+events.
 
 ## Packaging
 

@@ -206,6 +206,7 @@ impl NativeRuntime {
             if work_domains.cursor {
                 self.service_cursor_io_completions(&cycle.wakeup)?;
             }
+            self.service_keyboard_persistence_completions(&cycle.wakeup)?;
             self.arm_suspended_deadline()?;
             return Ok(());
         }
@@ -305,6 +306,7 @@ impl NativeRuntime {
         if work_domains.cursor {
             self.service_cursor_io_completions(&cycle.wakeup)?;
         }
+        self.service_keyboard_persistence_completions(&cycle.wakeup)?;
         if let Some(start_ns) = cursor_control_started_at_ns {
             self.pointer_timing.record_phase(
                 NativePointerTimingPhase::CursorAndControl,

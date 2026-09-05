@@ -1,5 +1,6 @@
 use crate::control_snapshots::{
-    AstreactlResult, CursorSnapshot, DoctorCheck, KeyboardLayoutSnapshot, WindowSnapshot,
+    AstreactlResult, CursorSnapshot, DoctorCheck, KeyboardConfigurationSnapshot,
+    KeyboardLayoutSnapshot, WindowSnapshot,
 };
 
 pub fn human(result: &AstreactlResult) -> String {
@@ -84,6 +85,7 @@ pub fn human(result: &AstreactlResult) -> String {
             })
             .unwrap_or_else(|| "No active window".to_string()),
         AstreactlResult::KeyboardLayout(snapshot) => format_keyboard_layout(snapshot),
+        AstreactlResult::KeyboardConfiguration(snapshot) => format_keyboard_configuration(snapshot),
         AstreactlResult::Cursor(snapshot) => format_cursor(snapshot),
         AstreactlResult::DecorationTheme(snapshot) => format!(
             "Selected: {}\nActive: {}\nSchema: {}\nGeneration: {}\nSource: {}\nError: {}",
@@ -149,6 +151,27 @@ fn format_keyboard_layout(snapshot: &KeyboardLayoutSnapshot) -> String {
         format!("{} {}  {}", marker, layout.index, name)
     }));
     lines.join("\n")
+}
+
+fn format_keyboard_configuration(snapshot: &KeyboardConfigurationSnapshot) -> String {
+    let config = &snapshot.configuration;
+    format!(
+        "Keyboard configuration\nSource: {}\nGeneration: {}\nPersistence: {}\nPending: {}\n\nRules: {}\nModel: {}\nLayout: {}\nVariant: {}\nOptions: {}\n\nRepeat: {}/s\nDelay: {} ms\nDefault layout: {}\n\nEffective layout: {}\nLocked layout: {}",
+        snapshot.source.as_str(),
+        snapshot.generation,
+        snapshot.persistence.as_str(),
+        snapshot.pending,
+        sanitize_optional_text(config.rules.as_deref()),
+        sanitize_optional_text(config.model.as_deref()),
+        sanitize_terminal_text(&config.layout),
+        sanitize_optional_text(config.variant.as_deref()),
+        sanitize_optional_text(config.options.as_deref()),
+        config.repeat_rate,
+        config.repeat_delay,
+        config.default_layout_index,
+        snapshot.layout.effective_index,
+        snapshot.layout.locked_index,
+    )
 }
 
 fn format_cursor(snapshot: &CursorSnapshot) -> String {

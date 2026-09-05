@@ -14,7 +14,7 @@ use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
 };
 use oblivion_one::native::event_loop::NativeWakeup;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[inline]
 fn input_requires_full_server_progression(
@@ -129,6 +129,49 @@ struct KeyboardLayoutSetArgs {
     index: u32,
 }
 
+#[derive(Debug)]
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredNullable<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyboardConfigurationSetArgs {
+    rules: RequiredNullable<String>,
+    model: RequiredNullable<String>,
+    layout: String,
+    variant: RequiredNullable<String>,
+    options: RequiredNullable<String>,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    default_layout_index: u32,
+}
+
+impl KeyboardConfigurationSetArgs {
+    fn into_config(self) -> oblivion_one::compositor::KeyboardConfig {
+        oblivion_one::compositor::KeyboardConfig {
+            rules: self.rules.0,
+            model: self.model.0,
+            layout: self.layout,
+            variant: self.variant.0,
+            options: self.options.0,
+            repeat_rate: self.repeat_rate,
+            repeat_delay: self.repeat_delay,
+            default_layout_index: self.default_layout_index,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CursorThemeArgs {
@@ -204,6 +247,52 @@ fn dispatch_keyboard_layout_command(
             ),
         },
         Err(error) => keyboard_layout_failure(request.id, error),
+    }
+}
+
+fn keyboard_configuration_argument_failure(id: u64) -> ControlResponse {
+    ControlResponse::failure(
+        id,
+        ControlError::new(
+            ControlErrorCode::InvalidArgument,
+            "invalid keyboard configuration arguments",
+        )
+        .with_detail("invalid_keyboard_configuration_arguments"),
+    )
+}
+
+fn keyboard_configuration_failure(
+    id: u64,
+    error: oblivion_one::compositor::KeyboardConfigurationControlError,
+) -> ControlResponse {
+    match error {
+        oblivion_one::compositor::KeyboardConfigurationControlError::InvalidArgument(message) => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(ControlErrorCode::InvalidArgument, message)
+                    .with_detail("invalid_keyboard_configuration"),
+            )
+        }
+        oblivion_one::compositor::KeyboardConfigurationControlError::Busy => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(
+                    ControlErrorCode::Internal,
+                    "keyboard configuration transaction is busy",
+                )
+                .with_detail("keyboard_configuration_busy"),
+            )
+        }
+        oblivion_one::compositor::KeyboardConfigurationControlError::Unavailable(message) => {
+            ControlResponse::failure(
+                id,
+                ControlError::new(ControlErrorCode::Internal, message)
+                    .with_detail("keyboard_state_unavailable"),
+            )
+        }
+        oblivion_one::compositor::KeyboardConfigurationControlError::Internal(message) => {
+            ControlResponse::failure(id, ControlError::new(ControlErrorCode::Internal, message))
+        }
     }
 }
 
@@ -315,6 +404,250 @@ impl NativeRuntime {
         self.cursor_io_worker.take();
     }
 
+    pub(super) fn service_keyboard_persistence_completions(
+        &mut self,
+        wakeup: &NativeWakeup,
+    ) -> NativeResult<()> {
+        let worker_failed_without_readiness = self
+            .keyboard_persistence_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_available());
+        let worker_ready = wakeup.reasons.keyboard_persistence_worker()
+            || !wakeup.keyboard_persistence_events.is_empty()
+            || worker_failed_without_readiness;
+        if worker_ready {
+            let terminal_readiness = wakeup.keyboard_persistence_events.iter().any(|event| {
+                event.flags & (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32 != 0
+            });
+            let (notification_error, completion, worker_unavailable) = {
+                let Some(worker) = self.keyboard_persistence_worker.as_ref() else {
+                    return self.try_commit_keyboard_configuration();
+                };
+                let notification_error = worker.drain_notification().err();
+                let completion = worker.try_completion();
+                (notification_error, completion, !worker.is_available())
+            };
+            let terminal_failure =
+                terminal_readiness || worker_unavailable || notification_error.is_some();
+            if let Some(completion) = completion {
+                if self
+                    .pending_keyboard_job
+                    .as_ref()
+                    .is_none_or(|pending| pending.job_id != completion.job_id)
+                {
+                    // A completion from an abandoned job cannot affect the active transaction.
+                    if terminal_failure {
+                        self.disable_keyboard_persistence_worker();
+                    }
+                    return self.try_commit_keyboard_configuration();
+                }
+                match completion.result {
+                    Ok(()) => {
+                        if self.server.mark_keyboard_configuration_persisted().is_err() {
+                            self.fail_keyboard_configuration(
+                                ControlErrorCode::Internal,
+                                "keyboard configuration persistence acknowledgement failed",
+                                "keyboard_configuration_internal",
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        self.server.abort_keyboard_configuration();
+                        let pending = self
+                            .pending_keyboard_job
+                            .take()
+                            .expect("keyboard completion had a pending job");
+                        let mut response = ControlResponse::failure(
+                            pending.request_id,
+                            ControlError::new(ControlErrorCode::Internal, error.to_string()),
+                        );
+                        if let Some(response_error) = response.error.as_mut() {
+                            response_error.detail = Some("keyboard_persistence_failed".to_string());
+                        }
+                        self.queue_keyboard_response_if_connected(pending.token, response)?;
+                    }
+                }
+                self.try_commit_keyboard_configuration()?;
+            } else if terminal_failure && self.pending_keyboard_job.is_some() {
+                self.server.abort_keyboard_configuration();
+                let pending = self
+                    .pending_keyboard_job
+                    .take()
+                    .expect("keyboard pending job checked above");
+                let response = ControlResponse::failure(
+                    pending.request_id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "keyboard configuration persistence unavailable",
+                    )
+                    .with_detail("keyboard_persistence_unavailable"),
+                );
+                self.queue_keyboard_response_if_connected(pending.token, response)?;
+            }
+            if terminal_failure {
+                self.disable_keyboard_persistence_worker();
+            }
+        }
+        self.try_commit_keyboard_configuration()
+    }
+
+    fn try_commit_keyboard_configuration(&mut self) -> NativeResult<()> {
+        let should_commit = self.pending_keyboard_job.is_some()
+            && self.server.keyboard_configuration_pending_is_persisted()
+            && self.server.keyboard_reconfiguration_is_quiescent();
+        if !should_commit {
+            return Ok(());
+        }
+        let pending = self
+            .pending_keyboard_job
+            .take()
+            .expect("keyboard commit readiness checked above");
+        let response = match self.server.commit_keyboard_configuration() {
+            Ok(mutation) => match serde_json::to_value(mutation.snapshot) {
+                Ok(snapshot) => ControlResponse::success(pending.request_id, snapshot),
+                Err(_) => ControlResponse::failure(
+                    pending.request_id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "keyboard configuration snapshot serialization failed",
+                    ),
+                ),
+            },
+            Err(error) => {
+                self.server.abort_keyboard_configuration();
+                keyboard_configuration_failure(pending.request_id, error)
+            }
+        };
+        self.queue_keyboard_response_if_connected(pending.token, response)
+    }
+
+    fn queue_keyboard_response_if_connected(
+        &mut self,
+        token: oblivion_one::native::event_loop::ReactorToken,
+        response: ControlResponse,
+    ) -> NativeResult<()> {
+        if self.control_server.has_client(token) {
+            self.control_server
+                .queue_response(&mut self.event_loop, token, response)?;
+        }
+        Ok(())
+    }
+
+    fn fail_keyboard_configuration(
+        &mut self,
+        code: ControlErrorCode,
+        message: &'static str,
+        detail: &'static str,
+    ) -> NativeResult<()> {
+        self.server.abort_keyboard_configuration();
+        let Some(pending) = self.pending_keyboard_job.take() else {
+            return Ok(());
+        };
+        let mut response =
+            ControlResponse::failure(pending.request_id, ControlError::new(code, message));
+        if let Some(error) = response.error.as_mut() {
+            error.detail = Some(detail.to_string());
+        }
+        self.queue_keyboard_response_if_connected(pending.token, response)
+    }
+
+    fn disable_keyboard_persistence_worker(&mut self) {
+        if let Some(token) = self.keyboard_persistence_worker_reactor_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        self.keyboard_persistence_worker.take();
+    }
+
+    fn keyboard_configuration_snapshot_response(&mut self, request_id: u64) -> ControlResponse {
+        match self.server.keyboard_configuration_snapshot() {
+            Ok(snapshot) => match serde_json::to_value(snapshot) {
+                Ok(snapshot) => ControlResponse::success(request_id, snapshot),
+                Err(_) => ControlResponse::failure(
+                    request_id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "keyboard configuration snapshot serialization failed",
+                    ),
+                ),
+            },
+            Err(error) => keyboard_configuration_failure(request_id, error),
+        }
+    }
+
+    fn queue_keyboard_configuration(
+        &mut self,
+        token: oblivion_one::native::event_loop::ReactorToken,
+        request_id: u64,
+        configuration: oblivion_one::compositor::KeyboardConfig,
+    ) -> Option<ControlResponse> {
+        if self.pending_keyboard_job.is_some() || self.server.keyboard_configuration_pending() {
+            return Some(keyboard_configuration_failure(
+                request_id,
+                oblivion_one::compositor::KeyboardConfigurationControlError::Busy,
+            ));
+        }
+        let preparation = match self
+            .server
+            .prepare_keyboard_configuration(configuration.clone())
+        {
+            Ok(preparation) => preparation,
+            Err(error) => return Some(keyboard_configuration_failure(request_id, error)),
+        };
+        if matches!(
+            preparation,
+            oblivion_one::compositor::KeyboardConfigurationPreparation::NoOp
+        ) {
+            return Some(self.keyboard_configuration_snapshot_response(request_id));
+        }
+        let Some(worker) = self.keyboard_persistence_worker.as_ref() else {
+            self.server.abort_keyboard_configuration();
+            return Some(ControlResponse::failure(
+                request_id,
+                ControlError::new(
+                    ControlErrorCode::Internal,
+                    "keyboard configuration persistence unavailable",
+                )
+                .with_detail("keyboard_persistence_unavailable"),
+            ));
+        };
+        let job_id = oblivion_one::keyboard_persistence::KeyboardJobId(self.next_keyboard_job_id);
+        self.next_keyboard_job_id = self.next_keyboard_job_id.saturating_add(1);
+        if let Err(error) = worker.submit(
+            oblivion_one::keyboard_persistence::KeyboardPersistenceOperation::Write {
+                job_id,
+                configuration,
+            },
+        ) {
+            self.server.abort_keyboard_configuration();
+            let (message, detail) = match error {
+                oblivion_one::keyboard_persistence::KeyboardPersistenceSubmitError::Busy => (
+                    "keyboard configuration persistence is busy",
+                    "keyboard_persistence_busy",
+                ),
+                oblivion_one::keyboard_persistence::KeyboardPersistenceSubmitError::Unavailable => {
+                    (
+                        "keyboard configuration persistence unavailable",
+                        "keyboard_persistence_unavailable",
+                    )
+                }
+            };
+            let mut response = ControlResponse::failure(
+                request_id,
+                ControlError::new(ControlErrorCode::Internal, message),
+            );
+            if let Some(error) = response.error.as_mut() {
+                error.detail = Some(detail.to_string());
+            }
+            return Some(response);
+        }
+        self.pending_keyboard_job = Some(PendingKeyboardJob {
+            token,
+            request_id,
+            job_id,
+        });
+        None
+    }
+
     fn dispatch_control_command(
         &mut self,
         token: oblivion_one::native::event_loop::ReactorToken,
@@ -338,6 +671,19 @@ impl NativeRuntime {
                 command,
                 request,
             ));
+        }
+        if command == ControlCommand::KeyboardConfigurationGet {
+            if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                return Some(keyboard_configuration_argument_failure(request.id));
+            }
+            return Some(self.keyboard_configuration_snapshot_response(request.id));
+        }
+        if command == ControlCommand::KeyboardConfigurationSet {
+            let args = match serde_json::from_value::<KeyboardConfigurationSetArgs>(request.args) {
+                Ok(args) => args,
+                Err(_) => return Some(keyboard_configuration_argument_failure(request.id)),
+            };
+            return self.queue_keyboard_configuration(token, request.id, args.into_config());
         }
         let result = match command {
             ControlCommand::Version => serde_json::to_value(VersionSnapshot {
@@ -1504,8 +1850,8 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmptyKeyboardLayoutArgs, KeyboardLayoutSetArgs, NativePreReadInputDecision,
-        decide_native_pre_read_input, dispatch_keyboard_layout_command,
+        EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs, KeyboardLayoutSetArgs,
+        NativePreReadInputDecision, decide_native_pre_read_input, dispatch_keyboard_layout_command,
         input_requires_full_server_progression, keyboard_layout_failure,
         promote_native_input_before_wayland_read,
     };
@@ -1566,6 +1912,36 @@ mod tests {
         let error = unavailable.error.unwrap();
         assert_eq!(error.code.as_str(), "internal");
         assert_eq!(error.detail.as_deref(), Some("keyboard_state_unavailable"));
+    }
+
+    #[test]
+    fn keyboard_configuration_set_requires_the_complete_typed_document() {
+        let valid = serde_json::json!({
+            "rules": null,
+            "model": null,
+            "layout": "us",
+            "variant": null,
+            "options": null,
+            "repeatRate": 25,
+            "repeatDelay": 600,
+            "defaultLayoutIndex": 0
+        });
+        assert!(serde_json::from_value::<KeyboardConfigurationSetArgs>(valid.clone()).is_ok());
+        for value in [
+            serde_json::json!({"layout": "us"}),
+            {
+                let mut value = valid.clone();
+                value["extra"] = serde_json::json!(true);
+                value
+            },
+            {
+                let mut value = valid;
+                value["repeatRate"] = serde_json::json!("25");
+                value
+            },
+        ] {
+            assert!(serde_json::from_value::<KeyboardConfigurationSetArgs>(value).is_err());
+        }
     }
 
     #[test]

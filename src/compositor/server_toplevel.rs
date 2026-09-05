@@ -218,6 +218,79 @@ impl OwnCompositorServer {
         Ok(mutation.snapshot)
     }
 
+    pub fn initialize_keyboard_state_with_config(
+        &mut self,
+        config: crate::compositor::keyboard::KeyboardConfig,
+        source: crate::control_snapshots::KeyboardConfigurationSource,
+        persistence: crate::control_snapshots::KeyboardConfigurationPersistence,
+        environment_override_active: bool,
+    ) -> Result<(), KeyboardConfigurationControlError> {
+        self.state.initialize_keyboard_state_with_config(
+            config,
+            source,
+            persistence,
+            environment_override_active,
+        )
+    }
+
+    pub fn keyboard_configuration_snapshot(
+        &mut self,
+    ) -> Result<
+        crate::control_snapshots::KeyboardConfigurationSnapshot,
+        KeyboardConfigurationControlError,
+    > {
+        self.state.keyboard_configuration_snapshot()
+    }
+
+    pub fn prepare_keyboard_configuration(
+        &mut self,
+        config: crate::compositor::keyboard::KeyboardConfig,
+    ) -> Result<
+        crate::compositor::keyboard::KeyboardConfigurationPreparation,
+        KeyboardConfigurationControlError,
+    > {
+        self.state.prepare_keyboard_configuration(config)
+    }
+
+    pub fn mark_keyboard_configuration_persisted(
+        &mut self,
+    ) -> Result<(), KeyboardConfigurationControlError> {
+        self.state.mark_keyboard_configuration_persisted()
+    }
+
+    pub fn abort_keyboard_configuration(&mut self) -> bool {
+        self.state.abort_keyboard_configuration()
+    }
+
+    pub fn keyboard_configuration_pending(&self) -> bool {
+        self.state.keyboard_configuration_pending()
+    }
+
+    pub fn keyboard_configuration_pending_is_persisted(&self) -> bool {
+        self.state.keyboard_configuration_pending_is_persisted()
+    }
+
+    pub fn keyboard_reconfiguration_is_quiescent(&self) -> bool {
+        self.state.keyboard_reconfiguration_is_quiescent()
+    }
+
+    pub fn commit_keyboard_configuration(
+        &mut self,
+    ) -> Result<KeyboardConfigurationMutation, KeyboardConfigurationControlError> {
+        let mutation = self.state.commit_keyboard_configuration()?;
+        if mutation.keymap_changed {
+            self.state.publish_keyboard_keymap();
+        }
+        if mutation.repeat_changed {
+            self.state.publish_keyboard_repeat_info();
+        }
+        if mutation.modifiers_changed {
+            self.state.send_keyboard_modifiers_without_key();
+        }
+        let _ = self.flush_wayland_clients();
+        Ok(mutation)
+    }
+
     pub fn clear_keyboard_transient_state_for_session_switch(&mut self) {
         self.state
             .clear_keyboard_transient_state_for_session_switch();

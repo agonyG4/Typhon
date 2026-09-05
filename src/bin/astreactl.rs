@@ -9,6 +9,39 @@ use support::{
     discovery, output, wallpaper,
 };
 
+#[derive(Debug, Default)]
+struct KeyboardConfigureOptions {
+    rules: Option<String>,
+    model: Option<String>,
+    layout: Option<String>,
+    variant: Option<String>,
+    options: Option<String>,
+    repeat_rate: Option<String>,
+    repeat_delay: Option<String>,
+    default_layout_index: Option<String>,
+    clear_rules: bool,
+    clear_model: bool,
+    clear_variant: bool,
+    clear_options: bool,
+}
+
+impl KeyboardConfigureOptions {
+    fn has_any(&self) -> bool {
+        self.rules.is_some()
+            || self.model.is_some()
+            || self.layout.is_some()
+            || self.variant.is_some()
+            || self.options.is_some()
+            || self.repeat_rate.is_some()
+            || self.repeat_delay.is_some()
+            || self.default_layout_index.is_some()
+            || self.clear_rules
+            || self.clear_model
+            || self.clear_variant
+            || self.clear_options
+    }
+}
+
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -29,6 +62,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
     let mut cursor_theme = None;
     let mut cursor_size = None;
     let mut wallpaper_fit = None;
+    let mut keyboard_configure = KeyboardConfigureOptions::default();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -86,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|wallpaper get|wallpaper list|wallpaper set PATH_OR_ID|wallpaper import PATH|wallpaper reset|wallpaper default>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|keyboard configure [typed options]|cursor ...|decoration ...|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -100,7 +134,21 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
                 return Ok(0);
             }
             value if value.starts_with('-') => {
-                if value == "--theme" || value == "--size" || value == "--fit" {
+                if matches!(
+                    value,
+                    "--theme"
+                        | "--size"
+                        | "--fit"
+                        | "--rules"
+                        | "--model"
+                        | "--layout"
+                        | "--variant"
+                        | "--options"
+                        | "--repeat-rate"
+                        | "--repeat-delay"
+                        | "--default-layout-index"
+                        | "--default-layout"
+                ) {
                     index += 1;
                     let argument = args.get(index).ok_or_else(|| {
                         AstreactlError::Usage(format!("missing value for {value}"))
@@ -122,14 +170,51 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
                             ));
                         }
                         cursor_size = Some(argument.clone());
-                    } else {
+                    } else if value == "--fit" {
                         if wallpaper_fit.is_some() {
                             return Err(AstreactlError::Usage(
                                 "duplicate wallpaper --fit".to_string(),
                             ));
                         }
                         wallpaper_fit = Some(argument.clone());
+                    } else {
+                        let destination = match value {
+                            "--rules" => &mut keyboard_configure.rules,
+                            "--model" => &mut keyboard_configure.model,
+                            "--layout" => &mut keyboard_configure.layout,
+                            "--variant" => &mut keyboard_configure.variant,
+                            "--options" => &mut keyboard_configure.options,
+                            "--repeat-rate" => &mut keyboard_configure.repeat_rate,
+                            "--repeat-delay" => &mut keyboard_configure.repeat_delay,
+                            "--default-layout-index" | "--default-layout" => {
+                                &mut keyboard_configure.default_layout_index
+                            }
+                            _ => unreachable!("matched keyboard configuration option"),
+                        };
+                        if destination.is_some() {
+                            return Err(AstreactlError::Usage(format!(
+                                "duplicate keyboard option {value}"
+                            )));
+                        }
+                        *destination = Some(argument.clone());
                     }
+                } else if matches!(
+                    value,
+                    "--clear-rules" | "--clear-model" | "--clear-variant" | "--clear-options"
+                ) {
+                    let destination = match value {
+                        "--clear-rules" => &mut keyboard_configure.clear_rules,
+                        "--clear-model" => &mut keyboard_configure.clear_model,
+                        "--clear-variant" => &mut keyboard_configure.clear_variant,
+                        "--clear-options" => &mut keyboard_configure.clear_options,
+                        _ => unreachable!("matched keyboard clear option"),
+                    };
+                    if *destination {
+                        return Err(AstreactlError::Usage(format!(
+                            "duplicate keyboard option {value}"
+                        )));
+                    }
+                    *destination = true;
                 } else {
                     return Err(AstreactlError::Usage(format!("unknown option {value}")));
                 }
@@ -147,6 +232,11 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         .first()
         .ok_or_else(|| AstreactlError::Usage("missing command".to_string()))?;
     if command == "wallpaper" {
+        if keyboard_configure.has_any() {
+            return Err(AstreactlError::Usage(
+                "keyboard configuration options require a keyboard command".to_string(),
+            ));
+        }
         if instance.is_some() || socket.is_some() {
             return Err(AstreactlError::Usage(
                 "wallpaper commands use the secure Paper endpoint and do not accept Typhon socket options".to_string(),
@@ -175,8 +265,18 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(0);
     }
     let (display_command, wire_command, request_args) = if command == "cursor" {
+        if keyboard_configure.has_any() {
+            return Err(AstreactlError::Usage(
+                "keyboard configuration options require a keyboard command".to_string(),
+            ));
+        }
         parse_cursor_command(&positionals[1..], cursor_theme, cursor_size)?
     } else if command == "decoration" {
+        if keyboard_configure.has_any() {
+            return Err(AstreactlError::Usage(
+                "keyboard configuration options require a keyboard command".to_string(),
+            ));
+        }
         if cursor_theme.is_some() || cursor_size.is_some() {
             return Err(AstreactlError::Usage(
                 "decoration command does not accept cursor options".to_string(),
@@ -189,12 +289,25 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
                 "keyboard commands do not accept cursor or wallpaper options".to_string(),
             ));
         }
-        parse_keyboard_command(&positionals[1..])?
+        if positionals
+            .get(1)
+            .is_some_and(|subcommand| subcommand == "configure")
+        {
+            parse_keyboard_configure_command(&positionals[1..], keyboard_configure)?
+        } else {
+            if keyboard_configure.has_any() {
+                return Err(AstreactlError::Usage(
+                    "keyboard configuration options require keyboard configure".to_string(),
+                ));
+            }
+            parse_keyboard_command(&positionals[1..])?
+        }
     } else {
         if positionals.len() != 1
             || cursor_theme.is_some()
             || cursor_size.is_some()
             || wallpaper_fit.is_some()
+            || keyboard_configure.has_any()
         {
             return Err(AstreactlError::Usage(
                 "multiple commands are not allowed".to_string(),
@@ -210,6 +323,15 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         (command.as_str(), wire_command, serde_json::json!({}))
     };
     let path = discovery::discover_socket(instance.as_deref(), socket.as_deref())?;
+    let request_args = if command == "keyboard"
+        && positionals
+            .get(1)
+            .is_some_and(|subcommand| subcommand == "configure")
+    {
+        merge_keyboard_configuration(&path, request_args, timeout)?
+    } else {
+        request_args
+    };
     let result = client::request_with_args(&path, wire_command, request_args, timeout)?;
     if json {
         println!(
@@ -234,6 +356,14 @@ fn parse_keyboard_command(
         .first()
         .ok_or_else(|| AstreactlError::Usage("missing keyboard subcommand".to_string()))?;
     match subcommand.as_str() {
+        "config" => {
+            if positionals.len() != 1 {
+                return Err(AstreactlError::Usage(
+                    "keyboard config takes no extra arguments".to_string(),
+                ));
+            }
+            Ok(("keyboard", "keyboard.config.get", serde_json::json!({})))
+        }
         "layout" => {
             if positionals.len() != 1 {
                 return Err(AstreactlError::Usage(
@@ -276,6 +406,104 @@ fn parse_keyboard_command(
             "unknown keyboard subcommand {subcommand}"
         ))),
     }
+}
+
+fn parse_keyboard_configure_command(
+    positionals: &[String],
+    options: KeyboardConfigureOptions,
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    if positionals.len() != 1 {
+        return Err(AstreactlError::Usage(
+            "keyboard configure accepts typed configuration options only".to_string(),
+        ));
+    }
+    if options.clear_rules && options.rules.is_some()
+        || options.clear_model && options.model.is_some()
+        || options.clear_variant && options.variant.is_some()
+        || options.clear_options && options.options.is_some()
+    {
+        return Err(AstreactlError::Usage(
+            "a keyboard field cannot be set and cleared together".to_string(),
+        ));
+    }
+    let mut args = serde_json::Map::new();
+    for (name, value) in [
+        ("rules", options.rules),
+        ("model", options.model),
+        ("layout", options.layout),
+        ("variant", options.variant),
+        ("options", options.options),
+        ("repeatRate", options.repeat_rate),
+        ("repeatDelay", options.repeat_delay),
+        ("defaultLayoutIndex", options.default_layout_index),
+    ] {
+        if let Some(value) = value {
+            let json_value = match name {
+                "repeatRate" | "repeatDelay" => serde_json::Value::Number(
+                    value
+                        .parse::<i32>()
+                        .map_err(|_| AstreactlError::Usage(format!("invalid keyboard {name}")))?
+                        .into(),
+                ),
+                "defaultLayoutIndex" => serde_json::Value::Number(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| {
+                            AstreactlError::Usage(
+                                "invalid keyboard default layout index".to_string(),
+                            )
+                        })?
+                        .into(),
+                ),
+                _ => serde_json::Value::String(value),
+            };
+            args.insert(name.to_string(), json_value);
+        }
+    }
+    for name in ["rules", "model", "variant", "options"] {
+        let clear = match name {
+            "rules" => options.clear_rules,
+            "model" => options.clear_model,
+            "variant" => options.clear_variant,
+            "options" => options.clear_options,
+            _ => false,
+        };
+        if clear {
+            args.insert(name.to_string(), serde_json::Value::Null);
+        }
+    }
+    Ok((
+        "keyboard",
+        "keyboard.config.set",
+        serde_json::Value::Object(args),
+    ))
+}
+
+fn merge_keyboard_configuration(
+    path: &std::path::Path,
+    partial: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, AstreactlError> {
+    let current =
+        client::request_with_args(path, "keyboard.config.get", serde_json::json!({}), timeout)?;
+    let snapshot = match current {
+        oblivion_one::control_snapshots::AstreactlResult::KeyboardConfiguration(snapshot) => {
+            snapshot
+        }
+        _ => return Err(AstreactlError::MalformedResponse),
+    };
+    let mut merged = serde_json::to_value(snapshot.configuration)
+        .map_err(|_| AstreactlError::MalformedResponse)?;
+    let Some(partial) = partial.as_object() else {
+        return Err(AstreactlError::MalformedResponse);
+    };
+    let Some(merged) = merged.as_object_mut() else {
+        return Err(AstreactlError::MalformedResponse);
+    };
+    for (name, value) in partial {
+        merged.insert(name.clone(), value.clone());
+    }
+    Ok(serde_json::Value::Object(merged.clone()))
 }
 
 fn parse_wallpaper_command(
@@ -511,7 +739,10 @@ fn exit_code(error: &AstreactlError) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_keyboard_command, parse_wallpaper_command};
+    use super::{
+        KeyboardConfigureOptions, parse_keyboard_command, parse_keyboard_configure_command,
+        parse_wallpaper_command,
+    };
     use oblivion_one::astreactl::wallpaper::DEFAULT_WALLPAPER_TIMEOUT;
     use oblivion_one::control_snapshots::AstreactlResult;
 
@@ -581,6 +812,31 @@ mod tests {
             parse_keyboard_command(&["set".to_string(), "1".to_string()]).unwrap();
         assert_eq!(wire, "keyboard.layout.set");
         assert_eq!(args, serde_json::json!({"index": 1}));
+
+        let (_, wire, args) = parse_keyboard_command(&["config".to_string()]).unwrap();
+        assert_eq!(wire, "keyboard.config.get");
+        assert_eq!(args, serde_json::json!({}));
+    }
+
+    #[test]
+    fn keyboard_configure_parser_emits_only_typed_overrides_and_clears() {
+        let options = KeyboardConfigureOptions {
+            layout: Some("us,br".to_string()),
+            repeat_rate: Some("30".to_string()),
+            clear_variant: true,
+            ..KeyboardConfigureOptions::default()
+        };
+        let (_, wire, args) =
+            parse_keyboard_configure_command(&["configure".to_string()], options).unwrap();
+        assert_eq!(wire, "keyboard.config.set");
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "layout": "us,br",
+                "repeatRate": 30,
+                "variant": null
+            })
+        );
     }
 
     #[test]

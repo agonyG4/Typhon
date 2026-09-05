@@ -23,6 +23,23 @@ fn keyboard_layout_commands_use_the_v2_wire_names() {
 }
 
 #[test]
+fn keyboard_configuration_commands_use_additive_v3_wire_names() {
+    for (wire_name, command) in [
+        (
+            "keyboard.config.get",
+            ControlCommand::KeyboardConfigurationGet,
+        ),
+        (
+            "keyboard.config.set",
+            ControlCommand::KeyboardConfigurationSet,
+        ),
+    ] {
+        assert_eq!(ControlCommand::parse(wire_name), Some(command));
+        assert_eq!(command.as_str(), wire_name);
+    }
+}
+
+#[test]
 fn request_codec_round_trips_the_v1_envelope() {
     let request = ControlRequest::new(7, "status", json!({})).unwrap();
 
