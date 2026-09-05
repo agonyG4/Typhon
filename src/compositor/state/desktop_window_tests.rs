@@ -603,6 +603,22 @@ fn focused_family_moves_between_special_and_current_regular_without_geometry_cha
 }
 
 #[test]
+fn moving_between_inactive_regular_workspaces_marks_presence_dirty() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 433))
+        .expect("window");
+    state.window_mut(id).expect("window").management = Some(WindowManagementState::new(
+        WorkspaceLocation::Regular(WorkspaceId::new(2).unwrap()),
+    ));
+    state.workspace_presence_dirty = false;
+
+    assert!(state.move_window_family_to_workspace(id, WorkspaceId::new(3).unwrap()));
+    assert!(state.workspace_presence_dirty);
+}
+
+#[test]
 fn moving_x11_family_to_special_queues_typed_clear_workspace() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(2).unwrap());

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 use wayland_protocols::ext::workspace::v1::server::{
     ext_workspace_group_handle_v1, ext_workspace_handle_v1, ext_workspace_manager_v1,
 };
@@ -12,6 +13,7 @@ pub(crate) struct WorkspaceProtocolSnapshotItem {
     pub(crate) name: String,
     pub(crate) coordinates: Vec<u32>,
     pub(crate) active: bool,
+    pub(crate) hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,7 @@ impl WorkspaceProtocolSnapshot {
     pub(crate) fn from_workspace_ids(
         workspaces: impl IntoIterator<Item = crate::wm::WorkspaceId>,
         active: crate::wm::WorkspaceId,
+        occupied: &BTreeSet<crate::wm::WorkspaceId>,
     ) -> Self {
         Self {
             workspaces: workspaces
@@ -33,6 +36,7 @@ impl WorkspaceProtocolSnapshot {
                     name: workspace.to_string(),
                     coordinates: vec![index as u32],
                     active: workspace == active,
+                    hidden: workspace != active && !occupied.contains(&workspace),
                 })
                 .collect(),
         }
@@ -121,8 +125,7 @@ impl WorkspaceProtocolState {
         display: &DisplayHandle,
         client: &Client,
         manager: ext_workspace_manager_v1::ExtWorkspaceManagerV1,
-        workspaces: Vec<crate::wm::WorkspaceId>,
-        active: crate::wm::WorkspaceId,
+        snapshot: WorkspaceProtocolSnapshot,
         outputs: &[wl_output::WlOutput],
     ) {
         let manager_id = manager.id();
@@ -141,7 +144,6 @@ impl WorkspaceProtocolState {
             return;
         };
 
-        let snapshot = WorkspaceProtocolSnapshot::from_workspace_ids(workspaces, active);
         let _ = manager.send_event(ext_workspace_manager_v1::Event::WorkspaceGroup {
             workspace_group: group.clone(),
         });
@@ -190,11 +192,13 @@ impl WorkspaceProtocolState {
                     .flat_map(|coordinate| coordinate.to_ne_bytes())
                     .collect(),
             });
-            let state = if item.active {
-                ext_workspace_handle_v1::State::Active
-            } else {
-                ext_workspace_handle_v1::State::empty()
-            };
+            let mut state = ext_workspace_handle_v1::State::empty();
+            if item.active {
+                state |= ext_workspace_handle_v1::State::Active;
+            }
+            if item.hidden {
+                state |= ext_workspace_handle_v1::State::Hidden;
+            }
             let _ = handle.send_event(ext_workspace_handle_v1::Event::State {
                 state: WEnum::Value(state),
             });
@@ -278,17 +282,23 @@ impl WorkspaceProtocolState {
         })
     }
 
-    pub(crate) fn publish_state(&mut self, active: crate::wm::WorkspaceId) {
+    pub(crate) fn publish_state(&mut self, snapshot: &WorkspaceProtocolSnapshot) {
         self.managers
             .retain(|_, binding| binding.resource.is_alive());
         for binding in self.managers.values_mut() {
             binding.handles.retain(|handle| handle.resource.is_alive());
             for handle in &binding.handles {
-                let state = if handle.workspace == active {
-                    ext_workspace_handle_v1::State::Active
-                } else {
-                    ext_workspace_handle_v1::State::empty()
-                };
+                let item = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|item| item.id == format!("typhon.workspace.{}", handle.workspace.get()));
+                let mut state = ext_workspace_handle_v1::State::empty();
+                if item.is_some_and(|item| item.active) {
+                    state |= ext_workspace_handle_v1::State::Active;
+                }
+                if item.is_some_and(|item| item.hidden) {
+                    state |= ext_workspace_handle_v1::State::Hidden;
+                }
                 let _ = handle
                     .resource
                     .send_event(ext_workspace_handle_v1::Event::State {
@@ -385,6 +395,30 @@ impl WorkspaceProtocolState {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn regular_workspace_occupancy(
+        &self,
+    ) -> BTreeSet<crate::wm::WorkspaceId> {
+        self.desktop_windows
+            .keys()
+            .copied()
+            .filter_map(|window_id| {
+                self.astrea_toplevel_snapshot(window_id)?;
+                self.desktop_windows
+                    .get(&window_id)
+                    .and_then(|window| window.management)
+                    .and_then(|management| management.regular_workspace())
+            })
+            .collect()
+    }
+
+    pub(in crate::compositor) fn workspace_protocol_snapshot(&self) -> WorkspaceProtocolSnapshot {
+        WorkspaceProtocolSnapshot::from_workspace_ids(
+            self.workspace_manager.workspaces(),
+            self.workspace_manager.active_workspace(),
+            &self.regular_workspace_occupancy(),
+        )
+    }
+
     pub(in crate::compositor) fn bind_workspace_manager(
         &mut self,
         display: &DisplayHandle,
@@ -398,8 +432,7 @@ impl CompositorState {
             display,
             client,
             manager,
-            self.workspace_manager.workspaces().collect(),
-            self.workspace_manager.active_workspace(),
+            self.workspace_protocol_snapshot(),
             &self.output_resources,
         );
     }
@@ -433,8 +466,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn publish_workspace_state(&mut self) {
-        self.workspace_protocol
-            .publish_state(self.workspace_manager.active_workspace());
+        let snapshot = self.workspace_protocol_snapshot();
+        self.workspace_protocol.publish_state(&snapshot);
+        self.workspace_presence_dirty = false;
     }
 
     pub(in crate::compositor) fn publish_workspace_output_enter(

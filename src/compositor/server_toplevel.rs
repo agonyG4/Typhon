@@ -28,27 +28,34 @@ impl CompositorState {
                         // An uncollectable follow-up target must not strand the
                         // already-frozen transaction. Complete the committed
                         // publication and fail closed for the follow-up.
-                        return self.astrea_toplevel_publisher.reconcile(
+                        let summary = self.astrea_toplevel_publisher.reconcile(
                             display,
                             None,
                             BTreeMap::new(),
                         );
+                        self.publish_workspace_presence_if_dirty();
+                        return summary;
                     }
                     self.astrea_toplevel_publisher.fail_all_managers();
                     self.astrea_toplevel_publisher
                         .clear_failed_collection_state();
-                    return AstreaToplevelPublicationSummary {
+                    let summary = AstreaToplevelPublicationSummary {
                         revision: self.astrea_toplevel_publisher.revision,
                         manager_count: self.astrea_toplevel_publisher.manager_count(),
                         ..AstreaToplevelPublicationSummary::default()
                     };
+                    self.publish_workspace_presence_if_dirty();
+                    return summary;
                 }
             }
         } else {
             None
         };
-        self.astrea_toplevel_publisher
-            .reconcile(display, collection, dirty_snapshots)
+        let summary =
+            self.astrea_toplevel_publisher
+                .reconcile(display, collection, dirty_snapshots);
+        self.publish_workspace_presence_if_dirty();
+        summary
     }
 
     pub(in crate::compositor) fn mark_astrea_toplevel_dirty(&mut self, window_id: WindowId) {
@@ -56,12 +63,20 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn mark_astrea_toplevel_removed(&mut self, window_id: WindowId) {
+        self.workspace_presence_dirty = true;
         self.astrea_toplevel_publisher
             .mark_window_removed(window_id);
     }
 
     pub(in crate::compositor) fn mark_astrea_toplevel_structure_dirty(&mut self) {
+        self.workspace_presence_dirty = true;
         self.astrea_toplevel_publisher.mark_structure_dirty();
+    }
+
+    fn publish_workspace_presence_if_dirty(&mut self) {
+        if self.workspace_presence_dirty {
+            self.publish_workspace_state();
+        }
     }
 
     pub(in crate::compositor) fn remove_astrea_toplevel_client(&mut self, client_id: &ClientId) {

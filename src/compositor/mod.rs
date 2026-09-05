@@ -796,6 +796,7 @@ pub struct CompositorState {
     pending_color_info: Vec<color::PendingColorInfo>,
     astrea_shortcut_registry: AstreaShortcutRegistry,
     astrea_toplevel_publisher: AstreaToplevelPublisher,
+    pub(in crate::compositor) workspace_presence_dirty: bool,
     astrea_toplevel_authorized_clients: HashSet<ClientId>,
     astrea_shell_authenticated_clients: HashSet<ClientId>,
     astrea_shell_client_pids: HashSet<u32>,

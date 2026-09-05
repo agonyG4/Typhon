@@ -499,6 +499,10 @@ impl CompositorState {
                 .then_some(change.window_id)
             })
             .collect::<Vec<_>>();
+        let workspace_presence_changed = transition.changes.iter().any(|change| {
+            matches!(change.previous, WorkspaceLocation::Regular(_))
+                || matches!(change.new, WorkspaceLocation::Regular(_))
+        });
         for change in &transition.changes {
             if let Some(window) = self.window_mut(change.window_id) {
                 window.management = window
@@ -525,6 +529,9 @@ impl CompositorState {
                 self.backend_commands.push(command);
             }
             self.mark_astrea_toplevel_dirty(change.window_id);
+        }
+        if workspace_presence_changed {
+            self.mark_astrea_toplevel_structure_dirty();
         }
         if let Some(prepared) = prepared_tiled_migration {
             let _ = self.apply_prepared_tiled_migration(prepared);
