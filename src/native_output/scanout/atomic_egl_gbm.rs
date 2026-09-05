@@ -741,6 +741,9 @@ impl AtomicEglGbmScanout {
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
         frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+        frozen_cursor_trace_reveal: Option<
+            crate::native_output::presentation::plane::CursorRevealTraceSnapshot,
+        >,
         async_policy_inputs: AtomicAsyncPolicyInputs,
         dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
@@ -1144,6 +1147,7 @@ impl AtomicEglGbmScanout {
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
             frozen_cursor_plane_owner,
+            frozen_cursor_trace_reveal,
             o1_admission,
         };
         let framebuffer_slot = frame.slot.get();

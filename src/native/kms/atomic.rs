@@ -682,6 +682,10 @@ pub enum AtomicCursorPlaneAssignment {
         src_h: u64,
         crtc_x: u64,
         crtc_y: u64,
+        pointer_x: i32,
+        pointer_y: i32,
+        plane_origin_x: i32,
+        plane_origin_y: i32,
         crtc_w: u64,
         crtc_h: u64,
         hotspot_x: i32,
@@ -845,6 +849,8 @@ pub fn cursor_plane_assignment(
         )
     })?;
     let props = &cursor_plane.property_ids;
+    let plane_origin_x = cursor.x.saturating_sub(cursor.hotspot_x);
+    let plane_origin_y = cursor.y.saturating_sub(cursor.hotspot_y);
     Ok(AtomicCursorPlaneAssignment::Enabled {
         plane_id: cursor_plane.plane_id().get(),
         framebuffer_id,
@@ -853,8 +859,12 @@ pub fn cursor_plane_assignment(
         src_y: 0,
         src_w,
         src_h,
-        crtc_x: i64::from(cursor.x.saturating_sub(cursor.hotspot_x)) as u64,
-        crtc_y: i64::from(cursor.y.saturating_sub(cursor.hotspot_y)) as u64,
+        crtc_x: i64::from(plane_origin_x) as u64,
+        crtc_y: i64::from(plane_origin_y) as u64,
+        pointer_x: cursor.x,
+        pointer_y: cursor.y,
+        plane_origin_x,
+        plane_origin_y,
         crtc_w: u64::from(cursor.width),
         crtc_h: u64::from(cursor.height),
         hotspot_x: cursor.hotspot_x,

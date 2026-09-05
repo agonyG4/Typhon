@@ -3,7 +3,7 @@ use super::kms_worker::{WorkerQueueOutcome, queue_explicit_composited_frame, que
 pub(super) use super::plane_cycle::cursor_worker_opportunities;
 use super::presentation_cursor::{
     RuntimePlanePlan, cursor_reveal_trace_snapshot, cursor_reveal_trace_snapshot_from_presented,
-    presented_delivery_for_plan,
+    cursor_source_for_trace, presented_delivery_for_plan,
 };
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
@@ -16,8 +16,7 @@ use crate::native_output::kms_worker::{
     KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
 };
 use crate::native_output::presentation::plane::{
-    CursorRevision, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
-    PresentedCursorDelivery,
+    CursorRevision, CursorSource, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -675,20 +674,24 @@ pub(super) fn present_cursor_for_presentation(
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
-        let trace_state = desired.clone().unwrap_or_else(|| {
-            let mut hidden = cursor.desired().clone();
-            hidden.visible = false;
-            hidden.framebuffer_id = None;
-            hidden
-        });
-        let trace_snapshot = cursor_reveal_trace_snapshot(
-            server,
-            cursor,
-            &trace_state,
-            Some(cursor_epoch),
-            Some(cursor.desired_revision()),
-            cursor_delivery,
-        );
+        let trace_snapshot = if crate::pointer_debug::cursor_presentation_trace_enabled() {
+            let trace_state = desired.clone().unwrap_or_else(|| {
+                let mut hidden = cursor.desired().clone();
+                hidden.visible = false;
+                hidden.framebuffer_id = None;
+                hidden
+            });
+            cursor_reveal_trace_snapshot(
+                server,
+                &trace_state,
+                Some(cursor_epoch),
+                Some(cursor.desired_revision()),
+                cursor_delivery,
+                Some(cursor_source_for_trace(cursor)),
+            )
+        } else {
+            None
+        };
         let decision = queue_plane_delta_for_presentation(
             worker,
             cursor,
@@ -773,7 +776,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
-    cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
     match queue_explicit_composited_frame(
         worker,
@@ -793,7 +795,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
         test_policy,
         ready_submit,
         validation_base,
-        cursor_reveal_trace,
     )? {
         WorkerQueueOutcome::Queued {
             transaction_id,
@@ -838,15 +839,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
         let frozen_primary_cursor_presentation =
             kms_primary_cursor_presentation(frozen_cursor_plan.primary_presentation);
         let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
-        let trace_snapshot = explicit_cursor_reveal_trace_snapshot(
-            server,
-            context.atomic_cursor,
-            output_transactions,
-            transaction_id,
-            cursor_update.clone(),
-            frozen_cursor_delivery,
-            frozen_primary_cursor_presentation,
-        );
         let pacing_frame_id = context
             .frame_pacing
             .reserve_worker_submission(ready_submit)
@@ -891,7 +883,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
             },
             ready_submit,
             context.validation_base,
-            trace_snapshot,
         ) {
             Ok(result) => result.map(|(token, framebuffer_id, transaction_id)| {
                 (token, framebuffer_id, transaction_id, true)
@@ -923,20 +914,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
         }
         return Ok(result);
     }
-    let frozen_cursor_plan = explicit
-        .swapchain()?
-        .ready_cursor_plan()
-        .ok_or_else(|| io::Error::other("ready explicit frame has no frozen cursor plan"))?;
-    let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
-    let trace_snapshot = explicit_cursor_reveal_trace_snapshot(
-        server,
-        context.atomic_cursor,
-        output_transactions,
-        transaction_id,
-        cursor_update,
-        frozen_cursor_plan.delivery,
-        kms_primary_cursor_presentation(frozen_cursor_plan.primary_presentation),
-    );
+    let trace_snapshot = explicit.swapchain()?.ready_cursor_trace_reveal();
     let (token, framebuffer_id, transaction_id) =
         explicit.submit_ready_frame(kms_backend, server, output_transactions)?;
     if let Some(snapshot) = trace_snapshot
@@ -953,47 +931,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
         );
     }
     Ok(Some((token, framebuffer_id, transaction_id, false)))
-}
-
-fn explicit_cursor_reveal_trace_snapshot(
-    server: &OwnCompositorServer,
-    cursor: Option<&NativeAtomicCursor>,
-    output_transactions: &OutputTransactionLedger,
-    transaction_id: OutputTransactionId,
-    cursor_update: KmsCursorUpdate,
-    cursor_delivery: PresentedCursorDelivery,
-    primary_cursor_presentation: KmsPrimaryCursorPresentation,
-) -> Option<CursorRevealTraceSnapshot> {
-    let cursor_epoch = output_transactions
-        .transaction(transaction_id)
-        .and_then(
-            |transaction| match transaction.descriptor().planes().cursor() {
-                CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(*desired_epoch),
-                CursorPlaneAssignment::Disabled | CursorPlaneAssignment::Unchanged => None,
-            },
-        );
-    if let KmsPrimaryCursorPresentation::Promote(state) = primary_cursor_presentation {
-        return cursor_reveal_trace_snapshot_from_presented(server, cursor, state, cursor_epoch);
-    }
-    let cursor = cursor?;
-    let state = match cursor_update {
-        KmsCursorUpdate::Set(state) => state,
-        KmsCursorUpdate::Disable => {
-            let mut state = cursor.desired().clone();
-            state.visible = false;
-            state.framebuffer_id = None;
-            state
-        }
-        KmsCursorUpdate::Unchanged => return None,
-    };
-    cursor_reveal_trace_snapshot(
-        server,
-        cursor,
-        &state,
-        cursor_epoch,
-        Some(cursor.desired_revision()),
-        cursor_delivery,
-    )
 }
 
 fn kms_primary_cursor_presentation(
@@ -1023,6 +960,7 @@ pub(super) fn queue_compatibility_for_presentation(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_source: Option<CursorSource>,
     cursor_revision: Option<CursorRevision>,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -1035,25 +973,21 @@ pub(super) fn queue_compatibility_for_presentation(
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
-    let trace_snapshot = server.cursor_reveal_authority().and_then(|authority| {
+    let trace_snapshot =
         if let KmsPrimaryCursorPresentation::Promote(state) = primary_cursor_presentation {
-            return Some(CursorRevealTraceSnapshot::from_presented(
-                authority,
-                Some(cursor_epoch),
-                state,
-                None,
-            ));
-        }
-        let state = cursor?;
-        Some(CursorRevealTraceSnapshot::from_atomic(
-            authority,
-            Some(cursor_epoch),
-            cursor_revision,
-            cursor_delivery,
-            state,
-            None,
-        ))
-    });
+            cursor_reveal_trace_snapshot_from_presented(server, state, Some(cursor_epoch))
+        } else {
+            cursor.and_then(|state| {
+                cursor_reveal_trace_snapshot(
+                    server,
+                    state,
+                    Some(cursor_epoch),
+                    cursor_revision,
+                    cursor_delivery,
+                    cursor_source,
+                )
+            })
+        };
     match super::kms_worker::queue_atomic_compatibility_frame(
         worker,
         scanout,
@@ -1115,10 +1049,11 @@ pub(super) fn finish_direct_worker_queued(
     effective_cursor: Option<&AtomicCursorVisualState>,
     cursor_revision: Option<CursorRevision>,
     context: WorkerPrimarySubmissionContext<'_>,
+    trace_snapshot: Option<CursorRevealTraceSnapshot>,
     output_generation: u64,
     crtc_id: u32,
     scene_generation: u64,
-    cursor_epoch: u64,
+    _cursor_epoch: u64,
     last_rendered_scene_generation: &mut u64,
     _last_submitted_cursor_epoch: &mut u64,
     frame_index: &mut u64,
@@ -1158,18 +1093,6 @@ pub(super) fn finish_direct_worker_queued(
             .frame_batch_id()
             .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?
     };
-    let trace_snapshot = context.atomic_cursor.and_then(|cursor| {
-        effective_cursor.and_then(|state| {
-            cursor_reveal_trace_snapshot(
-                server,
-                cursor,
-                state,
-                Some(cursor_epoch),
-                cursor_revision,
-                context.cursor_delivery,
-            )
-        })
-    });
     let mut owners = KmsBundleOwners::for_transaction(
         kind,
         std::sync::Arc::new(

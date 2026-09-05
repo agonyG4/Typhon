@@ -5,6 +5,7 @@ use oblivion_one::native::kms::{
     AtomicCursorPlaneAssignment, AtomicCursorVisualState, AtomicPipelineProperties, PageFlipToken,
 };
 
+pub(crate) use super::plane::CursorRevealTraceSnapshot;
 use super::plane::{
     CursorPlanePoint, CursorRevision, CursorSource, PlanePageflipIdentity, PresentedCursorDelivery,
     PresentedCursorState,
@@ -30,19 +31,6 @@ impl CursorRevealPhysicalIdentity {
             token: identity.token,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct CursorRevealTraceSnapshot {
-    pub(crate) authority: CursorRevealAuthority,
-    pub(crate) expected_epoch: Option<u64>,
-    pub(crate) expected_revision: Option<CursorRevision>,
-    pub(crate) expected_delivery: Option<PresentedCursorDelivery>,
-    pub(crate) expected_position: Option<CursorPlanePoint>,
-    pub(crate) expected_hotspot: Option<CursorPlanePoint>,
-    pub(crate) expected_framebuffer_id: Option<Option<u32>>,
-    pub(crate) expected_image_generation: Option<u64>,
-    pub(crate) expected_source: Option<CursorSource>,
 }
 
 impl CursorRevealTraceSnapshot {
@@ -77,7 +65,6 @@ impl CursorRevealTraceSnapshot {
         authority: CursorRevealAuthority,
         expected_epoch: Option<u64>,
         state: PresentedCursorState,
-        source: Option<CursorSource>,
     ) -> Self {
         Self {
             authority,
@@ -88,7 +75,7 @@ impl CursorRevealTraceSnapshot {
             expected_hotspot: Some(state.hotspot),
             expected_framebuffer_id: Some(state.framebuffer_id),
             expected_image_generation: state.image_generation,
-            expected_source: source.or(state.source),
+            expected_source: state.source,
         }
     }
 }
@@ -238,6 +225,24 @@ impl CursorRevealTraceLedger {
             identity,
             reveal: snapshot.authority.constraint,
             snapshot,
+        });
+        crate::pointer_debug::cursor_presentation_log_lazy(|| {
+            format!(
+                "event=cursor_submission_bound constraint={}/{} output_generation={} crtc_id={} pageflip_token={} expected_epoch={:?} expected_revision={:?} expected_delivery={:?} expected_position={:?} expected_hotspot={:?} expected_framebuffer_id={:?} expected_image_generation={:?} expected_source={:?}",
+                snapshot.authority.constraint.constraint_id,
+                snapshot.authority.constraint.generation,
+                identity.output_generation,
+                identity.crtc_id,
+                identity.token.get(),
+                snapshot.expected_epoch,
+                snapshot.expected_revision,
+                snapshot.expected_delivery,
+                snapshot.expected_position,
+                snapshot.expected_hotspot,
+                snapshot.expected_framebuffer_id,
+                snapshot.expected_image_generation,
+                snapshot.expected_source,
+            )
         });
     }
 
@@ -398,15 +403,15 @@ fn format_cursor_kms_submit_assignment(
     match assignment {
         AtomicCursorPlaneAssignment::Unavailable => {
             if unchanged {
-                line.push_str("unchanged plane_id=unknown FB_ID=unknown CRTC_ID=unknown SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X=unknown CRTC_Y=unknown CRTC_W=unknown CRTC_H=unknown position=unknown hotspot=unknown framebuffer_id=unknown image_generation=unknown");
+                line.push_str("unchanged plane_id=unknown FB_ID=unknown CRTC_ID=unknown SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X_RAW=unknown CRTC_Y_RAW=unknown CRTC_W=unknown CRTC_H=unknown pointer_position=unknown hotspot=unknown plane_origin_signed=unknown framebuffer_id=unknown image_generation=unknown");
             } else {
-                line.push_str("unavailable plane_id=unknown FB_ID=unknown CRTC_ID=unknown SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X=unknown CRTC_Y=unknown CRTC_W=unknown CRTC_H=unknown position=unknown hotspot=unknown framebuffer_id=unknown image_generation=unknown");
+                line.push_str("unavailable plane_id=unknown FB_ID=unknown CRTC_ID=unknown SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X_RAW=unknown CRTC_Y_RAW=unknown CRTC_W=unknown CRTC_H=unknown pointer_position=unknown hotspot=unknown plane_origin_signed=unknown framebuffer_id=unknown image_generation=unknown");
             }
         }
         AtomicCursorPlaneAssignment::Disabled { plane_id } => {
             let _ = write!(
                 line,
-                "disabled plane_id={} FB_ID=0 CRTC_ID=0 SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X=unknown CRTC_Y=unknown CRTC_W=unknown CRTC_H=unknown position=unknown hotspot=unknown framebuffer_id=none image_generation=unknown",
+                "disabled plane_id={} FB_ID=0 CRTC_ID=0 SRC_X=unknown SRC_Y=unknown SRC_W=unknown SRC_H=unknown CRTC_X_RAW=unknown CRTC_Y_RAW=unknown CRTC_W=unknown CRTC_H=unknown pointer_position=unknown hotspot=unknown plane_origin_signed=unknown framebuffer_id=none image_generation=unknown",
                 plane_id
             );
         }
@@ -420,6 +425,10 @@ fn format_cursor_kms_submit_assignment(
             src_h,
             crtc_x,
             crtc_y,
+            pointer_x,
+            pointer_y,
+            plane_origin_x,
+            plane_origin_y,
             crtc_w,
             crtc_h,
             hotspot_x,
@@ -429,7 +438,7 @@ fn format_cursor_kms_submit_assignment(
         } => {
             let _ = write!(
                 line,
-                "enabled plane_id={} FB_ID={} CRTC_ID={} SRC_X={} SRC_Y={} SRC_W={} SRC_H={} CRTC_X={} CRTC_Y={} CRTC_W={} CRTC_H={} position=({}, {}) hotspot=({}, {}) framebuffer_id={} image_generation={}",
+                "enabled plane_id={} FB_ID={} CRTC_ID={} SRC_X={} SRC_Y={} SRC_W={} SRC_H={} CRTC_X_RAW={} CRTC_Y_RAW={} CRTC_W={} CRTC_H={} pointer_position=({}, {}) hotspot=({}, {}) plane_origin_signed=({}, {}) framebuffer_id={} image_generation={}",
                 plane_id,
                 framebuffer_id,
                 crtc_id,
@@ -441,10 +450,12 @@ fn format_cursor_kms_submit_assignment(
                 crtc_y,
                 crtc_w,
                 crtc_h,
-                crtc_x,
-                crtc_y,
+                pointer_x,
+                pointer_y,
                 hotspot_x,
                 hotspot_y,
+                plane_origin_x,
+                plane_origin_y,
                 framebuffer_id,
                 image_generation
             );
@@ -490,11 +501,7 @@ mod tests {
 
     fn snapshot(id: u64, visible: bool) -> CursorRevealTraceSnapshot {
         let authority = authority(id, visible);
-        CursorRevealTraceSnapshot::from_presented(
-            authority,
-            Some(id),
-            state(id),
-        )
+        CursorRevealTraceSnapshot::from_presented(authority, Some(id), state(id))
     }
 
     fn identity(token: u64) -> CursorRevealPhysicalIdentity {
@@ -533,11 +540,7 @@ mod tests {
         let mut expected = state(1);
         expected.revision = CursorRevision::initial().advance_image();
         let authority = authority(1, true);
-        let snapshot = CursorRevealTraceSnapshot::from_presented(
-            authority,
-            Some(1),
-            expected,
-        );
+        let snapshot = CursorRevealTraceSnapshot::from_presented(authority, Some(1), expected);
         let mut presented = state(1);
         presented.revision = CursorRevision::initial();
         presented.image_generation = Some(0);
@@ -549,6 +552,17 @@ mod tests {
         assert_eq!(comparison.revision_match, CursorTraceMatch::False);
         assert_eq!(comparison.visual_match, CursorTraceMatch::False);
         assert_eq!(comparison.overall_match, CursorTraceMatch::False);
+    }
+
+    #[test]
+    fn presented_snapshot_uses_frozen_state_source() {
+        let authority = authority(4, true);
+        let mut presented = state(4);
+        presented.source = Some(CursorSource::Theme);
+
+        let snapshot = CursorRevealTraceSnapshot::from_presented(authority, Some(4), presented);
+
+        assert_eq!(snapshot.expected_source, Some(CursorSource::Theme));
     }
 
     #[test]

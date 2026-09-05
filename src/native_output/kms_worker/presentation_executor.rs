@@ -73,7 +73,10 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     ..
                 } => Some(cursor_epoch),
                 crate::native_output::runtime::AtomicCommitKind::CompositedPrimary { .. }
-                | crate::native_output::runtime::AtomicCommitKind::DirectPrimary { .. } => None,
+                | crate::native_output::runtime::AtomicCommitKind::DirectPrimary { .. } => job
+                    .owners
+                    .trace_reveal()
+                    .and_then(|snapshot| snapshot.expected_epoch),
             };
             trace_cursor_kms_submit(
                 self.submitter.pipeline(),
@@ -88,7 +91,11 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     token: job.token,
                     crtc_id: job.crtc_id,
                     cursor_epoch,
-                    cursor_revision: job.owners.cursor().map(|owner| owner.revision),
+                    cursor_revision: job
+                        .owners
+                        .trace_reveal()
+                        .and_then(|snapshot| snapshot.expected_revision)
+                        .or_else(|| job.owners.cursor().map(|owner| owner.revision)),
                     submission_kind: if matches!(&job.primary, KmsPrimaryUpdate::Unchanged) {
                         "cursor_only"
                     } else {

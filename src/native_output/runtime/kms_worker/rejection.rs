@@ -777,6 +777,7 @@ mod ownership_tests {
         let owners = KmsBundleOwners::new(
             Some(KmsPrimaryOwner {
                 transaction: Arc::clone(&transaction),
+                trace_reveal: None,
             }),
             cursor_owner,
         )

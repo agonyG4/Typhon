@@ -803,7 +803,20 @@ impl NativeRuntime {
                     frozen_cursor.0.as_ref(),
                     frozen_cursor.1.as_ref(),
                 );
-                Some((frame_target, submit_window, frozen_cursor))
+                let frozen_cursor_trace_reveal = frozen_cursor_trace_for_render(
+                    server,
+                    atomic_cursor.as_ref(),
+                    effective_cursor.as_ref(),
+                    primary_cursor,
+                    cursor_epoch,
+                    planned_cursor_delivery,
+                );
+                Some((
+                    frame_target,
+                    submit_window,
+                    frozen_cursor,
+                    frozen_cursor_trace_reveal,
+                ))
             } else {
                 None
             };
@@ -846,6 +859,18 @@ impl NativeRuntime {
                     && worker_mode
                     && kms_commit_worker.is_some()
                 {
+                    let direct_trace_snapshot = atomic_cursor.as_ref().and_then(|cursor| {
+                        effective_cursor.as_ref().and_then(|state| {
+                            cursor_reveal_trace_snapshot(
+                                server,
+                                state,
+                                Some(cursor_epoch),
+                                frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
+                                planned_cursor_delivery,
+                                Some(cursor_source_for_trace(cursor)),
+                            )
+                        })
+                    });
                     match scanout.try_direct_scanout(
                         kms_backend,
                         server,
@@ -908,6 +933,7 @@ impl NativeRuntime {
                                     planned_cursor_delivery,
                                     primary_cursor,
                                 ),
+                                direct_trace_snapshot,
                                 *drm_file_generation,
                                 target.crtc_id,
                                 scene_generation,
@@ -1091,14 +1117,24 @@ impl NativeRuntime {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let expected_scene_signature = resolved_scene.scene_identity_signature();
                         drop(resolved_scene);
-                        let (frame_target, submit_window, frozen_cursor) = if let Some((
+                        let (
                             frame_target,
                             submit_window,
                             frozen_cursor,
-                        )) =
-                            preadmitted_explicit_render
+                            frozen_cursor_trace_reveal,
+                        ) = if let Some((
+                            frame_target,
+                            submit_window,
+                            frozen_cursor,
+                            frozen_cursor_trace_reveal,
+                        )) = preadmitted_explicit_render
                         {
-                            (frame_target, submit_window, frozen_cursor)
+                            (
+                                frame_target,
+                                submit_window,
+                                frozen_cursor,
+                                frozen_cursor_trace_reveal,
+                            )
                         } else {
                             let frame_target = scheduled_presentation_target
                                 .take()
@@ -1140,7 +1176,20 @@ impl NativeRuntime {
                                 frozen_cursor.0.as_ref(),
                                 frozen_cursor.1.as_ref(),
                             );
-                            (frame_target, submit_window, frozen_cursor)
+                            let frozen_cursor_trace_reveal = frozen_cursor_trace_for_render(
+                                server,
+                                atomic_cursor.as_ref(),
+                                effective_cursor.as_ref(),
+                                primary_cursor,
+                                cursor_epoch,
+                                planned_cursor_delivery,
+                            );
+                            (
+                                frame_target,
+                                submit_window,
+                                frozen_cursor,
+                                frozen_cursor_trace_reveal,
+                            )
                         };
                         let o1_admission = Some(admission_observation_for_frame(
                             frame_target,
@@ -1184,7 +1233,9 @@ impl NativeRuntime {
                                 primary_cursor,
                                 runtime_plane_plan.as_ref(),
                             ),
-                            frozen_cursor_plane_owner, AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
+                            frozen_cursor_plane_owner,
+                            frozen_cursor_trace_reveal,
+                            AtomicAsyncPolicyInputs::new(cursor_state_changed, atomic_kms_lane_free, confirmed_output_presentation.content_type),
                             release_safety,
                             dmabuf_gpu_release_lease_id,
                         ).inspect_err(|_| {

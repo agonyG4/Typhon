@@ -2,7 +2,9 @@ use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_sour
 use super::*;
 use crate::native_output::kms_worker::AttachablePrimary;
 use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
-use crate::native_output::presentation::plane::{CursorRevision, PresentedCursorState};
+use crate::native_output::presentation::plane::{
+    CursorRevision, CursorSource, PresentedCursorDelivery, PresentedCursorState,
+};
 
 pub(super) fn synchronize_active_cursor_image(
     server: &OwnCompositorServer,
@@ -300,18 +302,16 @@ pub(super) struct RuntimePlanePlan {
 
 pub(super) fn cursor_reveal_trace_snapshot(
     server: &OwnCompositorServer,
-    cursor: &NativeAtomicCursor,
     state: &AtomicCursorVisualState,
     cursor_epoch: Option<u64>,
     revision: Option<CursorRevision>,
-    delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    delivery: PresentedCursorDelivery,
+    source: Option<CursorSource>,
 ) -> Option<CursorRevealTraceSnapshot> {
+    if !crate::pointer_debug::cursor_presentation_trace_enabled() {
+        return None;
+    }
     let authority = server.cursor_reveal_authority()?;
-    let source = Some(if cursor.client_source_key().is_some() {
-        crate::native_output::presentation::plane::CursorSource::Client
-    } else {
-        crate::native_output::presentation::plane::CursorSource::Theme
-    });
     Some(CursorRevealTraceSnapshot::from_atomic(
         authority,
         cursor_epoch,
@@ -324,24 +324,56 @@ pub(super) fn cursor_reveal_trace_snapshot(
 
 pub(super) fn cursor_reveal_trace_snapshot_from_presented(
     server: &OwnCompositorServer,
-    cursor: Option<&NativeAtomicCursor>,
     state: PresentedCursorState,
     cursor_epoch: Option<u64>,
 ) -> Option<CursorRevealTraceSnapshot> {
+    if !crate::pointer_debug::cursor_presentation_trace_enabled() {
+        return None;
+    }
     let authority = server.cursor_reveal_authority()?;
-    let source = cursor.map(|cursor| {
-        if cursor.client_source_key().is_some() {
-            crate::native_output::presentation::plane::CursorSource::Client
-        } else {
-            crate::native_output::presentation::plane::CursorSource::Theme
-        }
-    });
     Some(CursorRevealTraceSnapshot::from_presented(
         authority,
         cursor_epoch,
         state,
-        source,
     ))
+}
+
+pub(super) fn cursor_source_for_trace(cursor: &NativeAtomicCursor) -> CursorSource {
+    if cursor.client_source_key().is_some() {
+        CursorSource::Client
+    } else {
+        CursorSource::Theme
+    }
+}
+
+pub(super) fn frozen_cursor_trace_for_render(
+    server: &OwnCompositorServer,
+    cursor: Option<&NativeAtomicCursor>,
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
+    cursor_epoch: u64,
+    cursor_delivery: PresentedCursorDelivery,
+) -> Option<CursorRevealTraceSnapshot> {
+    if !crate::pointer_debug::cursor_presentation_trace_enabled() {
+        return None;
+    }
+    let authority = server.cursor_reveal_authority()?;
+    match primary_cursor_presentation {
+        KmsPrimaryCursorPresentation::Promote(state) => Some(
+            CursorRevealTraceSnapshot::from_presented(authority, Some(cursor_epoch), state),
+        ),
+        KmsPrimaryCursorPresentation::Preserve => {
+            let state = effective_cursor?;
+            Some(CursorRevealTraceSnapshot::from_atomic(
+                authority,
+                Some(cursor_epoch),
+                cursor.map(NativeAtomicCursor::desired_revision),
+                cursor_delivery,
+                state,
+                cursor.map(cursor_source_for_trace),
+            ))
+        }
+    }
 }
 
 pub(super) fn trace_cursor_plane_plan(

@@ -14,6 +14,7 @@ use oblivion_one::native::kms::PageFlipToken;
 #[derive(Debug, Clone)]
 pub(crate) struct KmsPrimaryOwner {
     pub(crate) transaction: Arc<OutputTransaction>,
+    pub(crate) trace_reveal: Option<CursorRevealTraceSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,7 @@ impl KmsBundleOwners {
         let primary =
             (!matches!(kind, AtomicCommitKind::PlaneDelta { .. })).then(|| KmsPrimaryOwner {
                 transaction: Arc::clone(&transaction),
+                trace_reveal: None,
             });
         let cursor = match transaction.planes().cursor() {
             CursorPlaneAssignment::Unchanged => {
@@ -133,7 +135,16 @@ impl KmsBundleOwners {
     pub(crate) fn set_cursor_trace_reveal(&mut self, snapshot: Option<CursorRevealTraceSnapshot>) {
         if let Some(cursor) = self.cursor.as_mut() {
             cursor.trace_reveal = snapshot;
+        } else if let Some(primary) = self.primary.as_mut() {
+            primary.trace_reveal = snapshot;
         }
+    }
+
+    pub(crate) fn trace_reveal(&self) -> Option<CursorRevealTraceSnapshot> {
+        self.cursor
+            .as_ref()
+            .and_then(|owner| owner.trace_reveal)
+            .or_else(|| self.primary.as_ref().and_then(|owner| owner.trace_reveal))
     }
 
     pub(crate) fn replace_cursor(&mut self, cursor: KmsCursorOwner) -> Option<KmsCursorOwner> {

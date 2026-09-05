@@ -72,6 +72,7 @@ impl AtomicEglGbmScanout {
         let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
         let transaction_id = frame.transaction_id;
         debug_assert_eq!(transaction_id, ready_transaction_id);
+        let frozen_cursor_trace_reveal = frame.frozen_cursor_trace_reveal;
         let planned_cursor = match output_transactions
             .transaction(transaction_id)
             .ok_or_else(|| io::Error::other("ready transaction disappeared before submission"))?
@@ -194,8 +195,10 @@ impl AtomicEglGbmScanout {
                             transaction_id: Some(transaction_id),
                             token,
                             crtc_id: submitter.pipeline().crtc.get(),
-                            cursor_epoch: None,
-                            cursor_revision: None,
+                            cursor_epoch: frozen_cursor_trace_reveal
+                                .and_then(|snapshot| snapshot.expected_epoch),
+                            cursor_revision: frozen_cursor_trace_reveal
+                                .and_then(|snapshot| snapshot.expected_revision),
                             submission_kind: "primary_plus_cursor",
                             transport: "synchronous",
                             delivery: if planned_cursor.as_ref().is_some_and(|state| state.visible)

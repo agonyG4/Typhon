@@ -1,5 +1,5 @@
 use super::cursor_cycle::defer_cursor_after_busy;
-use super::presentation_cursor::cursor_reveal_trace_snapshot;
+use super::presentation_cursor::{cursor_reveal_trace_snapshot, cursor_source_for_trace};
 use super::*;
 use crate::native_output::presentation::plane::PresentedCursorDelivery;
 use oblivion_one::compositor::CompositorFrameBatchId;
@@ -866,11 +866,11 @@ pub(super) fn submit_plane_delta(
             };
             let trace_snapshot = cursor_reveal_trace_snapshot(
                 server,
-                cursor,
                 &submitted_state,
                 Some(cursor_epoch),
                 Some(submitted_revision),
                 submitted_delivery,
+                Some(cursor_source_for_trace(cursor)),
             );
             match kms_backend.submit_cursor_flip(desired.as_ref(), token) {
                 Ok(()) => {

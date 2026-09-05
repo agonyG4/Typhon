@@ -116,9 +116,6 @@ pub(super) fn queue_explicit_composited_frame(
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
-    cursor_reveal_trace: Option<
-        crate::native_output::presentation::cursor_trace::CursorRevealTraceSnapshot,
-    >,
 ) -> NativeResult<WorkerQueueOutcome> {
     let slot = explicit
         .swapchain()?
@@ -161,6 +158,7 @@ pub(super) fn queue_explicit_composited_frame(
         .swapchain_mut()?
         .take_ready_for_worker(token, MonotonicTimestampNs::new(queued_at_ns))?;
     let (in_fence, frozen_cursor_owner) = in_fence_and_owner;
+    let frozen_cursor_trace_reveal = explicit.swapchain()?.worker_queued_cursor_trace_reveal();
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,
@@ -218,7 +216,7 @@ pub(super) fn queue_explicit_composited_frame(
         frozen_cursor_owner_metadata.and_then(|(_, capability_key)| capability_key),
     )
     .map_err(|error| io::Error::other(format!("invalid ready cursor owner: {error:?}")))?;
-    owners.set_cursor_trace_reveal(cursor_reveal_trace);
+    owners.set_cursor_trace_reveal(frozen_cursor_trace_reveal);
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
@@ -878,11 +876,7 @@ impl NativeRuntime {
                 {
                     self.scanout.note_composited_async_validation(key, true);
                 }
-                let trace_snapshot = ownership
-                    .job
-                    .owners
-                    .cursor()
-                    .and_then(|owner| owner.trace_reveal);
+                let trace_snapshot = ownership.job.owners.trace_reveal();
                 let trace_identity = crate::native_output::CursorRevealPhysicalIdentity {
                     output_generation: ownership.job.output_generation,
                     crtc_id: ownership.job.crtc_id,

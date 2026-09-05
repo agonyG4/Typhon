@@ -6,6 +6,7 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
+use oblivion_one::compositor::CursorRevealAuthority;
 use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
 
 use super::pipeline::PresentedPrimaryState;
@@ -249,6 +250,19 @@ pub(crate) struct PresentedCursorState {
     pub(crate) visible: bool,
     pub(crate) output_position: CursorPlanePoint,
     pub(crate) hotspot: CursorPlanePoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CursorRevealTraceSnapshot {
+    pub(crate) authority: CursorRevealAuthority,
+    pub(crate) expected_epoch: Option<u64>,
+    pub(crate) expected_revision: Option<CursorRevision>,
+    pub(crate) expected_delivery: Option<PresentedCursorDelivery>,
+    pub(crate) expected_position: Option<CursorPlanePoint>,
+    pub(crate) expected_hotspot: Option<CursorPlanePoint>,
+    pub(crate) expected_framebuffer_id: Option<Option<u32>>,
+    pub(crate) expected_image_generation: Option<u64>,
+    pub(crate) expected_source: Option<CursorSource>,
 }
 
 impl PresentedCursorState {

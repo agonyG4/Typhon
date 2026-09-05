@@ -26,7 +26,9 @@ use crate::native_output::presentation::transaction::{
     FramePresentationReservation, O1PredecessorAnchor,
 };
 use crate::native_output::presentation::{
-    kms_timing::KmsSubmitWindow, plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
+    kms_timing::KmsSubmitWindow,
+    plane::{CursorRevealTraceSnapshot, FrozenPrimaryCursorPlan},
+    plane_policy::CursorCapabilityKey,
 };
 use oblivion_one::native::buffering::PresentationOpportunityFrontier;
 
@@ -192,6 +194,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) cpu_encode_duration_ns: u64,
     pub(crate) frozen_cursor_plan: FrozenPrimaryCursorPlan,
     pub(crate) frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+    pub(crate) frozen_cursor_trace_reveal: Option<CursorRevealTraceSnapshot>,
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }
 
@@ -511,6 +514,7 @@ impl AtomicOutputSwapchain {
                     crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip,
             },
             frozen_cursor_plane_owner: None,
+            frozen_cursor_trace_reveal: None,
             o1_admission: None,
         })
     }
@@ -554,6 +558,24 @@ impl AtomicOutputSwapchain {
         self.ready
             .as_ref()
             .and_then(|frame| frame.frozen_cursor_plane_owner.as_ref())
+    }
+
+    pub(crate) fn ready_cursor_trace_reveal(&self) -> Option<CursorRevealTraceSnapshot> {
+        self.ready
+            .as_ref()
+            .and_then(|frame| frame.frozen_cursor_trace_reveal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ready_cursor_trace_reveal_for_test(
+        &mut self,
+        snapshot: Option<CursorRevealTraceSnapshot>,
+    ) -> io::Result<()> {
+        self.ready
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?
+            .frozen_cursor_trace_reveal = snapshot;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -621,6 +643,7 @@ impl AtomicOutputSwapchain {
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan,
             frozen_cursor_plane_owner,
+            frozen_cursor_trace_reveal: None,
             o1_admission: None,
         });
         Ok(())
@@ -699,6 +722,14 @@ impl AtomicOutputSwapchain {
             .as_mut()
             .and_then(|queued| queued.frame.frozen_cursor_plane_owner.take());
         Ok((fence, owner))
+    }
+
+    pub(crate) fn worker_queued_cursor_trace_reveal(&self) -> Option<CursorRevealTraceSnapshot> {
+        let trace_reveal = self
+            .worker_queued
+            .as_ref()
+            .and_then(|queued| queued.frame.frozen_cursor_trace_reveal);
+        trace_reveal
     }
 
     pub(crate) fn store_worker_queued(
@@ -1940,6 +1971,7 @@ mod tests {
                 cursor_test_policy: FrozenCursorTestPolicy::Skip,
             },
             frozen_cursor_plane_owner: None,
+            frozen_cursor_trace_reveal: None,
             o1_admission: None,
         }
     }

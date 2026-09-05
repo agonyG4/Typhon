@@ -187,6 +187,7 @@ fn two_owner_job(
     job.owners = KmsBundleOwners::new(
         Some(KmsPrimaryOwner {
             transaction: transaction(primary_id, token),
+            trace_reveal: None,
         }),
         Some(KmsCursorOwner {
             transaction: transaction(cursor_id, token.saturating_mul(10)),

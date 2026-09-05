@@ -236,6 +236,9 @@ pub(super) fn submit_ready_frame(
                 cursor,
                 atomic_cursor
                     .as_ref()
+                    .map(super::presentation_cursor::cursor_source_for_trace),
+                atomic_cursor
+                    .as_ref()
                     .and_then(|cursor_state| cursor.map(|_| cursor_state.desired_revision())),
                 cursor_delivery,
                 primary_cursor_presentation,

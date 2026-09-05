@@ -1283,10 +1283,39 @@ fn visible_cursor_geometry_preserves_negative_partially_offscreen_coordinates() 
     cursor.hotspot_x = 7;
     cursor.hotspot_y = 9;
     let request = AtomicRequest::cursor_only(&pipeline, Some(&cursor)).unwrap();
+    let assignment = cursor_plane_assignment(&pipeline, Some(&cursor)).unwrap();
     let serialized = request.serialize();
 
     assert_eq!(serialized.values[6], (-5i64) as u64);
     assert_eq!(serialized.values[7], (-6i64) as u64);
+    assert_eq!(
+        assignment,
+        AtomicCursorPlaneAssignment::Enabled {
+            plane_id: 4,
+            framebuffer_id: 99,
+            crtc_id: 2,
+            src_x: 0,
+            src_y: 0,
+            src_w: 64 << 16,
+            src_h: 64 << 16,
+            crtc_x: (-5i64) as u64,
+            crtc_y: (-6i64) as u64,
+            pointer_x: 2,
+            pointer_y: 3,
+            plane_origin_x: -5,
+            plane_origin_y: -6,
+            crtc_w: 64,
+            crtc_h: 64,
+            hotspot_x: 7,
+            hotspot_y: 9,
+            width: 64,
+            height: 64,
+            image_generation: 3,
+            rotation: None,
+            alpha: None,
+            pixel_blend_mode: None,
+        }
+    );
 }
 
 #[test]

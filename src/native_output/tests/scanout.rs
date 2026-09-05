@@ -302,6 +302,67 @@ fn ready_frame_keeps_its_frozen_cursor_contract() {
 }
 
 #[test]
+fn ready_frame_carries_frozen_cursor_reveal_through_worker_queue() {
+    let slots = explicit_slot_set();
+    let mut swapchain =
+        AtomicOutputSwapchain::from_presented_slots(slots, OutputSlotId::new(0).unwrap(), 1)
+            .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let state = crate::native_output::presentation::plane::PresentedCursorState {
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        coupling: crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
+        delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+        framebuffer_id: None,
+        image_generation: Some(7),
+        source: Some(crate::native_output::presentation::plane::CursorSource::Client),
+        visible: false,
+        output_position: crate::native_output::presentation::plane::CursorPlanePoint {
+            x: 90,
+            y: 75,
+        },
+        hotspot: crate::native_output::presentation::plane::CursorPlanePoint { x: 10, y: 5 },
+    };
+    let snapshot = crate::native_output::CursorRevealTraceSnapshot::from_presented(
+        oblivion_one::compositor::CursorRevealAuthority {
+            constraint: oblivion_one::compositor::PointerConstraintBackendId {
+                constraint_id: 7,
+                generation: 8,
+            },
+            final_position: oblivion_one::compositor::OutputPosition { x: 100.0, y: 80.0 },
+            visibility_requested: true,
+        },
+        Some(7),
+        state,
+    );
+    let frozen = crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+        delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+        primary_presentation:
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Promote(
+                state,
+            ),
+        cursor_test_policy: crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip,
+    };
+    swapchain
+        .prepare_ready_for_test(slot, test_render_fence(), frozen, None)
+        .unwrap();
+    swapchain
+        .set_ready_cursor_trace_reveal_for_test(Some(snapshot))
+        .unwrap();
+
+    assert_eq!(swapchain.ready_cursor_trace_reveal(), Some(snapshot));
+    swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(41).unwrap(),
+            MonotonicTimestampNs::new(1),
+        )
+        .unwrap();
+    assert_eq!(
+        swapchain.worker_queued_cursor_trace_reveal(),
+        Some(snapshot)
+    );
+}
+
+#[test]
 fn ready_frame_retains_and_transfers_its_frozen_cursor_pin() {
     let slots = explicit_slot_set();
     let mut swapchain =
