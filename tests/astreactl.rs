@@ -472,6 +472,28 @@ fn keyboard_cli_sends_exact_wire_commands_and_arguments() {
     }
 }
 
+#[test]
+fn keyboard_cli_preserves_server_error_exit_categories() {
+    let invalid = run_socket_once_args(
+        &["keyboard", "set", "1"],
+        envelope_with_error(serde_json::json!({
+            "code": "invalid_argument",
+            "message": "keyboard layout index is out of range"
+        })),
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+
+    let unavailable = run_socket_once_args(
+        &["keyboard", "layout"],
+        envelope_with_error(serde_json::json!({
+            "code": "internal",
+            "message": "keyboard state unavailable",
+            "detail": "keyboard_state_unavailable"
+        })),
+    );
+    assert_eq!(unavailable.status.code(), Some(1));
+}
+
 fn run_socket_cycles(command: &str, response: Vec<u8>, expected_code: i32) {
     run_socket_cycles_args(&[command], response, expected_code);
 }

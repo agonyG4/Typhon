@@ -340,17 +340,21 @@ mod tests {
             layouts: vec![
                 KeyboardLayoutEntrySnapshot {
                     index: 0,
-                    name: "Portuguese\n(Brazil)".to_string(),
+                    name: "Portuguese\n\t\u{1b}(Brazil)".to_string(),
                 },
                 KeyboardLayoutEntrySnapshot {
                     index: 1,
                     name: "English (US)".to_string(),
                 },
+                KeyboardLayoutEntrySnapshot {
+                    index: 2,
+                    name: String::new(),
+                },
             ],
         });
         assert_eq!(
             human(&value),
-            "Effective: 1\nLocked: 1\n\n  0  Portuguese (Brazil)\n* 1  English (US)"
+            "Effective: 1\nLocked: 1\n\n  0  Portuguese  (Brazil)\n* 1  English (US)\n  2  Unnamed"
         );
     }
 }

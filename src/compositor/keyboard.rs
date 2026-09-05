@@ -886,6 +886,28 @@ mod tests {
     }
 
     #[test]
+    fn layout_handle_fails_closed_on_a_different_thread() {
+        let handle = std::thread::spawn(|| {
+            let mut handle = KeyboardStateHandle::default();
+            assert!(
+                handle.ensure_with(|| XkbKeyboardState::from_config(&KeyboardConfig::default()))
+            );
+            handle
+        })
+        .join()
+        .unwrap();
+
+        let mut handle = handle;
+        assert!(matches!(
+            handle.layout_snapshot(),
+            Err(KeyboardLayoutError::Unavailable(
+                "keyboard state unavailable"
+            ))
+        ));
+        assert!(!handle.ensure());
+    }
+
+    #[test]
     fn keyboard_state_handles_get_distinct_tls_ids() {
         let mut first = KeyboardStateHandle::default();
         let mut second = KeyboardStateHandle::default();
@@ -986,6 +1008,8 @@ mod tests {
         assert_eq!(change.snapshot.locked_index, 1);
         assert_eq!(change.snapshot.effective_index, 1);
         assert_eq!(state.wayland_serialized_state().depressed, before.depressed);
+        assert_eq!(state.wayland_serialized_state().latched, before.latched);
+        assert_eq!(state.wayland_serialized_state().locked, before.locked);
         assert_eq!(state.keymap_text_v1(), keymap_before);
         assert!(state.physical_pressed_keys.contains(&42));
     }
@@ -1027,6 +1051,37 @@ mod tests {
         let mut state = XkbKeyboardState::from_config(&config).unwrap();
         assert_eq!(state.next_layout().unwrap().snapshot.locked_index, 1);
         assert_eq!(state.next_layout().unwrap().snapshot.locked_index, 0);
+        assert_eq!(state.previous_layout().unwrap().snapshot.locked_index, 1);
+    }
+
+    #[test]
+    fn runtime_layout_single_layout_operations_are_idempotent() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        assert!(!state.next_layout().unwrap().changed);
+        assert!(!state.previous_layout().unwrap().changed);
+        assert!(!state.set_locked_layout(0).unwrap().changed);
+        assert_eq!(state.layout_snapshot().unwrap().locked_index, 0);
+    }
+
+    #[test]
+    fn runtime_layout_selection_shares_authority_with_physical_group_actions() {
+        let config = KeyboardConfig {
+            layout: "br,us".into(),
+            variant: Some("abnt2,".into()),
+            options: Some("grp:alt_shift_toggle".into()),
+            ..KeyboardConfig::default()
+        };
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        let selected = state.set_locked_layout(1).unwrap();
+        assert_eq!(selected.snapshot.locked_index, 1);
+        assert_eq!(selected.snapshot.effective_index, 1);
+
+        for (evdev_key, pressed) in [(56, true), (42, true), (42, false), (56, false)] {
+            state.update_physical_key(evdev_key, pressed);
+        }
+        let after_physical = state.layout_snapshot().unwrap();
+        assert_eq!(after_physical.locked_index, 0);
+        assert_eq!(after_physical.effective_index, 0);
         assert_eq!(state.previous_layout().unwrap().snapshot.locked_index, 1);
     }
 
