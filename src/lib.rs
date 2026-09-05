@@ -12,6 +12,8 @@ pub mod cursor_manager;
 pub mod cursor_persistence;
 pub mod cursor_theme;
 mod defaults;
+pub mod effects;
+pub mod keyboard_persistence;
 mod launch_env;
 pub mod native;
 mod paths;
