@@ -1030,6 +1030,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_primary_none_keeps_current_slot_non_renderable() {
+        let mut swapchain = swapchain();
+        let current = swapchain.current();
+        let snapshot = build_output_pipeline_snapshot_with_presented(
+            2,
+            7,
+            NativeOutputPacingMode::ReactiveDouble,
+            1,
+            &swapchain,
+            &OutputTransactionLedger::new(),
+            &AtomicCommitArbiter::new(),
+            None,
+            None,
+            TripleCapability::Capable,
+            PresentedPlaneSnapshot::legacy(None),
+        )
+        .expect("a recovery baseline without primary provenance is valid");
+
+        assert_eq!(snapshot.free_compositor_slots, 2);
+        let render_slot = swapchain.acquire_render_slot().expect("a free render slot");
+        assert_ne!(render_slot, current);
+    }
+
+    #[test]
     fn exact_ready_mapping_builds_snapshot() {
         let swapchain = ready_swapchain();
         let ready = swapchain.ready_identity().unwrap();

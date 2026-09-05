@@ -588,4 +588,28 @@ mod tests {
         _assert_sync::<KmsTestOnlyPolicy>();
         _assert_sync::<KmsCursorUpdate>();
     }
+
+    #[test]
+    fn pre_recovery_presented_validation_base_is_invalid_after_snapshot_rebase() {
+        let before = PresentedPlaneSnapshot::legacy(None);
+        let mut after = before;
+        after.rebase_after_session_recovery(PresentedCursorState::hidden());
+
+        assert_ne!(before.revision, after.revision);
+        assert_eq!(
+            validation_base_ready(
+                EstablishedKmsBase::Presented {
+                    revision: before.revision,
+                    output_generation: 2,
+                    crtc_id: 7,
+                },
+                KmsValidationBase::Presented {
+                    snapshot: after,
+                    output_generation: 2,
+                    crtc_id: 7,
+                },
+            ),
+            ValidationBaseDisposition::Invalidated
+        );
+    }
 }
