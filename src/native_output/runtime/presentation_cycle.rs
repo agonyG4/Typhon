@@ -142,6 +142,7 @@ impl NativeRuntime {
             presentation_cadence: _,
             frame_pacing,
             presentation_trace,
+            cursor_reveal_trace,
             last_acquire_ready_at_ns,
             resize_perf: _,
             pointer_constraint_backend: _,
@@ -655,6 +656,7 @@ impl NativeRuntime {
                 current_client_cursor_damage,
                 current_software_cursor_damage,
                 runtime_plane_plan.as_ref(),
+                cursor_reveal_trace,
             )?
             else {
                 *queued_redraw_requested = true;
@@ -734,6 +736,7 @@ impl NativeRuntime {
                 atomic_commit_arbiter,
                 output_transactions,
                 presentation_trace,
+                cursor_reveal_trace,
                 pacing_mode,
                 *presented_planes,
                 scene_history,
@@ -1401,6 +1404,7 @@ impl NativeRuntime {
                                             primary_cursor,
                                         ),
                                         false,
+                                        cursor_reveal_trace,
                                     )?
                                     else {
                                         server.note_frame_callback_admission_failure(protocol_batch_id);

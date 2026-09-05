@@ -54,6 +54,10 @@ pub(crate) enum KmsPrimaryCursorPresentation {
     Promote(PresentedCursorState),
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the presented snapshot remains inline so validation compares the exact immutable plane state"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsValidationBase {
     Presented {

@@ -263,11 +263,18 @@ impl NativeAtomicCursor {
         revision: crate::native_output::presentation::plane::CursorRevision,
         coupling: crate::native_output::presentation::plane::CursorCoupling,
     ) -> crate::native_output::presentation::plane::PresentedCursorState {
-        crate::native_output::presentation::plane::PresentedCursorState::from_atomic(
-            revision,
-            coupling,
-            &self.current,
-        )
+        let mut presented =
+            crate::native_output::presentation::plane::PresentedCursorState::from_atomic(
+                revision,
+                coupling,
+                &self.current,
+            );
+        presented.source = Some(if self.client_source_key().is_some() {
+            crate::native_output::presentation::plane::CursorSource::Client
+        } else {
+            crate::native_output::presentation::plane::CursorSource::Theme
+        });
+        presented
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {

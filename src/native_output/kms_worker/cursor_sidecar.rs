@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::native_output::{
     CursorFramebufferPin, CursorPlaneAssignment, OutputTransaction, OutputTransactionId,
+    presentation::cursor_trace::CursorRevealTraceSnapshot,
     presentation::plane::{CursorRevision, CursorSidecarId, PresentedCursorDelivery},
     presentation::plane_policy::CursorCapabilityKey,
 };
@@ -40,6 +41,7 @@ pub(crate) struct CursorSidecar {
     pub(crate) test_policy: KmsTestOnlyPolicy,
     pub(crate) cursor_delivery: PresentedCursorDelivery,
     pub(crate) capability_key: Option<CursorCapabilityKey>,
+    pub(crate) trace_reveal: Option<CursorRevealTraceSnapshot>,
     pub(crate) validation_base: KmsValidationBase,
 }
 

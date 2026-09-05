@@ -690,6 +690,8 @@ impl NativeRuntime {
             astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
             presentation_trace: PresentationTransactionTraceRing::from_env(),
+            cursor_reveal_trace: crate::pointer_debug::cursor_presentation_trace_enabled()
+                .then(CursorRevealTraceLedger::new),
             presentation_trace_path: std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
                 .map(std::path::PathBuf::from),
             timing_scopes: std::collections::BTreeMap::new(),

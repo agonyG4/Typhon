@@ -53,6 +53,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         test_policy: KmsTestOnlyPolicy::Skip,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
         capability_key: None,
+        trace_reveal: None,
         validation_base: job.validation_base,
     }
 }
@@ -192,6 +193,7 @@ fn two_owner_job(
             sidecar_id: None,
             revision: crate::native_output::presentation::plane::CursorRevision::initial(),
             capability_key: None,
+            trace_reveal: None,
         }),
     )
     .unwrap();
@@ -1422,6 +1424,8 @@ fn software_primary_presentation_requires_a_matching_primary_payload() {
             coupling: crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
             delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
             framebuffer_id: None,
+            image_generation: None,
+            source: None,
             visible: false,
             output_position: crate::native_output::presentation::plane::CursorPlanePoint {
                 x: 12,

@@ -552,6 +552,7 @@ pub(crate) struct NativeRuntime {
     astrea_launch_tracker: AstreaLaunchLifecycleTracker,
     shutdown: NativeShutdownLifecycle,
     presentation_trace: PresentationTransactionTraceRing,
+    cursor_reveal_trace: Option<CursorRevealTraceLedger>,
     presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,

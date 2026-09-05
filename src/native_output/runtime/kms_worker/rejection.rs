@@ -772,6 +772,7 @@ mod ownership_tests {
                 sidecar_id: None,
                 revision,
                 capability_key: Some(key()),
+                trace_reveal: None,
             });
         let owners = KmsBundleOwners::new(
             Some(KmsPrimaryOwner {

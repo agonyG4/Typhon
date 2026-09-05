@@ -99,8 +99,22 @@ impl CompositorState {
         fallback_position: Option<OutputPosition>,
         fallback_origin: Option<PointerWarpOrigin>,
     ) {
+        if let Some(previous) = self
+            .last_cursor_reveal_authority
+            .filter(|authority| authority.visibility_requested)
+        {
+            crate::pointer_debug::cursor_presentation_log_lazy(|| {
+                format!(
+                    "event=cursor_reveal_terminal reason=superseded_by_new_reveal constraint={}/{} visibility_requested={} final_position=({},{})",
+                    previous.constraint.constraint_id,
+                    previous.constraint.generation,
+                    previous.visibility_requested,
+                    previous.final_position.x,
+                    previous.final_position.y
+                )
+            });
+        }
         self.last_cursor_reveal_authority = None;
-        self.cursor_reveal_first_visible_reported = false;
         pointer_debug_log(format!(
             "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_kept_hidden=true",
             backend_id.constraint_id,
@@ -299,6 +313,17 @@ impl CompositorState {
             final_position,
             visibility_requested,
         });
+        if !visibility_requested {
+            crate::pointer_debug::cursor_presentation_log_lazy(|| {
+                format!(
+                    "event=cursor_reveal_terminal reason=no_visible_cursor_requested constraint={}/{} visibility_requested=false final_position=({},{})",
+                    pending.backend_id.constraint_id,
+                    pending.backend_id.generation,
+                    final_position.x,
+                    final_position.y
+                )
+            });
+        }
         pointer_debug_log(format!(
             "pointer.unlock transition_finalize reason={} id={} generation={} final=({},{}) visibility_request={} epoch={}",
             reason,

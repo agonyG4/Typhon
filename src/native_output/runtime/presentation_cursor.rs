@@ -2,7 +2,7 @@ use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_sour
 use super::*;
 use crate::native_output::kms_worker::AttachablePrimary;
 use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
-use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::presentation::plane::{CursorRevision, PresentedCursorState};
 
 pub(super) fn synchronize_active_cursor_image(
     server: &OwnCompositorServer,
@@ -298,6 +298,52 @@ pub(super) struct RuntimePlanePlan {
     pub(super) primary_cursor_presentation: KmsPrimaryCursorPresentation,
 }
 
+pub(super) fn cursor_reveal_trace_snapshot(
+    server: &OwnCompositorServer,
+    cursor: &NativeAtomicCursor,
+    state: &AtomicCursorVisualState,
+    cursor_epoch: Option<u64>,
+    revision: Option<CursorRevision>,
+    delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+) -> Option<CursorRevealTraceSnapshot> {
+    let authority = server.cursor_reveal_authority()?;
+    let source = Some(if cursor.client_source_key().is_some() {
+        crate::native_output::presentation::plane::CursorSource::Client
+    } else {
+        crate::native_output::presentation::plane::CursorSource::Theme
+    });
+    Some(CursorRevealTraceSnapshot::from_atomic(
+        authority,
+        cursor_epoch,
+        revision,
+        delivery,
+        state,
+        source,
+    ))
+}
+
+pub(super) fn cursor_reveal_trace_snapshot_from_presented(
+    server: &OwnCompositorServer,
+    cursor: Option<&NativeAtomicCursor>,
+    state: PresentedCursorState,
+    cursor_epoch: Option<u64>,
+) -> Option<CursorRevealTraceSnapshot> {
+    let authority = server.cursor_reveal_authority()?;
+    let source = cursor.map(|cursor| {
+        if cursor.client_source_key().is_some() {
+            crate::native_output::presentation::plane::CursorSource::Client
+        } else {
+            crate::native_output::presentation::plane::CursorSource::Theme
+        }
+    });
+    Some(CursorRevealTraceSnapshot::from_presented(
+        authority,
+        cursor_epoch,
+        state,
+        source,
+    ))
+}
+
 pub(super) fn trace_cursor_plane_plan(
     server: &OwnCompositorServer,
     cursor: &NativeAtomicCursor,
@@ -499,21 +545,30 @@ pub(super) fn trace_cursor_freeze(
 
 pub(super) fn trace_presented_cursor(
     server: &mut OwnCompositorServer,
+    ledger: &mut Option<CursorRevealTraceLedger>,
     identity: crate::native_output::presentation::plane::PlanePageflipIdentity,
     previous: crate::native_output::presentation::plane::PresentedCursorState,
     cursor: crate::native_output::presentation::plane::PresentedCursorState,
 ) {
-    if server.cursor_reveal_authority().is_none()
-        || !crate::pointer_debug::cursor_presentation_trace_enabled()
-    {
+    if !crate::pointer_debug::cursor_presentation_trace_enabled() {
         return;
     }
+    let trace_identity = CursorRevealPhysicalIdentity::from_pageflip(identity);
+    let entry = ledger
+        .as_mut()
+        .and_then(|ledger| ledger.take(trace_identity));
     crate::pointer_debug::cursor_presentation_log_lazy(|| {
-        let reveal = server.cursor_reveal_authority();
+        let reveal = entry.map(|entry| entry.snapshot.authority);
         format!(
-            "event=cursor_presented constraint={}/{} pageflip_token={} output_generation={} crtc_id={} revision={:?} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?}",
-            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
-            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            "event=cursor_presented constraint={}/{} pageflip_token={} output_generation={} crtc_id={} revision={:?} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?} image_generation={:?} source={:?} reveal_attribution={}",
+            reveal.map_or_else(
+                || "unknown".to_string(),
+                |reveal| reveal.constraint.constraint_id.to_string()
+            ),
+            reveal.map_or_else(
+                || "unknown".to_string(),
+                |reveal| reveal.constraint.generation.to_string()
+            ),
             identity.token.get(),
             identity.output_generation,
             identity.crtc_id,
@@ -525,27 +580,37 @@ pub(super) fn trace_presented_cursor(
             cursor.output_position.y,
             cursor.hotspot.x,
             cursor.hotspot.y,
-            cursor.framebuffer_id
+            cursor.framebuffer_id,
+            cursor.image_generation,
+            cursor.source,
+            entry.is_some()
         )
     });
     let newly_visible = previous.delivery
         == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
         && cursor.delivery
             != crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
-    if !newly_visible || !server.take_cursor_reveal_first_visible_slot() {
+    if !newly_visible {
+        return;
+    }
+    let Some(entry) = entry else {
+        return;
+    };
+    let first_visible = ledger
+        .as_mut()
+        .is_some_and(|ledger| ledger.mark_first_visible(entry.reveal));
+    if !first_visible {
         return;
     }
     crate::pointer_debug::cursor_presentation_log_lazy(|| {
-        let reveal = server.cursor_reveal_authority();
-        let authority = reveal.map(|reveal| reveal.final_position);
-        let matches_authority = authority.is_some_and(|position| {
-            cursor.output_position.x == position.x.round() as i32
-                && cursor.output_position.y == position.y.round() as i32
-        });
+        let reveal = entry.snapshot.authority;
+        let comparison = entry.snapshot.compare(cursor);
+        let mut comparison_fields = String::new();
+        trace_comparison_fields(&mut comparison_fields, comparison);
         format!(
-            "event=first_visible_cursor_presentation constraint={}/{} pageflip_token={} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?} authoritative_position={:?} match={}",
-            reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
-            reveal.map_or(0, |reveal| reveal.constraint.generation),
+            "event=first_visible_cursor_presentation constraint={}/{} pageflip_token={} delivery={:?} coupling={:?} visible={} position=({},{}) hotspot=({},{}) framebuffer_id={:?} image_generation={:?} source={:?} authoritative_position=({},{}) {}",
+            reveal.constraint.constraint_id,
+            reveal.constraint.generation,
             identity.token.get(),
             cursor.delivery,
             cursor.coupling,
@@ -555,11 +620,14 @@ pub(super) fn trace_presented_cursor(
             cursor.hotspot.x,
             cursor.hotspot.y,
             cursor.framebuffer_id,
-            authority,
-            matches_authority
+            cursor.image_generation,
+            cursor.source,
+            reveal.final_position.x,
+            reveal.final_position.y,
+            comparison_fields
         )
     });
-    server.complete_cursor_reveal_trace();
+    server.complete_cursor_reveal_trace_if(entry.snapshot.authority);
 }
 
 pub(super) fn frozen_revision(
@@ -601,14 +669,21 @@ pub(super) fn freeze_primary_cursor_presentation(
         },
         NativeAtomicCursor::desired_revision,
     );
-    KmsPrimaryCursorPresentation::Promote(
+    let mut presented =
         crate::native_output::presentation::plane::PresentedCursorState::from_atomic_with_delivery(
             revision,
             crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
             next_delivery,
             &state,
-        ),
-    )
+        );
+    presented.source = atomic_cursor.map(|cursor| {
+        if cursor.client_source_key().is_some() {
+            crate::native_output::presentation::plane::CursorSource::Client
+        } else {
+            crate::native_output::presentation::plane::CursorSource::Theme
+        }
+    });
+    KmsPrimaryCursorPresentation::Promote(presented)
 }
 
 pub(super) fn presented_delivery_for_plan(

@@ -1,5 +1,7 @@
 use super::cursor_cycle::defer_cursor_after_busy;
+use super::presentation_cursor::cursor_reveal_trace_snapshot;
 use super::*;
+use crate::native_output::presentation::plane::PresentedCursorDelivery;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::{TerminalCallbackDisposition, TerminalCallbackOwnership};
 use oblivion_one::native::kms::{KmsBackendKind, KmsBackendSelection};
@@ -810,6 +812,8 @@ pub(super) fn submit_plane_delta(
     current_client_cursor_damage: Option<NativeClientCursorDamageState>,
     current_software_cursor_damage: Option<NativeDamageRect>,
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
+    server: &OwnCompositorServer,
+    cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
 ) -> NativeResult<SchedulerDecision> {
     let cursor_capability_key = desired
         .as_ref()
@@ -848,8 +852,61 @@ pub(super) fn submit_plane_delta(
                 )?;
                 return Err(Box::new(io::Error::other(error)));
             }
+            let submitted_state = desired.clone().unwrap_or_else(|| {
+                let mut hidden = cursor.desired().clone();
+                hidden.visible = false;
+                hidden.framebuffer_id = None;
+                hidden
+            });
+            let submitted_revision = cursor.revision_for_legacy_epoch(cursor_epoch);
+            let submitted_delivery = if submitted_state.visible {
+                PresentedCursorDelivery::Hardware
+            } else {
+                PresentedCursorDelivery::Hidden
+            };
+            let trace_snapshot = cursor_reveal_trace_snapshot(
+                server,
+                cursor,
+                &submitted_state,
+                Some(cursor_epoch),
+                Some(submitted_revision),
+                submitted_delivery,
+            );
             match kms_backend.submit_cursor_flip(desired.as_ref(), token) {
                 Ok(()) => {
+                    if let Some(submitter) = kms_backend.atomic_commit_submitter() {
+                        trace_cursor_kms_submit(
+                            submitter.pipeline(),
+                            if let Some(state) = desired.as_ref() {
+                                CursorKmsAssignment::Set(state)
+                            } else {
+                                CursorKmsAssignment::Disable
+                            },
+                            CursorKmsSubmitContext {
+                                output_generation,
+                                transaction_id: Some(transaction_id),
+                                token,
+                                crtc_id,
+                                cursor_epoch: Some(cursor_epoch),
+                                cursor_revision: Some(submitted_revision),
+                                submission_kind: "cursor_only",
+                                transport: "synchronous",
+                                delivery: submitted_delivery,
+                            },
+                        );
+                    }
+                    if let Some(snapshot) = trace_snapshot
+                        && let Some(ledger) = cursor_reveal_trace.as_mut()
+                    {
+                        ledger.bind(
+                            CursorRevealPhysicalIdentity {
+                                output_generation,
+                                crtc_id,
+                                token,
+                            },
+                            snapshot,
+                        );
+                    }
                     output_transactions
                         .mark_submitted(
                             transaction_id,
@@ -860,12 +917,6 @@ pub(super) fn submit_plane_delta(
                     presentation_trace.push(PresentationTransactionEvent::KmsSubmitReturned {
                         transaction_id,
                         timestamp_ns: monotonic_now_ns()?,
-                    });
-                    let submitted_state = desired.unwrap_or_else(|| {
-                        let mut hidden = cursor.desired().clone();
-                        hidden.visible = false;
-                        hidden.framebuffer_id = None;
-                        hidden
                     });
                     let submitted_state = cursor.begin_submission_at_revision_with_capability_key(
                         token,

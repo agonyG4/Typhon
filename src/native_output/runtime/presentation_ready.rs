@@ -69,6 +69,7 @@ pub(super) fn submit_ready_frame(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
+    cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
     pacing_mode: NativeOutputPacingMode,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     scene_history: &mut NativeSceneHistory,
@@ -162,6 +163,7 @@ pub(super) fn submit_ready_frame(
                         primary_cursor_presentation,
                     ),
                     true,
+                    cursor_reveal_trace,
                 )?
             else {
                 if let Some(batch_id) = callback_batch_id {

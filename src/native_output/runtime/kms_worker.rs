@@ -116,6 +116,9 @@ pub(super) fn queue_explicit_composited_frame(
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
+    cursor_reveal_trace: Option<
+        crate::native_output::presentation::cursor_trace::CursorRevealTraceSnapshot,
+    >,
 ) -> NativeResult<WorkerQueueOutcome> {
     let slot = explicit
         .swapchain()?
@@ -202,22 +205,24 @@ pub(super) fn queue_explicit_composited_frame(
         )?;
         return Err(io::Error::other(error).into());
     }
+    let mut owners = KmsBundleOwners::for_transaction(
+        kind,
+        Arc::new(
+            output_transactions
+                .transaction(transaction_id)
+                .ok_or_else(|| io::Error::other("queued worker transaction disappeared"))?
+                .descriptor()
+                .clone(),
+        ),
+        frozen_cursor_owner_metadata.map(|(revision, _)| revision),
+        frozen_cursor_owner_metadata.and_then(|(_, capability_key)| capability_key),
+    )
+    .map_err(|error| io::Error::other(format!("invalid ready cursor owner: {error:?}")))?;
+    owners.set_cursor_trace_reveal(cursor_reveal_trace);
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_transaction(
-            kind,
-            Arc::new(
-                output_transactions
-                    .transaction(transaction_id)
-                    .ok_or_else(|| io::Error::other("queued worker transaction disappeared"))?
-                    .descriptor()
-                    .clone(),
-            ),
-            frozen_cursor_owner_metadata.map(|(revision, _)| revision),
-            frozen_cursor_owner_metadata.and_then(|(_, capability_key)| capability_key),
-        )
-        .map_err(|error| io::Error::other(format!("invalid ready cursor owner: {error:?}")))?,
+        owners,
         transaction_id,
         token,
         output_generation,
@@ -332,6 +337,9 @@ pub(super) fn queue_atomic_compatibility_frame(
     test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
+    cursor_reveal_trace: Option<
+        crate::native_output::presentation::cursor_trace::CursorRevealTraceSnapshot,
+    >,
 ) -> NativeResult<WorkerQueueOutcome> {
     if scanout.compatibility_framebuffer_id().is_none() {
         return Ok(WorkerQueueOutcome::Unavailable(
@@ -433,26 +441,24 @@ pub(super) fn queue_atomic_compatibility_frame(
         )?;
         return Err(io::Error::other(error).into());
     }
+    let mut owners = KmsBundleOwners::for_transaction(
+        kind,
+        Arc::new(
+            output_transactions
+                .transaction(transaction_id)
+                .ok_or_else(|| io::Error::other("compatibility worker transaction disappeared"))?
+                .descriptor()
+                .clone(),
+        ),
+        cursor_revision,
+        cursor_capability_key,
+    )
+    .map_err(|error| io::Error::other(format!("invalid compatibility cursor owner: {error:?}")))?;
+    owners.set_cursor_trace_reveal(cursor_reveal_trace);
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_transaction(
-            kind,
-            Arc::new(
-                output_transactions
-                    .transaction(transaction_id)
-                    .ok_or_else(|| {
-                        io::Error::other("compatibility worker transaction disappeared")
-                    })?
-                    .descriptor()
-                    .clone(),
-            ),
-            cursor_revision,
-            cursor_capability_key,
-        )
-        .map_err(|error| {
-            io::Error::other(format!("invalid compatibility cursor owner: {error:?}"))
-        })?,
+        owners,
         transaction_id,
         token,
         output_generation,
@@ -872,7 +878,22 @@ impl NativeRuntime {
                 {
                     self.scanout.note_composited_async_validation(key, true);
                 }
+                let trace_snapshot = ownership
+                    .job
+                    .owners
+                    .cursor()
+                    .and_then(|owner| owner.trace_reveal);
+                let trace_identity = crate::native_output::CursorRevealPhysicalIdentity {
+                    output_generation: ownership.job.output_generation,
+                    crtc_id: ownership.job.crtc_id,
+                    token: ownership.job.token,
+                };
                 self.submitted_worker_ownership.push(ownership);
+                if let Some(snapshot) = trace_snapshot
+                    && let Some(ledger) = self.cursor_reveal_trace.as_mut()
+                {
+                    ledger.bind(trace_identity, snapshot);
+                }
                 let ownership = self
                     .submitted_worker_ownership
                     .last_mut()

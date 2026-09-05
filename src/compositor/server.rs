@@ -1137,18 +1137,10 @@ impl OwnCompositorServer {
         self.state.last_cursor_reveal_authority
     }
 
-    pub fn take_cursor_reveal_first_visible_slot(&mut self) -> bool {
-        if self.state.last_cursor_reveal_authority.is_none()
-            || self.state.cursor_reveal_first_visible_reported
-        {
-            return false;
+    pub fn complete_cursor_reveal_trace_if(&mut self, completed: CursorRevealAuthority) {
+        if self.state.last_cursor_reveal_authority == Some(completed) {
+            self.state.last_cursor_reveal_authority = None;
         }
-        self.state.cursor_reveal_first_visible_reported = true;
-        true
-    }
-
-    pub fn complete_cursor_reveal_trace(&mut self) {
-        self.state.last_cursor_reveal_authority = None;
     }
 
     pub fn last_pointer_position(&self) -> (f64, f64) {

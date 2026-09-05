@@ -102,6 +102,7 @@ fn independent_hidden_sidecar(validation_base: KmsValidationBase) -> CursorSidec
         test_policy: KmsTestOnlyPolicy::Required,
         cursor_delivery: PresentedCursorDelivery::Hidden,
         capability_key: None,
+        trace_reveal: None,
         validation_base,
     }
 }
@@ -137,6 +138,7 @@ fn promoted_independent_sidecar_uses_fresh_standalone_validation_base() {
         None,
         CursorPlaneAction::Independent,
         PresentedCursorDelivery::Hidden,
+        None,
         None,
     )
     .unwrap();

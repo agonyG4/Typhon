@@ -171,13 +171,42 @@ impl AtomicEglGbmScanout {
             framebuffer,
             token,
             in_fence,
-            cursor: planned_cursor,
+            cursor: planned_cursor.clone(),
             presentation_mode,
             content_type,
         });
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {
             Ok(submission) => {
+                if let Some(submitter) = kms.atomic_commit_submitter() {
+                    crate::native_output::trace_cursor_kms_submit(
+                        submitter.pipeline(),
+                        planned_cursor.as_ref().map_or(
+                            crate::native_output::CursorKmsAssignment::Disable,
+                            crate::native_output::CursorKmsAssignment::Set,
+                        ),
+                        crate::native_output::CursorKmsSubmitContext {
+                            output_generation: output_transactions
+                                .transaction(transaction_id)
+                                .map_or(0, |transaction| {
+                                    transaction.descriptor().output_generation()
+                                }),
+                            transaction_id: Some(transaction_id),
+                            token,
+                            crtc_id: submitter.pipeline().crtc.get(),
+                            cursor_epoch: None,
+                            cursor_revision: None,
+                            submission_kind: "primary_plus_cursor",
+                            transport: "synchronous",
+                            delivery: if planned_cursor.as_ref().is_some_and(|state| state.visible)
+                            {
+                                crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+                            } else {
+                                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+                            },
+                        },
+                    );
+                }
                 self.counters.note_atomic_submission(presentation_mode);
                 if submission.out_fence.is_some() {
                     self.counters.atomic_out_fences_received += 1;

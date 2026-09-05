@@ -9,6 +9,7 @@ use crate::native_output::kms_worker::{
     KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
 };
 use crate::native_output::presentation::{
+    cursor_trace::CursorRevealTraceSnapshot,
     plane::{CursorRevision, PresentedCursorDelivery},
     plane_policy::CursorPlaneAction,
 };
@@ -54,6 +55,7 @@ pub(super) struct PlaneDeltaPreparationSubmit {
     pub(super) target: PresentationTarget,
     pub(super) validation_base: KmsValidationBase,
     pub(super) cursor_delivery: PresentedCursorDelivery,
+    pub(super) cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 }
 
 pub(super) fn plane_delta_reservation_outcome(
@@ -82,6 +84,7 @@ pub(super) fn queue_plane_delta(
     cursor_delivery: PresentedCursorDelivery,
     cursor_surface_damage: Option<SurfaceDamagePresentation>,
     cursor_reveal: Option<(u64, u64)>,
+    cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -99,6 +102,7 @@ pub(super) fn queue_plane_delta(
         cursor_action,
         cursor_delivery,
         cursor_surface_damage,
+        cursor_reveal_trace,
     )?;
     let (
         transaction_id,
@@ -109,6 +113,7 @@ pub(super) fn queue_plane_delta(
         target,
         validation_base,
         cursor_delivery,
+        cursor_reveal_trace,
     ) = match preparation {
         PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
         PlaneDeltaPreparation::Submit(preparation) => {
@@ -121,6 +126,7 @@ pub(super) fn queue_plane_delta(
                 target,
                 validation_base,
                 cursor_delivery,
+                cursor_reveal_trace,
             } = *preparation;
             (
                 transaction_id,
@@ -131,6 +137,7 @@ pub(super) fn queue_plane_delta(
                 target,
                 validation_base,
                 cursor_delivery,
+                cursor_reveal_trace,
             )
         }
     };
@@ -188,24 +195,26 @@ pub(super) fn queue_plane_delta(
         )?;
         return Ok(WorkerQueueOutcome::Unavailable(reason));
     }
+    let mut owners = KmsBundleOwners::for_transaction(
+        kind,
+        Arc::new(
+            output_transactions
+                .transaction(transaction_id)
+                .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?
+                .descriptor()
+                .clone(),
+        ),
+        Some(owned_revision.unwrap_or_else(|| cursor.desired_revision())),
+        desired
+            .as_ref()
+            .and_then(|state| cursor.capability_key_for(state)),
+    )
+    .map_err(|error| io::Error::other(format!("invalid cursor owner: {error:?}")))?;
+    owners.set_cursor_trace_reveal(cursor_reveal_trace);
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_transaction(
-            kind,
-            Arc::new(
-                output_transactions
-                    .transaction(transaction_id)
-                    .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?
-                    .descriptor()
-                    .clone(),
-            ),
-            Some(owned_revision.unwrap_or_else(|| cursor.desired_revision())),
-            desired
-                .as_ref()
-                .and_then(|state| cursor.capability_key_for(state)),
-        )
-        .map_err(|error| io::Error::other(format!("invalid cursor owner: {error:?}")))?,
+        owners,
         transaction_id,
         token,
         output_generation,
@@ -351,6 +360,7 @@ pub(super) fn prepare_plane_delta(
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
     cursor_surface_damage: Option<SurfaceDamagePresentation>,
+    cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<PlaneDeltaPreparation> {
     if matches!(
         cursor_action,
@@ -391,6 +401,7 @@ pub(super) fn prepare_plane_delta(
                 // it against the current exact lane state.
                 validation_base,
                 cursor_delivery: promoted.cursor_delivery,
+                cursor_reveal_trace: promoted.trace_reveal,
             },
         )));
     }
@@ -431,6 +442,7 @@ pub(super) fn prepare_plane_delta(
         attachable_primary,
         cursor_action,
         cursor_delivery,
+        cursor_reveal_trace,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
@@ -444,6 +456,7 @@ pub(super) fn prepare_plane_delta(
             target,
             validation_base,
             cursor_delivery,
+            cursor_reveal_trace: None,
         },
     )))
 }
@@ -463,6 +476,7 @@ pub(super) fn try_offer_cursor_sidecar(
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
     cursor_delivery: PresentedCursorDelivery,
+    cursor_reveal_trace: Option<CursorRevealTraceSnapshot>,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
     let Some(attachable_primary) = attachable_primary else {
         return Ok(None);
@@ -511,6 +525,7 @@ pub(super) fn try_offer_cursor_sidecar(
         test_policy: scheduled_kms_test_policy(cursor),
         cursor_delivery,
         capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
+        trace_reveal: cursor_reveal_trace,
         validation_base: sidecar_validation_base,
     };
     match worker.offer_cursor_sidecar(sidecar) {

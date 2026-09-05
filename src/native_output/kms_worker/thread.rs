@@ -727,6 +727,7 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
     let sidecar_transaction_id = sidecar.transaction.id();
     let sidecar_revision = sidecar.revision;
     let sidecar_delivery = sidecar.cursor_delivery;
+    let sidecar_trace_reveal = sidecar.trace_reveal;
     let sidecar_assignment = sidecar.assignment.clone();
     job.cursor = match &sidecar.assignment {
         crate::native_output::CursorPlaneAssignment::Atomic {
@@ -743,6 +744,7 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
         sidecar_id: Some(sidecar.id),
         revision: sidecar.revision,
         capability_key: sidecar.capability_key,
+        trace_reveal: sidecar_trace_reveal,
     });
     job.test_policy.cursor = sidecar.test_policy;
     crate::pointer_debug::cursor_presentation_log_lazy(|| {

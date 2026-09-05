@@ -625,7 +625,6 @@ pub struct CompositorState {
     pending_backend_constraint: Option<PointerConstraintBackendId>,
     pending_locked_pointer_reveal: Option<PendingLockedPointerReveal>,
     last_cursor_reveal_authority: Option<CursorRevealAuthority>,
-    cursor_reveal_first_visible_reported: bool,
     pending_pointer_constraint_backend_requests: Vec<PointerConstraintBackendRequest>,
     cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,

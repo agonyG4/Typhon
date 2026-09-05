@@ -349,6 +349,7 @@ impl NativeRuntime {
             pointer_constraint_backend: _,
             process_supervisor: _,
             shutdown,
+            cursor_reveal_trace,
             ..
         } = self;
         let scheduler_state_before = frame_scheduler.state();
@@ -680,7 +681,13 @@ impl NativeRuntime {
                         )
                         .into());
                     }
-                    trace_presented_cursor(server, identity, previous_cursor, presented_cursor);
+                    trace_presented_cursor(
+                        server,
+                        cursor_reveal_trace,
+                        identity,
+                        previous_cursor,
+                        presented_cursor,
+                    );
                 }
             }
             let direct_pending = matches!(
@@ -881,6 +888,7 @@ impl NativeRuntime {
                         if let Some(presented_cursor) = presented_cursor {
                             trace_presented_cursor(
                                 server,
+                                cursor_reveal_trace,
                                 identity,
                                 previous_cursor,
                                 presented_cursor,
@@ -1222,6 +1230,7 @@ impl NativeRuntime {
                         if let Some(presented_cursor) = presented_cursor {
                             trace_presented_cursor(
                                 server,
+                                cursor_reveal_trace,
                                 identity,
                                 previous_cursor,
                                 presented_cursor,
@@ -1617,7 +1626,13 @@ impl NativeRuntime {
                             .into());
                         }
                         if let Some(cursor) = cursor_for_trace {
-                            trace_presented_cursor(server, identity, previous_cursor, cursor);
+                            trace_presented_cursor(
+                                server,
+                                cursor_reveal_trace,
+                                identity,
+                                previous_cursor,
+                                cursor,
+                            );
                         }
                         if let Some(worker) = kms_commit_worker.as_ref() {
                             worker.set_established_presented_base(

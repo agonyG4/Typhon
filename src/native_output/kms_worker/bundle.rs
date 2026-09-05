@@ -2,8 +2,11 @@ use std::sync::Arc;
 
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionId,
-    presentation::plane::{CursorRevision, CursorSidecarId},
     presentation::plane_policy::CursorCapabilityKey,
+    presentation::{
+        cursor_trace::CursorRevealTraceSnapshot,
+        plane::{CursorRevision, CursorSidecarId},
+    },
     runtime::AtomicCommitKind,
 };
 use oblivion_one::native::kms::PageFlipToken;
@@ -19,6 +22,7 @@ pub(crate) struct KmsCursorOwner {
     pub(crate) sidecar_id: Option<CursorSidecarId>,
     pub(crate) revision: CursorRevision,
     pub(crate) capability_key: Option<CursorCapabilityKey>,
+    pub(crate) trace_reveal: Option<CursorRevealTraceSnapshot>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +115,7 @@ impl KmsBundleOwners {
                     transaction,
                     sidecar_id: None,
                     capability_key,
+                    trace_reveal: None,
                 })
             }
         };
@@ -123,6 +128,12 @@ impl KmsBundleOwners {
 
     pub(crate) fn cursor(&self) -> Option<&KmsCursorOwner> {
         self.cursor.as_ref()
+    }
+
+    pub(crate) fn set_cursor_trace_reveal(&mut self, snapshot: Option<CursorRevealTraceSnapshot>) {
+        if let Some(cursor) = self.cursor.as_mut() {
+            cursor.trace_reveal = snapshot;
+        }
     }
 
     pub(crate) fn replace_cursor(&mut self, cursor: KmsCursorOwner) -> Option<KmsCursorOwner> {

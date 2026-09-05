@@ -115,6 +115,7 @@ pub(crate) use launch::*;
 pub(crate) use output::*;
 use pacing::*;
 pub(crate) use perf::*;
+pub(crate) use presentation::cursor_trace::*;
 pub(crate) use presentation::kms_timing::*;
 pub(crate) use presentation::ledger::*;
 pub(crate) use presentation::pipeline::*;

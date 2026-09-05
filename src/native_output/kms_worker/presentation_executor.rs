@@ -3,6 +3,9 @@ use super::{
     AtomicKmsWorkerExecutor, KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure,
 };
 use crate::native_output::kms_worker::KmsCommitJob;
+use crate::native_output::presentation::cursor_trace::{
+    CursorKmsAssignment, CursorKmsSubmitContext, trace_cursor_kms_submit,
+};
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind};
 use std::os::fd::{AsRawFd, BorrowedFd};
 
@@ -63,48 +66,39 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
             KmsCursorUpdate::Set(state) => Some(state),
             KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => None,
         };
-        crate::pointer_debug::cursor_presentation_log_lazy(|| {
-            let cursor_fields = match &job.cursor {
-                KmsCursorUpdate::Set(state) => format!(
-                    "enabled=true fb_id={:?} crtc_id_property={:?} src=(0,0,{}, {}) crtc=({},{},{},{}) hotspot=({},{}) image_generation={}",
-                    state.framebuffer_id,
-                    self.submitter
-                        .pipeline()
-                        .cursor_plane
-                        .as_ref()
-                        .map(|plane| plane.crtc_id),
-                    u64::from(state.width) << 16,
-                    u64::from(state.height) << 16,
-                    state.x.saturating_sub(state.hotspot_x),
-                    state.y.saturating_sub(state.hotspot_y),
-                    state.width,
-                    state.height,
-                    state.hotspot_x,
-                    state.hotspot_y,
-                    state.image_generation
-                ),
-                KmsCursorUpdate::Disable => String::from(
-                    "enabled=false fb_id=0 crtc_id_property=0 src=(0,0,0,0) crtc=(disabled)",
-                ),
-                KmsCursorUpdate::Unchanged => String::from("enabled=unchanged"),
+        if touch_cursor {
+            let cursor_epoch = match job.kind {
+                crate::native_output::runtime::AtomicCommitKind::PlaneDelta {
+                    cursor_epoch,
+                    ..
+                } => Some(cursor_epoch),
+                crate::native_output::runtime::AtomicCommitKind::CompositedPrimary { .. }
+                | crate::native_output::runtime::AtomicCommitKind::DirectPrimary { .. } => None,
             };
-            format!(
-                "event=cursor_kms_submit output_generation={} transaction_id={} token={} crtc_id={} plane_id={:?} cursor_revision={:?} cursor_epoch=not_available submission_kind={:?} delivery={:?} {}",
-                job.output_generation,
-                job.transaction_id.get(),
-                job.token.get(),
-                job.crtc_id,
-                self.submitter
-                    .pipeline()
-                    .cursor_plane
-                    .as_ref()
-                    .map(|plane| plane.plane_id),
-                job.owners.cursor().map(|owner| owner.revision),
-                job.kind,
-                job.cursor_delivery,
-                cursor_fields
-            )
-        });
+            trace_cursor_kms_submit(
+                self.submitter.pipeline(),
+                match &job.cursor {
+                    KmsCursorUpdate::Set(state) => CursorKmsAssignment::Set(state),
+                    KmsCursorUpdate::Disable => CursorKmsAssignment::Disable,
+                    KmsCursorUpdate::Unchanged => CursorKmsAssignment::Unchanged,
+                },
+                CursorKmsSubmitContext {
+                    output_generation: job.output_generation,
+                    transaction_id: Some(job.transaction_id),
+                    token: job.token,
+                    crtc_id: job.crtc_id,
+                    cursor_epoch,
+                    cursor_revision: job.owners.cursor().map(|owner| owner.revision),
+                    submission_kind: if matches!(&job.primary, KmsPrimaryUpdate::Unchanged) {
+                        "cursor_only"
+                    } else {
+                        "primary_plus_cursor"
+                    },
+                    transport: "worker",
+                    delivery: job.cursor_delivery,
+                },
+            );
+        }
         let input_fence = match &job.primary {
             KmsPrimaryUpdate::Framebuffer { in_fence, .. } if !presentation_mode.is_async() => {
                 in_fence.as_ref().map(|fence| {
