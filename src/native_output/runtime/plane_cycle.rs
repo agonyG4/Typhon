@@ -456,7 +456,7 @@ pub(super) fn prepare_plane_delta(
             target,
             validation_base,
             cursor_delivery,
-            cursor_reveal_trace: None,
+            cursor_reveal_trace,
         },
     )))
 }
