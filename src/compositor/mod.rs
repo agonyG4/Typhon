@@ -230,6 +230,19 @@ pub use interaction::{
     WindowInteractionReleaseMetrics,
 };
 use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyboardLayoutControlError {
+    Unavailable(&'static str),
+    InvalidIndex { index: u32, count: u32 },
+    Internal(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyboardLayoutMutation {
+    pub(crate) snapshot: crate::control_snapshots::KeyboardLayoutSnapshot,
+    pub(crate) changed: bool,
+}
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,

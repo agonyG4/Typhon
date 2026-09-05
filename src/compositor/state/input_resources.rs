@@ -1,4 +1,43 @@
 use super::*;
+use crate::control_snapshots::{KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot};
+
+fn project_keyboard_layout_snapshot(
+    state: crate::compositor::keyboard::KeyboardLayoutState,
+) -> KeyboardLayoutSnapshot {
+    let layout_count = u32::try_from(state.layouts.len()).unwrap_or(u32::MAX);
+    KeyboardLayoutSnapshot {
+        effective_index: state.effective_index,
+        locked_index: state.locked_index,
+        layout_count,
+        layouts: state
+            .layouts
+            .into_iter()
+            .map(|layout| KeyboardLayoutEntrySnapshot {
+                index: layout.index,
+                name: layout.name,
+            })
+            .collect(),
+    }
+}
+
+fn map_keyboard_layout_error(
+    error: crate::compositor::keyboard::KeyboardLayoutError,
+) -> KeyboardLayoutControlError {
+    match error {
+        crate::compositor::keyboard::KeyboardLayoutError::Unavailable(reason) => {
+            KeyboardLayoutControlError::Unavailable(reason)
+        }
+        crate::compositor::keyboard::KeyboardLayoutError::InvalidIndex { index, count } => {
+            KeyboardLayoutControlError::InvalidIndex { index, count }
+        }
+        crate::compositor::keyboard::KeyboardLayoutError::IndexTooLarge(_) => {
+            KeyboardLayoutControlError::Internal("keyboard layout index is not representable")
+        }
+        crate::compositor::keyboard::KeyboardLayoutError::FfiFailed => {
+            KeyboardLayoutControlError::Internal("keyboard layout update failed")
+        }
+    }
+}
 
 impl CompositorState {
     pub(in crate::compositor) fn ensure_keyboard_state(&mut self) -> bool {
@@ -21,6 +60,75 @@ impl CompositorState {
         keyboard: &wl_keyboard::WlKeyboard,
     ) -> bool {
         self.ensure_keyboard_state() && self.keyboard_state.send_initial_state(keyboard)
+    }
+
+    pub(crate) fn keyboard_layout_snapshot(
+        &mut self,
+    ) -> Result<KeyboardLayoutSnapshot, KeyboardLayoutControlError> {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardLayoutControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        self.keyboard_state
+            .layout_snapshot()
+            .map(project_keyboard_layout_snapshot)
+            .map_err(map_keyboard_layout_error)
+    }
+
+    pub(crate) fn set_keyboard_layout(
+        &mut self,
+        index: u32,
+    ) -> Result<KeyboardLayoutMutation, KeyboardLayoutControlError> {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardLayoutControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        let change = self
+            .keyboard_state
+            .set_locked_layout(index)
+            .map_err(map_keyboard_layout_error)?;
+        Ok(KeyboardLayoutMutation {
+            snapshot: project_keyboard_layout_snapshot(change.snapshot),
+            changed: change.changed,
+        })
+    }
+
+    pub(crate) fn next_keyboard_layout(
+        &mut self,
+    ) -> Result<KeyboardLayoutMutation, KeyboardLayoutControlError> {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardLayoutControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        let change = self
+            .keyboard_state
+            .next_layout()
+            .map_err(map_keyboard_layout_error)?;
+        Ok(KeyboardLayoutMutation {
+            snapshot: project_keyboard_layout_snapshot(change.snapshot),
+            changed: change.changed,
+        })
+    }
+
+    pub(crate) fn previous_keyboard_layout(
+        &mut self,
+    ) -> Result<KeyboardLayoutMutation, KeyboardLayoutControlError> {
+        if !self.ensure_keyboard_state() {
+            return Err(KeyboardLayoutControlError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        }
+        let change = self
+            .keyboard_state
+            .previous_layout()
+            .map_err(map_keyboard_layout_error)?;
+        Ok(KeyboardLayoutMutation {
+            snapshot: project_keyboard_layout_snapshot(change.snapshot),
+            changed: change.changed,
+        })
     }
 
     pub(in crate::compositor) fn clear_pointer_button_state_for_removed_surfaces(

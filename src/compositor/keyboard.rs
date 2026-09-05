@@ -176,6 +176,7 @@ pub(super) enum KeyboardLayoutError {
     Unavailable(&'static str),
     InvalidIndex { index: u32, count: u32 },
     IndexTooLarge(u32),
+    FfiFailed,
 }
 
 pub(super) struct XkbKeyboardState {
@@ -378,7 +379,9 @@ impl XkbKeyboardState {
             });
         }
         let index = i32::try_from(index).map_err(|_| KeyboardLayoutError::IndexTooLarge(index))?;
-        let _ = xkb_compat::set_locked_layout(&self.physical_state, index);
+        if !xkb_compat::set_locked_layout(&self.physical_state, index) {
+            return Err(KeyboardLayoutError::FfiFailed);
+        }
         let snapshot = self.layout_snapshot()?;
         Ok(KeyboardLayoutChange {
             changed: snapshot != before,
@@ -529,6 +532,113 @@ impl KeyboardStateHandle {
                 .get(&id)
                 .map(XkbKeyboardState::wayland_serialized_state)
         })
+    }
+
+    pub(super) fn layout_snapshot(&mut self) -> Result<KeyboardLayoutState, KeyboardLayoutError> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err(KeyboardLayoutError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        };
+        let snapshot = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow()
+                .get(&id)
+                .map(XkbKeyboardState::layout_snapshot)
+        });
+        match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                Err(KeyboardLayoutError::Unavailable(
+                    "keyboard state unavailable",
+                ))
+            }
+        }
+    }
+
+    pub(super) fn set_locked_layout(
+        &mut self,
+        index: u32,
+    ) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err(KeyboardLayoutError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        };
+        let change = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(|state| state.set_locked_layout(index))
+        });
+        match change {
+            Some(change) => change,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                Err(KeyboardLayoutError::Unavailable(
+                    "keyboard state unavailable",
+                ))
+            }
+        }
+    }
+
+    pub(super) fn next_layout(&mut self) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err(KeyboardLayoutError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        };
+        let change = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(XkbKeyboardState::next_layout)
+        });
+        match change {
+            Some(change) => change,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                Err(KeyboardLayoutError::Unavailable(
+                    "keyboard state unavailable",
+                ))
+            }
+        }
+    }
+
+    pub(super) fn previous_layout(&mut self) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let KeyboardStateStatus::Ready(id) = self.status else {
+            return Err(KeyboardLayoutError::Unavailable(
+                "keyboard state unavailable",
+            ));
+        };
+        let change = KEYBOARD_STATES.with(|states| {
+            states
+                .borrow_mut()
+                .get_mut(&id)
+                .map(XkbKeyboardState::previous_layout)
+        });
+        match change {
+            Some(change) => change,
+            None => {
+                self.status = KeyboardStateStatus::Failed;
+                eprintln!(
+                    "oblivion-one compositor: keyboard state was used outside its owning thread"
+                );
+                Err(KeyboardLayoutError::Unavailable(
+                    "keyboard state unavailable",
+                ))
+            }
+        }
     }
 
     pub(super) fn update_physical_key(&mut self, evdev_key: u32, pressed: bool) -> bool {

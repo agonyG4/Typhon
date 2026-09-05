@@ -166,6 +166,43 @@ impl OwnCompositorServer {
         let _ = self.flush_wayland_clients();
     }
 
+    pub fn keyboard_layout_snapshot(
+        &mut self,
+    ) -> Result<crate::control_snapshots::KeyboardLayoutSnapshot, KeyboardLayoutControlError> {
+        self.state.keyboard_layout_snapshot()
+    }
+
+    pub fn set_keyboard_layout(
+        &mut self,
+        index: u32,
+    ) -> Result<crate::control_snapshots::KeyboardLayoutSnapshot, KeyboardLayoutControlError> {
+        let mutation = self.state.set_keyboard_layout(index)?;
+        if mutation.changed {
+            self.send_keyboard_modifiers_without_key();
+        }
+        Ok(mutation.snapshot)
+    }
+
+    pub fn next_keyboard_layout(
+        &mut self,
+    ) -> Result<crate::control_snapshots::KeyboardLayoutSnapshot, KeyboardLayoutControlError> {
+        let mutation = self.state.next_keyboard_layout()?;
+        if mutation.changed {
+            self.send_keyboard_modifiers_without_key();
+        }
+        Ok(mutation.snapshot)
+    }
+
+    pub fn previous_keyboard_layout(
+        &mut self,
+    ) -> Result<crate::control_snapshots::KeyboardLayoutSnapshot, KeyboardLayoutControlError> {
+        let mutation = self.state.previous_keyboard_layout()?;
+        if mutation.changed {
+            self.send_keyboard_modifiers_without_key();
+        }
+        Ok(mutation.snapshot)
+    }
+
     pub fn clear_keyboard_transient_state_for_session_switch(&mut self) {
         self.state
             .clear_keyboard_transient_state_for_session_switch();

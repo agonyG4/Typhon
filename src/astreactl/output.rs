@@ -1,4 +1,6 @@
-use crate::control_snapshots::{AstreactlResult, CursorSnapshot, DoctorCheck, WindowSnapshot};
+use crate::control_snapshots::{
+    AstreactlResult, CursorSnapshot, DoctorCheck, KeyboardLayoutSnapshot, WindowSnapshot,
+};
 
 pub fn human(result: &AstreactlResult) -> String {
     match result {
@@ -81,6 +83,7 @@ pub fn human(result: &AstreactlResult) -> String {
                 )
             })
             .unwrap_or_else(|| "No active window".to_string()),
+        AstreactlResult::KeyboardLayout(snapshot) => format_keyboard_layout(snapshot),
         AstreactlResult::Cursor(snapshot) => format_cursor(snapshot),
         AstreactlResult::DecorationTheme(snapshot) => format!(
             "Selected: {}\nActive: {}\nSchema: {}\nGeneration: {}\nSource: {}\nError: {}",
@@ -124,6 +127,28 @@ pub fn human(result: &AstreactlResult) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     }
+}
+
+fn format_keyboard_layout(snapshot: &KeyboardLayoutSnapshot) -> String {
+    let mut lines = vec![
+        format!("Effective: {}", snapshot.effective_index),
+        format!("Locked: {}", snapshot.locked_index),
+        String::new(),
+    ];
+    lines.extend(snapshot.layouts.iter().map(|layout| {
+        let marker = if layout.index == snapshot.effective_index {
+            '*'
+        } else {
+            ' '
+        };
+        let name = if layout.name.is_empty() {
+            "Unnamed".to_string()
+        } else {
+            sanitize_terminal_text(&layout.name)
+        };
+        format!("{} {:>2}  {}", marker, layout.index, name)
+    }));
+    lines.join("\n")
 }
 
 fn format_cursor(snapshot: &CursorSnapshot) -> String {

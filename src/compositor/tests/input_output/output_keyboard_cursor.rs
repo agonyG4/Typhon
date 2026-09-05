@@ -1,5 +1,115 @@
 use super::*;
 use xkbcommon::xkb;
+
+static KEYBOARD_LAYOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn runtime_layout_publication_sends_only_changed_modifiers() {
+    let _guard = KEYBOARD_LAYOUT_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let initial_modifiers = state
+        .keyboard_event_log
+        .iter()
+        .filter(|event| **event == "keyboard_modifiers")
+        .count();
+
+    let (reply, result) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetKeyboardLayout { index: 1, reply })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(result.recv().unwrap());
+    queue.roundtrip(&mut state).unwrap();
+
+    let modifier_count = state
+        .keyboard_event_log
+        .iter()
+        .filter(|event| **event == "keyboard_modifiers")
+        .count();
+    assert_eq!(modifier_count, initial_modifiers + 1);
+    assert_eq!(state.keyboard_groups, vec![0, 1]);
+    assert_eq!(state.keyboard_keys, Vec::<u32>::new());
+    assert_eq!(
+        state
+            .keyboard_event_log
+            .iter()
+            .filter(|event| **event == "keyboard_keymap")
+            .count(),
+        1
+    );
+
+    let (reply, result) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetKeyboardLayout { index: 1, reply })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(result.recv().unwrap());
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        state
+            .keyboard_event_log
+            .iter()
+            .filter(|event| **event == "keyboard_modifiers")
+            .count(),
+        modifier_count
+    );
+    assert_eq!(initial_modifiers, 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+}
 #[test]
 fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
     let socket_name = unique_socket_name();

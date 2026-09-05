@@ -57,6 +57,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         key: u32,
         pressed: bool,
     },
+    SetKeyboardLayout {
+        index: u32,
+        reply: Sender<bool>,
+    },
     SetShortcutInhibitorPolicy {
         surface_id: u32,
         enabled: bool,
@@ -324,6 +328,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                 match command {
                     ServerCommand::KeyboardKey { key, pressed } => {
                         server.send_keyboard_key(key, pressed);
+                    }
+                    ServerCommand::SetKeyboardLayout { index, reply } => {
+                        let _ = reply.send(server.set_keyboard_layout(index).is_ok());
                     }
                     ServerCommand::SetShortcutInhibitorPolicy {
                         surface_id,

@@ -225,6 +225,24 @@ pub struct StatusSnapshot {
     pub control: ControlStatusSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardLayoutSnapshot {
+    pub effective_index: u32,
+    pub locked_index: u32,
+    pub layout_count: u32,
+    pub layouts: Vec<KeyboardLayoutEntrySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardLayoutEntrySnapshot {
+    pub index: u32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -657,6 +675,7 @@ pub enum AstreactlResult {
     Outputs(OutputListSnapshot),
     Windows(WindowListSnapshot),
     ActiveWindow(ActiveWindowSnapshot),
+    KeyboardLayout(KeyboardLayoutSnapshot),
     Cursor(CursorSnapshot),
     Performance(Box<PerformanceSnapshot>),
     DecorationTheme(DecorationThemeSnapshot),
