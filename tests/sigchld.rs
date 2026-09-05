@@ -4,6 +4,16 @@ use oblivion_one::process::{
 };
 use std::{process::Command, thread};
 
+#[cfg(target_os = "linux")]
+extern "C" fn block_sigchld_before_test_threads() {
+    let _ = block_sigchld_for_current_thread();
+}
+
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static BLOCK_SIGCHLD_BEFORE_LIBTEST_THREADS: extern "C" fn() = block_sigchld_before_test_threads;
+
 fn shell_command(script: &str) -> Command {
     let mut command = Command::new("sh");
     command.arg("-c").arg(script);
