@@ -204,6 +204,44 @@ rtk git diff --check
 passed
 ```
 
+v1.2.1 worker cursor-only retention verification on the current checkout:
+
+```text
+rtk cargo test --locked independent_plane_delta_preparation_retains_frozen_reveal_without_sidecar -- --test-threads=1
+1 passed
+
+rtk cargo test --locked plane_cycle -- --test-threads=1
+2 passed
+
+rtk cargo test --locked worker -- --test-threads=1
+188 passed
+
+rtk cargo test --locked cursor_reveal -- --test-threads=1
+2 passed
+
+rtk cargo test --locked sidecar -- --test-threads=1
+18 passed
+
+rtk cargo check --locked --all-targets
+passed
+
+rtk cargo clippy --locked --all-targets -- -D warnings
+passed
+
+rtk cargo test --locked
+3437 passed, 5 ignored, 40 filtered out
+
+rtk git diff --check
+passed
+
+rtk cargo fmt --check
+failed: unrelated uncommitted keyboard/control edits in
+src/astreactl/client.rs and src/native_output/runtime/cycle_dispatch.rs
+```
+
+The formatting failure is outside the v1.2.1 commit set; no unrelated files
+were reformatted or staged.
+
 ## Qualification boundary and next step
 
 This report qualifies the causal observability and attribution closure only.
