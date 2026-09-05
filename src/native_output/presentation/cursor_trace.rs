@@ -494,7 +494,6 @@ mod tests {
             authority,
             Some(id),
             state(id),
-            Some(CursorSource::Client),
         )
     }
 
@@ -538,7 +537,6 @@ mod tests {
             authority,
             Some(1),
             expected,
-            Some(CursorSource::Client),
         );
         let mut presented = state(1);
         presented.revision = CursorRevision::initial();
@@ -602,6 +600,10 @@ mod tests {
                 src_h: 64 << 16,
                 crtc_x: 20,
                 crtc_y: 33,
+                pointer_x: 25,
+                pointer_y: 40,
+                plane_origin_x: 20,
+                plane_origin_y: 33,
                 crtc_w: 64,
                 crtc_h: 64,
                 hotspot_x: 5,
@@ -632,7 +634,9 @@ mod tests {
         assert!(line.contains("submission_kind=primary_plus_cursor"));
         assert!(line.contains("FB_ID=99 CRTC_ID=11"));
         assert!(line.contains("SRC_W=4194304 SRC_H=4194304"));
-        assert!(line.contains("position=(20, 33) hotspot=(5, 7)"));
+        assert!(line.contains("CRTC_X_RAW=20 CRTC_Y_RAW=33"));
+        assert!(line.contains("pointer_position=(25, 40) hotspot=(5, 7)"));
+        assert!(line.contains("plane_origin_signed=(20, 33)"));
         assert!(line.contains("image_generation=3"));
     }
 
