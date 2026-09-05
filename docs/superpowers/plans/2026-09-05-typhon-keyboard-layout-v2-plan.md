@@ -1,12 +1,14 @@
 # Typhon Keyboard Layout v2 — Runtime Layout Control Implementation Plan
 
-> **For agentic workers:** Execute this plan task-by-task in the current checkout. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task in the current checkout. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add ephemeral seat-level runtime layout selection through the existing authoritative libxkbcommon state, `astrea.control`, and `astreactl`.
 
 **Architecture:** Keep the compiled Text V1 keymap and the compositor-thread TLS-owned `xkb::State` from Keyboard Layout Core v1. Add a private compatibility bridge for `xkb_state_update_latched_locked()` and expose layout enumeration plus locked-layout mutation through narrow compositor/server wrappers. Control requests execute on the compositor thread, return typed snapshots, and publish only standalone `wl_keyboard.modifiers` when the authoritative serialized state changes.
 
 **Tech Stack:** Rust 2024, existing `xkbcommon = "0.9.0"` safe bindings, libxkbcommon >= 1.10.0, one `pkg-config` build dependency, serde/serde_json, existing Wayland test harness, `rtk` command output filtering.
+
+**Completion status (2026-09-05):** Tasks 1–5 are implemented and qualified; Task 6 is the final repository verification checklist. Completed steps are marked `[x]` below.
 
 ## Global Constraints
 
@@ -43,7 +45,7 @@
 - `XkbKeyboardState::next_layout(&mut self) -> Result<KeyboardLayoutChange, KeyboardLayoutError>` and `previous_layout` derive wrapping from `STATE_LAYOUT_LOCKED`.
 - `KeyboardLayoutChange` contains the resulting `KeyboardLayoutState` and `changed: bool`; no raw XKB pointer is exposed.
 
-- [ ] **Step 1: Write failing unit tests for layout enumeration and out-of-band semantics.** Add tests in the existing `#[cfg(test)]` module using a deterministic `br,us` configuration and the existing `xkb::State` reference style:
+- [x] **Step 1: Write failing unit tests for layout enumeration and out-of-band semantics.** Add tests in the existing `#[cfg(test)]` module using a deterministic `br,us` configuration and the existing `xkb::State` reference style:
 
 ```rust
 #[test]
@@ -109,7 +111,7 @@ fn runtime_layout_rejects_out_of_range_index_without_mutation() {
 }
 ```
 
-- [ ] **Step 2: Run the new unit tests and verify the expected RED failure.**
+- [x] **Step 2: Run the new unit tests and verify the expected RED failure.**
 
   Run:
 
@@ -119,7 +121,7 @@ rtk cargo test --lib compositor::keyboard::tests::runtime_layout -- --nocapture
 
   Expected: compile failure because the layout types and methods do not exist. Fix only naming/import errors if the test harness reports one before the intended missing-API failure.
 
-- [ ] **Step 3: Add the build-time libxkbcommon floor.** Add `pkg-config = "0.3"` under `[build-dependencies]` in `Cargo.toml` and create `build.rs` with the smallest possible qualification:
+- [x] **Step 3: Add the build-time libxkbcommon floor.** Add `pkg-config = "0.3"` under `[build-dependencies]` in `Cargo.toml` and create `build.rs` with the smallest possible qualification:
 
 ```rust
 fn main() {
@@ -134,7 +136,7 @@ fn main() {
 
   Run `pkg-config --modversion xkbcommon` and record the detected version in the implementation report. Run `rtk cargo check` to confirm the build script and lockfile resolve in the local checkout.
 
-- [ ] **Step 4: Add the private exact-ABI FFI declaration.** In `src/compositor/keyboard.rs`, use the public opaque `xkb::ffi::xkb_state` type returned by `xkb::State::get_raw_ptr()` and the installed header’s exact types:
+- [x] **Step 4: Add the private exact-ABI FFI declaration.** In `src/compositor/keyboard.rs`, use the public opaque `xkb::ffi::xkb_state` type returned by `xkb::State::get_raw_ptr()` and the installed header’s exact types:
 
 ```rust
 mod xkb_compat {
@@ -180,11 +182,11 @@ mod xkb_compat {
 
   Keep the unsafe call private and do not add an FFI module for unrelated XKB functions. Confirm the declaration against `/usr/include/xkbcommon/xkbcommon.h` before compiling.
 
-- [ ] **Step 5: Implement layout snapshots and strict mutation.** Add `KeyboardLayoutError` variants for unavailable/zero-layout state, invalid index with `{ index, count }`, and bounded FFI failure only if the C result indicates failure. Use `keymap.num_layouts()` as the count, convert every index to `u32`, preserve empty `layout_get_name(index)` values as `String::new()`, and read effective/locked state with `serialize_layout(STATE_LAYOUT_EFFECTIVE)` and `serialize_layout(STATE_LAYOUT_LOCKED)`.
+- [x] **Step 5: Implement layout snapshots and strict mutation.** Add `KeyboardLayoutError` variants for unavailable/zero-layout state, invalid index with `{ index, count }`, and bounded FFI failure only if the C result indicates failure. Use `keymap.num_layouts()` as the count, convert every index to `u32`, preserve empty `layout_get_name(index)` values as `String::new()`, and read effective/locked state with `serialize_layout(STATE_LAYOUT_EFFECTIVE)` and `serialize_layout(STATE_LAYOUT_LOCKED)`.
 
   In `set_locked_layout`, reject `index >= count` and any index that cannot be represented as `i32` before the FFI call; pass the checked `i32` to the private bridge; short-circuit an already-locked index as `changed: false`; capture the complete `wayland_serialized_state()` before and after; invoke only the eight arguments shown above; never touch `physical_pressed_keys`, the raw client ledger, modifiers, latched layout, or keymap bytes. Implement next/previous using locked state and `(locked + 1) % count` / `(locked + count - 1) % count`, with single-layout operations returning successful no-ops.
 
-- [ ] **Step 6: Run the focused unit tests GREEN and verify no reconstruction paths returned.**
+- [x] **Step 6: Run the focused unit tests GREEN and verify no reconstruction paths returned.**
 
 ```bash
 rtk cargo test --lib compositor::keyboard::tests::runtime_layout -- --nocapture
@@ -193,7 +195,7 @@ rtk rg -n "xkb_state_update_mask|xkb_state_update_latched_locked|Keymap::new_fro
 
   The only runtime mutation bridge must be `xkb_state_update_latched_locked`; `State::new` remains only initialization/reference-test code, and no runtime method may recompile a keymap or construct another authoritative state.
 
-- [ ] **Step 7: Commit the core API and dependency gate.**
+- [x] **Step 7: Commit the core API and dependency gate.**
 
 ```bash
 rtk git add build.rs Cargo.toml Cargo.lock src/compositor/keyboard.rs
@@ -215,9 +217,9 @@ rtk git commit -m "feat: add runtime xkb layout state control"
 - `CompositorState::keyboard_layout_snapshot`, `set_keyboard_layout`, `next_keyboard_layout`, and `previous_keyboard_layout` return a complete public `KeyboardLayoutSnapshot` or a narrow `KeyboardLayoutControlError`.
 - `OwnCompositorServer` exposes the same four operations as public server wrappers, matching its existing keyboard publication wrappers.
 
-- [ ] **Step 1: Write a failing compositor publication test.** Extend the existing Wayland keyboard fixture in `src/compositor/tests/input_output/output_keyboard_cursor.rs` to configure `br,us`, invoke the server’s runtime set wrapper, and assert that the client event log contains exactly one `keyboard_modifiers` event with group 1 and no keyboard key or keymap event. Invoke set 1 again and assert the modifier-event count does not change.
+- [x] **Step 1: Write a failing compositor publication test.** Extend the existing Wayland keyboard fixture in `src/compositor/tests/input_output/output_keyboard_cursor.rs` to configure `br,us`, invoke the server’s runtime set wrapper, and assert that the client event log contains exactly one `keyboard_modifiers` event with group 1 and no keyboard key or keymap event. Invoke set 1 again and assert the modifier-event count does not change.
 
-- [ ] **Step 2: Run the publication test RED.**
+- [x] **Step 2: Run the publication test RED.**
 
 ```bash
 rtk cargo test --lib compositor::tests::input_output::output_keyboard_cursor::runtime_layout -- --nocapture
@@ -225,15 +227,15 @@ rtk cargo test --lib compositor::tests::input_output::output_keyboard_cursor::ru
 
   Expected: compile failure for the missing server/state methods.
 
-- [ ] **Step 3: Add TLS handle forwarding.** Mirror `KeyboardStateHandle::update_physical_key`: match `Ready(id)`, borrow the state in `KEYBOARD_STATES`, call the layout method, and mark the handle `Failed` when the TLS entry is missing. For `Uninitialized`, return the existing unavailable error after the caller has attempted `ensure_keyboard_state`; for `Failed`, never initialize or retry.
+- [x] **Step 3: Add TLS handle forwarding.** Mirror `KeyboardStateHandle::update_physical_key`: match `Ready(id)`, borrow the state in `KEYBOARD_STATES`, call the layout method, and mark the handle `Failed` when the TLS entry is missing. For `Uninitialized`, return the existing unavailable error after the caller has attempted `ensure_keyboard_state`; for `Failed`, never initialize or retry.
 
-- [ ] **Step 4: Add `CompositorState` and `OwnCompositorServer` wrappers.** Ensure initialization before every operation. Convert the internal layout state into `control_snapshots::KeyboardLayoutSnapshot`, copy entries without changing names, and map internal invalid-index/unavailable errors without panicking. Keep the mutation and snapshot read in the same TLS call so the returned snapshot is authoritative.
+- [x] **Step 4: Add `CompositorState` and `OwnCompositorServer` wrappers.** Ensure initialization before every operation. Convert the internal layout state into `control_snapshots::KeyboardLayoutSnapshot`, copy entries without changing names, and map internal invalid-index/unavailable errors without panicking. Keep the mutation and snapshot read in the same TLS call so the returned snapshot is authoritative.
 
-- [ ] **Step 5: Publish changed state through the existing standalone path.** After each mutation wrapper receives `KeyboardLayoutChange { changed, snapshot }`, call `send_keyboard_modifiers_without_key()` only when `changed` is true and a focused keyboard exists. Do not call a key path, alter `pressed_keys`, resend `send_keyboard_initial_state`, create a new serial counter, or flush a redundant event. With no focus, leave the XKB state changed and let `ensure_keyboard_focus()` publish it on the next enter.
+- [x] **Step 5: Publish changed state through the existing standalone path.** After each mutation wrapper receives `KeyboardLayoutChange { changed, snapshot }`, call `send_keyboard_modifiers_without_key()` only when `changed` is true and a focused keyboard exists. Do not call a key path, alter `pressed_keys`, resend `send_keyboard_initial_state`, create a new serial counter, or flush a redundant event. With no focus, leave the XKB state changed and let `ensure_keyboard_focus()` publish it on the next enter.
 
-- [ ] **Step 6: Verify held modifiers and session retention.** Add compositor tests for Shift and Control held across `set_keyboard_layout(1)`, followed by their real releases; assert no synthetic key events, no duplicate modifier transitions, and a final depressed mask of zero. Add a session-reset test that sets layout 1, clears/restores keyboard focus through the accepted v1 path, and asserts locked/effective layout 1 after enter.
+- [x] **Step 6: Verify held modifiers and session retention.** Add compositor tests for Shift and Control held across `set_keyboard_layout(1)`, followed by their real releases; assert no synthetic key events, no duplicate modifier transitions, and a final depressed mask of zero. Add a session-reset test that sets layout 1, clears/restores keyboard focus through the accepted v1 path, and asserts locked/effective layout 1 after enter.
 
-- [ ] **Step 7: Run compositor keyboard tests GREEN and commit.**
+- [x] **Step 7: Run compositor keyboard tests GREEN and commit.**
 
 ```bash
 rtk cargo test --lib compositor::keyboard::tests -- --nocapture
@@ -259,7 +261,7 @@ rtk git commit -m "feat: expose runtime layout switching from compositor"
 - `AstreactlResult::KeyboardLayout(KeyboardLayoutSnapshot)` carries every successful query/mutation response.
 - `KeyboardLayoutGetArgs {}` and `KeyboardLayoutSetArgs { index: u32 }` are private strict dispatch argument types.
 
-- [ ] **Step 1: Write failing codec and snapshot tests.** Add command round-trip assertions:
+- [x] **Step 1: Write failing codec and snapshot tests.** Add command round-trip assertions:
 
 ```rust
 assert_eq!(ControlCommand::parse("keyboard.layout.get"), Some(ControlCommand::KeyboardLayoutGet));
@@ -268,7 +270,7 @@ assert_eq!(ControlCommand::KeyboardLayoutSet.as_str(), "keyboard.layout.set");
 
   Add serde tests that accept the complete camelCase snapshot and reject a missing field, wrong field type, or `unknownField`. Add request fixtures for `{}` and `{"index": 1}`.
 
-- [ ] **Step 2: Run the codec tests RED.**
+- [x] **Step 2: Run the codec tests RED.**
 
 ```bash
 rtk cargo test --lib control -- --nocapture
@@ -277,7 +279,7 @@ rtk cargo test --lib control_snapshots -- --nocapture
 
   Expected: missing enum variants/types or failed fixture decoding.
 
-- [ ] **Step 3: Add the command variants and strict typed snapshots.** Implement the four command `as_str`/`parse` arms. Add:
+- [x] **Step 3: Add the command variants and strict typed snapshots.** Implement the four command `as_str`/`parse` arms. Add:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,13 +301,13 @@ pub struct KeyboardLayoutEntrySnapshot {
 
   Add the result variant and keep the existing untagged result envelope.
 
-- [ ] **Step 4: Add dispatch argument validation.** Define private `EmptyKeyboardLayoutArgs {}` and `KeyboardLayoutSetArgs { index: u32 }` with `#[serde(deny_unknown_fields)]`. Deserialization must reject negative, fractional, string, missing, and unknown fields before calling the server. Do not parse an explicit index through a signed type and cast it.
+- [x] **Step 4: Add dispatch argument validation.** Define private `EmptyKeyboardLayoutArgs {}` and `KeyboardLayoutSetArgs { index: u32 }` with `#[serde(deny_unknown_fields)]`. Deserialization must reject negative, fractional, string, missing, and unknown fields before calling the server. Do not parse an explicit index through a signed type and cast it.
 
-- [ ] **Step 5: Dispatch all four commands on the compositor thread.** Add match arms in `NativeRuntime::dispatch_control_command`: validate args, call the corresponding `OwnCompositorServer` wrapper, serialize its returned snapshot, and map errors to `ControlErrorCode::InvalidArgument` for invalid index or `ControlErrorCode::Internal` with bounded `keyboard_state_unavailable` detail for unavailable state. Preserve the existing success/error response envelope and response-size validation.
+- [x] **Step 5: Dispatch all four commands on the compositor thread.** Add match arms in `NativeRuntime::dispatch_control_command`: validate args, call the corresponding `OwnCompositorServer` wrapper, serialize its returned snapshot, and map errors to `ControlErrorCode::InvalidArgument` for invalid index or `ControlErrorCode::Internal` with bounded `keyboard_state_unavailable` detail for unavailable state. Preserve the existing success/error response envelope and response-size validation.
 
-- [ ] **Step 6: Add dispatch behavior tests.** Exercise valid get/set/next/previous, out-of-range set, all strict argument failures, typed success payloads, unavailable keyboard state, and no-op mutation response. Assert the server wrapper is the only mutation route and no new control-side active-layout variable exists.
+- [x] **Step 6: Add dispatch behavior tests.** Exercise valid get/set/next/previous, out-of-range set, all strict argument failures, typed success payloads, unavailable keyboard state, and no-op mutation response. Assert the server wrapper is the only mutation route and no new control-side active-layout variable exists.
 
-- [ ] **Step 7: Run control/native tests and commit.**
+- [x] **Step 7: Run control/native tests and commit.**
 
 ```bash
 rtk cargo test --lib control -- --nocapture
@@ -332,9 +334,9 @@ rtk git commit -m "feat: add keyboard layout control commands"
 - Wire commands remain `keyboard.layout.get`, `keyboard.layout.next`, `keyboard.layout.previous`, and `keyboard.layout.set`.
 - All forms use the existing global `--json`, socket discovery, timeout, and typed `AstreactlResult` decoder.
 
-- [ ] **Step 1: Write failing parser/decoder/output tests.** Add CLI tests for the four command forms and invalid arity/negative/non-integer index. Add typed decoder fixtures for the complete snapshot, missing fields, wrong types, unknown fields, and server invalid_argument/internal responses. Add human-output assertions that mark the effective index, show locked index, preserve numeric ids, and sanitize layout names containing newline/tab/ESC.
+- [x] **Step 1: Write failing parser/decoder/output tests.** Add CLI tests for the four command forms and invalid arity/negative/non-integer index. Add typed decoder fixtures for the complete snapshot, missing fields, wrong types, unknown fields, and server invalid_argument/internal responses. Add human-output assertions that mark the effective index, show locked index, preserve numeric ids, and sanitize layout names containing newline/tab/ESC.
 
-- [ ] **Step 2: Run astreactl tests RED.**
+- [x] **Step 2: Run astreactl tests RED.**
 
 ```bash
 rtk cargo test --bin astreactl -- --nocapture
@@ -343,11 +345,11 @@ rtk cargo test --test astreactl -- --nocapture
 
   Expected: parser rejects `keyboard` as unknown or typed decoder returns the existing unknown-command error.
 
-- [ ] **Step 3: Add the parser branch and help text.** In `run`, route `command == "keyboard"` to a focused `parse_keyboard_command(&positionals[1..])`. Map `layout` to an empty-object get request, `next`/`previous` to empty-object mutations, and `set INDEX` to `{"index": parsed_u32}`. Reject extra args and values beginning with `-` using the established usage error style. Add the four forms to `--help`.
+- [x] **Step 3: Add the parser branch and help text.** In `run`, route `command == "keyboard"` to a focused `parse_keyboard_command(&positionals[1..])`. Map `layout` to an empty-object get request, `next`/`previous` to empty-object mutations, and `set INDEX` to `{"index": parsed_u32}`. Reject extra args and values beginning with `-` using the established usage error style. Add the four forms to `--help`.
 
-- [ ] **Step 4: Add typed result decoding.** Import `KeyboardLayoutSnapshot`, add the result variant, and map all four wire commands to `serde_json::from_value::<KeyboardLayoutSnapshot>`. Do not decode arbitrary `Value` or reuse another snapshot type.
+- [x] **Step 4: Add typed result decoding.** Import `KeyboardLayoutSnapshot`, add the result variant, and map all four wire commands to `serde_json::from_value::<KeyboardLayoutSnapshot>`. Do not decode arbitrary `Value` or reuse another snapshot type.
 
-- [ ] **Step 5: Add sanitized human formatting.** Add `AstreactlResult::KeyboardLayout` to `output::human` and implement `format_keyboard_layout`. Print:
+- [x] **Step 5: Add sanitized human formatting.** Add `AstreactlResult::KeyboardLayout` to `output::human` and implement `format_keyboard_layout`. Print:
 
 ```text
 Effective: 1
@@ -359,9 +361,9 @@ Locked: 1
 
   Use `sanitize_terminal_text` for every layout name. Display unnamed entries with the fixed text `Unnamed` and never use names for selection or identity. Do not add colors.
 
-- [ ] **Step 6: Update CLI documentation and test all forms.** Add the commands, wire names, snapshot schema, JSON behavior, strict index rules, no persistence, no UI, and sanitized human output to `docs/astreactl.md`. Extend `valid_result` and request fixtures in `tests/astreactl.rs` for all four commands; verify `--json` returns exactly the typed JSON object.
+- [x] **Step 6: Update CLI documentation and test all forms.** Add the commands, wire names, snapshot schema, JSON behavior, strict index rules, no persistence, no UI, and sanitized human output to `docs/astreactl.md`. Extend `valid_result` and request fixtures in `tests/astreactl.rs` for all four commands; verify `--json` returns exactly the typed JSON object.
 
-- [ ] **Step 7: Run astreactl tests and commit.**
+- [x] **Step 7: Run astreactl tests and commit.**
 
 ```bash
 rtk cargo test --bin astreactl -- --nocapture
@@ -383,17 +385,17 @@ rtk git commit -m "feat: expose keyboard layouts through astreactl"
 - Tests use the public server wrappers and existing real Wayland keyboard client/event capture helpers; they must not access an XKB pointer or create a second Typhon state.
 - Reference assertions use an independently created `xkb::State` driven only by the original physical `update_key` sequence where XKB semantics are compared.
 
-- [ ] **Step 1: Add real Wayland no-key publication coverage.** Start `br,us` at group 0, invoke runtime set 1, and capture the client event log. Assert the sequence contains no `wl_keyboard.key` or `wl_keyboard.keymap`, exactly one standalone `wl_keyboard.modifiers` with group 1, and a complete depressed/latched/locked snapshot. Set 1 again and assert the modifier count is unchanged.
+- [x] **Step 1: Add real Wayland no-key publication coverage.** Start `br,us` at group 0, invoke runtime set 1, and capture the client event log. Assert the sequence contains no `wl_keyboard.key` or `wl_keyboard.keymap`, exactly one standalone `wl_keyboard.modifiers` with group 1, and a complete depressed/latched/locked snapshot. Set 1 again and assert the modifier count is unchanged.
 
-- [ ] **Step 2: Add wrapping and no-focus coverage.** Assert next from the final layout wraps to 0 and previous from 0 wraps to the final layout. Temporarily remove keyboard focus, perform a runtime switch, assert no invalid event is emitted, restore focus, and assert enter publishes the current effective/locked group.
+- [x] **Step 2: Add wrapping and no-focus coverage.** Assert next from the final layout wraps to 0 and previous from 0 wraps to the final layout. Temporarily remove keyboard focus, perform a runtime switch, assert no invalid event is emitted, restore focus, and assert enter publishes the current effective/locked group.
 
-- [ ] **Step 3: Add held-modifier coverage.** Hold Shift and separately Control across `set 1`; assert each remains physically depressed, no key up/down is synthesized, and the real release clears the final depressed state. Add RightAlt/AltGr coverage against the independent physical XKB reference.
+- [x] **Step 3: Add held-modifier coverage.** Hold Shift and separately Control across `set 1`; assert each remains physically depressed, no key up/down is synthesized, and the real release clears the final depressed state. Add RightAlt/AltGr coverage against the independent physical XKB reference.
 
-- [ ] **Step 4: Add `grp:*` interoperability coverage.** Configure `br,us` with `grp:alt_shift_toggle`, perform control set 1, drive physical Alt+Shift, query, then previous. Assert every result comes from the same authoritative state and reflects both effective and locked groups without a control-side counter.
+- [x] **Step 4: Add `grp:*` interoperability coverage.** Configure `br,us` with `grp:alt_shift_toggle`, perform control set 1, drive physical Alt+Shift, query, then previous. Assert every result comes from the same authoritative state and reflects both effective and locked groups without a control-side counter.
 
-- [ ] **Step 5: Add session persistence coverage.** Set locked layout 1, execute the accepted leave/clear/restore session path, and assert locked layout remains 1 after enter alongside retained Caps Lock behavior and an empty transient raw-key list.
+- [x] **Step 5: Add session persistence coverage.** Set locked layout 1, execute the accepted leave/clear/restore session path, and assert locked layout remains 1 after enter alongside retained Caps Lock behavior and an empty transient raw-key list.
 
-- [ ] **Step 6: Run the complete focused regression matrix.**
+- [x] **Step 6: Run the complete focused regression matrix.**
 
 ```bash
 rtk cargo test --lib compositor::keyboard::tests -- --nocapture
@@ -404,7 +406,7 @@ rtk cargo test --bin oblivion-one native_output::tests::input_shortcut_inhibitio
 
   Confirm all Keyboard Layout Core v1 tests remain green, especially physical authority, raw repeat value 2, deferred Alt/Super, inhibition, group actions, TLS failure, focus, and session reset.
 
-- [ ] **Step 7: Commit end-to-end qualification.**
+- [x] **Step 7: Commit end-to-end qualification.**
 
 ```bash
 rtk git add src/compositor/tests/input_output/output_keyboard_cursor.rs src/native_output/tests/input.rs
