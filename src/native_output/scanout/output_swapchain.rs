@@ -725,11 +725,9 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn worker_queued_cursor_trace_reveal(&self) -> Option<CursorRevealTraceSnapshot> {
-        let trace_reveal = self
-            .worker_queued
+        self.worker_queued
             .as_ref()
-            .and_then(|queued| queued.frame.frozen_cursor_trace_reveal);
-        trace_reveal
+            .and_then(|queued| queued.frame.frozen_cursor_trace_reveal)
     }
 
     pub(crate) fn store_worker_queued(
