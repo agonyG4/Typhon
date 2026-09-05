@@ -13,6 +13,38 @@ use xkbcommon::xkb;
 
 use super::runtime_files::unique_runtime_file_path;
 
+mod xkb_compat {
+    use std::os::raw::c_int;
+
+    use xkbcommon::xkb;
+
+    #[link(name = "xkbcommon")]
+    unsafe extern "C" {
+        fn xkb_state_update_latched_locked(
+            state: *mut xkb::ffi::xkb_state,
+            affect_latched_mods: u32,
+            latched_mods: u32,
+            affect_latched_layout: bool,
+            latched_layout: i32,
+            affect_locked_mods: u32,
+            locked_mods: u32,
+            affect_locked_layout: bool,
+            locked_layout: i32,
+        ) -> c_int;
+    }
+
+    pub(super) fn set_locked_layout(state: &xkb::State, index: i32) -> bool {
+        // SAFETY: `state.get_raw_ptr()` points to this live compositor-thread
+        // XKB state; libxkbcommon does not retain it, the state outlives this
+        // call, no concurrent access exists, the index was validated before
+        // entry, and this declaration matches xkbcommon.h on >= 1.10.0.
+        unsafe {
+            xkb_state_update_latched_locked(state.get_raw_ptr(), 0, 0, false, 0, 0, 0, true, index)
+                != 0
+        }
+    }
+}
+
 const WL_KEYBOARD_REPEAT_INFO_SINCE: u32 = 4;
 const XKB_EVDEV_OFFSET: u32 = 8;
 
@@ -118,6 +150,32 @@ pub(super) struct KeyboardSerializedState {
     pub(super) latched: u32,
     pub(super) locked: u32,
     pub(super) group: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeyboardLayoutState {
+    pub(super) effective_index: u32,
+    pub(super) locked_index: u32,
+    pub(super) layouts: Vec<KeyboardLayoutEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeyboardLayoutEntry {
+    pub(super) index: u32,
+    pub(super) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeyboardLayoutChange {
+    pub(super) snapshot: KeyboardLayoutState,
+    pub(super) changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeyboardLayoutError {
+    Unavailable(&'static str),
+    InvalidIndex { index: u32, count: u32 },
+    IndexTooLarge(u32),
 }
 
 pub(super) struct XkbKeyboardState {
@@ -280,6 +338,65 @@ impl XkbKeyboardState {
                 .physical_state
                 .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
         }
+    }
+
+    pub(super) fn layout_snapshot(&self) -> Result<KeyboardLayoutState, KeyboardLayoutError> {
+        let count = self.keymap.num_layouts();
+        if count == 0 {
+            return Err(KeyboardLayoutError::Unavailable("keymap has no layouts"));
+        }
+        let layouts = (0..count)
+            .map(|index| KeyboardLayoutEntry {
+                index,
+                name: self.keymap.layout_get_name(index).to_string(),
+            })
+            .collect();
+        Ok(KeyboardLayoutState {
+            effective_index: self
+                .physical_state
+                .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+            locked_index: self
+                .physical_state
+                .serialize_layout(xkb::STATE_LAYOUT_LOCKED),
+            layouts,
+        })
+    }
+
+    pub(super) fn set_locked_layout(
+        &mut self,
+        index: u32,
+    ) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let before = self.layout_snapshot()?;
+        let count = u32::try_from(before.layouts.len()).unwrap_or(u32::MAX);
+        if index >= count {
+            return Err(KeyboardLayoutError::InvalidIndex { index, count });
+        }
+        if index == before.locked_index {
+            return Ok(KeyboardLayoutChange {
+                snapshot: before,
+                changed: false,
+            });
+        }
+        let index = i32::try_from(index).map_err(|_| KeyboardLayoutError::IndexTooLarge(index))?;
+        let _ = xkb_compat::set_locked_layout(&self.physical_state, index);
+        let snapshot = self.layout_snapshot()?;
+        Ok(KeyboardLayoutChange {
+            changed: snapshot != before,
+            snapshot,
+        })
+    }
+
+    pub(super) fn next_layout(&mut self) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let snapshot = self.layout_snapshot()?;
+        let index = (snapshot.locked_index + 1) % snapshot.layouts.len() as u32;
+        self.set_locked_layout(index)
+    }
+
+    pub(super) fn previous_layout(&mut self) -> Result<KeyboardLayoutChange, KeyboardLayoutError> {
+        let snapshot = self.layout_snapshot()?;
+        let index = (snapshot.locked_index + snapshot.layouts.len() as u32 - 1)
+            % snapshot.layouts.len() as u32;
+        self.set_locked_layout(index)
     }
 
     pub(super) fn clear_transient_key_state(&mut self) {
@@ -723,6 +840,68 @@ mod tests {
         state.update_physical_key(42, false);
         state.update_physical_key(56, false);
         assert_eq!(state.wayland_serialized_state().group, 1);
+    }
+
+    #[test]
+    fn runtime_layout_snapshot_comes_from_compiled_keymap() {
+        let config = KeyboardConfig {
+            layout: "br,us".into(),
+            variant: Some("abnt2,".into()),
+            ..KeyboardConfig::default()
+        };
+        let state = XkbKeyboardState::from_config(&config).unwrap();
+        let snapshot = state.layout_snapshot().unwrap();
+        assert_eq!(snapshot.effective_index, 0);
+        assert_eq!(snapshot.locked_index, 0);
+        assert_eq!(snapshot.layouts.len(), 2);
+        assert_eq!(snapshot.layouts[0].index, 0);
+        assert_eq!(snapshot.layouts[1].index, 1);
+    }
+
+    #[test]
+    fn runtime_layout_set_preserves_physical_state_and_keymap_bytes() {
+        let config = KeyboardConfig {
+            layout: "br,us".into(),
+            variant: Some("abnt2,".into()),
+            ..KeyboardConfig::default()
+        };
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        state.update_physical_key(42, true);
+        let keymap_before = state.keymap_text_v1().to_string();
+        let before = state.wayland_serialized_state();
+
+        let change = state.set_locked_layout(1).unwrap();
+
+        assert!(change.changed);
+        assert_eq!(change.snapshot.locked_index, 1);
+        assert_eq!(change.snapshot.effective_index, 1);
+        assert_eq!(state.wayland_serialized_state().depressed, before.depressed);
+        assert_eq!(state.keymap_text_v1(), keymap_before);
+        assert!(state.physical_pressed_keys.contains(&42));
+    }
+
+    #[test]
+    fn runtime_layout_navigation_wraps_from_locked_layout() {
+        let config = KeyboardConfig {
+            layout: "br,us".into(),
+            variant: Some("abnt2,".into()),
+            ..KeyboardConfig::default()
+        };
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        assert_eq!(state.next_layout().unwrap().snapshot.locked_index, 1);
+        assert_eq!(state.next_layout().unwrap().snapshot.locked_index, 0);
+        assert_eq!(state.previous_layout().unwrap().snapshot.locked_index, 1);
+    }
+
+    #[test]
+    fn runtime_layout_rejects_out_of_range_index_without_mutation() {
+        let mut state = XkbKeyboardState::from_config(&KeyboardConfig::default()).unwrap();
+        let before = state.layout_snapshot().unwrap();
+        assert!(matches!(
+            state.set_locked_layout(1),
+            Err(KeyboardLayoutError::InvalidIndex { index: 1, count: 1 })
+        ));
+        assert_eq!(state.layout_snapshot().unwrap(), before);
     }
 
     #[test]

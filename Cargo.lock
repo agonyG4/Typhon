@@ -857,6 +857,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libseat",
+ "pkg-config",
  "resvg",
  "serde",
  "serde_json",
