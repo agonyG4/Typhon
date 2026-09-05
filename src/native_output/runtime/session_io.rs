@@ -33,6 +33,7 @@ pub(crate) enum NativeIoOperation {
     AtomicCommit,
     LegacyCommit,
     HardwareCursorDrm,
+    HardwareCursorSessionRetire,
     SchedulerRearm,
     WaylandProgress,
     DestructorDisarm,
@@ -69,7 +70,7 @@ pub(crate) trait NativeSessionIo {
     }
     fn quarantine_pageflip(&mut self) -> NativeResult<()>;
     fn unregister_drm_source(&mut self) -> NativeResult<()>;
-    fn disable_hardware_cursor(&mut self) -> NativeResult<()>;
+    fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()>;
     fn recover_kms_pipeline(&mut self) -> NativeResult<()>;
     fn retire_quarantined_pageflip(&mut self) -> NativeResult<()>;
     fn rearm_explicit_sync(&mut self) -> NativeResult<()>;
@@ -99,8 +100,8 @@ pub(crate) fn quiesce_and_acknowledge<I: NativeSessionIo>(
     io.quarantine_pageflip()?;
     io.observe(NativeIoOperation::DrmSourceUnregister);
     io.unregister_drm_source()?;
-    io.observe(NativeIoOperation::HardwareCursorDrm);
-    io.disable_hardware_cursor()?;
+    io.observe(NativeIoOperation::HardwareCursorSessionRetire);
+    io.retire_hardware_cursor_for_session()?;
     acknowledge(io)
 }
 
@@ -196,6 +197,9 @@ impl NativeSessionIo for NativeRuntime {
         let Some(worker) = self.kms_commit_worker.take() else {
             return Ok(());
         };
+        if let Some(seat) = self.seat_session.as_ref() {
+            seat.install_pre_disable_quiesce_authority(None);
+        }
         if let Some(token) = self.kms_commit_worker_reactor_token.take() {
             self.event_loop.unregister(token)?;
         }
@@ -244,12 +248,12 @@ impl NativeSessionIo for NativeRuntime {
         Ok(())
     }
 
-    fn disable_hardware_cursor(&mut self) -> NativeResult<()> {
+    fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()> {
         if let Some(cursor) = self.atomic_cursor.as_mut() {
             cursor.suspend_for_session();
         }
         if let Some(mut cursor) = self.legacy_cursor.take() {
-            cursor.disable()?;
+            cursor.disarm_drm_cleanup();
         }
         Ok(())
     }
@@ -598,6 +602,9 @@ mod tests {
         ExplicitSyncNotifier,
         FramebufferRemove,
         RawInputAction,
+        SeatDisableCallback,
+        PreRevokeKmsQuiesce,
+        SeatDisableCallbackReturned,
     }
 
     #[derive(Default)]
@@ -636,7 +643,7 @@ mod tests {
         fn unregister_drm_source(&mut self) -> NativeResult<()> {
             Ok(())
         }
-        fn disable_hardware_cursor(&mut self) -> NativeResult<()> {
+        fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()> {
             Ok(())
         }
         fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
@@ -734,8 +741,8 @@ mod tests {
             self.push(Operation::DrmUnregister);
             Ok(())
         }
-        fn disable_hardware_cursor(&mut self) -> NativeResult<()> {
-            self.push(Operation::CursorDisable);
+        fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()> {
+            self.push(Operation::CursorSessionRetire);
             Ok(())
         }
         fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
@@ -819,7 +826,40 @@ mod tests {
         let mut recorder = Recorder::default();
         quiesce_without_seat(&mut recorder);
 
-        assert!(recorder.operations.contains(&Operation::CursorSessionRetire));
+        assert!(
+            recorder
+                .operations
+                .contains(&Operation::CursorSessionRetire)
+        );
+        assert!(!recorder.operations.contains(&Operation::CursorDisable));
+    }
+
+    #[test]
+    fn callback_return_precedes_runtime_session_io_in_backend_neutral_model() {
+        let mut recorder = Recorder::default();
+        recorder.push(Operation::SeatDisableCallback);
+        recorder.push(Operation::PreRevokeKmsQuiesce);
+        recorder.push(Operation::SeatDisableCallbackReturned);
+        quiesce_without_seat(&mut recorder);
+
+        let pre_revoke = recorder
+            .operations
+            .iter()
+            .position(|operation| *operation == Operation::PreRevokeKmsQuiesce)
+            .unwrap();
+        let callback_returned = recorder
+            .operations
+            .iter()
+            .position(|operation| *operation == Operation::SeatDisableCallbackReturned)
+            .unwrap();
+        let runtime_suspend = recorder
+            .operations
+            .iter()
+            .position(|operation| *operation == Operation::InputSuspend)
+            .unwrap();
+
+        assert!(pre_revoke < callback_returned);
+        assert!(callback_returned < runtime_suspend);
         assert!(!recorder.operations.contains(&Operation::CursorDisable));
     }
 

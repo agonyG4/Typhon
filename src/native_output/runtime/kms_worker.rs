@@ -746,7 +746,11 @@ impl NativeRuntime {
             .commit_submitter();
         match KmsCommitWorkerHandle::start_atomic(submitter) {
             Ok(worker) => {
+                let quiesce_authority = worker.quiesce_authority();
                 self.kms_commit_worker = Some(worker);
+                if let Some(seat) = self.seat_session.as_ref() {
+                    seat.install_pre_disable_quiesce_authority(Some(quiesce_authority));
+                }
                 Ok(())
             }
             Err(error)
@@ -758,6 +762,9 @@ impl NativeRuntime {
                 );
                 self.kms_commit_worker_transport =
                     crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous;
+                if let Some(seat) = self.seat_session.as_ref() {
+                    seat.install_pre_disable_quiesce_authority(None);
+                }
                 Ok(())
             }
             Err(error) => Err(io::Error::other(format!(

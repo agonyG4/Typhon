@@ -559,6 +559,67 @@ fn pre_revoke_authority_waits_for_active_submit_and_closes_admission() {
 }
 
 #[test]
+fn no_worker_pre_disable_hook_is_a_noop() {
+    let hook = crate::native_output::NativeSeatPreDisableHook::default();
+
+    assert!(!hook.invoke());
+}
+
+#[test]
+fn recovered_worker_replaces_pre_disable_hook_authority() {
+    let hook = crate::native_output::NativeSeatPreDisableHook::default();
+    let first = KmsCommitWorkerHandle::start(Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    }))
+    .unwrap();
+    reserve_for_test(&first, test_job(62).kind)
+        .enqueue(test_job(62))
+        .unwrap();
+    for _ in 0..100 {
+        if first.inflight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    hook.install(Some(first.quiesce_authority()));
+    assert!(hook.invoke());
+    assert!(matches!(
+        first.try_reserve_admission(test_job(62).kind),
+        Err(KmsWorkerAdmissionError::Quiescing)
+    ));
+    first
+        .ack_pageflip(test_job(62).token, test_job(62).transaction_id, 1)
+        .unwrap();
+    first.join().unwrap();
+
+    let second = KmsCommitWorkerHandle::start(Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    }))
+    .unwrap();
+    reserve_for_test(&second, test_job(63).kind)
+        .enqueue(test_job(63))
+        .unwrap();
+    for _ in 0..100 {
+        if second.inflight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    hook.install(Some(second.quiesce_authority()));
+    assert!(hook.invoke());
+    assert!(matches!(
+        second.try_reserve_admission(test_job(63).kind),
+        Err(KmsWorkerAdmissionError::Quiescing)
+    ));
+    second
+        .ack_pageflip(test_job(63).token, test_job(63).transaction_id, 1)
+        .unwrap();
+    second.join().unwrap();
+}
+
+#[test]
 fn idle_worker_has_only_one_reserved_ready_slot() {
     let executor = Arc::new(ScriptedExecutor {
         outcomes: Mutex::new(VecDeque::new()),

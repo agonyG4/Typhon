@@ -40,7 +40,6 @@ fn binding_application_launch_receives_current_xwayland_environment() {
             resize_perf: &mut resize_perf,
             cursor_mode: NativeCursorRenderMode::Software,
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::Accelerated,
-            seat_session: None,
             process_supervisor: &mut process_supervisor,
             xwayland: Some(&xwayland),
         },

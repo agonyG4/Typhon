@@ -224,6 +224,13 @@ impl NativeRuntime {
             } else {
                 NativeWaylandInputDispatchOutcome::default()
             };
+        if let Some(vt) = dispatch_outcome.vt_switch_requested {
+            self.request_native_vt_switch(vt)?;
+            if !self.session.permits_output() {
+                self.quiesce_control_server()?;
+                return Ok(());
+            }
+        }
         let mut routing_guard = NativeInputTransitionLatencyGuard::default();
         if let Some(transition) = dispatch_outcome.routing_transition {
             routing_guard.arm(transition);
@@ -701,7 +708,6 @@ impl NativeRuntime {
         ));
     }
 
-    #[allow(unused_variables)]
     fn dispatch_runtime_seat_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         if !wakeup.reasons.seat() {
             return Ok(());
@@ -711,11 +717,26 @@ impl NativeRuntime {
         };
         NativeSessionIo::observe(self, NativeIoOperation::SeatDispatch);
         seat.dispatch()?;
+        self.consume_pending_seat_events(&seat)?;
+        Ok(())
+    }
+
+    fn consume_pending_seat_events(&mut self, seat: &NativeSeatSession) -> NativeResult<bool> {
+        let mut disabled_observed = false;
         for event in seat.drain_events() {
+            if matches!(event, NativeSeatEvent::Disabled) {
+                disabled_observed = true;
+                let (disable_sequence, worker_present) = seat.pre_disable_observation();
+                self.perf.log("native.seat_pre_revoke", || {
+                    vec![
+                        NativePerfField::bool("worker_present", worker_present),
+                        NativePerfField::bool("worker_quiesced", true),
+                        NativePerfField::u64("disable_sequence", disable_sequence),
+                    ]
+                });
+            }
             match self.session.begin_for_event(event) {
-                Some(NativeSessionTransition::BeginSuspend) => {
-                    self.suspend_native_session(&seat)?
-                }
+                Some(NativeSessionTransition::BeginSuspend) => self.suspend_native_session(seat)?,
                 Some(NativeSessionTransition::BeginResume) if self.shutdown.is_running() => {
                     self.resume_native_session()?
                 }
@@ -729,6 +750,42 @@ impl NativeRuntime {
                 }
                 _ => {}
             }
+        }
+        Ok(disabled_observed)
+    }
+
+    fn request_native_vt_switch(&mut self, vt: u8) -> NativeResult<()> {
+        let Some(seat) = self.seat_session.clone() else {
+            self.perf.log("native.vt_switch_request", || {
+                vec![
+                    NativePerfField::u64("vt", u64::from(vt)),
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::bool("disabled_observed", false),
+                    NativePerfField::str("error", "no seat session"),
+                ]
+            });
+            eprintln!("native input: VT switch request vt={vt} failed: no seat session");
+            return Ok(());
+        };
+        let outcome =
+            request_native_vt_switch(&seat, vt, || self.consume_pending_seat_events(&seat))?;
+        let status = match outcome.status {
+            NativeVtSwitchRequestStatus::Requested => "requested",
+            NativeVtSwitchRequestStatus::Failed => "failed",
+        };
+        self.perf.log("native.vt_switch_request", || {
+            vec![
+                NativePerfField::u64("vt", u64::from(vt)),
+                NativePerfField::str("status", status),
+                NativePerfField::bool("disabled_observed", outcome.disabled_observed),
+                NativePerfField::str(
+                    "error",
+                    outcome.error.clone().unwrap_or_else(|| "none".to_string()),
+                ),
+            ]
+        });
+        if let Some(error) = outcome.error {
+            eprintln!("native input: VT switch request vt={vt} failed: {error}");
         }
         Ok(())
     }

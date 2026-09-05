@@ -32,7 +32,9 @@ pub(crate) use queue::{
 };
 #[cfg(test)]
 pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
-pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent, ValidationBaseInvalidationReason};
+pub(crate) use thread::{
+    KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerQuiesceHandle, ValidationBaseInvalidationReason,
+};
 pub(crate) use timing::{KmsWorkerDispatchBudget, KmsWorkerDispatchModel};
 
 #[cfg(test)]

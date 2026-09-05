@@ -1,7 +1,48 @@
 //! Runtime ownership of a libseat-managed native session.
 
-use crate::native_output::NativeSeatEvent;
+use crate::native_output::{NativeResult, NativeSeatEvent};
 use oblivion_one::control_snapshots::{ControlSessionState, DoctorSeverity};
+use std::io;
+
+pub(crate) trait NativeSeatSwitch {
+    fn switch_session_request(&self, session: i32) -> io::Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeVtSwitchRequestStatus {
+    Requested,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeVtSwitchRequestOutcome {
+    pub(crate) status: NativeVtSwitchRequestStatus,
+    pub(crate) disabled_observed: bool,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) fn request_native_vt_switch<S, F>(
+    seat: &S,
+    vt: u8,
+    consume_pending_events: F,
+) -> NativeResult<NativeVtSwitchRequestOutcome>
+where
+    S: NativeSeatSwitch,
+    F: FnOnce() -> NativeResult<bool>,
+{
+    let request = seat.switch_session_request(i32::from(vt));
+    let disabled_observed = consume_pending_events()?;
+    let error = request.as_ref().err().map(ToString::to_string);
+    Ok(NativeVtSwitchRequestOutcome {
+        status: if request.is_ok() {
+            NativeVtSwitchRequestStatus::Requested
+        } else {
+            NativeVtSwitchRequestStatus::Failed
+        },
+        disabled_observed,
+        error,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeSessionState {

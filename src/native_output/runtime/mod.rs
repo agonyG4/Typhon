@@ -134,7 +134,10 @@ pub(crate) use presentation_transactions::{
     direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
     settle_no_visual_change_output_transaction,
 };
-pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
+pub(crate) use session::{
+    NativeSeatSwitch, NativeSessionLifecycle, NativeSessionTransition, NativeVtSwitchRequestStatus,
+    request_native_vt_switch,
+};
 #[cfg(test)]
 pub(crate) use session_io::NativeIoRecorder;
 pub(crate) use session_io::{

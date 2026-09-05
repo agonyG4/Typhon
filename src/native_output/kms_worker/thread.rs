@@ -148,6 +148,17 @@ pub(crate) struct KmsCommitWorkerHandle {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct KmsWorkerQuiesceHandle {
+    shared: Arc<WorkerShared>,
+}
+
+impl KmsWorkerQuiesceHandle {
+    pub(crate) fn request_quiesce(&self) {
+        self.shared.request_quiesce();
+    }
+}
+
 impl KmsCommitWorkerHandle {
     pub(crate) fn start(
         executor: Arc<dyn KmsCommitExecutor>,
@@ -175,6 +186,12 @@ impl KmsCommitWorkerHandle {
         submitter: AtomicCommitSubmitter,
     ) -> Result<Self, KmsCommitWorkerStartError> {
         Self::start(Arc::new(AtomicKmsWorkerExecutor { submitter }))
+    }
+
+    pub(crate) fn quiesce_authority(&self) -> KmsWorkerQuiesceHandle {
+        KmsWorkerQuiesceHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
     pub(crate) fn try_reserve_admission(
         &self,

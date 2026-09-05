@@ -1,6 +1,6 @@
 use super::kms_worker_startup::start_kms_commit_worker;
 use super::*;
-use crate::native_output::kms_worker::KmsCommitWorkerPolicy;
+use crate::native_output::kms_worker::{KmsCommitWorkerHandle, KmsCommitWorkerPolicy};
 use oblivion_one::compositor::gpu_protocol_capabilities::{
     GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
 };
@@ -367,6 +367,13 @@ impl NativeRuntime {
         .map_err(io::Error::other)?;
         let (kms_commit_worker, kms_commit_worker_transport, kms_commit_worker_startup) =
             start_kms_commit_worker(requested_worker_policy, &kms_backend)?;
+        if let Some(seat) = seat_session.as_ref() {
+            seat.install_pre_disable_quiesce_authority(
+                kms_commit_worker
+                    .as_ref()
+                    .map(KmsCommitWorkerHandle::quiesce_authority),
+            );
+        }
         println!(
             "native KMS commit worker: requested={} effective={} startup={}",
             requested_worker_policy.as_str(),

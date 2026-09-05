@@ -82,6 +82,7 @@ fn timing_transition(transition: NativeInputRoutingTransition) -> NativePointerT
 pub(super) struct NativeWaylandInputDispatchOutcome {
     pub(super) pacing_readiness_changed: bool,
     pub(super) routing_transition: Option<NativeInputRoutingTransition>,
+    pub(super) vt_switch_requested: Option<u8>,
 }
 
 fn settle_native_pointer_constraint_backend_requests(
@@ -936,7 +937,6 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
-            seat_session,
             process_supervisor,
             render_telemetry,
             pointer_timing,
@@ -951,6 +951,7 @@ impl NativeRuntime {
         let mut accepted = 0;
         let mut tick_us = 0;
         let mut pacing_readiness_changed = false;
+        let mut vt_switch_requested = None;
         let mut input_drain_us = 0;
         let mut raw_input_events = 0;
         let mut coalesced_input_events = 0;
@@ -1238,7 +1239,6 @@ impl NativeRuntime {
                         resize_perf,
                         cursor_mode: *cursor_render_mode,
                         app_gpu_policy: *effective_app_gpu_policy,
-                        seat_session: seat_session.as_ref(),
                         process_supervisor,
                         xwayland: xwayland_app_environment,
                     },
@@ -1249,6 +1249,7 @@ impl NativeRuntime {
                         return Err(error);
                     }
                 };
+                vt_switch_requested = vt_switch_requested.or(application.vt_switch_requested);
                 if application.exit_requested {
                     cycle.shutdown_requested = true;
                     break;
@@ -1495,6 +1496,7 @@ impl NativeRuntime {
         Ok(NativeWaylandInputDispatchOutcome {
             pacing_readiness_changed,
             routing_transition,
+            vt_switch_requested,
         })
     }
 }

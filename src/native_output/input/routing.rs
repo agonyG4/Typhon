@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::kms_worker::KmsWorkerQuiesceHandle;
 use crate::native_output::runtime::{
     NativePointerConstraintBackendAction, NativePointerTimingPoint, NativePointerTransitionContext,
     capture_timing_point,
@@ -416,12 +417,57 @@ pub(crate) enum NativeSeatEvent {
     Disabled,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct NativeSeatPreDisableHook {
+    authority: Rc<RefCell<Option<KmsWorkerQuiesceHandle>>>,
+    sequence: Rc<Cell<u64>>,
+}
+
+impl NativeSeatPreDisableHook {
+    pub(crate) fn install(&self, authority: Option<KmsWorkerQuiesceHandle>) {
+        *self.authority.borrow_mut() = authority;
+    }
+
+    pub(crate) fn invoke(&self) -> bool {
+        self.sequence.set(self.sequence.get().saturating_add(1));
+        let authority = self.authority.borrow().clone();
+        if let Some(authority) = authority {
+            authority.request_quiesce();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn worker_present(&self) -> bool {
+        self.authority.borrow().is_some()
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence.get()
+    }
+}
+
+fn handle_disable_callback(
+    active: &Cell<bool>,
+    disable_pending: &Cell<bool>,
+    events: &RefCell<Vec<NativeSeatEvent>>,
+    pre_disable_hook: &NativeSeatPreDisableHook,
+) {
+    active.set(false);
+    pre_disable_hook.invoke();
+    if !disable_pending.replace(true) {
+        events.borrow_mut().push(NativeSeatEvent::Disabled);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeSeatSession {
     pub(crate) inner: Rc<RefCell<NativeSeatSessionInner>>,
     pub(crate) events: Rc<RefCell<Vec<NativeSeatEvent>>>,
     pub(crate) active: Rc<Cell<bool>>,
     pub(crate) disable_pending: Rc<Cell<bool>>,
+    pre_disable_hook: NativeSeatPreDisableHook,
 }
 
 pub(crate) struct NativeSeatSessionInner {
@@ -457,9 +503,11 @@ impl NativeSeatSession {
         let active = Rc::new(Cell::new(false));
         let events = Rc::new(RefCell::new(Vec::new()));
         let disable_pending = Rc::new(Cell::new(false));
+        let pre_disable_hook = NativeSeatPreDisableHook::default();
         let callback_active = Rc::clone(&active);
         let callback_events = Rc::clone(&events);
         let callback_disable_pending = Rc::clone(&disable_pending);
+        let callback_pre_disable_hook = pre_disable_hook.clone();
         let seat = libseat::Seat::open(move |_seat, event| match event {
             libseat::SeatEvent::Enable => {
                 callback_disable_pending.set(false);
@@ -467,10 +515,12 @@ impl NativeSeatSession {
                 callback_events.borrow_mut().push(NativeSeatEvent::Enabled);
             }
             libseat::SeatEvent::Disable => {
-                callback_active.set(false);
-                if !callback_disable_pending.replace(true) {
-                    callback_events.borrow_mut().push(NativeSeatEvent::Disabled);
-                }
+                handle_disable_callback(
+                    &callback_active,
+                    &callback_disable_pending,
+                    &callback_events,
+                    &callback_pre_disable_hook,
+                );
             }
         })
         .map_err(io::Error::from)?;
@@ -483,6 +533,7 @@ impl NativeSeatSession {
             events,
             active,
             disable_pending,
+            pre_disable_hook,
         };
         session.wait_for_activation()?;
         Ok(session)
@@ -518,6 +569,20 @@ impl NativeSeatSession {
     pub(crate) fn switch_session(&self, session: i32) -> io::Result<()> {
         let mut inner = self.inner.borrow_mut();
         inner.seat.switch_session(session).map_err(io::Error::from)
+    }
+
+    pub(crate) fn install_pre_disable_quiesce_authority(
+        &self,
+        authority: Option<KmsWorkerQuiesceHandle>,
+    ) {
+        self.pre_disable_hook.install(authority);
+    }
+
+    pub(crate) fn pre_disable_observation(&self) -> (u64, bool) {
+        (
+            self.pre_disable_hook.sequence(),
+            self.pre_disable_hook.worker_present(),
+        )
     }
 
     pub(crate) fn wait_for_activation(&self) -> io::Result<()> {
@@ -584,6 +649,33 @@ impl NativeSeatSession {
         if let Err(error) = inner.seat.close_device(device) {
             eprintln!("native seat: failed to close libseat device: {error}");
         }
+    }
+}
+
+impl crate::native_output::runtime::NativeSeatSwitch for NativeSeatSession {
+    fn switch_session_request(&self, session: i32) -> io::Result<()> {
+        Self::switch_session(self, session)
+    }
+}
+
+#[cfg(test)]
+mod seat_callback_tests {
+    use super::*;
+
+    #[test]
+    fn disable_callback_deduplicates_runtime_events_without_reopening_state() {
+        let active = Cell::new(true);
+        let disable_pending = Cell::new(false);
+        let events = RefCell::new(Vec::new());
+        let hook = NativeSeatPreDisableHook::default();
+
+        for _ in 0..3 {
+            handle_disable_callback(&active, &disable_pending, &events, &hook);
+        }
+
+        assert!(!active.get());
+        assert_eq!(events.borrow().as_slice(), &[NativeSeatEvent::Disabled]);
+        assert_eq!(hook.sequence(), 3);
     }
 }
 
@@ -1149,6 +1241,7 @@ pub(crate) fn apply_native_input_effect(
         launch: None,
         fallback_attempts: 0,
         fallback_spawn_failed: None,
+        vt_switch_requested: effect.vt_switch,
     };
     application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
         if context.server.window_interaction_active() {
@@ -1376,14 +1469,6 @@ pub(crate) fn apply_native_input_effect(
             fallback_attempt = Some((shortcut.clone(), kind));
         }
     }
-    if let Some(vt) = effect.vt_switch
-        && let Some(session) = context.seat_session
-    {
-        session.switch_session(i32::from(vt))?;
-        context.perf.log("vt.switch", || {
-            vec![NativePerfField::u64("vt", u64::from(vt))]
-        });
-    }
     if let Some(command) = effect.launch_command {
         let source = effect
             .launch_source
@@ -1450,7 +1535,6 @@ pub(crate) struct NativeInputApplyContext<'a> {
     pub(crate) resize_perf: &'a mut NativeResizePerfState,
     pub(crate) cursor_mode: NativeCursorRenderMode,
     pub(crate) app_gpu_policy: EffectiveCompositorAppGpuPolicy,
-    pub(crate) seat_session: Option<&'a NativeSeatSession>,
     pub(crate) process_supervisor: &'a mut ChildSupervisor,
     pub(crate) xwayland: Option<&'a oblivion_one::xwayland::XwaylandAppEnvironment>,
 }
@@ -1867,6 +1951,7 @@ pub(crate) struct NativeInputApplication {
     pub(crate) launch: Option<NativeAppLaunchPerf>,
     pub(crate) fallback_attempts: usize,
     pub(crate) fallback_spawn_failed: Option<AstreaShortcutFallbackKind>,
+    pub(crate) vt_switch_requested: Option<u8>,
 }
 
 pub(crate) fn apply_native_window_action(
