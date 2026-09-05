@@ -473,9 +473,12 @@ impl NativeAtomicCursor {
         }
     }
 
-    /// The initial modeset has already made `state` the kernel-owned state.
+    /// A synchronous modeset has already made `state` the kernel-owned state.
     /// Promote it without manufacturing a redundant cursor-only pageflip.
-    pub(crate) fn mark_initial_submitted(&mut self, state: Option<&AtomicCursorVisualState>) {
+    pub(crate) fn mark_synchronous_modeset_submitted(
+        &mut self,
+        state: Option<&AtomicCursorVisualState>,
+    ) {
         let state = state.cloned().unwrap_or_else(|| AtomicCursorVisualState {
             visible: false,
             framebuffer_id: None,
@@ -487,6 +490,12 @@ impl NativeAtomicCursor {
         self.revisions.mark_initial_presented();
         self.dirty = AtomicCursorDirty::default();
         self.plane_lifecycle.confirm_initial_clear(self.generation);
+    }
+
+    /// The initial modeset has already made `state` the kernel-owned state.
+    /// Promote it without manufacturing a redundant cursor-only pageflip.
+    pub(crate) fn mark_initial_submitted(&mut self, state: Option<&AtomicCursorVisualState>) {
+        self.mark_synchronous_modeset_submitted(state);
     }
 
     pub(crate) fn set_position(&mut self, x: i32, y: i32) {

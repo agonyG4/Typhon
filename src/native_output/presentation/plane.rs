@@ -266,6 +266,20 @@ pub(crate) struct CursorRevealTraceSnapshot {
 }
 
 impl PresentedCursorState {
+    pub(crate) const fn hidden() -> Self {
+        Self {
+            revision: CursorRevision::initial(),
+            coupling: CursorCoupling::Hidden,
+            delivery: PresentedCursorDelivery::Hidden,
+            framebuffer_id: None,
+            image_generation: None,
+            source: None,
+            visible: false,
+            output_position: CursorPlanePoint { x: 0, y: 0 },
+            hotspot: CursorPlanePoint { x: 0, y: 0 },
+        }
+    }
+
     pub(crate) fn from_atomic(
         revision: CursorRevision,
         coupling: CursorCoupling,
@@ -337,18 +351,17 @@ impl PresentedPlaneSnapshot {
         Self {
             revision: PlaneStateRevision::new(NonZeroU64::MIN),
             primary,
-            cursor: PresentedCursorState {
-                revision: CursorRevision::initial(),
-                coupling: CursorCoupling::Hidden,
-                delivery: PresentedCursorDelivery::Hidden,
-                framebuffer_id: None,
-                image_generation: None,
-                source: None,
-                visible: false,
-                output_position: CursorPlanePoint { x: 0, y: 0 },
-                hotspot: CursorPlanePoint { x: 0, y: 0 },
-            },
+            cursor: PresentedCursorState::hidden(),
         }
+    }
+
+    /// A synchronous recovery modeset establishes physical state without
+    /// creating pageflip provenance. Retire the old primary identity and
+    /// promote the exact cursor baseline programmed by that modeset.
+    pub(crate) fn rebase_after_session_recovery(&mut self, cursor: PresentedCursorState) {
+        self.primary = None;
+        self.cursor = cursor;
+        self.revision = self.revision.next();
     }
 
     pub(crate) fn promote_cursor(
