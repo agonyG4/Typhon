@@ -991,6 +991,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_layout_set_preserves_held_shift_ctrl_and_right_alt() {
+        let config = KeyboardConfig {
+            layout: "br,us".into(),
+            variant: Some("abnt2,".into()),
+            ..KeyboardConfig::default()
+        };
+        let mut state = XkbKeyboardState::from_config(&config).unwrap();
+        for evdev_key in [42, 29, 100] {
+            state.update_physical_key(evdev_key, true);
+        }
+        let before = state.wayland_serialized_state();
+
+        let change = state.set_locked_layout(1).unwrap();
+
+        let after = state.wayland_serialized_state();
+        assert!(change.changed);
+        assert_eq!(after.depressed, before.depressed);
+        assert_eq!(after.latched, before.latched);
+        assert_eq!(after.locked, before.locked);
+        assert_eq!(state.physical_pressed_keys.len(), 3);
+        for evdev_key in [42, 29, 100] {
+            state.update_physical_key(evdev_key, false);
+        }
+        assert_eq!(state.wayland_serialized_state().depressed, 0);
+    }
+
+    #[test]
     fn runtime_layout_navigation_wraps_from_locked_layout() {
         let config = KeyboardConfig {
             layout: "br,us".into(),

@@ -110,6 +110,69 @@ fn runtime_layout_publication_sends_only_changed_modifiers() {
         }
     }
 }
+
+#[test]
+fn runtime_layout_without_focus_is_published_on_next_keyboard_enter() {
+    let _guard = KEYBOARD_LAYOUT_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (reply, result) = mpsc::channel();
+    commands
+        .send(ServerCommand::SetKeyboardLayout { index: 1, reply })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(result.recv().unwrap());
+
+    let state = create_focused_toplevel_without_keypress(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(state.keyboard_groups, vec![1]);
+    assert_eq!(
+        state
+            .keyboard_event_log
+            .iter()
+            .filter(|event| **event == "keyboard_modifiers")
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .keyboard_event_log
+            .iter()
+            .filter(|event| **event == "keyboard_keymap")
+            .count(),
+        1
+    );
+    assert!(state.keyboard_keys.is_empty());
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+}
+
 #[test]
 fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
     let socket_name = unique_socket_name();

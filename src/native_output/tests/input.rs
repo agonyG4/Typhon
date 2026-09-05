@@ -2301,6 +2301,84 @@ fn native_input_consumed_super_space_publishes_xkb_group_without_key_leak() {
 }
 
 #[test]
+fn native_runtime_layout_set_preserves_held_modifier_and_session_state() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+    let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+    let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+    // SAFETY: this test serializes its process-wide environment changes.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+        std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+        std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+    }
+
+    let socket_name = format!(
+        "typhon-native-runtime-layout-held-modifier-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_keyboard_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let mut input = NativeInputState::new(320, 200);
+    apply_native_keyboard_events(&mut server, &mut input, &[(KEY_LEFTSHIFT, 1)]);
+    let before = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    let shifted_keymap = before.keymap.clone();
+    let shift_mask = native_keyboard_modifier_mask(&before.keymap, xkb::MOD_NAME_SHIFT);
+
+    let snapshot = server.set_keyboard_layout(1).unwrap();
+    assert_eq!(snapshot.effective_index, 1);
+    assert_eq!(snapshot.locked_index, 1);
+    let after_set = capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert_eq!(after_set.keymap, shifted_keymap);
+    assert_eq!(after_set.keys, before.keys);
+    assert_eq!(
+        after_set.modifiers.last().map(|state| state.0 & shift_mask),
+        Some(shift_mask)
+    );
+    assert_eq!(after_set.modifiers.last().map(|state| state.3), Some(1));
+
+    apply_native_keyboard_events(&mut server, &mut input, &[(KEY_LEFTSHIFT, 0)]);
+    let after_release =
+        capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert_eq!(after_release.modifiers.last().map(|state| state.0), Some(0));
+    assert_eq!(after_release.modifiers.last().map(|state| state.3), Some(1));
+
+    reset_native_keyboard_session(&mut server, &mut input);
+    let after_session =
+        capture_native_keyboard_state(&mut server, &client_commands, &client_events);
+    assert_eq!(after_session.enters.last(), Some(&Vec::new()));
+    assert_eq!(after_session.modifiers.last().map(|state| state.3), Some(1));
+
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+
+    // SAFETY: restore the values while the same environment lock is held.
+    unsafe {
+        match previous_layout {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+        }
+        match previous_variant {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+        }
+        match previous_options {
+            Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+            None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+        }
+    }
+}
+
+#[test]
 fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion() {
     let socket_name = format!("typhon-native-input-interaction-{}", std::process::id());
     let socket_path =

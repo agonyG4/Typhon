@@ -413,6 +413,65 @@ fn keyboard_cli_rejects_invalid_values_locally() {
     }
 }
 
+#[test]
+fn keyboard_cli_sends_exact_wire_commands_and_arguments() {
+    let commands = [
+        (
+            vec!["keyboard", "layout"],
+            "keyboard.layout.get",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["keyboard", "next"],
+            "keyboard.layout.next",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["keyboard", "previous"],
+            "keyboard.layout.previous",
+            serde_json::json!({}),
+        ),
+        (
+            vec!["keyboard", "set", "1"],
+            "keyboard.layout.set",
+            serde_json::json!({"index": 1}),
+        ),
+    ];
+    for (args, expected_command, expected_args) in commands {
+        let path = std::env::temp_dir().join(format!(
+            "typhon-astreactl-keyboard-wire-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let (request_sender, request_receiver) = std::sync::mpsc::channel();
+        let response = envelope(valid_result(expected_command));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            request_sender
+                .send(serde_json::from_slice::<serde_json::Value>(&request).unwrap())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let mut cli_args = vec!["--json", "--socket", path.to_str().unwrap()];
+        cli_args.extend(args);
+        let output = run(&cli_args);
+        let request = request_receiver.recv().unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(output.status.success(), "stderr={:?}", output.stderr);
+        assert_eq!(request["command"], expected_command);
+        assert_eq!(request["args"], expected_args);
+    }
+}
+
 fn run_socket_cycles(command: &str, response: Vec<u8>, expected_code: i32) {
     run_socket_cycles_args(&[command], response, expected_code);
 }
