@@ -3,6 +3,10 @@ name = "oblivion-one"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "astreactl"
+path = "src/bin/astreactl.rs"
+
 [dependencies]
 ab_glyph = "0.2.32"
 bitflags = "2.13.0"

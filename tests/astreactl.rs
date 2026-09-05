@@ -371,6 +371,51 @@ fn typed_keyboard_layout_results_are_validated_for_every_keyboard_command() {
                 .code(),
             Some(6)
         );
+
+        let mut count_mismatch = valid_result(wire_command);
+        count_mismatch["layoutCount"] = serde_json::json!(1);
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(count_mismatch))
+                .status
+                .code(),
+            Some(6)
+        );
+
+        let mut duplicate_index = valid_result(wire_command);
+        duplicate_index["layouts"][1]["index"] = serde_json::json!(0);
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(duplicate_index))
+                .status
+                .code(),
+            Some(6)
+        );
+
+        for field in ["effectiveIndex", "lockedIndex"] {
+            let mut out_of_range = valid_result(wire_command);
+            out_of_range[field] = serde_json::json!(2);
+            assert_eq!(
+                run_socket_once_args(&cli_args, envelope(out_of_range))
+                    .status
+                    .code(),
+                Some(6),
+                "out-of-range field={field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn help_lists_the_runtime_keyboard_layout_commands() {
+    let output = run(&["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "keyboard layout",
+        "keyboard next",
+        "keyboard previous",
+        "keyboard set INDEX",
+    ] {
+        assert!(help.contains(command), "missing {command} from {help}");
     }
 }
 

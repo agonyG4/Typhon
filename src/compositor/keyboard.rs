@@ -378,13 +378,15 @@ impl XkbKeyboardState {
                 changed: false,
             });
         }
+        let before_wayland = self.wayland_serialized_state();
         let index = i32::try_from(index).map_err(|_| KeyboardLayoutError::IndexTooLarge(index))?;
         if !xkb_compat::set_locked_layout(&self.physical_state, index) {
             return Err(KeyboardLayoutError::FfiFailed);
         }
         let snapshot = self.layout_snapshot()?;
+        let after_wayland = self.wayland_serialized_state();
         Ok(KeyboardLayoutChange {
-            changed: snapshot != before,
+            changed: before_wayland != after_wayland,
             snapshot,
         })
     }

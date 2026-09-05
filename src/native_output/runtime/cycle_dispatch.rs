@@ -153,6 +153,59 @@ struct DecorationThemeArgs {
     theme: String,
 }
 
+fn dispatch_keyboard_layout_command(
+    server: &mut OwnCompositorServer,
+    command: ControlCommand,
+    request: ControlRequest,
+) -> ControlResponse {
+    let result = match command {
+        ControlCommand::KeyboardLayoutGet => {
+            if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                return keyboard_layout_argument_failure(request.id);
+            }
+            server.keyboard_layout_snapshot()
+        }
+        ControlCommand::KeyboardLayoutNext => {
+            if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                return keyboard_layout_argument_failure(request.id);
+            }
+            server.next_keyboard_layout()
+        }
+        ControlCommand::KeyboardLayoutPrevious => {
+            if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
+                return keyboard_layout_argument_failure(request.id);
+            }
+            server.previous_keyboard_layout()
+        }
+        ControlCommand::KeyboardLayoutSet => {
+            let args = match serde_json::from_value::<KeyboardLayoutSetArgs>(request.args) {
+                Ok(args) => args,
+                Err(_) => return keyboard_layout_argument_failure(request.id),
+            };
+            server.set_keyboard_layout(args.index)
+        }
+        _ => {
+            return ControlResponse::failure(
+                request.id,
+                ControlError::new(
+                    ControlErrorCode::InvalidCommand,
+                    "command is not a keyboard layout command",
+                ),
+            );
+        }
+    };
+    match result {
+        Ok(snapshot) => match serde_json::to_value(snapshot) {
+            Ok(snapshot) => ControlResponse::success(request.id, snapshot),
+            Err(_) => ControlResponse::failure(
+                request.id,
+                ControlError::new(ControlErrorCode::Internal, "control snapshot failed"),
+            ),
+        },
+        Err(error) => keyboard_layout_failure(request.id, error),
+    }
+}
+
 impl NativeRuntime {
     pub(super) fn service_control_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         if !wakeup.reasons.control() {
@@ -272,6 +325,19 @@ impl NativeRuntime {
                 ControlError::new(ControlErrorCode::InvalidCommand, "unknown control command"),
             ));
         };
+        if matches!(
+            command,
+            ControlCommand::KeyboardLayoutGet
+                | ControlCommand::KeyboardLayoutNext
+                | ControlCommand::KeyboardLayoutPrevious
+                | ControlCommand::KeyboardLayoutSet
+        ) {
+            return Some(dispatch_keyboard_layout_command(
+                &mut self.server,
+                command,
+                request,
+            ));
+        }
         let result = match command {
             ControlCommand::Version => serde_json::to_value(VersionSnapshot {
                 protocol_version: oblivion_one::control::CONTROL_VERSION,
@@ -483,43 +549,6 @@ impl NativeRuntime {
             ControlCommand::ActiveWindow => serde_json::to_value(ActiveWindowSnapshot {
                 window: self.server.control_active_window_snapshot(),
             }),
-            ControlCommand::KeyboardLayoutGet => {
-                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
-                    return Some(keyboard_layout_argument_failure(request.id));
-                }
-                match self.server.keyboard_layout_snapshot() {
-                    Ok(snapshot) => serde_json::to_value(snapshot),
-                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
-                }
-            }
-            ControlCommand::KeyboardLayoutNext => {
-                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
-                    return Some(keyboard_layout_argument_failure(request.id));
-                }
-                match self.server.next_keyboard_layout() {
-                    Ok(snapshot) => serde_json::to_value(snapshot),
-                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
-                }
-            }
-            ControlCommand::KeyboardLayoutPrevious => {
-                if serde_json::from_value::<EmptyKeyboardLayoutArgs>(request.args).is_err() {
-                    return Some(keyboard_layout_argument_failure(request.id));
-                }
-                match self.server.previous_keyboard_layout() {
-                    Ok(snapshot) => serde_json::to_value(snapshot),
-                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
-                }
-            }
-            ControlCommand::KeyboardLayoutSet => {
-                let args = match serde_json::from_value::<KeyboardLayoutSetArgs>(request.args) {
-                    Ok(args) => args,
-                    Err(_) => return Some(keyboard_layout_argument_failure(request.id)),
-                };
-                match self.server.set_keyboard_layout(args.index) {
-                    Ok(snapshot) => serde_json::to_value(snapshot),
-                    Err(error) => return Some(keyboard_layout_failure(request.id, error)),
-                }
-            }
             ControlCommand::CursorGet => {
                 if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                     self.cursor_manager.note_validation_failure();
@@ -1474,11 +1503,18 @@ impl NativeRuntime {
 mod tests {
     use super::{
         EmptyKeyboardLayoutArgs, KeyboardLayoutSetArgs, NativePreReadInputDecision,
-        decide_native_pre_read_input, input_requires_full_server_progression,
-        keyboard_layout_failure, promote_native_input_before_wayland_read,
+        decide_native_pre_read_input, dispatch_keyboard_layout_command,
+        input_requires_full_server_progression, keyboard_layout_failure,
+        promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
-    use oblivion_one::compositor::KeyboardLayoutControlError;
+    use oblivion_one::{
+        compositor::{KeyboardLayoutControlError, OwnCompositorServer},
+        control::{ControlCommand, ControlRequest},
+    };
+    use std::sync::Mutex;
+
+    static KEYBOARD_LAYOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintMode {
@@ -1528,6 +1564,167 @@ mod tests {
         let error = unavailable.error.unwrap();
         assert_eq!(error.code.as_str(), "internal");
         assert_eq!(error.detail.as_deref(), Some("keyboard_state_unavailable"));
+    }
+
+    #[test]
+    fn keyboard_layout_dispatch_qualifies_the_live_server_sequence() {
+        let _guard = KEYBOARD_LAYOUT_ENV_LOCK.lock().unwrap();
+        let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
+        let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
+        let previous_options = std::env::var_os("OBLIVION_ONE_XKB_OPTIONS");
+        // SAFETY: this test serializes its process-wide environment changes.
+        unsafe {
+            std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br,us");
+            std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2,");
+            std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", "");
+        }
+
+        let socket_name = format!(
+            "typhon-keyboard-control-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+        let dispatch = |server: &mut OwnCompositorServer, command, args| {
+            dispatch_keyboard_layout_command(
+                server,
+                command,
+                ControlRequest::new(1, command.as_str(), args).unwrap(),
+            )
+        };
+        let snapshot = |response: oblivion_one::control::ControlResponse| {
+            assert!(
+                response.ok,
+                "unexpected control error: {:?}",
+                response.error
+            );
+            serde_json::from_value(response.result.unwrap()).unwrap()
+        };
+
+        let initial: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutGet,
+            serde_json::json!({}),
+        ));
+        assert_eq!((initial.effective_index, initial.locked_index), (0, 0));
+        assert_eq!(initial.layout_count, 2);
+
+        let selected: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutSet,
+            serde_json::json!({"index": 1}),
+        ));
+        assert_eq!((selected.effective_index, selected.locked_index), (1, 1));
+
+        let queried: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutGet,
+            serde_json::json!({}),
+        ));
+        assert_eq!(queried.locked_index, 1);
+
+        let next: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutNext,
+            serde_json::json!({}),
+        ));
+        assert_eq!(next.locked_index, 0);
+
+        let previous: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutPrevious,
+            serde_json::json!({}),
+        ));
+        assert_eq!(previous.locked_index, 1);
+
+        let no_op: oblivion_one::control_snapshots::KeyboardLayoutSnapshot = snapshot(dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutSet,
+            serde_json::json!({"index": 1}),
+        ));
+        assert_eq!(no_op, previous);
+
+        let invalid = dispatch(
+            &mut server,
+            ControlCommand::KeyboardLayoutSet,
+            serde_json::json!({"index": 2}),
+        );
+        assert_eq!(invalid.error.unwrap().code.as_str(), "invalid_argument");
+        for (command, args) in [
+            (
+                ControlCommand::KeyboardLayoutGet,
+                serde_json::json!({"extra": true}),
+            ),
+            (
+                ControlCommand::KeyboardLayoutNext,
+                serde_json::json!({"extra": true}),
+            ),
+            (
+                ControlCommand::KeyboardLayoutPrevious,
+                serde_json::json!({"extra": true}),
+            ),
+            (ControlCommand::KeyboardLayoutSet, serde_json::json!({})),
+            (
+                ControlCommand::KeyboardLayoutSet,
+                serde_json::json!({"index": -1}),
+            ),
+            (
+                ControlCommand::KeyboardLayoutSet,
+                serde_json::json!({"index": 1.5}),
+            ),
+            (
+                ControlCommand::KeyboardLayoutSet,
+                serde_json::json!({"index": "1"}),
+            ),
+            (
+                ControlCommand::KeyboardLayoutSet,
+                serde_json::json!({"index": 1, "extra": true}),
+            ),
+        ] {
+            let response = dispatch(&mut server, command, args);
+            assert_eq!(response.error.unwrap().code.as_str(), "invalid_argument");
+        }
+
+        drop(server);
+        unsafe {
+            std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", "br");
+            std::env::set_var("OBLIVION_ONE_XKB_VARIANT", "abnt2");
+        }
+        let mut single_layout_server = OwnCompositorServer::bind(&socket_name).unwrap();
+        for command in [
+            ControlCommand::KeyboardLayoutNext,
+            ControlCommand::KeyboardLayoutPrevious,
+            ControlCommand::KeyboardLayoutSet,
+        ] {
+            let args = if command == ControlCommand::KeyboardLayoutSet {
+                serde_json::json!({"index": 0})
+            } else {
+                serde_json::json!({})
+            };
+            let response = dispatch(&mut single_layout_server, command, args);
+            let snapshot: oblivion_one::control_snapshots::KeyboardLayoutSnapshot =
+                snapshot(response);
+            assert_eq!(snapshot.locked_index, 0);
+            assert_eq!(snapshot.layout_count, 1);
+        }
+        drop(single_layout_server);
+        unsafe {
+            match previous_layout {
+                Some(value) => std::env::set_var("OBLIVION_ONE_XKB_LAYOUT", value),
+                None => std::env::remove_var("OBLIVION_ONE_XKB_LAYOUT"),
+            }
+            match previous_variant {
+                Some(value) => std::env::set_var("OBLIVION_ONE_XKB_VARIANT", value),
+                None => std::env::remove_var("OBLIVION_ONE_XKB_VARIANT"),
+            }
+            match previous_options {
+                Some(value) => std::env::set_var("OBLIVION_ONE_XKB_OPTIONS", value),
+                None => std::env::remove_var("OBLIVION_ONE_XKB_OPTIONS"),
+            }
+        }
     }
 
     fn settle_if_allowed(

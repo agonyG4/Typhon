@@ -1,5 +1,6 @@
 use serde::de::Error as _;
 use std::{
+    collections::HashSet,
     error::Error,
     fmt,
     io::{self, Read, Write},
@@ -90,6 +91,10 @@ fn decode_command_result(
         | "keyboard.layout.next"
         | "keyboard.layout.previous"
         | "keyboard.layout.set" => serde_json::from_value::<KeyboardLayoutSnapshot>(value)
+            .and_then(|snapshot| {
+                validate_keyboard_layout_snapshot(&snapshot)?;
+                Ok(snapshot)
+            })
             .map(AstreactlResult::KeyboardLayout),
         "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
             serde_json::from_value::<CursorSnapshot>(value)
@@ -111,6 +116,40 @@ fn decode_command_result(
         _ => return Err(AstreactlError::Usage("unknown control command".to_string())),
     };
     decoded.map_err(|_| AstreactlError::MalformedResponse)
+}
+
+fn validate_keyboard_layout_snapshot(
+    snapshot: &KeyboardLayoutSnapshot,
+) -> Result<(), serde_json::Error> {
+    let actual_count = u32::try_from(snapshot.layouts.len())
+        .map_err(|_| serde_json::Error::custom("too many keyboard layouts"))?;
+    if snapshot.layout_count != actual_count {
+        return Err(serde_json::Error::custom(
+            "keyboard layout count does not match entries",
+        ));
+    }
+    if snapshot.layout_count == 0 {
+        return Ok(());
+    }
+    if snapshot.effective_index >= snapshot.layout_count {
+        return Err(serde_json::Error::custom(
+            "keyboard effective layout index is out of range",
+        ));
+    }
+    if snapshot.locked_index >= snapshot.layout_count {
+        return Err(serde_json::Error::custom(
+            "keyboard locked layout index is out of range",
+        ));
+    }
+    let mut indices = HashSet::with_capacity(snapshot.layouts.len());
+    for layout in &snapshot.layouts {
+        if layout.index >= snapshot.layout_count || !indices.insert(layout.index) {
+            return Err(serde_json::Error::custom(
+                "keyboard layout entry indices are invalid",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn request(
@@ -391,6 +430,61 @@ mod tests {
                 Err(AstreactlError::MalformedResponse)
             ));
         }
+    }
+
+    #[test]
+    fn keyboard_layout_result_decoding_rejects_invalid_snapshot_invariants() {
+        let valid = serde_json::json!({
+            "effectiveIndex": 1,
+            "lockedIndex": 1,
+            "layoutCount": 2,
+            "layouts": [
+                {"index": 0, "name": "Portuguese (Brazil)"},
+                {"index": 1, "name": "English (US)"}
+            ]
+        });
+        assert!(matches!(
+            decode_command_result(
+                "keyboard.layout.get",
+                ControlResponse::success(1, valid.clone())
+            ),
+            Ok(AstreactlResult::KeyboardLayout(_))
+        ));
+
+        let mut invalid = valid.clone();
+        invalid["layoutCount"] = serde_json::json!(1);
+        assert!(matches!(
+            decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid["layouts"][0]["index"] = serde_json::json!(2);
+        assert!(matches!(
+            decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid["layouts"][1]["index"] = serde_json::json!(0);
+        assert!(matches!(
+            decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid["effectiveIndex"] = serde_json::json!(2);
+        assert!(matches!(
+            decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
+
+        let mut invalid = valid;
+        invalid["lockedIndex"] = serde_json::json!(2);
+        assert!(matches!(
+            decode_command_result("keyboard.layout.get", ControlResponse::success(1, invalid)),
+            Err(AstreactlError::MalformedResponse)
+        ));
     }
 
     #[test]
