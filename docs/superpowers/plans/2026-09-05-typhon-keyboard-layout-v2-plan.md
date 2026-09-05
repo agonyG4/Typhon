@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, existing `xkbcommon = "0.9.0"` safe bindings, libxkbcommon >= 1.10.0, one `pkg-config` build dependency, serde/serde_json, existing Wayland test harness, `rtk` command output filtering.
 
-**Completion status (2026-09-05):** Tasks 1–5 are implemented and qualified; Task 6 is the final repository verification checklist. Completed steps are marked `[x]` below.
+**Completion status (2026-09-05):** Tasks 1–6 are implemented, qualified, and verified. Completed steps are marked `[x]` below.
 
 ## Global Constraints
 
@@ -419,7 +419,7 @@ rtk git commit -m "test: qualify runtime keyboard layout control"
 **Files:**
 - Modify: only files required by failing verification; never stage unrelated shared-checkout changes
 
-- [ ] **Step 1: Run the required dependency and formatting checks.**
+- [x] **Step 1: Run the required dependency and formatting checks.**
 
 ```bash
 pkg-config --modversion xkbcommon
@@ -429,7 +429,7 @@ rtk git diff --check
 
   Confirm the installed version is at least 1.10.0 and record the exact version.
 
-- [ ] **Step 2: Audit v1 preservation and v2 guards.** Search the complete source tree for:
+- [x] **Step 2: Audit v1 preservation and v2 guards.** Search the complete source tree for:
 
 ```bash
 rtk rg -n "xkb_state_update_mask|fake.*(group|modifier)|synthetic.*key|rebuild.*XKB|State::new|new_from_names|keymap.*recompil|keyboard\.layout|active.*layout|layout.*name.*id|Send.*Xkb|Sync.*Xkb" src build.rs docs tests
@@ -437,7 +437,7 @@ rtk rg -n "xkb_state_update_mask|fake.*(group|modifier)|synthetic.*key|rebuild.*
 
   Inspect each match. `State::new` and `new_from_names` may remain only in initial construction/reference tests; the runtime switch must use the single private out-of-band bridge. There must be no separate active-layout variable, no keymap resend, no pointer escape, no fixed masks, and no persistence write.
 
-- [ ] **Step 3: Run the full verification suite in the checkout.**
+- [x] **Step 3: Run the full verification suite in the checkout.**
 
 ```bash
 rtk cargo test
@@ -446,7 +446,7 @@ rtk cargo clippy --all-targets -- -D warnings
 
   Report exact pass/ignored/failure output. If an unrelated baseline failure occurs, preserve it, identify the exact test and file, and do not hide it or broaden the patch.
 
-- [ ] **Step 4: Review staged scope after every implementation commit.**
+- [x] **Step 4: Review staged scope after every implementation commit.**
 
 ```bash
 rtk git status --short
@@ -456,4 +456,4 @@ rtk git diff HEAD~1 --check
 
   Ensure only v2 implementation/docs/tests are in each commit. The pre-existing KMS/presentation edits in the shared checkout must remain unstaged and uncommitted.
 
-- [ ] **Step 5: Final report.** Include the detected libxkbcommon version, FFI signature and safety invariant, effective/locked semantics, keymap-derived enumeration, four control commands, four astreactl forms, Wayland event behavior, wrap/no-op behavior, physical `grp:*` interoperability, session persistence, exact tests, and any remaining follow-up. State explicitly that no Settings UI, persistence, per-device policy, new keybinding, or event protocol was added.
+- [x] **Step 5: Final report.** Include the detected libxkbcommon version, FFI signature and safety invariant, effective/locked semantics, keymap-derived enumeration, four control commands, four astreactl forms, Wayland event behavior, wrap/no-op behavior, physical `grp:*` interoperability, session persistence, exact tests, and any remaining follow-up. State explicitly that no Settings UI, persistence, per-device policy, new keybinding, or event protocol was added.
