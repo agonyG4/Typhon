@@ -437,7 +437,7 @@ fn collect_events(handle: &KmsCommitWorkerHandle) -> Vec<KmsWorkerEvent> {
 fn assert_worker_quiescing(handle: &KmsCommitWorkerHandle, kind: AtomicCommitKind) {
     for _ in 0..100 {
         match handle.try_reserve_admission(kind) {
-            Err(KmsWorkerAdmissionError::Quiescing) => return,
+            Err(KmsWorkerAdmissionError::Quiescing | KmsWorkerAdmissionError::Stopped) => return,
             Err(KmsWorkerAdmissionError::AdmissionContention) => std::thread::yield_now(),
             Err(error) => panic!("unexpected admission result after pre-revoke: {error:?}"),
             Ok(_) => panic!("worker accepted admission after pre-revoke boundary"),
