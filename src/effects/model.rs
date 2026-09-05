@@ -4,8 +4,6 @@ mod tests {
 
     #[test]
     fn effect_program_model_is_renderer_independent() {
-        use super::super::parameters::EffectParameterBlock;
-
         let source = EffectNodeId::new(1).unwrap();
         let blur = EffectNodeId::new(2).unwrap();
         let program = EffectProgram {
@@ -275,9 +273,11 @@ impl EffectNode {
         spec: CustomFragmentSpec,
     ) -> Result<Self, EffectValidationError> {
         spec.validate()?;
+        let mut inputs = vec![input];
+        inputs.extend(spec.auxiliary_inputs.iter().copied());
         Ok(Self {
             id,
-            inputs: vec![input],
+            inputs,
             kind: EffectNodeKind::CustomFragment(spec),
         })
     }
@@ -375,7 +375,7 @@ impl TintSpec {
 }
 
 impl ColorMatrixSpec {
-    fn validate(&self) -> Result<(), EffectValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), EffectValidationError> {
         if self
             .matrix
             .iter()
@@ -454,7 +454,7 @@ pub struct CustomFragmentSpec {
 }
 
 impl CustomFragmentSpec {
-    fn validate(&self) -> Result<(), EffectValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), EffectValidationError> {
         if self.uniforms.len() > MAX_EFFECT_UNIFORMS_PER_SHADER {
             return Err(EffectValidationError::TooManyUniforms);
         }
