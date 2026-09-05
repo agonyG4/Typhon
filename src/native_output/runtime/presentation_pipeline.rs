@@ -768,9 +768,19 @@ mod tests {
         slot: OutputSlotId,
         framebuffer_id: u32,
     ) {
+        insert_composited_for_generation(ledger, identity, slot, framebuffer_id, 1);
+    }
+
+    fn insert_composited_for_generation(
+        ledger: &mut OutputTransactionLedger,
+        identity: OutputFrameIdentitySnapshot,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        output_generation: u64,
+    ) {
         let transaction = OutputTransaction::composited(
             identity.transaction_id,
-            1,
+            output_generation,
             MonotonicTimestampNs::new(0),
             identity.target.expect("test ready identity is bound"),
             NativeOutputPacingMode::PredictiveTriple,
@@ -893,10 +903,22 @@ mod tests {
         AtomicCommitArbiter,
         PresentedPrimaryState,
     ) {
+        completed_composed_fixture_for_generation(history_capacity, 1)
+    }
+
+    fn completed_composed_fixture_for_generation(
+        history_capacity: usize,
+        output_generation: u64,
+    ) -> (
+        AtomicOutputSwapchain,
+        OutputTransactionLedger,
+        AtomicCommitArbiter,
+        PresentedPrimaryState,
+    ) {
         let mut swapchain = ready_swapchain();
         let ready = swapchain.ready_identity().unwrap();
         let mut ledger = OutputTransactionLedger::with_capacities(8, history_capacity);
-        insert_composited(&mut ledger, ready, ready.slot, 42);
+        insert_composited_for_generation(&mut ledger, ready, ready.slot, 42, output_generation);
         let pageflip = token(11);
         swapchain.submit_ready(pageflip, None).unwrap();
         ledger
@@ -906,7 +928,7 @@ mod tests {
         arbiter
             .reserve(
                 pageflip,
-                1,
+                output_generation,
                 7,
                 AtomicCommitKind::CompositedPrimary {
                     transaction_id: ready.transaction_id,
@@ -922,14 +944,16 @@ mod tests {
             .mark_presented(
                 ready.transaction_id,
                 pageflip,
-                1,
+                output_generation,
                 MonotonicTimestampNs::new(2),
                 Some(1),
             )
             .unwrap();
         let pageflip_identity =
             crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
-                pageflip, 1, 7,
+                pageflip,
+                output_generation,
+                7,
             );
         let current = composed_primary(
             ready.transaction_id,
@@ -1556,6 +1580,7 @@ mod tests {
         assert_eq!(presented.primary, None);
         assert_eq!(presented.cursor, cursor);
         assert_ne!(presented.revision, revision_before);
+        assert_eq!(current.pageflip_identity().output_generation, 1);
         assert!(
             build_output_pipeline_snapshot_with_presented(
                 2,
@@ -1597,5 +1622,77 @@ mod tests {
                 transaction_id: current.transaction_id(),
             })
         );
+    }
+
+    #[test]
+    fn first_real_g2_pageflip_restores_exact_primary_provenance() {
+        let (swapchain, ledger, _arbiter, current) =
+            completed_composed_fixture_for_generation(1, 2);
+        let arbiter = AtomicCommitArbiter::new();
+        let identity = current.pageflip_identity();
+        let mut presented = PresentedPlaneSnapshot::legacy(None);
+
+        assert!(presented.promote_bundle(identity, identity, Some(current), None));
+
+        let snapshot = build_output_pipeline_snapshot_with_presented(
+            2,
+            7,
+            NativeOutputPacingMode::ReactiveDouble,
+            1,
+            &swapchain,
+            &ledger,
+            &arbiter,
+            None,
+            None,
+            TripleCapability::Capable,
+            presented,
+        )
+        .expect("the first genuine G2 pageflip must establish valid provenance");
+
+        assert_eq!(snapshot.presented_planes.primary, Some(current));
+        assert_eq!(current.pageflip_identity().output_generation, 2);
+        assert_eq!(current.pageflip_identity().crtc_id, 7);
+    }
+
+    #[test]
+    fn repeated_session_recovery_retires_every_previous_primary() {
+        let (_, _, _, current) = completed_composed_fixture(1);
+        let mut presented = PresentedPlaneSnapshot::legacy(Some(current));
+        let revision_g1 = presented.revision;
+        let hidden = PresentedPlaneSnapshot::legacy(None).cursor;
+
+        presented.rebase_after_session_recovery(hidden);
+        let revision_g2 = presented.revision;
+        presented.rebase_after_session_recovery(hidden);
+
+        assert_eq!(presented.primary, None);
+        assert!(revision_g2 > revision_g1);
+        assert!(presented.revision > revision_g2);
+    }
+
+    #[test]
+    fn direct_primary_is_retired_without_rewriting_its_g1_identity() {
+        let token = token(19);
+        let identity =
+            crate::native_output::presentation::plane::PlanePageflipIdentity::from_pageflip(
+                token, 1, 7,
+            );
+        let key = direct_key();
+        let direct = PresentedPrimaryState::Direct {
+            transaction_id: transaction_id(19),
+            token,
+            pageflip: identity,
+            surface_id: 9,
+            key,
+            framebuffer_id: 42,
+        };
+        let mut presented = PresentedPlaneSnapshot::legacy(Some(direct));
+        let hidden = PresentedPlaneSnapshot::legacy(None).cursor;
+
+        presented.rebase_after_session_recovery(hidden);
+
+        assert_eq!(presented.primary, None);
+        assert_eq!(direct.pageflip_identity().output_generation, 1);
+        assert_eq!(direct.pageflip_identity().token, token);
     }
 }

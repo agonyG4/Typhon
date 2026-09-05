@@ -1038,6 +1038,27 @@ fn initial_software_modeset_records_a_disabled_cursor_plane() {
 }
 
 #[test]
+fn synchronous_recovery_modeset_promotes_exact_cursor_state_without_pageflip() {
+    let mut cursor = test_cursor();
+    let state = AtomicCursorVisualState {
+        visible: true,
+        x: 101,
+        y: 202,
+        hotspot_x: 3,
+        hotspot_y: 4,
+        framebuffer_id: Some(123),
+        image_generation: 9,
+        ..cursor.desired().clone()
+    };
+
+    cursor.mark_synchronous_modeset_submitted(Some(&state));
+
+    assert_eq!(cursor.current(), &state);
+    assert_eq!(cursor.submitted_state(), &state);
+    assert!(cursor.pending_token().is_none());
+}
+
+#[test]
 fn cursor_plane_lifecycle_is_generation_scoped() {
     let mut lifecycle = CursorPlaneLifecycle::new(4);
     assert!(lifecycle.initial_clear_required());

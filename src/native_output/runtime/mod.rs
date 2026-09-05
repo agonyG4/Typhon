@@ -148,6 +148,13 @@ pub(super) use xwayland_reactor::{
     sync_xwayland_reactor_sources, sync_xwayland_reactor_sources_with_generation,
 };
 
+#[derive(Debug, Clone, Copy)]
+struct PendingSessionRecovery {
+    scanout: NativeScanoutRecovery,
+    generation: u64,
+    cursor: crate::native_output::presentation::plane::PresentedCursorState,
+}
+
 pub(super) struct NativeCycleState {
     pub(super) wakeup: NativeWakeup,
     pub(super) work_class: NativeWorkClass,
@@ -471,7 +478,7 @@ pub(crate) struct NativeRuntime {
     input_epoch: NativeInputEpoch,
     seat_session: Option<NativeSeatSession>,
     session: NativeSessionLifecycle,
-    pending_session_recovery: Option<NativeScanoutRecovery>,
+    pending_session_recovery: Option<PendingSessionRecovery>,
     #[cfg(test)]
     native_io_recorder: NativeIoRecorder,
     acquire_notifier: DrmAcquirePointNotifier,

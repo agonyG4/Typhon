@@ -21,6 +21,7 @@ pub(crate) enum NativeIoOperation {
     KmsWorkerStopAdmission,
     PageflipQuarantine,
     PageflipRetire,
+    PresentedPlaneRebase,
     PageflipDrain,
     PageflipSubmit,
     ScanoutPresent,
@@ -108,6 +109,7 @@ pub(crate) fn recover_native_output(io: &mut impl NativeSessionIo) -> NativeResu
     io.recover_kms_pipeline()?;
     io.observe(NativeIoOperation::PageflipRetire);
     io.retire_quarantined_pageflip()?;
+    io.observe(NativeIoOperation::PresentedPlaneRebase);
     io.observe(NativeIoOperation::ExplicitSyncRearm);
     io.observe(NativeIoOperation::ExplicitSyncNotifier);
     io.rearm_explicit_sync()?;
@@ -258,9 +260,10 @@ impl NativeSessionIo for NativeRuntime {
             self.kms_backend
                 .rediscover_atomic_cursor_for_recovery(self.kms.file().as_fd())?;
         }
+        let generation = allocate_native_drm_file_generation();
         let recovery = self.scanout.prepare_session_recovery()?;
         let framebuffer = recovery.framebuffer_id();
-        let _cursor_state = if self.atomic_cursor.is_some() {
+        let _prepared_cursor_state = if self.atomic_cursor.is_some() {
             let atomic = self.kms_backend.atomic().ok_or_else(|| {
                 io::Error::other("Atomic cursor exists without an Atomic KMS backend")
             })?;
@@ -272,7 +275,7 @@ impl NativeSessionIo for NativeRuntime {
                             plane,
                             atomic.discovery().cursor_width,
                             atomic.discovery().cursor_height,
-                            self.drm_file_generation.saturating_add(1),
+                            generation,
                         )?)
                     } else {
                         None
@@ -306,12 +309,27 @@ impl NativeSessionIo for NativeRuntime {
         });
         self.kms_backend
             .recover_with_cursor(framebuffer, cursor_kms_state.as_ref())?;
-        self.pending_session_recovery = Some(recovery);
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.mark_synchronous_modeset_submitted(cursor_kms_state.as_ref());
+        }
+        let cursor = self
+            .atomic_cursor
+            .as_ref()
+            .map(NativeAtomicCursor::presented_plane_state)
+            .unwrap_or_else(
+                crate::native_output::presentation::plane::PresentedCursorState::hidden,
+            );
+        self.pending_session_recovery = Some(PendingSessionRecovery {
+            scanout: recovery,
+            generation,
+            cursor,
+        });
         self.perf.log("native.session_recovery", || {
             vec![
                 NativePerfField::str("completion", "synchronous_modeset"),
                 NativePerfField::str("kms_backend", self.kms_backend.effective_kind().as_str()),
                 NativePerfField::u64("framebuffer", u64::from(framebuffer.get())),
+                NativePerfField::u64("prepared_generation", generation),
             ]
         });
         Ok(())
@@ -321,7 +339,7 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self.pending_session_recovery.as_ref().ok_or_else(|| {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
-        self.scanout.complete_session_recovery(*recovery)?;
+        self.scanout.complete_session_recovery(recovery.scanout)?;
         self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         self.submitted_worker_ownership.clear();
         self.worker_quarantine.jobs.clear();
@@ -369,22 +387,67 @@ impl NativeSessionIo for NativeRuntime {
             )?;
         }
         self.retire_settled_output_terminals();
-        self.pending_session_recovery = None;
+        let recovery = self
+            .pending_session_recovery
+            .expect("session recovery remains pending until generation rebind");
+        let snapshot_revision_before = self.presented_planes.revision;
+        let (had_presented_primary, primary_kind) =
+            self.presented_planes
+                .primary
+                .map_or((false, "none"), |primary| {
+                    (
+                        true,
+                        if primary.is_direct() {
+                            "direct"
+                        } else {
+                            "composed"
+                        },
+                    )
+                });
+        self.presented_planes
+            .rebase_after_session_recovery(recovery.cursor);
+        self.perf.log("native.session_generation_barrier", || {
+            vec![
+                NativePerfField::u64("old_generation", self.drm_file_generation),
+                NativePerfField::u64("new_generation", recovery.generation),
+                NativePerfField::bool("had_presented_primary", had_presented_primary),
+                NativePerfField::str("old_primary_kind", primary_kind),
+                NativePerfField::bool("primary_pageflip_provenance_retired", true),
+                NativePerfField::str(
+                    "cursor_baseline",
+                    match recovery.cursor.delivery {
+                        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware =>
+                            "hardware",
+                        crate::native_output::presentation::plane::PresentedCursorDelivery::Software =>
+                            "software",
+                        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden =>
+                            "hidden",
+                    },
+                ),
+                NativePerfField::u64(
+                    "snapshot_revision_before",
+                    snapshot_revision_before.get(),
+                ),
+                NativePerfField::u64("snapshot_revision_after", self.presented_planes.revision.get()),
+            ]
+        });
         Ok(())
     }
 
     fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
-        self.drm_file_generation = allocate_native_drm_file_generation();
+        let generation = self
+            .pending_session_recovery
+            .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
+            .generation;
         self.presentation_timing.reconfigure(
             KmsModeTiming::from_mode(
                 &self.target.mode,
                 1_000_000_000u64 / u64::from(self.refresh_hz.max(1)),
             ),
-            self.drm_file_generation,
+            generation,
         );
         self.abandon_direct_fallback();
-        self.scanout
-            .rebind_session_generation(self.drm_file_generation);
+        self.scanout.rebind_session_generation(generation);
         if !apply_native_scanout_feedback(
             &mut self.server,
             &self.scanout,
@@ -392,10 +455,12 @@ impl NativeSessionIo for NativeRuntime {
         ) {
             self.scanout.note_dmabuf_feedback_unchanged_rebuild();
         }
-        self.acquire_watches
-            .set_drm_file_generation(self.drm_file_generation);
+        self.acquire_watches.set_drm_file_generation(generation);
         self.restart_kms_commit_worker_after_recovery()?;
-        self.rearm_parked_acquire_watches()
+        self.rearm_parked_acquire_watches()?;
+        self.drm_file_generation = generation;
+        self.pending_session_recovery = None;
+        Ok(())
     }
 
     fn recover_hardware_cursor(&mut self) -> NativeResult<()> {
@@ -834,6 +899,20 @@ mod tests {
         assert!(recovery < resume);
         assert!(!recorder.operations.contains(&Operation::PageflipQuarantine));
         assert!(!recorder.operations.contains(&Operation::PageflipSubmit));
+
+        let baseline = recorder
+            .native_io
+            .operations()
+            .iter()
+            .position(|operation| *operation == NativeIoOperation::PresentedPlaneRebase)
+            .expect("recovery must observe its physical baseline barrier");
+        let rearm = recorder
+            .native_io
+            .operations()
+            .iter()
+            .position(|operation| *operation == NativeIoOperation::ExplicitSyncRearm)
+            .expect("recovery must observe explicit-sync rearm");
+        assert!(baseline < rearm);
     }
 
     #[test]
