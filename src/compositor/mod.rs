@@ -76,6 +76,7 @@ mod commit_debug;
 mod decoration;
 mod desktop_window;
 mod dmabuf;
+mod effects;
 mod explicit_sync;
 mod frame_batch;
 mod fullscreen;
@@ -83,7 +84,7 @@ pub mod gpu_protocol_capabilities;
 mod idle;
 mod input;
 mod interaction;
-mod keyboard;
+pub(crate) mod keyboard;
 mod layer_shell;
 mod output;
 mod pacing;
@@ -195,6 +196,10 @@ pub use decoration::render_plan::DecorationRenderPrimitive;
 use decoration::theme::DecorationThemeSnapshot;
 use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
+pub use effects::{
+    EffectAnchor, EffectFrameDemandSnapshot, EffectSceneSummary, ResolvedEffectInstance,
+    ResolvedEffectScene,
+};
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
@@ -229,6 +234,7 @@ pub use interaction::{
     WindowInteractionKind, WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
     WindowInteractionReleaseMetrics,
 };
+pub use keyboard::{KeyboardConfig, KeyboardConfigurationPreparation};
 use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,9 +245,25 @@ pub enum KeyboardLayoutControlError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyboardConfigurationControlError {
+    Unavailable(&'static str),
+    InvalidArgument(String),
+    Busy,
+    Internal(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyboardLayoutMutation {
     pub(crate) snapshot: crate::control_snapshots::KeyboardLayoutSnapshot,
     pub(crate) changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardConfigurationMutation {
+    pub snapshot: crate::control_snapshots::KeyboardConfigurationSnapshot,
+    pub keymap_changed: bool,
+    pub repeat_changed: bool,
+    pub modifiers_changed: bool,
 }
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
@@ -624,6 +646,9 @@ pub struct CompositorState {
     shortcut_inhibition: ShortcutInhibitionRegistry,
     keyboard_state: KeyboardStateHandle,
     pressed_keys: HashSet<u32>,
+    keyboard_configuration_source: crate::control_snapshots::KeyboardConfigurationSource,
+    keyboard_configuration_persistence: crate::control_snapshots::KeyboardConfigurationPersistence,
+    keyboard_environment_override_active: bool,
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,
     pointer_constraints: HashMap<u64, PointerConstraint>,

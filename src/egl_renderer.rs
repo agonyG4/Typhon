@@ -193,6 +193,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
     pub decoration_instances: &'a [DecorationRenderInstance],
+    pub effects: &'a compositor::ResolvedEffectScene,
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
 }
@@ -445,6 +446,7 @@ impl GlesSceneRenderer {
             visual_state,
             output_scale,
             decoration_instances,
+            effects: _effects,
             popup_surface_ids,
             client_cursor,
             current_damage,

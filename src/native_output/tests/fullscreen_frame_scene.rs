@@ -4,6 +4,7 @@ use crate::egl_renderer::{
     BufferAge, EglPartialRepaintCapabilities, OutputDamage, PartialRepaintPlanner, RepaintMode,
 };
 use oblivion_one::compositor::FullscreenRenderPlanMetrics;
+use oblivion_one::compositor::ResolvedEffectScene;
 use std::borrow::Cow;
 
 #[test]
@@ -48,6 +49,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             rejection: None,
         },
         snapshot: NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new()),
+        effects: ResolvedEffectScene::default(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         1,

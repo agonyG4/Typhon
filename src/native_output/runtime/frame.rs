@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use oblivion_one::compositor::{
     DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
-    PointerWarpOrigin,
+    PointerWarpOrigin, ResolvedEffectScene,
 };
 
 #[derive(Debug)]
@@ -15,6 +15,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) render_generation: u64,
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
+    pub(crate) effects: ResolvedEffectScene,
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
@@ -41,6 +42,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation,
             visibility: server.fullscreen_render_plan_metrics(),
             snapshot,
+            effects: ResolvedEffectScene::default(),
         }
     }
 
@@ -115,7 +117,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     }
 
     pub(crate) fn scene_identity_signature(&self) -> u64 {
-        self.snapshot().identity_signature()
+        let mut signature = self.snapshot().identity_signature();
+        signature ^= self.effects.signature;
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+        signature
     }
 }
 
@@ -940,6 +945,7 @@ impl NativeFrameRenderer {
                 .then(|| server.client_cursor_render_state())
                 .flatten(),
             current_damage,
+            effects: &resolved_scene.effects,
         }
     }
 }
