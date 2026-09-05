@@ -815,7 +815,7 @@ mod tests {
                 Operation::KmsWorkerJoin,
                 Operation::PageflipQuarantine,
                 Operation::DrmUnregister,
-                Operation::CursorDisable,
+                Operation::CursorSessionRetire,
                 Operation::DisableAck,
             ]
         );

@@ -434,6 +434,18 @@ fn collect_events(handle: &KmsCommitWorkerHandle) -> Vec<KmsWorkerEvent> {
     handle.drain_events()
 }
 
+fn assert_worker_quiescing(handle: &KmsCommitWorkerHandle, kind: AtomicCommitKind) {
+    for _ in 0..100 {
+        match handle.try_reserve_admission(kind) {
+            Err(KmsWorkerAdmissionError::Quiescing) => return,
+            Err(KmsWorkerAdmissionError::AdmissionContention) => std::thread::yield_now(),
+            Err(error) => panic!("unexpected admission result after pre-revoke: {error:?}"),
+            Ok(_) => panic!("worker accepted admission after pre-revoke boundary"),
+        }
+    }
+    panic!("worker did not enter quiescing state after pre-revoke boundary");
+}
+
 pub(super) fn reserve_for_test(
     handle: &KmsCommitWorkerHandle,
     kind: AtomicCommitKind,
@@ -548,10 +560,7 @@ fn pre_revoke_authority_waits_for_active_submit_and_closes_admission() {
             .expect("pre-revoke authority should complete after submit returns");
     });
 
-    assert!(matches!(
-        handle.try_reserve_admission(test_job(61).kind),
-        Err(KmsWorkerAdmissionError::Quiescing)
-    ));
+    assert_worker_quiescing(&handle, test_job(61).kind);
     handle
         .ack_pageflip(test_job(60).token, test_job(60).transaction_id, 1)
         .unwrap();
@@ -584,10 +593,7 @@ fn recovered_worker_replaces_pre_disable_hook_authority() {
     }
     hook.install(Some(first.quiesce_authority()));
     assert!(hook.invoke());
-    assert!(matches!(
-        first.try_reserve_admission(test_job(62).kind),
-        Err(KmsWorkerAdmissionError::Quiescing)
-    ));
+    assert_worker_quiescing(&first, test_job(62).kind);
     first
         .ack_pageflip(test_job(62).token, test_job(62).transaction_id, 1)
         .unwrap();
@@ -609,10 +615,7 @@ fn recovered_worker_replaces_pre_disable_hook_authority() {
     }
     hook.install(Some(second.quiesce_authority()));
     assert!(hook.invoke());
-    assert!(matches!(
-        second.try_reserve_admission(test_job(63).kind),
-        Err(KmsWorkerAdmissionError::Quiescing)
-    ));
+    assert_worker_quiescing(&second, test_job(63).kind);
     second
         .ack_pageflip(test_job(63).token, test_job(63).transaction_id, 1)
         .unwrap();
