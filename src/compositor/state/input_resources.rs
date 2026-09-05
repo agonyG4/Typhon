@@ -311,9 +311,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
         let physical_changed = self.update_keyboard_physical_state(key, pressed);
-        let client_changed = self.update_keyboard_client_state(key, pressed);
-        let modifiers_changed = physical_changed || client_changed;
-        self.send_keyboard_key_after_state_update(key, pressed, modifiers_changed);
+        self.send_keyboard_key_after_state_update(key, pressed, physical_changed);
     }
 
     pub(in crate::compositor) fn update_keyboard_physical_state(
@@ -325,17 +323,6 @@ impl CompositorState {
             return false;
         }
         self.keyboard_state.update_physical_key(key, pressed)
-    }
-
-    pub(in crate::compositor) fn update_keyboard_client_state(
-        &mut self,
-        key: u32,
-        pressed: bool,
-    ) -> bool {
-        if !self.ensure_keyboard_state() {
-            return false;
-        }
-        self.keyboard_state.update_client_key(key, pressed)
     }
 
     pub(in crate::compositor) fn send_keyboard_key_after_state_update(
@@ -392,9 +379,8 @@ impl CompositorState {
         &mut self,
         key: u32,
         pressed: bool,
-        modifiers_changed: bool,
     ) {
-        self.send_keyboard_key_after_state_update(key, pressed, modifiers_changed);
+        self.send_keyboard_key_after_state_update(key, pressed, false);
     }
 
     pub(in crate::compositor) fn send_keyboard_modifiers_without_key(&mut self) {

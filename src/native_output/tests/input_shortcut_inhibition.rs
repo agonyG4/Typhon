@@ -65,6 +65,38 @@ fn native_input_shortcut_inhibition_reconciles_deferred_alt_and_cancels_alt_tab(
 }
 
 #[test]
+fn native_input_shortcut_inhibition_reconciles_deferred_right_alt() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let alt_press = input.handle_key_event(KEY_RIGHTALT, 1);
+    assert_eq!(
+        alt_press.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalOnly(
+            NativeKeyboardEvent::new(KEY_RIGHTALT, true)
+        )]
+    );
+    assert!(alt_press.keyboard_events.is_empty());
+
+    let transition = input
+        .reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    assert_eq!(
+        transition.keyboard_actions,
+        vec![NativeKeyboardAction::ClientOnly(NativeKeyboardEvent::new(
+            KEY_RIGHTALT,
+            true,
+        ))]
+    );
+
+    let alt_release = input.handle_key_event(KEY_RIGHTALT, 0);
+    assert_eq!(
+        alt_release.keyboard_actions,
+        vec![NativeKeyboardAction::PhysicalAndClient(
+            NativeKeyboardEvent::new(KEY_RIGHTALT, false)
+        )]
+    );
+}
+
+#[test]
 fn native_input_shortcut_inhibition_preserves_forwarded_release_across_disable() {
     let mut input = NativeInputState::new(320, 200);
     input.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));

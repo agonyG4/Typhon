@@ -139,14 +139,6 @@ impl OwnCompositorServer {
         self.state.update_keyboard_physical_state(key, pressed)
     }
 
-    pub fn update_keyboard_client_state_without_publication(
-        &mut self,
-        key: u32,
-        pressed: bool,
-    ) -> bool {
-        self.state.update_keyboard_client_state(key, pressed)
-    }
-
     #[cfg(test)]
     pub(crate) fn fail_keyboard_state_for_test(&mut self) {
         self.state.fail_keyboard_state_for_test();
@@ -163,14 +155,9 @@ impl OwnCompositorServer {
         let _ = self.flush_wayland_clients();
     }
 
-    pub fn send_keyboard_key_without_state_update(
-        &mut self,
-        key: u32,
-        pressed: bool,
-        modifiers_changed: bool,
-    ) {
+    pub fn send_keyboard_key_without_state_update(&mut self, key: u32, pressed: bool) {
         self.state
-            .send_keyboard_key_without_state_update(key, pressed, modifiers_changed);
+            .send_keyboard_key_without_state_update(key, pressed);
         let _ = self.flush_wayland_clients();
     }
 

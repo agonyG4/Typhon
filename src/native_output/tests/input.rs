@@ -2091,7 +2091,7 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
     assert!(
         modifiers
             .iter()
-            .all(|(depressed, _, _, _)| depressed & alt_mask == 0)
+            .any(|(depressed, _, _, _)| depressed & alt_mask != 0)
     );
     let groups = modifiers
         .iter()
@@ -2103,7 +2103,7 @@ fn native_input_group_switch_reaches_wayland_keyboard_modifiers() {
 }
 
 #[test]
-fn native_input_deferred_alt_projection_does_not_leak_or_stick_alt() {
+fn native_input_deferred_alt_keeps_authoritative_physical_modifier_state() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
     let previous_layout = std::env::var_os("OBLIVION_ONE_XKB_LAYOUT");
     let previous_variant = std::env::var_os("OBLIVION_ONE_XKB_VARIANT");
@@ -2203,7 +2203,7 @@ fn native_input_deferred_alt_projection_does_not_leak_or_stick_alt() {
     assert!(
         modifiers
             .iter()
-            .all(|(depressed, _, _, _)| depressed & alt_mask == 0)
+            .any(|(depressed, _, _, _)| depressed & alt_mask != 0)
     );
     assert!(
         modifiers
@@ -2253,12 +2253,16 @@ fn native_input_consumed_super_space_publishes_xkb_group_without_key_leak() {
     client_commands
         .send(ClientCommand::CaptureKeyboardState)
         .unwrap();
-    let (keys, modifiers) = match pump_native_input_server_until(&mut server, &client_events) {
-        ClientEvent::KeyboardState {
-            keys, modifiers, ..
-        } => (keys, modifiers),
-        event => panic!("expected keyboard state, got {event:?}"),
-    };
+    let (keymap, keys, modifiers) =
+        match pump_native_input_server_until(&mut server, &client_events) {
+            ClientEvent::KeyboardState {
+                keymap,
+                keys,
+                modifiers,
+                ..
+            } => (keymap, keys, modifiers),
+            event => panic!("expected keyboard state, got {event:?}"),
+        };
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
         pump_native_input_server_until(&mut server, &client_events),
@@ -2282,12 +2286,18 @@ fn native_input_consumed_super_space_publishes_xkb_group_without_key_leak() {
     }
 
     assert!(keys.is_empty());
+    let logo_mask = native_keyboard_modifier_mask(&keymap, xkb::MOD_NAME_LOGO);
     let groups = modifiers
         .iter()
         .map(|(_, _, _, group)| *group)
         .collect::<Vec<_>>();
     assert!(groups.windows(2).any(|pair| pair == [0, 1]));
-    assert!(modifiers.iter().all(|(depressed, _, _, _)| *depressed == 0));
+    assert!(
+        modifiers
+            .iter()
+            .any(|(depressed, _, _, _)| depressed & logo_mask != 0)
+    );
+    assert_eq!(modifiers.last().map(|state| state.0), Some(0));
 }
 
 #[test]

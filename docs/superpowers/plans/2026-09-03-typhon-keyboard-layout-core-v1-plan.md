@@ -4,26 +4,29 @@
 
 **Goal:** Replace Typhon's hand-written XKB approximation with one cached,
 libxkbcommon-backed seat keyboard core while preserving physical compositor
-bindings and Wayland input protocol behavior. The v1.2 closure keeps physical
-XKB state separate from the client-visible projection and excludes raw evdev
-repeat notifications from authoritative XKB updates.
+bindings and Wayland input protocol behavior. The v1.4 closure makes one
+physical XKB state authoritative, keeps raw forwarding bookkeeping separate,
+and excludes raw evdev repeat notifications from authoritative XKB updates.
 
 **Architecture:** Add a focused `compositor::keyboard` module that compiles
-RMLVO into one immutable keymap, owns physical and client XKB states over that
-same keymap, serializes the explicit Wayland projection, and caches Text V1
-bytes. `physical_state` sees every real press/release and owns global group,
-latch, lock, and LED semantics. `client_state` sees only logically forwarded
-keys and owns client depressed modifiers. `CompositorState` owns a sendable
+RMLVO into one immutable keymap, owns one physical XKB state over that keymap,
+serializes the explicit Wayland projection, and caches Text V1 bytes.
+`physical_state` sees every real press/release and owns global group, latch,
+lock, and LED semantics. A separate raw forwarded-key ledger tracks only
+client-visible keys for enter state, deferred replay, release reconciliation,
+and session reset. `CompositorState` owns a sendable
 `KeyboardStateHandle`; the handle owns only a unique identity while the actual
 `XkbKeyboardState` lives in compositor-thread TLS. This keeps
 `CompositorState::default()` non-panicking and makes cross-thread use fail
 closed. Normal startup uses requested configuration, baseline `br(abnt2)`,
 then `us` fallback, preserving the requested repeat rate and delay across
 fallback. Keyboard resource publication and forwarded key events consume that
-same TLS-owned instance. Physical-only actions can publish projected global
-group/lock changes without leaking hidden depressed modifiers; client-only
-replay updates only the client state. Session suspend clears transient keys in
-both states without resetting layout or lock state.
+same TLS-owned instance. Every real physical value 1/0 updates the physical XKB
+state exactly once; value 2 never updates it. Physical-only actions can publish
+global group/lock changes even when raw forwarding is suppressed. Client-only
+replay forwards a raw key without updating XKB or fabricating modifiers.
+Session suspend clears transient physical keys and the raw ledger without
+resetting layout or lock state.
 
 **Tech Stack:** Rust 2024, `xkbcommon` 0.9 safe bindings, libxkbcommon,
 Wayland server/client protocol bindings, existing cargo test harness, `rtk`
@@ -38,13 +41,13 @@ for command output filtering.
   deferred. Raw evdev `value=2` is a repeat notification and creates no XKB
   state action.
 - Keep XKB state transitions separate from client-visible key forwarding so a
-  replayed deferred modifier updates `client_state` exactly once and never
-  updates `physical_state` twice. Publish a changed projected modifier
-  snapshot after the corresponding visible key, or standalone for a
-  physical-only global group/lock change.
-- Serialize client depressed masks from `client_state`; serialize latched,
-  locked, and effective group from `physical_state`. Use no fixed modifier bit
-  positions and no hardcoded group zero.
+  deferred raw replay never updates the physical state twice. Publish a
+  changed projected modifier snapshot after the corresponding visible key, or
+  standalone for a physical-only global group/lock change.
+- Serialize depressed, latched, locked, and effective group fields directly
+  from `physical_state`. Use no fixed modifier bit positions and no hardcoded
+  group zero; do not filter physical modifiers because their raw keys were
+  suppressed.
 - Publish cached XKB Text V1 bytes as a NUL-terminated `XkbV1` keymap.
 - Preserve v1 repeat-info gating, configured repeat values, client-side
   Wayland repeat, native shortcut repeat policy, focus isolation, shortcut
@@ -79,10 +82,9 @@ for command output filtering.
   configurations inherit only the requested repeat rate/delay; their RMLVO is
   still the documented baseline or minimal `us` configuration.
 - `XkbKeyboardState::update_physical_key(evdev_key: u32, pressed: bool) -> bool`
-  performs checked `+8` conversion and reports projected-state changes;
-  `update_client_key` updates only the client projection state.
+  performs checked `+8` conversion and reports direct projected-state changes.
 - `XkbKeyboardState::wayland_serialized_state() -> KeyboardSerializedState`
-  combines client depressed modifiers with physical global state, while
+  serializes all modifier and group fields from the physical state, while
   `keymap_file() -> io::Result<(File, u32)>` exposes the cached keymap.
 
 - [ ] **Step 1: Add the safe dependency and module declaration.**
@@ -146,15 +148,15 @@ fn update_physical_key_uses_xkb_offset_but_keeps_evdev_api() {
   absent rules/model/variant and `None` for absent options, call
   `Keymap::new_from_names`, serialize with
   `KEYMAP_FORMAT_TEXT_V1`, append exactly one NUL byte, and initialize one
-  physical and client `xkb::State` values from the immutable keymap. Return a descriptive error including
+  physical `xkb::State` from the immutable keymap. Return a descriptive error including
   every requested RMLVO value when compilation fails.
 
 - [ ] **Step 6: Implement state serialization, checked key updates, LEDs, and FD creation.**
 
   `update_physical_key` must use `checked_add(8)` and reject values outside
   the legal XKB range. Compare the explicit Wayland projection before and
-  after each state update. Serialize depressed modifiers from `client_state`,
-  latched and locked modifiers plus the effective group from `physical_state`.
+  after each state update. Serialize all modifier fields and the effective
+  group directly from `physical_state`.
   Expose logical Caps/Num/Scroll LED queries.
   `keymap_file` writes the cached bytes to an unlinked unique runtime file and
   returns its byte size including the NUL.
@@ -187,9 +189,8 @@ git commit -m "feat: add libxkbcommon keyboard state core"
 - `CompositorState::ensure_keyboard_state()` lazily initializes the TLS-owned
   state without panicking during `Default` construction; a missing owner or
   failed initialization permanently disables keyboard state for that handle.
-- `CompositorState::keyboard_serialized_state()` returns the current explicit
-  client/global projection or all-zero state when initialization is
-  unavailable.
+- `CompositorState::keyboard_serialized_state()` returns the current direct
+  physical XKB snapshot or all-zero state when initialization is unavailable.
 - `CompositorState::send_keyboard_initial_state(&wl_keyboard::WlKeyboard)`
   sends the cached keymap and supported repeat info from the owned state.
 
@@ -240,8 +241,8 @@ fn caps_lock_changes_xkb_locked_mask_without_manual_modifier_state() {
 
   Keep raw `pressed_keys` bookkeeping only for client-visible keys. Apply the
   explicit `PhysicalOnly`, `PhysicalAndClient`, and `ClientOnly` action stream:
-  physical actions update `physical_state`, visible actions update both
-  states, and deferred Alt/Super replay updates only `client_state`. Publish
+  physical actions update `physical_state`, visible actions publish the raw
+  key, and deferred Alt/Super replay is client-only with no XKB update. Publish
   `wl_keyboard::key { key }` with the raw evdev value, then publish the
   projected modifiers/group only if it changed; a physical-only global change
   may publish a standalone modifiers event. Update focus enter and modifier
@@ -251,10 +252,10 @@ fn caps_lock_changes_xkb_locked_mask_without_manual_modifier_state() {
 - [ ] **Step 7: Close repeat and session transient-state semantics.**
 
   Treat raw evdev values as release (`0`), press (`1`), and repeat (`2`). A
-  repeat may reach binding repeat policy but creates no physical or client XKB
-  update and no normal Wayland key. During session suspend/VT switching,
-  reconcile tracked transient physical and client keys before discarded input
-  can strand depressed state; retain physical locked/layout state.
+  repeat may reach binding repeat policy but creates no physical XKB update and
+  no normal Wayland key. During session suspend/VT switching, reconcile tracked
+  transient physical keys and raw forwarded keys before discarded input can
+  strand depressed state; retain physical locked/layout state.
 
 - [ ] **Step 8: Run focused existing tests and new unit tests.**
 
@@ -398,58 +399,53 @@ git commit -m "fix: close keyboard layout core verification gaps"
   exact verification commands/results, and remaining physical LED/layout-v2
   follow-up work.
 
-## v1.3 closure plan
+## v1.4 correction plan
 
-**Goal:** Close the two remaining v1 correctness gaps without changing the
-accepted physical/client action architecture: client modifier projection must
-follow the physical effective group, and session suspension must reset the
-Wayland client's logical keyboard state.
+**Goal:** Close the single-XKB-authority gap while preserving the accepted
+session leave/enter reset semantics and the physical/client routing contract.
 
-**Architecture:** Keep `physical_state` as the only authoritative server XKB
-state. Turn `client_state` into an explicitly non-authoritative slave
-projection rebuilt from physical serialized modifier/layout components and an
-ordered client-visible pressed-key ledger. Use `xkb_state_update_mask` only to
-seed that slave projection and replay client keys with `xkb_state_update_key`;
-never use the projection to drive physical input. Treat session suspend as a
-Wayland keyboard-focus boundary by sending leave before clearing transient
-state and restoring enter plus projected modifiers after resume.
+**Architecture:** Keep one authoritative `physical_state` per seat. Every real
+physical press/release updates it exactly once, while repeat value 2 does not
+update XKB. Keep the raw forwarded-key ledger only for Wayland enter state,
+deferred raw replay, release reconciliation, and session reset. Serialize all
+Wayland modifier and group fields directly from `physical_state`; no replay
+state reseeding, fixed modifier masks, or filtering is allowed.
 
-### Task 5: Rebase the client projection on physical global state
+### Task 5: Remove the secondary XKB projection
 
 **Files:**
 - Modify: `src/compositor/keyboard.rs`
-- Modify: `src/compositor/state/input_resources.rs` only if projection
-  publication needs a new state-change hook
+- Modify: `src/compositor/state/input_resources.rs`
+- Modify: `src/compositor/server_toplevel.rs`
+- Modify: `src/native_output/input/routing.rs`
 - Test: `src/compositor/keyboard.rs`
 - Test: `src/native_output/tests/input.rs`
 
-- [ ] **Step 1: Preserve client key press order.** Replace the unordered
-  client pressed-key set with an ordered ledger that removes the matching
-  evdev key on release and does not duplicate repeated presses.
+- [ ] **Step 1: Keep one physical state and a separate raw ledger.** Remove
+  the secondary XKB state and its rebuild path. Retain raw pressed-key
+  bookkeeping only where Wayland forwarding and session reconciliation need it.
 
-- [ ] **Step 2: Add the slave projection rebuild.** Construct a fresh
-  `xkb::State` from the cached keymap, call `update_mask` with physical
-  depressed base `0`, physical latched/locked modifier masks, and physical
-  depressed/latched/locked layout indices, then replay each ordered client
-  key with `update_key`. Store the rebuilt state only as the client
-  projection and keep the physical state on the `update_key` server path.
+- [ ] **Step 2: Enforce action routing.** PhysicalOnly and
+  PhysicalAndClient update the physical state once for real value 1/0;
+  ClientOnly forwards a raw key without an XKB update. Preserve key-before-
+  modifiers ordering and standalone publication for physical-only changes.
 
-- [ ] **Step 3: Rebuild after physical global changes.** Run the projection
-  rebuild after each physical update before serializing Wayland state so a
-  physical group switch rebases held client-visible modifiers immediately.
+- [ ] **Step 3: Serialize the authoritative snapshot.** Publish depressed,
+  latched, locked, and effective group values directly from the physical state,
+  including physical modifiers whose raw keys are suppressed.
 
-- [ ] **Step 4: Add the `us,br` AltGr regression.** Configure
-  `layout=us,br`, `variant=,abnt2`, and
-  `options=grp:alt_shift_toggle`; switch to group 1, forward Right Alt,
-  parse the received Text V1 keymap, and compare the published depressed mask
-  to the group-1 XKB behavior. Switch back to group 0 and repeat the semantic
-  check without fixed Mod1/Mod5 masks.
+- [ ] **Step 4: Add independent group-sensitive references.** Parse the
+  published Text V1 keymap into independent XKB states and compare complete
+  snapshots for held RightAlt across `us,br` with `,abnt2` and
+  `grp:alt_shift_toggle`, plus Ctrl+Shift with `grp:ctrl_shift_toggle`. The
+  reference oracle must not use Typhon's projected state.
 
-- [ ] **Step 5: Re-run the existing projection matrix.** Keep deferred
-  Alt/Shift, hidden Super, consumed Super+Space, focus-enter, repeat, and
-  event-ordering tests green.
+- [ ] **Step 5: Cover RightAlt inhibition and retain the existing matrix.**
+  Verify deferred RightAlt replay while shortcut inhibition is effective,
+  including promoted release, then keep deferred Alt/Super, consumed
+  Super+Space, focus-enter, repeat, and event-ordering tests green.
 
-### Task 6: Reconcile Wayland keyboard focus across session suspension
+### Task 6: Preserve Wayland keyboard focus across session suspension
 
 **Files:**
 - Modify: `src/compositor/mod.rs`
@@ -461,12 +457,12 @@ state and restoring enter plus projected modifiers after resume.
 - [ ] **Step 1: Remember the pre-suspend keyboard focus.** Add a compositor
   field for the keyboard surface to restore. The suspend helper must send a
   protocol `leave`, clear the keyboard focus, clear transient state, and clear
-  only the client-visible pressed-key ledger.
+  the raw forwarded-key ledger.
 
 - [ ] **Step 2: Restore focus after input recovery.** Add a server method
   called by `NativeRuntime::resume_input`. If the remembered surface is still
   the focused live surface, call normal focus reconciliation so the client
-  receives `enter` with an empty key list and the current projected
+  receives `enter` with an empty key list and the current direct
   modifiers/group; otherwise discard the target.
 
 - [ ] **Step 3: Test forwarded Ctrl and an ordinary Z.** With a real Wayland
@@ -479,7 +475,7 @@ state and restoring enter plus projected modifiers after resume.
   transient reset, then assert the resumed modifier snapshot has no depressed
   transient keys but retains the XKB locked Caps mask.
 
-### Task 7: Final v1.3 verification
+### Task 7: Final v1.4 verification
 
 - [ ] **Step 1:** Run focused keyboard, native-input, session, and compositor
   keyboard tests in the repository checkout so Cargo uses the local target
@@ -487,8 +483,8 @@ state and restoring enter plus projected modifiers after resume.
 - [ ] **Step 2:** Run `rtk cargo fmt --check`, `rtk cargo test`, and
   `rtk cargo clippy --all-targets -- -D warnings`; report unrelated baseline
   failures separately and do not stage unrelated worktree changes.
-- [ ] **Step 3:** Audit for stale client-group assumptions, unpaired session
-  focus reset, fixed modifier masks, `value=2` XKB updates, duplicate physical
-  transitions, and non-English Markdown.
+- [ ] **Step 3:** Audit for secondary XKB state/replay assumptions, unpaired
+  session focus reset, fixed modifier masks, `value=2` XKB updates, duplicate
+  physical transitions, and non-English Markdown.
 - [ ] **Step 4:** Run `rtk git diff --check`, inspect the staged file list, and
-  commit the v1.3 closure separately from unrelated pacing changes.
+  commit the v1.4 closure separately from unrelated pacing changes.

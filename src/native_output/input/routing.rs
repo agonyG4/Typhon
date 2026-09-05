@@ -1182,26 +1182,18 @@ pub(crate) fn apply_native_input_effect(
                     let physical_changed = context
                         .server
                         .update_keyboard_state_without_publication(event.key, event.pressed);
-                    let client_changed = context
-                        .server
-                        .update_keyboard_client_state_without_publication(event.key, event.pressed);
                     context
                         .server
                         .send_keyboard_key_after_state_update_without_publication(
                             event.key,
                             event.pressed,
-                            physical_changed || client_changed,
+                            physical_changed,
                         );
                 }
                 NativeKeyboardAction::ClientOnly(event) => {
-                    let modifiers_changed = context
+                    context
                         .server
-                        .update_keyboard_client_state_without_publication(event.key, event.pressed);
-                    context.server.send_keyboard_key_without_state_update(
-                        event.key,
-                        event.pressed,
-                        modifiers_changed,
-                    );
+                        .send_keyboard_key_without_state_update(event.key, event.pressed);
                 }
             }
         }
