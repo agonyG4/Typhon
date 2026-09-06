@@ -109,6 +109,7 @@ impl super::CompositorState {
         self.effect_scene_summary
     }
 
+    #[allow(dead_code)] // Used when the compositor begins publishing resolved effect snapshots.
     pub(in crate::compositor) fn set_effect_scene_summary(&mut self, summary: EffectSceneSummary) {
         self.effect_scene_summary = summary;
     }

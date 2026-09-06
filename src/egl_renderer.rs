@@ -8,6 +8,9 @@ use std::{
 
 use glow::HasContext;
 use khronos_egl as egl;
+use oblivion_one::effects::{
+    EffectRect, EffectRegion, EffectRegistry, FrameExecutionPlan, compile_frame_execution_plan,
+};
 use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
@@ -23,6 +26,7 @@ use oblivion_one::{
 
 mod damage;
 pub(crate) mod dmabuf;
+mod effects;
 mod geometry;
 pub(crate) mod native_fence;
 mod program;
@@ -231,6 +235,7 @@ pub(crate) struct GlesSceneRenderer {
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
+    effect_registry: EffectRegistry,
     frame_stats: GlesSceneFrameStats,
 }
 
@@ -355,6 +360,7 @@ impl GlesSceneRenderer {
                 (width, height),
                 partial_repaint_capabilities,
             ),
+            effect_registry: EffectRegistry::empty(),
             frame_stats: GlesSceneFrameStats::default(),
         })
     }
@@ -376,6 +382,12 @@ impl GlesSceneRenderer {
             renderer: unsafe { self.gl.get_parameter_string(glow::RENDERER) },
             version: unsafe { self.gl.get_parameter_string(glow::VERSION) },
         }
+    }
+
+    #[allow(dead_code)] // Populated by the trusted registry reload boundary.
+    pub(crate) fn set_effect_registry(&mut self, registry: EffectRegistry) {
+        self.effect_registry = registry;
+        self.invalidate_presented_damage_history();
     }
 
     pub(crate) fn draw_scene(
@@ -446,7 +458,7 @@ impl GlesSceneRenderer {
             visual_state,
             output_scale,
             decoration_instances,
-            effects: _effects,
+            effects,
             popup_surface_ids,
             client_cursor,
             current_damage,
@@ -566,6 +578,7 @@ impl GlesSceneRenderer {
             output_scale,
             framebuffer_origin,
         );
+        let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
             self.record_repaint_stats(&plan);
@@ -574,7 +587,23 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
-        if let Err(error) = self.draw_textured_layers(&plan, framebuffer_origin) {
+        let output_bounds = EffectRect::new(0, 0, width, height)
+            .expect("non-zero renderer dimensions must form valid effect bounds");
+        let execution_plan = compile_frame_execution_plan(
+            effects,
+            &effect_source_damage,
+            output_bounds,
+            &self.effect_registry,
+        )
+        .map_err(|error| io::Error::other(format!("effect graph compilation failed: {error}")))?;
+        let draw_result = match execution_plan {
+            FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
+            FrameExecutionPlan::EffectGraph(graph) => {
+                effects::execute_semantic_graph(&graph)?;
+                self.draw_textured_layers(&plan, framebuffer_origin)
+            }
+        };
+        if let Err(error) = draw_result {
             self.repaint_planner.invalidate();
             return Err(error);
         }
@@ -2693,6 +2722,29 @@ pub(crate) fn choose_surfaceless_egl_config(
     configs.get(selected).copied().ok_or_else(|| {
         io::Error::other("selected surfaceless EGL config index out of range").into()
     })
+}
+
+fn effect_region_from_output_damage(
+    damage: &OutputDamage,
+    width: u32,
+    height: u32,
+) -> EffectRegion {
+    match damage {
+        OutputDamage::Empty => EffectRegion::empty(),
+        OutputDamage::Full => EffectRegion::from_rect(
+            EffectRect::new(0, 0, width, height).expect("renderer dimensions are valid"),
+        ),
+        OutputDamage::Rects(rects) => {
+            let mut region = EffectRegion::empty();
+            for rect in rects {
+                if let Some(effect_rect) = EffectRect::new(rect.x, rect.y, rect.width, rect.height)
+                {
+                    region.push(effect_rect);
+                }
+            }
+            region
+        }
+    }
 }
 
 #[cfg(test)]
