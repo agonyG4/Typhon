@@ -340,19 +340,21 @@ impl OutputPipelineSnapshot {
             return Err(PipelineValidationError::DuplicateCommitToken);
         }
 
-        let mut occupied = Vec::with_capacity(4);
-        if let Some(PresentedPrimaryState::Composed { slot, .. }) = self.presented_planes.primary {
-            occupied.push(slot);
-        }
-        occupied.extend(
-            [self.kernel_submitted, self.worker_queued_next]
-                .into_iter()
-                .flatten()
-                .filter_map(|commit| commit.kind.compositor_slot()),
-        );
-        occupied.extend(self.prepared.slot());
+        let occupied = [
+            match self.presented_planes.primary {
+                Some(PresentedPrimaryState::Composed { slot, .. }) => Some(slot),
+                _ => None,
+            },
+            self.kernel_submitted
+                .and_then(|commit| commit.kind.compositor_slot()),
+            self.worker_queued_next
+                .and_then(|commit| commit.kind.compositor_slot()),
+            self.prepared.slot(),
+        ];
         for (index, slot) in occupied.iter().copied().enumerate() {
-            if occupied[index + 1..].contains(&slot) {
+            if let Some(slot) = slot
+                && occupied[index + 1..].contains(&Some(slot))
+            {
                 return Err(PipelineValidationError::SlotAliasing { slot });
             }
         }
@@ -361,17 +363,18 @@ impl OutputPipelineSnapshot {
         if depth > 2 {
             return Err(PipelineValidationError::FuturePrimaryDepthExceeded { depth });
         }
-        let mut targets = [self.kernel_submitted, self.worker_queued_next]
-            .into_iter()
-            .flatten()
-            .filter(|commit| commit.kind.is_primary())
-            .map(|commit| commit.target)
-            .collect::<Vec<_>>();
-        targets.extend(self.prepared.target());
-        for pair in targets.windows(2) {
-            let [earlier, later] = pair else {
-                continue;
-            };
+        let targets = [
+            self.kernel_submitted
+                .filter(|commit| commit.kind.is_primary())
+                .map(|commit| commit.target),
+            self.worker_queued_next
+                .filter(|commit| commit.kind.is_primary())
+                .map(|commit| commit.target),
+            self.prepared.target(),
+        ];
+        // Compare adjacent present targets, including across an empty worker slot.
+        let targets = targets.into_iter().flatten();
+        for (earlier, later) in targets.clone().zip(targets.skip(1)) {
             let earlier_claim = earlier.physical_claim();
             let later_claim = later.physical_claim();
             if earlier.clock_generation != later.clock_generation

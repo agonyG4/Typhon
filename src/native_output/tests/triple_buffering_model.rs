@@ -259,6 +259,34 @@ fn pipeline_snapshot_rejects_non_monotonic_targets() {
 }
 
 #[test]
+fn pipeline_checks_target_order_across_an_empty_worker_position() {
+    let mut snapshot = empty_snapshot();
+    snapshot.kernel_submitted = Some(composed_commit(1, 2, 0, 10));
+    snapshot.prepared = ready(2, 1, 1);
+
+    assert_eq!(
+        snapshot.validate(),
+        Err(PipelineValidationError::NonMonotonicTargetOrder {
+            earlier_sequence: 2,
+            later_sequence: 1,
+        })
+    );
+}
+
+#[test]
+fn pipeline_checks_slot_aliasing_across_empty_commit_positions() {
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.prepared = ready(1, 1, 0);
+
+    assert_eq!(
+        snapshot.validate(),
+        Err(PipelineValidationError::SlotAliasing {
+            slot: OutputSlotId::new(0).unwrap(),
+        })
+    );
+}
+
+#[test]
 fn reactive_double_rejects_pending_plus_prepared() {
     let mut snapshot = empty_snapshot();
     snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;

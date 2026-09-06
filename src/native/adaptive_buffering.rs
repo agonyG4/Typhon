@@ -790,13 +790,18 @@ fn push_bounded(samples: &mut VecDeque<u64>, value: u64) {
 }
 
 fn nearest_rank(samples: &VecDeque<u64>, percentile: usize) -> u64 {
-    let mut sorted: Vec<_> = samples.iter().copied().collect();
-    if sorted.is_empty() {
+    if samples.is_empty() {
         return 0;
     }
-    sorted.sort_unstable();
-    let rank = (percentile * sorted.len()).div_ceil(100).max(1);
-    sorted[rank - 1]
+    // Histories are bounded by push_bounded; prediction must not allocate on
+    // the frame path. Copy both ring segments without disturbing eviction order.
+    let mut scratch = [0; SAMPLE_CAPACITY];
+    let values = &mut scratch[..samples.len()];
+    let (front, back) = samples.as_slices();
+    values[..front.len()].copy_from_slice(front);
+    values[front.len()..].copy_from_slice(back);
+    let rank = (percentile * values.len()).div_ceil(100).max(1);
+    *values.select_nth_unstable(rank - 1).1
 }
 
 fn mean_alpha(dt_ns: u64) -> (u64, u64) {
@@ -891,6 +896,31 @@ mod tests {
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.p95_wake_lateness_ns, 19);
         assert_eq!(prediction.p95_atomic_submit_ns, 19);
+    }
+
+    #[test]
+    fn nearest_rank_matches_sorted_reference_through_ring_wraps() {
+        let mut samples = VecDeque::with_capacity(SAMPLE_CAPACITY);
+        for step in 0..=SAMPLE_CAPACITY * 3 {
+            let original = samples.clone();
+            let mut sorted: Vec<_> = samples.iter().copied().collect();
+            sorted.sort_unstable();
+            for percentile in [1, 50, 90, 95, 100] {
+                let expected = if sorted.is_empty() {
+                    0
+                } else {
+                    sorted[(percentile * sorted.len()).div_ceil(100) - 1]
+                };
+                assert_eq!(nearest_rank(&samples, percentile), expected);
+            }
+            assert_eq!(samples, original, "prediction must preserve eviction order");
+            let sample = match step % 4 {
+                0 => 0,
+                1 => u64::MAX,
+                _ => ((step * 73) % 127) as u64,
+            };
+            push_bounded(&mut samples, sample);
+        }
     }
 
     #[test]
