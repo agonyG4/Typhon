@@ -201,10 +201,12 @@ pub use effects::{
     ResolvedEffectScene,
 };
 pub use fullscreen::DirectScanoutSceneBlockers;
-pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,
     FullscreenPresentationRejection, FullscreenPresentationState, FullscreenRenderPlanMetrics,
+};
+pub(crate) use fullscreen::{
+    direct_scanout_scene_rejection_for_effects, direct_scanout_scene_rejection_for_flags,
 };
 pub use idle::{IdleManager, IdleState};
 pub use input::{
@@ -781,6 +783,7 @@ pub struct CompositorState {
     cursor_generation: u64,
     surface_tree_generation: Option<u64>,
     scene_render_generation: u64,
+    effect_scene_summary: EffectSceneSummary,
     pointer_hit_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,

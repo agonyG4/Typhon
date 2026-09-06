@@ -104,6 +104,16 @@ impl EffectFrameDemandSnapshot {
     }
 }
 
+impl super::CompositorState {
+    pub(in crate::compositor) fn effect_scene_summary(&self) -> EffectSceneSummary {
+        self.effect_scene_summary
+    }
+
+    pub(in crate::compositor) fn set_effect_scene_summary(&mut self, summary: EffectSceneSummary) {
+        self.effect_scene_summary = summary;
+    }
+}
+
 fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64 ^ generation;
     for instance in instances {

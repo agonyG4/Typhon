@@ -38,6 +38,7 @@ pub enum DirectScanoutSceneRejection {
     OwnerDoesNotCoverOutput,
     OwnerRootBufferMissing,
     OwnerTreeHasAdditionalSurface,
+    EffectRequiresComposition,
     OverlayVisible,
     PopupVisible,
     NonDmabuf,
@@ -62,6 +63,7 @@ impl DirectScanoutSceneRejection {
             Self::OwnerDoesNotCoverOutput => "owner_does_not_cover_output",
             Self::OwnerRootBufferMissing => "owner_root_buffer_missing",
             Self::OwnerTreeHasAdditionalSurface => "owner_tree_has_additional_surface",
+            Self::EffectRequiresComposition => "effect_requires_composition",
             Self::OverlayVisible => "overlay_visible",
             Self::PopupVisible => "popup_visible",
             Self::NonDmabuf => "non_dmabuf",
@@ -147,6 +149,16 @@ pub(crate) const fn direct_scanout_scene_rejection_for_flags(
         Some(DirectScanoutSceneRejection::OverlayVisible)
     } else if popup_visible {
         Some(DirectScanoutSceneRejection::PopupVisible)
+    } else {
+        None
+    }
+}
+
+pub(crate) const fn direct_scanout_scene_rejection_for_effects(
+    summary: crate::compositor::EffectSceneSummary,
+) -> Option<DirectScanoutSceneRejection> {
+    if summary.requires_composition && summary.visible_instance_count > 0 {
+        Some(DirectScanoutSceneRejection::EffectRequiresComposition)
     } else {
         None
     }
@@ -262,6 +274,26 @@ mod tests {
             direct_scanout_scene_rejection_for_flags(true, true),
             Some(DirectScanoutSceneRejection::OverlayVisible)
         );
+    }
+
+    #[test]
+    fn visible_effect_blocks_direct_scanout_with_stable_reason() {
+        let summary = crate::compositor::EffectSceneSummary {
+            visible_instance_count: 1,
+            requires_composition: true,
+            continuous_instance_count: 0,
+            maximum_capture_pixels: 80 * 40,
+        };
+        assert_eq!(
+            direct_scanout_scene_rejection_for_effects(summary),
+            Some(DirectScanoutSceneRejection::EffectRequiresComposition)
+        );
+    }
+
+    #[test]
+    fn removing_last_effect_restores_direct_scanout_eligibility() {
+        let empty = crate::compositor::EffectSceneSummary::default();
+        assert_eq!(direct_scanout_scene_rejection_for_effects(empty), None);
     }
 
     #[test]

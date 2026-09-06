@@ -270,6 +270,12 @@ impl CompositorState {
             return Err(DirectScanoutSceneRejection::OwnerMinimized);
         }
 
+        if let Some(rejection) =
+            direct_scanout_scene_rejection_for_effects(self.effect_scene_summary())
+        {
+            return Err(rejection);
+        }
+
         if self.has_visible_special_application_content() {
             return Err(DirectScanoutSceneRejection::OverlayVisible);
         }
