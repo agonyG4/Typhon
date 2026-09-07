@@ -89,7 +89,7 @@ fn populated_render_prediction_does_not_allocate() {
 fn populated_worker_dispatch_budget_does_not_allocate() {
     let mut model = worker_timing::KmsWorkerDispatchModel::default();
     for value in 1..=241 {
-        model.record(value, value * 2, value * 3);
+        model.record(value, value * 2, value * 3, value * 4);
     }
     let allocations = allocations_during(|| {
         black_box(black_box(&model).budget());

@@ -37,6 +37,8 @@ use std::{
 mod validation;
 use validation::invalidate_queued_dependents;
 
+const PAGEFLIP_TIMEOUT_NS: u64 = 1_000_000_000;
+
 #[derive(Debug)]
 pub(crate) struct KmsWorkerSubmission {
     pub(crate) out_fence: Option<OwnedFd>,
@@ -160,6 +162,11 @@ impl KmsWorkerQuiesceHandle {
 }
 
 impl KmsCommitWorkerHandle {
+    #[cfg(test)]
+    pub(crate) fn notify_work_for_test(&self) {
+        self.shared.work_wakeup.notify_all();
+    }
+
     pub(crate) fn start(
         executor: Arc<dyn KmsCommitExecutor>,
     ) -> Result<Self, KmsCommitWorkerStartError> {
@@ -1320,12 +1327,40 @@ fn wait_for_pageflip_or_quiesce(
         if state.inflight.is_none() {
             return true;
         }
-        let (next, timeout) = shared
-            .work_wakeup
-            .wait_timeout(state, Duration::from_secs(1))
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state = next;
-        let timed_out_bundle = (timeout.timed_out() && !timeout_reported)
+        let timed_out = if timeout_reported {
+            state = shared
+                .work_wakeup
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            false
+        } else {
+            let Some(timeout_deadline_ns) = state
+                .inflight
+                .filter(|inflight| inflight.token == token)
+                .map(|inflight| {
+                    inflight
+                        .submit_returned_at_ns
+                        .saturating_add(PAGEFLIP_TIMEOUT_NS)
+                })
+            else {
+                continue;
+            };
+            let now_ns = monotonic_now_ns();
+            if now_ns >= timeout_deadline_ns {
+                true
+            } else {
+                let (next, timeout) = shared
+                    .work_wakeup
+                    .wait_timeout(
+                        state,
+                        Duration::from_nanos(timeout_deadline_ns.saturating_sub(now_ns)),
+                    )
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next;
+                timeout.timed_out()
+            }
+        };
+        let timed_out_bundle = (timed_out && !timeout_reported)
             .then(|| state.inflight.filter(|inflight| inflight.token == token))
             .flatten()
             .map(|inflight| inflight.bundle);

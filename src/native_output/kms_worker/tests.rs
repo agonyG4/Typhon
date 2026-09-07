@@ -14,7 +14,7 @@ use std::{
     collections::VecDeque,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{Arc, Barrier, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -807,6 +807,55 @@ fn worker_emits_one_pageflip_timeout_for_inflight_commit() {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::PageflipTimeout { .. }))
+            .count(),
+        1
+    );
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn worker_pageflip_timeout_deadline_survives_repeated_wakeups() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    reserve_for_test(&handle, test_job(14).kind)
+        .enqueue(test_job(14))
+        .unwrap();
+
+    let mut events = Vec::new();
+    let submitted_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < submitted_deadline
+        && !events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+    {
+        events.extend(collect_events(&handle));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+    );
+
+    let timeout_deadline = Instant::now() + Duration::from_millis(1_300);
+    while Instant::now() < timeout_deadline
+        && !events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::PageflipTimeout { .. }))
+    {
+        handle.notify_work_for_test();
+        events.extend(collect_events(&handle));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
     assert_eq!(
         events
             .iter()
