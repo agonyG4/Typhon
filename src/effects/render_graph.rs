@@ -77,6 +77,7 @@ pub struct CompiledRenderPass {
     pub output: Option<GraphTextureId>,
     pub damage: EffectRegion,
     pub instance: EffectInstanceId,
+    pub anchor: EffectAnchor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -212,6 +213,7 @@ impl GraphBuilder {
         output: Option<GraphTextureId>,
         damage: EffectRegion,
         instance: EffectInstanceId,
+        anchor: EffectAnchor,
     ) -> Result<GraphPassId, RenderGraphCompileError> {
         if self.passes.len() >= MAX_GRAPH_PASSES {
             return Err(RenderGraphCompileError::TooManyPasses);
@@ -229,6 +231,7 @@ impl GraphBuilder {
             output,
             damage,
             instance,
+            anchor,
         });
         Ok(id)
     }
@@ -360,6 +363,7 @@ fn compile_instance(
                         Some(texture),
                         capture_damage.clone(),
                         instance.id,
+                        instance.anchor,
                     )?;
                 }
                 outputs.insert(node.id, texture);
@@ -378,6 +382,7 @@ fn compile_instance(
                         Some(texture),
                         capture_damage.clone(),
                         instance.id,
+                        instance.anchor,
                     )?;
                     current = texture;
                 }
@@ -392,6 +397,7 @@ fn compile_instance(
                         Some(texture),
                         output_damage.clone(),
                         instance.id,
+                        instance.anchor,
                     )?;
                     current = texture;
                 }
@@ -414,6 +420,7 @@ fn compile_instance(
                     Some(texture),
                     output_damage.clone(),
                     instance.id,
+                    instance.anchor,
                 )?;
                 outputs.insert(node.id, texture);
             }
@@ -431,6 +438,7 @@ fn compile_instance(
                     Some(texture),
                     output_damage.clone(),
                     instance.id,
+                    instance.anchor,
                 )?;
                 outputs.insert(node.id, texture);
             }
@@ -448,6 +456,7 @@ fn compile_instance(
                     Some(texture),
                     output_damage.clone(),
                     instance.id,
+                    instance.anchor,
                 )?;
                 outputs.insert(node.id, texture);
             }
@@ -469,6 +478,7 @@ fn compile_instance(
         Some(output_texture),
         output_damage.clone(),
         instance.id,
+        instance.anchor,
     )?;
     Ok(())
 }

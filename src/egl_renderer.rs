@@ -103,6 +103,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub commands_rejected_occluded: usize,
     pub opaque_rectangles_subtracted: usize,
     pub planner_early_terminations: usize,
+    pub effect_fallbacks: usize,
     pub region_fragmentation_overflow_fallbacks: usize,
     pub peak_region_piece_count: usize,
     pub texture_binds: usize,
@@ -239,6 +240,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_resources: EffectGlResourceCache,
     effect_registry: EffectRegistry,
     effect_shaders: ShaderProgramCache,
+    effect_quad: Option<(GlVertexArray, GlBuffer)>,
     frame_stats: GlesSceneFrameStats,
 }
 
@@ -367,6 +369,7 @@ impl GlesSceneRenderer {
             effect_registry: EffectRegistry::empty(),
             effect_shaders: ShaderProgramCache::new(128)
                 .expect("stable default shader cache capacity is non-zero"),
+            effect_quad: None,
             frame_stats: GlesSceneFrameStats::default(),
         })
     }
@@ -394,6 +397,37 @@ impl GlesSceneRenderer {
     pub(crate) fn set_effect_registry(&mut self, registry: EffectRegistry) {
         self.effect_registry = registry;
         self.invalidate_presented_damage_history();
+    }
+
+    fn ensure_effect_quad(&mut self) -> RendererResult<(GlVertexArray, GlBuffer)> {
+        if let Some(quad) = self.effect_quad {
+            return Ok(quad);
+        }
+        let vertex_array = unsafe { self.gl.create_vertex_array().map_err(io::Error::other)? };
+        let vertex_buffer = unsafe { self.gl.create_buffer().map_err(io::Error::other)? };
+        let vertices: [f32; 24] = [
+            -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0,
+            1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 0.0,
+        ];
+        unsafe {
+            self.gl.bind_vertex_array(Some(vertex_array));
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&vertices),
+                glow::STATIC_DRAW,
+            );
+            self.gl.enable_vertex_attrib_array(0);
+            self.gl
+                .vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 16, 0);
+            self.gl.enable_vertex_attrib_array(1);
+            self.gl
+                .vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 16, 8);
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            self.gl.bind_vertex_array(None);
+        }
+        self.effect_quad = Some((vertex_array, vertex_buffer));
+        Ok((vertex_array, vertex_buffer))
     }
 
     pub(crate) fn draw_scene(
@@ -601,15 +635,26 @@ impl GlesSceneRenderer {
             output_bounds,
             &self.effect_registry,
         )
-        .map_err(|error| io::Error::other(format!("effect graph compilation failed: {error}")))?;
+        .unwrap_or_else(|_| {
+            self.frame_stats.effect_fallbacks = self.frame_stats.effect_fallbacks.saturating_add(1);
+            FrameExecutionPlan::LegacyScene
+        });
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
-                self.effect_resources.prepare_graph(&self.gl, &graph)?;
-                let _resource_metrics = self.effect_resources.metrics();
-                let _shader_program_count = self.effect_shaders.len();
-                effects::execute_semantic_graph(&graph)?;
-                self.draw_textured_layers(&plan, framebuffer_origin)
+                let base_result = self.draw_textured_layers(&plan, framebuffer_origin);
+                if let Err(error) = base_result {
+                    Err(error)
+                } else {
+                    match effects::execute_effect_graph(self, &graph, framebuffer_origin) {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            self.frame_stats.effect_fallbacks =
+                                self.frame_stats.effect_fallbacks.saturating_add(1);
+                            self.draw_textured_layers(&plan, framebuffer_origin)
+                        }
+                    }
+                }
             }
         };
         if let Err(error) = draw_result {
@@ -1406,7 +1451,16 @@ impl GlesSceneRenderer {
         scene: bool,
         scissor: Option<OutputRect>,
     ) -> RendererResult<()> {
-        if scene {
+        self.draw_command_batch_with_visibility(scene, scissor, true)
+    }
+
+    fn draw_command_batch_with_visibility(
+        &mut self,
+        scene: bool,
+        scissor: Option<OutputRect>,
+        plan_scene_visibility: bool,
+    ) -> RendererResult<()> {
+        if scene && plan_scene_visibility {
             self.plan_scene_visibility(scissor);
         }
         let (vertices, commands) = if scene {
@@ -1555,6 +1609,23 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
+    fn draw_capture_commands(
+        &mut self,
+        command_indices: &[usize],
+        scissor: OutputRect,
+    ) -> RendererResult<()> {
+        let saved_visibility = std::mem::take(&mut self.scene_visibility_plan);
+        self.scene_visibility_plan = vec![EglVisibilityDecision::Occluded; self.commands.len()];
+        for &index in command_indices {
+            if let Some(decision) = self.scene_visibility_plan.get_mut(index) {
+                *decision = EglVisibilityDecision::Drawable;
+            }
+        }
+        let result = self.draw_command_batch_with_visibility(true, Some(scissor), false);
+        self.scene_visibility_plan = saved_visibility;
+        result
+    }
+
     fn plan_scene_visibility(&mut self, scissor: Option<OutputRect>) {
         let repair = scissor
             .map(|rect| {
@@ -1653,6 +1724,14 @@ impl GlesSceneRenderer {
         }
         for (_, resource) in self.dmabuf_resource_cache.drain() {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
+        }
+        self.effect_shaders.clear(&self.gl);
+        self.effect_resources.destroy(&self.gl);
+        if let Some((vertex_array, vertex_buffer)) = self.effect_quad.take() {
+            unsafe {
+                self.gl.delete_buffer(vertex_buffer);
+                self.gl.delete_vertex_array(vertex_array);
+            }
         }
 
         unsafe {

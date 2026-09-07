@@ -1,7 +1,9 @@
 use std::{collections::HashMap, io};
 
 use glow::HasContext;
-use oblivion_one::effects::{CompiledFrameGraph, EffectWorkingSpace, GraphTextureSource};
+use oblivion_one::effects::{
+    CompiledFrameGraph, EffectWorkingSpace, GraphTextureId, GraphTexturePlan, GraphTextureSource,
+};
 
 use super::metrics::EffectResourceMetrics;
 
@@ -406,39 +408,40 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         graph: &CompiledFrameGraph,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut checked_out = Vec::new();
+        let textures = self.acquire_graph(gl, graph)?;
+        self.release_graph(textures)
+    }
+
+    pub(crate) fn acquire_graph(
+        &mut self,
+        gl: &glow::Context,
+        graph: &CompiledFrameGraph,
+    ) -> Result<HashMap<GraphTextureId, PooledEffectTexture>, Box<dyn std::error::Error>> {
+        let mut checked_out = HashMap::new();
         for texture in &graph.textures {
             if texture.source == GraphTextureSource::Output {
                 continue;
             }
-            let format = if texture.source == GraphTextureSource::Intermediate {
-                EffectTextureFormat::Rgba16Float
-            } else {
-                EffectTextureFormat::Rgba8
-            };
-            let filter = if matches!(texture.source, GraphTextureSource::Static(_)) {
-                EffectTextureFilter::Nearest
-            } else {
-                EffectTextureFilter::Linear
-            };
-            let key = EffectTextureKey::new(
-                texture.width,
-                texture.height,
-                format,
-                filter,
-                EffectWorkingSpace::LinearSrgb,
-            );
-            match self.acquire(gl, key) {
-                Ok(texture) => checked_out.push(texture),
+            match self.acquire(gl, texture_key(texture)) {
+                Ok(realized) => {
+                    checked_out.insert(texture.id, realized);
+                }
                 Err(error) => {
-                    for texture in checked_out {
+                    for texture in checked_out.into_values() {
                         let _ = self.release(texture);
                     }
                     return Err(error);
                 }
             }
         }
-        for texture in checked_out {
+        Ok(checked_out)
+    }
+
+    pub(crate) fn release_graph(
+        &mut self,
+        textures: HashMap<GraphTextureId, PooledEffectTexture>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for texture in textures.into_values() {
             self.release(texture)?;
         }
         Ok(())
@@ -494,6 +497,36 @@ impl EffectGlResourceCache {
     pub(crate) fn metrics(&self) -> EffectResourceMetrics {
         self.pool.metrics()
     }
+
+    pub(crate) fn destroy(&mut self, gl: &glow::Context) {
+        for (_, texture) in self.gl_textures.drain() {
+            unsafe { gl.delete_texture(texture) };
+        }
+        if let Some(framebuffer) = self.scratch_fbo.take() {
+            unsafe { gl.delete_framebuffer(framebuffer) };
+        }
+        self.pool.cleanup_size_history();
+    }
+}
+
+fn texture_key(texture: &GraphTexturePlan) -> EffectTextureKey {
+    let format = if texture.source == GraphTextureSource::Intermediate {
+        EffectTextureFormat::Rgba16Float
+    } else {
+        EffectTextureFormat::Rgba8
+    };
+    let filter = if matches!(texture.source, GraphTextureSource::Static(_)) {
+        EffectTextureFilter::Nearest
+    } else {
+        EffectTextureFilter::Linear
+    };
+    EffectTextureKey::new(
+        texture.width,
+        texture.height,
+        format,
+        filter,
+        EffectWorkingSpace::LinearSrgb,
+    )
 }
 
 #[cfg(test)]
