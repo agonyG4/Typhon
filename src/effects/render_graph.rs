@@ -118,6 +118,9 @@ pub struct CompiledRenderPass {
     pub instance: EffectInstanceId,
     pub anchor: EffectAnchor,
     pub blur_radius: Option<f32>,
+    pub stage: Option<EffectNodeKind>,
+    pub fused_stages: Vec<EffectNodeKind>,
+    pub parameter_block: super::EffectParameterBlock,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -262,8 +265,34 @@ impl GraphBuilder {
             instance,
             anchor,
             blur_radius,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: super::EffectParameterBlock::default(),
         });
         Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_stage_pass(
+        &mut self,
+        kind: RenderPassKind,
+        inputs: Vec<GraphTextureId>,
+        output: Option<GraphTextureId>,
+        damage: EffectRegion,
+        instance: EffectInstanceId,
+        anchor: EffectAnchor,
+        stage: EffectNodeKind,
+    ) -> Result<GraphPassId, RenderGraphCompileError> {
+        let pass = self.add_pass(kind, inputs, output, damage, instance, anchor, None)?;
+        self.passes
+            .last_mut()
+            .expect("stage pass was appended")
+            .stage = Some(stage);
+        self.passes
+            .last_mut()
+            .expect("stage pass was appended")
+            .parameter_block = super::EffectParameterBlock::default();
+        Ok(pass)
     }
 }
 
@@ -307,6 +336,7 @@ pub fn compile_frame_execution_plan(
         )?;
     }
 
+    fuse_compatible_local_stages(&mut builder);
     let intermediate_textures = builder
         .textures
         .iter()
@@ -347,6 +377,80 @@ pub fn compile_frame_execution_plan(
         final_damage,
         stats,
     }))
+}
+
+fn fuse_compatible_local_stages(builder: &mut GraphBuilder) {
+    let mut index = 0;
+    while index + 1 < builder.passes.len() {
+        let (first, second) = (&builder.passes[index], &builder.passes[index + 1]);
+        let Some(first_stage) = first.stage.as_ref() else {
+            index += 1;
+            continue;
+        };
+        let Some(second_stage) = builder.passes[index + 1].stage.as_ref() else {
+            index += 1;
+            continue;
+        };
+        let can_fuse = first.kind == RenderPassKind::Fragment
+            && second.kind == RenderPassKind::Fragment
+            && first.instance == second.instance
+            && first.output.is_some()
+            && second.inputs == first.output.into_iter().collect::<Vec<_>>()
+            && first.fused_stages.is_empty()
+            && second.fused_stages.is_empty()
+            && compatible_local_stage_order(first_stage, second_stage)
+            && first
+                .output
+                .and_then(|id| builder.textures.iter().find(|texture| texture.id == id))
+                .is_some_and(|texture| texture.last_use == Some(second.id));
+        if !can_fuse {
+            index += 1;
+            continue;
+        }
+        let second_stage = second_stage.clone();
+        let old_output = first.output.expect("fusion input output exists");
+        let new_output = second.output.expect("fusion output exists");
+        let second_id = second.id;
+        let first_id = first.id;
+        builder.passes[index].output = Some(new_output);
+        builder.passes[index].damage = builder.passes[index + 1].damage.clone();
+        builder.passes[index].fused_stages.push(second_stage);
+        builder.passes.remove(index + 1);
+        if let Some(texture) = builder
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == old_output)
+        {
+            texture.first_use = None;
+            texture.last_use = None;
+        }
+        if let Some(texture) = builder
+            .textures
+            .iter_mut()
+            .find(|texture| texture.id == new_output)
+        {
+            if texture.first_use == Some(second_id) {
+                texture.first_use = Some(first_id);
+            }
+            if texture.last_use == Some(second_id) {
+                texture.last_use = Some(first_id);
+            }
+        }
+    }
+}
+
+fn compatible_local_stage_order(first: &EffectNodeKind, second: &EffectNodeKind) -> bool {
+    fn rank(stage: &EffectNodeKind) -> Option<u8> {
+        Some(match stage {
+            EffectNodeKind::ColorMatrix(_) => 0,
+            EffectNodeKind::Tint(_) => 1,
+            EffectNodeKind::Noise(_) => 2,
+            _ => return None,
+        })
+    }
+    rank(first)
+        .zip(rank(second))
+        .is_some_and(|(first, second)| second > first)
 }
 
 fn compile_instance(
@@ -484,7 +588,42 @@ fn compile_instance(
             | EffectNodeKind::CustomFragment(_)
             | EffectNodeKind::Blend(_)
             | EffectNodeKind::Mask(_) => {
-                return Err(RenderGraphCompileError::UnsupportedNode(node.id));
+                let inputs = node
+                    .inputs
+                    .iter()
+                    .map(|input| outputs.get(input).copied())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(RenderGraphCompileError::InvalidGraph(
+                        EffectValidationError::MissingInputNode(node.id),
+                    ))?;
+                let input_plan = builder.texture(inputs[0]);
+                let output = builder.add_texture_with_layout(
+                    GraphTextureSource::Intermediate,
+                    input_plan.domain,
+                    input_plan.width,
+                    input_plan.height,
+                    EffectWorkingSpace::LinearSrgb,
+                )?;
+                let kind = match node.kind {
+                    EffectNodeKind::Blend(_) => RenderPassKind::Blend,
+                    EffectNodeKind::Mask(_) => RenderPassKind::Mask,
+                    _ => RenderPassKind::Fragment,
+                };
+                builder.add_stage_pass(
+                    kind,
+                    inputs,
+                    Some(output),
+                    output_damage.clone(),
+                    instance.id,
+                    instance.anchor,
+                    node.kind.clone(),
+                )?;
+                builder
+                    .passes
+                    .last_mut()
+                    .expect("stage pass was appended")
+                    .parameter_block = instance.parameter_block.clone();
+                outputs.insert(node.id, output);
             }
         }
     }
@@ -701,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_nodes_fail_compilation_instead_of_becoming_copy_passes() {
+    fn built_in_local_nodes_compile_to_real_stage_passes() {
         let source = EffectNodeId::new(1).unwrap();
         let tint = EffectNodeId::new(2).unwrap();
         let program = validate_effect_program(EffectProgram {
@@ -734,14 +873,91 @@ mod tests {
                 frame_demand: EffectFrameDemand::OnDamage,
             }],
         );
-        assert_eq!(
-            compile_frame_execution_plan(
-                &scene,
-                &region,
-                EffectRect::new(0, 0, 100, 100).unwrap(),
-                &registry,
-            ),
-            Err(RenderGraphCompileError::UnsupportedNode(tint))
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible local stage must compile to an effect graph");
+        };
+        assert!(graph.passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::Fragment
+                && matches!(pass.stage, Some(EffectNodeKind::Tint(_)))
+        }));
+    }
+
+    #[test]
+    fn compatible_zero_footprint_local_stages_fuse_in_canonical_order() {
+        let source = EffectNodeId::new(1).unwrap();
+        let matrix = EffectNodeId::new(2).unwrap();
+        let tint = EffectNodeId::new(3).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(10).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::color_matrix(
+                    matrix,
+                    source,
+                    ColorMatrixSpec {
+                        matrix: [
+                            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                            0.0, 1.0,
+                        ],
+                        bias: [0.0; 4],
+                    },
+                )
+                .unwrap(),
+                EffectNode::tint(
+                    tint,
+                    matrix,
+                    TintSpec::new([1.0, 0.9, 0.8, 1.0], 0.5).unwrap(),
+                ),
+            ],
+            output: tint,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(10).unwrap(),
+                anchor: EffectAnchor::OutputPostProcess,
+                target_bounds: region.bounding_rect().unwrap(),
+                region: region.clone(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+            }],
         );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible local stages must compile to an effect graph");
+        };
+        let stages = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::Fragment)
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].fused_stages.len(), 1);
+        assert!(matches!(
+            stages[0].stage,
+            Some(EffectNodeKind::ColorMatrix(_))
+        ));
     }
 }

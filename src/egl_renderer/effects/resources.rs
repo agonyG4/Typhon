@@ -818,6 +818,9 @@ mod tests {
                 instance: effect,
                 anchor,
                 blur_radius: None,
+                stage: None,
+                fused_stages: Vec::new(),
+                parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
             })
             .collect();
         let graph = CompiledFrameGraph {

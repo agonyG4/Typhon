@@ -232,6 +232,9 @@ impl ShaderProgramCache {
             (1002, 0, blur::DUAL_KAWASE_UPSAMPLE_SHADER),
             (1003, 0, super::executor::COPY_FRAGMENT_SHADER),
             (1004, 0, super::executor::COMPOSITE_FRAGMENT_SHADER),
+            (1005, 0, super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER),
+            (1006, 0, super::executor::MASK_STAGE_FRAGMENT_SHADER),
+            (1007, 0, super::executor::BLEND_STAGE_FRAGMENT_SHADER),
         ] {
             let key = ShaderProgramKey::new(
                 oblivion_one::effects::ShaderModuleId::new(module)

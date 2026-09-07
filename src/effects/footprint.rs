@@ -91,4 +91,56 @@ mod tests {
         let node = EffectNode::custom_fragment(EffectNodeId::new(2).unwrap(), input, spec);
         assert!(node.is_ok());
     }
+
+    #[test]
+    fn local_builtins_have_zero_stage_sampling_radius() {
+        let color = EffectNodeKind::ColorMatrix(ColorMatrixSpec {
+            matrix: [1.0; 16],
+            bias: [0.0; 4],
+        });
+        let tint = EffectNodeKind::Tint(TintSpec::WHITE);
+        let noise = EffectNodeKind::Noise(NoiseSpec::new(NoiseKind::Hash, 0.2).unwrap());
+        assert_eq!(node_footprint(&color).unwrap(), EffectFootprint::ZERO);
+        assert_eq!(node_footprint(&tint).unwrap(), EffectFootprint::ZERO);
+        assert_eq!(node_footprint(&noise).unwrap(), EffectFootprint::ZERO);
+    }
+
+    #[test]
+    fn mask_and_blend_preserve_input_dependency_footprints() {
+        let source = EffectNodeId::new(1).unwrap();
+        let blur = EffectNodeId::new(2).unwrap();
+        let mask = EffectNodeId::new(3).unwrap();
+        let blend = EffectNodeId::new(4).unwrap();
+        let program = EffectProgram {
+            id: EffectProgramId::new(1).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::dual_kawase(
+                    blur,
+                    source,
+                    DualKawaseBlurSpec::new(4.0, 1, 1.0).unwrap(),
+                ),
+                EffectNode::mask(
+                    mask,
+                    blur,
+                    MaskSpec {
+                        mode: MaskMode::Alpha,
+                    },
+                ),
+                EffectNode::blend(
+                    blend,
+                    vec![mask, source],
+                    BlendSpec::new(BlendMode::SourceOver, 1.0).unwrap(),
+                ),
+            ],
+            output: blend,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+        let validated = validate_effect_program(program).unwrap();
+        assert_eq!(validated.aggregate_footprint, EffectFootprint::symmetric(8));
+    }
 }
