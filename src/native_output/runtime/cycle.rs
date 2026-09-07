@@ -70,6 +70,9 @@ impl NativeRuntime {
             pacing_due: self.should_progress_surface_pacing(now_ns),
             xwayland_generation_changed: self.xwayland.reactor_registration_generation()
                 != self.xwayland_reactor_generation,
+            xwayland_backend_commands_pending: !cycle.shutdown_requested
+                && self.xwayland.generation().is_some()
+                && self.server.has_pending_xwayland_backend_commands(),
             recovery_required: self.pending_session_recovery.is_some(),
             shutdown_requested: cycle.shutdown_requested,
             input_backlog_pending: self.input_epoch.backlog_pending(),
@@ -476,6 +479,14 @@ impl NativeRuntime {
         }
         if !presentation_work || self.input_epoch.backlog_pending() {
             self.arm_runtime_deadline()?;
+        }
+        if !cycle.shutdown_requested
+            && self.xwayland.generation().is_some()
+            && self.server.has_pending_xwayland_backend_commands()
+        {
+            self.request_native_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::XwaylandContinuation,
+            )?;
         }
         cycle.fast_path_completed = !prepare_outcome.acquire_service_ran && !presentation_work;
         self.flush_presentation_trace()?;

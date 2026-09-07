@@ -18,6 +18,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) pacing_active: bool,
     pub(super) pacing_due: bool,
     pub(super) xwayland_generation_changed: bool,
+    pub(super) xwayland_backend_commands_pending: bool,
     pub(super) recovery_required: bool,
     pub(super) shutdown_requested: bool,
     pub(super) input_backlog_pending: bool,
@@ -123,7 +124,8 @@ impl NativeWorkDomains {
             || wakeup
                 .continuation
                 .contains(NativeContinuationReason::XwaylandContinuation)
-            || state.xwayland_generation_changed;
+            || state.xwayland_generation_changed
+            || state.xwayland_backend_commands_pending;
         let explicit_sync = reasons.explicit_sync_acquire()
             || !wakeup.explicit_sync_acquire_tokens.is_empty()
             || state.explicit_sync_service_due;
@@ -521,6 +523,20 @@ mod tests {
     #[test]
     fn input_with_xwm_readiness_requires_xwayland_service() {
         let decision = NativeWorkDomains::from_wakeup(&wakeup(INPUT | XWAYLAND_XWM), &state());
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(decision.service_xwayland);
+    }
+
+    #[test]
+    fn pending_xwayland_backend_commands_require_xwayland_service() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(0),
+            &NativeRuntimeState {
+                xwayland_backend_commands_pending: true,
+                ..state()
+            },
+        );
 
         assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
         assert!(decision.service_xwayland);

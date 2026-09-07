@@ -1728,6 +1728,37 @@ fn x11_resize_queues_a_typed_backend_command() {
 }
 
 #[test]
+fn pending_xwayland_backend_commands_filter_out_xdg_only_work() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(3).expect("generation"));
+    let x11_id = insert_x11(&mut state, x11_snapshot(generation, 401, 402));
+    let xdg_id = state.allocate_window_id().expect("XDG window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(xdg_id, 403))
+        .expect("XDG window");
+    let _ = state.take_backend_commands();
+
+    state.queue_backend_configure(
+        xdg_id,
+        WindowGeometry::new(SurfacePlacement::root_at(1, 2), 300, 200),
+        ToplevelMode::Normal,
+        false,
+    );
+    assert!(!state.has_pending_xwayland_backend_commands());
+
+    state.queue_backend_configure(
+        x11_id,
+        WindowGeometry::new(SurfacePlacement::root_at(3, 4), 500, 400),
+        ToplevelMode::Normal,
+        true,
+    );
+    assert!(state.has_pending_xwayland_backend_commands());
+
+    let _ = state.take_backend_commands();
+    assert!(!state.has_pending_xwayland_backend_commands());
+}
+
+#[test]
 fn override_redirect_window_is_excluded_from_normal_window_cycle() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

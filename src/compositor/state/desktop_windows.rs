@@ -1473,6 +1473,34 @@ impl CompositorState {
         std::mem::take(&mut self.backend_commands)
     }
 
+    pub(in crate::compositor) fn has_pending_xwayland_backend_commands(&self) -> bool {
+        let is_x11_window = |window_id: &WindowId| {
+            self.window(*window_id)
+                .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        };
+
+        self.backend_commands.iter().any(|command| match command {
+            crate::compositor::window_backend::WindowBackendCommand::Configure { window, .. }
+            | crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
+                window, ..
+            }
+            | crate::compositor::window_backend::WindowBackendCommand::Close { window }
+            | crate::compositor::window_backend::WindowBackendCommand::SetActivated { window, .. }
+            | crate::compositor::window_backend::WindowBackendCommand::Restack { window }
+            | crate::compositor::window_backend::WindowBackendCommand::PublishState { window, .. }
+            | crate::compositor::window_backend::WindowBackendCommand::SetWorkspace { window, .. }
+            | crate::compositor::window_backend::WindowBackendCommand::ClearWorkspace { window } => {
+                is_x11_window(window)
+            }
+            crate::compositor::window_backend::WindowBackendCommand::RestackExact { windows } => {
+                windows.iter().any(is_x11_window)
+            }
+            crate::compositor::window_backend::WindowBackendCommand::PublishWorkspaceState {
+                ..
+            } => true,
+        })
+    }
+
     pub(in crate::compositor) fn window_id_for_surface(&self, surface_id: u32) -> Option<WindowId> {
         self.window_by_root_surface.get(&surface_id).copied()
     }

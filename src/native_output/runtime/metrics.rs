@@ -606,7 +606,8 @@ impl NativeRuntime {
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
-            xwayland_continuation: false,
+            xwayland_continuation: self.xwayland.generation().is_some()
+                && self.server.has_pending_xwayland_backend_commands(),
             control_timeout_pending: control_timeout_deadline
                 .is_some_and(|deadline| deadline <= now_ns),
         });

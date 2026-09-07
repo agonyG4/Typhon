@@ -1256,6 +1256,10 @@ impl OwnCompositorServer {
         self.state.has_pending_frame_prepare_work()
     }
 
+    pub fn has_pending_xwayland_backend_commands(&self) -> bool {
+        self.state.has_pending_xwayland_backend_commands()
+    }
+
     pub fn has_pending_interactive_visual_work(&self) -> bool {
         self.state.has_pending_interactive_visual_work()
     }
