@@ -1762,6 +1762,17 @@ impl LiveTestClient {
         self.connection.roundtrip()?;
         Ok(())
     }
+
+    pub(in crate::compositor::tests) fn unmap_surface(
+        &self,
+        surface: &client_wl_surface::WlSurface,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        surface.attach(None, 0, 0);
+        surface.commit();
+        self.connection.flush()?;
+        self.connection.roundtrip()?;
+        Ok(())
+    }
 }
 
 pub(in crate::compositor::tests) fn create_test_buffered_toplevel(

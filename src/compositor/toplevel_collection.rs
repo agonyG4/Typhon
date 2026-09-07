@@ -39,31 +39,9 @@ impl CompositorState {
         &self,
         window_id: WindowId,
     ) -> Option<AstreaToplevelSnapshot> {
+        let kind = self.astrea_toplevel_kind_if_eligible(window_id)?;
         let window = self.desktop_windows.get(&window_id)?;
-        let (kind, eligible) = match window.backend {
-            WindowBackend::Xdg(handle) => {
-                let lifecycle = self.xdg_surface_lifecycle(handle.root_surface_id())?;
-                (
-                    AstreaToplevelKind::XdgToplevel,
-                    self.toplevel_surfaces
-                        .contains_key(&handle.root_surface_id())
-                        && lifecycle.currently_mapped,
-                )
-            }
-            WindowBackend::X11(_) => (
-                match window.x11_role {
-                    Some(X11DesktopRole::Toplevel) => AstreaToplevelKind::X11Toplevel,
-                    Some(X11DesktopRole::Dialog) => AstreaToplevelKind::X11Dialog,
-                    _ => return None,
-                },
-                window.kind == DesktopWindowKind::Managed
-                    && window
-                        .x11_surface_id
-                        .and_then(|surface_id| self.surface_resource_by_id(surface_id))
-                        .is_some(),
-            ),
-        };
-        eligible.then(|| {
+        Some({
             let mut states = AstreaToplevelStates::default();
             if self.focused_window_id == Some(window_id) {
                 states = states.union(AstreaToplevelStates::ACTIVE);
@@ -90,5 +68,35 @@ impl CompositorState {
                 window.last_focus_serial,
             )
         })
+    }
+
+    pub(in crate::compositor) fn astrea_toplevel_kind_if_eligible(
+        &self,
+        window_id: WindowId,
+    ) -> Option<AstreaToplevelKind> {
+        let window = self.desktop_windows.get(&window_id)?;
+        match window.backend {
+            WindowBackend::Xdg(handle) => {
+                let lifecycle = self.xdg_surface_lifecycle(handle.root_surface_id())?;
+                (self
+                    .toplevel_surfaces
+                    .contains_key(&handle.root_surface_id())
+                    && lifecycle.currently_mapped)
+                    .then_some(AstreaToplevelKind::XdgToplevel)
+            }
+            WindowBackend::X11(_) => {
+                let kind = match window.x11_role {
+                    Some(X11DesktopRole::Toplevel) => AstreaToplevelKind::X11Toplevel,
+                    Some(X11DesktopRole::Dialog) => AstreaToplevelKind::X11Dialog,
+                    _ => return None,
+                };
+                (window.kind == DesktopWindowKind::Managed
+                    && window
+                        .x11_surface_id
+                        .and_then(|surface_id| self.surface_resource_by_id(surface_id))
+                        .is_some())
+                .then_some(kind)
+            }
+        }
     }
 }

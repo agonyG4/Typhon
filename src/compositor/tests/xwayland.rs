@@ -251,6 +251,156 @@ fn admit_first_buffer(fixture: &mut FirstBufferFixture, x: i32, y: i32) {
     );
 }
 
+#[test]
+fn astrea_occupancy_uses_only_eligible_live_x11_roles() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        Some(crate::compositor::AstreaToplevelKind::X11Toplevel)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .regular_workspace_occupancy()
+            .contains(&crate::wm::WorkspaceId::new(1).unwrap())
+    );
+
+    fixture
+        .server
+        .state
+        .window_mut(window_id)
+        .unwrap()
+        .management = Some(crate::wm::WindowManagementState::new(
+        crate::wm::WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
+    ));
+    assert!(
+        fixture
+            .server
+            .state
+            .regular_workspace_occupancy()
+            .is_empty()
+    );
+    fixture
+        .server
+        .state
+        .window_mut(window_id)
+        .unwrap()
+        .management = Some(crate::wm::WindowManagementState::new(
+        crate::wm::WorkspaceLocation::Regular(crate::wm::WorkspaceId::new(1).unwrap()),
+    ));
+    assert!(
+        fixture
+            .server
+            .state
+            .regular_workspace_occupancy()
+            .contains(&crate::wm::WorkspaceId::new(1).unwrap())
+    );
+
+    assert!(fixture.server.state.apply_x11_metadata_delta(
+        handle,
+        crate::xwayland::xwm::X11MetadataDelta::WindowTypes(X11WindowTypes::new(vec![
+            X11WindowType::Dialog,
+        ]))
+    ));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        Some(crate::compositor::AstreaToplevelKind::X11Dialog)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .regular_workspace_occupancy()
+            .contains(&crate::wm::WorkspaceId::new(1).unwrap())
+    );
+
+    for window_type in [
+        X11WindowType::PopupMenu,
+        X11WindowType::Notification,
+        X11WindowType::Dock,
+    ] {
+        assert!(fixture.server.state.apply_x11_metadata_delta(
+            handle,
+            crate::xwayland::xwm::X11MetadataDelta::WindowTypes(X11WindowTypes::new(vec![
+                window_type,
+            ]))
+        ));
+        assert_eq!(
+            fixture
+                .server
+                .state
+                .astrea_toplevel_kind_if_eligible(window_id),
+            None
+        );
+        assert!(
+            !fixture
+                .server
+                .state
+                .regular_workspace_occupancy()
+                .contains(&crate::wm::WorkspaceId::new(1).unwrap())
+        );
+    }
+
+    assert!(fixture.server.state.apply_x11_metadata_delta(
+        handle,
+        crate::xwayland::xwm::X11MetadataDelta::Kind(DesktopWindowKind::OverrideRedirect)
+    ));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        None
+    );
+
+    assert!(fixture.server.state.apply_x11_metadata_delta(
+        handle,
+        crate::xwayland::xwm::X11MetadataDelta::WindowTypes(X11WindowTypes::default())
+    ));
+    assert!(fixture.server.state.apply_x11_metadata_delta(
+        handle,
+        crate::xwayland::xwm::X11MetadataDelta::Kind(DesktopWindowKind::Managed)
+    ));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        Some(crate::compositor::AstreaToplevelKind::X11Toplevel)
+    );
+
+    assert!(fixture.server.state.detach_x11_surface(fixture.surface_id));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .astrea_toplevel_kind_if_eligible(window_id),
+        None
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .regular_workspace_occupancy()
+            .is_empty()
+    );
+}
+
 fn fake_snapshot() -> X11WindowSnapshot {
     X11WindowSnapshot {
         handle: X11WindowHandle::new(

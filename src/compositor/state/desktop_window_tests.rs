@@ -619,6 +619,48 @@ fn moving_between_inactive_regular_workspaces_marks_presence_dirty() {
 }
 
 #[test]
+fn moving_between_regular_and_special_marks_presence_dirty() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 434))
+        .expect("window");
+    state.focused_window_id = Some(id);
+    state.workspace_presence_dirty = false;
+
+    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(state.workspace_presence_dirty);
+
+    state.workspace_presence_dirty = false;
+    state
+        .workspace_manager
+        .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+    state.focused_window_id = Some(id);
+    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(state.workspace_presence_dirty);
+}
+
+#[test]
+fn metadata_only_x11_updates_do_not_dirty_workspace_presence() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(3).unwrap());
+    let snapshot = x11_snapshot(generation, 241, 242);
+    let handle = snapshot.handle;
+    insert_x11(&mut state, snapshot);
+
+    for delta in [
+        X11MetadataDelta::Title(Some("new title".into())),
+        X11MetadataDelta::AppId(Some("new.app".into())),
+        X11MetadataDelta::Pid(Some(9001)),
+        X11MetadataDelta::Constraints(WindowConstraints::default()),
+    ] {
+        state.workspace_presence_dirty = false;
+        assert!(state.apply_x11_metadata_delta(handle, delta));
+        assert!(!state.workspace_presence_dirty);
+    }
+}
+
+#[test]
 fn moving_x11_family_to_special_queues_typed_clear_workspace() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(2).unwrap());
@@ -978,6 +1020,7 @@ fn x11_kind_delta_reclassifies_existing_window_as_override_redirect() {
     let snapshot = x11_snapshot(generation, 105, 56);
     let id = insert_x11(&mut state, snapshot.clone());
 
+    state.workspace_presence_dirty = false;
     assert!(state.apply_x11_metadata_delta(
         snapshot.handle,
         X11MetadataDelta::Kind(DesktopWindowKind::OverrideRedirect)
@@ -987,6 +1030,14 @@ fn x11_kind_delta_reclassifies_existing_window_as_override_redirect() {
     assert_eq!(window.x11_role, Some(X11DesktopRole::OverrideRedirect));
     assert_eq!(window.management, None);
     assert!(state.x11_client_lists().0.is_empty());
+    assert!(state.workspace_presence_dirty);
+
+    state.workspace_presence_dirty = false;
+    assert!(state.apply_x11_metadata_delta(
+        snapshot.handle,
+        X11MetadataDelta::Kind(DesktopWindowKind::Managed)
+    ));
+    assert!(state.workspace_presence_dirty);
 }
 
 #[test]

@@ -166,5 +166,6 @@ mod toplevel_management;
 mod windows;
 mod windows_geometry;
 mod windows_resize_liveness;
+mod workspace;
 mod xdg;
 mod xwayland;

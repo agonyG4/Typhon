@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, registry_state::*, subsurface_client::*, window_ops::*,
 };
+use crate::wm::WorkspaceId;
 pub(in crate::compositor::tests) fn create_test_shm_file(
     pixels: &[u32],
 ) -> Result<File, Box<dyn std::error::Error>> {
@@ -138,6 +139,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ToggleFullscreenFocused,
     ToggleDefaultSpecialWorkspace,
     MoveFocusedWindowToOrFromSpecialWorkspace,
+    MoveFocusedWindowToWorkspace {
+        workspace: u32,
+    },
     SetFocusedRootVisualGeometry {
         placement: SurfacePlacement,
         width: u32,
@@ -461,6 +465,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace => {
                         server.move_focused_window_to_or_from_special_workspace();
+                    }
+                    ServerCommand::MoveFocusedWindowToWorkspace { workspace } => {
+                        let Some(workspace) = WorkspaceId::new(workspace) else {
+                            continue;
+                        };
+                        server.move_focused_window_to_workspace(workspace);
                     }
                     ServerCommand::SetFocusedRootVisualGeometry {
                         placement,

@@ -402,7 +402,7 @@ impl CompositorState {
             .keys()
             .copied()
             .filter_map(|window_id| {
-                self.astrea_toplevel_snapshot(window_id)?;
+                self.astrea_toplevel_kind_if_eligible(window_id)?;
                 self.desktop_windows
                     .get(&window_id)
                     .and_then(|window| window.management)
