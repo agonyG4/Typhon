@@ -42,7 +42,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation,
             visibility: server.fullscreen_render_plan_metrics(),
             snapshot,
-            effects: ResolvedEffectScene::default(),
+            effects: server.resolved_effect_scene(),
         }
     }
 

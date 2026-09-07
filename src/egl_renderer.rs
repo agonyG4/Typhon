@@ -366,7 +366,7 @@ impl GlesSceneRenderer {
                 partial_repaint_capabilities,
             ),
             effect_resources: EffectGlResourceCache::new(),
-            effect_registry: EffectRegistry::empty(),
+            effect_registry: EffectRegistry::with_builtin_background_blur(),
             effect_shaders: ShaderProgramCache::new(128)
                 .expect("stable default shader cache capacity is non-zero"),
             effect_quad: None,

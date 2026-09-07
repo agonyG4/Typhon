@@ -514,6 +514,7 @@ pub enum RenderGenerationCause {
     CursorMotion,
     CursorState,
     WindowDecoration,
+    EffectBinding,
 }
 impl RenderGenerationCause {
     pub const fn as_str(self) -> &'static str {
@@ -537,6 +538,7 @@ impl RenderGenerationCause {
             Self::CursorMotion => "cursor_motion",
             Self::CursorState => "cursor_state",
             Self::WindowDecoration => "window_decoration",
+            Self::EffectBinding => "effect_binding",
         }
     }
     pub const fn uses_surface_damage(self) -> bool {
@@ -784,6 +786,9 @@ pub struct CompositorState {
     surface_tree_generation: Option<u64>,
     scene_render_generation: u64,
     effect_scene_summary: EffectSceneSummary,
+    internal_surface_effects: HashMap<u32, ResolvedEffectInstance>,
+    #[allow(dead_code)] // Consumed by the internal effect assignment API as presets are enabled.
+    next_internal_effect_instance_id: u64,
     pointer_hit_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,

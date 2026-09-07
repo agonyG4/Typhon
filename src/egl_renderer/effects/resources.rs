@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    io,
+};
 
 use glow::HasContext;
 use oblivion_one::effects::{
@@ -348,7 +351,7 @@ impl EffectGlResourceCache {
                 unsafe { gl.delete_texture(gl_texture) };
             }
         }
-        if !self.gl_textures.contains_key(&texture.id) {
+        if let Entry::Vacant(entry) = self.gl_textures.entry(texture.id) {
             let gl_texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(gl_texture));
@@ -398,7 +401,7 @@ impl EffectGlResourceCache {
                     glow::PixelUnpackData::Slice(None),
                 );
             }
-            self.gl_textures.insert(texture.id, gl_texture);
+            entry.insert(gl_texture);
         }
         Ok(texture)
     }

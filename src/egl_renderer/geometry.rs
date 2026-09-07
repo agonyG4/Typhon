@@ -206,7 +206,7 @@ pub(super) fn plan_capture_visibility(
             continue;
         };
         stats.commands_visited = stats.commands_visited.saturating_add(1);
-        if !repair.intersection(command.bounds).is_some() {
+        if repair.intersection(command.bounds).is_none() {
             stats.commands_rejected_outside_remaining =
                 stats.commands_rejected_outside_remaining.saturating_add(1);
             decisions[index] = EglVisibilityDecision::OutsideRemaining;

@@ -3,13 +3,43 @@ use std::{collections::HashMap, num::NonZeroU16};
 use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene};
 
 use super::{
-    EffectInstanceId, EffectNodeId, EffectNodeKind, EffectProgramId, EffectRect, EffectRegion,
-    EffectSource, EffectValidationError, MAX_EFFECT_PROGRAMS, ValidatedEffectProgram,
-    plan_effect_damage,
+    DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectInstanceId,
+    EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId,
+    EffectRect, EffectRegion, EffectSource, EffectValidationError, EffectWorkingSpace,
+    MAX_EFFECT_PROGRAMS, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
 pub const MAX_GRAPH_PASSES: usize = 4096;
+pub const BUILTIN_BACKGROUND_BLUR_NAME: &str = "system.background_blur";
+
+pub fn builtin_background_blur_program_id() -> EffectProgramId {
+    EffectProgramId::new(1).expect("builtin effect program id is non-zero")
+}
+
+pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
+    let source = EffectNodeId::new(1).expect("builtin source node id is non-zero");
+    let blur = EffectNodeId::new(2).expect("builtin blur node id is non-zero");
+    validate_effect_program(EffectProgram {
+        id: builtin_background_blur_program_id(),
+        nodes: vec![
+            EffectNode::source(source, EffectSource::Backdrop),
+            EffectNode::dual_kawase(
+                blur,
+                source,
+                DualKawaseBlurSpec::new(4.0, 2, 1.0)
+                    .expect("builtin blur specification must validate"),
+            ),
+        ],
+        output: blur,
+        working_space: EffectWorkingSpace::LinearSrgb,
+        alpha_mode: EffectAlphaMode::Opaque,
+        outsets: EffectOutsets::ZERO,
+        frame_demand: EffectFrameDemand::OnDamage,
+        failure_policy: EffectFailurePolicy::Passthrough,
+    })
+    .expect("builtin background blur program must validate")
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GraphTextureId(NonZeroU16);
@@ -111,6 +141,14 @@ pub struct EffectRegistry {
 impl EffectRegistry {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    pub fn with_builtin_background_blur() -> Self {
+        let mut registry = Self::empty();
+        registry
+            .insert(builtin_background_blur_program())
+            .expect("builtin effect registry has capacity");
+        registry
     }
 
     pub fn insert(&mut self, program: ValidatedEffectProgram) -> Result<(), EffectRegistryError> {
@@ -544,6 +582,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(plan, FrameExecutionPlan::LegacyScene));
+    }
+
+    #[test]
+    fn builtin_background_blur_has_stable_identity_and_two_pass_shape() {
+        let registry = EffectRegistry::with_builtin_background_blur();
+        let id = builtin_background_blur_program_id();
+        let program = &registry
+            .get(id)
+            .expect("builtin blur must be registered")
+            .program;
+
+        assert_eq!(BUILTIN_BACKGROUND_BLUR_NAME, "system.background_blur");
+        assert_eq!(program.id, id);
+        assert_eq!(program.nodes.len(), 2);
+        assert!(matches!(
+            program.nodes[1].kind,
+            EffectNodeKind::DualKawaseBlur(_)
+        ));
     }
 
     #[test]
