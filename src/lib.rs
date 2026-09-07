@@ -1,3 +1,4 @@
+pub mod astrea_effects;
 pub mod astrea_shell_auth;
 pub mod astrea_shell_control;
 pub mod astrea_shortcuts;

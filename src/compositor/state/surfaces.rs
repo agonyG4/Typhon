@@ -751,6 +751,8 @@ impl CompositorState {
             dmabuf_scanout_target_device_override: None,
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
+            trusted_effect_registry:
+                crate::effects::TrustedEffectRegistry::with_builtin_background_blur(),
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()
         };
@@ -1162,6 +1164,7 @@ impl CompositorState {
         }
         self.active_commit_timing_targets.remove(&surface_id);
         self.fifo_resources.remove(&surface_id);
+        self.internal_surface_effects.remove(&surface_id);
         self.background_effect_resources.remove(&surface_id);
         self.background_effect_surface_ids.remove(&surface_id);
         self.commit_timer_resources.remove(&surface_id);

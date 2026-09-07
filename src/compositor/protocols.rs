@@ -7,6 +7,7 @@ mod core;
 pub(crate) mod cursor_shape;
 mod data_control;
 mod data_device;
+mod effects_control;
 mod fifo;
 mod globals;
 mod idle_inhibit;

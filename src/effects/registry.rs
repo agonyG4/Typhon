@@ -78,6 +78,32 @@ pub struct EffectRegistryGeneration {
 }
 
 impl EffectRegistryGeneration {
+    pub fn with_builtin_background_blur() -> Self {
+        let program = super::validate_effect_program(
+            super::render_graph::builtin_background_blur_program().program,
+        )
+        .expect("builtin effect program must validate");
+        let mut registry = EffectRegistry::empty();
+        registry
+            .insert(program.clone())
+            .expect("builtin effect registry has capacity");
+        let mut effects = BTreeMap::new();
+        effects.insert(
+            super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME.to_string(),
+            RegisteredEffect {
+                name: super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME.to_string(),
+                program,
+                parameters: BTreeMap::new(),
+            },
+        );
+        Self {
+            generation: 1,
+            registry,
+            effects,
+            shaders: BTreeMap::new(),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             generation: 0,
@@ -111,6 +137,14 @@ impl TrustedEffectRegistry {
     pub fn new() -> Self {
         Self {
             current: RwLock::new(Arc::new(EffectRegistryGeneration::empty())),
+        }
+    }
+
+    pub fn with_builtin_background_blur() -> Self {
+        Self {
+            current: RwLock::new(Arc::new(
+                EffectRegistryGeneration::with_builtin_background_blur(),
+            )),
         }
     }
 

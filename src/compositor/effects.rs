@@ -1,6 +1,6 @@
 use crate::effects::{
-    EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect,
-    EffectRegion,
+    EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectParameterDefinition,
+    EffectParameterId, EffectProgramId, EffectRect, EffectRegion, EffectUniformValue,
 };
 
 use super::{BackgroundEffectRegion, InputRegionOp, SurfaceData};
@@ -157,6 +157,7 @@ impl super::CompositorState {
                         EffectAnchor::BeforeSurface(surface.surface_id),
                         crate::effects::builtin_background_blur_program_id(),
                         &region,
+                        &EffectParameterBlock::default(),
                     ),
                     frame_demand: EffectFrameDemand::OnDamage,
                     region,
@@ -193,6 +194,25 @@ impl super::CompositorState {
         program: EffectProgramId,
         region: EffectRegion,
     ) -> bool {
+        self.set_internal_surface_effect_with_parameters(
+            surface_id,
+            anchor,
+            program,
+            region,
+            EffectParameterBlock::default(),
+            EffectFrameDemand::OnDamage,
+        )
+    }
+
+    pub(in crate::compositor) fn set_internal_surface_effect_with_parameters(
+        &mut self,
+        surface_id: u32,
+        anchor: EffectAnchor,
+        program: EffectProgramId,
+        region: EffectRegion,
+        parameter_block: EffectParameterBlock,
+        frame_demand: EffectFrameDemand,
+    ) -> bool {
         let Some(target_bounds) = region.bounding_rect() else {
             return false;
         };
@@ -219,9 +239,15 @@ impl super::CompositorState {
             anchor,
             region: region.clone(),
             target_bounds,
-            parameter_block: EffectParameterBlock::default(),
-            signature: internal_effect_signature(surface_id, anchor, program, &region),
-            frame_demand: EffectFrameDemand::OnDamage,
+            parameter_block: parameter_block.clone(),
+            signature: internal_effect_signature(
+                surface_id,
+                anchor,
+                program,
+                &region,
+                &parameter_block,
+            ),
+            frame_demand,
         };
         if self.internal_surface_effects.get(&surface_id) == Some(&instance) {
             return false;
@@ -234,6 +260,87 @@ impl super::CompositorState {
         );
         self.set_effect_scene_summary(self.resolved_effect_scene().summary);
         true
+    }
+
+    pub(in crate::compositor) fn effect_program_id_for_name(
+        &self,
+        name: &str,
+    ) -> Option<EffectProgramId> {
+        self.trusted_effect_registry.current().program_id(name)
+    }
+
+    pub(in crate::compositor) fn effect_parameter_definition(
+        &self,
+        program: EffectProgramId,
+        name: &str,
+    ) -> Option<EffectParameterDefinition> {
+        self.trusted_effect_registry
+            .current()
+            .effects
+            .values()
+            .find(|effect| effect.program.program.id == program)
+            .and_then(|effect| effect.parameters.get(name))
+            .cloned()
+    }
+
+    pub(in crate::compositor) fn effect_parameter_defaults(
+        &self,
+        program: EffectProgramId,
+    ) -> Vec<(EffectParameterId, EffectUniformValue)> {
+        self.trusted_effect_registry
+            .current()
+            .effects
+            .values()
+            .find(|effect| effect.program.program.id == program)
+            .map(|effect| {
+                effect
+                    .parameters
+                    .values()
+                    .map(|parameter| (parameter.spec.id, parameter.default))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(in crate::compositor) fn surface_effect_region(
+        &self,
+        surface_id: u32,
+    ) -> Option<EffectRegion> {
+        let (surface, origin) = self
+            .active_scene_surfaces()
+            .iter()
+            .zip(self.active_scene_surface_origins())
+            .find(|(surface, _)| surface.surface_id == surface_id)?;
+        Some(EffectRegion::from_rect(EffectRect::new(
+            origin.0,
+            origin.1,
+            surface.width,
+            surface.height,
+        )?))
+    }
+
+    pub(in crate::compositor) fn apply_protocol_surface_effect(
+        &mut self,
+        surface_id: u32,
+        program: EffectProgramId,
+        enabled: bool,
+        parameter_block: EffectParameterBlock,
+    ) -> bool {
+        if !enabled {
+            self.clear_internal_surface_effect(surface_id);
+            return true;
+        }
+        let Some(region) = self.surface_effect_region(surface_id) else {
+            return false;
+        };
+        self.set_internal_surface_effect_with_parameters(
+            surface_id,
+            EffectAnchor::BeforeSurface(surface_id),
+            program,
+            region,
+            parameter_block,
+            EffectFrameDemand::OnDamage,
+        )
     }
 
     #[allow(dead_code)] // Invoked by internal effect qualification and protocol adapters.
@@ -361,6 +468,7 @@ fn internal_effect_signature(
     anchor: EffectAnchor,
     program: EffectProgramId,
     region: &EffectRegion,
+    parameter_block: &EffectParameterBlock,
 ) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64;
     for value in [
@@ -386,6 +494,30 @@ fn internal_effect_signature(
             signature ^= value;
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
+    }
+    for value in parameter_block.values() {
+        signature ^= u64::from(value.id.get());
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+        match value.value {
+            EffectUniformValue::Float(value) => signature ^= u64::from(value.to_bits()),
+            EffectUniformValue::Vec2(value) => {
+                for value in value {
+                    signature ^= u64::from(value.to_bits());
+                }
+            }
+            EffectUniformValue::Vec3(value) => {
+                for value in value {
+                    signature ^= u64::from(value.to_bits());
+                }
+            }
+            EffectUniformValue::Vec4(value) => {
+                for value in value {
+                    signature ^= u64::from(value.to_bits());
+                }
+            }
+            EffectUniformValue::Int(value) => signature ^= value as u64,
+        }
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
     }
     signature
 }

@@ -787,6 +787,7 @@ pub struct CompositorState {
     scene_render_generation: u64,
     effect_scene_summary: EffectSceneSummary,
     internal_surface_effects: HashMap<u32, ResolvedEffectInstance>,
+    trusted_effect_registry: crate::effects::TrustedEffectRegistry,
     background_effect_enabled: bool,
     background_effect_resources: HashMap<u32, ObjectId>,
     background_effect_surface_ids: HashSet<u32>,

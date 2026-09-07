@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="astrea_effects_v1">
+  <copyright>
+    Copyright 2026 AstreaOS contributors
+  </copyright>
+
+  <interface name="astrea_effects_manager_v1" version="1">
+    <description summary="authenticated compositor-owned named effects">
+      This protocol exposes only trusted effect names and typed parameter
+      values. Shader source, filesystem paths, graphs, and graphics handles
+      are never sent over the wire. Scalar values use signed 16.16 fixed
+      point integers.
+    </description>
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="invalid_surface" value="1"/>
+      <entry name="effect_exists" value="2"/>
+      <entry name="invalid_slot" value="3"/>
+    </enum>
+    <request name="get_surface_effect">
+      <arg name="id" type="new_id" interface="astrea_surface_effect_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="slot" type="string"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="astrea_surface_effect_v1" version="1">
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="surface_destroyed" value="1"/>
+      <entry name="unknown_program" value="2"/>
+      <entry name="unknown_parameter" value="3"/>
+      <entry name="invalid_value" value="4"/>
+    </enum>
+    <request name="set_program">
+      <arg name="name" type="string"/>
+    </request>
+    <request name="set_float">
+      <arg name="parameter" type="string"/>
+      <arg name="value_16_16" type="int"/>
+    </request>
+    <request name="set_vec2">
+      <arg name="parameter" type="string"/>
+      <arg name="x_16_16" type="int"/>
+      <arg name="y_16_16" type="int"/>
+    </request>
+    <request name="set_vec4">
+      <arg name="parameter" type="string"/>
+      <arg name="x_16_16" type="int"/>
+      <arg name="y_16_16" type="int"/>
+      <arg name="z_16_16" type="int"/>
+      <arg name="w_16_16" type="int"/>
+    </request>
+    <request name="set_enabled">
+      <arg name="enabled" type="uint"/>
+    </request>
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>
