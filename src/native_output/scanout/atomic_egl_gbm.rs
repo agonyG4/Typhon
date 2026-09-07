@@ -1132,6 +1132,7 @@ impl AtomicEglGbmScanout {
             ),
             submit_window,
             render_fence: parts.render_fence,
+            fence_timing_evidence: None,
             scene_commit: parts.scene_commit,
             surface_damage,
             protocol_batch_id,
@@ -1226,12 +1227,15 @@ impl AtomicEglGbmScanout {
     ) -> io::Result<CompositedPageflipCompletion> {
         let generation = self.swapchain()?.pool_generation();
         let completed = self.swapchain_mut()?.complete_pageflip(token, generation)?;
+        let mut completed_frame = completed.frame;
         let timing_result = monotonic_now_ns().and_then(|observed_at| {
-            completed
-                .frame
-                .render_fence
-                .sample_timing_nonblocking(observed_at)
+            completed_frame.sample_fence_timing(MonotonicTimestampNs::new(observed_at))
         });
+        let fence_timing_accounted = timing_result
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|evidence| evidence.render_sample_recorded);
         let RenderedOutputFrame {
             id,
             transaction_id,
@@ -1249,14 +1253,13 @@ impl AtomicEglGbmScanout {
             hardware_cursor_surface_id,
             o1_admission,
             ..
-        } = completed.frame;
+        } = completed_frame;
         let target = reservation
             .bound_target()
             .ok_or_else(|| io::Error::other("completed pageflip frame is unbound"))?;
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
-            timing_result.map(|sample| {
-                sample.map(|(timestamp, quality)| (MonotonicTimestampNs::new(timestamp), quality))
-            }),
+            timing_result
+                .map(|sample| sample.map(|evidence| (evidence.signaled_at, evidence.quality))),
             || {
                 self.scene
                     .commit_presented(scene_commit, presented_transition_damage);
@@ -1283,6 +1286,7 @@ impl AtomicEglGbmScanout {
                 submit_started_at: completed.submit_started_at,
                 submit_returned_at: completed.submit_returned_at,
                 fence_signal,
+                fence_timing_accounted,
                 o1_admission,
                 client_commit_ns,
                 callback_reaction_ns,
@@ -1359,10 +1363,7 @@ impl AtomicEglGbmScanout {
         let Some(frame) = self.swapchain_mut()?.pending_frame_mut() else {
             return Ok(None);
         };
-        let sample = frame
-            .render_fence
-            .sample_timing_nonblocking(observed_at.get())?;
-        let Some((signaled_at, quality)) = sample else {
+        let Some(evidence) = frame.sample_fence_timing(observed_at)? else {
             return Ok(None);
         };
         let timing = PendingFenceTiming {
@@ -1372,9 +1373,10 @@ impl AtomicEglGbmScanout {
                 .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
             submit_window: frame.submit_window,
             composite_started_at: frame.composite_started_at,
-            signaled_at: MonotonicTimestampNs::new(signaled_at),
-            quality,
+            signaled_at: evidence.signaled_at,
+            quality: evidence.quality,
         };
+        frame.mark_fence_timing_accounted();
         drop(frame.render_fence.take_timing_fd());
         Ok(Some(timing))
     }
@@ -1600,6 +1602,7 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) callback_surface_id: Option<u32>,
     pub(crate) callback_surface_is_exclusive: bool,
     pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+    pub(crate) fence_timing_accounted: bool,
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }
 

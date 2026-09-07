@@ -1252,7 +1252,9 @@ impl NativeRuntime {
                     let mut proven_miss = pending_proven_deadline_miss
                         .take()
                         .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));
-                    if let Some((signaled_at, quality)) = frame.fence_signal {
+                    if !frame.fence_timing_accounted
+                        && let Some((signaled_at, quality)) = frame.fence_signal
+                    {
                         frame_pacing.note_fence_timestamp_quality(quality);
                         render_journal.record_render_sample(
                             render_sample_duration_ns(frame.composite_started_at, signaled_at),

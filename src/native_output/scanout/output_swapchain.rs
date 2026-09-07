@@ -7,6 +7,7 @@ use std::{
 use std::num::NonZeroU64;
 
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
+use oblivion_one::native::adaptive_buffering::FenceTimestampQuality;
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 #[cfg(test)]
@@ -179,6 +180,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) reservation: FramePresentationReservation,
     pub(crate) submit_window: KmsSubmitWindow,
     pub(crate) render_fence: NativeRenderFence,
+    pub(crate) fence_timing_evidence: Option<RenderFenceTimingEvidence>,
     pub(crate) scene_commit: EglSceneFrameCommit,
     pub(crate) surface_damage: SurfaceDamagePresentation,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
@@ -198,6 +200,13 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderFenceTimingEvidence {
+    pub(crate) signaled_at: MonotonicTimestampNs,
+    pub(crate) quality: FenceTimestampQuality,
+    pub(crate) render_sample_recorded: bool,
+}
+
 impl RenderedOutputFrame {
     pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
         self.reservation.bound_target()
@@ -205,6 +214,34 @@ impl RenderedOutputFrame {
 
     pub(crate) const fn is_deferred_o1(&self) -> bool {
         self.reservation.is_deferred_o1()
+    }
+
+    pub(crate) fn sample_fence_timing(
+        &mut self,
+        observed_at: MonotonicTimestampNs,
+    ) -> io::Result<Option<RenderFenceTimingEvidence>> {
+        if let Some(evidence) = self.fence_timing_evidence {
+            return Ok(Some(evidence));
+        }
+        let Some((signaled_at, quality)) = self
+            .render_fence
+            .sample_timing_nonblocking(observed_at.get())?
+        else {
+            return Ok(None);
+        };
+        let evidence = RenderFenceTimingEvidence {
+            signaled_at: MonotonicTimestampNs::new(signaled_at),
+            quality,
+            render_sample_recorded: false,
+        };
+        self.fence_timing_evidence = Some(evidence);
+        Ok(Some(evidence))
+    }
+
+    pub(crate) fn mark_fence_timing_accounted(&mut self) {
+        if let Some(evidence) = &mut self.fence_timing_evidence {
+            evidence.render_sample_recorded = true;
+        }
     }
 }
 
@@ -493,6 +530,7 @@ impl AtomicOutputSwapchain {
             )
             .expect("test output frame has a reachable submit window"),
             render_fence,
+            fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
             surface_damage: SurfaceDamagePresentation::default(),
             protocol_batch_id,
@@ -626,6 +664,7 @@ impl AtomicOutputSwapchain {
             submit_window: KmsSubmitWindow::try_new(now.get(), now.get(), 0, 0)
                 .expect("test ready frame has a reachable submit window"),
             render_fence,
+            fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
             surface_damage: SurfaceDamagePresentation::default(),
             protocol_batch_id: CompositorFrameBatchId::new(
@@ -1892,6 +1931,40 @@ mod tests {
         NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) })
     }
 
+    #[test]
+    fn render_fence_timing_evidence_survives_timing_fd_take() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = OutputSlotId::new(1).expect("test slot");
+        let target = test_target(1, 10, PresentationTargetReason::ForcedValidation);
+        let mut frame = test_frame(&swapchain, slot, target);
+
+        let first = frame
+            .sample_fence_timing(MonotonicTimestampNs::new(20))
+            .expect("sample timing")
+            .expect("closed test pipe is observable");
+        frame.mark_fence_timing_accounted();
+        assert!(frame.render_fence.take_timing_fd().is_some());
+
+        let second = frame
+            .sample_fence_timing(MonotonicTimestampNs::new(30))
+            .expect("reuse timing evidence")
+            .expect("retained timing evidence");
+        assert_eq!(second.signaled_at, first.signaled_at);
+        assert_eq!(second.quality, first.quality);
+        assert!(second.render_sample_recorded);
+    }
+
     fn test_target(
         sequence: u64,
         presentation_time: u64,
@@ -1950,6 +2023,7 @@ mod tests {
             )
             .expect("test submit window"),
             render_fence: test_render_fence(),
+            fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
             surface_damage: SurfaceDamagePresentation::default(),
             protocol_batch_id: batch_id,
