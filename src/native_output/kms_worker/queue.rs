@@ -1,4 +1,4 @@
-//! Bounded admission and result queues for the Atomic submit worker.
+//! Bounded admission and lossless result delivery for the Atomic submit worker.
 
 use super::{
     CursorSidecar, CursorSidecarMailbox, EstablishedKmsBase, KmsCommitBundleIdentity, KmsCommitJob,
@@ -18,8 +18,6 @@ use std::{
 };
 
 pub(crate) const QUEUED_JOB_CAPACITY: usize = 1;
-pub(crate) const RESULT_EVENT_CAPACITY: usize = 8;
-
 #[derive(Debug, Default)]
 pub(crate) struct WorkerMetrics {
     pub(crate) timing: WorkerTimingMetrics,
@@ -332,7 +330,6 @@ pub(crate) struct WorkerShared {
     pub(crate) work_wakeup: Condvar,
     pub(crate) results: Mutex<VecDeque<KmsWorkerEvent>>,
     pub(crate) fatal_jobs: Mutex<Vec<KmsWorkerFatalJob>>,
-    pub(crate) result_space: Condvar,
     pub(crate) result_fd: OwnedFd,
     pub(crate) metrics: WorkerMetrics,
     pub(crate) fatal_reason_code: AtomicU64,
@@ -570,9 +567,8 @@ impl WorkerShared {
             }),
             submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),
-            results: Mutex::new(VecDeque::with_capacity(RESULT_EVENT_CAPACITY)),
+            results: Mutex::new(VecDeque::new()),
             fatal_jobs: Mutex::new(Vec::new()),
-            result_space: Condvar::new(),
             result_fd,
             metrics: WorkerMetrics::default(),
             fatal_reason_code: AtomicU64::new(0),

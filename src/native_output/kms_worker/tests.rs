@@ -429,6 +429,109 @@ impl KmsCommitExecutor for ScriptedExecutor {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FatalAfterSuccessOutcome {
+    Success,
+    Panic,
+}
+
+#[derive(Debug)]
+struct FatalAfterSuccessExecutor {
+    outcomes: Mutex<VecDeque<FatalAfterSuccessOutcome>>,
+}
+
+impl KmsCommitExecutor for FatalAfterSuccessExecutor {
+    fn submit(&self, _job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        match self
+            .outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(FatalAfterSuccessOutcome::Success)
+        {
+            FatalAfterSuccessOutcome::Success => Ok(KmsWorkerSubmission { out_fence: None }),
+            FatalAfterSuccessOutcome::Panic => panic!("fake fatal worker submit"),
+        }
+    }
+}
+
+fn wait_for_inflight(handle: &KmsCommitWorkerHandle) {
+    for _ in 0..10_000 {
+        if handle.inflight() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("worker did not reach kernel-in-flight state");
+}
+
+fn assert_join_completes_without_draining(handle: Arc<KmsCommitWorkerHandle>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || sender.send(handle.join()).unwrap());
+    let result = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker join should not wait for result consumption");
+    assert!(result.is_ok());
+    joiner.join().unwrap();
+}
+
+fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(id.saturating_mul(100)).expect("sidecar transaction is nonzero"),
+    );
+    let transaction = Arc::new(
+        crate::native_output::OutputTransaction::cursor_plane_delta(
+            transaction_id,
+            job.output_generation,
+            MonotonicTimestampNs::new(id),
+            job.target,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            id,
+            None,
+            crate::native_output::OutputReleasePlan::Pageflip,
+        )
+        .unwrap(),
+    );
+    CursorSidecar {
+        id: crate::native_output::presentation::plane::CursorSidecarId::new(
+            std::num::NonZeroU64::new(id).expect("sidecar ID is nonzero"),
+        ),
+        transaction,
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        assignment: crate::native_output::CursorPlaneAssignment::Atomic {
+            desired_epoch: id,
+            state: None,
+        },
+        lease: None,
+        coupling: CursorSidecarCoupling::Independent,
+        created_at: MonotonicTimestampNs::new(id),
+        deadline: job.target,
+        crtc_id: job.crtc_id,
+        test_policy: KmsTestOnlyPolicy::Skip,
+        cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+        capability_key: None,
+        trace_reveal: None,
+        validation_base: job.validation_base,
+    }
+}
+
+fn offer_pending_sidecar(handle: &KmsCommitWorkerHandle, mut sidecar: CursorSidecar) {
+    for _ in 0..10_000 {
+        match handle.offer_cursor_sidecar(sidecar) {
+            Ok(replaced) => {
+                assert!(replaced.is_none());
+                return;
+            }
+            Err(error) if error.reason == KmsWorkerAdmissionError::AdmissionContention => {
+                sidecar = *error.sidecar;
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("pending sidecar offer failed: {:?}", error.reason),
+        }
+    }
+    panic!("pending sidecar offer remained contended");
+}
+
 fn collect_events(handle: &KmsCommitWorkerHandle) -> Vec<KmsWorkerEvent> {
     handle.drain_eventfd().unwrap();
     handle.drain_events()
@@ -1021,9 +1124,31 @@ fn eventfd_notification_failure_marks_worker_fatal() {
         handle.try_reserve_admission(test_job(18).kind),
         Err(KmsWorkerAdmissionError::Fatal)
     ));
-    handle.drain_events();
-    handle.request_quiesce();
     handle.join().unwrap();
+    let events = handle.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 17
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Fatal {
+                    reason: KmsWorkerFatalReason::EventNotification,
+                    uncertain_submit: false,
+                }
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1064,8 +1189,321 @@ fn notification_failure_does_not_drop_owned_queued_job() {
     assert_eq!(fd_identity(raw_fd).as_deref(), original_identity.as_deref());
     drop(fatal_jobs);
     assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
+    handle.join().unwrap();
+    let events = handle.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::BusyDeferred { token, .. } if token.get() == 19))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Fatal {
+                    reason: KmsWorkerFatalReason::EventNotification,
+                    uncertain_submit: false,
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn undrained_completion_results_do_not_block_quiesce_or_join() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()); 9])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = Arc::new(KmsCommitWorkerHandle::start(executor).unwrap());
+
+    let mut predecessor = None;
+    for token in 1..=9 {
+        let mut job = test_job(token);
+        if let Some(identity) = predecessor {
+            job.validation_base = KmsValidationBase::Predecessor(identity);
+        }
+        let identity = job.identity();
+        let transaction_id = job.transaction_id;
+        reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+        wait_for_inflight(&handle);
+        handle
+            .ack_pageflip(test_job(token).token, transaction_id, 1)
+            .unwrap();
+        predecessor = Some(identity);
+    }
+
+    handle.request_quiesce();
+    assert_join_completes_without_draining(Arc::clone(&handle));
+
+    let events = handle.drain_events();
+    let submitted_tokens = events
+        .iter()
+        .filter_map(|event| match event {
+            KmsWorkerEvent::Submitted { ownership } => Some(ownership.job.token.get()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(submitted_tokens, (1..=9).collect::<Vec<_>>());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+            .count(),
+        9
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Quiesced { .. }))
+            .count(),
+        1
+    );
+    assert!(handle.drain_events().is_empty());
+}
+
+#[test]
+fn fatal_publication_does_not_wait_for_undrained_completion_results() {
+    let outcomes = [FatalAfterSuccessOutcome::Success; 9]
+        .into_iter()
+        .chain([FatalAfterSuccessOutcome::Panic])
+        .collect::<VecDeque<_>>();
+    let executor = Arc::new(FatalAfterSuccessExecutor {
+        outcomes: Mutex::new(outcomes),
+    });
+    let handle = Arc::new(KmsCommitWorkerHandle::start(executor).unwrap());
+
+    let mut predecessor = None;
+    for token in 1..=9 {
+        let mut job = test_job(token);
+        if let Some(identity) = predecessor {
+            job.validation_base = KmsValidationBase::Predecessor(identity);
+        }
+        let identity = job.identity();
+        let transaction_id = job.transaction_id;
+        reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+        wait_for_inflight(&handle);
+        handle
+            .ack_pageflip(test_job(token).token, transaction_id, 1)
+            .unwrap();
+        predecessor = Some(identity);
+    }
+
+    reserve_for_test(&handle, test_job(10).kind)
+        .enqueue(test_job(10))
+        .unwrap();
+    for _ in 0..10_000 {
+        if handle.fatal_reason().is_some() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(handle.fatal_reason(), Some(KmsWorkerFatalReason::Panic));
+
+    let fatal_jobs = handle.take_fatal_jobs();
+    assert_eq!(fatal_jobs.len(), 1);
+    assert_eq!(fatal_jobs[0].job.token.get(), 10);
+    assert!(fatal_jobs[0].uncertain_submit);
+
+    assert_join_completes_without_draining(Arc::clone(&handle));
+    let events = handle.drain_events();
+    let submitted_tokens = events
+        .iter()
+        .filter_map(|event| match event {
+            KmsWorkerEvent::Submitted { ownership } => Some(ownership.job.token.get()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(submitted_tokens, (1..=9).collect::<Vec<_>>());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+            .count(),
+        9
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Fatal {
+                    reason: KmsWorkerFatalReason::Panic,
+                    uncertain_submit: true,
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(handle.drain_events().is_empty());
+}
+
+#[test]
+fn eventfd_failure_preserves_submitted_ownership_and_uncertain_state() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let value = u64::MAX - 1;
+    let written = unsafe {
+        libc::write(
+            handle.event_fd(),
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(written, std::mem::size_of::<u64>() as isize);
+
+    let job = test_job(20);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    for _ in 0..10_000 {
+        if handle.fatal_reason().is_some() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        handle.fatal_reason(),
+        Some(KmsWorkerFatalReason::EventNotification)
+    );
+    assert!(handle.inflight());
+
+    handle.join().unwrap();
+    let events = handle.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 20
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Fatal {
+                    reason: KmsWorkerFatalReason::EventNotification,
+                    uncertain_submit: true,
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(handle.take_fatal_jobs().is_empty());
+}
+
+#[test]
+fn quiesce_returns_queued_job_and_sidecar_once_with_undrained_results() {
+    let executor = Arc::new(BarrierExecutor {
+        started: Barrier::new(2),
+        release: Barrier::new(2),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let worker_executor: Arc<dyn KmsCommitExecutor> = executor.clone();
+    let handle = KmsCommitWorkerHandle::start(worker_executor).unwrap();
+
+    let first = test_job(21);
+    let first_transaction_id = first.transaction_id;
+    reserve_for_test(&handle, first.kind)
+        .enqueue(first)
+        .unwrap();
+    executor.started.wait();
+
+    let second = test_job(22);
+    let second_token = second.token;
+    let second_kind = second.kind;
+    reserve_for_test(&handle, second_kind)
+        .enqueue(second)
+        .unwrap();
+    let sidecar = test_pending_sidecar(&test_job(22), 2_200);
+    let sidecar_id = sidecar.id;
+    offer_pending_sidecar(&handle, sidecar);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            handle.request_quiesce();
+            sender.send(()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(10)).is_err());
+        executor.release.wait();
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("quiesce should complete after submit returns");
+    });
+
+    handle
+        .ack_pageflip(test_job(21).token, first_transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+    let events = handle.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 21))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                KmsWorkerEvent::Quiesced {
+                    returned_jobs,
+                    returned_sidecar: Some(sidecar),
+                } if returned_jobs.iter().filter(|job| job.token == second_token).count() == 1
+                    && sidecar.id == sidecar_id
+            ))
+            .count(),
+        1
+    );
+    assert!(handle.take_pending_cursor_sidecar().is_none());
+    assert!(handle.drain_events().is_empty());
+}
+
+#[test]
+fn completion_drain_is_one_shot_and_does_not_duplicate_settlement() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(23);
+    let transaction_id = job.transaction_id;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    wait_for_inflight(&handle);
+    handle
+        .ack_pageflip(test_job(23).token, transaction_id, 1)
+        .unwrap();
     handle.request_quiesce();
     handle.join().unwrap();
+
+    let first_drain = handle.drain_events();
+    assert_eq!(
+        first_drain
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        first_drain
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::Quiesced { .. }))
+            .count(),
+        1
+    );
+    assert!(handle.drain_events().is_empty());
 }
 
 #[test]

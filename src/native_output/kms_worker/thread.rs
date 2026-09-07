@@ -9,8 +9,8 @@ use super::queue::DequeuePause;
 use super::queue::{
     AttachablePrimary, AttachablePrimaryPhase, KmsWorkerFatalJob, KmsWorkerForcedShutdown,
     KmsWorkerLifecycle, KmsWorkerPhase, KmsWorkerQueuedCancellation, KmsWorkerShutdownSnapshot,
-    RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
-    drain_eventfd, notify_eventfd,
+    WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd,
+    notify_eventfd,
 };
 use super::{
     CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
@@ -329,9 +329,7 @@ impl KmsCommitWorkerHandle {
             .results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let events = results.drain(..).collect();
-        self.shared.result_space.notify_all();
-        events
+        results.drain(..).collect()
     }
 
     pub(crate) fn take_fatal_jobs(&self) -> Vec<KmsWorkerFatalJob> {
@@ -1437,16 +1435,12 @@ fn quiesce_with_jobs(shared: &Arc<WorkerShared>, mut returned_jobs: Vec<KmsCommi
 
 fn publish_event(shared: &Arc<WorkerShared>, event: KmsWorkerEvent) -> bool {
     let uncertain_submit = matches!(&event, KmsWorkerEvent::Submitted { .. });
+    // The queue is authoritative; eventfd only wakes the reactor and must not
+    // become a completion-consumer backpressure boundary.
     let mut results = shared
         .results
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while results.len() >= RESULT_EVENT_CAPACITY {
-        results = shared
-            .result_space
-            .wait(results)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
     results.push_back(event);
     drop(results);
     if notify_eventfd(&shared.result_fd).is_ok() {
@@ -1507,16 +1501,12 @@ fn mark_fatal(shared: &Arc<WorkerShared>, reason: KmsWorkerFatalReason, uncertai
         .metrics
         .fatal_events
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Fatal publication follows the same lossless queue path. In particular,
+    // a fatal marker must not wait behind earlier undrained completions.
     let mut results = shared
         .results
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while results.len() >= RESULT_EVENT_CAPACITY {
-        results = shared
-            .result_space
-            .wait(results)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
     results.push_back(KmsWorkerEvent::Fatal {
         reason,
         uncertain_submit,
