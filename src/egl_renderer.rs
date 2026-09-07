@@ -39,7 +39,7 @@ use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
     RenderExecution, RepaintPlan,
 };
-use effects::EffectGlResourceCache;
+use effects::{EffectGlResourceCache, ShaderProgramCache};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
     MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_visibility, push_draw_command,
@@ -238,6 +238,7 @@ pub(crate) struct GlesSceneRenderer {
     repaint_planner: PartialRepaintPlanner,
     effect_resources: EffectGlResourceCache,
     effect_registry: EffectRegistry,
+    effect_shaders: ShaderProgramCache,
     frame_stats: GlesSceneFrameStats,
 }
 
@@ -364,6 +365,8 @@ impl GlesSceneRenderer {
             ),
             effect_resources: EffectGlResourceCache::new(),
             effect_registry: EffectRegistry::empty(),
+            effect_shaders: ShaderProgramCache::new(128)
+                .expect("stable default shader cache capacity is non-zero"),
             frame_stats: GlesSceneFrameStats::default(),
         })
     }
@@ -604,6 +607,7 @@ impl GlesSceneRenderer {
             FrameExecutionPlan::EffectGraph(graph) => {
                 self.effect_resources.prepare_graph(&self.gl, &graph)?;
                 let _resource_metrics = self.effect_resources.metrics();
+                let _shader_program_count = self.effect_shaders.len();
                 effects::execute_semantic_graph(&graph)?;
                 self.draw_textured_layers(&plan, framebuffer_origin)
             }

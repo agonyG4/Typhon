@@ -5,8 +5,16 @@ use glow::HasContext;
 use super::{GlProgram, RendererResult};
 
 pub(super) fn create_texture_program(gl: &glow::Context) -> RendererResult<GlProgram> {
-    let vertex_shader = compile_shader(gl, glow::VERTEX_SHADER, EGL_VERTEX_SHADER)?;
-    let fragment_shader = compile_shader(gl, glow::FRAGMENT_SHADER, EGL_FRAGMENT_SHADER)?;
+    create_program_from_sources(gl, EGL_VERTEX_SHADER, EGL_FRAGMENT_SHADER)
+}
+
+pub(super) fn create_program_from_sources(
+    gl: &glow::Context,
+    vertex_source: &str,
+    fragment_source: &str,
+) -> RendererResult<GlProgram> {
+    let vertex_shader = compile_shader(gl, glow::VERTEX_SHADER, vertex_source)?;
+    let fragment_shader = compile_shader(gl, glow::FRAGMENT_SHADER, fragment_source)?;
     let program = unsafe { gl.create_program().map_err(io::Error::other)? };
     unsafe {
         gl.attach_shader(program, vertex_shader);
