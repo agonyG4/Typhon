@@ -1,5 +1,16 @@
 # Known Issues
 
+## Effects hardware qualification is deferred
+
+The effects engine has deterministic model, graph, damage, resource, protocol,
+and renderer-path coverage, but no real TTY/DRM performance run has been
+recorded for this checkout. GPU timing, native presentation combinations, and
+the 1920x1080@165 qualification matrix remain deferred. The procedure and
+required evidence are in `docs/EFFECTS_QUALIFICATION.md`.
+
+The first effects milestone is linear-sRGB-only. HDR, wide-gamut color
+management, and trusted static texture assets are not advertised or accepted.
+
 ## Direct Scanout 2.0 remains experimental
 
 Direct Scanout 2.0 is implemented as a conservative primary-plane assignment

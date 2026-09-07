@@ -41,6 +41,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `wp_presentation` | 2 | Partial |
 | `zwlr_layer_shell_v1` | 4 | Partial |
 | `wp_color_manager_v1` | 1 | Partial |
+| `astrea_effects_manager_v1` | 1 | Implemented (qualified native background-effect profile only) |
 | `zwp_relative_pointer_manager_v1` | 1 | Partial |
 | `zwp_pointer_constraints_v1` | 1 | Partial |
 | `wp_pointer_warp_v1` | 1 | Partial |
