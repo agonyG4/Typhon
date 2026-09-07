@@ -262,6 +262,40 @@ impl OutputDamage {
     }
 }
 
+pub(crate) fn output_damage_from_effect_region(
+    region: &oblivion_one::effects::EffectRegion,
+    output_width: u32,
+    output_height: u32,
+) -> OutputDamage {
+    if region.is_empty() {
+        return OutputDamage::Empty;
+    }
+    if region.bounding_rect().is_none() {
+        return OutputDamage::Full;
+    }
+    OutputDamage::rects(
+        output_width,
+        output_height,
+        region
+            .rects()
+            .iter()
+            .map(|rect| OutputRect::new(rect.x, rect.y, rect.width, rect.height)),
+    )
+}
+
+pub(crate) fn merge_effect_damage(
+    current_damage: OutputDamage,
+    effect_damage: &oblivion_one::effects::EffectRegion,
+    output_width: u32,
+    output_height: u32,
+) -> OutputDamage {
+    current_damage.union(
+        output_damage_from_effect_region(effect_damage, output_width, output_height),
+        output_width,
+        output_height,
+    )
+}
+
 fn coalesce_rects(mut rects: Vec<OutputRect>) -> Vec<OutputRect> {
     let mut output = Vec::<OutputRect>::new();
     while let Some(mut pending) = rects.pop() {

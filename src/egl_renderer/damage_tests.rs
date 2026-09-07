@@ -4,6 +4,10 @@ fn rect(x: i32, y: i32, width: u32, height: u32) -> OutputRect {
     OutputRect::new(x, y, width, height)
 }
 
+fn effect_rect(x: i32, y: i32, width: u32, height: u32) -> oblivion_one::effects::EffectRect {
+    oblivion_one::effects::EffectRect::new(x, y, width, height).unwrap()
+}
+
 fn partial_capabilities() -> EglPartialRepaintCapabilities {
     EglPartialRepaintCapabilities {
         buffer_age: true,
@@ -55,6 +59,46 @@ fn output_damage_coalesces_overlapping_and_touching_rectangles() {
         ),
         OutputDamage::Rects(vec![rect(5, 5, 15, 10)])
     );
+}
+
+#[test]
+fn effect_damage_stays_local_to_a_blur_panel() {
+    let current = OutputDamage::rects(1920, 1080, [rect(10, 10, 10, 10)]);
+    let effect = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 500, 60));
+    let merged = merge_effect_damage(current, &effect, 1920, 1080);
+    assert_ne!(merged, OutputDamage::Full);
+    assert!(merged.pixels(1920, 1080).unwrap() < 1920 * 1080);
+    assert!(merged.rects_slice().iter().any(|rect| rect.width <= 500));
+}
+
+#[test]
+fn effect_damage_union_covers_removal_and_move_transitions() {
+    let old = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 500, 60));
+    let new = oblivion_one::effects::EffectRegion::from_rect(effect_rect(700, 0, 500, 60));
+    let transition = oblivion_one::effects::effect_transition_damage(&old, &new);
+    let merged = merge_effect_damage(OutputDamage::Empty, &transition, 1920, 1080);
+    assert!(merged.rects_slice().iter().any(|rect| rect.x == 0));
+    assert!(merged.rects_slice().iter().any(|rect| rect.x == 700));
+}
+
+#[test]
+fn effect_damage_preserves_buffer_age_history() {
+    let capabilities = partial_capabilities();
+    let mut planner = partial_planner((1920, 1080), capabilities);
+    let first = OutputDamage::rects(1920, 1080, [rect(0, 0, 500, 60)]);
+    let first_plan = planner.plan(first.clone(), BufferAge::Value(1));
+    assert_eq!(first_plan.mode, RepaintMode::Full);
+    planner.commit_presented_transition(first);
+    let effect = oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 500, 60));
+    let current = merge_effect_damage(
+        OutputDamage::rects(1920, 1080, [rect(10, 10, 10, 10)]),
+        &effect,
+        1920,
+        1080,
+    );
+    let plan = planner.plan(current, BufferAge::Value(2));
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert!(plan.repair_damage.pixels(1920, 1080).unwrap() < 1920 * 1080);
 }
 
 #[test]

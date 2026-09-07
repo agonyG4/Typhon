@@ -192,6 +192,37 @@ pub(super) fn plan_visibility(
     stats
 }
 
+pub(super) fn plan_capture_visibility(
+    commands: &[EglDrawCommand],
+    command_indices: &[usize],
+    repair: EglRect,
+    decisions: &mut Vec<EglVisibilityDecision>,
+) -> EglVisibilityPlanStats {
+    decisions.clear();
+    decisions.resize(commands.len(), EglVisibilityDecision::Occluded);
+    let mut stats = EglVisibilityPlanStats::default();
+    for &index in command_indices {
+        let Some(command) = commands.get(index) else {
+            continue;
+        };
+        stats.commands_visited = stats.commands_visited.saturating_add(1);
+        if !repair.intersection(command.bounds).is_some() {
+            stats.commands_rejected_outside_remaining =
+                stats.commands_rejected_outside_remaining.saturating_add(1);
+            decisions[index] = EglVisibilityDecision::OutsideRemaining;
+            continue;
+        }
+        decisions[index] = EglVisibilityDecision::Drawable;
+        stats.commands_drawable = stats.commands_drawable.saturating_add(1);
+    }
+    stats.commands_rejected_occluded = decisions
+        .iter()
+        .filter(|decision| **decision == EglVisibilityDecision::Occluded)
+        .count();
+    stats.peak_region_pieces = usize::from(stats.commands_drawable > 0);
+    stats
+}
+
 fn subtract_rect(source: EglRect, excluded: EglRect, pieces: &mut [Option<EglRect>; 4]) -> usize {
     let Some(intersection) = source.intersection(excluded) else {
         pieces[0] = Some(source);
@@ -644,6 +675,32 @@ mod tests {
                 EglVisibilityDecision::Drawable
             ]
         );
+    }
+
+    #[test]
+    fn capture_visibility_does_not_apply_final_scene_occlusion() {
+        let commands = vec![
+            test_command(EglRect::new(0.0, 0.0, 100.0, 100.0), Vec::new()),
+            test_command(
+                EglRect::new(0.0, 0.0, 100.0, 100.0),
+                vec![EglRect::new(0.0, 0.0, 100.0, 100.0)],
+            ),
+        ];
+        let mut decisions = Vec::new();
+        let stats = plan_capture_visibility(
+            &commands,
+            &[0],
+            EglRect::new(0.0, 0.0, 100.0, 100.0),
+            &mut decisions,
+        );
+        assert_eq!(
+            decisions,
+            vec![
+                EglVisibilityDecision::Drawable,
+                EglVisibilityDecision::Occluded
+            ]
+        );
+        assert_eq!(stats.commands_drawable, 1);
     }
 
     #[test]

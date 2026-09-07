@@ -37,13 +37,13 @@ pub(crate) use damage::{
 };
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
-    RenderExecution, RepaintPlan,
+    RenderExecution, RepaintPlan, merge_effect_damage,
 };
 use effects::{EffectGlResourceCache, ShaderProgramCache};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
-    MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_visibility, push_draw_command,
-    push_draw_command_with_uv, surface_sampling_for_plan,
+    MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_capture_visibility,
+    plan_visibility, push_draw_command, push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use program::create_texture_program;
 
@@ -619,14 +619,6 @@ impl GlesSceneRenderer {
             framebuffer_origin,
         );
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
-        let plan = self.repaint_planner.plan(output_damage, buffer_age);
-        if plan.mode == RepaintMode::Skip {
-            self.record_repaint_stats(&plan);
-            return Ok(EglFrameOutcome::Skipped {
-                reason: FrameSkipReason::NoLogicalDamage,
-                stats: self.frame_stats,
-            });
-        }
         let output_bounds = EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
         let execution_plan = compile_frame_execution_plan(
@@ -639,6 +631,20 @@ impl GlesSceneRenderer {
             self.frame_stats.effect_fallbacks = self.frame_stats.effect_fallbacks.saturating_add(1);
             FrameExecutionPlan::LegacyScene
         });
+        let output_damage = match &execution_plan {
+            FrameExecutionPlan::LegacyScene => output_damage,
+            FrameExecutionPlan::EffectGraph(graph) => {
+                merge_effect_damage(output_damage, &graph.final_damage, width, height)
+            }
+        };
+        let plan = self.repaint_planner.plan(output_damage, buffer_age);
+        if plan.mode == RepaintMode::Skip {
+            self.record_repaint_stats(&plan);
+            return Ok(EglFrameOutcome::Skipped {
+                reason: FrameSkipReason::NoLogicalDamage,
+                stats: self.frame_stats,
+            });
+        }
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -1615,13 +1621,23 @@ impl GlesSceneRenderer {
         scissor: OutputRect,
     ) -> RendererResult<()> {
         let saved_visibility = std::mem::take(&mut self.scene_visibility_plan);
-        self.scene_visibility_plan = vec![EglVisibilityDecision::Occluded; self.commands.len()];
-        for &index in command_indices {
-            if let Some(decision) = self.scene_visibility_plan.get_mut(index) {
-                *decision = EglVisibilityDecision::Drawable;
-            }
-        }
+        let repair = EglRect::new(
+            scissor.x as f32,
+            scissor.y as f32,
+            scissor.width as f32,
+            scissor.height as f32,
+        );
+        let capture_stats = plan_capture_visibility(
+            &self.commands,
+            command_indices,
+            repair,
+            &mut self.scene_visibility_plan,
+        );
         let result = self.draw_command_batch_with_visibility(true, Some(scissor), false);
+        self.frame_stats.planner_commands_visited = self
+            .frame_stats
+            .planner_commands_visited
+            .saturating_add(capture_stats.commands_visited);
         self.scene_visibility_plan = saved_visibility;
         result
     }
