@@ -6,5 +6,6 @@ mod resources;
 mod shader_cache;
 
 pub(crate) use executor::execute_effect_graph;
+pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
 pub(crate) use resources::EffectGlResourceCache;
 pub(crate) use shader_cache::ShaderProgramCache;

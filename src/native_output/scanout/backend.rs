@@ -227,12 +227,50 @@ impl NativePaintStats {
                 NativePerfField::bool("egl_swap_succeeded", rendered),
                 NativePerfField::bool("gbm_front_buffer_locked", rendered),
                 NativePerfField::bool("ready_frame_created", rendered),
+                NativePerfField::usize(
+                    "effect_instances_visible",
+                    repaint.effect_instances_visible,
+                ),
+                NativePerfField::usize(
+                    "effect_instances_executed",
+                    repaint.effect_instances_executed,
+                ),
+                NativePerfField::usize(
+                    "effect_instances_cache_hit",
+                    repaint.effect_instances_cache_hit,
+                ),
+                NativePerfField::usize("effect_instances_failed", repaint.effect_instances_failed),
+                NativePerfField::usize("render_graph_passes", repaint.render_graph_passes),
+                NativePerfField::usize(
+                    "render_graph_peak_live_textures",
+                    repaint.render_graph_peak_live_textures,
+                ),
+                NativePerfField::u64("effect_capture_pixels", repaint.effect_capture_pixels),
+                NativePerfField::u64("effect_output_pixels", repaint.effect_output_pixels),
+                NativePerfField::usize("blur_downsample_passes", repaint.blur_downsample_passes),
+                NativePerfField::usize("blur_upsample_passes", repaint.blur_upsample_passes),
+                NativePerfField::usize(
+                    "effect_resource_allocations",
+                    repaint.effect_resource_allocations,
+                ),
+                NativePerfField::usize("effect_resource_reuses", repaint.effect_resource_reuses),
+                NativePerfField::usize(
+                    "effect_resource_evictions",
+                    repaint.effect_resource_evictions,
+                ),
+                NativePerfField::u64("effect_gpu_cache_bytes", repaint.effect_gpu_cache_bytes),
             ]);
             if let Some(age) = repaint.buffer_age {
                 fields.push(NativePerfField::u64("egl_buffer_age", u64::from(age)));
             }
             if let Some(reason) = repaint.fallback_reason {
                 fields.push(NativePerfField::str("full_repaint_reason", reason.as_str()));
+            }
+            if let Some(reason) = repaint.effect_failure_reason {
+                fields.push(NativePerfField::str(
+                    "effect_failure_reason",
+                    reason.as_str(),
+                ));
             }
         }
         fields

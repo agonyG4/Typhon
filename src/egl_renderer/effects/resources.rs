@@ -111,6 +111,8 @@ pub struct EffectResourcePool {
     next_id: u64,
     clock: u64,
     evicted_ids: Vec<u64>,
+    allocation_count: usize,
+    reuse_count: usize,
 }
 
 impl EffectResourcePool {
@@ -131,6 +133,8 @@ impl EffectResourcePool {
             next_id: 1,
             clock: 0,
             evicted_ids: Vec::new(),
+            allocation_count: 0,
+            reuse_count: 0,
         })
     }
 
@@ -147,6 +151,7 @@ impl EffectResourcePool {
         {
             texture.checked_out = true;
             texture.last_used = self.clock;
+            self.reuse_count = self.reuse_count.saturating_add(1);
             return Ok(texture.clone());
         }
 
@@ -177,6 +182,7 @@ impl EffectResourcePool {
         self.textures.entry(key).or_default().push(texture.clone());
         self.current_bytes = new_current;
         self.peak_bytes = self.peak_bytes.max(new_current);
+        self.allocation_count = self.allocation_count.saturating_add(1);
         Ok(texture)
     }
 
@@ -255,6 +261,8 @@ impl EffectResourcePool {
             cached_texture_count,
             checked_out_texture_count,
             eviction_count: self.evicted_ids.len(),
+            allocation_count: self.allocation_count,
+            reuse_count: self.reuse_count,
         }
     }
 
@@ -830,5 +838,18 @@ mod tests {
             stats: Default::default(),
         };
         assert!(estimate_graph_peak_bytes(&graph).unwrap() < DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn resource_metrics_distinguish_allocations_from_reuses() {
+        let mut pool = EffectResourcePool::new();
+        let texture = pool.checkout(key(16, 16)).unwrap();
+        assert_eq!(pool.metrics().allocation_count, 1);
+        assert_eq!(pool.metrics().reuse_count, 0);
+        pool.return_texture(texture).unwrap();
+        let reused = pool.checkout(key(16, 16)).unwrap();
+        assert_eq!(pool.metrics().allocation_count, 1);
+        assert_eq!(pool.metrics().reuse_count, 1);
+        pool.return_texture(reused).unwrap();
     }
 }

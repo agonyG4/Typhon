@@ -40,7 +40,10 @@ use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
     RenderExecution, RepaintPlan, merge_effect_damage,
 };
-use effects::{EffectGlResourceCache, ShaderProgramCache};
+use effects::{
+    EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
+    graph_metrics,
+};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
     MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_capture_visibility,
@@ -118,6 +121,21 @@ pub(crate) struct GlesSceneFrameStats {
     pub partial_repaint_enabled: bool,
     pub contradictory_empty_damage: bool,
     pub orphan_decoration_count: u32,
+    pub effect_instances_visible: usize,
+    pub effect_instances_executed: usize,
+    pub effect_instances_cache_hit: usize,
+    pub effect_instances_failed: usize,
+    pub render_graph_passes: usize,
+    pub render_graph_peak_live_textures: usize,
+    pub effect_capture_pixels: u64,
+    pub effect_output_pixels: u64,
+    pub blur_downsample_passes: usize,
+    pub blur_upsample_passes: usize,
+    pub effect_resource_allocations: usize,
+    pub effect_resource_reuses: usize,
+    pub effect_resource_evictions: usize,
+    pub effect_gpu_cache_bytes: u64,
+    pub effect_failure_reason: Option<EffectFailureReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,6 +574,11 @@ impl GlesSceneRenderer {
         }
         self.frame_stats = GlesSceneFrameStats::default();
         self.ensure_output_size(width, height)?;
+        self.frame_stats.effect_instances_visible = effects
+            .instances
+            .iter()
+            .filter(|instance| !instance.region.is_empty())
+            .count();
         self.ensure_frame_resources()?;
         self.ensure_decoration_resources(egl, egl_display, decoration_instances)?;
         if scaled_visual_state.cursor.is_some() {
@@ -664,16 +687,26 @@ impl GlesSceneRenderer {
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let output_bounds = EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
-        let execution_plan = compile_frame_execution_plan(
+        let execution_plan = match compile_frame_execution_plan(
             effects,
             &effect_source_damage,
             output_bounds,
             &self.effect_registry,
-        )
-        .unwrap_or_else(|_| {
-            self.frame_stats.effect_fallbacks = self.frame_stats.effect_fallbacks.saturating_add(1);
-            FrameExecutionPlan::LegacyScene
-        });
+        ) {
+            Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
+            Ok(FrameExecutionPlan::EffectGraph(graph)) => {
+                self.record_effect_graph_metrics(graph_metrics(&graph));
+                FrameExecutionPlan::EffectGraph(graph)
+            }
+            Err(_) => {
+                self.frame_stats.effect_fallbacks =
+                    self.frame_stats.effect_fallbacks.saturating_add(1);
+                self.frame_stats.effect_instances_failed =
+                    self.frame_stats.effect_instances_visible;
+                self.frame_stats.effect_failure_reason = Some(EffectFailureReason::GraphCompile);
+                FrameExecutionPlan::LegacyScene
+            }
+        };
         let output_damage = match &execution_plan {
             FrameExecutionPlan::LegacyScene => output_damage,
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -682,6 +715,7 @@ impl GlesSceneRenderer {
         };
         let plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
+            self.record_effect_resource_metrics();
             self.record_repaint_stats(&plan);
             return Ok(EglFrameOutcome::Skipped {
                 reason: FrameSkipReason::NoLogicalDamage,
@@ -692,10 +726,19 @@ impl GlesSceneRenderer {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
                 match effects::execute_effect_graph(self, &graph, framebuffer_origin, &plan) {
-                    Ok(_) => Ok(()),
-                    Err(_) => {
+                    Ok(execution_stats) => {
+                        self.frame_stats.effect_instances_executed = graph.stats.effect_instances;
+                        self.frame_stats.blur_downsample_passes = execution_stats.blur_downsamples;
+                        self.frame_stats.blur_upsample_passes = execution_stats.blur_upsamples;
+                        Ok(())
+                    }
+                    Err(error) => {
                         self.frame_stats.effect_fallbacks =
                             self.frame_stats.effect_fallbacks.saturating_add(1);
+                        self.frame_stats.effect_instances_failed =
+                            self.frame_stats.effect_instances_visible;
+                        self.frame_stats.effect_failure_reason =
+                            Some(EffectFailureReason::from_error(error.as_ref()));
                         self.draw_textured_layers(&plan, framebuffer_origin)
                     }
                 }
@@ -705,6 +748,7 @@ impl GlesSceneRenderer {
             self.repaint_planner.invalidate();
             return Err(error);
         }
+        self.record_effect_resource_metrics();
         self.record_repaint_stats(&plan);
         Ok(EglFrameOutcome::Rendered {
             commit: EglSceneFrameCommit {
@@ -750,6 +794,22 @@ impl GlesSceneRenderer {
         self.frame_stats.fallback_reason = plan.fallback_reason;
         self.frame_stats.partial_repaint_enabled = self.repaint_planner.partial_enabled();
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
+    }
+
+    fn record_effect_graph_metrics(&mut self, metrics: EffectGraphMetrics) {
+        self.frame_stats.effect_instances_visible = metrics.instances;
+        self.frame_stats.render_graph_passes = metrics.passes;
+        self.frame_stats.render_graph_peak_live_textures = metrics.peak_live_textures;
+        self.frame_stats.effect_capture_pixels = metrics.capture_pixels;
+        self.frame_stats.effect_output_pixels = metrics.output_pixels;
+    }
+
+    fn record_effect_resource_metrics(&mut self) {
+        let metrics = self.effect_resources.metrics();
+        self.frame_stats.effect_resource_allocations = metrics.allocation_count;
+        self.frame_stats.effect_resource_reuses = metrics.reuse_count;
+        self.frame_stats.effect_resource_evictions = metrics.eviction_count;
+        self.frame_stats.effect_gpu_cache_bytes = metrics.current_bytes;
     }
 
     fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {

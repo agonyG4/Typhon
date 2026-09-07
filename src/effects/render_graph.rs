@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU16};
+use std::{collections::HashMap, fmt::Write as _, num::NonZeroU16};
 
 use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene};
 
@@ -138,6 +138,103 @@ pub struct CompiledFrameGraph {
     pub textures: Vec<GraphTexturePlan>,
     pub final_damage: EffectRegion,
     pub stats: RenderGraphCompileStats,
+}
+
+impl CompiledFrameGraph {
+    /// Returns a bounded, deterministic description suitable for diagnostics.
+    /// It names logical stages and allocation geometry but never includes shader
+    /// source or user-provided uniform values.
+    pub fn explain(&self) -> String {
+        let capture_pixels = self
+            .textures
+            .iter()
+            .filter(|texture| {
+                matches!(
+                    texture.source,
+                    GraphTextureSource::CapturedScene | GraphTextureSource::CapturedTarget
+                )
+            })
+            .map(|texture| u64::from(texture.width).saturating_mul(u64::from(texture.height)))
+            .sum::<u64>();
+        let output_pixels = self
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::Output)
+            .map_or(0, |texture| {
+                u64::from(texture.width).saturating_mul(u64::from(texture.height))
+            });
+        let mut explanation = format!(
+            "effects graph: instances={} passes={} textures={} peak_live={} capture_px={} output_px={}\n",
+            self.stats.effect_instances,
+            self.stats.passes,
+            self.stats.textures,
+            self.stats.peak_live_intermediates,
+            capture_pixels,
+            output_pixels,
+        );
+        for (index, pass) in self.passes.iter().enumerate() {
+            let _ = write!(
+                explanation,
+                "  #{index} {} instance={} anchor={} ",
+                pass_label(pass),
+                pass.instance.get(),
+                anchor_label(pass.anchor),
+            );
+            if let Some(input) = pass.inputs.first() {
+                let _ = write!(explanation, "input=t{} ", input.get());
+            }
+            if pass.inputs.len() > 1 {
+                let _ = write!(explanation, "inputs={} ", pass.inputs.len());
+            }
+            if let Some(output) = pass.output {
+                let _ = write!(explanation, "output=t{} ", output.get());
+                if let Some(texture) = self.textures.iter().find(|texture| texture.id == output) {
+                    let _ = write!(explanation, "size={}x{} ", texture.width, texture.height);
+                }
+            }
+            if let Some(radius) = pass.blur_radius {
+                let _ = write!(explanation, "radius={radius} ");
+            }
+            explanation.push('\n');
+        }
+        explanation
+    }
+}
+
+fn pass_label(pass: &CompiledRenderPass) -> &'static str {
+    match pass.kind {
+        RenderPassKind::SceneCapture => "capture_scene",
+        RenderPassKind::SurfaceCapture => "capture_target",
+        RenderPassKind::DualKawaseDownsample => "kawase_down",
+        RenderPassKind::DualKawaseUpsample => "kawase_up",
+        RenderPassKind::Fragment => pass.stage.as_ref().map_or("fragment", node_label),
+        RenderPassKind::Blend => "blend",
+        RenderPassKind::Mask => "mask",
+        RenderPassKind::Composite => "composite",
+        RenderPassKind::OutputPostProcess => "output_post_process",
+    }
+}
+
+fn node_label(node: &EffectNodeKind) -> &'static str {
+    match node {
+        EffectNodeKind::Source(_) => "source",
+        EffectNodeKind::DualKawaseBlur(_) => "kawase",
+        EffectNodeKind::ColorMatrix(_) => "color_matrix",
+        EffectNodeKind::Tint(_) => "tint",
+        EffectNodeKind::Noise(_) => "noise",
+        EffectNodeKind::CustomFragment(_) => "custom",
+        EffectNodeKind::Blend(_) => "blend",
+        EffectNodeKind::Mask(_) => "mask",
+    }
+}
+
+fn anchor_label(anchor: EffectAnchor) -> String {
+    match anchor {
+        EffectAnchor::BeforeSurface(id) => format!("before_surface={id}"),
+        EffectAnchor::ReplaceSurface(id) => format!("replace_surface={id}"),
+        EffectAnchor::AfterSurface(id) => format!("after_surface={id}"),
+        EffectAnchor::OutputPostProcess => "output_post_process".to_owned(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -837,6 +934,29 @@ mod tests {
             .find(|texture| texture.source == GraphTextureSource::CapturedScene)
             .unwrap();
         assert_eq!(capture.domain, EffectRect::new(76, 56, 368, 228).unwrap());
+    }
+
+    #[test]
+    fn graph_explanation_is_deterministic_and_source_free() {
+        let (scene, registry) = blur_scene();
+        let plan = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("visible effects must compile to an effect graph");
+        };
+        let explanation = graph.explain();
+        assert_eq!(explanation, graph.explain());
+        assert!(explanation.starts_with(
+            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=2073600\n"
+        ));
+        assert!(explanation.contains("capture_scene"));
+        assert!(explanation.contains("kawase_down"));
+        assert!(!explanation.contains("#version"));
     }
 
     #[test]
