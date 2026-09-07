@@ -39,6 +39,7 @@ use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
     RenderExecution, RepaintPlan,
 };
+use effects::EffectGlResourceCache;
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
     MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_visibility, push_draw_command,
@@ -235,6 +236,7 @@ pub(crate) struct GlesSceneRenderer {
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
+    effect_resources: EffectGlResourceCache,
     effect_registry: EffectRegistry,
     frame_stats: GlesSceneFrameStats,
 }
@@ -360,6 +362,7 @@ impl GlesSceneRenderer {
                 (width, height),
                 partial_repaint_capabilities,
             ),
+            effect_resources: EffectGlResourceCache::new(),
             effect_registry: EffectRegistry::empty(),
             frame_stats: GlesSceneFrameStats::default(),
         })
@@ -599,6 +602,8 @@ impl GlesSceneRenderer {
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
+                self.effect_resources.prepare_graph(&self.gl, &graph)?;
+                let _resource_metrics = self.effect_resources.metrics();
                 effects::execute_semantic_graph(&graph)?;
                 self.draw_textured_layers(&plan, framebuffer_origin)
             }

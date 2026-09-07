@@ -89,7 +89,7 @@ typed_id!(EffectParameterId, u16, NonZeroU16);
 typed_id!(ShaderModuleId, u64, NonZeroU64);
 typed_id!(StaticTextureId, u64, NonZeroU64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EffectWorkingSpace {
     OutputEncodedSrgb,
     LinearSrgb,
