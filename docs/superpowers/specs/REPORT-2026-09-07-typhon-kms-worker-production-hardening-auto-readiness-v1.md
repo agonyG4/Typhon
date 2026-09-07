@@ -2,9 +2,10 @@
 
 Date: 2026-09-07
 
-Status: completion-lane hardening implemented and committed; final repository
-verification is blocked by unrelated unstaged edits in the shared checkout;
-physical DRM qualification remains pending. The worker default remains `off`.
+Status: completion-lane hardening implemented and committed; all 42 KMS-worker
+tests pass. Repository-wide format, clippy, and all-target test gates remain
+affected by unrelated unstaged edits in the shared checkout; physical DRM
+qualification remains pending. The worker default remains `off`.
 
 ## Outcome
 
@@ -18,6 +19,9 @@ Implementation commits:
 - `220fc98` — completion-lane design and implementation plan;
 - `2add594` — lossless KMS worker completion publication and deterministic
   regression tests.
+- `05d2116` — chain the fatal regression job from the preceding successful
+  submission so the scripted panic is exercised rather than validation-
+  invalidated.
 
 The accepted baseline remains present and was not modified:
 
@@ -134,13 +138,13 @@ Added to `src/native_output/kms_worker/tests.rs`:
 - `completion_drain_is_one_shot_and_does_not_duplicate_settlement` checks exact
   `Submitted`/`Quiesced` counts and an empty second drain.
 
-The tests were added before the production queue change. The requested RED run
-was attempted, but the binary test target could not compile because unrelated
-unstaged effect/frame edits in the shared checkout were already incomplete.
-After the worker test helper corrections, the focused compile reports only the
-pre-existing `Option<f32>: Eq` error in `src/effects/render_graph.rs`; no KMS
-worker compile error remains in that attempt. Since the target cannot execute,
-no green KMS test result is claimed here.
+The requested RED run was attempted before the production queue change. The
+initial repository-wide compile was blocked by unrelated unstaged effect/frame
+edits in the shared checkout. The follow-up fatal-test failure was then traced
+to the test itself leaving job 10 on the helper's default `Presented` base after
+job 9 had established a bundle; job 10 was correctly invalidated and never
+reached the scripted panic. Commit `05d2116` makes job 10 explicitly depend on
+job 9. The focused fatal test and the complete KMS-worker test suite now pass.
 
 ## Lock-order and ownership review
 
@@ -199,21 +203,27 @@ rtk rustfmt --edition 2024 --check \
 rtk git diff --check                           PASS
 ```
 
-The required repository gates were run after the final worker change and are
-blocked before execution by unrelated unstaged work:
+The required repository gates were run after the final worker change. Current
+results are:
 
 | Command | Result | Blocking evidence |
 |---|---|---|
-| `rtk cargo fmt --check` | BLOCKED | rustfmt differences in unstaged compositor/effects files |
-| `rtk cargo check --locked --all-targets` | BLOCKED | `src/effects/render_graph.rs:119`: `Option<f32>` cannot implement `Eq` |
-| `rtk cargo clippy --locked --all-targets -- -D warnings` | BLOCKED | same unrelated `Eq` compile error |
-| `rtk cargo test --locked --all-targets` | BLOCKED | same unrelated compile error before tests |
-| focused KMS worker/presentation/pageflip/session/shutdown suites | BLOCKED | bin test target cannot compile the unrelated dirty effect code |
+| `rtk cargo fmt --check` | BLOCKED | rustfmt differences in concurrently edited `src/compositor/tests/xwayland.rs` |
+| `rtk cargo check --locked --all-targets` | PASS | no compile errors |
+| `rtk cargo clippy --locked --all-targets -- -D warnings` | BLOCKED | unrelated `clippy::too_many_arguments` at `src/effects/render_graph.rs:277` |
+| `rtk cargo test --locked --all-targets` | BLOCKED | 2 unrelated compositor test failures; 2153 passed and 2 ignored |
+| `rtk cargo test --locked --bin oblivion-one native_output::kms_worker::tests` | PASS | 42 passed, 1227 filtered |
 
 The dirty files were not staged, modified, reset, or discarded. They include
-unstaged compositor test support, effects/render graph, EGL effect tests, and
-native repaint tests. This report therefore does not represent the repository
-as fully green.
+unstaged compositor state/tests and support, effects/render graph, EGL effect
+tests, and native repaint tests. This report therefore does not represent the
+repository as fully green. The two all-target failures were:
+
+- `compositor::state::desktop_window_tests::moving_between_regular_and_special_marks_presence_dirty`;
+- `compositor::tests::workspace::wire_visibility_is_atomic_and_independent_of_astrea_manager`.
+
+They are outside the KMS worker change and were already part of the shared
+checkout's concurrent dirty work.
 
 ## Physical qualification and readiness
 
