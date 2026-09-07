@@ -1293,8 +1293,13 @@ fn fatal_publication_does_not_wait_for_undrained_completion_results() {
         predecessor = Some(identity);
     }
 
-    reserve_for_test(&handle, test_job(10).kind)
-        .enqueue(test_job(10))
+    let mut fatal_job = test_job(10);
+    fatal_job.validation_base =
+        KmsValidationBase::Predecessor(predecessor.expect(
+            "the ninth successful submission establishes the predecessor for the fatal job",
+        ));
+    reserve_for_test(&handle, fatal_job.kind)
+        .enqueue(fatal_job)
         .unwrap();
     for _ in 0..10_000 {
         if handle.fatal_reason().is_some() {
