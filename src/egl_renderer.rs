@@ -259,6 +259,8 @@ pub(crate) struct GlesSceneRenderer {
     repaint_planner: PartialRepaintPlanner,
     effect_resources: EffectGlResourceCache,
     effect_registry: EffectRegistry,
+    effect_registry_generation: u64,
+    failed_effect_generation: Option<u64>,
     effect_shaders: ShaderProgramCache,
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
     active_output_framebuffer: Option<glow::Framebuffer>,
@@ -399,6 +401,8 @@ impl GlesSceneRenderer {
             ),
             effect_resources: EffectGlResourceCache::new(),
             effect_registry: EffectRegistry::with_builtin_background_blur(),
+            effect_registry_generation: 1,
+            failed_effect_generation: None,
             effect_shaders,
             effect_quad: None,
             active_output_framebuffer: None,
@@ -435,6 +439,8 @@ impl GlesSceneRenderer {
     #[allow(dead_code)] // Populated by the trusted registry reload boundary.
     pub(crate) fn set_effect_registry(&mut self, registry: EffectRegistry) {
         self.effect_registry = registry;
+        self.effect_registry_generation = self.effect_registry_generation.saturating_add(1);
+        self.failed_effect_generation = None;
         self.invalidate_presented_damage_history();
     }
 
@@ -445,15 +451,35 @@ impl GlesSceneRenderer {
         &mut self,
         generation: EffectRegistryGeneration,
     ) -> Result<(), RegistryReloadError> {
-        for shader in generation.shaders.values() {
-            self.effect_shaders
-                .prewarm_trusted_custom(&self.gl, shader)
-                .map_err(|error| RegistryReloadError::ShaderCompile {
-                    module: shader.module,
+        let mut next_shaders =
+            ShaderProgramCache::new(128).expect("stable default shader cache capacity is non-zero");
+        let compile_result = (|| {
+            next_shaders.prewarm_builtins(&self.gl).map_err(|error| {
+                RegistryReloadError::ShaderCompile {
+                    module: oblivion_one::effects::ShaderModuleId::new(1001)
+                        .expect("builtin shader ids are non-zero"),
                     log: error.to_string(),
-                })?;
+                }
+            })?;
+            for shader in generation.shaders.values() {
+                next_shaders
+                    .prewarm_trusted_custom(&self.gl, shader)
+                    .map_err(|error| RegistryReloadError::ShaderCompile {
+                        module: shader.module,
+                        log: error.to_string(),
+                    })?;
+            }
+            Ok::<(), RegistryReloadError>(())
+        })();
+        if let Err(error) = compile_result {
+            next_shaders.clear(&self.gl);
+            return Err(error);
         }
+        self.effect_shaders.clear(&self.gl);
+        self.effect_shaders = next_shaders;
         self.effect_registry = generation.registry;
+        self.effect_registry_generation = generation.generation;
+        self.failed_effect_generation = None;
         self.invalidate_presented_damage_history();
         Ok(())
     }
@@ -687,24 +713,36 @@ impl GlesSceneRenderer {
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let output_bounds = EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
-        let execution_plan = match compile_frame_execution_plan(
-            effects,
-            &effect_source_damage,
-            output_bounds,
-            &self.effect_registry,
-        ) {
-            Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
-            Ok(FrameExecutionPlan::EffectGraph(graph)) => {
-                self.record_effect_graph_metrics(graph_metrics(&graph));
-                FrameExecutionPlan::EffectGraph(graph)
-            }
-            Err(_) => {
-                self.frame_stats.effect_fallbacks =
-                    self.frame_stats.effect_fallbacks.saturating_add(1);
-                self.frame_stats.effect_instances_failed =
-                    self.frame_stats.effect_instances_visible;
-                self.frame_stats.effect_failure_reason = Some(EffectFailureReason::GraphCompile);
-                FrameExecutionPlan::LegacyScene
+        let execution_plan = if self.failed_effect_generation
+            == Some(self.effect_registry_generation)
+            && self.frame_stats.effect_instances_visible != 0
+        {
+            self.frame_stats.effect_fallbacks = self.frame_stats.effect_fallbacks.saturating_add(1);
+            self.frame_stats.effect_instances_failed = self.frame_stats.effect_instances_visible;
+            self.frame_stats.effect_failure_reason = Some(EffectFailureReason::GraphCompile);
+            FrameExecutionPlan::LegacyScene
+        } else {
+            match compile_frame_execution_plan(
+                effects,
+                &effect_source_damage,
+                output_bounds,
+                &self.effect_registry,
+            ) {
+                Ok(FrameExecutionPlan::LegacyScene) => FrameExecutionPlan::LegacyScene,
+                Ok(FrameExecutionPlan::EffectGraph(graph)) => {
+                    self.record_effect_graph_metrics(graph_metrics(&graph));
+                    FrameExecutionPlan::EffectGraph(graph)
+                }
+                Err(_) => {
+                    self.frame_stats.effect_fallbacks =
+                        self.frame_stats.effect_fallbacks.saturating_add(1);
+                    self.frame_stats.effect_instances_failed =
+                        self.frame_stats.effect_instances_visible;
+                    self.frame_stats.effect_failure_reason =
+                        Some(EffectFailureReason::GraphCompile);
+                    self.failed_effect_generation = Some(self.effect_registry_generation);
+                    FrameExecutionPlan::LegacyScene
+                }
             }
         };
         let output_damage = match &execution_plan {
@@ -739,6 +777,11 @@ impl GlesSceneRenderer {
                             self.frame_stats.effect_instances_visible;
                         self.frame_stats.effect_failure_reason =
                             Some(EffectFailureReason::from_error(error.as_ref()));
+                        if self.frame_stats.effect_failure_reason
+                            == Some(EffectFailureReason::ShaderUnavailable)
+                        {
+                            self.failed_effect_generation = Some(self.effect_registry_generation);
+                        }
                         self.draw_textured_layers(&plan, framebuffer_origin)
                     }
                 }
@@ -820,6 +863,7 @@ impl GlesSceneRenderer {
         self.current_size = (width, height);
         self.repaint_planner.resize((width, height));
         self.scene_cache_key = None;
+        self.effect_resources.cleanup_size_history(&self.gl);
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
         }

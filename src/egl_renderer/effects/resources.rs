@@ -206,12 +206,21 @@ impl EffectResourcePool {
     }
 
     #[allow(dead_code)]
-    pub fn cleanup_size_history(&mut self) {
+    pub fn cleanup_size_history(&mut self) -> Vec<u64> {
+        let mut removed = Vec::new();
         self.textures.retain(|_, textures| {
-            textures.retain(|texture| texture.checked_out);
+            textures.retain(|texture| {
+                if texture.checked_out {
+                    true
+                } else {
+                    removed.push(texture.id);
+                    false
+                }
+            });
             !textures.is_empty()
         });
         self.recalculate_current_bytes();
+        removed
     }
 
     #[allow(dead_code)]
@@ -528,6 +537,14 @@ impl EffectGlResourceCache {
 
     pub(crate) fn metrics(&self) -> EffectResourceMetrics {
         self.pool.metrics()
+    }
+
+    pub(crate) fn cleanup_size_history(&mut self, gl: &glow::Context) {
+        for id in self.pool.cleanup_size_history() {
+            if let Some(texture) = self.gl_textures.remove(&id) {
+                unsafe { gl.delete_texture(texture) };
+            }
+        }
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
@@ -851,5 +868,18 @@ mod tests {
         assert_eq!(pool.metrics().allocation_count, 1);
         assert_eq!(pool.metrics().reuse_count, 1);
         pool.return_texture(reused).unwrap();
+    }
+
+    #[test]
+    fn cleanup_size_history_removes_idle_dimensions_but_preserves_live_textures() {
+        let mut pool = EffectResourcePool::new();
+        let old = pool.checkout(key(64, 64)).unwrap();
+        pool.return_texture(old.clone()).unwrap();
+        let live = pool.checkout(key(32, 32)).unwrap();
+        let removed = pool.cleanup_size_history();
+        assert_eq!(removed, vec![old.id]);
+        assert_eq!(pool.cached_key_count(), 1);
+        assert!(pool.is_checked_out(live.id));
+        pool.return_texture(live).unwrap();
     }
 }
