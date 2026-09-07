@@ -9,7 +9,8 @@ use std::{
 use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::effects::{
-    EffectRect, EffectRegion, EffectRegistry, FrameExecutionPlan, compile_frame_execution_plan,
+    EffectRect, EffectRegion, EffectRegistry, EffectRegistryGeneration, FrameExecutionPlan,
+    RegistryReloadError, compile_frame_execution_plan,
 };
 use oblivion_one::{
     compositor::{
@@ -417,6 +418,26 @@ impl GlesSceneRenderer {
     pub(crate) fn set_effect_registry(&mut self, registry: EffectRegistry) {
         self.effect_registry = registry;
         self.invalidate_presented_damage_history();
+    }
+
+    /// Compile all custom modules at the active compositor GL boundary before
+    /// making their complete validated generation visible to frame execution.
+    #[allow(dead_code)]
+    pub(crate) fn publish_effect_registry_generation(
+        &mut self,
+        generation: EffectRegistryGeneration,
+    ) -> Result<(), RegistryReloadError> {
+        for shader in generation.shaders.values() {
+            self.effect_shaders
+                .prewarm_trusted_custom(&self.gl, shader)
+                .map_err(|error| RegistryReloadError::ShaderCompile {
+                    module: shader.module,
+                    log: error.to_string(),
+                })?;
+        }
+        self.effect_registry = generation.registry;
+        self.invalidate_presented_damage_history();
+        Ok(())
     }
 
     fn ensure_effect_quad(&mut self) -> RendererResult<(GlVertexArray, GlBuffer)> {

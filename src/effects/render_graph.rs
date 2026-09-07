@@ -2,11 +2,12 @@ use std::{collections::HashMap, num::NonZeroU16};
 
 use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene};
 
+use super::registry::EffectRegistry;
 use super::{
     DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectInstanceId,
     EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId,
     EffectRect, EffectRegion, EffectSource, EffectValidationError, EffectWorkingSpace,
-    MAX_EFFECT_PROGRAMS, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
+    ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -140,52 +141,6 @@ pub struct CompiledFrameGraph {
 pub enum FrameExecutionPlan {
     LegacyScene,
     EffectGraph(CompiledFrameGraph),
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct EffectRegistry {
-    programs: HashMap<EffectProgramId, ValidatedEffectProgram>,
-}
-
-impl EffectRegistry {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn with_builtin_background_blur() -> Self {
-        let mut registry = Self::empty();
-        registry
-            .insert(builtin_background_blur_program())
-            .expect("builtin effect registry has capacity");
-        registry
-    }
-
-    pub fn insert(&mut self, program: ValidatedEffectProgram) -> Result<(), EffectRegistryError> {
-        if self.programs.len() >= MAX_EFFECT_PROGRAMS
-            && !self.programs.contains_key(&program.program.id)
-        {
-            return Err(EffectRegistryError::Full);
-        }
-        self.programs.insert(program.program.id, program);
-        Ok(())
-    }
-
-    pub fn get(&self, id: EffectProgramId) -> Option<&ValidatedEffectProgram> {
-        self.programs.get(&id)
-    }
-
-    pub fn len(&self) -> usize {
-        self.programs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.programs.is_empty()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EffectRegistryError {
-    Full,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

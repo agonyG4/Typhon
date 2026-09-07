@@ -212,6 +212,18 @@ impl ShaderProgramCache {
         self.get_or_compile(gl, key, vertex_source, fragment_source)
     }
 
+    pub(crate) fn prewarm_trusted_custom(
+        &mut self,
+        gl: &glow::Context,
+        asset: &oblivion_one::effects::TrustedShaderAsset,
+    ) -> RendererResult<()> {
+        let fragment =
+            generate_fragment_wrapper(&asset.source, &asset.uniforms).map_err(io::Error::other)?;
+        let key = ShaderProgramKey::new(asset.module, 0, EffectWorkingSpace::LinearSrgb);
+        self.prewarm(gl, key, blur::DUAL_KAWASE_VERTEX_SHADER, &fragment)?;
+        Ok(())
+    }
+
     pub(crate) fn prewarm_builtins(&mut self, gl: &glow::Context) -> RendererResult<()> {
         let vertex = blur::DUAL_KAWASE_VERTEX_SHADER;
         for (module, variant, fragment) in [
