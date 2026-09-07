@@ -35,6 +35,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 .collect(),
             popup_surface_ids.as_ref(),
         );
+        let effects = server.resolved_effect_scene();
         Self {
             surfaces,
             decorations,
@@ -43,7 +44,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation,
             visibility: server.fullscreen_render_plan_metrics(),
             snapshot,
-            effects: server.resolved_effect_scene(),
+            effects,
         }
     }
 
@@ -121,6 +122,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             .fold(EffectRegion::empty(), |damage, instance| {
                 damage.union(&instance.region)
             });
+        snapshot.effect_identity_signature = self.effects.signature;
         snapshot
     }
 
@@ -132,7 +134,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeRepaintInputs {
     // Retained for cycle diagnostics only; accepting a socket is not visual work.
     pub(crate) accepted_clients: bool,
@@ -141,6 +143,8 @@ pub(crate) struct NativeRepaintInputs {
     pub(crate) only_pending_surface_frame_callbacks: bool,
     pub(crate) redraw_requested: bool,
     pub(crate) cursor_work_pending: bool,
+    pub(crate) effect_work_pending: bool,
+    pub(crate) effect_dirty_region: EffectRegion,
     pub(crate) page_flip_pending: bool,
 }
 
@@ -167,10 +171,12 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
         };
     }
 
+    let effect_work_pending = inputs.effect_work_pending || !inputs.effect_dirty_region.is_empty();
     let protocol_only_present = inputs.pending_frame_work
         && inputs.only_pending_surface_frame_callbacks
         && !inputs.render_generation_changed
-        && !inputs.redraw_requested;
+        && !inputs.redraw_requested
+        && !effect_work_pending;
     NativeRepaintDecision {
         // Accepting a socket is protocol progress, not visual work.  The
         // accepted-client bit is retained in the input for diagnostics, but
@@ -179,6 +185,7 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
         repaint: inputs.render_generation_changed
             || inputs.redraw_requested
             || inputs.cursor_work_pending
+            || effect_work_pending
             || (inputs.pending_frame_work && !protocol_only_present),
         protocol_only_present,
     }

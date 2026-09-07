@@ -208,6 +208,7 @@ pub(crate) struct GlesSceneRenderer {
     cursor_image: std::sync::Arc<CompositorCursorImage>,
     gl: glow::Context,
     program: GlProgram,
+    capture_program: GlProgram,
     scene_vertex_array: GlVertexArray,
     scene_vertex_buffer: GlBuffer,
     scene_vertex_buffer_capacity: usize,
@@ -241,6 +242,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_registry: EffectRegistry,
     effect_shaders: ShaderProgramCache,
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
+    active_output_framebuffer: Option<glow::Framebuffer>,
     frame_stats: GlesSceneFrameStats,
 }
 
@@ -291,6 +293,7 @@ impl GlesSceneRenderer {
             })
         };
         let program = create_texture_program(&gl)?;
+        let capture_program = program::create_capture_program(&gl)?;
         let scene_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         let overlay_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
@@ -318,6 +321,11 @@ impl GlesSceneRenderer {
             if let Some(location) = gl.get_uniform_location(program, "u_texture") {
                 gl.uniform_1_i32(Some(&location), 0);
             }
+            gl.use_program(Some(capture_program));
+            if let Some(location) = gl.get_uniform_location(capture_program, "u_texture") {
+                gl.uniform_1_i32(Some(&location), 0);
+            }
+            gl.use_program(Some(program));
             gl.enable(glow::BLEND);
             gl.blend_func_separate(
                 glow::ONE,
@@ -329,9 +337,14 @@ impl GlesSceneRenderer {
             gl.viewport(0, 0, width as i32, height as i32);
         }
 
+        let mut effect_shaders =
+            ShaderProgramCache::new(128).expect("stable default shader cache capacity is non-zero");
+        effect_shaders.prewarm_builtins(&gl)?;
+
         Ok(Self {
             gl,
             program,
+            capture_program,
             scene_vertex_array,
             scene_vertex_buffer,
             scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
@@ -367,9 +380,9 @@ impl GlesSceneRenderer {
             ),
             effect_resources: EffectGlResourceCache::new(),
             effect_registry: EffectRegistry::with_builtin_background_blur(),
-            effect_shaders: ShaderProgramCache::new(128)
-                .expect("stable default shader cache capacity is non-zero"),
+            effect_shaders,
             effect_quad: None,
+            active_output_framebuffer: None,
             frame_stats: GlesSceneFrameStats::default(),
         })
     }
@@ -383,6 +396,13 @@ impl GlesSceneRenderer {
         self.damage_tracker.set_cursor_image(cursor_image);
         self.cursor_resource_stale = true;
         self.repaint_planner.invalidate();
+    }
+
+    pub(crate) fn bind_active_output_framebuffer(&self) {
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::FRAMEBUFFER, self.active_output_framebuffer);
+        }
     }
 
     pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
@@ -462,6 +482,7 @@ impl GlesSceneRenderer {
     ) -> RendererResult<EglFrameOutcome> {
         request.width = target.width;
         request.height = target.height;
+        self.active_output_framebuffer = Some(target.framebuffer);
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
@@ -478,6 +499,7 @@ impl GlesSceneRenderer {
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
+        self.active_output_framebuffer = None;
         result
     }
 
@@ -648,17 +670,12 @@ impl GlesSceneRenderer {
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
-                let base_result = self.draw_textured_layers(&plan, framebuffer_origin);
-                if let Err(error) = base_result {
-                    Err(error)
-                } else {
-                    match effects::execute_effect_graph(self, &graph, framebuffer_origin) {
-                        Ok(_) => Ok(()),
-                        Err(_) => {
-                            self.frame_stats.effect_fallbacks =
-                                self.frame_stats.effect_fallbacks.saturating_add(1);
-                            self.draw_textured_layers(&plan, framebuffer_origin)
-                        }
+                match effects::execute_effect_graph(self, &graph, framebuffer_origin, &plan) {
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        self.frame_stats.effect_fallbacks =
+                            self.frame_stats.effect_fallbacks.saturating_add(1);
+                        self.draw_textured_layers(&plan, framebuffer_origin)
                     }
                 }
             }
@@ -1452,12 +1469,133 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
+    pub(crate) fn begin_effect_repaint(
+        &mut self,
+        plan: &RepaintPlan,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<Vec<OutputRect>> {
+        unsafe {
+            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            self.gl.use_program(Some(self.program));
+            self.gl.active_texture(glow::TEXTURE0);
+        }
+        let execution = plan
+            .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
+            .ok_or_else(|| io::Error::other("effect repaint conversion failed"))?;
+        let mut rects = Vec::new();
+        match execution {
+            RenderExecution::Full => unsafe {
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                rects.push(OutputRect::new(
+                    0,
+                    0,
+                    self.current_size.0,
+                    self.current_size.1,
+                ));
+            },
+            RenderExecution::Scissored { scissors, .. } => unsafe {
+                self.gl.enable(glow::SCISSOR_TEST);
+                for scissor in scissors {
+                    self.gl
+                        .scissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+                    self.gl.clear(glow::COLOR_BUFFER_BIT);
+                    if let Some(rect) =
+                        gl_scissor_to_output_rect(scissor, self.current_size.1, framebuffer_origin)
+                    {
+                        rects.push(rect);
+                    }
+                }
+                self.gl.disable(glow::SCISSOR_TEST);
+            },
+        }
+        Ok(rects)
+    }
+
+    pub(crate) fn draw_effect_scene_range(
+        &mut self,
+        rects: &[OutputRect],
+        start: usize,
+        end: usize,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        let end = end.min(self.commands.len());
+        let start = start.min(end);
+        for rect in rects {
+            let y = match framebuffer_origin {
+                OutputFramebufferOrigin::BottomLeft => self
+                    .current_size
+                    .1
+                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                    as i32,
+                OutputFramebufferOrigin::TopLeftScanout => rect.y,
+            };
+            unsafe {
+                self.gl.use_program(Some(self.program));
+                self.gl.active_texture(glow::TEXTURE0);
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+            }
+            self.draw_command_batch_range(true, Some(*rect), start, end)?;
+        }
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_effect_overlays(
+        &mut self,
+        rects: &[OutputRect],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        for rect in rects {
+            let y = match framebuffer_origin {
+                OutputFramebufferOrigin::BottomLeft => self
+                    .current_size
+                    .1
+                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                    as i32,
+                OutputFramebufferOrigin::TopLeftScanout => rect.y,
+            };
+            unsafe {
+                self.gl.use_program(Some(self.program));
+                self.gl.active_texture(glow::TEXTURE0);
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+            }
+            self.draw_command_batch(false, Some(*rect))?;
+        }
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+        }
+        Ok(())
+    }
+
     fn draw_command_batch(
         &mut self,
         scene: bool,
         scissor: Option<OutputRect>,
     ) -> RendererResult<()> {
-        self.draw_command_batch_with_visibility(scene, scissor, true)
+        self.draw_command_batch_with_visibility_and_range(scene, scissor, true, None, true)
+    }
+
+    fn draw_command_batch_range(
+        &mut self,
+        scene: bool,
+        scissor: Option<OutputRect>,
+        start: usize,
+        end: usize,
+    ) -> RendererResult<()> {
+        self.draw_command_batch_with_visibility_and_range(
+            scene,
+            scissor,
+            false,
+            Some((start, end)),
+            false,
+        )
     }
 
     fn draw_command_batch_with_visibility(
@@ -1465,6 +1603,23 @@ impl GlesSceneRenderer {
         scene: bool,
         scissor: Option<OutputRect>,
         plan_scene_visibility: bool,
+    ) -> RendererResult<()> {
+        self.draw_command_batch_with_visibility_and_range(
+            scene,
+            scissor,
+            plan_scene_visibility,
+            None,
+            true,
+        )
+    }
+
+    fn draw_command_batch_with_visibility_and_range(
+        &mut self,
+        scene: bool,
+        scissor: Option<OutputRect>,
+        plan_scene_visibility: bool,
+        command_range: Option<(usize, usize)>,
+        use_visibility_plan: bool,
     ) -> RendererResult<()> {
         if scene && plan_scene_visibility {
             self.plan_scene_visibility(scissor);
@@ -1537,12 +1692,17 @@ impl GlesSceneRenderer {
         let mut texture_binds = 0;
         let mut draw_calls = 0;
         for (command_index, command) in commands.iter().enumerate() {
+            if command_range
+                .is_some_and(|(start, end)| command_index < start || command_index >= end)
+            {
+                continue;
+            }
             commands_considered += 1;
             if scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
                 commands_rejected_outside_damage += 1;
                 continue;
             }
-            if scene {
+            if scene && use_visibility_plan {
                 match self.scene_visibility_plan[command_index] {
                     EglVisibilityDecision::Drawable => {}
                     EglVisibilityDecision::OutsideRemaining | EglVisibilityDecision::Occluded => {
@@ -1756,6 +1916,7 @@ impl GlesSceneRenderer {
             self.gl.delete_buffer(self.overlay_vertex_buffer);
             self.gl.delete_vertex_array(self.overlay_vertex_array);
             self.gl.delete_program(self.program);
+            self.gl.delete_program(self.capture_program);
         }
     }
 }

@@ -8,6 +8,10 @@ pub(super) fn create_texture_program(gl: &glow::Context) -> RendererResult<GlPro
     create_program_from_sources(gl, EGL_VERTEX_SHADER, EGL_FRAGMENT_SHADER)
 }
 
+pub(super) fn create_capture_program(gl: &glow::Context) -> RendererResult<GlProgram> {
+    create_program_from_sources(gl, CAPTURE_VERTEX_SHADER, EGL_FRAGMENT_SHADER)
+}
+
 pub(super) fn create_program_from_sources(
     gl: &glow::Context,
     vertex_source: &str,
@@ -70,5 +74,25 @@ out vec4 out_color;
 
 void main() {
     out_color = texture(u_texture, v_uv);
+}
+"#;
+
+const CAPTURE_VERTEX_SHADER: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_position;
+layout(location = 1) in vec2 a_uv;
+uniform vec2 u_capture_output_size;
+uniform vec4 u_capture_domain;
+uniform int u_capture_origin_bottom_left;
+out vec2 v_uv;
+
+void main() {
+    vec2 output_pixel = vec2(
+        (a_position.x + 1.0) * 0.5 * u_capture_output_size.x,
+        u_capture_origin_bottom_left != 0
+            ? (1.0 - a_position.y) * 0.5 * u_capture_output_size.y
+            : (a_position.y + 1.0) * 0.5 * u_capture_output_size.y);
+    vec2 local = (output_pixel - u_capture_domain.xy) / u_capture_domain.zw;
+    gl_Position = vec4(local.x * 2.0 - 1.0, 1.0 - local.y * 2.0, 0.0, 1.0);
+    v_uv = a_uv;
 }
 "#;

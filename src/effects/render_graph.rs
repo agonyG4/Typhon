@@ -76,12 +76,20 @@ pub enum GraphTextureSource {
     Static(super::StaticTextureId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphTextureOrigin {
+    BottomLeft,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphTexturePlan {
     pub id: GraphTextureId,
     pub source: GraphTextureSource,
     pub width: u32,
     pub height: u32,
+    pub domain: EffectRect,
+    pub working_space: EffectWorkingSpace,
+    pub origin: GraphTextureOrigin,
     pub first_use: Option<GraphPassId>,
     pub last_use: Option<GraphPassId>,
 }
@@ -99,7 +107,7 @@ pub enum RenderPassKind {
     OutputPostProcess,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompiledRenderPass {
     pub id: GraphPassId,
     pub kind: RenderPassKind,
@@ -108,6 +116,7 @@ pub struct CompiledRenderPass {
     pub damage: EffectRegion,
     pub instance: EffectInstanceId,
     pub anchor: EffectAnchor,
+    pub blur_radius: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -119,7 +128,7 @@ pub struct RenderGraphCompileStats {
     pub peak_live_intermediates: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompiledFrameGraph {
     pub passes: Vec<CompiledRenderPass>,
     pub textures: Vec<GraphTexturePlan>,
@@ -127,7 +136,7 @@ pub struct CompiledFrameGraph {
     pub stats: RenderGraphCompileStats,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FrameExecutionPlan {
     LegacyScene,
     EffectGraph(CompiledFrameGraph),
@@ -186,6 +195,8 @@ pub enum RenderGraphCompileError {
     TooManyTextures,
     TooManyPasses,
     TextureIdOverflow,
+    UnsupportedNode(EffectNodeId),
+    UnsupportedStaticTexture(super::StaticTextureId),
 }
 
 impl std::fmt::Display for RenderGraphCompileError {
@@ -207,14 +218,23 @@ impl GraphBuilder {
             passes: Vec::new(),
             textures: Vec::new(),
         };
-        let output = builder.add_texture(GraphTextureSource::Output, output_bounds)?;
+        let output = builder.add_texture_with_layout(
+            GraphTextureSource::Output,
+            output_bounds,
+            output_bounds.width,
+            output_bounds.height,
+            EffectWorkingSpace::OutputEncodedSrgb,
+        )?;
         Ok((builder, output))
     }
 
-    fn add_texture(
+    fn add_texture_with_layout(
         &mut self,
         source: GraphTextureSource,
-        bounds: EffectRect,
+        domain: EffectRect,
+        width: u32,
+        height: u32,
+        working_space: EffectWorkingSpace,
     ) -> Result<GraphTextureId, RenderGraphCompileError> {
         if self.textures.len() >= MAX_GRAPH_TEXTURES {
             return Err(RenderGraphCompileError::TooManyTextures);
@@ -225,8 +245,11 @@ impl GraphBuilder {
         self.textures.push(GraphTexturePlan {
             id,
             source,
-            width: bounds.width,
-            height: bounds.height,
+            width: width.max(1),
+            height: height.max(1),
+            domain,
+            working_space,
+            origin: GraphTextureOrigin::BottomLeft,
             first_use: None,
             last_use: None,
         });
@@ -244,6 +267,18 @@ impl GraphBuilder {
         entry.last_use = Some(pass);
     }
 
+    fn texture(&self, texture: GraphTextureId) -> GraphTexturePlan {
+        self.textures
+            .get(usize::from(texture.get() - 1))
+            .expect("graph texture id must refer to a builder texture")
+            .clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "graph pass fields stay explicit at the lowering boundary"
+    )]
     fn add_pass(
         &mut self,
         kind: RenderPassKind,
@@ -252,6 +287,7 @@ impl GraphBuilder {
         damage: EffectRegion,
         instance: EffectInstanceId,
         anchor: EffectAnchor,
+        blur_radius: Option<f32>,
     ) -> Result<GraphPassId, RenderGraphCompileError> {
         if self.passes.len() >= MAX_GRAPH_PASSES {
             return Err(RenderGraphCompileError::TooManyPasses);
@@ -270,6 +306,7 @@ impl GraphBuilder {
             damage,
             instance,
             anchor,
+            blur_radius,
         });
         Ok(id)
     }
@@ -383,12 +420,39 @@ fn compile_instance(
             ))?;
         match &node.kind {
             EffectNodeKind::Source(source) => {
+                if let EffectSource::StaticTexture(id) = source {
+                    return Err(RenderGraphCompileError::UnsupportedStaticTexture(*id));
+                }
                 let texture_source = match source {
                     EffectSource::Backdrop => GraphTextureSource::CapturedScene,
                     EffectSource::TargetContent => GraphTextureSource::CapturedTarget,
                     EffectSource::StaticTexture(id) => GraphTextureSource::Static(*id),
                 };
-                let texture = builder.add_texture(texture_source, output_bounds)?;
+                let (domain, width, height, working_space) = match source {
+                    EffectSource::Backdrop => {
+                        let domain = capture_damage.bounding_rect().unwrap_or(output_bounds);
+                        (
+                            domain,
+                            domain.width,
+                            domain.height,
+                            EffectWorkingSpace::OutputEncodedSrgb,
+                        )
+                    }
+                    EffectSource::TargetContent => (
+                        instance.target_bounds,
+                        instance.target_bounds.width,
+                        instance.target_bounds.height,
+                        EffectWorkingSpace::OutputEncodedSrgb,
+                    ),
+                    EffectSource::StaticTexture(_) => unreachable!("static textures are rejected"),
+                };
+                let texture = builder.add_texture_with_layout(
+                    texture_source,
+                    domain,
+                    width,
+                    height,
+                    working_space,
+                )?;
                 if !matches!(source, EffectSource::StaticTexture(_)) {
                     let kind = match source {
                         EffectSource::Backdrop => RenderPassKind::SceneCapture,
@@ -402,17 +466,27 @@ fn compile_instance(
                         capture_damage.clone(),
                         instance.id,
                         instance.anchor,
+                        None,
                     )?;
                 }
                 outputs.insert(node.id, texture);
             }
             EffectNodeKind::DualKawaseBlur(spec) => {
                 let input = outputs[&node.inputs[0]];
+                let input_plan = builder.texture(input);
+                let processing_width = scaled_dimension(input_plan.width, spec.scale);
+                let processing_height = scaled_dimension(input_plan.height, spec.scale);
                 let mut current = input;
-                for _ in 0..spec.passes {
-                    let texture = builder.add_texture(
+                for level in 1..=spec.passes {
+                    let divisor = 1_u32 << level.min(31);
+                    let width = ceil_div(processing_width, divisor);
+                    let height = ceil_div(processing_height, divisor);
+                    let texture = builder.add_texture_with_layout(
                         GraphTextureSource::Intermediate,
-                        scaled_bounds(output_bounds, spec.scale),
+                        input_plan.domain,
+                        width,
+                        height,
+                        EffectWorkingSpace::LinearSrgb,
                     )?;
                     builder.add_pass(
                         RenderPassKind::DualKawaseDownsample,
@@ -421,13 +495,20 @@ fn compile_instance(
                         capture_damage.clone(),
                         instance.id,
                         instance.anchor,
+                        Some(spec.radius),
                     )?;
                     current = texture;
                 }
-                for _ in 0..spec.passes {
-                    let texture = builder.add_texture(
+                for level in (0..spec.passes).rev() {
+                    let divisor = 1_u32 << level.min(31);
+                    let width = ceil_div(processing_width, divisor);
+                    let height = ceil_div(processing_height, divisor);
+                    let texture = builder.add_texture_with_layout(
                         GraphTextureSource::Intermediate,
-                        scaled_bounds(output_bounds, spec.scale),
+                        input_plan.domain,
+                        width,
+                        height,
+                        EffectWorkingSpace::LinearSrgb,
                     )?;
                     builder.add_pass(
                         RenderPassKind::DualKawaseUpsample,
@@ -436,6 +517,7 @@ fn compile_instance(
                         output_damage.clone(),
                         instance.id,
                         instance.anchor,
+                        Some(spec.radius),
                     )?;
                     current = texture;
                 }
@@ -444,59 +526,10 @@ fn compile_instance(
             EffectNodeKind::ColorMatrix(_)
             | EffectNodeKind::Tint(_)
             | EffectNodeKind::Noise(_)
-            | EffectNodeKind::CustomFragment(_) => {
-                let input = node
-                    .inputs
-                    .iter()
-                    .map(|input| outputs[input])
-                    .collect::<Vec<_>>();
-                let texture =
-                    builder.add_texture(GraphTextureSource::Intermediate, output_bounds)?;
-                builder.add_pass(
-                    RenderPassKind::Fragment,
-                    input,
-                    Some(texture),
-                    output_damage.clone(),
-                    instance.id,
-                    instance.anchor,
-                )?;
-                outputs.insert(node.id, texture);
-            }
-            EffectNodeKind::Blend(_) => {
-                let input = node
-                    .inputs
-                    .iter()
-                    .map(|input| outputs[input])
-                    .collect::<Vec<_>>();
-                let texture =
-                    builder.add_texture(GraphTextureSource::Intermediate, output_bounds)?;
-                builder.add_pass(
-                    RenderPassKind::Blend,
-                    input,
-                    Some(texture),
-                    output_damage.clone(),
-                    instance.id,
-                    instance.anchor,
-                )?;
-                outputs.insert(node.id, texture);
-            }
-            EffectNodeKind::Mask(_) => {
-                let input = node
-                    .inputs
-                    .iter()
-                    .map(|input| outputs[input])
-                    .collect::<Vec<_>>();
-                let texture =
-                    builder.add_texture(GraphTextureSource::Intermediate, output_bounds)?;
-                builder.add_pass(
-                    RenderPassKind::Mask,
-                    input,
-                    Some(texture),
-                    output_damage.clone(),
-                    instance.id,
-                    instance.anchor,
-                )?;
-                outputs.insert(node.id, texture);
+            | EffectNodeKind::CustomFragment(_)
+            | EffectNodeKind::Blend(_)
+            | EffectNodeKind::Mask(_) => {
+                return Err(RenderGraphCompileError::UnsupportedNode(node.id));
             }
         }
     }
@@ -517,16 +550,17 @@ fn compile_instance(
         output_damage.clone(),
         instance.id,
         instance.anchor,
+        None,
     )?;
     Ok(())
 }
 
-fn scaled_bounds(bounds: EffectRect, scale: f32) -> EffectRect {
-    let width = (f64::from(bounds.width) * f64::from(scale)).ceil().max(1.0) as u32;
-    let height = (f64::from(bounds.height) * f64::from(scale))
-        .ceil()
-        .max(1.0) as u32;
-    EffectRect::new(bounds.x, bounds.y, width, height).unwrap_or(bounds)
+fn scaled_dimension(value: u32, scale: f32) -> u32 {
+    (f64::from(value) * f64::from(scale)).ceil().max(1.0) as u32
+}
+
+fn ceil_div(value: u32, divisor: u32) -> u32 {
+    value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1)
 }
 
 #[cfg(test)]
@@ -653,5 +687,106 @@ mod tests {
                 .all(|texture| texture.first_use.is_some() && texture.last_use.is_some())
         );
         assert!(graph.stats.peak_live_intermediates > 0);
+    }
+
+    #[test]
+    fn dual_kawase_uses_decreasing_then_increasing_physical_levels() {
+        let (scene, registry) = blur_scene();
+        let plan = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("visible effects must compile to an effect graph");
+        };
+        let dimensions = graph
+            .textures
+            .iter()
+            .filter(|texture| texture.source == GraphTextureSource::Intermediate)
+            .map(|texture| (texture.width, texture.height))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dimensions,
+            vec![(184, 114), (92, 57), (184, 114), (368, 228)]
+        );
+        assert!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| matches!(
+                    pass.kind,
+                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+                ))
+                .all(|pass| pass.blur_radius == Some(4.0))
+        );
+    }
+
+    #[test]
+    fn backdrop_capture_is_local_to_the_effect_dependency_domain() {
+        let (scene, registry) = blur_scene();
+        let plan = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("visible effects must compile to an effect graph");
+        };
+        let capture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .unwrap();
+        assert_eq!(capture.domain, EffectRect::new(76, 56, 368, 228).unwrap());
+    }
+
+    #[test]
+    fn unsupported_nodes_fail_compilation_instead_of_becoming_copy_passes() {
+        let source = EffectNodeId::new(1).unwrap();
+        let tint = EffectNodeId::new(2).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(9).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::tint(tint, source, TintSpec::WHITE),
+            ],
+            output: tint,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(9).unwrap(),
+                anchor: EffectAnchor::OutputPostProcess,
+                target_bounds: region.bounding_rect().unwrap(),
+                region: region.clone(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+            }],
+        );
+        assert_eq!(
+            compile_frame_execution_plan(
+                &scene,
+                &region,
+                EffectRect::new(0, 0, 100, 100).unwrap(),
+                &registry,
+            ),
+            Err(RenderGraphCompileError::UnsupportedNode(tint))
+        );
     }
 }

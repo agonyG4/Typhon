@@ -88,6 +88,29 @@ impl NativeOutputDamage {
         self
     }
 
+    pub(crate) fn union_effect_region(
+        self,
+        region: &oblivion_one::effects::EffectRegion,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        if region.is_empty() {
+            return self;
+        }
+        if region.bounding_rect().is_none() {
+            return Self::full_output(output_width, output_height);
+        }
+        self.union_surface_rects(region.rects().iter().copied().filter_map(|rect| {
+            NativeDamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            }
+            .clipped_to_output(output_width, output_height)
+        }))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.kind == NativeDamageKind::Empty || self.rects.is_empty() || self.pixels == 0
     }
@@ -265,6 +288,7 @@ pub(crate) struct NativeSceneSnapshot {
     pub(crate) popup_surface_ids: Vec<u32>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) effect_damage: oblivion_one::effects::EffectRegion,
+    pub(crate) effect_identity_signature: u64,
     pub(crate) visibility_signature: u64,
     pub(crate) surface_order_signature: u64,
 }
@@ -343,6 +367,7 @@ impl NativeSceneSnapshot {
             popup_surface_ids: popup_surface_ids.to_vec(),
             external_overlay_surface_ids: Vec::new(),
             effect_damage: oblivion_one::effects::EffectRegion::empty(),
+            effect_identity_signature: 0,
             visibility_signature: 0,
             surface_order_signature,
         }
@@ -1049,8 +1074,14 @@ pub(crate) fn native_output_damage_for_scene_snapshots(
     ));
     let mut damage = scene.into_output_damage();
     let effect_transition = oblivion_one::effects::effect_transition_damage(
-        &previous.effect_damage,
-        &current.effect_damage,
+        &oblivion_one::effects::EffectDamageSnapshot::new(
+            previous.effect_identity_signature,
+            previous.effect_damage.clone(),
+        ),
+        &oblivion_one::effects::EffectDamageSnapshot::new(
+            current.effect_identity_signature,
+            current.effect_damage.clone(),
+        ),
     );
     if !effect_transition.is_empty() {
         if effect_transition.bounding_rect().is_none() {

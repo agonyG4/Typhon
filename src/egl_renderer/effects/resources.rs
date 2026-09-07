@@ -411,8 +411,26 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         graph: &CompiledFrameGraph,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let textures = self.acquire_graph(gl, graph)?;
-        self.release_graph(textures)
+        let mut live = HashMap::new();
+        for pass in &graph.passes {
+            for texture_id in pass.inputs.iter().copied().chain(pass.output) {
+                if graph_texture_is_output(graph, texture_id) || live.contains_key(&texture_id) {
+                    continue;
+                }
+                let texture = self.acquire_plan(gl, graph_texture_plan(graph, texture_id)?)?;
+                live.insert(texture_id, texture);
+            }
+            release_dead_graph_textures(self, graph, pass.id, &mut live)?;
+        }
+        self.release_graph(live)
+    }
+
+    pub(crate) fn acquire_plan(
+        &mut self,
+        gl: &glow::Context,
+        plan: &GraphTexturePlan,
+    ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
+        self.acquire(gl, texture_key(plan))
     }
 
     pub(crate) fn acquire_graph(
@@ -444,10 +462,13 @@ impl EffectGlResourceCache {
         &mut self,
         textures: HashMap<GraphTextureId, PooledEffectTexture>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut first_error = None;
         for texture in textures.into_values() {
-            self.release(texture)?;
+            if let Err(error) = self.release(texture) {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     pub(crate) fn texture(&self, texture: &PooledEffectTexture) -> Option<glow::Texture> {
@@ -528,14 +549,92 @@ fn texture_key(texture: &GraphTexturePlan) -> EffectTextureKey {
         texture.height,
         format,
         filter,
-        EffectWorkingSpace::LinearSrgb,
+        texture.working_space,
     )
+}
+
+fn graph_texture_plan(
+    graph: &CompiledFrameGraph,
+    id: GraphTextureId,
+) -> Result<&GraphTexturePlan, Box<dyn std::error::Error>> {
+    graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == id)
+        .ok_or_else(|| io::Error::other("effect graph references an unknown texture").into())
+}
+
+fn graph_texture_is_output(graph: &CompiledFrameGraph, id: GraphTextureId) -> bool {
+    graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == id)
+        .is_some_and(|texture| texture.source == GraphTextureSource::Output)
+}
+
+pub(crate) fn release_dead_graph_textures(
+    cache: &mut EffectGlResourceCache,
+    graph: &CompiledFrameGraph,
+    pass: oblivion_one::effects::GraphPassId,
+    live: &mut HashMap<GraphTextureId, PooledEffectTexture>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dead = graph
+        .textures
+        .iter()
+        .filter(|texture| texture.last_use == Some(pass))
+        .map(|texture| texture.id)
+        .collect::<Vec<_>>();
+    for id in dead {
+        if let Some(texture) = live.remove(&id) {
+            cache.release(texture)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn estimate_graph_peak_bytes(
+    graph: &CompiledFrameGraph,
+) -> Result<u64, EffectResourceError> {
+    let mut pool = EffectResourcePool::new();
+    let mut live = HashMap::new();
+    for pass in &graph.passes {
+        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
+            let Some(plan) = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == texture_id)
+            else {
+                return Err(EffectResourceError::UnknownTexture(u64::from(
+                    texture_id.get(),
+                )));
+            };
+            if plan.source == GraphTextureSource::Output || live.contains_key(&texture_id) {
+                continue;
+            }
+            live.insert(texture_id, pool.checkout(texture_key(plan))?);
+        }
+        let dead = graph
+            .textures
+            .iter()
+            .filter(|texture| texture.last_use == Some(pass.id))
+            .map(|texture| texture.id)
+            .collect::<Vec<_>>();
+        for texture_id in dead {
+            if let Some(texture) = live.remove(&texture_id) {
+                pool.return_texture(texture)?;
+            }
+        }
+    }
+    Ok(pool.peak_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oblivion_one::effects::EffectWorkingSpace;
+    use oblivion_one::effects::{
+        CompiledRenderPass, EffectInstanceId, EffectRegion, EffectWorkingSpace, RenderPassKind,
+    };
 
     fn key(width: u32, height: u32) -> EffectTextureKey {
         EffectTextureKey::new(
@@ -623,5 +722,110 @@ mod tests {
         assert_eq!(pool.cached_key_count(), 1);
         assert!(pool.is_checked_out(live.id));
         pool.return_texture(live).unwrap();
+    }
+
+    #[test]
+    fn compatible_lifetimes_alias_a_single_physical_target() {
+        let mut pool = EffectResourcePool::new();
+        let full = EffectTextureKey::new(
+            1920,
+            1080,
+            EffectTextureFormat::Rgba16Float,
+            EffectTextureFilter::Linear,
+            EffectWorkingSpace::LinearSrgb,
+        );
+        let first = pool.checkout(full).unwrap();
+        pool.return_texture(first.clone()).unwrap();
+        let second = pool.checkout(full).unwrap();
+        assert_eq!(first.id, second.id);
+        assert!(pool.peak_bytes() <= DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+        pool.return_texture(second).unwrap();
+    }
+
+    #[test]
+    fn fullscreen_1080p_blur_liveness_stays_inside_the_default_budget() {
+        let effect = EffectInstanceId::new(1).unwrap();
+        let anchor = oblivion_one::compositor::EffectAnchor::OutputPostProcess;
+        let ids = (1..=6)
+            .map(GraphTextureId::new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let pass_ids = (1..=6)
+            .map(oblivion_one::effects::GraphPassId::new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let mut textures = Vec::new();
+        textures.push(GraphTexturePlan {
+            id: ids[0],
+            source: GraphTextureSource::CapturedScene,
+            width: 1920,
+            height: 1080,
+            domain: oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: Some(pass_ids[0]),
+            last_use: Some(pass_ids[1]),
+        });
+        for (index, (width, height, first, last)) in [
+            (960, 540, 1, 2),
+            (480, 270, 2, 3),
+            (960, 540, 3, 4),
+            (1920, 1080, 4, 5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            textures.push(GraphTexturePlan {
+                id: ids[index + 1],
+                source: GraphTextureSource::Intermediate,
+                width,
+                height,
+                domain: oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+                working_space: EffectWorkingSpace::LinearSrgb,
+                origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                first_use: Some(pass_ids[first]),
+                last_use: Some(pass_ids[last]),
+            });
+        }
+        textures.push(GraphTexturePlan {
+            id: ids[5],
+            source: GraphTextureSource::Output,
+            width: 1920,
+            height: 1080,
+            domain: oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: Some(pass_ids[5]),
+            last_use: Some(pass_ids[5]),
+        });
+        let input_output = [
+            (vec![], ids[0]),
+            (vec![ids[0]], ids[1]),
+            (vec![ids[1]], ids[2]),
+            (vec![ids[2]], ids[3]),
+            (vec![ids[3]], ids[4]),
+            (vec![ids[4]], ids[5]),
+        ];
+        let passes = input_output
+            .into_iter()
+            .zip(pass_ids)
+            .map(|((inputs, output), id)| CompiledRenderPass {
+                id,
+                kind: RenderPassKind::Composite,
+                inputs,
+                output: Some(output),
+                damage: EffectRegion::empty(),
+                instance: effect,
+                anchor,
+                blur_radius: None,
+            })
+            .collect();
+        let graph = CompiledFrameGraph {
+            passes,
+            textures,
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        assert!(estimate_graph_peak_bytes(&graph).unwrap() < DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
     }
 }

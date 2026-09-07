@@ -17,8 +17,8 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    ResolvedEffectScene, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
-    compositor_surface_id,
+    EffectFrameDemandSnapshot, ResolvedEffectScene, ShmBufferLifetimeMetrics,
+    SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1183,6 +1183,10 @@ impl OwnCompositorServer {
 
     pub fn resolved_effect_scene(&self) -> ResolvedEffectScene {
         self.state.resolved_effect_scene()
+    }
+
+    pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {
+        self.resolved_effect_scene().frame_demand_snapshot()
     }
 
     pub fn render_generation_cause(&self) -> RenderGenerationCause {

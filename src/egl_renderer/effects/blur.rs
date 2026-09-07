@@ -3,11 +3,12 @@ use oblivion_one::effects::{EffectRect, EffectValidationError};
 pub(crate) const DUAL_KAWASE_VERTEX_SHADER: &str = r#"#version 300 es
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_uv;
+uniform int u_effect_origin_bottom_left;
 out vec2 v_uv;
 
 void main() {
     gl_Position = vec4(a_position, 0.0, 1.0);
-    v_uv = a_uv;
+    v_uv = u_effect_origin_bottom_left != 0 ? a_uv : vec2(a_uv.x, 1.0 - a_uv.y);
 }
 "#;
 
@@ -15,6 +16,7 @@ pub(crate) const DUAL_KAWASE_DOWNSAMPLE_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
 in vec2 v_uv;
 out vec4 out_color;
 
@@ -23,7 +25,7 @@ vec3 typhon_srgb_to_linear(vec3 value) {
 }
 
 void main() {
-    vec2 offset = u_effect_texel_size;
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
     vec4 sample_a = texture(u_effect_input, v_uv + offset);
     vec4 sample_b = texture(u_effect_input, v_uv - offset);
     vec4 sample_c = texture(u_effect_input, v_uv + vec2(offset.x, -offset.y));
@@ -34,15 +36,34 @@ void main() {
 }
 "#;
 
-pub(crate) const DUAL_KAWASE_UPSAMPLE_SHADER: &str = r#"#version 300 es
+pub(crate) const DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
 in vec2 v_uv;
 out vec4 out_color;
 
 void main() {
-    vec2 offset = u_effect_texel_size;
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec4 sample_a = texture(u_effect_input, v_uv + offset);
+    vec4 sample_b = texture(u_effect_input, v_uv - offset);
+    vec4 sample_c = texture(u_effect_input, v_uv + vec2(offset.x, -offset.y));
+    vec4 sample_d = texture(u_effect_input, v_uv + vec2(-offset.x, offset.y));
+    out_color = (sample_a + sample_b + sample_c + sample_d) * 0.25;
+}
+"#;
+
+pub(crate) const DUAL_KAWASE_UPSAMPLE_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+in vec2 v_uv;
+out vec4 out_color;
+
+void main() {
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
     vec4 result = texture(u_effect_input, v_uv) * 0.4;
     result += texture(u_effect_input, v_uv + vec2(offset.x, 0.0)) * 0.15;
     result += texture(u_effect_input, v_uv - vec2(offset.x, 0.0)) * 0.15;
@@ -84,5 +105,8 @@ mod tests {
     fn built_in_blur_shaders_define_srgb_conversion_boundaries() {
         assert!(DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("typhon_srgb_to_linear"));
         assert!(DUAL_KAWASE_UPSAMPLE_SHADER.contains("u_effect_texel_size"));
+        assert!(DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("u_effect_blur_radius"));
+        assert!(DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER.contains("u_effect_blur_radius"));
+        assert!(!DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER.contains("typhon_srgb_to_linear"));
     }
 }

@@ -166,6 +166,7 @@ impl NativeRuntime {
         let tick_us = cycle.tick_us;
         #[rustfmt::skip] let (accepted, redraw_requested, skipped_input_repaints, input_drain_us, raw_input_events, coalesced_input_events) = (cycle.accepted, cycle.redraw_requested, cycle.skipped_input_repaints, cycle.input_drain_us, cycle.raw_input_events, cycle.coalesced_input_events);
         #[rustfmt::skip] let (render_generation, _scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
+        let effect_demand = server.effect_frame_demand_snapshot();
         let pacing_now_ns = monotonic_now_ns()?;
         #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
         let (client_cursor, client_cursor_active, cursor_visible) =
@@ -292,6 +293,8 @@ impl NativeRuntime {
             only_pending_surface_frame_callbacks: server.has_only_pending_surface_frame_callbacks(),
             redraw_requested: primary_redraw_requested,
             cursor_work_pending,
+            effect_work_pending: effect_demand.continuous_visible,
+            effect_dirty_region: effect_demand.dirty_region.clone(),
             page_flip_pending: false,
         });
         if repaint_decision.repaint {
@@ -1045,8 +1048,14 @@ impl NativeRuntime {
                     &*server,
                     (current_client_cursor_damage, current_software_cursor_damage),
                 );
+                let output_damage = output_damage.union_effect_region(
+                    &effect_demand.dirty_region,
+                    target.width,
+                    target.height,
+                );
                 let no_primary_work = output_damage.is_empty()
                     && !effective_redraw_requested
+                    && !effect_demand.continuous_visible
                     && !interactive_visual_applied;
                 if no_primary_work {
                     let surface_damage = scene_changed.then(|| {

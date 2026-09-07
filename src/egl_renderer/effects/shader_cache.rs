@@ -6,6 +6,7 @@ use glow::HasContext;
 use oblivion_one::effects::{EffectUniformBinding, EffectWorkingSpace};
 
 use super::super::{GlProgram, RendererResult};
+use super::blur;
 
 pub const RESERVED_SHADER_NAMES: &[&str] = &[
     "u_typhon_primary",
@@ -45,6 +46,7 @@ impl ShaderProgramKey {
 pub enum ShaderCacheError {
     InvalidCapacity,
     CacheFull,
+    MissingProgram,
 }
 
 impl std::fmt::Display for ShaderCacheError {
@@ -186,6 +188,48 @@ impl ShaderProgramCache {
             },
         );
         Ok(program)
+    }
+
+    pub(crate) fn lookup(&mut self, key: ShaderProgramKey) -> RendererResult<GlProgram> {
+        self.clock = self.clock.saturating_add(1);
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::other(ShaderCacheError::MissingProgram))?;
+        entry.last_used = self.clock;
+        entry
+            .program
+            .ok_or_else(|| io::Error::other("effect shader was not prewarmed").into())
+    }
+
+    pub(crate) fn prewarm(
+        &mut self,
+        gl: &glow::Context,
+        key: ShaderProgramKey,
+        vertex_source: &str,
+        fragment_source: &str,
+    ) -> RendererResult<GlProgram> {
+        self.get_or_compile(gl, key, vertex_source, fragment_source)
+    }
+
+    pub(crate) fn prewarm_builtins(&mut self, gl: &glow::Context) -> RendererResult<()> {
+        let vertex = blur::DUAL_KAWASE_VERTEX_SHADER;
+        for (module, variant, fragment) in [
+            (1001, 0, blur::DUAL_KAWASE_DOWNSAMPLE_SHADER),
+            (1001, 1, blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER),
+            (1002, 0, blur::DUAL_KAWASE_UPSAMPLE_SHADER),
+            (1003, 0, super::executor::COPY_FRAGMENT_SHADER),
+            (1004, 0, super::executor::COMPOSITE_FRAGMENT_SHADER),
+        ] {
+            let key = ShaderProgramKey::new(
+                oblivion_one::effects::ShaderModuleId::new(module)
+                    .expect("builtin shader ids are non-zero"),
+                variant,
+                EffectWorkingSpace::LinearSrgb,
+            );
+            self.prewarm(gl, key, vertex, fragment)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn last_compile_log(&self, key: ShaderProgramKey) -> Option<&str> {
@@ -397,5 +441,13 @@ mod tests {
         assert!(source.contains("void main()"));
         assert!(source.contains("u_typhon_primary"));
         assert!(source.contains("struct TyphonEffectContext"));
+    }
+
+    #[test]
+    fn render_lookup_never_compiles_or_inserts_a_program() {
+        let mut cache = ShaderProgramCache::new(2).unwrap();
+        let key = key(1, 0);
+        assert!(cache.lookup(key).is_err());
+        assert_eq!(cache.len(), 0);
     }
 }

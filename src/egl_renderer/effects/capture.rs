@@ -23,6 +23,46 @@ pub(crate) fn indices_below_anchor(layers: &[CaptureLayer], anchor: EffectAnchor
     (0..cutoff).collect()
 }
 
+pub(crate) fn indices_for_capture(
+    layers: &[CaptureLayer],
+    anchor: EffectAnchor,
+    target_content: bool,
+) -> Vec<usize> {
+    if !target_content {
+        return indices_below_anchor(layers, anchor);
+    }
+    let target = match anchor {
+        EffectAnchor::BeforeSurface(surface_id)
+        | EffectAnchor::ReplaceSurface(surface_id)
+        | EffectAnchor::AfterSurface(surface_id) => surface_id,
+        EffectAnchor::OutputPostProcess => return Vec::new(),
+    };
+    layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layer)| (*layer == CaptureLayer::Surface(target)).then_some(index))
+        .collect()
+}
+
+#[cfg(test)]
+mod target_content_tests {
+    use super::*;
+
+    #[test]
+    fn target_content_capture_contains_only_the_target_surface() {
+        let layers = [
+            CaptureLayer::Other,
+            CaptureLayer::Surface(10),
+            CaptureLayer::Surface(20),
+            CaptureLayer::Surface(30),
+        ];
+        assert_eq!(
+            indices_for_capture(&layers, EffectAnchor::BeforeSurface(20), true),
+            vec![2]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

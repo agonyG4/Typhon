@@ -82,6 +82,10 @@ impl ResolvedEffectScene {
     pub fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }
+
+    pub fn frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {
+        EffectFrameDemandSnapshot::from_visible_instances(self.instances.iter().cloned())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

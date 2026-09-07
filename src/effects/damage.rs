@@ -90,6 +90,43 @@ pub struct EffectRegion {
     conservative_full: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectDamageSnapshot {
+    pub identity: u64,
+    pub region: EffectRegion,
+}
+
+impl EffectDamageSnapshot {
+    pub const fn new(identity: u64, region: EffectRegion) -> Self {
+        Self { identity, region }
+    }
+}
+
+pub trait EffectTransitionSource {
+    fn effect_identity(&self) -> Option<u64>;
+    fn effect_region(&self) -> &EffectRegion;
+}
+
+impl EffectTransitionSource for EffectRegion {
+    fn effect_identity(&self) -> Option<u64> {
+        None
+    }
+
+    fn effect_region(&self) -> &EffectRegion {
+        self
+    }
+}
+
+impl EffectTransitionSource for EffectDamageSnapshot {
+    fn effect_identity(&self) -> Option<u64> {
+        Some(self.identity)
+    }
+
+    fn effect_region(&self) -> &EffectRegion {
+        &self.region
+    }
+}
+
 impl EffectRegion {
     pub fn empty() -> Self {
         Self::default()
@@ -240,8 +277,27 @@ pub fn plan_effect_damage(
     }
 }
 
-pub fn effect_transition_damage(old: &EffectRegion, new: &EffectRegion) -> EffectRegion {
-    old.union(new)
+pub fn effect_transition_damage<O, N>(old: &O, new: &N) -> EffectRegion
+where
+    O: EffectTransitionSource,
+    N: EffectTransitionSource,
+{
+    if old.effect_region() == new.effect_region() && old.effect_identity() == new.effect_identity()
+    {
+        EffectRegion::empty()
+    } else if old.effect_region() == new.effect_region()
+        && old.effect_identity().is_some()
+        && old.effect_identity() != new.effect_identity()
+    {
+        old.effect_region().clone()
+    } else if old.effect_identity().is_some()
+        && old.effect_identity() == new.effect_identity()
+        && old.effect_region() == new.effect_region()
+    {
+        EffectRegion::empty()
+    } else {
+        old.effect_region().union(new.effect_region())
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +365,22 @@ mod tests {
         let old = EffectRegion::from_rect(EffectRect::new(10, 10, 50, 20).unwrap());
         let damage = effect_transition_damage(&old, &EffectRegion::empty());
         assert_eq!(damage, old);
+    }
+
+    #[test]
+    fn unchanged_effect_identity_has_no_transition_damage() {
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 50, 20).unwrap());
+        let old = EffectDamageSnapshot::new(7, region.clone());
+        let new = EffectDamageSnapshot::new(7, region);
+        assert!(effect_transition_damage(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn changed_effect_identity_damages_the_affected_region() {
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 50, 20).unwrap());
+        let old = EffectDamageSnapshot::new(7, region.clone());
+        let new = EffectDamageSnapshot::new(8, region.clone());
+        assert_eq!(effect_transition_damage(&old, &new), region);
     }
 
     #[test]
