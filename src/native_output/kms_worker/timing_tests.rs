@@ -30,8 +30,8 @@ fn worker_timing_records_submit_ack_delay() {
 #[test]
 fn worker_dispatch_budget_uses_actual_wake_and_post_wake_dispatch() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(10_000, 40_000, 60_000);
-    model.record(20_000, 50_000, 70_000);
+    model.record(10_000, 40_000, 60_000, 100_000);
+    model.record(20_000, 50_000, 70_000, 120_000);
 
     let budget = model.budget();
 
@@ -44,7 +44,7 @@ fn worker_dispatch_budget_uses_actual_wake_and_post_wake_dispatch() {
 #[test]
 fn worker_dispatch_budget_does_not_include_queue_residency() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(0, 100_000, 200_000);
+    model.record(0, 100_000, 200_000, 300_000);
 
     assert_eq!(model.budget().dispatch_budget_ns, 350_000);
 }

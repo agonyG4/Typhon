@@ -990,6 +990,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
                         submit_duration_ns,
+                        dispatch_duration_ns,
                     );
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let submission_budget_ns = dispatch_budget.dispatch_budget_ns;

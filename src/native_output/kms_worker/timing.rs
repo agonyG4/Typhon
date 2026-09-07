@@ -38,14 +38,12 @@ impl KmsWorkerDispatchModel {
         wake_lateness_ns: u64,
         pre_submit_ns: u64,
         ioctl_duration_ns: u64,
+        dispatch_duration_ns: u64,
     ) {
         push_bounded(&mut self.wake_lateness_ns, wake_lateness_ns);
         push_bounded(&mut self.pre_submit_ns, pre_submit_ns);
         push_bounded(&mut self.ioctl_duration_ns, ioctl_duration_ns);
-        push_bounded(
-            &mut self.dispatch_duration_ns,
-            pre_submit_ns.saturating_add(ioctl_duration_ns),
-        );
+        push_bounded(&mut self.dispatch_duration_ns, dispatch_duration_ns);
     }
 
     pub(crate) fn budget(&self) -> KmsWorkerDispatchBudget {
@@ -111,5 +109,14 @@ mod tests {
             };
             push_bounded(&mut samples, sample);
         }
+    }
+
+    #[test]
+    fn dispatch_budget_uses_the_measured_full_dispatch_interval() {
+        let mut model = KmsWorkerDispatchModel::default();
+
+        model.record(10, 100, 200, 1_000);
+
+        assert_eq!(model.budget().dispatch_budget_ns, 51_010);
     }
 }
