@@ -146,6 +146,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     SetPointerHitInstrumentationEnabled(bool),
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
+    CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
     CaptureFocusGeneration(Sender<u64>),
     CapturePointerInputMetrics(Sender<PointerInputMetrics>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
@@ -509,6 +510,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureSceneRenderGeneration(reply) => {
                         let _ = reply.send(server.scene_render_generation());
+                    }
+                    ServerCommand::CaptureResolvedEffectScene(reply) => {
+                        let _ = reply.send(server.resolved_effect_scene());
                     }
                     ServerCommand::CaptureFocusGeneration(reply) => {
                         let _ = reply.send(server.state.focus_generation);

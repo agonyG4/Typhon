@@ -109,6 +109,7 @@ impl CompositorState {
         self.advance_pointer_hit_generation();
         self.refresh_frame_work_visibility();
         self.rebuild_scene_work_index();
+        self.refresh_effect_scene_summary();
         update
     }
 

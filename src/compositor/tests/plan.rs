@@ -40,6 +40,7 @@ fn renderer_color_capability_adds_color_management_once() {
         SelectionProtocolCapabilities::core_clipboard(),
         RendererProtocolCapabilities {
             color_management: true,
+            background_effect: false,
         },
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
@@ -51,6 +52,32 @@ fn renderer_color_capability_adds_color_management_once() {
             .filter(|name| **name == "wp_color_manager_v1")
             .count(),
         1
+    );
+}
+
+#[test]
+fn qualified_native_renderer_adds_background_effect_once() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities::safe_baseline(),
+        RendererProtocolCapabilities::qualified_native(),
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "ext_background_effect_manager_v1")
+            .count(),
+        1
+    );
+    assert!(
+        !client_protocols_for_capabilities(
+            InputProtocolCapabilities::desktop_baseline(),
+            SelectionProtocolCapabilities::safe_baseline(),
+            RendererProtocolCapabilities::unsupported(),
+        )
+        .contains(&ProtocolGlobal::ExtBackgroundEffect)
     );
 }
 
@@ -113,6 +140,7 @@ fn protocol_capability_policy_does_not_duplicate_globals() {
         },
         RendererProtocolCapabilities {
             color_management: true,
+            background_effect: false,
         },
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();

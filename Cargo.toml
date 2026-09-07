@@ -25,7 +25,7 @@ resvg = "0.48.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 unicode-normalization = "0.1"
-wayland-protocols = { version = "0.32.12", features = ["client", "server", "staging", "unstable"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "server", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client", "server"] }
 wayland-backend = "0.3.15"
 wayland-client = "0.31.15"

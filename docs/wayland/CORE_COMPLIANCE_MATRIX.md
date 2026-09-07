@@ -106,6 +106,7 @@ profile and carry persistent surface presentation metadata.
 |---|---:|---|
 | `wp_tearing_control_manager_v1` | 1 | Implemented (qualified native profile only) |
 | `wp_content_type_manager_v1` | 1 | Implemented (qualified native profile only) |
+| `ext_background_effect_manager_v1` | 1 | Implemented (qualified native profile only) |
 
 The current dispatch audit still finds generated-protocol wildcard arms in
 some extension handlers. Covered Core/XDG requests have explicit dispatch or

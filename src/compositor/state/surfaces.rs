@@ -1162,6 +1162,8 @@ impl CompositorState {
         }
         self.active_commit_timing_targets.remove(&surface_id);
         self.fifo_resources.remove(&surface_id);
+        self.background_effect_resources.remove(&surface_id);
+        self.background_effect_surface_ids.remove(&surface_id);
         self.commit_timer_resources.remove(&surface_id);
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);

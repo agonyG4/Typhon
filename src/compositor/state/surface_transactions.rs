@@ -177,6 +177,7 @@ impl CompositorState {
             buffer_transform,
             opaque_region,
             input_region,
+            background_effect,
             presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
@@ -219,6 +220,14 @@ impl CompositorState {
             renderable.set_opaque_region(opaque_region.clone());
         }
         let input_region_changed = data.apply_input_region_change(input_region);
+        let background_effect_changed = data.apply_background_effect_change(background_effect);
+        if background_effect_changed {
+            if data.committed_background_effect().ops().is_empty() {
+                self.background_effect_surface_ids.remove(&surface_id);
+            } else {
+                self.background_effect_surface_ids.insert(surface_id);
+            }
+        }
         if input_region_changed {
             self.advance_pointer_hit_generation();
         }
@@ -312,5 +321,12 @@ impl CompositorState {
             self.refresh_pointer_focus_at_last_position();
         }
         self.queue_pending_presentation_feedbacks(presentation_feedbacks);
+        if background_effect_changed {
+            self.advance_render_generation_with_scene_effect(
+                RenderGenerationCause::EffectBinding,
+                self.surface_is_visible_in_active_scene(surface_id),
+            );
+            self.refresh_effect_scene_summary();
+        }
     }
 }

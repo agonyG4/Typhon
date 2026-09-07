@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1 as client_ext_background_effect_manager_v1;
 use wayland_protocols::wp::content_type::v1::client::{
     wp_content_type_manager_v1 as client_wp_content_type_manager_v1,
     wp_content_type_v1 as client_wp_content_type_v1,
@@ -217,6 +218,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_count: usize,
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_serials: Vec<u32>,
     pub(in crate::compositor::tests) astrea_shortcut_events: Vec<AstreaShortcutEventRecord>,
+    pub(in crate::compositor::tests) background_effect_capabilities: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1903,6 +1905,40 @@ impl Dispatch<client_wp_content_type_manager_v1::WpContentTypeManagerV1, ()> for
         _state: &mut Self,
         _proxy: &client_wp_content_type_manager_v1::WpContentTypeManagerV1,
         _event: client_wp_content_type_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
+        event: client_ext_background_effect_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_ext_background_effect_manager_v1::Event::Capabilities {
+            flags: WEnum::Value(flags),
+        } = event
+        {
+            state.background_effect_capabilities.push(flags.bits());
+        }
+    }
+}
+
+impl Dispatch<client_ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+        _event: client_ext_background_effect_surface_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

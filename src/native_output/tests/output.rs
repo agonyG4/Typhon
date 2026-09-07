@@ -1,6 +1,32 @@
 use super::*;
 #[rustfmt::skip]
 use crate::egl_renderer::{BufferAge, EglPartialRepaintCapabilities, PartialRepaintPlanner, RepaintMode};
+use oblivion_one::effects::{EffectRect, EffectRegion};
+
+#[test]
+fn native_damage_includes_old_and_new_effect_regions() {
+    let previous = NativeSceneSnapshot::default();
+    let current = NativeSceneSnapshot {
+        effect_damage: EffectRegion::from_rect(EffectRect::new(40, 30, 20, 10).unwrap()),
+        ..Default::default()
+    };
+
+    let damage = native_output_damage_for_scene_snapshots(
+        200,
+        120,
+        &previous,
+        &current,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert!(damage.rects.iter().any(|rect| {
+        rect.x <= 40
+            && rect.y <= 30
+            && rect.x.saturating_add(rect.width as i32) >= 60
+            && rect.y.saturating_add(rect.height as i32) >= 40
+    }));
+}
+
 #[test]
 fn direct_plane_validation_key_changes_for_modifier_and_generation() {
     let first = DirectPlaneValidationKey {

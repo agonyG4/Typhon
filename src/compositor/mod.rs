@@ -787,6 +787,9 @@ pub struct CompositorState {
     scene_render_generation: u64,
     effect_scene_summary: EffectSceneSummary,
     internal_surface_effects: HashMap<u32, ResolvedEffectInstance>,
+    background_effect_enabled: bool,
+    background_effect_resources: HashMap<u32, ObjectId>,
+    background_effect_surface_ids: HashSet<u32>,
     #[allow(dead_code)] // Consumed by the internal effect assignment API as presets are enabled.
     next_internal_effect_instance_id: u64,
     pointer_hit_generation: u64,

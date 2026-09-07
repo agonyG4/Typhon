@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::effects::EffectRegion;
 use std::borrow::Cow;
 
 use oblivion_one::compositor::{
@@ -113,6 +114,13 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         snapshot.popup_surface_ids = self.popup_surface_ids.to_vec();
         snapshot.external_overlay_surface_ids = self.external_overlay_surface_ids.clone();
         snapshot.visibility_signature = self.visibility_signature();
+        snapshot.effect_damage = self
+            .effects
+            .instances
+            .iter()
+            .fold(EffectRegion::empty(), |damage, instance| {
+                damage.union(&instance.region)
+            });
         snapshot
     }
 

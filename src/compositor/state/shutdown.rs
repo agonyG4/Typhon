@@ -56,6 +56,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         buffer_transform: None,
         opaque_region: None,
         input_region: None,
+        background_effect: None,
         presentation_feedbacks: Vec::new(),
         resize_commit: None,
         resize_capture_finalized: true,

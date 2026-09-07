@@ -3,6 +3,9 @@ use crate::effects::{
     EffectRegion,
 };
 
+use super::{BackgroundEffectRegion, InputRegionOp, SurfaceData};
+use wayland_server::Resource;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectAnchor {
     BeforeSurface(u32),
@@ -120,8 +123,62 @@ impl super::CompositorState {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        if self.background_effect_enabled && !self.background_effect_surface_ids.is_empty() {
+            for (surface, origin) in self
+                .active_scene_surfaces()
+                .iter()
+                .zip(self.active_scene_surface_origins())
+            {
+                let Some(surface_resource) = self.surface_resource_by_id(surface.surface_id) else {
+                    continue;
+                };
+                let Some(surface_data) = surface_resource.data::<SurfaceData>() else {
+                    continue;
+                };
+                let region = background_effect_output_region(
+                    &surface_data.committed_background_effect(),
+                    *origin,
+                    surface.width,
+                    surface.height,
+                );
+                let Some(target_bounds) = region.bounding_rect() else {
+                    continue;
+                };
+                instances.push(ResolvedEffectInstance {
+                    id: background_effect_instance_id(surface.surface_id),
+                    program: crate::effects::builtin_background_blur_program_id(),
+                    anchor: EffectAnchor::BeforeSurface(surface.surface_id),
+                    signature: internal_effect_signature(
+                        surface.surface_id,
+                        EffectAnchor::BeforeSurface(surface.surface_id),
+                        crate::effects::builtin_background_blur_program_id(),
+                        &region,
+                    ),
+                    frame_demand: EffectFrameDemand::OnDamage,
+                    region,
+                    target_bounds,
+                    parameter_block: EffectParameterBlock::default(),
+                });
+            }
+        }
         instances.sort_by_key(|instance| instance.id);
         ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    pub(in crate::compositor) fn refresh_effect_scene_summary(&mut self) {
+        self.set_effect_scene_summary(self.resolved_effect_scene().summary);
+    }
+
+    pub(in crate::compositor) fn set_background_effect_enabled(&mut self, enabled: bool) {
+        if self.background_effect_enabled == enabled {
+            return;
+        }
+        self.background_effect_enabled = enabled;
+        self.advance_render_generation_with_scene_effect(
+            super::RenderGenerationCause::EffectBinding,
+            true,
+        );
+        self.refresh_effect_scene_summary();
     }
 
     #[allow(dead_code)] // Invoked by internal effect qualification and protocol adapters.
@@ -187,6 +244,111 @@ impl super::CompositorState {
         self.set_effect_scene_summary(self.resolved_effect_scene().summary);
         true
     }
+}
+
+fn background_effect_instance_id(surface_id: u32) -> EffectInstanceId {
+    EffectInstanceId::new((1_u64 << 63) | (u64::from(surface_id) + 1))
+        .expect("background effect instance id is non-zero")
+}
+
+pub(in crate::compositor) fn background_effect_output_region(
+    region: &BackgroundEffectRegion,
+    origin: (i32, i32),
+    surface_width: u32,
+    surface_height: u32,
+) -> EffectRegion {
+    let mut rects = Vec::new();
+    for operation in region.ops() {
+        let Some(local) = clipped_background_effect_rect(
+            operation.rect().coordinates(),
+            surface_width,
+            surface_height,
+        ) else {
+            continue;
+        };
+        let Some(output) = translate_effect_rect(local, origin) else {
+            continue;
+        };
+        match operation {
+            InputRegionOp::Add(_) => rects.push(output),
+            InputRegionOp::Subtract(_) => {
+                rects = rects
+                    .into_iter()
+                    .flat_map(|existing| subtract_effect_rect(existing, output))
+                    .collect();
+            }
+        }
+    }
+    let mut output = EffectRegion::empty();
+    for rect in rects {
+        output.push(rect);
+    }
+    output
+}
+
+fn clipped_background_effect_rect(
+    (x, y, width, height): (i32, i32, i32, i32),
+    surface_width: u32,
+    surface_height: u32,
+) -> Option<EffectRect> {
+    let left = i64::from(x).max(0);
+    let top = i64::from(y).max(0);
+    let right = i64::from(x)
+        .saturating_add(i64::from(width))
+        .min(i64::from(surface_width));
+    let bottom = i64::from(y)
+        .saturating_add(i64::from(height))
+        .min(i64::from(surface_height));
+    effect_rect_from_edges(left, top, right, bottom)
+}
+
+fn translate_effect_rect(rect: EffectRect, origin: (i32, i32)) -> Option<EffectRect> {
+    let x = i64::from(origin.0).saturating_add(i64::from(rect.x));
+    let y = i64::from(origin.1).saturating_add(i64::from(rect.y));
+    let right = x.saturating_add(i64::from(rect.width));
+    let bottom = y.saturating_add(i64::from(rect.height));
+    effect_rect_from_edges(x, y, right, bottom)
+}
+
+fn subtract_effect_rect(source: EffectRect, excluded: EffectRect) -> Vec<EffectRect> {
+    let left = i64::from(source.x).max(i64::from(excluded.x));
+    let top = i64::from(source.y).max(i64::from(excluded.y));
+    let right = i64::from(source.right()).min(i64::from(excluded.right()));
+    let bottom = i64::from(source.bottom()).min(i64::from(excluded.bottom()));
+    if right <= left || bottom <= top {
+        return vec![source];
+    }
+
+    [
+        effect_rect_from_edges(
+            i64::from(source.x),
+            i64::from(source.y),
+            i64::from(source.right()),
+            top,
+        ),
+        effect_rect_from_edges(
+            i64::from(source.x),
+            bottom,
+            i64::from(source.right()),
+            i64::from(source.bottom()),
+        ),
+        effect_rect_from_edges(i64::from(source.x), top, left, bottom),
+        effect_rect_from_edges(right, top, i64::from(source.right()), bottom),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn effect_rect_from_edges(left: i64, top: i64, right: i64, bottom: i64) -> Option<EffectRect> {
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let x = i32::try_from(left).ok()?;
+    let y = i32::try_from(top).ok()?;
+    let width = u32::try_from(right - left).ok()?;
+    let height = u32::try_from(bottom - top).ok()?;
+    EffectRect::new(x, y, width, height)
 }
 
 #[allow(dead_code)] // Called by the staged internal assignment API.
@@ -259,6 +421,7 @@ fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::{InputRegionRect, SurfaceInputRegion};
     use crate::effects::{
         EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect, EffectRegion,
     };
@@ -398,5 +561,25 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn background_effect_regions_are_clipped_translated_and_subtracted() {
+        let region =
+            BackgroundEffectRegion::from_surface_input_region(SurfaceInputRegion::Custom(vec![
+                InputRegionOp::Add(InputRegionRect::new(0, 0, 10, 10).unwrap()),
+                InputRegionOp::Subtract(InputRegionRect::new(4, 3, 2, 2).unwrap()),
+            ]));
+        let output = background_effect_output_region(&region, (100, 50), 8, 8);
+
+        assert!(output.contains_point(100, 50));
+        assert!(output.contains_point(107, 57));
+        assert!(
+            !output.contains_point(104, 53),
+            "rects={:?}",
+            output.rects()
+        );
+        assert!(!output.contains_point(105, 54));
+        assert!(!output.contains_point(108, 58));
     }
 }

@@ -542,6 +542,7 @@ pub(crate) const ZWP_IDLE_INHIBIT_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_V1: u32 = 1;
 pub(crate) const ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1: u32 = 1;
 pub(crate) const EXT_DATA_CONTROL_MANAGER_V1: u32 = 1;
+pub(crate) const EXT_BACKGROUND_EFFECT_MANAGER_V1: u32 = 1;
 pub(crate) const WP_FIFO_MANAGER_V1: u32 = 1;
 pub(crate) const WP_COMMIT_TIMING_MANAGER_V1: u32 = 1;
 pub(crate) const WP_TEARING_CONTROL_MANAGER_V1: u32 = 1;
@@ -594,6 +595,10 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
         ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1,
     ),
     GlobalAdvertisement::new("ext_data_control_manager_v1", EXT_DATA_CONTROL_MANAGER_V1),
+    GlobalAdvertisement::new(
+        "ext_background_effect_manager_v1",
+        EXT_BACKGROUND_EFFECT_MANAGER_V1,
+    ),
     GlobalAdvertisement::new("wp_fifo_manager_v1", WP_FIFO_MANAGER_V1),
     GlobalAdvertisement::new("wp_commit_timing_manager_v1", WP_COMMIT_TIMING_MANAGER_V1),
     GlobalAdvertisement::new(

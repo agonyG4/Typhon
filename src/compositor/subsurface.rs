@@ -11,7 +11,10 @@ use super::{
     CapturedSurfacePresentation, RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence,
     SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
-    state_data::{PendingSurfaceAttachment, PendingViewportChange, SurfaceBufferRelease},
+    state_data::{
+        BackgroundEffectRegion, PendingSurfaceAttachment, PendingViewportChange,
+        SurfaceBufferRelease,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -148,6 +151,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) buffer_transform: Option<wl_output::Transform>,
     pub(super) opaque_region: Option<SurfaceInputRegion>,
     pub(super) input_region: Option<SurfaceInputRegion>,
+    pub(super) background_effect: Option<BackgroundEffectRegion>,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) resize_commit: Option<super::ResizeCommitSnapshot>,
     pub(super) resize_capture_finalized: bool,
@@ -173,6 +177,7 @@ impl CachedSubsurfaceCommit {
             buffer_transform,
             opaque_region,
             input_region,
+            background_effect,
             presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
@@ -218,6 +223,9 @@ impl CachedSubsurfaceCommit {
         }
         if input_region.is_some() {
             self.input_region = input_region;
+        }
+        if background_effect.is_some() {
+            self.background_effect = background_effect;
         }
         self.presentation_feedbacks.extend(presentation_feedbacks);
         self.presentation = presentation;
@@ -265,7 +273,7 @@ fn merge_damage(
 #[cfg(test)]
 mod window_geometry_tests {
     use super::*;
-    use crate::compositor::state_data::{InputRegionOp, InputRegionRect};
+    use crate::compositor::state_data::{BackgroundEffectRegion, InputRegionOp, InputRegionRect};
     use crate::compositor::{
         SurfaceContentType, SurfacePresentationHint, SurfacePresentationMetadata,
         SurfacePresentationState, XdgWindowGeometry,
@@ -288,6 +296,7 @@ mod window_geometry_tests {
             buffer_transform: None,
             opaque_region: None,
             input_region: None,
+            background_effect: None,
             presentation_feedbacks: Vec::new(),
             resize_commit: None,
             resize_capture_finalized: true,
@@ -347,6 +356,26 @@ mod window_geometry_tests {
                 PointerConstraintHintCommit::NoChange,
             )
         );
+    }
+
+    #[test]
+    fn newer_pending_background_effect_replaces_older_pending_effect() {
+        let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
+        let first =
+            BackgroundEffectRegion::from_surface_input_region(SurfaceInputRegion::Custom(vec![
+                InputRegionOp::Add(InputRegionRect::new(1, 2, 3, 4).unwrap()),
+            ]));
+        let second =
+            BackgroundEffectRegion::from_surface_input_region(SurfaceInputRegion::Custom(vec![
+                InputRegionOp::Add(InputRegionRect::new(5, 6, 7, 8).unwrap()),
+            ]));
+        cached.background_effect = Some(first);
+        let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
+        newer.background_effect = Some(second.clone());
+
+        cached.merge(newer);
+
+        assert_eq!(cached.background_effect, Some(second));
     }
 
     #[test]

@@ -37,6 +37,10 @@ use wayland_client::{
         wl_surface as client_wl_surface, wl_touch as client_wl_touch,
     },
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1 as client_ext_background_effect_manager_v1,
+    ext_background_effect_surface_v1 as client_ext_background_effect_surface_v1,
+};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1 as client_ext_data_control_device_v1,
     ext_data_control_manager_v1 as client_ext_data_control_manager_v1,
@@ -141,6 +145,7 @@ use support::window_ops::*;
 mod astrea_shell_auth;
 mod astrea_shell_capability;
 mod astrea_shortcuts;
+mod background_effect;
 mod data_control;
 mod data_device;
 mod direct_scanout;

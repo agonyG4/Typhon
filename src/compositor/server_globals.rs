@@ -1,5 +1,6 @@
 use super::*;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
+use wayland_protocols::ext::background_effect::v1::server::ext_background_effect_manager_v1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1;
 use wayland_protocols::wp::{
     commit_timing::v1::server::wp_commit_timing_manager_v1,
@@ -60,6 +61,13 @@ pub(super) fn register_minimum_globals(
     );
     if renderer_capabilities.color_management {
         color::register_color_management_global(display);
+    }
+    if renderer_capabilities.background_effect {
+        display.create_global::<
+            CompositorState,
+            ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
+            _,
+        >(versions::EXT_BACKGROUND_EFFECT_MANAGER_V1, ());
     }
     if input_capabilities.relative_pointer {
         display.create_global::<

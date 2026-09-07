@@ -201,7 +201,7 @@ impl OwnCompositorServer {
             false,
             InputProtocolCapabilities::native_libinput(),
             SelectionProtocolCapabilities::core_clipboard(),
-            RendererProtocolCapabilities::unsupported(),
+            RendererProtocolCapabilities::qualified_native(),
             FramePacingProtocolCapabilities::qualified_native(),
             PresentationProtocolCapabilities::qualified_native(),
         )
@@ -372,6 +372,7 @@ impl OwnCompositorServer {
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
 
         let mut state = CompositorState::new(syncobj_device);
+        state.set_background_effect_enabled(renderer_capabilities.background_effect);
         state.load_persisted_decoration_theme();
         state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
         let verifier: AstreaShellCapabilityVerifier = astrea_shell_capability.verifier();

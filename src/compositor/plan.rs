@@ -20,6 +20,7 @@ pub enum ProtocolGlobal {
     WpTearingControl,
     WpContentType,
     ExtDataControl,
+    ExtBackgroundEffect,
     XdgDecoration,
     LinuxDmabuf,
     LinuxDrmSyncobj,
@@ -52,6 +53,7 @@ impl ProtocolGlobal {
             Self::WpTearingControl => "wp_tearing_control_manager_v1",
             Self::WpContentType => "wp_content_type_manager_v1",
             Self::ExtDataControl => "ext_data_control_manager_v1",
+            Self::ExtBackgroundEffect => "ext_background_effect_manager_v1",
             Self::XdgDecoration => "zxdg_decoration_manager_v1",
             Self::LinuxDmabuf => "zwp_linux_dmabuf_v1",
             Self::LinuxDrmSyncobj => "wp_linux_drm_syncobj_manager_v1",
@@ -153,6 +155,7 @@ impl SelectionProtocolCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RendererProtocolCapabilities {
     pub color_management: bool,
+    pub background_effect: bool,
 }
 
 /// Protocols which are safe to expose only after their complete frame-pacing
@@ -207,6 +210,14 @@ impl RendererProtocolCapabilities {
     pub const fn unsupported() -> Self {
         Self {
             color_management: false,
+            background_effect: false,
+        }
+    }
+
+    pub const fn qualified_native() -> Self {
+        Self {
+            color_management: false,
+            background_effect: true,
         }
     }
 }
@@ -288,6 +299,14 @@ pub fn client_protocols_for_capabilities_with_presentation(
     }
     if presentation_capabilities.tearing_control {
         protocols.insert(selection_insert_at, ProtocolGlobal::WpTearingControl);
+    }
+
+    if renderer_capabilities.background_effect {
+        let insert_at = protocols
+            .iter()
+            .position(|protocol| *protocol == ProtocolGlobal::XdgDecoration)
+            .unwrap_or(protocols.len());
+        protocols.insert(insert_at, ProtocolGlobal::ExtBackgroundEffect);
     }
 
     if renderer_capabilities.color_management {

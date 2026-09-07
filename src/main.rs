@@ -169,7 +169,7 @@ fn native_protocol_names() -> Vec<&'static str> {
     client_protocols_for_capabilities_with_frame_pacing(
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
-        RendererProtocolCapabilities::unsupported(),
+        RendererProtocolCapabilities::qualified_native(),
         FramePacingProtocolCapabilities::qualified_native(),
     )
     .into_iter()
@@ -202,7 +202,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
         false,
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
-        RendererProtocolCapabilities::unsupported(),
+        RendererProtocolCapabilities::qualified_native(),
         FramePacingProtocolCapabilities::qualified_native(),
     )?;
     println!("Wayland socket bound: {}", server.socket_name());

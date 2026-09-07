@@ -359,6 +359,7 @@ pub(super) struct SurfaceData {
     buffer_transform: Mutex<SurfaceBufferTransformState>,
     input_region: Mutex<SurfaceInputRegionState>,
     opaque_region: Mutex<SurfaceInputRegionState>,
+    background_effect: Mutex<BackgroundEffectState>,
 }
 
 #[cfg(test)]
@@ -704,6 +705,45 @@ impl SurfaceData {
         if let Ok(mut state) = self.opaque_region.lock() {
             state.pending = Some(region);
         }
+    }
+
+    pub(super) fn set_pending_background_effect(&self, region: BackgroundEffectRegion) {
+        if let Ok(mut state) = self.background_effect.lock() {
+            state.pending = Some(region);
+        }
+    }
+
+    pub(super) fn clear_pending_background_effect(&self) {
+        self.set_pending_background_effect(BackgroundEffectRegion::default());
+    }
+
+    pub(super) fn take_pending_background_effect(&self) -> Option<BackgroundEffectRegion> {
+        self.background_effect
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take())
+    }
+
+    pub(super) fn apply_background_effect_change(
+        &self,
+        pending: Option<BackgroundEffectRegion>,
+    ) -> bool {
+        let Ok(mut state) = self.background_effect.lock() else {
+            return false;
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        let changed = state.committed != pending;
+        state.committed = pending;
+        changed
+    }
+
+    pub(super) fn committed_background_effect(&self) -> BackgroundEffectRegion {
+        self.background_effect
+            .lock()
+            .map(|state| state.committed.clone())
+            .unwrap_or_default()
     }
 
     pub(super) fn take_pending_opaque_region(&self) -> Option<SurfaceInputRegion> {
@@ -1153,6 +1193,30 @@ impl Default for SurfaceBufferScaleState {
 struct SurfaceInputRegionState {
     committed: SurfaceInputRegion,
     pending: Option<SurfaceInputRegion>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct BackgroundEffectState {
+    committed: BackgroundEffectRegion,
+    pending: Option<BackgroundEffectRegion>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct BackgroundEffectRegion {
+    ops: Vec<InputRegionOp>,
+}
+
+impl BackgroundEffectRegion {
+    pub(super) fn from_surface_input_region(region: SurfaceInputRegion) -> Self {
+        match region {
+            SurfaceInputRegion::Default => Self::default(),
+            SurfaceInputRegion::Custom(ops) => Self { ops },
+        }
+    }
+
+    pub(in crate::compositor) fn ops(&self) -> &[InputRegionOp] {
+        &self.ops
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

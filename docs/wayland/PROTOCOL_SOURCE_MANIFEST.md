@@ -27,7 +27,7 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 | `wayland-server` | 0.31.14 | `0dde9c29be0f723a573977de51ee455bf3dfa03652730a74f9dd3b337e374d75` |
 | `wayland-client` | 0.31.15 | `e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073` |
 | `wayland-scanner` | 0.31.10 | `9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a` |
-| `wayland-protocols` | 0.32.12 | `563a85523cade2429938e790815fd7319062103b9f4a2dc806e9b53b95982d8f` |
+| `wayland-protocols` | 0.32.13 | `23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6` |
 | `input` | 0.10.0 | `f9793345a65d71317763a33066b5d8351f8760dde8d4930fe9e39b5f14a7959d` |
 | `wayland-protocols-wlr` | 0.3.12 | `eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234` |
 
@@ -57,27 +57,28 @@ paths; the locked crate version and XML SHA-256 identify the exact input.
 
 ### Stable, staging, and already-advertised extension XML
 
-- `xdg-shell`: `wayland-protocols-0.32.12/protocols/stable/xdg-shell/xdg-shell.xml`
-- `viewporter`: `wayland-protocols-0.32.12/protocols/stable/viewporter/viewporter.xml`
-- `presentation-time`: `wayland-protocols-0.32.12/protocols/stable/presentation-time/presentation-time.xml`
-- `linux-dmabuf`: `wayland-protocols-0.32.12/protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml`
-- `fractional-scale`: `wayland-protocols-0.32.12/protocols/staging/fractional-scale/fractional-scale-v1.xml`
-- `color-management`: `wayland-protocols-0.32.12/protocols/staging/color-management/color-management-v1.xml`
-- `linux-drm-syncobj`: `wayland-protocols-0.32.12/protocols/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml`
-- `pointer-warp`: `wayland-protocols-0.32.12/protocols/staging/pointer-warp/pointer-warp-v1.xml`
-- `xdg-activation`: `wayland-protocols-0.32.12/protocols/staging/xdg-activation/xdg-activation-v1.xml`
-- `cursor-shape`: `wayland-protocols-0.32.12/protocols/staging/cursor-shape/cursor-shape-v1.xml`
-- `pointer-constraints`: `wayland-protocols-0.32.12/protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml`
-- `relative-pointer`: `wayland-protocols-0.32.12/protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml`
-- `primary-selection`: `wayland-protocols-0.32.12/protocols/unstable/primary-selection/primary-selection-unstable-v1.xml`
-- `idle-inhibit`: `wayland-protocols-0.32.12/protocols/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml`
-- `xdg-decoration`: `wayland-protocols-0.32.12/protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml`
-- `ext-data-control`: `wayland-protocols-0.32.12/protocols/staging/ext-data-control/ext-data-control-v1.xml`
-- `ext-workspace`: `wayland-protocols-0.32.12/protocols/staging/ext-workspace/ext-workspace-v1.xml`
+- `xdg-shell`: `wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml`
+- `viewporter`: `wayland-protocols-0.32.13/protocols/stable/viewporter/viewporter.xml`
+- `presentation-time`: `wayland-protocols-0.32.13/protocols/stable/presentation-time/presentation-time.xml`
+- `linux-dmabuf`: `wayland-protocols-0.32.13/protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml`
+- `fractional-scale`: `wayland-protocols-0.32.13/protocols/staging/fractional-scale/fractional-scale-v1.xml`
+- `color-management`: `wayland-protocols-0.32.13/protocols/staging/color-management/color-management-v1.xml`
+- `linux-drm-syncobj`: `wayland-protocols-0.32.13/protocols/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml`
+- `pointer-warp`: `wayland-protocols-0.32.13/protocols/staging/pointer-warp/pointer-warp-v1.xml`
+- `xdg-activation`: `wayland-protocols-0.32.13/protocols/staging/xdg-activation/xdg-activation-v1.xml`
+- `cursor-shape`: `wayland-protocols-0.32.13/protocols/staging/cursor-shape/cursor-shape-v1.xml`
+- `pointer-constraints`: `wayland-protocols-0.32.13/protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml`
+- `relative-pointer`: `wayland-protocols-0.32.13/protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml`
+- `primary-selection`: `wayland-protocols-0.32.13/protocols/unstable/primary-selection/primary-selection-unstable-v1.xml`
+- `idle-inhibit`: `wayland-protocols-0.32.13/protocols/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml`
+- `xdg-decoration`: `wayland-protocols-0.32.13/protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml`
+- `ext-data-control`: `wayland-protocols-0.32.13/protocols/staging/ext-data-control/ext-data-control-v1.xml`
+- `ext-workspace`: `wayland-protocols-0.32.13/protocols/staging/ext-workspace/ext-workspace-v1.xml`
+- `ext-background-effect`: `wayland-protocols-0.32.13/protocols/staging/ext-background-effect/ext-background-effect-v1.xml`
 - `wlr-layer-shell`: `wayland-protocols-wlr-0.3.12/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml`
 
 Generated module routing used by the locked crates is in
-`wayland-protocols-0.32.12/src/xdg.rs`, `src/wp.rs`, and
+`wayland-protocols-0.32.13/src/xdg.rs`, `src/wp.rs`, and
 `src/protocol_macro.rs`, and in `wayland-protocols-wlr-0.3.12/src/lib.rs`.
 Typhon’s local generated protocols are invoked from:
 
@@ -91,24 +92,25 @@ Typhon’s local generated protocols are invoked from:
 | XML | SHA-256 |
 |---|---|
 | Core `wayland.xml` (server/client copies) | `cc860987e54f8d85c940e97fa1270c69b6e4ad31fbcf5a7f00107ce1157f5e07` |
-| stable `xdg-shell.xml` | `5084e76386f6c3959bee957a784c57de204be0de3f57533ce07b4be0617b171a` |
+| stable `xdg-shell.xml` | `7ba7f9c8473deee674cb1f154a18abd0bb0cc072604fc055b0c15e459fc4c7df` |
 | stable `viewporter.xml` | `dcb12279a03746301fe490aaed4b38a403485a925abfce2ccfceb644e104fe71` |
 | stable `presentation-time.xml` | `dffac93bcb2bb1d8c385e72b8a8c2c0d4d79a336866322f3ba886dce2b27b1e2` |
-| stable `linux-dmabuf-v1.xml` | `ef39de11196083a41e865737f71e89a9ce3d61b94d2dbbed9b156cd89d6bb97f` |
+| stable `linux-dmabuf-v1.xml` | `2735bb4589cbb364dfcb6a821dd3abbf0c0257956b716b9691718ddfd453df4c` |
 | staging `cursor-shape-v1.xml` | `bb57d91e53a79dadab7c612dab87c233393cee73673feefa7442cfbfdd9aed2f` |
-| staging `ext-workspace-v1.xml` | `2437063d2011a06419380ab97acb84fe424a9747f004205b298fd407ace1a6dd` |
+| staging `ext-workspace-v1.xml` | `9b449d9d5d40f6032eba9813d18093b84f249a2cf38d6755dec7bca7eb96b0f3` |
+| staging `ext-background-effect-v1.xml` | `e463b7863c97d7be05489b52b15cd0b3a5d8290b51340f62023b47d03b4217e3` |
 | WLR `wlr-layer-shell-unstable-v1.xml` | `87e0b9c837aecd6977f76f3c47d73088b7159871f5d979dc1840f6cadb5e2ed8` |
 | Astrea `astrea-toplevel-management-v1.xml` | `e693df18b4da304378bf2e1f1a681a278ad25439c205a407303563e3f182f237` |
 
 ## Upstream comparison source
 
 The primary comparison source for this checkpoint is the XML distributed in
-the locked `wayland-server` 0.31.14 and `wayland-protocols` 0.32.12 source
+the locked `wayland-server` 0.31.14 and `wayland-protocols` 0.32.13 source
 packages. Those packages identify the upstream repositories as
 `https://gitlab.freedesktop.org/wayland/wayland` and
 `https://gitlab.freedesktop.org/wayland/wayland-protocols`; no unpinned live
 checkout is mixed into the build. The stable `xdg-shell` revision used here is
-the `wayland-protocols` 0.32.12 release source whose exact XML hash is recorded
+the `wayland-protocols` 0.32.13 release source whose exact XML hash is recorded
 above.
 
 ## Reproduction and regeneration
@@ -120,7 +122,7 @@ cargo fetch --locked --offline
 cargo fmt --check
 cargo build --locked
 sha256sum "$CARGO_HOME/registry/src/"*/wayland-server-0.31.14/wayland.xml
-sha256sum "$CARGO_HOME/registry/src/"*/wayland-protocols-0.32.12/protocols/stable/xdg-shell/xdg-shell.xml
+sha256sum "$CARGO_HOME/registry/src/"*/wayland-protocols-0.32.13/protocols/stable/xdg-shell/xdg-shell.xml
 cargo test --lib output_production_model_runs_10_000_operations -- --test-threads=1
 cargo test --lib dnd_production_state_seeded_model_runs_100_000_transitions -- --test-threads=1
 ```
@@ -163,6 +165,7 @@ The target contract is:
 | `wp_commit_timing_manager_v1` | 1 | qualified native frame-pacing capability |
 | `wp_tearing_control_manager_v1` | 1 | qualified native presentation-metadata capability |
 | `wp_content_type_manager_v1` | 1 | qualified native presentation-metadata capability |
+| `ext_background_effect_manager_v1` | 1 | qualified native background-effect capability |
 | `wp_color_manager_v1` | 1 | color capability |
 | `zwp_relative_pointer_manager_v1` | 1 | relative-pointer capability |
 | `zwp_pointer_constraints_v1` | 1 | pointer-constraints capability |
