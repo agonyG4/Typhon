@@ -14,7 +14,7 @@ use oblivion_one::{
 };
 
 use crate::egl_renderer::{
-    BufferAge, EglInstance, GlEglImageTargetTexture2DOes, render_target_buffer_age,
+    BufferAge, EglImageGuard, EglInstance, GlEglImageTargetTexture2DOes, render_target_buffer_age,
 };
 
 use super::{
@@ -103,6 +103,9 @@ impl AtomicOutputSlot {
             .map_err(|error| {
                 io::Error::other(format!("EGL output image import failed: {error}"))
             })?;
+        let image_guard = EglImageGuard::new(egl_image, |image| {
+            let _ = egl.destroy_image(egl_display, image);
+        });
 
         let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
         unsafe {
@@ -117,10 +120,9 @@ impl AtomicOutputSlot {
                 glow::TEXTURE_MAG_FILTER,
                 glow::LINEAR as i32,
             );
-            image_target(glow::TEXTURE_2D, egl_image.as_ptr());
+            image_target(glow::TEXTURE_2D, image_guard.image().as_ptr());
             if gl.get_error() != glow::NO_ERROR {
                 gl.delete_texture(texture);
-                let _ = egl.destroy_image(egl_display, egl_image);
                 return Err(io::Error::other(
                     "glEGLImageTargetTexture2DOES failed for explicit output BO",
                 ));
@@ -130,7 +132,6 @@ impl AtomicOutputSlot {
             Ok(framebuffer) => framebuffer,
             Err(error) => {
                 unsafe { gl.delete_texture(texture) };
-                let _ = egl.destroy_image(egl_display, egl_image);
                 return Err(io::Error::other(error));
             }
         };
@@ -146,7 +147,6 @@ impl AtomicOutputSlot {
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
                 gl.delete_framebuffer(gl_framebuffer);
                 gl.delete_texture(texture);
-                let _ = egl.destroy_image(egl_display, egl_image);
                 return Err(io::Error::other("explicit output FBO is incomplete"));
             }
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -157,7 +157,7 @@ impl AtomicOutputSlot {
             pool_generation,
             bo,
             framebuffer,
-            egl_image,
+            egl_image: image_guard.disarm(),
             texture,
             gl_framebuffer,
             last_presented_serial: None,

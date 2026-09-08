@@ -2212,7 +2212,7 @@ struct EglImageResource {
     egl_image: Option<egl::Image>,
 }
 
-struct EglImageGuard<F>
+pub(crate) struct EglImageGuard<F>
 where
     F: FnMut(egl::Image),
 {
@@ -2224,18 +2224,18 @@ impl<F> EglImageGuard<F>
 where
     F: FnMut(egl::Image),
 {
-    fn new(image: egl::Image, destroy: F) -> Self {
+    pub(crate) fn new(image: egl::Image, destroy: F) -> Self {
         Self {
             image: Some(image),
             destroy,
         }
     }
 
-    fn image(&self) -> egl::Image {
+    pub(crate) fn image(&self) -> egl::Image {
         self.image.expect("EGL image guard must own an image")
     }
 
-    fn disarm(mut self) -> egl::Image {
+    pub(crate) fn disarm(mut self) -> egl::Image {
         self.image
             .take()
             .expect("EGL image guard must own an image")
