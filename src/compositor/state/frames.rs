@@ -181,6 +181,7 @@ impl CompositorState {
     pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
         self.has_pending_frame_prepare_work()
             || self.has_pending_interactive_visual_work()
+            || self.presentation_animation_has_pending_visible()
             || self.has_unowned_frame_callbacks()
             || self.has_visible_pending_presentation_feedbacks()
             // Deferred DMA-BUF releases are runtime retry debt.  They must

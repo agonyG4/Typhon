@@ -162,6 +162,18 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
 }
 
 impl AtomicEglGbmScanout {
+    pub(crate) fn reload_trusted_effect_registry(
+        &mut self,
+        registry: &oblivion_one::effects::TrustedEffectRegistry,
+        manifest: oblivion_one::effects::EffectManifest,
+    ) -> Result<
+        std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        oblivion_one::effects::RegistryReloadError,
+    > {
+        self.scene
+            .reload_trusted_effect_registry(registry, manifest)
+    }
+
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
@@ -728,7 +740,7 @@ impl AtomicEglGbmScanout {
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
-        expected_scene_signature: u64,
+        resolved_scene: ResolvedNativeFrameScene<'static>,
         render_generation: u64,
         output_generation: u64,
         target: PresentationTarget,
@@ -907,37 +919,8 @@ impl AtomicEglGbmScanout {
             surface_damage,
             hardware_cursor_surface_id,
         ) = {
-            let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
             let resolved_snapshot = resolved_scene.snapshot();
             let resolved_scene_signature = resolved_scene.scene_identity_signature();
-            if resolved_scene_signature != expected_scene_signature {
-                eprintln!(
-                    "NATIVE P0: rejecting atomic render because the resolved scene changed between damage and render: expected={expected_scene_signature:#018x} actual={resolved_scene_signature:#018x}"
-                );
-                let error = io::Error::other(
-                    "resolved native frame scene changed between damage and atomic render",
-                );
-                settle_failed_output_transaction(
-                    output_transactions,
-                    transaction_id,
-                    OutputTransactionFailureStage::RenderPreparation,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    |obligations| {
-                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
-                            io::Error::other("scene mismatch transaction has no frame batch")
-                        })?;
-                        server.restore_frame_batch_after_render_failure(batch_id);
-                        self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
-                        Ok(())
-                    },
-                )
-                .map_err(|error| io::Error::other(error.to_string()))?;
-                return Err(error);
-            }
-            debug_assert_eq!(
-                resolved_scene_signature, expected_scene_signature,
-                "atomic damage and render must consume the same resolved native frame scene"
-            );
             let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
             let exact_cursor_commit = cursor_mode
                 .is_software()

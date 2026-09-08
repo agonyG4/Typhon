@@ -3,8 +3,10 @@ use super::*;
 use crate::egl_renderer::{
     BufferAge, EglPartialRepaintCapabilities, OutputDamage, PartialRepaintPlanner, RepaintMode,
 };
-use oblivion_one::compositor::FullscreenRenderPlanMetrics;
-use oblivion_one::compositor::ResolvedEffectScene;
+use oblivion_one::compositor::{
+    AnimationTime, FullscreenRenderPlanMetrics, PresentationSceneSample, ResolvedEffectScene,
+};
+use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 use std::borrow::Cow;
 
 #[test]
@@ -50,6 +52,13 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         },
         snapshot: NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new()),
         effects: ResolvedEffectScene::default(),
+        presentation: PresentationSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            windows: Vec::new(),
+            transforms: Vec::new(),
+            active_transitions: 0,
+            sampled_windows: 0,
+        },
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         1,
@@ -79,6 +88,39 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
     assert_eq!(renderer_ids, snapshot_ids);
     assert!(snapshot.scene.decorations.is_empty());
     assert_eq!(raw_snapshot.decorations.len(), 2);
+}
+
+#[test]
+fn freezing_a_resolved_scene_shares_shm_payload_backing() {
+    let surface =
+        super::output::test_renderable_surface(901, 0, 0, 16, 12, RenderableSurfaceDamage::Full);
+    let original_pixels = surface
+        .buffer
+        .cpu_pixels()
+        .expect("test surface uses SHM")
+        .as_ptr();
+    let surfaces = vec![surface];
+    let resolved_scene = ResolvedNativeFrameScene {
+        surfaces: Cow::Borrowed(&surfaces),
+        decorations: Vec::new(),
+        popup_surface_ids: Cow::Borrowed(&[]),
+        external_overlay_surface_ids: Vec::new(),
+        render_generation: 1,
+        visibility: FullscreenRenderPlanMetrics::default(),
+        snapshot: NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new()),
+        effects: ResolvedEffectScene::default(),
+        presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(7)),
+    };
+    let frozen = resolved_scene.into_owned();
+    assert_eq!(
+        frozen.surfaces[0]
+            .buffer
+            .cpu_pixels()
+            .expect("frozen surface uses SHM")
+            .as_ptr(),
+        original_pixels,
+        "freezing a frame scene must clone surface metadata, not SHM pixels"
+    );
 }
 
 #[test]
@@ -222,6 +264,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
             render_generation: 0,
             scene: normal.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
+            presentation: PresentationFrameSnapshot::empty(),
         });
         for frame_id in 1..=20_u64 {
             let scene = fullscreen_scene(frame_id);
@@ -230,6 +273,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
                 render_generation: frame_id,
                 scene,
                 cursor_damage: NativeCursorDamageBounds::default(),
+                presentation: PresentationFrameSnapshot::empty(),
             });
             let token = 700 + frame_id;
             assert!(history.queue_submission(token));

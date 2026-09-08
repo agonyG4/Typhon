@@ -574,10 +574,33 @@ pub(crate) struct NativeRuntime {
     astrea_launch_tracker: AstreaLaunchLifecycleTracker,
     shutdown: NativeShutdownLifecycle,
     presentation_trace: PresentationTransactionTraceRing,
+    presentation_trace_export_cursor: Option<(usize, u64)>,
     cursor_reveal_trace: Option<CursorRevealTraceLedger>,
     presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,
+}
+
+pub(super) fn reload_trusted_effects_from_disk(
+    scanout: &mut NativeScanoutBackend,
+    server: &mut OwnCompositorServer,
+) -> Result<Option<oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot>, String> {
+    let Some((path, manifest)) = oblivion_one::effects::load_default_trusted_effect_manifest()
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let generation = scanout
+        .reload_trusted_effect_registry(server.trusted_effect_registry(), manifest)
+        .map_err(|error| error.to_string())?;
+    server.reconcile_trusted_effect_bindings();
+    Ok(Some(
+        oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot {
+            manifest_path: path.display().to_string(),
+            generation: generation.generation,
+            effect_count: generation.effects.len(),
+        },
+    ))
 }
 
 impl NativeRuntime {

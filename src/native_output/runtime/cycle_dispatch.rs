@@ -8,7 +8,7 @@ use oblivion_one::control_snapshots::{
     ActiveWindowSnapshot, ControlStatusSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot, FeatureState,
     FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot, PositionSnapshot,
-    StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
+    StatusSnapshot, TrustedEffectsReloadSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
 use oblivion_one::cursor_manager::{
     CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
@@ -684,6 +684,50 @@ impl NativeRuntime {
                 Err(_) => return Some(keyboard_configuration_argument_failure(request.id)),
             };
             return self.queue_keyboard_configuration(token, request.id, args.into_config());
+        }
+        if command == ControlCommand::EffectsReload {
+            if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "effects reload takes no arguments",
+                    ),
+                ));
+            }
+            let snapshot = match super::reload_trusted_effects_from_disk(
+                &mut self.scanout,
+                &mut self.server,
+            ) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "trusted effects manifest is not present",
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(ControlErrorCode::Internal, error),
+                    ));
+                }
+            };
+            return Some(
+                match serde_json::to_value::<TrustedEffectsReloadSnapshot>(snapshot) {
+                    Ok(result) => ControlResponse::success(request.id, result),
+                    Err(_) => ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "effect reload snapshot failed",
+                        ),
+                    ),
+                },
+            );
         }
         let result = match command {
             ControlCommand::Version => serde_json::to_value(VersionSnapshot {

@@ -861,6 +861,7 @@ impl CompositorState {
         self.layout_batch_depth = self.layout_batch_depth.saturating_add(1);
         if self.layout_batch_depth == 1 {
             self.layout_batch_scene_effect = false;
+            self.layout_animation_epoch = AnimationTime::monotonic_now();
         }
     }
 
@@ -872,6 +873,7 @@ impl CompositorState {
         }
         let scene_effect = self.layout_batch_scene_effect;
         self.layout_batch_scene_effect = false;
+        self.layout_animation_epoch = None;
         if scene_effect {
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::LayoutReflow,
@@ -1147,6 +1149,10 @@ impl CompositorState {
         surface_id: u32,
         reason: SurfaceTeardownReason,
     ) {
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if root_surface_id == surface_id {
+            self.cancel_presentation_for_root(root_surface_id);
+        }
         self.remove_keyboard_shortcut_inhibitors_for_surface(surface_id);
         self.surface_frame_clock.remove(&surface_id);
         if reason != SurfaceTeardownReason::ClientDisconnected {

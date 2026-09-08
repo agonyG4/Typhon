@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::WindowId;
@@ -9,6 +10,7 @@ use super::{
     SurfaceDamageRect, SurfaceRenderBackend,
 };
 use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
+use crate::presentation_animation::{PresentationGroupTransform, PresentationRect};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 #[cfg(test)]
 use wayland_server::protocol::wl_output;
@@ -132,6 +134,10 @@ impl DecorationRenderInstance {
         (self.origin_x, self.origin_y)
     }
 
+    pub const fn root_surface_id(&self) -> u32 {
+        self.root_surface_id
+    }
+
     pub fn scene_snapshot(&self) -> DecorationSceneSnapshot {
         DecorationSceneSnapshot::from_bounds(
             self.window_id,
@@ -142,6 +148,109 @@ impl DecorationRenderInstance {
             self.plan.layout.outer.height,
             self.plan.visual_signature(),
         )
+    }
+
+    /// Return a frame-local decoration projection without mutating the
+    /// canonical decoration plan. The same group transform used for client
+    /// surfaces is applied to every SSD primitive and its scene bounds.
+    pub fn with_presentation_transform(
+        &self,
+        transform: PresentationGroupTransform,
+    ) -> Option<Self> {
+        let mapped_origin = map_presentation_point(
+            transform,
+            (f64::from(self.origin_x), f64::from(self.origin_y)),
+        );
+        let mapped_origin = (
+            saturating_i32_from_f64(mapped_origin.0.floor()),
+            saturating_i32_from_f64(mapped_origin.1.floor()),
+        );
+        let map_rect = |rect: DecorationRect| {
+            map_decoration_rect(
+                transform,
+                (self.origin_x, self.origin_y),
+                rect,
+                mapped_origin,
+            )
+        };
+        let mut plan = self.plan.clone();
+        plan.layout.outer = map_rect(plan.layout.outer)?;
+        for primitive in &mut plan.primitives {
+            match primitive {
+                DecorationRenderPrimitive::SolidRect { rect, .. }
+                | DecorationRenderPrimitive::Image { rect, .. } => {
+                    *rect = map_rect(*rect)?;
+                }
+                DecorationRenderPrimitive::Text { rect, clip, .. } => {
+                    *rect = map_rect(*rect)?;
+                    *clip = map_rect(*clip)?;
+                }
+            }
+        }
+        Some(Self {
+            plan,
+            origin_x: mapped_origin.0,
+            origin_y: mapped_origin.1,
+            window_id: self.window_id,
+            root_surface_id: self.root_surface_id,
+        })
+    }
+}
+
+#[allow(dead_code)] // Used by the native-output presentation projection.
+fn map_decoration_rect(
+    transform: PresentationGroupTransform,
+    origin: (i32, i32),
+    rect: DecorationRect,
+    mapped_origin: (i32, i32),
+) -> Option<DecorationRect> {
+    let canonical = PresentationRect::new(
+        f64::from(origin.0.saturating_add(rect.x)),
+        f64::from(origin.1.saturating_add(rect.y)),
+        f64::from(rect.width),
+        f64::from(rect.height),
+    )?;
+    let mapped = transform.map_rect(canonical)?;
+    let left = mapped.x().floor();
+    let top = mapped.y().floor();
+    let right = (mapped.x() + mapped.width()).ceil();
+    let bottom = (mapped.y() + mapped.height()).ceil();
+    let width = (right - left).max(1.0).min(f64::from(u32::MAX));
+    let height = (bottom - top).max(1.0).min(f64::from(u32::MAX));
+    Some(DecorationRect::new(
+        saturating_i32_from_f64(left - f64::from(mapped_origin.0)),
+        saturating_i32_from_f64(top - f64::from(mapped_origin.1)),
+        width as u32,
+        height as u32,
+    ))
+}
+
+#[allow(dead_code)] // Used by the native-output presentation projection.
+fn map_presentation_point(transform: PresentationGroupTransform, point: (f64, f64)) -> (f64, f64) {
+    transform.map_point(point)
+}
+
+#[allow(dead_code)] // Used by the native-output presentation projection.
+fn saturating_i32_from_f64(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VisualGroupId(NonZeroU32);
+
+impl VisualGroupId {
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
     }
 }
 
@@ -168,6 +277,10 @@ impl VisualStackGroup {
 
     pub fn is_popup(&self) -> bool {
         self.popup
+    }
+
+    pub fn id_for_order(index: usize) -> Option<VisualGroupId> {
+        VisualGroupId::new(u32::try_from(index).ok()?.saturating_add(1))
     }
 }
 
@@ -4563,6 +4676,32 @@ mod tests {
             window_id: WindowId::from_raw(1).expect("test window id"),
             root_surface_id: 1,
         }
+    }
+
+    #[test]
+    fn decoration_projection_uses_the_shared_group_transform() {
+        let instance = test_decoration_instance(100, 100);
+        let transform = PresentationGroupTransform::new(
+            1,
+            crate::presentation_animation::TransitionId::new(
+                std::num::NonZeroU64::new(3).expect("non-zero transition id"),
+            ),
+            PresentationRect::new(100.0, 100.0, 20.0, 20.0).expect("canonical group"),
+            PresentationRect::new(200.0, 200.0, 40.0, 40.0).expect("presented group"),
+            false,
+        );
+        let projected = instance
+            .with_presentation_transform(transform)
+            .expect("decoration projection");
+        assert_eq!(projected.origin(), (200, 200));
+        assert_eq!(
+            projected.plan.layout.outer.width,
+            instance.plan.layout.outer.width.saturating_mul(2)
+        );
+        assert_eq!(
+            projected.plan.layout.outer.height,
+            instance.plan.layout.outer.height.saturating_mul(2)
+        );
     }
 
     #[test]

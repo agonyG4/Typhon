@@ -693,8 +693,8 @@ impl CompositorState {
         };
         if !resource_belongs_to_surface_client(&pointer, &focused)
             || !resource_belongs_to_surface_client(&pointer, &surface)
-            || self.root_surface_id_for_surface(compositor_surface_id(&focused))
-                != self.root_surface_id_for_surface(compositor_surface_id(&surface))
+            || self.presentation_owner_root_for_surface(compositor_surface_id(&focused))
+                != self.presentation_owner_root_for_surface(compositor_surface_id(&surface))
         {
             pointer_debug_log(format!(
                 "pointer.constraint activation deferred id={} reason=focus_client_or_root_mismatch focused={} owner={}",
@@ -795,7 +795,7 @@ impl CompositorState {
             return Some(current);
         }
         let owner_root =
-            self.root_surface_id_for_surface(compositor_surface_id(&constraint.surface));
+            self.presentation_owner_root_for_surface(compositor_surface_id(&constraint.surface));
         if let Some(press) = self.held_pointer_buttons.iter().rev().find(|press| {
             press.root_surface_id == owner_root
                 && resource_belongs_to_surface_client(&press.surface, &constraint.surface)
@@ -895,8 +895,8 @@ impl CompositorState {
         };
         if !resource_belongs_to_surface_client(&pointer, &focused)
             || !resource_belongs_to_surface_client(&pointer, &surface)
-            || self.root_surface_id_for_surface(compositor_surface_id(&focused))
-                != self.root_surface_id_for_surface(compositor_surface_id(&surface))
+            || self.presentation_owner_root_for_surface(compositor_surface_id(&focused))
+                != self.presentation_owner_root_for_surface(compositor_surface_id(&surface))
         {
             self.abort_pointer_constraint_backend_activation(id, "focus_client_or_root_changed");
             return None;

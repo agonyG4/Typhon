@@ -210,6 +210,13 @@ pub(crate) struct PresentationTransactionTraceRing {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TraceExport {
+    Unchanged,
+    Append(String),
+    Replace(String),
+}
+
 impl PresentationTransactionTraceRing {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
@@ -311,16 +318,43 @@ impl PresentationTransactionTraceRing {
     pub(crate) fn export_jsonl(&self) -> String {
         let mut output = String::new();
         for event in self.events.iter().copied() {
-            let _ = writeln!(
-                output,
-                "{{\"event\":\"{}\",\"transaction_id\":{},\"timestamp_ns\":{}}}",
-                event.name(),
-                event.transaction_id().get(),
-                event.timestamp_ns(),
-            );
+            append_event_jsonl(&mut output, event);
         }
         output
     }
+
+    pub(crate) fn export_delta(&self, previous: Option<(usize, u64)>) -> TraceExport {
+        let current = (self.events.len(), self.dropped);
+        let Some((previous_len, previous_dropped)) = previous else {
+            return TraceExport::Replace(self.export_jsonl());
+        };
+        if current == (previous_len, previous_dropped) {
+            return TraceExport::Unchanged;
+        }
+        if previous_dropped == self.dropped && previous_len <= self.events.len() {
+            let mut output = String::new();
+            for event in self.events.iter().skip(previous_len).copied() {
+                append_event_jsonl(&mut output, event);
+            }
+            TraceExport::Append(output)
+        } else {
+            TraceExport::Replace(self.export_jsonl())
+        }
+    }
+
+    pub(crate) fn export_cursor(&self) -> (usize, u64) {
+        (self.events.len(), self.dropped)
+    }
+}
+
+fn append_event_jsonl(output: &mut String, event: PresentationTransactionEvent) {
+    let _ = writeln!(
+        output,
+        "{{\"event\":\"{}\",\"transaction_id\":{},\"timestamp_ns\":{}}}",
+        event.name(),
+        event.transaction_id().get(),
+        event.timestamp_ns(),
+    );
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -359,5 +393,52 @@ impl TimingSummary {
             }
         }
         HISTOGRAM_BUCKETS_NS[HISTOGRAM_BUCKETS_NS.len() - 1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    fn event(timestamp_ns: u64) -> PresentationTransactionEvent {
+        PresentationTransactionEvent::ContentObserved {
+            transaction_id: OutputTransactionId::new(NonZeroU64::new(1).unwrap()),
+            timestamp_ns,
+        }
+    }
+
+    #[test]
+    fn unchanged_trace_does_not_rewrite_history() {
+        let mut ring = PresentationTransactionTraceRing::new(4);
+        ring.push(event(1));
+        let cursor = ring.export_cursor();
+        assert_eq!(ring.export_delta(Some(cursor)), TraceExport::Unchanged);
+    }
+
+    #[test]
+    fn new_events_export_as_append_only_jsonl() {
+        let mut ring = PresentationTransactionTraceRing::new(4);
+        ring.push(event(1));
+        let cursor = ring.export_cursor();
+        ring.push(event(2));
+        let TraceExport::Append(delta) = ring.export_delta(Some(cursor)) else {
+            panic!("expected append-only export");
+        };
+        assert!(delta.contains("\"timestamp_ns\":2"));
+        assert!(!delta.contains("\"timestamp_ns\":1"));
+    }
+
+    #[test]
+    fn ring_overwrite_requires_a_bounded_full_replacement() {
+        let mut ring = PresentationTransactionTraceRing::new(1);
+        ring.push(event(1));
+        let cursor = ring.export_cursor();
+        ring.push(event(2));
+        let TraceExport::Replace(full) = ring.export_delta(Some(cursor)) else {
+            panic!("expected replacement export after a drop");
+        };
+        assert!(!full.contains("\"timestamp_ns\":1"));
+        assert!(full.contains("\"timestamp_ns\":2"));
     }
 }

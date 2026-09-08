@@ -24,7 +24,8 @@ struct SurfaceEffectState {
 pub(super) struct AstreaSurfaceEffectData {
     surface_id: u32,
     surface: wl_surface::WlSurface,
-    _slot: String,
+    slot: SurfaceEffectSlot,
+    binding_id: u64,
     state: Mutex<SurfaceEffectState>,
 }
 
@@ -80,20 +81,28 @@ impl Dispatch<astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for Composi
                     );
                     return;
                 }
+                let Some(slot) = SurfaceEffectSlot::parse(&slot) else {
+                    resource.post_error(
+                        astrea_effects_manager_v1::Error::InvalidSlot,
+                        "surface effect slot is unsupported for v1",
+                    );
+                    return;
+                };
                 let surface_id = compositor_surface_id(&surface);
-                if state.internal_surface_effects.contains_key(&surface_id) {
+                let Some(binding_id) = state.claim_protocol_surface_effect(surface_id, slot) else {
                     resource.post_error(
                         astrea_effects_manager_v1::Error::EffectExists,
                         "a surface effect already occupies this surface slot",
                     );
                     return;
-                }
+                };
                 data_init.init(
                     id,
                     AstreaSurfaceEffectData {
                         surface_id,
                         surface,
-                        _slot: slot,
+                        slot,
+                        binding_id,
                         state: Mutex::new(SurfaceEffectState::default()),
                     },
                 );
@@ -127,7 +136,13 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
 
         match request {
             astrea_surface_effect_v1::Request::Destroy => {
-                state.clear_internal_surface_effect(data.surface_id);
+                state.release_protocol_surface_effect(
+                    SurfaceEffectBindingKey {
+                        surface_id: data.surface_id,
+                        slot: data.slot,
+                    },
+                    data.binding_id,
+                );
             }
             astrea_surface_effect_v1::Request::SetProgram { name } => {
                 if !data.surface.is_alive() {
@@ -146,6 +161,20 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     );
                     return;
                 };
+                if !state.prepare_protocol_surface_effect_program(
+                    data.binding_id,
+                    data.surface_id,
+                    data.slot,
+                    &name,
+                    program,
+                ) {
+                    post_surface_error(
+                        resource,
+                        astrea_surface_effect_v1::Error::InvalidValue,
+                        "trusted effect generation changed; set_program cannot be applied",
+                    );
+                    return;
+                }
                 let defaults = state.effect_parameter_defaults(program);
                 let values = defaults.iter().copied().collect::<BTreeMap<_, _>>();
                 let (enabled, block) = {
@@ -157,7 +186,14 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     (current.enabled, block)
                 };
                 if enabled
-                    && !state.apply_protocol_surface_effect(data.surface_id, program, true, block)
+                    && !state.apply_protocol_surface_effect(
+                        data.binding_id,
+                        data.surface_id,
+                        data.slot,
+                        program,
+                        true,
+                        block,
+                    )
                 {
                     post_surface_error(
                         resource,
@@ -245,7 +281,9 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                 drop(current);
                 if want_enabled
                     && !state.apply_protocol_surface_effect(
+                        data.binding_id,
                         data.surface_id,
+                        data.slot,
                         program,
                         true,
                         block.clone(),
@@ -259,7 +297,14 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     return;
                 }
                 if !want_enabled {
-                    state.apply_protocol_surface_effect(data.surface_id, program, false, block);
+                    state.apply_protocol_surface_effect(
+                        data.binding_id,
+                        data.surface_id,
+                        data.slot,
+                        program,
+                        false,
+                        block,
+                    );
                 }
                 data.state
                     .lock()
@@ -275,7 +320,13 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
         _resource: &astrea_surface_effect_v1::AstreaSurfaceEffectV1,
         data: &AstreaSurfaceEffectData,
     ) {
-        state.clear_internal_surface_effect(data.surface_id);
+        state.release_protocol_surface_effect(
+            SurfaceEffectBindingKey {
+                surface_id: data.surface_id,
+                slot: data.slot,
+            },
+            data.binding_id,
+        );
     }
 }
 
@@ -327,7 +378,9 @@ fn update_parameter(
     };
     if enabled
         && !state.apply_protocol_surface_effect(
+            data.binding_id,
             data.surface_id,
+            data.slot,
             program,
             true,
             parameter_block(&values),
@@ -369,6 +422,51 @@ fn value_in_range(
             EffectUniformValue::Float(value),
         ) => value >= min && value <= max,
         (
+            Some(crate::effects::EffectParameterRange::Float { min, max }),
+            EffectUniformValue::Vec2(value),
+        ) => value.iter().all(|value| *value >= min && *value <= max),
+        (
+            Some(crate::effects::EffectParameterRange::Float { min, max }),
+            EffectUniformValue::Vec3(value),
+        ) => value.iter().all(|value| *value >= min && *value <= max),
+        (
+            Some(crate::effects::EffectParameterRange::Float { min, max }),
+            EffectUniformValue::Vec4(value),
+        ) => value.iter().all(|value| *value >= min && *value <= max),
+        (
+            Some(crate::effects::EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 2,
+            }),
+            EffectUniformValue::Vec2(value),
+        ) => value
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (
+            Some(crate::effects::EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 3,
+            }),
+            EffectUniformValue::Vec3(value),
+        ) => value
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (
+            Some(crate::effects::EffectParameterRange::FloatComponents {
+                min,
+                max,
+                components: 4,
+            }),
+            EffectUniformValue::Vec4(value),
+        ) => value
+            .iter()
+            .enumerate()
+            .all(|(index, value)| *value >= min[index] && *value <= max[index]),
+        (
             Some(crate::effects::EffectParameterRange::Int { min, max }),
             EffectUniformValue::Int(value),
         ) => value >= min && value <= max,
@@ -387,4 +485,40 @@ fn post_surface_error(
     message: &str,
 ) {
     resource.post_error(error, message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_ranges_apply_component_wise_to_vectors() {
+        let range = Some(crate::effects::EffectParameterRange::Float { min: 0.0, max: 1.0 });
+        assert!(value_in_range(range, EffectUniformValue::Vec2([0.1, 0.9])));
+        assert!(!value_in_range(
+            range,
+            EffectUniformValue::Vec3([0.1, 1.1, 0.2])
+        ));
+        assert!(value_in_range(
+            range,
+            EffectUniformValue::Vec4([0.0, 0.25, 0.5, 1.0])
+        ));
+    }
+
+    #[test]
+    fn component_float_ranges_apply_per_vector_component() {
+        let range = Some(crate::effects::EffectParameterRange::FloatComponents {
+            min: [0.0, 0.2, 0.4, 0.0],
+            max: [0.1, 0.3, 0.6, 1.0],
+            components: 3,
+        });
+        assert!(value_in_range(
+            range,
+            EffectUniformValue::Vec3([0.05, 0.25, 0.5])
+        ));
+        assert!(!value_in_range(
+            range,
+            EffectUniformValue::Vec3([0.05, 0.35, 0.5])
+        ));
+    }
 }

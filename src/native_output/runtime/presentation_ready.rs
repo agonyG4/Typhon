@@ -4,8 +4,8 @@ use super::presentation_transactions::{
     register_primary_transaction,
 };
 use super::presentation_worker::{
-    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation,
-    validation_base_for_submission, worker_ctx,
+    promote_immediate_and_publish, queue_compatibility_for_presentation,
+    submit_explicit_ready_for_presentation, validation_base_for_submission, worker_ctx,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
@@ -422,7 +422,7 @@ pub(super) fn submit_ready_frame(
             });
         }
         NativePresentResult::Immediate => {
-            if !scene_history.promote_immediate() {
+            if !promote_immediate_and_publish(scene_history, server) {
                 return Err(io::Error::other(
                     "immediate compatibility presentation has no rendered scene snapshot",
                 )

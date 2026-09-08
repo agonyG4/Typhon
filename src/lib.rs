@@ -20,6 +20,7 @@ pub mod native;
 mod paths;
 mod pointer_debug;
 pub mod portal;
+pub mod presentation_animation;
 pub mod process;
 pub mod render_backend;
 pub mod session;

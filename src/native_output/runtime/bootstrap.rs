@@ -567,6 +567,10 @@ impl NativeRuntime {
             .map_or(0, NativeAtomicCursor::desired_epoch);
         let last_primary_presented_at_ns = None;
         let cursor_output_arbitration = NativeCursorOutputArbitration::default();
+        server.publish_presented_presentation(
+            initial_presented_scene.frame_id,
+            &initial_presented_scene.presentation,
+        );
         let scene_history = NativeSceneHistory::new(initial_presented_scene);
         let last_client_cursor_damage = None;
         let last_software_cursor_damage = None;
@@ -732,6 +736,7 @@ impl NativeRuntime {
             astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
             presentation_trace: PresentationTransactionTraceRing::from_env(),
+            presentation_trace_export_cursor: None,
             cursor_reveal_trace: crate::pointer_debug::cursor_presentation_trace_enabled()
                 .then(CursorRevealTraceLedger::new),
             presentation_trace_path: std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
@@ -992,6 +997,16 @@ impl NativeRuntime {
             NativeKmsStartupPlan::Atomic { discovery } => Some(discovery.as_ref()),
             NativeKmsStartupPlan::Legacy { .. } => None,
         };
+        match super::reload_trusted_effects_from_disk(&mut scanout, &mut server) {
+            Ok(Some(snapshot)) => println!(
+                "trusted effects: loaded {} generation={} effects={}",
+                snapshot.manifest_path, snapshot.generation, snapshot.effect_count
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "trusted effects: manifest rejected; retaining previous generation: {error}"
+            ),
+        }
         perf.log("native.backend", || {
             vec![
                 NativePerfField::str("drm", kms.kind().as_str()),

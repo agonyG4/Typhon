@@ -18,6 +18,7 @@ use crate::native_output::kms_worker::{
 use crate::native_output::presentation::plane::{
     CursorRevision, CursorSource, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
 };
+use oblivion_one::compositor::AnimationTime;
 use oblivion_one::native::kms::FramebufferId;
 
 #[expect(
@@ -57,6 +58,7 @@ pub(super) fn replace_atomic_ready_scene(
     resolved_snapshot: NativeSceneSnapshot,
     frame_id: u64,
     render_generation: u64,
+    presentation: oblivion_one::compositor::PresentationFrameSnapshot,
     cursor: (
         Option<NativeClientCursorDamageState>,
         Option<NativeDamageRect>,
@@ -68,6 +70,7 @@ pub(super) fn replace_atomic_ready_scene(
         render_generation,
         scene: resolved_snapshot,
         cursor_damage,
+        presentation,
     });
 }
 
@@ -82,6 +85,7 @@ pub(super) fn record_atomic_rendered_scene(
     transaction_id: OutputTransactionId,
     resolved_render_generation: u64,
     resolved_snapshot: NativeSceneSnapshot,
+    presentation: oblivion_one::compositor::PresentationFrameSnapshot,
     resolved_scene_signature: u64,
     render_damage_signature: u64,
     repair_damage_signature: u64,
@@ -98,6 +102,7 @@ pub(super) fn record_atomic_rendered_scene(
         resolved_snapshot,
         frame_id,
         resolved_render_generation,
+        presentation,
         cursor,
     );
     record_composited_scene_identity(
@@ -120,12 +125,16 @@ pub(super) fn resolve_scene_and_damage<'a>(
     height: u32,
     scene_history: &NativeSceneHistory,
     server: &'a OwnCompositorServer,
+    presentation_time: Option<AnimationTime>,
     cursor: (
         Option<NativeClientCursorDamageState>,
         Option<NativeDamageRect>,
     ),
 ) -> (ResolvedNativeFrameScene<'a>, NativeOutputDamage) {
-    let resolved_scene = ResolvedNativeFrameScene::from_server(server);
+    let at = presentation_time
+        .or_else(AnimationTime::monotonic_now)
+        .unwrap_or(AnimationTime::from_nanos(0));
+    let resolved_scene = ResolvedNativeFrameScene::from_server_at(server, at);
     let output_damage = native_output_damage_for_presented_scene(
         direct,
         width,
@@ -332,6 +341,33 @@ pub(super) fn replace_ready_scene(
         resolved_scene,
         scene_history.cursor_damage((current_client_cursor_damage, current_software_cursor_damage)),
     ));
+}
+
+pub(super) fn promote_pageflip_and_publish(
+    scene_history: &mut NativeSceneHistory,
+    token: u64,
+    server: &mut OwnCompositorServer,
+) -> bool {
+    if !scene_history.promote_pageflip(token) {
+        return false;
+    }
+    if let Some(snapshot) = scene_history.presented_snapshot() {
+        server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
+    }
+    true
+}
+
+pub(super) fn promote_immediate_and_publish(
+    scene_history: &mut NativeSceneHistory,
+    server: &mut OwnCompositorServer,
+) -> bool {
+    if !scene_history.promote_immediate() {
+        return false;
+    }
+    if let Some(snapshot) = scene_history.presented_snapshot() {
+        server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
+    }
+    true
 }
 
 pub(super) fn can_queue_worker_primary(

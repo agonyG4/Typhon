@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|keyboard configure [typed options]|cursor ...|decoration ...|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|keyboard configure [typed options]|cursor ...|decoration ...|effects reload|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -283,6 +283,18 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             ));
         }
         parse_decoration_command(&positionals[1..])?
+    } else if command == "effects" {
+        if keyboard_configure.has_any() {
+            return Err(AstreactlError::Usage(
+                "keyboard configuration options require a keyboard command".to_string(),
+            ));
+        }
+        if cursor_theme.is_some() || cursor_size.is_some() || wallpaper_fit.is_some() {
+            return Err(AstreactlError::Usage(
+                "effects commands do not accept cursor or wallpaper options".to_string(),
+            ));
+        }
+        parse_effects_command(&positionals[1..])?
     } else if command == "keyboard" {
         if cursor_theme.is_some() || cursor_size.is_some() || wallpaper_fit.is_some() {
             return Err(AstreactlError::Usage(
@@ -612,6 +624,17 @@ fn parse_decoration_command(
             "unknown decoration command {subcommand}"
         ))),
     }
+}
+
+fn parse_effects_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    if positionals.len() == 1 && positionals[0] == "reload" {
+        return Ok(("effects", "effects.reload", serde_json::json!({})));
+    }
+    Err(AstreactlError::Usage(
+        "effects command requires reload".to_string(),
+    ))
 }
 
 fn parse_cursor_command(

@@ -50,6 +50,77 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn premultiplied_mask_scales_rgb_and_alpha_without_nan() {
+        let input = PremultipliedRgba::new(0.4, 0.2, 0.1, 0.5);
+        assert_eq!(
+            input.apply_mask(0.25, MaskMode::Alpha),
+            PremultipliedRgba::new(0.1, 0.05, 0.025, 0.125)
+        );
+        assert_eq!(
+            PremultipliedRgba::new(0.0, 0.0, 0.0, 0.0).apply_mask(1.0, MaskMode::InvertedAlpha),
+            PremultipliedRgba::TRANSPARENT
+        );
+    }
+
+    #[test]
+    fn premultiplied_blend_modes_are_finite_and_source_over_is_exact() {
+        let destination = PremultipliedRgba::new(0.2, 0.1, 0.05, 0.5);
+        let source = PremultipliedRgba::new(0.4, 0.2, 0.1, 0.5);
+        let result = destination.blend(source, BlendMode::SourceOver, 1.0);
+        assert_eq!(result, PremultipliedRgba::new(0.5, 0.25, 0.125, 0.75));
+        for mode in [BlendMode::Add, BlendMode::Multiply, BlendMode::Screen] {
+            let result = destination.blend(source, mode, 0.75);
+            assert!(
+                [result.r, result.g, result.b, result.a]
+                    .into_iter()
+                    .all(f32::is_finite)
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_alpha_is_forced_only_at_the_explicit_boundary() {
+        let input = PremultipliedRgba::new(0.1, 0.05, 0.02, 0.25);
+        assert_eq!(input.with_alpha_mode(EffectAlphaMode::Preserve), input);
+        assert_eq!(input.with_alpha_mode(EffectAlphaMode::Opaque).a, 1.0);
+    }
+
+    #[test]
+    fn premultiplied_srgb_round_trip_preserves_saturated_straight_color() {
+        for alpha in [0.0, 0.25, 0.5, 1.0] {
+            let input = PremultipliedRgba::new(0.8 * alpha, 0.2 * alpha, 0.05 * alpha, alpha);
+            let round_trip = input.decode_srgb().encode_srgb();
+            if alpha == 0.0 {
+                assert_eq!(round_trip, PremultipliedRgba::TRANSPARENT);
+            } else {
+                assert!((round_trip.r - input.r).abs() < 0.0001);
+                assert!((round_trip.g - input.g).abs() < 0.0001);
+                assert!((round_trip.b - input.b).abs() < 0.0001);
+                assert_eq!(round_trip.a, alpha);
+            }
+        }
+    }
+
+    #[test]
+    fn linear_kawase_reference_decodes_each_sample_before_averaging() {
+        let samples = [
+            PremultipliedRgba::new(0.0, 0.0, 0.0, 1.0),
+            PremultipliedRgba::new(1.0, 1.0, 1.0, 1.0),
+            PremultipliedRgba::new(0.0, 0.0, 0.0, 1.0),
+            PremultipliedRgba::new(1.0, 1.0, 1.0, 1.0),
+        ];
+        let decoded = samples.map(PremultipliedRgba::decode_srgb);
+        let average = PremultipliedRgba::new(
+            decoded.iter().map(|sample| sample.r).sum::<f32>() * 0.25,
+            decoded.iter().map(|sample| sample.g).sum::<f32>() * 0.25,
+            decoded.iter().map(|sample| sample.b).sum::<f32>() * 0.25,
+            decoded.iter().map(|sample| sample.a).sum::<f32>() * 0.25,
+        );
+        let encoded_average = PremultipliedRgba::new(0.5, 0.5, 0.5, 1.0).decode_srgb();
+        assert!(average.r > encoded_average.r);
+    }
 }
 use std::num::{NonZeroU16, NonZeroU64};
 
@@ -61,6 +132,24 @@ pub const MAX_EFFECT_BLUR_PASSES: u8 = 8;
 pub const MAX_EFFECT_REGION_RECTS: usize = 128;
 pub const MAX_EFFECT_PROGRAMS: usize = 256;
 pub const MAX_EFFECT_SHADER_SOURCE_BYTES: usize = 256 * 1024;
+
+pub const BUILTIN_EFFECT_PROGRAM_ID: u64 = 1;
+pub const INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE: u64 = 1001;
+pub const INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE: u64 = 1002;
+pub const INTERNAL_EFFECT_SHADER_MODULE_COPY: u64 = 1003;
+pub const INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE: u64 = 1004;
+pub const INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT: u64 = 1005;
+pub const INTERNAL_EFFECT_SHADER_MODULE_MASK: u64 = 1006;
+pub const INTERNAL_EFFECT_SHADER_MODULE_BLEND: u64 = 1007;
+pub const INTERNAL_EFFECT_SHADER_MODULE_IDS: &[u64] = &[
+    INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+    INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE,
+    INTERNAL_EFFECT_SHADER_MODULE_COPY,
+    INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE,
+    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
+    INTERNAL_EFFECT_SHADER_MODULE_MASK,
+    INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+];
 
 macro_rules! typed_id {
     ($name:ident, $raw:ty, $inner:ty) => {
@@ -353,6 +442,15 @@ pub struct ColorMatrixSpec {
     pub bias: [f32; 4],
 }
 
+impl ColorMatrixSpec {
+    pub const IDENTITY: Self = Self {
+        matrix: [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
+        bias: [0.0; 4],
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TintSpec {
     pub color: [f32; 4],
@@ -443,6 +541,165 @@ pub enum MaskMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaskSpec {
     pub mode: MaskMode,
+}
+
+/// A finite premultiplied RGBA value used by the renderer-independent effect
+/// math contract.  All channels are clamped to the normalized color range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PremultipliedRgba {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl PremultipliedRgba {
+    pub const TRANSPARENT: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
+
+    pub fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        let a = finite_clamp(a);
+        Self {
+            r: finite_clamp(r).min(a),
+            g: finite_clamp(g).min(a),
+            b: finite_clamp(b).min(a),
+            a,
+        }
+    }
+
+    pub fn apply_mask(self, mask_alpha: f32, mode: MaskMode) -> Self {
+        let coverage = match mode {
+            MaskMode::Alpha => finite_clamp(mask_alpha),
+            MaskMode::InvertedAlpha => finite_clamp(1.0 - mask_alpha),
+        };
+        Self::new(
+            self.r * coverage,
+            self.g * coverage,
+            self.b * coverage,
+            self.a * coverage,
+        )
+    }
+
+    pub fn with_alpha_mode(self, mode: EffectAlphaMode) -> Self {
+        match mode {
+            EffectAlphaMode::Preserve => self,
+            EffectAlphaMode::Opaque => Self::new(self.r, self.g, self.b, 1.0),
+        }
+    }
+
+    /// Blend `source` over `destination` in premultiplied form.
+    pub fn blend(self, source: Self, mode: BlendMode, opacity: f32) -> Self {
+        let source_alpha = source.a * finite_clamp(opacity);
+        let source = Self::new(
+            source.r * finite_clamp(opacity),
+            source.g * finite_clamp(opacity),
+            source.b * finite_clamp(opacity),
+            source_alpha,
+        );
+        let inverse_source_alpha = 1.0 - source.a;
+        let alpha = source.a + self.a * inverse_source_alpha;
+        let rgb = match mode {
+            BlendMode::SourceOver => [
+                source.r + self.r * inverse_source_alpha,
+                source.g + self.g * inverse_source_alpha,
+                source.b + self.b * inverse_source_alpha,
+            ],
+            BlendMode::Add => [self.r + source.r, self.g + source.g, self.b + source.b],
+            BlendMode::Multiply | BlendMode::Screen => {
+                let destination_straight = self.straight_rgb();
+                let source_straight = source.straight_rgb();
+                let blended = match mode {
+                    BlendMode::Multiply => [
+                        destination_straight[0] * source_straight[0],
+                        destination_straight[1] * source_straight[1],
+                        destination_straight[2] * source_straight[2],
+                    ],
+                    BlendMode::Screen => [
+                        1.0 - (1.0 - destination_straight[0]) * (1.0 - source_straight[0]),
+                        1.0 - (1.0 - destination_straight[1]) * (1.0 - source_straight[1]),
+                        1.0 - (1.0 - destination_straight[2]) * (1.0 - source_straight[2]),
+                    ],
+                    _ => unreachable!(),
+                };
+                [
+                    self.r * (1.0 - source.a)
+                        + source.r * (1.0 - self.a)
+                        + blended[0] * self.a * source.a,
+                    self.g * (1.0 - source.a)
+                        + source.g * (1.0 - self.a)
+                        + blended[1] * self.a * source.a,
+                    self.b * (1.0 - source.a)
+                        + source.b * (1.0 - self.a)
+                        + blended[2] * self.a * source.a,
+                ]
+            }
+        };
+        Self::new(rgb[0], rgb[1], rgb[2], alpha)
+    }
+
+    fn straight_rgb(self) -> [f32; 3] {
+        if self.a <= f32::EPSILON {
+            [0.0; 3]
+        } else {
+            [self.r / self.a, self.g / self.a, self.b / self.a]
+        }
+    }
+
+    pub fn decode_srgb(self) -> Self {
+        if self.a <= f32::EPSILON {
+            return Self::TRANSPARENT;
+        }
+        let straight = self.straight_rgb();
+        let linear = straight.map(srgb_decode);
+        Self::new(
+            linear[0] * self.a,
+            linear[1] * self.a,
+            linear[2] * self.a,
+            self.a,
+        )
+    }
+
+    pub fn encode_srgb(self) -> Self {
+        if self.a <= f32::EPSILON {
+            return Self::TRANSPARENT;
+        }
+        let straight = self.straight_rgb();
+        let encoded = straight.map(srgb_encode);
+        Self::new(
+            encoded[0] * self.a,
+            encoded[1] * self.a,
+            encoded[2] * self.a,
+            self.a,
+        )
+    }
+}
+
+pub fn srgb_decode(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub fn srgb_encode(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn finite_clamp(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

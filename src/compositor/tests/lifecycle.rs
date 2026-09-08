@@ -303,8 +303,7 @@ fn presentation_feedback_for_superseded_commit_is_discarded_before_capture() {
     let presentation: client_wp_presentation::WpPresentation =
         globals.bind(&qh, 1..=2, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
-    let file =
-        create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -351,8 +350,7 @@ fn captured_presentation_feedback_keeps_its_original_commit_identity() {
     let presentation: client_wp_presentation::WpPresentation =
         globals.bind(&qh, 1..=2, ()).unwrap();
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
-    let file =
-        create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());

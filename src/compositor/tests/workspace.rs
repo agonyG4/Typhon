@@ -242,11 +242,17 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     let mut occupied_state = WorkspaceWireState::default();
     occupied_queue.roundtrip(&mut occupied_state).unwrap();
     assert_eq!(occupied_state.done_snapshots.len(), 1);
-    assert_eq!(occupied_state.workspace("typhon.workspace.3").state, 0);
+    assert_eq!(occupied_state.workspaces.len(), 10);
+    // The logical workspace id is shared across clients; the protocol handle is not.
+    let occupied_workspace_three = occupied_state.workspace("typhon.workspace.3");
     assert_eq!(
-        occupied_state.workspace("typhon.workspace.3").handle.id(),
-        workspace_three_object
+        occupied_workspace_three.id.as_deref(),
+        Some("typhon.workspace.3")
     );
+    assert_eq!(occupied_workspace_three.name.as_deref(), Some("3"));
+    assert_eq!(occupied_workspace_three.coordinates, vec![2]);
+    assert_eq!(occupied_workspace_three.state, 0);
+    assert_eq!(occupied_state.workspace("typhon.workspace.1").state, 1);
 
     let workspace_three = state.handle("typhon.workspace.3");
     workspace_three.activate();
@@ -373,5 +379,84 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     );
     assert_eq!(state.removed_count, 0);
 
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn wire_regular_workspace_migration_is_atomic() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<WorkspaceWireState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_ext_workspace_manager_v1::ExtWorkspaceManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    connection.flush().unwrap();
+
+    let mut state = WorkspaceWireState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.done_snapshots.len(), 1);
+    assert_eq!(state.workspaces.len(), 10);
+
+    let mut app = LiveTestClient::connect(&socket_path).unwrap();
+    let surface = app
+        .create_toplevel_surface("workspace-wire-migration-test", 32, 32)
+        .unwrap();
+    app.commit_surface(&surface, 32, 32).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let application_window =
+        capture_focused_window_id(&commands).expect("mapped application should be focused");
+
+    commands
+        .send(ServerCommand::MoveFocusedWindowToWorkspace { workspace: 2 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let done_before_workspace_two = state.done_snapshots.len();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.done_snapshots.len(), done_before_workspace_two + 1);
+    assert_eq!(state.workspace("typhon.workspace.1").state, 1);
+    assert_eq!(state.workspace("typhon.workspace.2").state, 0);
+    assert_eq!(state.workspace("typhon.workspace.3").state, 4);
+
+    let workspace_two_object = state.workspace("typhon.workspace.2").handle.id();
+    let workspace_three_object = state.workspace("typhon.workspace.3").handle.id();
+
+    // Both regular workspaces are inactive; only workspace 1 remains active.
+    let done_before_migration = state.done_snapshots.len();
+    let (move_reply, move_result) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::MoveWindowToWorkspace {
+            window_id: application_window,
+            workspace: 3,
+            reply: move_reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        move_result
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("server should report the workspace move")
+    );
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.done_snapshots.len(), done_before_migration + 1);
+    assert_eq!(state.workspaces.len(), 10);
+    assert_eq!(state.workspace("typhon.workspace.1").state, 1);
+    assert_eq!(state.workspace("typhon.workspace.2").state, 4);
+    assert_eq!(state.workspace("typhon.workspace.3").state, 0);
+    assert_eq!(
+        state.workspace("typhon.workspace.2").handle.id(),
+        workspace_two_object
+    );
+    assert_eq!(
+        state.workspace("typhon.workspace.3").handle.id(),
+        workspace_three_object
+    );
+    assert_eq!(state.removed_count, 0);
+
+    app.unmap_surface(&surface).unwrap();
     let _ = stop_controllable_test_server(commands, server_thread);
 }

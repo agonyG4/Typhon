@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     io,
 };
 
@@ -110,7 +110,8 @@ pub struct EffectResourcePool {
     budget_bytes: u64,
     next_id: u64,
     clock: u64,
-    evicted_ids: Vec<u64>,
+    pending_evicted_ids: VecDeque<u64>,
+    eviction_count: usize,
     allocation_count: usize,
     reuse_count: usize,
 }
@@ -132,7 +133,8 @@ impl EffectResourcePool {
             budget_bytes,
             next_id: 1,
             clock: 0,
-            evicted_ids: Vec::new(),
+            pending_evicted_ids: VecDeque::new(),
+            eviction_count: 0,
             allocation_count: 0,
             reuse_count: 0,
         })
@@ -250,8 +252,13 @@ impl EffectResourcePool {
             .any(|texture| texture.id == id && texture.checked_out)
     }
 
+    #[allow(dead_code)]
     pub fn evicted_texture_ids(&self) -> Vec<u64> {
-        self.evicted_ids.clone()
+        self.pending_evicted_ids.iter().copied().collect()
+    }
+
+    pub fn drain_evicted_texture_ids(&mut self) -> Vec<u64> {
+        self.pending_evicted_ids.drain(..).collect()
     }
 
     pub(crate) fn metrics(&self) -> EffectResourceMetrics {
@@ -269,7 +276,7 @@ impl EffectResourcePool {
             cached_key_count: self.cached_key_count(),
             cached_texture_count,
             checked_out_texture_count,
-            eviction_count: self.evicted_ids.len(),
+            eviction_count: self.eviction_count,
             allocation_count: self.allocation_count,
             reuse_count: self.reuse_count,
         }
@@ -289,7 +296,8 @@ impl EffectResourcePool {
                 break;
             };
             if self.remove_texture(id) {
-                self.evicted_ids.push(id);
+                self.pending_evicted_ids.push_back(id);
+                self.eviction_count = self.eviction_count.saturating_add(1);
             } else {
                 break;
             }
@@ -356,15 +364,9 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         key: EffectTextureKey,
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
-        let evictions_before = self.pool.evicted_texture_ids().len();
         let texture = self.pool.checkout(key)?;
-        for id in self
-            .pool
-            .evicted_texture_ids()
-            .iter()
-            .skip(evictions_before)
-        {
-            if let Some(gl_texture) = self.gl_textures.remove(id) {
+        for id in self.pool.drain_evicted_texture_ids() {
+            if let Some(gl_texture) = self.gl_textures.remove(&id) {
                 unsafe { gl.delete_texture(gl_texture) };
             }
         }
@@ -738,6 +740,20 @@ mod tests {
     }
 
     #[test]
+    fn eviction_notifications_are_consumable_without_losing_cumulative_stats() {
+        let mut pool = EffectResourcePool::with_budget(2048).unwrap();
+        let old = pool.checkout(key(16, 16)).unwrap();
+        pool.return_texture(old.clone()).unwrap();
+        let replacement = pool.checkout(key(32, 16)).unwrap();
+
+        assert_eq!(pool.drain_evicted_texture_ids(), vec![old.id]);
+        assert!(pool.drain_evicted_texture_ids().is_empty());
+        assert_eq!(pool.metrics().eviction_count, 1);
+
+        pool.return_texture(replacement).unwrap();
+    }
+
+    #[test]
     fn size_history_cleanup_removes_idle_entries_but_keeps_live_textures() {
         let mut pool = EffectResourcePool::with_budget(16 * 1024).unwrap();
         let idle = pool.checkout(key(8, 8)).unwrap();
@@ -846,6 +862,11 @@ mod tests {
                 stage: None,
                 fused_stages: Vec::new(),
                 parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+                alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+                encode_output: false,
+                color_conversion: oblivion_one::effects::EffectColorConversion::None,
+                checkpoint_dependencies: Vec::new(),
+                visual_group: None,
             })
             .collect();
         let graph = CompiledFrameGraph {

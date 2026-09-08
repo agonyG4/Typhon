@@ -280,6 +280,12 @@ impl CompositorState {
             return Err(DirectScanoutSceneRejection::OverlayVisible);
         }
 
+        if self.presentation_animation_has_pending_visible()
+            || self.presented_presentation_is_non_identity(owner.owner_root_surface_id)
+        {
+            return Err(DirectScanoutSceneRejection::AnimationTransform);
+        }
+
         let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
         if let Some(rejection) = direct_scanout_scene_rejection_for_flags(
             self.visible_layer_surface_above_content_count() > 0,
@@ -426,6 +432,11 @@ impl CompositorState {
         }
         if self.has_visible_special_application_content() {
             blockers.push(DirectScanoutSceneRejection::OverlayVisible);
+        }
+        if self.presentation_animation_has_pending_visible()
+            || self.presented_presentation_is_non_identity(owner.owner_root_surface_id)
+        {
+            blockers.push(DirectScanoutSceneRejection::AnimationTransform);
         }
 
         let geometry = self.current_visual_root_window_geometry(owner.owner_root_surface_id);
@@ -598,6 +609,96 @@ impl CompositorState {
         )
     }
 
+    pub(in crate::compositor) fn native_frame_renderable_surfaces_with_presentation(
+        &self,
+        sample: &PresentationSceneSample,
+    ) -> Cow<'_, [RenderableSurface]> {
+        let surfaces = self.native_frame_renderable_surfaces();
+        if sample.transforms.is_empty() {
+            return surfaces;
+        }
+
+        let mut transformed = surfaces.to_vec();
+        let canonical_origins = render::surface_origins(surfaces.as_ref());
+        let mut presented_origins = HashMap::new();
+        for transform in &sample.transforms {
+            for (index, surface) in surfaces.iter().enumerate() {
+                if self.root_surface_id_for_surface(surface.surface_id) != transform.root_surface_id
+                {
+                    continue;
+                }
+                let Some(origin) = canonical_origins.get(index).copied() else {
+                    continue;
+                };
+                let Some(canonical_rect) = PresentationRect::new(
+                    f64::from(origin.0),
+                    f64::from(origin.1),
+                    f64::from(surface.width),
+                    f64::from(surface.height),
+                ) else {
+                    continue;
+                };
+                let Some(presented_rect) = transform.map_rect(canonical_rect) else {
+                    continue;
+                };
+                presented_origins.insert(surface.surface_id, presented_rect);
+            }
+        }
+
+        for surface in &mut transformed {
+            let Some(presented_rect) = presented_origins.get(&surface.surface_id).copied() else {
+                continue;
+            };
+            let presented_x = saturating_i32_from_f64(presented_rect.x().round());
+            let presented_y = saturating_i32_from_f64(presented_rect.y().round());
+            let presented_width = saturating_u32_from_f64(presented_rect.width().round());
+            let presented_height = saturating_u32_from_f64(presented_rect.height().round());
+            let parent_id = surface.placement.parent_surface_id.or_else(|| {
+                surface
+                    .render_placement
+                    .and_then(|placement| placement.parent_surface_id)
+            });
+            surface.render_placement = Some(match parent_id {
+                Some(parent_id) => {
+                    let parent_origin = presented_origins
+                        .get(&parent_id)
+                        .copied()
+                        .unwrap_or(presented_rect);
+                    SurfacePlacement::subsurface(
+                        parent_id,
+                        presented_x
+                            .saturating_sub(saturating_i32_from_f64(parent_origin.x().round()))
+                            .saturating_sub(surface.x),
+                        presented_y
+                            .saturating_sub(saturating_i32_from_f64(parent_origin.y().round()))
+                            .saturating_sub(surface.y),
+                    )
+                }
+                None => SurfacePlacement::absolute_root_at(
+                    presented_x.saturating_sub(surface.x),
+                    presented_y.saturating_sub(surface.y),
+                ),
+            });
+            surface.render_target_size = BufferSize::new(presented_width, presented_height);
+        }
+        Cow::Owned(transformed)
+    }
+
+    pub(in crate::compositor) fn presentation_geometry_signature(
+        &self,
+        sample: &PresentationSceneSample,
+    ) -> u64 {
+        sample.geometry_signature()
+    }
+
+    pub(in crate::compositor) fn presented_presentation_is_non_identity(
+        &self,
+        root_surface_id: u32,
+    ) -> bool {
+        self.presented_presentation_transform(root_surface_id)
+            .is_some_and(|transform| !transform.is_identity())
+    }
+
     pub(in crate::compositor) fn has_visible_application_content_outside_fullscreen_owner(
         &self,
         owner_root_surface_id: u32,
@@ -640,6 +741,20 @@ impl CompositorState {
             })
             .collect()
     }
+}
+
+fn saturating_i32_from_f64(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn saturating_u32_from_f64(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1;
+    }
+    value.clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]

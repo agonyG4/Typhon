@@ -3,8 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use super::footprint::node_footprint;
 use super::{
     EffectFootprint, EffectNodeId, EffectNodeKind, EffectProgram, EffectSource,
-    EffectValidationError,
-    MAX_EFFECT_PROGRAM_NODES,
+    EffectValidationError, MAX_EFFECT_PROGRAM_NODES,
 };
 
 #[derive(Clone, Debug, PartialEq)]

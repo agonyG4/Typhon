@@ -6,7 +6,8 @@ use std::{
 };
 
 use super::{
-    EffectProgramId, MAX_EFFECT_PROGRAMS, ShaderModuleId, ValidatedEffectProgram,
+    BUILTIN_EFFECT_PROGRAM_ID, EffectFrameDemand, EffectProgramId,
+    INTERNAL_EFFECT_SHADER_MODULE_IDS, MAX_EFFECT_PROGRAMS, ShaderModuleId, ValidatedEffectProgram,
     config::{EffectConfigError, EffectDefinition, EffectManifest, load_manifest},
 };
 
@@ -59,6 +60,34 @@ pub struct RegisteredEffect {
     pub name: String,
     pub program: ValidatedEffectProgram,
     pub parameters: BTreeMap<String, super::config::EffectParameterDefinition>,
+}
+
+impl RegisteredEffect {
+    pub fn schema_signature(&self) -> u64 {
+        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+        signature = signature.wrapping_mul(0x1000_0000_01b3) ^ self.program.program.id.get();
+        signature = signature.wrapping_mul(0x1000_0000_01b3)
+            ^ match self.program.program.frame_demand {
+                EffectFrameDemand::OnDamage => 0,
+                EffectFrameDemand::Continuous => 1,
+                EffectFrameDemand::Manual => 2,
+            };
+        for (name, parameter) in &self.parameters {
+            for byte in name.bytes() {
+                signature = signature.wrapping_mul(0x1000_0000_01b3) ^ u64::from(byte);
+            }
+            signature = signature.wrapping_mul(0x1000_0000_01b3) ^ parameter.spec.id.get() as u64;
+            signature = signature.wrapping_mul(0x1000_0000_01b3)
+                ^ match parameter.spec.ty {
+                    super::EffectParameterType::Float => 0,
+                    super::EffectParameterType::Vec2 => 1,
+                    super::EffectParameterType::Vec3 => 2,
+                    super::EffectParameterType::Vec4 => 3,
+                    super::EffectParameterType::Int => 4,
+                };
+        }
+        signature
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +149,17 @@ impl EffectRegistryGeneration {
     pub fn program_id(&self, name: &str) -> Option<EffectProgramId> {
         self.program(name).map(|program| program.program.id)
     }
+
+    pub fn effect_for_program(&self, id: EffectProgramId) -> Option<&RegisteredEffect> {
+        self.effects
+            .values()
+            .find(|effect| effect.program.program.id == id)
+    }
+
+    pub fn schema_signature(&self, id: EffectProgramId) -> Option<u64> {
+        self.effect_for_program(id)
+            .map(RegisteredEffect::schema_signature)
+    }
 }
 
 #[derive(Debug)]
@@ -155,7 +195,9 @@ impl TrustedEffectRegistry {
             .clone()
     }
 
-    pub fn publish(&self, generation: EffectRegistryGeneration) -> Arc<EffectRegistryGeneration> {
+    // Kept private so callers cannot bypass `build_generation`'s v1 policy
+    // checks (including StaticTexture rejection and reserved IDs).
+    fn publish(&self, generation: EffectRegistryGeneration) -> Arc<EffectRegistryGeneration> {
         let generation = Arc::new(generation);
         *self
             .current
@@ -241,7 +283,10 @@ pub enum RegistryReloadError {
     Config(EffectConfigError),
     Registry(EffectRegistryError),
     ProgramIdCollision(EffectProgramId),
+    ReservedProgramId(EffectProgramId),
+    ReservedSystemEffectName(String),
     ShaderModuleCollision(ShaderModuleId),
+    ReservedShaderModuleId(ShaderModuleId),
     ShaderCompile { module: ShaderModuleId, log: String },
 }
 
@@ -269,8 +314,19 @@ pub fn build_generation(
     manifest: EffectManifest,
     generation: u64,
 ) -> Result<EffectRegistryGeneration, RegistryReloadError> {
+    let builtin = super::render_graph::builtin_background_blur_program();
+    let builtin_id = builtin.program.id;
     let mut registry = EffectRegistry::empty();
+    registry.insert(builtin.clone())?;
     let mut effects = BTreeMap::new();
+    effects.insert(
+        super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME.to_owned(),
+        RegisteredEffect {
+            name: super::render_graph::BUILTIN_BACKGROUND_BLUR_NAME.to_owned(),
+            program: builtin,
+            parameters: BTreeMap::new(),
+        },
+    );
     let mut shaders = BTreeMap::new();
     for (name, definition) in manifest.effects {
         let EffectDefinition {
@@ -279,9 +335,16 @@ pub fn build_generation(
             shader_assets,
             ..
         } = definition;
+        if name.starts_with("system.") {
+            return Err(RegistryReloadError::ReservedSystemEffectName(name));
+        }
+        if program.id.get() == BUILTIN_EFFECT_PROGRAM_ID {
+            return Err(RegistryReloadError::ReservedProgramId(program.id));
+        }
         if effects
             .values()
             .any(|effect: &RegisteredEffect| effect.program.program.id == program.id)
+            || program.id == builtin_id
         {
             return Err(RegistryReloadError::ProgramIdCollision(program.id));
         }
@@ -289,6 +352,9 @@ pub fn build_generation(
             .map_err(|error| RegistryReloadError::Config(EffectConfigError::Validation(error)))?;
         registry.insert(validated.clone())?;
         for asset in shader_assets {
+            if INTERNAL_EFFECT_SHADER_MODULE_IDS.contains(&asset.module.get()) {
+                return Err(RegistryReloadError::ReservedShaderModuleId(asset.module));
+            }
             if shaders
                 .insert(
                     asset.module,
@@ -382,6 +448,10 @@ mod tests {
         let generation = registry.reload(manifest(), |_| Ok(())).unwrap();
         assert_eq!(generation.generation, 1);
         assert_eq!(generation.program_id("glass.panel").unwrap().get(), 77);
+        assert_eq!(
+            generation.program_id("system.background_blur"),
+            Some(super::super::render_graph::builtin_background_blur_program_id())
+        );
         assert!(registry.current().program("glass.panel").is_some());
         let _ = Path::new(".");
     }
@@ -404,11 +474,9 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(RegistryReloadError::Config(
-                EffectConfigError::Validation(
-                    super::super::EffectValidationError::UnsupportedStaticTexture(static_id)
-                )
-            ))
+            Err(RegistryReloadError::Config(EffectConfigError::Validation(
+                super::super::EffectValidationError::UnsupportedStaticTexture(static_id)
+            )))
         );
         assert_eq!(registry.current().generation, previous);
         assert!(registry.current().program("glass.panel").is_none());
@@ -463,7 +531,10 @@ mod tests {
 
         let result = reload_with_publisher(&registry, manifest(), &mut publisher);
 
-        assert!(matches!(result, Err(RegistryReloadError::ShaderCompile { .. })));
+        assert!(matches!(
+            result,
+            Err(RegistryReloadError::ShaderCompile { .. })
+        ));
         assert_eq!(registry.current().generation, first.generation);
         assert!(publisher.published.is_empty());
     }
@@ -481,15 +552,66 @@ mod tests {
             version: 1,
             effects: BTreeMap::new(),
         };
-        let second = reload_with_publisher(
-            &registry,
-            empty,
-            &mut TestGenerationPublisher::default(),
-        )
-        .unwrap();
+        let second =
+            reload_with_publisher(&registry, empty, &mut TestGenerationPublisher::default())
+                .unwrap();
 
         assert_eq!(second.generation, first.generation.saturating_add(1));
         assert!(registry.current().program("glass.panel").is_none());
         assert_eq!(registry.current().generation, second.generation);
+    }
+
+    #[test]
+    fn v1_reserves_builtin_system_name_and_program_id() {
+        let mut system_name = manifest();
+        let definition = system_name.effects.remove("glass.panel").unwrap();
+        system_name
+            .effects
+            .insert("system.background_blur".into(), definition);
+        assert!(matches!(
+            build_generation(system_name, 1),
+            Err(RegistryReloadError::ReservedSystemEffectName(name))
+                if name == "system.background_blur"
+        ));
+
+        let mut builtin_id = manifest();
+        builtin_id
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .program
+            .id = super::super::EffectProgramId::new(BUILTIN_EFFECT_PROGRAM_ID).unwrap();
+        assert!(matches!(
+            build_generation(builtin_id, 1),
+            Err(RegistryReloadError::ReservedProgramId(id))
+                if id.get() == BUILTIN_EFFECT_PROGRAM_ID
+        ));
+    }
+
+    #[test]
+    fn v1_rejects_every_internal_shader_module_id_but_allows_external_ids() {
+        for module in INTERNAL_EFFECT_SHADER_MODULE_IDS {
+            let mut candidate = manifest();
+            candidate
+                .effects
+                .get_mut("glass.panel")
+                .unwrap()
+                .shader_assets[0]
+                .module = ShaderModuleId::new(*module).unwrap();
+            assert!(matches!(
+                build_generation(candidate, 1),
+                Err(RegistryReloadError::ReservedShaderModuleId(id))
+                    if id.get() == *module
+            ));
+        }
+
+        let mut external = manifest();
+        external
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .shader_assets[0]
+            .module = ShaderModuleId::new(9001).unwrap();
+        assert!(build_generation(external, 1).is_ok());
     }
 }

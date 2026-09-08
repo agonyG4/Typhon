@@ -333,6 +333,18 @@ impl NativeGbmFramebufferCache {
 }
 
 impl NativeEglGbmScanout {
+    pub(crate) fn reload_trusted_effect_registry(
+        &mut self,
+        registry: &oblivion_one::effects::TrustedEffectRegistry,
+        manifest: oblivion_one::effects::EffectManifest,
+    ) -> Result<
+        std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        oblivion_one::effects::RegistryReloadError,
+    > {
+        self.scene
+            .reload_trusted_effect_registry(registry, manifest)
+    }
+
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,

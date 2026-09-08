@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write as _;
 
 #[path = "cycle_direct.rs"]
 mod cycle_direct;
@@ -542,14 +543,35 @@ impl NativeRuntime {
         Ok(outcome)
     }
 
-    fn flush_presentation_trace(&self) -> NativeResult<()> {
+    fn flush_presentation_trace(&mut self) -> NativeResult<()> {
         let Some(path) = self.presentation_trace_path.as_ref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let export = self
+            .presentation_trace
+            .export_delta(self.presentation_trace_export_cursor);
+        let cursor = self.presentation_trace.export_cursor();
+        match export {
+            TraceExport::Unchanged => return Ok(()),
+            TraceExport::Append(delta) => {
+                if delta.is_empty() {
+                    self.presentation_trace_export_cursor = Some(cursor);
+                    return Ok(());
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?
+                    .write_all(delta.as_bytes())?;
+            }
+            TraceExport::Replace(contents) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, contents)?;
+            }
         }
-        std::fs::write(path, self.presentation_trace.export_jsonl())?;
+        self.presentation_trace_export_cursor = Some(cursor);
         Ok(())
     }
 

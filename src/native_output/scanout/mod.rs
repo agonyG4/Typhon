@@ -258,6 +258,24 @@ pub(crate) struct AtomicExplicitRecovery {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn reload_trusted_effect_registry(
+        &mut self,
+        registry: &oblivion_one::effects::TrustedEffectRegistry,
+        manifest: oblivion_one::effects::EffectManifest,
+    ) -> io::Result<std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .reload_trusted_effect_registry(registry, manifest)
+                .map_err(io::Error::other),
+            Self::NativeEglGbm(scanout) => scanout
+                .reload_trusted_effect_registry(registry, manifest)
+                .map_err(io::Error::other),
+            Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "trusted effect reload requires an EGL scene renderer",
+            )),
+        }
+    }
+
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,

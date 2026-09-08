@@ -11,8 +11,19 @@ pub enum EffectParameterType {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EffectParameterRange {
-    Float { min: f32, max: f32 },
-    Int { min: i32, max: i32 },
+    Float {
+        min: f32,
+        max: f32,
+    },
+    FloatComponents {
+        min: [f32; 4],
+        max: [f32; 4],
+        components: u8,
+    },
+    Int {
+        min: i32,
+        max: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

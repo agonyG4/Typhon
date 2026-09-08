@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
     path::{Component, Path, PathBuf},
 };
 
@@ -27,6 +27,31 @@ pub const EFFECT_MANIFEST_VERSION: u64 = 1;
 pub const MAX_EFFECT_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_EFFECT_NAME_BYTES: usize = 128;
 pub const MAX_EFFECT_PARAMETERS: usize = MAX_EFFECT_UNIFORMS_PER_SHADER;
+pub const EFFECT_MANIFEST_FILE_NAME: &str = "effects.json";
+
+/// Return the one v1 trusted manifest location and its shader/config root.
+///
+/// The environment only selects the standard per-user config base; callers do
+/// not get to redirect the trusted root or manifest filename independently.
+pub fn default_trusted_effect_manifest() -> Option<(PathBuf, PathBuf)> {
+    let config_base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let root = config_base.join("AstreaOS").join("typhon");
+    Some((root.join(EFFECT_MANIFEST_FILE_NAME), root))
+}
+
+pub fn load_default_trusted_effect_manifest()
+-> Result<Option<(PathBuf, EffectManifest)>, EffectConfigError> {
+    let Some((path, root)) = default_trusted_effect_manifest() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let manifest = load_manifest(Path::new(EFFECT_MANIFEST_FILE_NAME), &root)?;
+    Ok(Some((path, manifest)))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectManifest {
@@ -67,6 +92,9 @@ pub enum EffectConfigError {
     ShaderIo(String),
     ShaderTooLarge,
     Validation(EffectValidationError),
+    UnsupportedFailurePolicy(EffectFailurePolicy),
+    UnsupportedFrameDemand(EffectFrameDemand),
+    UnsupportedStaticTexture,
     LimitExceeded(&'static str),
 }
 
@@ -208,11 +236,17 @@ fn parse_definition(
         "manual" => EffectFrameDemand::Manual,
         value => return Err(invalid(format!("unknown frame_demand {value}"))),
     };
+    if frame_demand == EffectFrameDemand::Manual {
+        return Err(EffectConfigError::UnsupportedFrameDemand(frame_demand));
+    }
     let failure_policy = match optional_string(object, "failure_policy")?.unwrap_or("passthrough") {
         "passthrough" => EffectFailurePolicy::Passthrough,
         "disable-instance" => EffectFailurePolicy::DisableInstance,
         value => return Err(invalid(format!("unknown failure_policy {value}"))),
     };
+    if failure_policy == EffectFailurePolicy::DisableInstance {
+        return Err(EffectConfigError::UnsupportedFailurePolicy(failure_policy));
+    }
     let outsets = parse_outsets(object.get("outsets"))?;
     let nodes_value = required(object, "nodes")?;
     let nodes_array = nodes_value
@@ -363,9 +397,7 @@ fn parse_node(
             Ok(EffectNode::blend(id, inputs, spec))
         }
         "custom-fragment" => parse_custom_node(id, object, shader_root, assets),
-        "static-texture" => Err(invalid(
-            "static-texture requires a compositor-owned immutable asset",
-        )),
+        "static-texture" => Err(EffectConfigError::UnsupportedStaticTexture),
         value => Err(invalid(format!("unknown node kind {value}"))),
     }
 }
@@ -495,6 +527,19 @@ fn parse_parameters(
                 min: parse_f32(min, "min")?,
                 max: parse_f32(max, "max")?,
             }),
+            (Some(min), Some(max)) if matches!(ty, "vec2" | "vec3" | "vec4") => {
+                let components = match ty {
+                    "vec2" => 2,
+                    "vec3" => 3,
+                    "vec4" => 4,
+                    _ => unreachable!(),
+                };
+                Some(EffectParameterRange::FloatComponents {
+                    min: parse_float_components(min, components, "min")?,
+                    max: parse_float_components(max, components, "max")?,
+                    components,
+                })
+            }
             (Some(min), Some(max)) if ty == "int" => Some(EffectParameterRange::Int {
                 min: parse_i32(min, "min")?,
                 max: parse_i32(max, "max")?,
@@ -505,8 +550,18 @@ fn parse_parameters(
         };
         if let Some(range) = range {
             match (range, default) {
-                (EffectParameterRange::Float { min, max }, EffectUniformValue::Float(value))
-                    if min <= max && value >= min && value <= max => {}
+                (EffectParameterRange::Float { min, max }, value)
+                    if min <= max && value_in_float_range(value, min, max) => {}
+                (
+                    EffectParameterRange::FloatComponents {
+                        min,
+                        max,
+                        components,
+                    },
+                    value,
+                ) if components_are_valid(components)
+                    && component_ranges_are_valid(min, max, components)
+                    && value_in_component_float_range(value, min, max, components) => {}
                 (EffectParameterRange::Int { min, max }, EffectUniformValue::Int(value))
                     if min <= max && value >= min && value <= max => {}
                 _ => return Err(invalid("parameter range or default is invalid")),
@@ -533,6 +588,67 @@ fn parse_parameters(
         }
     }
     Ok(result)
+}
+
+fn value_in_float_range(value: EffectUniformValue, min: f32, max: f32) -> bool {
+    match value {
+        EffectUniformValue::Float(value) => (min..=max).contains(&value),
+        EffectUniformValue::Vec2(value) => value.iter().all(|value| (min..=max).contains(value)),
+        EffectUniformValue::Vec3(value) => value.iter().all(|value| (min..=max).contains(value)),
+        EffectUniformValue::Vec4(value) => value.iter().all(|value| (min..=max).contains(value)),
+        EffectUniformValue::Int(_) => false,
+    }
+}
+
+fn parse_float_components(
+    value: &Value,
+    components: u8,
+    field: &str,
+) -> Result<[f32; 4], EffectConfigError> {
+    if let Some(values) = value.as_array() {
+        if values.len() != usize::from(components) {
+            return Err(invalid(format!(
+                "{field} must contain exactly {components} components"
+            )));
+        }
+        let mut parsed = [0.0; 4];
+        for (index, value) in values.iter().enumerate() {
+            parsed[index] = parse_f32(value, field)?;
+        }
+        Ok(parsed)
+    } else {
+        let scalar = parse_f32(value, field)?;
+        Ok([scalar; 4])
+    }
+}
+
+fn components_are_valid(components: u8) -> bool {
+    matches!(components, 2..=4)
+}
+
+fn component_ranges_are_valid(min: [f32; 4], max: [f32; 4], components: u8) -> bool {
+    min.iter()
+        .zip(max.iter())
+        .take(usize::from(components))
+        .all(|(min, max)| min <= max)
+}
+
+fn value_in_component_float_range(
+    value: EffectUniformValue,
+    min: [f32; 4],
+    max: [f32; 4],
+    components: u8,
+) -> bool {
+    let values = match value {
+        EffectUniformValue::Vec2(value) if components == 2 => value.to_vec(),
+        EffectUniformValue::Vec3(value) if components == 3 => value.to_vec(),
+        EffectUniformValue::Vec4(value) if components == 4 => value.to_vec(),
+        _ => return false,
+    };
+    values
+        .iter()
+        .enumerate()
+        .all(|(index, value)| (min[index]..=max[index]).contains(value))
 }
 
 fn parse_parameter_type(value: &str) -> Result<super::EffectParameterType, EffectConfigError> {
@@ -752,6 +868,94 @@ mod tests {
         );
         let parsed = parse_manifest(json.as_bytes(), Path::new(".")).unwrap();
         assert_eq!(parsed.effects["glass.panel"].program.nodes.len(), 2);
+    }
+
+    #[test]
+    fn parses_component_wise_float_ranges_for_vector_parameters() {
+        let json = r#"{
+            "version": 1,
+            "effects": {
+                "glass.panel": {
+                    "nodes": [{"id": 1, "kind": "backdrop"}],
+                    "output": 1,
+                    "parameters": {
+                        "tint": {
+                            "id": 1,
+                            "type": "vec3",
+                            "min": [0.0, 0.2, 0.4],
+                            "max": [0.1, 0.3, 0.6],
+                            "default": [0.05, 0.25, 0.5]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let parsed = parse_manifest(json.as_bytes(), Path::new(".")).unwrap();
+        assert_eq!(
+            parsed.effects["glass.panel"].parameters["tint"].spec.range,
+            Some(EffectParameterRange::FloatComponents {
+                min: [0.0, 0.2, 0.4, 0.0],
+                max: [0.1, 0.3, 0.6, 0.0],
+                components: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_disable_instance_failure_policy_in_v1() {
+        let json = r#"{
+            "version": 1,
+            "effects": {
+                "glass.panel": {
+                    "nodes": [{"id": 1, "kind": "backdrop"}],
+                    "output": 1,
+                    "failure_policy": "disable-instance"
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_manifest(json.as_bytes(), Path::new(".")),
+            Err(EffectConfigError::UnsupportedFailurePolicy(
+                EffectFailurePolicy::DisableInstance
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_manual_frame_demand_until_a_manual_trigger_exists() {
+        let json = r#"{
+            "version": 1,
+            "effects": {
+                "glass.panel": {
+                    "nodes": [{"id": 1, "kind": "backdrop"}],
+                    "output": 1,
+                    "frame_demand": "manual"
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_manifest(json.as_bytes(), Path::new(".")),
+            Err(EffectConfigError::UnsupportedFrameDemand(
+                EffectFrameDemand::Manual
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_static_texture_config_with_a_typed_v1_error() {
+        let json = r#"{
+            "version": 1,
+            "effects": {
+                "glass.panel": {
+                    "nodes": [{"id": 1, "kind": "static-texture"}],
+                    "output": 1
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_manifest(json.as_bytes(), Path::new(".")),
+            Err(EffectConfigError::UnsupportedStaticTexture)
+        );
     }
 
     #[test]

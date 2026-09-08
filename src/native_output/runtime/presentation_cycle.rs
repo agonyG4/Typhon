@@ -1046,6 +1046,11 @@ impl NativeRuntime {
                     target.height,
                     scene_history,
                     &*server,
+                    scheduled_presentation_target.map(|target| {
+                        oblivion_one::compositor::AnimationTime::from_nanos(
+                            target.presentation_time.get(),
+                        )
+                    }),
                     (current_client_cursor_damage, current_software_cursor_damage),
                 );
                 let output_damage = output_damage.union_effect_region(
@@ -1124,8 +1129,8 @@ impl NativeRuntime {
                 } else {
                     #[rustfmt::skip] let atomic_kms_lane_free = !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                        let expected_scene_signature = resolved_scene.scene_identity_signature();
-                        drop(resolved_scene);
+                        let resolved_scene = resolved_scene.into_owned();
+                        let presentation_snapshot = resolved_scene.presentation.frame_snapshot();
                         let (
                             frame_target,
                             submit_window,
@@ -1224,7 +1229,7 @@ impl NativeRuntime {
                             input_state,
                             *cursor_render_mode,
                             &output_damage,
-                            expected_scene_signature,
+                            resolved_scene,
                             render_generation,
                             *drm_file_generation,
                             frame_target,
@@ -1360,6 +1365,7 @@ impl NativeRuntime {
                                     transaction_id,
                                     resolved_render_generation,
                                     resolved_snapshot,
+                                    presentation_snapshot,
                                     resolved_scene_signature,
                                     render_damage_signature,
                                     repair_damage_signature,
@@ -1567,8 +1573,9 @@ impl NativeRuntime {
                             .enabled()
                             .then(NativeProcessCpuSample::read_current)
                             .flatten();
+                        let resolved_scene = resolved_scene.into_owned();
                         let sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
-                        let captured_scene_signature = resolved_scene.scene_identity_signature();
+                        let _captured_scene_signature = resolved_scene.scene_identity_signature();
                         let exact_cursor_commit = cursor_render_mode
                             .is_software()
                             .then(|| server.client_cursor_render_state())
@@ -1589,26 +1596,8 @@ impl NativeRuntime {
                         {
                             server.note_client_cursor_surface_sample(false);
                         }
-                        drop(resolved_scene);
                         server.capture_frame_callbacks_for_render();
                         server.set_prepared_frame_surface_damage(surface_damage);
-                        // The resolved scene is dropped only to release its
-                        // immutable server borrow while frame-batch state is
-                        // attached. These two mutations cannot change scene
-                        // selection, geometry, content, or topology, so the
-                        // re-resolved scene below is the same scene whose IDs
-                        // created this frame's presentation lineage.
-                        let resolved_scene = ResolvedNativeFrameScene::from_server(&*server);
-                        assert_eq!(
-                            resolved_scene.surface_ids().collect::<Vec<_>>(),
-                            sampled_surface_ids,
-                            "compatibility frame scene changed between lineage capture and paint"
-                        );
-                        assert_eq!(
-                            resolved_scene.scene_identity_signature(),
-                            captured_scene_signature,
-                            "compatibility frame scene identity changed between lineage capture and paint"
-                        );
                         let paint_outcome = match scanout.paint_server_frame(
                             frame_renderer,
                             &resolved_scene,
@@ -1777,7 +1766,12 @@ impl NativeRuntime {
                                     frame_submitted = true;
                                 }
                                 NativePresentResult::Immediate => {
-                                    scene_history.promote_immediate_or_error()?;
+                                    if !promote_immediate_and_publish(scene_history, server) {
+                                        return Err(io::Error::other(
+                                            "immediate compatibility presentation has no rendered scene snapshot",
+                                        )
+                                        .into());
+                                    }
                                     let transaction_id = record_immediate_scene_identity(
                                         presentation_trace,
                                         compatibility_transaction_id,

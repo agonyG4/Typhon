@@ -17,7 +17,8 @@ use crate::control::{
 use crate::control_snapshots::{
     ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DecorationThemeListSnapshot,
     DecorationThemeSnapshot, DoctorSnapshot, KeyboardConfigurationSnapshot, KeyboardLayoutSnapshot,
-    OutputListSnapshot, PerformanceSnapshot, StatusSnapshot, VersionSnapshot, WindowListSnapshot,
+    OutputListSnapshot, PerformanceSnapshot, StatusSnapshot, TrustedEffectsReloadSnapshot,
+    VersionSnapshot, WindowListSnapshot,
 };
 use crate::cursor_theme::CursorConfiguration;
 
@@ -130,6 +131,8 @@ fn decode_command_result(
         }
         "decoration.list" => serde_json::from_value::<DecorationThemeListSnapshot>(value)
             .map(AstreactlResult::DecorationThemes),
+        "effects.reload" => serde_json::from_value::<TrustedEffectsReloadSnapshot>(value)
+            .map(AstreactlResult::TrustedEffects),
         _ => return Err(AstreactlError::Usage("unknown control command".to_string())),
     };
     decoded.map_err(|_| AstreactlError::MalformedResponse)

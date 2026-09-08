@@ -34,7 +34,7 @@ impl EffectRect {
         (i64::from(self.y) + i64::from(self.height)) as i32
     }
 
-    fn intersect(self, other: Self) -> Option<Self> {
+    pub fn intersect(self, other: Self) -> Option<Self> {
         let left = self.x.max(other.x);
         let top = self.y.max(other.y);
         let right = self.right().min(other.right());
@@ -210,6 +210,36 @@ impl EffectRegion {
         result
     }
 
+    pub fn intersect(&self, other: &Self) -> Self {
+        if self.conservative_full {
+            return other.clone();
+        }
+        if other.conservative_full {
+            return self.clone();
+        }
+        let mut result = Self::empty();
+        for left in &self.rects {
+            for right in &other.rects {
+                if let Some(intersection) = left.intersect(*right) {
+                    result.push(intersection);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn intersects(&self, other: &Self) -> bool {
+        if self.conservative_full || other.conservative_full {
+            return !self.is_empty() && !other.is_empty();
+        }
+        self.rects.iter().any(|left| {
+            other
+                .rects
+                .iter()
+                .any(|right| left.intersect(*right).is_some())
+        })
+    }
+
     fn expand_clamped_xy(&self, radius_x: u32, radius_y: u32, bounds: EffectRect) -> Self {
         if self.conservative_full {
             return Self::from_rect(bounds);
@@ -257,22 +287,28 @@ pub fn plan_effect_damage(
         ),
         output_bounds,
     );
+    let output_influence_region = visible_region.expand_clamped_xy(
+        footprint
+            .output_outsets
+            .left
+            .max(footprint.output_outsets.right),
+        footprint
+            .output_outsets
+            .top
+            .max(footprint.output_outsets.bottom),
+        output_bounds,
+    );
     let output_damage = source_damage
         .expand_clamped_xy(
             footprint.sample_radius_x,
             footprint.sample_radius_y,
             output_bounds,
         )
-        .intersect_rect(visible_region.bounding_rect().unwrap_or(output_bounds));
-    let dependency_region = output_damage.expand_clamped_xy(
-        footprint.sample_radius_x,
-        footprint.sample_radius_y,
-        output_bounds,
-    );
+        .intersect(&output_influence_region);
     EffectDamagePlan {
         output_damage,
         source_query_region: capture_region.clone(),
-        dependency_region,
+        dependency_region: output_influence_region,
         capture_region,
     }
 }
@@ -333,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn blur_dependency_region_expands_requested_output() {
+    fn dependency_region_tracks_lower_output_influence_not_blur_sample_padding() {
         let footprint = EffectFootprint::symmetric(8);
         let visible = EffectRegion::from_rect(EffectRect::new(100, 100, 100, 40).unwrap());
         let source = visible.clone();
@@ -343,7 +379,8 @@ mod tests {
             &source,
             EffectRect::new(0, 0, 1920, 1080).unwrap(),
         );
-        assert!(plan.dependency_region.contains_point(92, 92));
+        assert!(plan.dependency_region.contains_point(100, 100));
+        assert!(!plan.dependency_region.contains_point(92, 92));
     }
 
     #[test]
@@ -399,5 +436,35 @@ mod tests {
         assert!(region.rects().len() <= MAX_EFFECT_REGION_RECTS);
         assert!(region.contains_point(0, 0));
         assert!(region.contains_point(MAX_EFFECT_REGION_RECTS as i32, 0));
+    }
+
+    #[test]
+    fn exact_intersection_preserves_disjoint_region_holes() {
+        let mut visible = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 4).unwrap());
+        visible.push(EffectRect::new(20, 0, 10, 4).unwrap());
+        let source = EffectRegion::from_rect(EffectRect::new(0, 0, 30, 4).unwrap());
+        let plan = plan_effect_damage(
+            EffectFootprint::ZERO,
+            &visible,
+            &source,
+            EffectRect::new(0, 0, 40, 10).unwrap(),
+        );
+        assert!(plan.output_damage.contains_point(5, 2));
+        assert!(!plan.output_damage.contains_point(15, 2));
+        assert!(plan.output_damage.contains_point(25, 2));
+    }
+
+    #[test]
+    fn dependency_influence_reaches_higher_blur_capture_padding() {
+        let lower = EffectRegion::from_rect(EffectRect::new(90, 90, 5, 5).unwrap());
+        let higher_visible = EffectRegion::from_rect(EffectRect::new(100, 100, 10, 10).unwrap());
+        let higher = plan_effect_damage(
+            EffectFootprint::symmetric(12),
+            &higher_visible,
+            &higher_visible,
+            EffectRect::new(0, 0, 200, 200).unwrap(),
+        );
+        assert!(!lower.intersects(&higher_visible));
+        assert!(lower.intersects(&higher.capture_region));
     }
 }

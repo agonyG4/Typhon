@@ -63,6 +63,7 @@ pub enum ControlCommand {
     DecorationSetTheme,
     DecorationReload,
     DecorationList,
+    EffectsReload,
     WindowActivate,
     WindowMinimize,
     WindowRestore,
@@ -94,6 +95,7 @@ impl ControlCommand {
             Self::DecorationSetTheme => "decoration.set-theme",
             Self::DecorationReload => "decoration.reload",
             Self::DecorationList => "decoration.list",
+            Self::EffectsReload => "effects.reload",
             Self::WindowActivate => "window.activate",
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
@@ -125,6 +127,7 @@ impl ControlCommand {
             "decoration.set-theme" => Self::DecorationSetTheme,
             "decoration.reload" => Self::DecorationReload,
             "decoration.list" => Self::DecorationList,
+            "effects.reload" => Self::EffectsReload,
             "window.activate" => Self::WindowActivate,
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
@@ -374,5 +377,15 @@ mod tests {
             "keyboard.config.set"
         );
         assert_eq!(ControlCommand::parse("keyboard.config"), None);
+    }
+
+    #[test]
+    fn trusted_effect_reload_command_is_explicitly_named() {
+        assert_eq!(
+            ControlCommand::parse("effects.reload"),
+            Some(ControlCommand::EffectsReload)
+        );
+        assert_eq!(ControlCommand::EffectsReload.as_str(), "effects.reload");
+        assert_eq!(ControlCommand::parse("effects"), None);
     }
 }

@@ -235,10 +235,6 @@ impl NativePaintStats {
                     "effect_instances_executed",
                     repaint.effect_instances_executed,
                 ),
-                NativePerfField::usize(
-                    "effect_instances_cache_hit",
-                    repaint.effect_instances_cache_hit,
-                ),
                 NativePerfField::usize("effect_instances_failed", repaint.effect_instances_failed),
                 NativePerfField::usize("render_graph_passes", repaint.render_graph_passes),
                 NativePerfField::usize(

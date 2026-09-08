@@ -102,6 +102,12 @@ pub fn human(result: &AstreactlResult) -> String {
             .map(|theme| sanitize_terminal_text(theme))
             .collect::<Vec<_>>()
             .join("\n"),
+        AstreactlResult::TrustedEffects(snapshot) => format!(
+            "Manifest: {}\nGeneration: {}\nEffects: {}",
+            sanitize_terminal_text(&snapshot.manifest_path),
+            snapshot.generation,
+            snapshot.effect_count,
+        ),
         AstreactlResult::Wallpaper(snapshot) => format!(
             "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
             sanitize_terminal_text(&snapshot.state),

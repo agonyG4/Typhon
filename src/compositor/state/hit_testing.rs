@@ -91,7 +91,7 @@ impl CompositorState {
                 continue;
             };
 
-            let root_surface_id = self.root_surface_id_for_surface(renderable.surface_id);
+            let root_surface_id = self.visual_stack_root_for_surface(renderable.surface_id);
             if self.window_id_for_surface(root_surface_id).is_none() {
                 continue;
             }
@@ -108,8 +108,13 @@ impl CompositorState {
                 continue;
             };
             let root_surface = &surfaces[root_index];
-            let local_x = x - f64::from(root_origin.0);
-            let local_y = y - f64::from(root_origin.1);
+            let Some((hit_x, hit_y, _)) =
+                self.presentation_input_point_for_root(root_surface_id, x, y)
+            else {
+                continue;
+            };
+            let local_x = hit_x - f64::from(root_origin.0);
+            let local_y = hit_y - f64::from(root_origin.1);
             if window_frame_action_for_local_point(
                 local_x,
                 local_y,
@@ -129,7 +134,7 @@ impl CompositorState {
             }
 
             if let Some((surface_x, surface_y)) =
-                render::surface_local_point_at_origin(renderable, origin, x, y)
+                render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)
                 && self.surface_accepts_input_at(renderable, surface_x, surface_y)
             {
                 return None;
@@ -141,6 +146,62 @@ impl CompositorState {
 
     pub(in crate::compositor) fn root_surface_id_for_surface(&self, surface_id: u32) -> u32 {
         root_surface_id_for_surface_in_placements(&self.surface_placements, surface_id)
+    }
+
+    /// Return the root that owns the physically presented transform for an
+    /// input surface. Popup visual groups are intentionally separate from
+    /// their parent stack group, but their presentation transform still
+    /// belongs to the popup node's toplevel/layer owner.
+    pub(in crate::compositor) fn presentation_owner_root_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> u32 {
+        let mut current = surface_id;
+        for _ in 0..self
+            .surface_placements
+            .len()
+            .saturating_add(self.popup_nodes.len())
+            .saturating_add(1)
+        {
+            if let Some(node) = self.popup_nodes.get(&current) {
+                return node.owner_root_id;
+            }
+            let Some(parent_surface_id) = self
+                .surface_placements
+                .get(&current)
+                .copied()
+                .and_then(|placement| placement.parent_surface_id)
+                .filter(|parent_surface_id| *parent_surface_id != current)
+            else {
+                break;
+            };
+            current = parent_surface_id;
+        }
+        self.root_surface_id_for_surface(surface_id)
+    }
+
+    fn visual_stack_root_for_surface(&self, surface_id: u32) -> u32 {
+        let Some(index) = self.active_scene_surface_index(surface_id) else {
+            return self.root_surface_id_for_surface(surface_id);
+        };
+        self.visual_stack_groups_cache
+            .iter()
+            .find(|group| group.surface_indices().contains(&index))
+            .map_or_else(
+                || {
+                    render::visual_stack_groups(
+                        self.active_scene_surfaces(),
+                        self.active_scene_popup_surface_ids(),
+                    )
+                    .into_iter()
+                    .find(|group| group.surface_indices().contains(&index))
+                    .map_or_else(
+                        || self.root_surface_id_for_surface(surface_id),
+                        |group| group.root_surface_id(),
+                    )
+                },
+                |group| group.root_surface_id(),
+            )
     }
 
     pub(in crate::compositor) fn root_window_local_point_at(
@@ -156,19 +217,20 @@ impl CompositorState {
             .iter()
             .position(|surface| surface.surface_id == root_surface_id)?;
         let root_origin = origins.get(root_index).copied()?;
+        let (hit_x, hit_y, _) = self.presentation_input_point_for_root(root_surface_id, x, y)?;
         let geometry = self.current_root_window_geometry(root_surface_id)?;
         let window_geometry = self
             .surface_window_geometries
             .get(&root_surface_id)
             .copied();
-        let local_x = x
+        let local_x = hit_x
             - f64::from(root_origin.0)
             - f64::from(
                 window_geometry
                     .map(|geometry| geometry.x)
                     .unwrap_or_default(),
             );
-        let local_y = y
+        let local_y = hit_y
             - f64::from(root_origin.1)
             - f64::from(
                 window_geometry
@@ -290,6 +352,39 @@ impl CompositorState {
         hit
     }
 
+    fn presentation_input_point_for_root(
+        &self,
+        root_surface_id: u32,
+        x: f64,
+        y: f64,
+    ) -> Option<(f64, f64, (i32, i32))> {
+        let Some(index) = self.active_scene_surface_index(root_surface_id) else {
+            return Some((x, y, (0, 0)));
+        };
+        let Some(origin) = self.active_scene_surface_origins().get(index).copied() else {
+            return Some((x, y, (0, 0)));
+        };
+        let presentation_owner = self.presentation_owner_root_for_surface(root_surface_id);
+        let interaction_takes_over = self
+            .window_interaction
+            .is_some_and(|interaction| interaction.root_surface_id == presentation_owner);
+        let Some(transform) = (!interaction_takes_over)
+            .then(|| self.presented_presentation_transform(presentation_owner))
+            .flatten()
+        else {
+            return Some((x, y, origin));
+        };
+        let canonical = transform.inverse_map_point_unbounded((x, y))?;
+        Some((
+            canonical.0,
+            canonical.1,
+            (
+                saturating_i32_from_f64(transform.presented_rect.x().floor()),
+                saturating_i32_from_f64(transform.presented_rect.y().floor()),
+            ),
+        ))
+    }
+
     fn pointer_scene_hit_uncached(
         &self,
         x: f64,
@@ -314,10 +409,19 @@ impl CompositorState {
             let Some(root_origin) = origins.get(root_index).copied() else {
                 continue;
             };
+            let Some((hit_x, hit_y, _presented_origin)) =
+                self.presentation_input_point_for_root(group.root_surface_id(), x, y)
+            else {
+                continue;
+            };
             if !group.is_popup()
-                && let Some(hit) =
-                    self.decoration_hit_for_root_at(group.root_surface_id(), root_origin, x, y)
-                && (!self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+                && let Some(hit) = self.decoration_hit_for_root_at(
+                    group.root_surface_id(),
+                    root_origin,
+                    hit_x,
+                    hit_y,
+                )
+                && (!self.root_surface_accepts_input_at(root_index, root_origin, hit_x, hit_y)
                     || (matches!(hit, DecorationHit::Resize(_))
                         && self
                             .window_id_for_surface(group.root_surface_id())
@@ -353,7 +457,7 @@ impl CompositorState {
                     continue;
                 };
                 let Some((surface_x, surface_y)) =
-                    render::surface_local_point_at_origin(renderable, origin, x, y)
+                    render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)
                 else {
                     continue;
                 };
@@ -388,7 +492,7 @@ impl CompositorState {
         match &cache.hit {
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
-                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                let root_surface_id = self.visual_stack_root_for_surface(surface_id);
                 if !self.pointer_scene_owner_is_frontmost(
                     root_surface_id,
                     Some(surface_id),
@@ -405,8 +509,10 @@ impl CompositorState {
                     .saturating_add(1);
                 let renderable = self.active_scene_surfaces().get(index)?;
                 let origin = self.active_scene_surface_origins().get(index).copied()?;
+                let (hit_x, hit_y, _) =
+                    self.presentation_input_point_for_root(root_surface_id, x, y)?;
                 let (surface_x, surface_y) =
-                    render::surface_local_point_at_origin(renderable, origin, x, y)?;
+                    render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)?;
                 if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
                     return None;
                 }
@@ -434,12 +540,15 @@ impl CompositorState {
                     .active_scene_index_hits
                     .saturating_add(1);
                 let origin = self.active_scene_surface_origins().get(index).copied()?;
-                (self.decoration_hit_for_root_at(*root_surface_id, origin, x, y) == Some(*hit))
-                    .then_some(PointerSceneHit::Decoration {
-                        window_id: *window_id,
-                        root_surface_id: *root_surface_id,
-                        hit: *hit,
-                    })
+                let (hit_x, hit_y, _) =
+                    self.presentation_input_point_for_root(*root_surface_id, x, y)?;
+                (self.decoration_hit_for_root_at(*root_surface_id, origin, hit_x, hit_y)
+                    == Some(*hit))
+                .then_some(PointerSceneHit::Decoration {
+                    window_id: *window_id,
+                    root_surface_id: *root_surface_id,
+                    hit: *hit,
+                })
             }
             PointerSceneHit::None => None,
         }
@@ -461,9 +570,19 @@ impl CompositorState {
             else {
                 continue;
             };
+            let Some((hit_x, hit_y, _)) =
+                self.presentation_input_point_for_root(group.root_surface_id(), x, y)
+            else {
+                continue;
+            };
             let decoration_hit = (!group.is_popup())
                 .then(|| {
-                    self.decoration_hit_for_root_at(group.root_surface_id(), root_origin, x, y)
+                    self.decoration_hit_for_root_at(
+                        group.root_surface_id(),
+                        root_origin,
+                        hit_x,
+                        hit_y,
+                    )
                 })
                 .flatten()
                 .filter(|hit| {
@@ -490,8 +609,9 @@ impl CompositorState {
                             let renderable = self.active_scene_surfaces().get(*index)?;
                             let origin =
                                 self.active_scene_surface_origins().get(*index).copied()?;
-                            let (surface_x, surface_y) =
-                                render::surface_local_point_at_origin(renderable, origin, x, y)?;
+                            let (surface_x, surface_y) = render::surface_local_point_at_origin(
+                                renderable, origin, hit_x, hit_y,
+                            )?;
                             self.surface_accepts_input_at(renderable, surface_x, surface_y)
                                 .then_some((renderable.surface_id, None))
                         })
@@ -556,9 +676,11 @@ impl CompositorState {
             .iter()
             .position(|surface| surface.surface_id == root_surface_id)?;
         let origin = origins.get(root_index).copied()?;
+        let (hit_x, hit_y, _presented_origin) =
+            self.presentation_input_point_for_root(root_surface_id, x, y)?;
         let geometry = self.current_visual_root_window_geometry(root_surface_id)?;
-        let surface_x = x - f64::from(origin.0);
-        let surface_y = y - f64::from(origin.1);
+        let surface_x = hit_x - f64::from(origin.0);
+        let surface_y = hit_y - f64::from(origin.1);
         if surface_x < 0.0
             || surface_y < 0.0
             || surface_x >= f64::from(geometry.width)
@@ -589,8 +711,10 @@ impl CompositorState {
             .position(|renderable| renderable.surface_id == surface_id)?;
         let renderable = &surfaces[index];
         let origin = origins.get(index).copied()?;
+        let root_surface_id = self.visual_stack_root_for_surface(surface_id);
+        let (hit_x, hit_y, _) = self.presentation_input_point_for_root(root_surface_id, x, y)?;
         let (surface_x, surface_y) =
-            render::surface_local_point_at_origin(renderable, origin, x, y)?;
+            render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)?;
         Some(PointerTarget {
             surface: surface.clone(),
             surface_x,
@@ -1275,6 +1399,13 @@ impl CompositorState {
             send_pointer_frame_if_supported(&pointer);
         }
     }
+}
+
+fn saturating_i32_from_f64(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 fn push_pointer_frame_once(

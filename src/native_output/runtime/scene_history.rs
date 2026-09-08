@@ -1,11 +1,13 @@
 use super::*;
+use oblivion_one::compositor::PresentationFrameSnapshot;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeFrameSceneSnapshot {
     pub(crate) frame_id: u64,
     pub(crate) render_generation: u64,
     pub(crate) scene: NativeSceneSnapshot,
     pub(crate) cursor_damage: NativeCursorDamageBounds,
+    pub(crate) presentation: PresentationFrameSnapshot,
 }
 
 impl NativeFrameSceneSnapshot {
@@ -19,6 +21,7 @@ impl NativeFrameSceneSnapshot {
             render_generation: resolved.render_generation,
             scene: resolved.snapshot(),
             cursor_damage,
+            presentation: resolved.presentation.frame_snapshot(),
         }
     }
 }
@@ -64,6 +67,10 @@ impl NativeSceneHistory {
 
     pub(crate) fn presented_frame_id(&self) -> Option<u64> {
         self.presented.as_ref().map(|snapshot| snapshot.frame_id)
+    }
+
+    pub(crate) fn presented_snapshot(&self) -> Option<&NativeFrameSceneSnapshot> {
+        self.presented.as_ref()
     }
 
     pub(crate) fn presented_cursor_damage(&self) -> NativeCursorDamageBounds {
@@ -175,6 +182,7 @@ impl NativeSceneHistory {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) fn promote_immediate_or_error(&mut self) -> NativeResult<()> {
         self.promote_immediate().then_some(()).ok_or_else(|| {
             io::Error::other("immediate presentation has no rendered scene snapshot").into()
@@ -231,6 +239,7 @@ mod tests {
             render_generation: frame_id,
             scene: NativeSceneSnapshot::default(),
             cursor_damage: NativeCursorDamageBounds::default(),
+            presentation: PresentationFrameSnapshot::empty(),
         }
     }
 

@@ -197,10 +197,12 @@ pub use decoration::render_plan::DecorationRenderPrimitive;
 use decoration::theme::DecorationThemeSnapshot;
 use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
+pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectFrameDemandSnapshot, EffectSceneSummary, ResolvedEffectInstance,
     ResolvedEffectScene,
 };
+pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub use fullscreen::{
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,
@@ -268,6 +270,12 @@ pub struct KeyboardConfigurationMutation {
     pub repeat_changed: bool,
     pub modifiers_changed: bool,
 }
+pub use crate::presentation_animation::{
+    AnimationCurve, AnimationTime, EasingCurve, PresentationAnimationMetrics, PresentationAnimator,
+    PresentationDamageRect, PresentationFrameSnapshot, PresentationGroupTransform,
+    PresentationRect, PresentationSceneSample, PresentationTransition, PresentationVelocity,
+    PresentationWindowSample, SpringSpec, TransitionId, presentation_damage,
+};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -288,17 +296,16 @@ pub use render::{
     DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
     OUTPUT_BACKGROUND, RenderSceneElement, RenderSceneElementId, RenderSceneElementKind,
     ServerFrameColor, SurfaceRenderPlan, SurfaceRenderSpaceAssignment, SurfaceTargetRect,
-    SurfaceVisualAperture, VisualStackGroup, WindowVisualGroup, compose_output, cursor_damage_rect,
-    output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
-    scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
-    server_frame_rects_for_surface, surface_origin, surface_origins, surface_render_plan,
-    surface_render_plan_with_clip, surface_render_plans_with_aperture,
+    SurfaceVisualAperture, VisualGroupId, VisualStackGroup, WindowVisualGroup, compose_output,
+    cursor_damage_rect, output_scale_key, render_scene_elements_for_surfaces,
+    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
+    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
+    surface_render_plan, surface_render_plan_with_clip, surface_render_plans_with_aperture,
     surface_render_space_assignments, visual_stack_groups, window_visual_stack_order,
     xwayland_visual_backing_target,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
-use state::ActiveSurfacePresentationCommit;
 pub use selection::*;
 pub use server::{OwnCompositorServer, XwaylandClientIdentity};
 pub use server_error::CompositorError;
@@ -307,6 +314,7 @@ use shm::{
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
     WL_SHM_FORMAT_XRGB2101010, shm_format_descriptor,
 };
+use state::ActiveSurfacePresentationCommit;
 pub(crate) use state::OverrideRedirectStackSnapshotResult;
 pub use state::{
     AstreaShortcutPhase, CommitTimingClockMappingMetadata, CommitTimingClockSample,
@@ -601,6 +609,9 @@ pub struct CompositorState {
     renderable_surface_indices: HashMap<u32, usize>,
     locality_metrics: Cell<SurfaceLocalityMetrics>,
     active_scene_view: ActiveSceneView,
+    presentation_animator: PresentationAnimator,
+    presented_presentation: PresentationFrameSnapshot,
+    presented_presentation_frame_id: u64,
     scene_work_index: SceneWorkIndex,
     pub(in crate::compositor) tiled_layout: TiledLayoutManager,
     pub(in crate::compositor) tiled_resize_session: Option<TiledResizeSession>,
@@ -608,6 +619,7 @@ pub struct CompositorState {
     pub(in crate::compositor) layout_generation: LayoutGeneration,
     layout_batch_depth: u8,
     layout_batch_scene_effect: bool,
+    pub(in crate::compositor) layout_animation_epoch: Option<AnimationTime>,
     tiled_layout_dirty: HashSet<WorkspaceLocation>,
     tiled_floating_restores: HashMap<WindowId, WindowGeometry>,
     next_surface_id: u32,
@@ -790,12 +802,16 @@ pub struct CompositorState {
     scene_render_generation: u64,
     effect_scene_summary: EffectSceneSummary,
     internal_surface_effects: HashMap<u32, ResolvedEffectInstance>,
+    protocol_surface_effects: HashMap<SurfaceEffectBindingKey, ProtocolSurfaceEffectBinding>,
+    surface_effect_binding_owners: SurfaceEffectBindingOwners,
     trusted_effect_registry: crate::effects::TrustedEffectRegistry,
     background_effect_enabled: bool,
     background_effect_resources: HashMap<u32, ObjectId>,
     background_effect_surface_ids: HashSet<u32>,
     #[allow(dead_code)] // Consumed by the internal effect assignment API as presets are enabled.
     next_internal_effect_instance_id: u64,
+    next_protocol_effect_instance_id: u64,
+    next_protocol_surface_binding_id: u64,
     pointer_hit_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,

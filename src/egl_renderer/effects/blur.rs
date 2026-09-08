@@ -20,8 +20,11 @@ uniform float u_effect_blur_radius;
 in vec2 v_uv;
 out vec4 out_color;
 
-vec3 typhon_srgb_to_linear(vec3 value) {
-    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), value));
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
 }
 
 void main() {
@@ -30,8 +33,12 @@ void main() {
     vec4 sample_b = texture(u_effect_input, v_uv - offset);
     vec4 sample_c = texture(u_effect_input, v_uv + vec2(offset.x, -offset.y));
     vec4 sample_d = texture(u_effect_input, v_uv + vec2(-offset.x, offset.y));
-    vec4 result = (sample_a + sample_b + sample_c + sample_d) * 0.25;
-    result.rgb = typhon_srgb_to_linear(result.rgb);
+    vec4 result = (
+        typhon_decode_premultiplied_srgb(sample_a) +
+        typhon_decode_premultiplied_srgb(sample_b) +
+        typhon_decode_premultiplied_srgb(sample_c) +
+        typhon_decode_premultiplied_srgb(sample_d)
+    ) * 0.25;
     out_color = result;
 }
 "#;
@@ -103,7 +110,12 @@ mod tests {
 
     #[test]
     fn built_in_blur_shaders_define_srgb_conversion_boundaries() {
-        assert!(DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("typhon_srgb_to_linear"));
+        assert!(
+            DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("typhon_decode_premultiplied_srgb(sample_a)")
+        );
+        assert!(
+            DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("typhon_decode_premultiplied_srgb(sample_d)")
+        );
         assert!(DUAL_KAWASE_UPSAMPLE_SHADER.contains("u_effect_texel_size"));
         assert!(DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("u_effect_blur_radius"));
         assert!(DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER.contains("u_effect_blur_radius"));

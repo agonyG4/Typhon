@@ -455,6 +455,9 @@ impl CompositorState {
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) {
+        let previous_geometry = self
+            .current_visual_root_window_geometry(root_surface_id)
+            .or_else(|| self.current_root_window_geometry(root_surface_id));
         let target_cleared = self
             .renderable_surfaces
             .iter_mut()
@@ -475,6 +478,10 @@ impl CompositorState {
         self.update_toplevel_visual_render_assignment(root_surface_id);
         if changed || target_cleared {
             self.advance_render_generation(RenderGenerationCause::WindowMode);
+        }
+        if changed {
+            self.advance_pointer_hit_generation();
+            self.animate_toplevel_visual_geometry(root_surface_id, previous_geometry, geometry);
         }
     }
 

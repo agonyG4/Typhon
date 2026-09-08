@@ -52,6 +52,7 @@ pub enum DirectScanoutSceneRejection {
     VisualClipPresent,
     PlacementMismatch,
     ResizePreviewActive,
+    AnimationTransform,
     PendingOrUnpublishedWork,
 }
 
@@ -77,6 +78,7 @@ impl DirectScanoutSceneRejection {
             Self::VisualClipPresent => "visual_clip_present",
             Self::PlacementMismatch => "placement_mismatch",
             Self::ResizePreviewActive => "resize_preview_active",
+            Self::AnimationTransform => "animation_transform",
             Self::PendingOrUnpublishedWork => "pending_or_unpublished_work",
         }
     }
@@ -221,7 +223,7 @@ pub struct FullscreenPresentationEligibility {
     pub software_cursor_visible: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FullscreenRenderPlanMetrics {
     pub fullscreen_active: bool,
     pub owner_root_surface_id: Option<u32>,
@@ -544,6 +546,14 @@ mod tests {
         assert_eq!(
             DirectScanoutSceneRejection::ViewportDestinationNonIdentity.as_str(),
             "viewport_destination_non_identity"
+        );
+    }
+
+    #[test]
+    fn animation_transform_rejection_has_stable_diagnostic_name() {
+        assert_eq!(
+            DirectScanoutSceneRejection::AnimationTransform.as_str(),
+            "animation_transform"
         );
     }
 }

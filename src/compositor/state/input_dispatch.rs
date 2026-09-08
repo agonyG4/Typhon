@@ -63,7 +63,7 @@ impl CompositorState {
         if !self.surface_resources.contains_key(&target_surface_id) {
             return false;
         }
-        let root_surface_id = self.root_surface_id_for_surface(target_surface_id);
+        let root_surface_id = self.presentation_owner_root_for_surface(target_surface_id);
         if !self.surface_is_visible_in_active_scene(root_surface_id)
             && !self.layer_surfaces.contains_key(&root_surface_id)
         {
@@ -75,13 +75,11 @@ impl CompositorState {
         {
             return false;
         }
-        self.renderable_surfaces
-            .iter()
-            .any(|surface| self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
-            || self
-                .current_surface_buffers
-                .keys()
-                .any(|surface_id| self.root_surface_id_for_surface(*surface_id) == root_surface_id)
+        self.renderable_surfaces.iter().any(|surface| {
+            self.presentation_owner_root_for_surface(surface.surface_id) == root_surface_id
+        }) || self.current_surface_buffers.keys().any(|surface_id| {
+            self.presentation_owner_root_for_surface(*surface_id) == root_surface_id
+        })
     }
 
     pub(in crate::compositor) fn advance_relative_pointer_resources_generation(&mut self) {
@@ -776,7 +774,7 @@ impl CompositorState {
         let Some(pending) = self.pending_floating_resize else {
             return origin;
         };
-        if self.root_surface_id_for_surface(surface_id) != pending.surface_id {
+        if self.presentation_owner_root_for_surface(surface_id) != pending.surface_id {
             return origin;
         }
         let Some(current) = self.current_visual_root_window_geometry(pending.surface_id) else {
@@ -882,7 +880,7 @@ impl CompositorState {
             }
             if pressed {
                 let surface_id = compositor_surface_id(&surface);
-                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                let root_surface_id = self.presentation_owner_root_for_surface(surface_id);
                 if self
                     .topmost_popup_grab_surface_id()
                     .is_some_and(|popup_id| self.surface_is_descendant_of(surface_id, popup_id))
@@ -950,7 +948,7 @@ impl CompositorState {
         };
         let captured_window_id = target.as_ref().and_then(|target| {
             let root_surface_id =
-                self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
+                self.presentation_owner_root_for_surface(compositor_surface_id(&target.surface));
             self.window_id_for_surface(root_surface_id)
         });
         if grabbed_surface.is_none() {
@@ -1007,7 +1005,7 @@ impl CompositorState {
 
         if pressed {
             let surface_id = compositor_surface_id(&surface);
-            let root_surface_id = self.root_surface_id_for_surface(surface_id);
+            let root_surface_id = self.presentation_owner_root_for_surface(surface_id);
             if self
                 .topmost_popup_grab_surface_id()
                 .is_some_and(|popup_id| self.surface_is_descendant_of(surface_id, popup_id))

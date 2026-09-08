@@ -4,6 +4,7 @@ use std::{
     ffi::c_void,
     io, ptr,
     sync::Arc,
+    time::Instant,
 };
 
 use glow::HasContext;
@@ -17,7 +18,7 @@ use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
         DesktopVisualState, RenderableSurface, SurfaceDamageRect, SurfaceOpaqueRect,
-        SurfaceOpaqueRegion,
+        SurfaceOpaqueRegion, VisualGroupId,
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
@@ -124,7 +125,6 @@ pub(crate) struct GlesSceneFrameStats {
     pub orphan_decoration_count: u32,
     pub effect_instances_visible: usize,
     pub effect_instances_executed: usize,
-    pub effect_instances_cache_hit: usize,
     pub effect_instances_failed: usize,
     pub render_graph_passes: usize,
     pub render_graph_peak_live_textures: usize,
@@ -203,6 +203,7 @@ impl EglSceneFrameCommit {
                 surface_signature_hash: 0,
                 decoration_signature_hash: 0,
                 popup_surface_signature_hash: 0,
+                presentation_geometry_signature: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
         }
@@ -220,6 +221,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub output_scale: f64,
     pub decoration_instances: &'a [DecorationRenderInstance],
     pub effects: &'a compositor::ResolvedEffectScene,
+    pub presentation_geometry_signature: u64,
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
 }
@@ -229,6 +231,7 @@ pub(crate) struct GlesSceneRenderer {
     gl: glow::Context,
     program: GlProgram,
     capture_program: GlProgram,
+    capture_uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
     scene_vertex_array: GlVertexArray,
     scene_vertex_buffer: GlBuffer,
     scene_vertex_buffer_capacity: usize,
@@ -266,6 +269,10 @@ pub(crate) struct GlesSceneRenderer {
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
     active_output_framebuffer: Option<glow::Framebuffer>,
     frame_stats: GlesSceneFrameStats,
+    effect_clock_start: Instant,
+    effect_time_seconds: f32,
+    effect_delta_seconds: f32,
+    effect_output_scale: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +374,7 @@ impl GlesSceneRenderer {
             gl,
             program,
             capture_program,
+            capture_uniform_locations: HashMap::new(),
             scene_vertex_array,
             scene_vertex_buffer,
             scene_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
@@ -408,6 +416,10 @@ impl GlesSceneRenderer {
             effect_quad: None,
             active_output_framebuffer: None,
             frame_stats: GlesSceneFrameStats::default(),
+            effect_clock_start: Instant::now(),
+            effect_time_seconds: 0.0,
+            effect_delta_seconds: 0.0,
+            effect_output_scale: 1.0,
         })
     }
 
@@ -427,6 +439,37 @@ impl GlesSceneRenderer {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, self.active_output_framebuffer);
         }
+    }
+
+    /// Restore the complete state expected by ordinary scene drawing after an
+    /// effect or other offscreen pass has changed GL state.
+    pub(crate) fn establish_ordinary_scene_state(&self) {
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::FRAMEBUFFER, self.active_output_framebuffer);
+            self.gl
+                .viewport(0, 0, self.current_size.0 as i32, self.current_size.1 as i32);
+            self.gl.use_program(Some(self.program));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+        }
+    }
+
+    pub(crate) fn capture_uniform_location(&mut self, name: &str) -> Option<glow::UniformLocation> {
+        if let Some(location) = self.capture_uniform_locations.get(name) {
+            return *location;
+        }
+        let location = unsafe { self.gl.get_uniform_location(self.capture_program, name) };
+        self.capture_uniform_locations
+            .insert(name.to_owned(), location);
+        location
     }
 
     pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
@@ -457,8 +500,10 @@ impl GlesSceneRenderer {
         let compile_result = (|| {
             next_shaders.prewarm_builtins(&self.gl).map_err(|error| {
                 RegistryReloadError::ShaderCompile {
-                    module: oblivion_one::effects::ShaderModuleId::new(1001)
-                        .expect("builtin shader ids are non-zero"),
+                    module: oblivion_one::effects::ShaderModuleId::new(
+                        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+                    )
+                    .expect("builtin shader ids are non-zero"),
                     log: error.to_string(),
                 }
             })?;
@@ -485,6 +530,7 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reload_trusted_effect_registry(
         &mut self,
         registry: &TrustedEffectRegistry,
@@ -595,6 +641,7 @@ impl GlesSceneRenderer {
             output_scale,
             decoration_instances,
             effects,
+            presentation_geometry_signature,
             popup_surface_ids,
             client_cursor,
             current_damage,
@@ -608,6 +655,14 @@ impl GlesSceneRenderer {
             scaled_visual_state.cursor = None;
         }
         self.frame_stats = GlesSceneFrameStats::default();
+        let effect_time = self.effect_clock_start.elapsed().as_secs_f32();
+        self.effect_delta_seconds = if self.effect_time_seconds == 0.0 {
+            0.0
+        } else {
+            (effect_time - self.effect_time_seconds).clamp(0.0, 0.25)
+        };
+        self.effect_time_seconds = effect_time;
+        self.effect_output_scale = output_scale.max(0.0) as f32;
         self.ensure_output_size(width, height)?;
         self.frame_stats.effect_instances_visible = effects
             .instances
@@ -642,6 +697,7 @@ impl GlesSceneRenderer {
             &surface_signatures,
             decoration_instances,
             popup_surface_ids,
+            presentation_geometry_signature,
             framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
@@ -653,6 +709,7 @@ impl GlesSceneRenderer {
             &surface_signatures,
             decoration_instances,
             popup_surface_ids,
+            presentation_geometry_signature,
             framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
@@ -707,6 +764,7 @@ impl GlesSceneRenderer {
                 output_scale,
                 output_scale_key,
                 &surface_signatures,
+                presentation_geometry_signature,
                 framebuffer_origin,
             );
         }
@@ -1335,6 +1393,7 @@ impl GlesSceneRenderer {
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
         popup_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.scene_cache_key.is_some_and(|key| {
@@ -1346,6 +1405,7 @@ impl GlesSceneRenderer {
                 surface_signatures,
                 decoration_instances,
                 popup_surface_ids,
+                presentation_geometry_signature,
                 framebuffer_origin,
             )
         })
@@ -1366,6 +1426,7 @@ impl GlesSceneRenderer {
         output_scale: f64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.frame_stats.orphan_decoration_count =
@@ -1386,11 +1447,19 @@ impl GlesSceneRenderer {
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
-        for group in compositor::WindowVisualGroup::stack_order_with_popups(
+        for (group_index, group) in compositor::WindowVisualGroup::stack_order_with_popups(
             surfaces,
             decoration_instances,
             popup_surface_ids,
-        ) {
+        )
+        .into_iter()
+        .enumerate()
+        {
+            let visual_group = VisualGroupId::new(
+                u32::try_from(group_index)
+                    .unwrap_or(u32::MAX.saturating_sub(1))
+                    .saturating_add(1),
+            );
             for &surface_index in group.surface_indices() {
                 let Some((surface, render_assignment)) = surfaces
                     .get(surface_index)
@@ -1406,6 +1475,7 @@ impl GlesSceneRenderer {
                     surface,
                     render_assignment,
                     framebuffer_origin,
+                    visual_group,
                 );
             }
             if let Some(decoration_index) = group.decoration_index()
@@ -1419,6 +1489,7 @@ impl GlesSceneRenderer {
                     instance,
                     output_scale,
                     framebuffer_origin,
+                    visual_group,
                 );
             }
         }
@@ -1431,6 +1502,7 @@ impl GlesSceneRenderer {
             surface_signatures,
             decoration_instances,
             popup_surface_ids,
+            presentation_geometry_signature,
             framebuffer_origin,
         ));
     }
@@ -1464,6 +1536,7 @@ impl GlesSceneRenderer {
                 surface,
                 render_assignment,
                 framebuffer_origin,
+                None,
             );
         }
 
@@ -1543,11 +1616,8 @@ impl GlesSceneRenderer {
         plan: &RepaintPlan,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<()> {
-        unsafe {
-            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl.use_program(Some(self.program));
-            self.gl.active_texture(glow::TEXTURE0);
-        }
+        self.establish_ordinary_scene_state();
+        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
 
         let execution = plan
             .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
@@ -1608,11 +1678,8 @@ impl GlesSceneRenderer {
         plan: &RepaintPlan,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<Vec<OutputRect>> {
-        unsafe {
-            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl.use_program(Some(self.program));
-            self.gl.active_texture(glow::TEXTURE0);
-        }
+        self.establish_ordinary_scene_state();
+        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
         let execution = plan
             .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
             .ok_or_else(|| io::Error::other("effect repaint conversion failed"))?;
@@ -1665,8 +1732,7 @@ impl GlesSceneRenderer {
                 OutputFramebufferOrigin::TopLeftScanout => rect.y,
             };
             unsafe {
-                self.gl.use_program(Some(self.program));
-                self.gl.active_texture(glow::TEXTURE0);
+                self.establish_ordinary_scene_state();
                 self.gl.enable(glow::SCISSOR_TEST);
                 self.gl
                     .scissor(rect.x, y, rect.width as i32, rect.height as i32);
@@ -1694,8 +1760,7 @@ impl GlesSceneRenderer {
                 OutputFramebufferOrigin::TopLeftScanout => rect.y,
             };
             unsafe {
-                self.gl.use_program(Some(self.program));
-                self.gl.active_texture(glow::TEXTURE0);
+                self.establish_ordinary_scene_state();
                 self.gl.enable(glow::SCISSOR_TEST);
                 self.gl
                     .scissor(rect.x, y, rect.width as i32, rect.height as i32);
@@ -1912,14 +1977,40 @@ impl GlesSceneRenderer {
     fn draw_capture_commands(
         &mut self,
         command_indices: &[usize],
-        scissor: OutputRect,
+        output_rect: OutputRect,
+        target_domain: EffectRect,
+        target_size: (u32, u32),
     ) -> RendererResult<()> {
+        let requested = EffectRect::new(
+            output_rect.x,
+            output_rect.y,
+            output_rect.width,
+            output_rect.height,
+        )
+        .and_then(|rect| rect.intersect(target_domain));
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let local_x = requested.x.saturating_sub(target_domain.x);
+        let local_y = requested.y.saturating_sub(target_domain.y);
+        let gl_y = i32::try_from(target_size.1)
+            .unwrap_or(i32::MAX)
+            .saturating_sub(local_y.saturating_add(requested.height as i32));
+        unsafe {
+            self.gl.enable(glow::SCISSOR_TEST);
+            self.gl.scissor(
+                local_x,
+                gl_y,
+                requested.width as i32,
+                requested.height as i32,
+            );
+        }
         let saved_visibility = std::mem::take(&mut self.scene_visibility_plan);
         let repair = EglRect::new(
-            scissor.x as f32,
-            scissor.y as f32,
-            scissor.width as f32,
-            scissor.height as f32,
+            output_rect.x as f32,
+            output_rect.y as f32,
+            output_rect.width as f32,
+            output_rect.height as f32,
         );
         let capture_stats = plan_capture_visibility(
             &self.commands,
@@ -1927,13 +2018,27 @@ impl GlesSceneRenderer {
             repair,
             &mut self.scene_visibility_plan,
         );
-        let result = self.draw_command_batch_with_visibility(true, Some(scissor), false);
+        let result = self.draw_command_batch_with_visibility(true, Some(output_rect), false);
+        unsafe { self.gl.disable(glow::SCISSOR_TEST) };
         self.frame_stats.planner_commands_visited = self
             .frame_stats
             .planner_commands_visited
             .saturating_add(capture_stats.commands_visited);
         self.scene_visibility_plan = saved_visibility;
         result
+    }
+
+    fn draw_capture_commands_for_regions(
+        &mut self,
+        command_indices: &[usize],
+        output_rects: &[OutputRect],
+        target_domain: EffectRect,
+        target_size: (u32, u32),
+    ) -> RendererResult<()> {
+        for &output_rect in output_rects {
+            self.draw_capture_commands(command_indices, output_rect, target_domain, target_size)?;
+        }
+        Ok(())
     }
 
     fn plan_scene_visibility(&mut self, scissor: Option<OutputRect>) {
@@ -2067,6 +2172,7 @@ fn resolve_scene_damage_authority(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_egl_decoration_instance(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,
@@ -2075,7 +2181,9 @@ fn push_egl_decoration_instance(
     instance: &DecorationRenderInstance,
     output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
+    visual_group: Option<VisualGroupId>,
 ) {
+    let command_start = commands.len();
     for primitive in instance.primitives() {
         match primitive {
             DecorationRenderPrimitive::SolidRect { rect, color } => {
@@ -2119,6 +2227,9 @@ fn push_egl_decoration_instance(
                 framebuffer_origin,
             ),
         }
+    }
+    for command in &mut commands[command_start..] {
+        command.visual_group = visual_group;
     }
 }
 
@@ -2339,16 +2450,38 @@ struct EglSceneCacheKey {
     surface_signature_hash: u64,
     decoration_signature_hash: u64,
     popup_surface_signature_hash: u64,
+    presentation_geometry_signature: u64,
     framebuffer_origin: OutputFramebufferOrigin,
 }
 
 impl EglSceneCacheKey {
+    #[allow(dead_code)] // Retained for focused cache-key unit tests.
     fn new(
         width: u32,
         height: u32,
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        Self::new_with_presentation(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            surface_signatures,
+            0,
+            framebuffer_origin,
+        )
+    }
+
+    fn new_with_presentation(
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
         Self {
@@ -2359,6 +2492,7 @@ impl EglSceneCacheKey {
             surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
             decoration_signature_hash: egl_decoration_signature_hash(&[]),
             popup_surface_signature_hash: 0,
+            presentation_geometry_signature,
             framebuffer_origin,
         }
     }
@@ -2375,14 +2509,16 @@ impl EglSceneCacheKey {
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
         popup_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
-        let mut key = Self::new(
+        let mut key = Self::new_with_presentation(
             width,
             height,
             content_generation,
             output_scale_key,
             surface_signatures,
+            presentation_geometry_signature,
             framebuffer_origin,
         );
         key.decoration_signature_hash = egl_decoration_signature_hash(decoration_instances);
@@ -2431,6 +2567,7 @@ impl EglSceneCacheKey {
             surface_signatures,
             &[],
             &[],
+            0,
             framebuffer_origin,
         )
     }
@@ -2448,6 +2585,7 @@ impl EglSceneCacheKey {
         surface_signatures: &[EglSceneSurfaceSignature],
         decoration_instances: &[DecorationRenderInstance],
         popup_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.width == width
@@ -2457,6 +2595,7 @@ impl EglSceneCacheKey {
             && self.decoration_signature_hash == egl_decoration_signature_hash(decoration_instances)
             && self.popup_surface_signature_hash
                 == egl_popup_surface_signature_hash(popup_surface_ids)
+            && self.presentation_geometry_signature == presentation_geometry_signature
             && self.framebuffer_origin == framebuffer_origin
     }
 
@@ -2531,6 +2670,7 @@ fn split_external_overlay_surfaces(
         .partition(|surface| !external_overlay_surface_ids.contains(&surface.surface_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_egl_surface_commands(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,
@@ -2539,7 +2679,9 @@ fn push_egl_surface_commands(
     surface: &RenderableSurface,
     render_assignment: compositor::SurfaceRenderSpaceAssignment,
     framebuffer_origin: OutputFramebufferOrigin,
+    visual_group: Option<VisualGroupId>,
 ) {
+    let command_start = commands.len();
     if let Some(bounds) =
         compositor::xwayland_visual_backing_target(surface, render_assignment.visual_clip.as_ref())
     {
@@ -2572,6 +2714,9 @@ fn push_egl_surface_commands(
             render_plan,
             framebuffer_origin,
         );
+    }
+    for command in &mut commands[command_start..] {
+        command.visual_group = visual_group;
     }
 }
 
@@ -3598,6 +3743,222 @@ mod tests {
     }
 
     #[test]
+    fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
+        const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
+        let egl = unsafe { EglInstance::load_required() }
+            .expect("EGL loader is required for the GLES wrapper compile test");
+        let display = unsafe {
+            egl.get_platform_display(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                std::ptr::null_mut(),
+                &[egl::ATTRIB_NONE],
+            )
+            .or_else(|_| {
+                egl.get_display(egl::DEFAULT_DISPLAY)
+                    .ok_or(egl::Error::BadDisplay)
+            })
+        }
+        .expect("EGL display is available");
+        egl.initialize(display).expect("EGL initializes");
+        egl.bind_api(egl::OPENGL_ES_API)
+            .expect("EGL binds the GLES API");
+        let config_attributes = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let count = egl
+            .matching_config_count(display, &config_attributes)
+            .expect("EGL returns GLES3 pbuffer configs");
+        assert!(count > 0, "EGL exposes a GLES3 pbuffer config");
+        let mut configs = Vec::with_capacity(count);
+        egl.choose_config(display, &config_attributes, &mut configs)
+            .expect("EGL chooses a GLES3 pbuffer config");
+        let config = configs[0];
+        let context = create_gles_context(&egl, display, config).expect("GLES3 context creates");
+        let surface = egl
+            .create_pbuffer_surface(display, config, &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE])
+            .expect("EGL pbuffer surface creates");
+        egl.make_current(display, Some(surface), Some(surface), Some(context))
+            .expect("EGL makes the GLES3 context current");
+
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| {
+                egl.get_proc_address(name)
+                    .map(|symbol| symbol as *const c_void)
+                    .unwrap_or(ptr::null())
+            })
+        };
+        let asset = oblivion_one::effects::TrustedShaderAsset {
+            module: oblivion_one::effects::ShaderModuleId::new(9001).unwrap(),
+            relative_path: std::path::PathBuf::from("test.glsl"),
+            source: r#"
+                uniform float u_float;
+                uniform vec2 u_vec2;
+                uniform vec4 u_vec4;
+                vec4 typhon_effect_main(TyphonEffectContext ctx) {
+                    vec4 aux = typhon_sample_aux(0, ctx.uv) + typhon_sample_aux(7, ctx.uv);
+                    return typhon_sample_primary(ctx.uv) + aux * 0.0
+                        + vec4(u_float + ctx.time + ctx.delta + u_vec2.x + u_vec4.x);
+                }
+            "#
+            .to_owned(),
+            uniforms: vec![
+                oblivion_one::effects::EffectUniformBinding {
+                    parameter: oblivion_one::effects::EffectParameterId::new(1).unwrap(),
+                    shader_name: "u_float".to_owned(),
+                },
+                oblivion_one::effects::EffectUniformBinding {
+                    parameter: oblivion_one::effects::EffectParameterId::new(2).unwrap(),
+                    shader_name: "u_vec2".to_owned(),
+                },
+                oblivion_one::effects::EffectUniformBinding {
+                    parameter: oblivion_one::effects::EffectParameterId::new(3).unwrap(),
+                    shader_name: "u_vec4".to_owned(),
+                },
+            ],
+        };
+        let mut cache = ShaderProgramCache::new(4).unwrap();
+        cache
+            .prewarm_trusted_custom(&gl, &asset)
+            .expect("trusted custom wrapper compiles and links in GLES3");
+        let cursor_image = Arc::new(
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff], 1, 1, 0, 0)
+                .expect("test cursor image is valid"),
+        );
+        let mut renderer = GlesSceneRenderer::new_current(
+            &egl,
+            1,
+            1,
+            None,
+            EglPartialRepaintCapabilities {
+                buffer_age: false,
+                partial_render_repair: false,
+                swap_buffers_with_damage: false,
+            },
+            cursor_image,
+        )
+        .expect("test GLES renderer creates");
+        renderer.establish_ordinary_scene_state();
+        unsafe {
+            assert!(gl.is_enabled(glow::BLEND));
+            assert!(!gl.is_enabled(glow::SCISSOR_TEST));
+            assert_eq!(
+                gl.get_parameter_i32(glow::ACTIVE_TEXTURE),
+                glow::TEXTURE0 as i32
+            );
+            assert_eq!(gl.get_parameter_i32(glow::BLEND_SRC_RGB), glow::ONE as i32);
+            assert_eq!(
+                gl.get_parameter_i32(glow::BLEND_DST_RGB),
+                glow::ONE_MINUS_SRC_ALPHA as i32
+            );
+            assert_eq!(
+                gl.get_parameter_i32(glow::BLEND_SRC_ALPHA),
+                glow::ONE as i32
+            );
+            assert_eq!(
+                gl.get_parameter_i32(glow::BLEND_DST_ALPHA),
+                glow::ONE_MINUS_SRC_ALPHA as i32
+            );
+            assert_ne!(gl.get_parameter_i32(glow::CURRENT_PROGRAM), 0);
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            assert_eq!(viewport, [0, 0, 1, 1]);
+        }
+
+        let source_over_program = program::create_program_from_sources(
+            &gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                void main() { gl_Position = vec4(a_position, 0.0, 1.0); }
+            "#,
+            r#"#version 300 es
+                precision highp float;
+                uniform vec4 u_color;
+                out vec4 out_color;
+                void main() { out_color = u_color; }
+            "#,
+        )
+        .expect("source-over regression shader compiles");
+        let (quad, _) = renderer
+            .ensure_effect_quad()
+            .expect("source-over regression quad creates");
+        let destination = oblivion_one::effects::PremultipliedRgba::new(0.2, 0.1, 0.05, 0.5);
+        let source = oblivion_one::effects::PremultipliedRgba::new(0.4, 0.2, 0.1, 0.5);
+        let expected = destination.blend(source, oblivion_one::effects::BlendMode::SourceOver, 1.0);
+        unsafe {
+            gl.viewport(0, 0, 1, 1);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.enable(glow::BLEND);
+            gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(source_over_program));
+            gl.bind_vertex_array(Some(quad));
+            let color = gl
+                .get_uniform_location(source_over_program, "u_color")
+                .expect("source-over color uniform is active");
+            gl.uniform_4_f32(
+                Some(&color),
+                destination.r,
+                destination.g,
+                destination.b,
+                destination.a,
+            );
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.uniform_4_f32(Some(&color), source.r, source.g, source.b, source.a);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.bind_vertex_array(None);
+            gl.flush();
+            let mut pixel = [0_u8; 4];
+            gl.read_pixels(
+                0,
+                0,
+                1,
+                1,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixel)),
+            );
+            for (actual, expected) in pixel.iter().zip([
+                (expected.r * 255.0).round() as u8,
+                (expected.g * 255.0).round() as u8,
+                (expected.b * 255.0).round() as u8,
+                (expected.a * 255.0).round() as u8,
+            ]) {
+                assert!(
+                    (*actual as i16 - expected as i16).abs() <= 2,
+                    "source-over channel mismatch: actual={actual}, expected={expected}, pixel={pixel:?}"
+                );
+            }
+            gl.delete_program(source_over_program);
+        }
+
+        egl.make_current(display, None, None, None)
+            .expect("EGL releases the GLES3 context");
+        egl.destroy_surface(display, surface)
+            .expect("EGL destroys the pbuffer surface");
+        egl.destroy_context(display, context)
+            .expect("EGL destroys the GLES3 context");
+        egl.terminate(display).expect("EGL terminates");
+    }
+
+    #[test]
     fn native_egl_config_selection_rejects_gles2_only_candidates() {
         let mut candidate = native_candidate(1, XR24);
         candidate.renderable_type = egl::OPENGL_ES2_BIT;
@@ -4231,6 +4592,42 @@ mod tests {
             120,
             &[signature],
             OutputFramebufferOrigin::TopLeftScanout,
+        ));
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_presentation_geometry_changes() {
+        let key = EglSceneCacheKey::new_with_presentation(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            11,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(key.is_current_with_decorations(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            &[],
+            &[],
+            11,
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(!key.is_current_with_decorations(
+            1280,
+            800,
+            9,
+            120,
+            &[],
+            &[],
+            &[],
+            12,
+            OutputFramebufferOrigin::BottomLeft,
         ));
     }
 

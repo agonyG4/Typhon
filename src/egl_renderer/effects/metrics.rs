@@ -69,13 +69,9 @@ pub(crate) fn graph_metrics(
         })
         .map(|texture| u64::from(texture.width).saturating_mul(u64::from(texture.height)))
         .sum();
-    let output_pixels = graph
-        .textures
-        .iter()
-        .find(|texture| texture.source == oblivion_one::effects::GraphTextureSource::Output)
-        .map_or(0, |texture| {
-            u64::from(texture.width).saturating_mul(u64::from(texture.height))
-        });
+    let output_pixels = graph.final_damage.rects().iter().fold(0u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+    });
     EffectGraphMetrics {
         instances: graph.stats.effect_instances,
         passes: graph.stats.passes,

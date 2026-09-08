@@ -280,7 +280,7 @@ fn validate_dmabuf_planes(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShmBufferSnapshot {
     size: BufferSize,
-    pixels: Vec<u32>,
+    pixels: Arc<Vec<u32>>,
 }
 
 impl ShmBufferSnapshot {
@@ -288,7 +288,10 @@ impl ShmBufferSnapshot {
         if size.pixel_count() != Some(pixels.len()) {
             return Err(BufferValidationError::PixelCountMismatch);
         }
-        Ok(Self { size, pixels })
+        Ok(Self {
+            size,
+            pixels: Arc::new(pixels),
+        })
     }
 
     pub const fn size(&self) -> BufferSize {
@@ -300,7 +303,7 @@ impl ShmBufferSnapshot {
     }
 
     pub fn pixels_mut(&mut self) -> &mut Vec<u32> {
-        &mut self.pixels
+        Arc::make_mut(&mut self.pixels)
     }
 }
 
@@ -422,5 +425,22 @@ mod identity_tests {
 
         drop(clone);
         assert!(!weak.is_alive());
+    }
+
+    #[test]
+    fn cloned_shm_snapshots_share_immutable_pixels_until_write() {
+        let mut allocator = BufferIdAllocator::default();
+        let identity = allocator.allocate().expect("buffer identity");
+        let size = BufferSize::new(2, 1).expect("buffer size");
+        let original = CommittedSurfaceBuffer::shm_snapshot(identity, size, vec![1, 2]);
+        let mut clone = original.clone();
+
+        assert_eq!(
+            original.cpu_pixels().expect("original pixels").as_ptr(),
+            clone.cpu_pixels().expect("clone pixels").as_ptr()
+        );
+        clone.shm_pixels_mut().expect("mutable snapshot")[0] = 9;
+        assert_eq!(original.cpu_pixels(), Some(&[1, 2][..]));
+        assert_eq!(clone.cpu_pixels(), Some(&[9, 2][..]));
     }
 }

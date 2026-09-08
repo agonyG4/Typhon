@@ -737,6 +737,15 @@ pub struct PerformanceSnapshot {
     pub timing_scopes: std::collections::BTreeMap<String, TimingSummarySnapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TrustedEffectsReloadSnapshot {
+    pub manifest_path: String,
+    pub generation: u64,
+    pub effect_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AstreactlResult {
@@ -752,6 +761,7 @@ pub enum AstreactlResult {
     Performance(Box<PerformanceSnapshot>),
     DecorationTheme(DecorationThemeSnapshot),
     DecorationThemes(DecorationThemeListSnapshot),
+    TrustedEffects(TrustedEffectsReloadSnapshot),
     Wallpaper(WallpaperSnapshot),
     WallpaperList(WallpaperListSnapshot),
 }

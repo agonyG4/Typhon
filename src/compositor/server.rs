@@ -17,8 +17,10 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    EffectFrameDemandSnapshot, ResolvedEffectScene, ShmBufferLifetimeMetrics,
-    SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
+    AnimationTime, EffectFrameDemandSnapshot, PresentationAnimationMetrics,
+    PresentationFrameSnapshot, PresentationGroupTransform, PresentationSceneSample,
+    ResolvedEffectScene, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
+    compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -141,6 +143,14 @@ impl Drop for OwnCompositorServer {
     }
 }
 impl OwnCompositorServer {
+    pub fn trusted_effect_registry(&self) -> &crate::effects::TrustedEffectRegistry {
+        self.state.trusted_effect_registry()
+    }
+
+    pub fn reconcile_trusted_effect_bindings(&mut self) {
+        self.state.reconcile_trusted_effect_bindings();
+    }
+
     pub(crate) fn focused_x11_window_xid(&self) -> Option<u32> {
         let window_id = self.state.focused_window_id?;
         match self.state.window(window_id)?.backend {
@@ -970,6 +980,59 @@ impl OwnCompositorServer {
         self.state.native_frame_renderable_surfaces()
     }
 
+    pub fn presentation_scene_sample_at(&self, at: AnimationTime) -> PresentationSceneSample {
+        self.state.presentation_scene_sample_at(at)
+    }
+
+    pub fn native_frame_renderable_surfaces_with_presentation(
+        &self,
+        sample: &PresentationSceneSample,
+    ) -> Cow<'_, [RenderableSurface]> {
+        self.state
+            .native_frame_renderable_surfaces_with_presentation(sample)
+    }
+
+    pub fn presentation_animation_has_unsettled_visible_at(&self, at: AnimationTime) -> bool {
+        self.state
+            .presentation_animation_has_unsettled_visible_at(at)
+    }
+
+    pub fn presentation_animation_has_pending_visible(&self) -> bool {
+        self.state.presentation_animation_has_pending_visible()
+    }
+
+    pub fn presentation_animation_metrics(&self) -> PresentationAnimationMetrics {
+        self.state.presentation_animation_metrics()
+    }
+
+    pub fn presentation_geometry_signature(&self, sample: &PresentationSceneSample) -> u64 {
+        self.state.presentation_geometry_signature(sample)
+    }
+
+    pub fn presented_presentation_transform(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<PresentationGroupTransform> {
+        self.state.presented_presentation_transform(root_surface_id)
+    }
+
+    pub fn presented_presentation_frame_id(&self) -> u64 {
+        self.state.presented_presentation_frame_id()
+    }
+
+    pub fn publish_presented_presentation(
+        &mut self,
+        frame_id: u64,
+        presentation: &PresentationFrameSnapshot,
+    ) {
+        self.state
+            .publish_presented_presentation(frame_id, presentation);
+    }
+
+    pub fn cancel_presentation_for_root(&mut self, root_surface_id: u32) {
+        self.state.cancel_presentation_for_root(root_surface_id);
+    }
+
     pub fn native_decoration_render_instances(
         &self,
         surfaces: &[RenderableSurface],
@@ -1183,6 +1246,14 @@ impl OwnCompositorServer {
 
     pub fn resolved_effect_scene(&self) -> ResolvedEffectScene {
         self.state.resolved_effect_scene()
+    }
+
+    pub fn resolved_effect_scene_for_presentation(
+        &self,
+        presentation: &PresentationSceneSample,
+    ) -> ResolvedEffectScene {
+        self.state
+            .resolved_effect_scene_with_presentation(presentation)
     }
 
     pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {

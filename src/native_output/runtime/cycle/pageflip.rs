@@ -5,6 +5,7 @@ use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presented_output_transaction,
     prepare_presented_output_transaction, settle_dropped_output_transaction,
 };
+use super::super::presentation_worker::promote_pageflip_and_publish;
 use super::super::*;
 use super::cycle_direct;
 use crate::native_output::kms_worker::{
@@ -724,7 +725,7 @@ impl NativeRuntime {
                 let explicit_composited_pageflip =
                     matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_)) && !direct_pending;
                 if !explicit_composited_pageflip {
-                    let _ = scene_history.promote_pageflip(pageflip.user_data);
+                    let _ = promote_pageflip_and_publish(scene_history, pageflip.user_data, server);
                 }
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
@@ -1094,7 +1095,7 @@ impl NativeRuntime {
                     );
                     dmabuf_gpu_release_registry
                         .note_composited_pageflip(transaction_id, presented_at_ns);
-                    if !scene_history.promote_pageflip(pageflip_token.get()) {
+                    if !promote_pageflip_and_publish(scene_history, pageflip_token.get(), server) {
                         return Err(io::Error::other(
                             "composited pageflip scene promotion did not match transition",
                         )

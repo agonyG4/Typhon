@@ -116,7 +116,7 @@ impl CompositorState {
             }),
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
-                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                let root_surface_id = self.presentation_owner_root_for_surface(surface_id);
                 let kind = self
                     .root_window_local_point_at(root_surface_id, x, y)
                     .map(|(local_x, local_y, width, height)| {
@@ -226,7 +226,7 @@ impl CompositorState {
             return false;
         };
         let surface_id = compositor_surface_id(&target.surface);
-        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        let root_surface_id = self.presentation_owner_root_for_surface(surface_id);
         self.begin_window_interaction_for_root(BeginWindowInteraction {
             window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
@@ -246,7 +246,8 @@ impl CompositorState {
         surface: &wl_surface::WlSurface,
         serial: u32,
     ) -> bool {
-        let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(surface));
+        let root_surface_id =
+            self.presentation_owner_root_for_surface(compositor_surface_id(surface));
         let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
         else {
             log_begin_rejection_without_target(
@@ -279,7 +280,8 @@ impl CompositorState {
         serial: u32,
         edges: ResizeEdges,
     ) -> bool {
-        let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(surface));
+        let root_surface_id =
+            self.presentation_owner_root_for_surface(compositor_surface_id(surface));
         let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
         else {
             log_begin_rejection_without_target(
@@ -566,7 +568,9 @@ impl CompositorState {
                 log_begin_rejection(self, begin, "motion_target_missing");
                 return false;
             }
-            if self.root_surface_id_for_surface(pointer_motion_surface_id) != root_surface_id {
+            if self.presentation_owner_root_for_surface(pointer_motion_surface_id)
+                != root_surface_id
+            {
                 log_begin_rejection(self, begin, "motion_target_wrong_root");
                 return false;
             }
@@ -578,10 +582,12 @@ impl CompositorState {
         );
         let start_geometry = match kind {
             WindowInteractionKind::Resize(_) => self
-                .current_visual_root_window_geometry(root_surface_id)
+                .presented_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
                 .unwrap_or(fallback_geometry),
             WindowInteractionKind::Move => self
-                .current_visual_root_window_geometry(root_surface_id)
+                .presented_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
                 .unwrap_or(fallback_geometry),
         };
@@ -589,6 +595,21 @@ impl CompositorState {
             log_begin_rejection(self, begin, "root_resource_missing");
             return false;
         };
+        if self
+            .presented_presentation_transform(root_surface_id)
+            .is_some()
+            || self.presentation_animation_pending_for_root(root_surface_id)
+        {
+            let takeover_cause = match kind {
+                WindowInteractionKind::Move => RenderGenerationCause::WindowMove,
+                WindowInteractionKind::Resize(_) => RenderGenerationCause::WindowResize,
+            };
+            self.take_over_presented_visual_geometry(
+                root_surface_id,
+                start_geometry,
+                takeover_cause,
+            );
+        }
         if source == WindowInteractionSource::NativeBinding {
             let _ = self.activate_desktop_window(window_id, WindowFocusReason::PointerPress);
         }

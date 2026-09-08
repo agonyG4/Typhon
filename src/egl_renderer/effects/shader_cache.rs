@@ -3,7 +3,12 @@
 use std::{collections::HashMap, io};
 
 use glow::HasContext;
-use oblivion_one::effects::{EffectUniformBinding, EffectWorkingSpace};
+use oblivion_one::effects::{
+    EffectUniformBinding, EffectWorkingSpace, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+    INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE, INTERNAL_EFFECT_SHADER_MODULE_COPY,
+    INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE, INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
+    INTERNAL_EFFECT_SHADER_MODULE_MASK, INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE,
+};
 
 use super::super::{GlProgram, RendererResult};
 use super::blur;
@@ -16,6 +21,19 @@ pub const RESERVED_SHADER_NAMES: &[&str] = &[
     "u_typhon_scale",
     "u_typhon_time",
     "u_typhon_delta",
+    "u_typhon_decode_srgb",
+    "u_typhon_encode_srgb",
+    "u_typhon_aux0",
+    "u_typhon_aux1",
+    "u_typhon_aux2",
+    "u_typhon_aux3",
+    "u_typhon_aux4",
+    "u_typhon_aux5",
+    "u_typhon_aux6",
+    "u_typhon_aux7",
+    "u_typhon_aux_count",
+    "typhon_sample_primary",
+    "typhon_sample_aux",
     "v_uv",
     "out_color",
     "TyphonEffectContext",
@@ -78,6 +96,7 @@ struct CachedShaderProgram {
     last_used: u64,
     program: Option<GlProgram>,
     compile_log: Option<String>,
+    uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
 }
 
 pub struct ShaderProgramCache {
@@ -122,6 +141,7 @@ impl ShaderProgramCache {
                 last_used: self.clock,
                 program: None,
                 compile_log: None,
+                uniform_locations: HashMap::new(),
             },
         );
         Ok(())
@@ -185,6 +205,7 @@ impl ShaderProgramCache {
                 last_used: self.clock,
                 program: Some(program),
                 compile_log: None,
+                uniform_locations: HashMap::new(),
             },
         );
         Ok(program)
@@ -200,6 +221,22 @@ impl ShaderProgramCache {
         entry
             .program
             .ok_or_else(|| io::Error::other("effect shader was not prewarmed").into())
+    }
+
+    pub(crate) fn uniform_location(
+        &mut self,
+        gl: &glow::Context,
+        key: ShaderProgramKey,
+        program: GlProgram,
+        name: &str,
+    ) -> Option<glow::UniformLocation> {
+        let entry = self.entries.get_mut(&key)?;
+        if let Some(location) = entry.uniform_locations.get(name) {
+            return *location;
+        }
+        let location = unsafe { gl.get_uniform_location(program, name) };
+        entry.uniform_locations.insert(name.to_owned(), location);
+        location
     }
 
     pub(crate) fn prewarm(
@@ -227,14 +264,51 @@ impl ShaderProgramCache {
     pub(crate) fn prewarm_builtins(&mut self, gl: &glow::Context) -> RendererResult<()> {
         let vertex = blur::DUAL_KAWASE_VERTEX_SHADER;
         for (module, variant, fragment) in [
-            (1001, 0, blur::DUAL_KAWASE_DOWNSAMPLE_SHADER),
-            (1001, 1, blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER),
-            (1002, 0, blur::DUAL_KAWASE_UPSAMPLE_SHADER),
-            (1003, 0, super::executor::COPY_FRAGMENT_SHADER),
-            (1004, 0, super::executor::COMPOSITE_FRAGMENT_SHADER),
-            (1005, 0, super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER),
-            (1006, 0, super::executor::MASK_STAGE_FRAGMENT_SHADER),
-            (1007, 0, super::executor::BLEND_STAGE_FRAGMENT_SHADER),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+                0,
+                blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
+                1,
+                blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE,
+                0,
+                blur::DUAL_KAWASE_UPSAMPLE_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_COPY,
+                0,
+                super::executor::COPY_FRAGMENT_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_COPY,
+                1,
+                super::executor::NORMALIZE_FRAGMENT_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE,
+                0,
+                super::executor::COMPOSITE_FRAGMENT_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
+                0,
+                super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_MASK,
+                0,
+                super::executor::MASK_STAGE_FRAGMENT_SHADER,
+            ),
+            (
+                INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+                0,
+                super::executor::BLEND_STAGE_FRAGMENT_SHADER,
+            ),
         ] {
             let key = ShaderProgramKey::new(
                 oblivion_one::effects::ShaderModuleId::new(module)
@@ -312,7 +386,10 @@ pub fn generate_fragment_wrapper(
         validate_uniform_name(binding)?;
     }
     for name in RESERVED_SHADER_NAMES {
-        if *name == "TyphonEffectContext" {
+        if matches!(
+            *name,
+            "TyphonEffectContext" | "typhon_sample_primary" | "typhon_sample_aux"
+        ) {
             continue;
         }
         if body.contains(name) {
@@ -329,19 +406,67 @@ uniform vec2 u_typhon_output_size;
 uniform float u_typhon_scale;
 uniform float u_typhon_time;
 uniform float u_typhon_delta;
+uniform int u_typhon_decode_srgb;
+uniform int u_typhon_encode_srgb;
+uniform sampler2D u_typhon_aux0;
+uniform sampler2D u_typhon_aux1;
+uniform sampler2D u_typhon_aux2;
+uniform sampler2D u_typhon_aux3;
+uniform sampler2D u_typhon_aux4;
+uniform sampler2D u_typhon_aux5;
+uniform sampler2D u_typhon_aux6;
+uniform sampler2D u_typhon_aux7;
+uniform int u_typhon_aux_count;
 in vec2 v_uv;
 out vec4 out_color;
 
 struct TyphonEffectContext {
-    sampler2D primary;
     vec2 texture_size;
     vec4 content_rect;
     vec2 output_size;
     float scale;
     float time;
     float delta;
+    int aux_count;
     vec2 uv;
 };
+
+vec4 typhon_decode_premultiplied_srgb(vec4 value);
+vec4 typhon_encode_premultiplied_srgb(vec4 value);
+
+vec4 typhon_sample_primary(vec2 uv) {
+    vec4 result = texture(u_typhon_primary, uv);
+    if (u_typhon_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
+    return result;
+}
+
+vec4 typhon_sample_aux(int index, vec2 uv) {
+    vec4 result = vec4(0.0);
+    if (index == 0) result = texture(u_typhon_aux0, uv);
+    if (index == 1) result = texture(u_typhon_aux1, uv);
+    if (index == 2) result = texture(u_typhon_aux2, uv);
+    if (index == 3) result = texture(u_typhon_aux3, uv);
+    if (index == 4) result = texture(u_typhon_aux4, uv);
+    if (index == 5) result = texture(u_typhon_aux5, uv);
+    if (index == 6) result = texture(u_typhon_aux6, uv);
+    if (index == 7) result = texture(u_typhon_aux7, uv);
+    if (u_typhon_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
+    return result;
+}
+
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
+}
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
+}
 
 "#,
     );
@@ -351,15 +476,16 @@ struct TyphonEffectContext {
 
 void main() {
     TyphonEffectContext ctx;
-    ctx.primary = u_typhon_primary;
     ctx.texture_size = u_typhon_texture_size;
     ctx.content_rect = u_typhon_content_rect;
     ctx.output_size = u_typhon_output_size;
     ctx.scale = u_typhon_scale;
     ctx.time = u_typhon_time;
     ctx.delta = u_typhon_delta;
+    ctx.aux_count = clamp(u_typhon_aux_count, 0, 8);
     ctx.uv = v_uv;
     out_color = typhon_effect_main(ctx);
+    if (u_typhon_encode_srgb != 0) out_color = typhon_encode_premultiplied_srgb(out_color);
 }
 "#,
     );
@@ -449,13 +575,46 @@ mod tests {
     #[test]
     fn wrapper_owns_main_and_context_abi() {
         let source = generate_fragment_wrapper(
-            "vec4 typhon_effect_main(TyphonEffectContext ctx) { return texture(ctx.primary, ctx.uv); }",
+            "vec4 typhon_effect_main(TyphonEffectContext ctx) { return typhon_sample_primary(ctx.uv); }",
             &[],
         )
         .unwrap();
         assert!(source.contains("void main()"));
         assert!(source.contains("u_typhon_primary"));
         assert!(source.contains("struct TyphonEffectContext"));
+        assert!(!source.contains("sampler2D primary"));
+    }
+
+    #[test]
+    fn wrapper_exposes_bounded_auxiliary_texture_abi() {
+        let source = generate_fragment_wrapper(
+            "vec4 typhon_effect_main(TyphonEffectContext ctx) { return typhon_sample_aux(0, ctx.uv); }",
+            &[],
+        )
+        .unwrap();
+        assert!(source.contains("u_typhon_aux0"));
+        assert!(source.contains("u_typhon_aux7"));
+        assert!(source.contains("u_typhon_aux_count"));
+        assert!(source.contains("ctx.aux_count"));
+        assert!(source.contains("if (index == 7) result = texture(u_typhon_aux7, uv);"));
+        for index in 0..8 {
+            assert!(source.contains(&format!("u_typhon_aux{index}")));
+        }
+        assert!(source.contains("ctx.time"));
+        assert!(source.contains("ctx.delta"));
+        assert!(!source.contains("sampler2D aux"));
+    }
+
+    #[test]
+    fn wrapper_preserves_premultiplied_srgb_conversion_contract() {
+        let source = generate_fragment_wrapper(
+            "vec4 typhon_effect_main(TyphonEffectContext ctx) { return typhon_sample_primary(ctx.uv); }",
+            &[],
+        )
+        .unwrap();
+        assert!(source.contains("typhon_decode_premultiplied_srgb"));
+        assert!(source.contains("typhon_encode_premultiplied_srgb"));
+        assert!(!source.contains("result.rgb = typhon_srgb_to_linear"));
     }
 
     #[test]

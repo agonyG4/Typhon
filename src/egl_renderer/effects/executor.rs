@@ -2,8 +2,10 @@ use std::io;
 
 use glow::HasContext;
 use oblivion_one::effects::{
-    CompiledFrameGraph, CompiledRenderPass, EffectNodeKind, EffectRegion, GraphTextureId,
-    GraphTextureSource, RenderPassKind, ShaderModuleId,
+    CompiledFrameGraph, CompiledRenderPass, EffectColorConversion, EffectNodeKind, EffectRegion,
+    GraphTextureId, GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind,
+    ShaderModuleId,
 };
 
 use super::super::geometry::EglDrawLayer;
@@ -11,7 +13,7 @@ use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, Rende
 use super::{
     blur, capture,
     resources::{PooledEffectTexture, release_dead_graph_textures},
-    shader_cache::ShaderProgramKey,
+    shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
 
 pub(super) const COPY_FRAGMENT_SHADER: &str = r#"#version 300 es
@@ -25,16 +27,28 @@ void main() {
 }
 "#;
 
-pub(super) const COMPOSITE_FRAGMENT_SHADER: &str = r#"#version 300 es
+pub(super) const NORMALIZE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec4 u_effect_input_domain;
 uniform vec2 u_effect_output_size;
+uniform int u_effect_decode_srgb;
+uniform int u_effect_encode_srgb;
 in vec2 v_uv;
 out vec4 out_color;
 
-vec3 typhon_linear_to_srgb(vec3 value) {
-    return mix(value * 12.92, 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), value));
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
+}
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
 }
 
 void main() {
@@ -45,7 +59,39 @@ void main() {
         discard;
     }
     vec4 result = texture(u_effect_input, input_uv);
-    result.rgb = typhon_linear_to_srgb(result.rgb);
+    if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
+    out_color = result;
+}
+"#;
+
+pub(super) const COMPOSITE_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec4 u_effect_input_domain;
+uniform vec2 u_effect_output_size;
+uniform int u_effect_encode_srgb;
+uniform int u_effect_force_opaque;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
+}
+
+void main() {
+    vec2 output_position = v_uv * u_effect_output_size;
+    vec2 input_uv = (output_position - u_effect_input_domain.xy) /
+        u_effect_input_domain.zw;
+    if (any(lessThan(input_uv, vec2(0.0))) || any(greaterThan(input_uv, vec2(1.0)))) {
+        discard;
+    }
+    vec4 result = texture(u_effect_input, input_uv);
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
+    if (u_effect_force_opaque != 0) result.a = 1.0;
     out_color = result;
 }
 "#;
@@ -54,6 +100,7 @@ pub(super) const FRAGMENT_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform int u_effect_decode_srgb;
+uniform int u_effect_encode_srgb;
 uniform mat4 u_effect_color_matrix;
 uniform vec4 u_effect_color_bias;
 uniform vec4 u_effect_tint_color;
@@ -62,17 +109,28 @@ uniform float u_effect_noise_amount;
 in vec2 v_uv;
 out vec4 out_color;
 
-vec3 typhon_srgb_to_linear(vec3 value) {
-    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), value));
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
+}
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
 }
 
 void main() {
     vec4 result = texture(u_effect_input, v_uv);
-    if (u_effect_decode_srgb != 0) result.rgb = typhon_srgb_to_linear(result.rgb);
+    if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
     float noise = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
     result.rgb += noise * u_effect_noise_amount;
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     out_color = result;
 }
 "#;
@@ -81,18 +139,38 @@ pub(super) const MASK_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform int u_effect_decode_srgb;
+uniform int u_effect_encode_srgb;
 uniform int u_effect_inverted;
 in vec2 v_uv;
 out vec4 out_color;
 
-vec3 typhon_srgb_to_linear(vec3 value) {
-    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), value));
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
+}
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
 }
 
 void main() {
     vec4 result = texture(u_effect_input, v_uv);
-    if (u_effect_decode_srgb != 0) result.rgb = typhon_srgb_to_linear(result.rgb);
-    result.a = u_effect_inverted != 0 ? 1.0 - result.a : result.a;
+    if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
+    float coverage = u_effect_inverted != 0 ? 1.0 - result.a : result.a;
+    if (u_effect_inverted != 0) {
+        vec3 straight = result.a > 0.00001 ? result.rgb / result.a : vec3(0.0);
+        result.a = clamp(coverage, 0.0, 1.0);
+        result.rgb = straight * result.a;
+    } else {
+        result.rgb *= clamp(coverage, 0.0, 1.0);
+        result.a *= clamp(coverage, 0.0, 1.0);
+    }
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     out_color = result;
 }
 "#;
@@ -102,30 +180,54 @@ precision highp float;
 uniform sampler2D u_effect_input;
 uniform sampler2D u_effect_input_secondary;
 uniform int u_effect_decode_srgb;
+uniform int u_effect_encode_srgb;
 uniform int u_effect_blend_mode;
 uniform float u_effect_blend_opacity;
 in vec2 v_uv;
 out vec4 out_color;
 
-vec3 typhon_srgb_to_linear(vec3 value) {
-    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), value));
+vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
+    return vec4(linear * value.a, value.a);
+}
+
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = value.rgb / value.a;
+    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
+    return vec4(encoded * value.a, value.a);
 }
 
 void main() {
     vec4 first = texture(u_effect_input, v_uv);
     vec4 second = texture(u_effect_input_secondary, v_uv);
-    if (u_effect_decode_srgb != 0) { first.rgb = typhon_srgb_to_linear(first.rgb); second.rgb = typhon_srgb_to_linear(second.rgb); }
+    if (u_effect_decode_srgb != 0) {
+        first = typhon_decode_premultiplied_srgb(first);
+        second = typhon_decode_premultiplied_srgb(second);
+    }
     float opacity = clamp(u_effect_blend_opacity, 0.0, 1.0);
     float second_alpha = clamp(second.a * opacity, 0.0, 1.0);
     vec3 blended = second.rgb;
-    if (u_effect_blend_mode == 1) blended = first.rgb + second.rgb;
-    else if (u_effect_blend_mode == 2) blended = first.rgb * second.rgb;
-    else if (u_effect_blend_mode == 3) blended = 1.0 - (1.0 - first.rgb) * (1.0 - second.rgb);
+    if (u_effect_blend_mode == 1) {
+        blended = first.rgb + second.rgb;
+    } else if (u_effect_blend_mode == 2 || u_effect_blend_mode == 3) {
+        vec3 first_straight = first.a > 0.00001 ? first.rgb / first.a : vec3(0.0);
+        vec3 second_straight = second.a > 0.00001 ? second.rgb / second.a : vec3(0.0);
+        blended = u_effect_blend_mode == 2
+            ? first_straight * second_straight
+            : 1.0 - (1.0 - first_straight) * (1.0 - second_straight);
+    }
     vec3 rgb = u_effect_blend_mode == 0
         ? second.rgb * opacity + first.rgb * (1.0 - second_alpha)
-        : first.rgb * (1.0 - second_alpha) + blended * second_alpha;
+        : u_effect_blend_mode == 1
+            ? first.rgb + second.rgb * opacity
+            : first.rgb * (1.0 - second_alpha) + second.rgb * (1.0 - first.a) + blended * first.a * second_alpha;
     float alpha = second_alpha + first.a * (1.0 - second_alpha);
-    out_color = vec4(rgb, alpha);
+    vec4 result = vec4(rgb, alpha);
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
+    out_color = result;
 }
 "#;
 
@@ -152,6 +254,10 @@ pub(crate) fn execute_effect_graph(
         framebuffer_origin,
         repaint_plan,
     );
+    if result.is_err() {
+        renderer.establish_ordinary_scene_state();
+        unsafe { renderer.gl.bind_texture(glow::TEXTURE_2D, None) };
+    }
     let release_result = renderer.effect_resources.release_graph(textures);
     match (result, release_result) {
         (Ok(stats), Ok(())) => Ok(stats),
@@ -168,16 +274,41 @@ fn execute_graph_passes(
     repaint_plan: &super::super::damage::RepaintPlan,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
-    let mut composite_passes = Vec::new();
+    let repaint_rects = renderer.begin_effect_repaint(repaint_plan, framebuffer_origin)?;
+    let mut scene_cursor = 0;
     for pass in &graph.passes {
+        ensure_pass_textures(renderer, graph, pass, textures)?;
+        if matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        ) && !pass.checkpoint_dependencies.is_empty()
+        {
+            let (draw_end, _) =
+                composition_range(&renderer.commands, pass.anchor, pass.visual_group);
+            if draw_end > scene_cursor {
+                renderer.draw_effect_scene_range(
+                    &repaint_rects,
+                    scene_cursor,
+                    draw_end,
+                    framebuffer_origin,
+                )?;
+                scene_cursor = draw_end;
+            }
+        }
         if matches!(
             pass.kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         ) {
-            composite_passes.push(pass);
-            continue;
+            let (draw_end, next_cursor) =
+                composition_range(&renderer.commands, pass.anchor, pass.visual_group);
+            renderer.draw_effect_scene_range(
+                &repaint_rects,
+                scene_cursor,
+                draw_end,
+                framebuffer_origin,
+            )?;
+            scene_cursor = next_cursor.max(scene_cursor);
         }
-        ensure_pass_textures(renderer, graph, pass, textures)?;
         execute_pass(
             renderer,
             graph,
@@ -188,50 +319,6 @@ fn execute_graph_passes(
         )?;
         release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
         stats.passes = stats.passes.saturating_add(1);
-    }
-
-    let layers = renderer
-        .commands
-        .iter()
-        .map(|command| match command.layer {
-            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
-            _ => capture::CaptureLayer::Other,
-        })
-        .collect::<Vec<_>>();
-    composite_passes
-        .sort_by_key(|pass| (composition_position(&layers, pass.anchor), pass.id.get()));
-    let repaint_rects = renderer.begin_effect_repaint(repaint_plan, framebuffer_origin)?;
-    let mut scene_cursor = 0;
-    for pass in composite_passes {
-        let position = composition_position(&layers, pass.anchor);
-        let (draw_end, next_cursor) = match pass.anchor {
-            oblivion_one::compositor::EffectAnchor::BeforeSurface(_) => (position, position),
-            oblivion_one::compositor::EffectAnchor::ReplaceSurface(_) => {
-                (position, position.saturating_add(1))
-            }
-            oblivion_one::compositor::EffectAnchor::AfterSurface(_) => (position, position),
-            oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
-                (renderer.commands.len(), renderer.commands.len())
-            }
-        };
-        renderer.draw_effect_scene_range(
-            &repaint_rects,
-            scene_cursor,
-            draw_end,
-            framebuffer_origin,
-        )?;
-        ensure_pass_textures(renderer, graph, pass, textures)?;
-        execute_pass(
-            renderer,
-            graph,
-            textures,
-            pass,
-            framebuffer_origin,
-            &mut stats,
-        )?;
-        release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
-        stats.passes = stats.passes.saturating_add(1);
-        scene_cursor = next_cursor.max(scene_cursor);
     }
     renderer.draw_effect_scene_range(
         &repaint_rects,
@@ -240,6 +327,7 @@ fn execute_graph_passes(
         framebuffer_origin,
     )?;
     renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
+    renderer.establish_ordinary_scene_state();
     Ok(stats)
 }
 
@@ -278,6 +366,53 @@ fn composition_position(
     }
 }
 
+fn composition_range(
+    commands: &[super::super::geometry::EglDrawCommand],
+    anchor: oblivion_one::compositor::EffectAnchor,
+    visual_group: Option<oblivion_one::compositor::VisualGroupId>,
+) -> (usize, usize) {
+    if let Some(visual_group) = visual_group {
+        let Some(start) = commands
+            .iter()
+            .position(|command| command.visual_group == Some(visual_group))
+        else {
+            return (commands.len(), commands.len());
+        };
+        let end = commands
+            .iter()
+            .rposition(|command| command.visual_group == Some(visual_group))
+            .map_or(start, |index| index.saturating_add(1));
+        return match anchor {
+            oblivion_one::compositor::EffectAnchor::BeforeSurface(_) => (start, start),
+            oblivion_one::compositor::EffectAnchor::ReplaceSurface(_) => (start, end),
+            oblivion_one::compositor::EffectAnchor::AfterSurface(_) => (end, end),
+            oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
+                (commands.len(), commands.len())
+            }
+        };
+    }
+    let position = composition_position(
+        &commands
+            .iter()
+            .map(|command| match command.layer {
+                EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+                _ => capture::CaptureLayer::Other,
+            })
+            .collect::<Vec<_>>(),
+        anchor,
+    );
+    match anchor {
+        oblivion_one::compositor::EffectAnchor::BeforeSurface(_) => (position, position),
+        oblivion_one::compositor::EffectAnchor::ReplaceSurface(_) => {
+            (position, position.saturating_add(1))
+        }
+        oblivion_one::compositor::EffectAnchor::AfterSurface(_) => (position, position),
+        oblivion_one::compositor::EffectAnchor::OutputPostProcess => {
+            (commands.len(), commands.len())
+        }
+    }
+}
+
 fn execute_pass(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
@@ -301,8 +436,15 @@ fn execute_pass(
                             && candidate.instance == pass.instance
                     })
                     .is_some_and(|candidate| candidate.id == pass.id);
+            let input_is_linear = pass
+                .inputs
+                .first()
+                .and_then(|input| graph.textures.iter().find(|texture| texture.id == *input))
+                .is_some_and(|texture| {
+                    texture.working_space == oblivion_one::effects::EffectWorkingSpace::LinearSrgb
+                });
             let fragment = match pass.kind {
-                RenderPassKind::DualKawaseDownsample if first_downsample => {
+                RenderPassKind::DualKawaseDownsample if first_downsample && !input_is_linear => {
                     blur::DUAL_KAWASE_DOWNSAMPLE_SHADER
                 }
                 RenderPassKind::DualKawaseDownsample => blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
@@ -328,17 +470,37 @@ fn execute_pass(
                 _ => unreachable!(),
             }
         }
+        RenderPassKind::NormalizeInput => {
+            execute_fullscreen_pass(
+                renderer,
+                graph,
+                textures,
+                pass,
+                NORMALIZE_FRAGMENT_SHADER,
+                framebuffer_origin,
+                false,
+            )?;
+        }
         RenderPassKind::Fragment | RenderPassKind::Blend | RenderPassKind::Mask => {
             let Some(stage) = pass.stage.as_ref() else {
                 return Err(io::Error::other("effect stage has no lowering metadata").into());
             };
             let (module, fragment) = match stage {
-                EffectNodeKind::Mask(_) => (1006, MASK_STAGE_FRAGMENT_SHADER),
-                EffectNodeKind::Blend(_) => (1007, BLEND_STAGE_FRAGMENT_SHADER),
+                EffectNodeKind::Mask(_) => (
+                    INTERNAL_EFFECT_SHADER_MODULE_MASK,
+                    MASK_STAGE_FRAGMENT_SHADER,
+                ),
+                EffectNodeKind::Blend(_) => (
+                    INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+                    BLEND_STAGE_FRAGMENT_SHADER,
+                ),
                 EffectNodeKind::CustomFragment(spec) => (spec.shader.get(), ""),
                 EffectNodeKind::ColorMatrix(_)
                 | EffectNodeKind::Tint(_)
-                | EffectNodeKind::Noise(_) => (1005, FRAGMENT_STAGE_FRAGMENT_SHADER),
+                | EffectNodeKind::Noise(_) => (
+                    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
+                    FRAGMENT_STAGE_FRAGMENT_SHADER,
+                ),
                 EffectNodeKind::Source(_) | EffectNodeKind::DualKawaseBlur(_) => {
                     return Err(io::Error::other("invalid effect stage kind").into());
                 }
@@ -414,11 +576,15 @@ fn execute_fullscreen_stage(
         renderer
             .gl
             .viewport(0, 0, output_plan.width as i32, output_plan.height as i32);
+        renderer.gl.disable(glow::BLEND);
         renderer.gl.use_program(Some(program));
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(program, "u_effect_origin_bottom_left")
-        {
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_origin_bottom_left",
+        ) {
             renderer.gl.uniform_1_i32(
                 Some(&location),
                 i32::from(matches!(
@@ -431,7 +597,13 @@ fn execute_fullscreen_stage(
         renderer
             .gl
             .bind_texture(glow::TEXTURE_2D, Some(input_texture));
-        if let Some(location) = renderer.gl.get_uniform_location(program, "u_effect_input") {
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input",
+        ) {
             renderer.gl.uniform_1_i32(Some(&location), 0);
         }
         for (unit, input_id) in pass.inputs.iter().copied().enumerate().skip(1) {
@@ -448,29 +620,83 @@ fn execute_fullscreen_stage(
             } else {
                 "u_effect_input_aux"
             };
-            if let Some(location) = renderer.gl.get_uniform_location(program, name) {
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                name,
+            ) {
                 renderer.gl.uniform_1_i32(Some(&location), unit as i32);
             }
+            if matches!(stage, EffectNodeKind::CustomFragment(_)) {
+                let aux_index = unit.saturating_sub(1);
+                let aux_name = format!("u_typhon_aux{aux_index}");
+                if let Some(location) = uniform_location(
+                    &mut renderer.effect_shaders,
+                    &renderer.gl,
+                    shader_key,
+                    program,
+                    &aux_name,
+                ) {
+                    renderer.gl.uniform_1_i32(Some(&location), unit as i32);
+                }
+            }
         }
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(program, "u_effect_decode_srgb")
+        if matches!(stage, EffectNodeKind::CustomFragment(_))
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_typhon_aux_count",
+            )
         {
             renderer.gl.uniform_1_i32(
                 Some(&location),
-                i32::from(
-                    input_plan.working_space
-                        == oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
-                ),
+                pass.inputs.len().saturating_sub(1).min(8) as i32,
+            );
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_decode_srgb",
+        ) {
+            renderer.gl.uniform_1_i32(
+                Some(&location),
+                i32::from(pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear),
+            );
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_encode_srgb",
+        ) {
+            renderer.gl.uniform_1_i32(
+                Some(&location),
+                i32::from(pass.color_conversion == EffectColorConversion::EncodeLinearToSrgb),
             );
         }
         set_stage_uniforms(
+            &mut renderer.effect_shaders,
             &renderer.gl,
+            shader_key,
             program,
             stage,
-            &pass.parameter_block,
-            input_plan,
-            &pass.fused_stages,
+            StageUniformContext {
+                parameters: &pass.parameter_block,
+                input_plan,
+                output_size: (output_plan.width as f32, output_plan.height as f32),
+                output_scale: renderer.effect_output_scale,
+                effect_time_seconds: renderer.effect_time_seconds,
+                effect_delta_seconds: renderer.effect_delta_seconds,
+                color_conversion: pass.color_conversion,
+                fused_stages: &pass.fused_stages,
+            },
         );
         renderer.gl.bind_vertex_array(Some(vertex_array));
         draw_damage_scissors(&renderer.gl, &pass.damage, output_plan, framebuffer_origin);
@@ -484,6 +710,7 @@ fn execute_fullscreen_stage(
             renderer.gl.bind_texture(glow::TEXTURE_2D, None);
         }
         renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.disable(glow::BLEND);
     }
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
@@ -492,40 +719,85 @@ fn execute_fullscreen_stage(
     Ok(())
 }
 
-fn set_stage_uniforms(
+fn uniform_location(
+    shaders: &mut ShaderProgramCache,
     gl: &glow::Context,
+    key: ShaderProgramKey,
+    program: glow::NativeProgram,
+    name: &str,
+) -> Option<glow::UniformLocation> {
+    shaders.uniform_location(gl, key, program, name)
+}
+
+struct StageUniformContext<'a> {
+    parameters: &'a oblivion_one::effects::EffectParameterBlock,
+    input_plan: &'a oblivion_one::effects::GraphTexturePlan,
+    output_size: (f32, f32),
+    output_scale: f32,
+    effect_time_seconds: f32,
+    effect_delta_seconds: f32,
+    color_conversion: EffectColorConversion,
+    fused_stages: &'a [EffectNodeKind],
+}
+
+fn set_stage_uniforms(
+    shaders: &mut ShaderProgramCache,
+    gl: &glow::Context,
+    shader_key: ShaderProgramKey,
     program: glow::NativeProgram,
     stage: &EffectNodeKind,
-    parameters: &oblivion_one::effects::EffectParameterBlock,
-    input_plan: &oblivion_one::effects::GraphTexturePlan,
-    fused_stages: &[EffectNodeKind],
+    context: StageUniformContext<'_>,
 ) {
+    let StageUniformContext {
+        parameters,
+        input_plan,
+        output_size,
+        output_scale,
+        effect_time_seconds,
+        effect_delta_seconds,
+        color_conversion,
+        fused_stages,
+    } = context;
     unsafe {
         if matches!(
             stage,
             EffectNodeKind::ColorMatrix(_) | EffectNodeKind::Tint(_) | EffectNodeKind::Noise(_)
         ) {
-            set_identity_color_matrix(gl, program);
-            if let Some(location) = gl.get_uniform_location(program, "u_effect_tint_color") {
+            set_identity_color_matrix(shaders, gl, shader_key, program);
+            if let Some(location) =
+                uniform_location(shaders, gl, shader_key, program, "u_effect_tint_color")
+            {
                 gl.uniform_4_f32(Some(&location), 1.0, 1.0, 1.0, 1.0);
             }
-            if let Some(location) = gl.get_uniform_location(program, "u_effect_tint_amount") {
+            if let Some(location) =
+                uniform_location(shaders, gl, shader_key, program, "u_effect_tint_amount")
+            {
                 gl.uniform_1_f32(Some(&location), 0.0);
             }
-            if let Some(location) = gl.get_uniform_location(program, "u_effect_noise_amount") {
+            if let Some(location) =
+                uniform_location(shaders, gl, shader_key, program, "u_effect_noise_amount")
+            {
                 gl.uniform_1_f32(Some(&location), 0.0);
             }
             for stage in std::iter::once(stage).chain(fused_stages.iter()) {
                 match stage {
                     EffectNodeKind::ColorMatrix(spec) => {
-                        if let Some(location) =
-                            gl.get_uniform_location(program, "u_effect_color_matrix")
-                        {
+                        if let Some(location) = uniform_location(
+                            shaders,
+                            gl,
+                            shader_key,
+                            program,
+                            "u_effect_color_matrix",
+                        ) {
                             gl.uniform_matrix_4_f32_slice(Some(&location), false, &spec.matrix);
                         }
-                        if let Some(location) =
-                            gl.get_uniform_location(program, "u_effect_color_bias")
-                        {
+                        if let Some(location) = uniform_location(
+                            shaders,
+                            gl,
+                            shader_key,
+                            program,
+                            "u_effect_color_bias",
+                        ) {
                             gl.uniform_4_f32(
                                 Some(&location),
                                 spec.bias[0],
@@ -536,9 +808,13 @@ fn set_stage_uniforms(
                         }
                     }
                     EffectNodeKind::Tint(spec) => {
-                        if let Some(location) =
-                            gl.get_uniform_location(program, "u_effect_tint_color")
-                        {
+                        if let Some(location) = uniform_location(
+                            shaders,
+                            gl,
+                            shader_key,
+                            program,
+                            "u_effect_tint_color",
+                        ) {
                             gl.uniform_4_f32(
                                 Some(&location),
                                 spec.color[0],
@@ -547,16 +823,24 @@ fn set_stage_uniforms(
                                 spec.color[3],
                             );
                         }
-                        if let Some(location) =
-                            gl.get_uniform_location(program, "u_effect_tint_amount")
-                        {
+                        if let Some(location) = uniform_location(
+                            shaders,
+                            gl,
+                            shader_key,
+                            program,
+                            "u_effect_tint_amount",
+                        ) {
                             gl.uniform_1_f32(Some(&location), spec.amount);
                         }
                     }
                     EffectNodeKind::Noise(spec) => {
-                        if let Some(location) =
-                            gl.get_uniform_location(program, "u_effect_noise_amount")
-                        {
+                        if let Some(location) = uniform_location(
+                            shaders,
+                            gl,
+                            shader_key,
+                            program,
+                            "u_effect_noise_amount",
+                        ) {
                             gl.uniform_1_f32(Some(&location), spec.amount);
                         }
                     }
@@ -567,10 +851,14 @@ fn set_stage_uniforms(
         }
         match stage {
             EffectNodeKind::ColorMatrix(spec) => {
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_color_matrix") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_color_matrix")
+                {
                     gl.uniform_matrix_4_f32_slice(Some(&location), false, &spec.matrix);
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_color_bias") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_color_bias")
+                {
                     gl.uniform_4_f32(
                         Some(&location),
                         spec.bias[0],
@@ -581,8 +869,10 @@ fn set_stage_uniforms(
                 }
             }
             EffectNodeKind::Tint(spec) => {
-                set_identity_color_matrix(gl, program);
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_tint_color") {
+                set_identity_color_matrix(shaders, gl, shader_key, program);
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_tint_color")
+                {
                     gl.uniform_4_f32(
                         Some(&location),
                         spec.color[0],
@@ -591,18 +881,24 @@ fn set_stage_uniforms(
                         spec.color[3],
                     );
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_tint_amount") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_tint_amount")
+                {
                     gl.uniform_1_f32(Some(&location), spec.amount);
                 }
             }
             EffectNodeKind::Noise(spec) => {
-                set_identity_color_matrix(gl, program);
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_noise_amount") {
+                set_identity_color_matrix(shaders, gl, shader_key, program);
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_noise_amount")
+                {
                     gl.uniform_1_f32(Some(&location), spec.amount);
                 }
             }
             EffectNodeKind::Mask(spec) => {
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_inverted") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_inverted")
+                {
                     gl.uniform_1_i32(
                         Some(&location),
                         i32::from(matches!(
@@ -613,7 +909,9 @@ fn set_stage_uniforms(
                 }
             }
             EffectNodeKind::Blend(spec) => {
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_blend_mode") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_blend_mode")
+                {
                     gl.uniform_1_i32(
                         Some(&location),
                         match spec.mode {
@@ -624,22 +922,46 @@ fn set_stage_uniforms(
                         },
                     );
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_effect_blend_opacity") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_effect_blend_opacity")
+                {
                     gl.uniform_1_f32(Some(&location), spec.opacity);
                 }
             }
             EffectNodeKind::CustomFragment(spec) => {
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_primary") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_decode_srgb")
+                {
+                    gl.uniform_1_i32(
+                        Some(&location),
+                        i32::from(color_conversion == EffectColorConversion::DecodeSrgbToLinear),
+                    );
+                }
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_encode_srgb")
+                {
+                    gl.uniform_1_i32(
+                        Some(&location),
+                        i32::from(color_conversion == EffectColorConversion::EncodeLinearToSrgb),
+                    );
+                }
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_primary")
+                {
                     gl.uniform_1_i32(Some(&location), 0);
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_texture_size") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_texture_size")
+                {
                     gl.uniform_2_f32(
                         Some(&location),
                         input_plan.width.max(1) as f32,
                         input_plan.height.max(1) as f32,
                     );
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_content_rect") {
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_content_rect")
+                {
                     gl.uniform_4_f32(
                         Some(&location),
                         input_plan.domain.x as f32,
@@ -648,21 +970,25 @@ fn set_stage_uniforms(
                         input_plan.domain.height.max(1) as f32,
                     );
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_output_size") {
-                    gl.uniform_2_f32(
-                        Some(&location),
-                        input_plan.domain.width.max(1) as f32,
-                        input_plan.domain.height.max(1) as f32,
-                    );
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_output_size")
+                {
+                    gl.uniform_2_f32(Some(&location), output_size.0, output_size.1);
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_scale") {
-                    gl.uniform_1_f32(Some(&location), 1.0);
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_scale")
+                {
+                    gl.uniform_1_f32(Some(&location), output_scale);
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_time") {
-                    gl.uniform_1_f32(Some(&location), 0.0);
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_time")
+                {
+                    gl.uniform_1_f32(Some(&location), effect_time_seconds);
                 }
-                if let Some(location) = gl.get_uniform_location(program, "u_typhon_delta") {
-                    gl.uniform_1_f32(Some(&location), 0.0);
+                if let Some(location) =
+                    uniform_location(shaders, gl, shader_key, program, "u_typhon_delta")
+                {
+                    gl.uniform_1_f32(Some(&location), effect_delta_seconds);
                 }
                 for binding in &spec.uniforms {
                     let Some(value) = parameters
@@ -673,7 +999,8 @@ fn set_stage_uniforms(
                     else {
                         continue;
                     };
-                    let Some(location) = gl.get_uniform_location(program, &binding.shader_name)
+                    let Some(location) =
+                        uniform_location(shaders, gl, shader_key, program, &binding.shader_name)
                     else {
                         continue;
                     };
@@ -707,9 +1034,16 @@ fn set_stage_uniforms(
     }
 }
 
-fn set_identity_color_matrix(gl: &glow::Context, program: glow::NativeProgram) {
+fn set_identity_color_matrix(
+    shaders: &mut ShaderProgramCache,
+    gl: &glow::Context,
+    shader_key: ShaderProgramKey,
+    program: glow::NativeProgram,
+) {
     unsafe {
-        if let Some(location) = gl.get_uniform_location(program, "u_effect_color_matrix") {
+        if let Some(location) =
+            uniform_location(shaders, gl, shader_key, program, "u_effect_color_matrix")
+        {
             gl.uniform_matrix_4_f32_slice(
                 Some(&location),
                 false,
@@ -718,7 +1052,9 @@ fn set_identity_color_matrix(gl: &glow::Context, program: glow::NativeProgram) {
                 ],
             );
         }
-        if let Some(location) = gl.get_uniform_location(program, "u_effect_color_bias") {
+        if let Some(location) =
+            uniform_location(shaders, gl, shader_key, program, "u_effect_color_bias")
+        {
             gl.uniform_4_f32(Some(&location), 0.0, 0.0, 0.0, 0.0);
         }
     }
@@ -738,6 +1074,40 @@ fn execute_capture(
         .get(&output)
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
+    if !pass.checkpoint_dependencies.is_empty() {
+        let target_texture = renderer
+            .effect_resources
+            .texture(target)
+            .ok_or_else(|| io::Error::other("checkpoint texture was not realized"))?;
+        let source_x = target_plan.domain.x.max(0);
+        let source_y = match framebuffer_origin {
+            OutputFramebufferOrigin::BottomLeft => target_plan.domain.y.max(0),
+            OutputFramebufferOrigin::TopLeftScanout => renderer
+                .current_size
+                .1
+                .saturating_sub(target_plan.domain.bottom().max(0) as u32)
+                as i32,
+        };
+        renderer.bind_active_output_framebuffer();
+        unsafe {
+            renderer
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(target_texture));
+            renderer.gl.copy_tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                source_x,
+                source_y,
+                target_plan.width as i32,
+                target_plan.height as i32,
+            );
+            renderer.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        restore_output_viewport(renderer);
+        return Ok(());
+    }
     renderer
         .effect_resources
         .bind_render_target(&renderer.gl, target)?;
@@ -746,23 +1116,24 @@ fn execute_capture(
             .gl
             .viewport(0, 0, target_plan.width as i32, target_plan.height as i32);
         renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.enable(glow::BLEND);
+        renderer.gl.blend_func_separate(
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+        );
         renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
         renderer.gl.clear(glow::COLOR_BUFFER_BIT);
         renderer.gl.use_program(Some(renderer.capture_program));
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(renderer.capture_program, "u_capture_output_size")
-        {
+        if let Some(location) = renderer.capture_uniform_location("u_capture_output_size") {
             renderer.gl.uniform_2_f32(
                 Some(&location),
                 renderer.current_size.0.max(1) as f32,
                 renderer.current_size.1.max(1) as f32,
             );
         }
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(renderer.capture_program, "u_capture_domain")
-        {
+        if let Some(location) = renderer.capture_uniform_location("u_capture_domain") {
             renderer.gl.uniform_4_f32(
                 Some(&location),
                 target_plan.domain.x as f32,
@@ -771,10 +1142,7 @@ fn execute_capture(
                 target_plan.domain.height.max(1) as f32,
             );
         }
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(renderer.capture_program, "u_capture_origin_bottom_left")
-        {
+        if let Some(location) = renderer.capture_uniform_location("u_capture_origin_bottom_left") {
             renderer.gl.uniform_1_i32(
                 Some(&location),
                 i32::from(matches!(
@@ -792,16 +1160,33 @@ fn execute_capture(
             _ => capture::CaptureLayer::Other,
         })
         .collect::<Vec<_>>();
+    let visual_groups = renderer
+        .commands
+        .iter()
+        .map(|command| command.visual_group)
+        .collect::<Vec<_>>();
     let indices = capture::indices_for_capture(
         &layers,
+        &visual_groups,
         pass.anchor,
         pass.kind == RenderPassKind::SurfaceCapture,
+        pass.visual_group,
     );
-    let scissor = pass.damage.bounding_rect().map_or_else(
-        || full_output_rect(renderer.current_size),
-        effect_rect_to_output_rect,
-    );
-    renderer.draw_capture_commands(&indices, scissor)?;
+    let scissors = if pass.damage.is_empty() {
+        vec![full_output_rect(renderer.current_size)]
+    } else {
+        pass.damage
+            .rects()
+            .iter()
+            .map(|rect| effect_rect_to_output_rect(*rect))
+            .collect::<Vec<_>>()
+    };
+    renderer.draw_capture_commands_for_regions(
+        &indices,
+        &scissors,
+        target_plan.domain,
+        (target_plan.width, target_plan.height),
+    )?;
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
     restore_output_viewport(renderer);
@@ -853,19 +1238,24 @@ fn execute_fullscreen_pass(
     }
     let module = if blur_shader {
         match pass.kind {
-            RenderPassKind::DualKawaseDownsample => 1001,
-            RenderPassKind::DualKawaseUpsample => 1002,
+            RenderPassKind::DualKawaseDownsample => {
+                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE
+            }
+            RenderPassKind::DualKawaseUpsample => {
+                oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE
+            }
             _ => 1000,
         }
     } else if output_is_framebuffer {
-        1004
+        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE
     } else {
-        1003
+        oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COPY
     };
     let shader_key = ShaderProgramKey::new(
         ShaderModuleId::new(module).expect("static effect shader ids are non-zero"),
-        if pass.kind == RenderPassKind::DualKawaseDownsample
-            && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER
+        if pass.kind == RenderPassKind::NormalizeInput
+            || (pass.kind == RenderPassKind::DualKawaseDownsample
+                && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER)
         {
             1
         } else {
@@ -877,10 +1267,13 @@ fn execute_fullscreen_pass(
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
     unsafe {
         renderer.gl.use_program(Some(program));
-        if let Some(location) = renderer
-            .gl
-            .get_uniform_location(program, "u_effect_origin_bottom_left")
-        {
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_origin_bottom_left",
+        ) {
             renderer.gl.uniform_1_i32(
                 Some(&location),
                 i32::from(
@@ -893,13 +1286,23 @@ fn execute_fullscreen_pass(
         renderer
             .gl
             .bind_texture(glow::TEXTURE_2D, Some(input_texture));
-        if let Some(location) = renderer.gl.get_uniform_location(program, "u_effect_input") {
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input",
+        ) {
             renderer.gl.uniform_1_i32(Some(&location), 0);
         }
         if blur_shader
-            && let Some(location) = renderer
-                .gl
-                .get_uniform_location(program, "u_effect_texel_size")
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_texel_size",
+            )
         {
             renderer.gl.uniform_2_f32(
                 Some(&location),
@@ -908,19 +1311,26 @@ fn execute_fullscreen_pass(
             );
         }
         if blur_shader
-            && let Some(location) = renderer
-                .gl
-                .get_uniform_location(program, "u_effect_blur_radius")
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_blur_radius",
+            )
         {
             renderer
                 .gl
                 .uniform_1_f32(Some(&location), pass.blur_radius.unwrap_or(1.0));
         }
         if !blur_shader
-            && output_is_framebuffer
-            && let Some(location) = renderer
-                .gl
-                .get_uniform_location(program, "u_effect_input_domain")
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_input_domain",
+            )
         {
             renderer.gl.uniform_4_f32(
                 Some(&location),
@@ -931,10 +1341,73 @@ fn execute_fullscreen_pass(
             );
         }
         if !blur_shader
-            && output_is_framebuffer
-            && let Some(location) = renderer
-                .gl
-                .get_uniform_location(program, "u_effect_output_size")
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_decode_srgb",
+            )
+        {
+            renderer.gl.uniform_1_i32(
+                Some(&location),
+                i32::from(pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear),
+            );
+        }
+        if !blur_shader
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_encode_srgb",
+            )
+        {
+            renderer.gl.uniform_1_i32(
+                Some(&location),
+                i32::from(
+                    pass.encode_output
+                        || pass.color_conversion == EffectColorConversion::EncodeLinearToSrgb,
+                ),
+            );
+        }
+        if output_is_framebuffer {
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_encode_srgb",
+            ) {
+                renderer
+                    .gl
+                    .uniform_1_i32(Some(&location), i32::from(pass.encode_output));
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_force_opaque",
+            ) {
+                renderer.gl.uniform_1_i32(
+                    Some(&location),
+                    i32::from(pass.alpha_mode == oblivion_one::effects::EffectAlphaMode::Opaque),
+                );
+            }
+            if pass.alpha_mode == oblivion_one::effects::EffectAlphaMode::Preserve {
+                renderer.gl.enable(glow::BLEND);
+                renderer.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            }
+        }
+        if !blur_shader
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            )
         {
             renderer.gl.uniform_2_f32(
                 Some(&location),
@@ -947,6 +1420,7 @@ fn execute_fullscreen_pass(
         renderer.gl.bind_vertex_array(None);
         renderer.gl.bind_texture(glow::TEXTURE_2D, None);
         renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.disable(glow::BLEND);
     }
     if output_texture.is_some() {
         renderer.effect_resources.unbind_render_target(&renderer.gl);
@@ -1156,5 +1630,20 @@ mod tests {
             full_output_rect((1920, 1080)),
             OutputRect::new(0, 0, 1920, 1080)
         );
+    }
+
+    #[test]
+    fn capture_source_over_contract_matches_two_translucent_layers() {
+        let background = oblivion_one::effects::PremultipliedRgba::new(0.2, 0.1, 0.05, 0.5);
+        let foreground = oblivion_one::effects::PremultipliedRgba::new(0.4, 0.2, 0.1, 0.5);
+        let captured = background.blend(
+            foreground,
+            oblivion_one::effects::BlendMode::SourceOver,
+            1.0,
+        );
+        assert_eq!(captured.a, 0.75);
+        assert_eq!(captured.r, 0.5);
+        assert_eq!(captured.g, 0.25);
+        assert_eq!(captured.b, 0.125);
     }
 }

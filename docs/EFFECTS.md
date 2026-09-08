@@ -65,14 +65,27 @@ bounded by the effect shader-source limit.
 
 Definitions include working space, alpha mode, frame demand, failure policy,
 outsets, nodes, output, and typed parameters. Parameters carry a type,
-default, optional scalar bounds, and an impact classification:
+default, optional scalar or component-wise vector bounds, and an impact
+classification:
 `UniformOnly`, `Footprint`, or `Structure`. Built-in and custom assets are
 published as immutable registry generations. A reload compiles every changed
 trusted shader before publication; a failed generation leaves the previous
 generation active.
 
-Static textures are not accepted by the JSON loader until a compositor-owned
-immutable asset table is supplied.
+The reserved `system.*` namespace and the built-in `system.background_blur`
+program are owned by Typhon. Their program and internal shader-module IDs
+cannot be overridden by a trusted manifest. V1 supports `OnDamage` and
+`Continuous` frame demand; `Manual` is rejected until a manual trigger API
+exists. The only advertised failure policy is `passthrough`; `disable-instance`
+is rejected in v1. Protocol mutation is provided for `Float`, `Vec2`, and
+`Vec4`; `Vec3` and `Int` remain trusted-default-only and are not protocol
+mutable in v1.
+
+`StaticTexture` remains an internal IR shape so a future bounded immutable
+trusted-asset table can be added without changing the effect IR or shader ABI.
+It is explicitly unsupported in v1: validation and registry publication reject
+any program that requires it with `UnsupportedStaticTexture`. No blank or
+fallback texture is allocated, and the semantics are never silently degraded.
 
 ## Custom shader ABI
 
@@ -83,10 +96,22 @@ vec4 typhon_effect_main(TyphonEffectContext ctx);
 ```
 
 Typhon owns `main()`, the vertex shader, the primary sampler, context uniforms,
-precision, output, and reserved names. The context supplies the primary
-texture, texture size, content rectangle, output size, scale, time, delta, and
-normalized UV. Declared typed uniforms are bound from the validated parameter
-block. Shader bodies cannot define `main()` or collide with reserved ABI names.
+precision, output, and reserved names. The context is value-only and supplies
+texture size, content rectangle, output size, scale, time, delta, and normalized
+UV. Trusted stages sample the primary input with `typhon_sample_primary(ctx.uv)`
+and bounded auxiliary inputs with `typhon_sample_aux(index, uv)`; the fixed
+sampler ABI is `u_typhon_primary`, `u_typhon_aux0` through `u_typhon_aux7`, and
+`u_typhon_aux_count`. Declared typed uniforms are bound from the validated
+parameter block. Shader bodies cannot define `main()` or collide with reserved
+ABI declarations. The runtime also compiles and links a representative wrapper
+inside a real GLES 3 context at the renderer boundary.
+
+The production loader uses the fixed per-user manifest
+`$XDG_CONFIG_HOME/AstreaOS/typhon/effects.json`, falling back to
+`$HOME/.config/AstreaOS/typhon/effects.json`, with that `typhon` directory as
+the trusted shader root. Startup load and the explicit `astreactl effects
+reload` command both prewarm the candidate generation before publication;
+invalid candidates leave the previous generation active.
 
 ## Damage, presentation, and fallback
 

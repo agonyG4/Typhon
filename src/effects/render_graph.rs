@@ -1,13 +1,13 @@
 use std::{collections::HashMap, fmt::Write as _, num::NonZeroU16};
 
-use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene};
+use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene, VisualGroupId};
 
 use super::registry::EffectRegistry;
 use super::{
-    DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectInstanceId,
-    EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId,
-    EffectRect, EffectRegion, EffectSource, EffectValidationError, EffectWorkingSpace,
-    ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
+    BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
+    EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
+    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectSource, EffectValidationError,
+    EffectWorkingSpace, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -15,7 +15,7 @@ pub const MAX_GRAPH_PASSES: usize = 4096;
 pub const BUILTIN_BACKGROUND_BLUR_NAME: &str = "system.background_blur";
 
 pub fn builtin_background_blur_program_id() -> EffectProgramId {
-    EffectProgramId::new(1).expect("builtin effect program id is non-zero")
+    EffectProgramId::new(BUILTIN_EFFECT_PROGRAM_ID).expect("builtin effect program id is non-zero")
 }
 
 pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
@@ -99,6 +99,7 @@ pub struct GraphTexturePlan {
 pub enum RenderPassKind {
     SceneCapture,
     SurfaceCapture,
+    NormalizeInput,
     DualKawaseDownsample,
     DualKawaseUpsample,
     Fragment,
@@ -106,6 +107,14 @@ pub enum RenderPassKind {
     Mask,
     Composite,
     OutputPostProcess,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EffectColorConversion {
+    #[default]
+    None,
+    DecodeSrgbToLinear,
+    EncodeLinearToSrgb,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +130,11 @@ pub struct CompiledRenderPass {
     pub stage: Option<EffectNodeKind>,
     pub fused_stages: Vec<EffectNodeKind>,
     pub parameter_block: super::EffectParameterBlock,
+    pub alpha_mode: EffectAlphaMode,
+    pub encode_output: bool,
+    pub color_conversion: EffectColorConversion,
+    pub checkpoint_dependencies: Vec<GraphPassId>,
+    pub visual_group: Option<VisualGroupId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -156,13 +170,7 @@ impl CompiledFrameGraph {
             })
             .map(|texture| u64::from(texture.width).saturating_mul(u64::from(texture.height)))
             .sum::<u64>();
-        let output_pixels = self
-            .textures
-            .iter()
-            .find(|texture| texture.source == GraphTextureSource::Output)
-            .map_or(0, |texture| {
-                u64::from(texture.width).saturating_mul(u64::from(texture.height))
-            });
+        let output_pixels = region_pixels(&self.final_damage);
         let mut explanation = format!(
             "effects graph: instances={} passes={} textures={} peak_live={} capture_px={} output_px={}\n",
             self.stats.effect_instances,
@@ -205,6 +213,7 @@ fn pass_label(pass: &CompiledRenderPass) -> &'static str {
     match pass.kind {
         RenderPassKind::SceneCapture => "capture_scene",
         RenderPassKind::SurfaceCapture => "capture_target",
+        RenderPassKind::NormalizeInput => "normalize_input",
         RenderPassKind::DualKawaseDownsample => "kawase_down",
         RenderPassKind::DualKawaseUpsample => "kawase_up",
         RenderPassKind::Fragment => pass.stage.as_ref().map_or("fragment", node_label),
@@ -235,6 +244,12 @@ fn anchor_label(anchor: EffectAnchor) -> String {
         EffectAnchor::AfterSurface(id) => format!("after_surface={id}"),
         EffectAnchor::OutputPostProcess => "output_post_process".to_owned(),
     }
+}
+
+fn region_pixels(region: &EffectRegion) -> u64 {
+    region.rects().iter().fold(0u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,6 +380,11 @@ impl GraphBuilder {
             stage: None,
             fused_stages: Vec::new(),
             parameter_block: super::EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
         });
         Ok(id)
     }
@@ -410,6 +430,7 @@ pub fn compile_frame_execution_plan(
 
     let (mut builder, output_texture) = GraphBuilder::new(output_bounds)?;
     let mut final_damage = source_damage.clone();
+    let mut checkpoints = Vec::<(GraphPassId, EffectRegion)>::new();
 
     for instance in visible_instances {
         let program = registry
@@ -422,15 +443,24 @@ pub fn compile_frame_execution_plan(
             output_bounds,
         );
         final_damage = final_damage.union(&effect_damage.output_damage);
-        compile_instance(
+        let dependencies = checkpoints
+            .iter()
+            .filter(|(_, region)| region.intersects(&effect_damage.capture_region))
+            .map(|(pass, _)| *pass)
+            .collect::<Vec<_>>();
+        let checkpoint = compile_instance(
             &mut builder,
             output_texture,
             instance,
             program,
-            &effect_damage.capture_region,
-            &effect_damage.output_damage,
-            output_bounds,
+            InstanceCompilePlan {
+                capture_damage: &effect_damage.capture_region,
+                output_damage: &effect_damage.output_damage,
+                output_bounds,
+                checkpoint_dependencies: &dependencies,
+            },
         )?;
+        checkpoints.push((checkpoint, effect_damage.dependency_region));
     }
 
     fuse_compatible_local_stages(&mut builder);
@@ -550,21 +580,33 @@ fn compatible_local_stage_order(first: &EffectNodeKind, second: &EffectNodeKind)
         .is_some_and(|(first, second)| second > first)
 }
 
+struct InstanceCompilePlan<'a> {
+    capture_damage: &'a EffectRegion,
+    output_damage: &'a EffectRegion,
+    output_bounds: EffectRect,
+    checkpoint_dependencies: &'a [GraphPassId],
+}
+
 fn compile_instance(
     builder: &mut GraphBuilder,
     output_texture: GraphTextureId,
     instance: &ResolvedEffectInstance,
     program: &ValidatedEffectProgram,
-    capture_damage: &EffectRegion,
-    output_damage: &EffectRegion,
-    output_bounds: EffectRect,
-) -> Result<(), RenderGraphCompileError> {
+    plan: InstanceCompilePlan<'_>,
+) -> Result<GraphPassId, RenderGraphCompileError> {
+    let InstanceCompilePlan {
+        capture_damage,
+        output_damage,
+        output_bounds,
+        checkpoint_dependencies,
+    } = plan;
     let nodes = program
         .program
         .nodes
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
+    let visual_group = instance.visual_group;
     let mut outputs = HashMap::<EffectNodeId, GraphTextureId>::new();
 
     for node_id in &program.topological_order {
@@ -624,6 +666,14 @@ fn compile_instance(
                         instance.anchor,
                         None,
                     )?;
+                    let capture_pass = builder
+                        .passes
+                        .last_mut()
+                        .expect("capture pass was appended");
+                    if matches!(source, EffectSource::Backdrop) {
+                        capture_pass.checkpoint_dependencies = checkpoint_dependencies.to_vec();
+                    }
+                    capture_pass.visual_group = visual_group;
                 }
                 outputs.insert(node.id, texture);
             }
@@ -693,13 +743,54 @@ fn compile_instance(
                     .ok_or(RenderGraphCompileError::InvalidGraph(
                         EffectValidationError::MissingInputNode(node.id),
                     ))?;
+                let primary_plan = builder.texture(inputs[0]);
+                let multi_input = inputs.len() > 1;
+                let mut normalized_inputs = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let input_plan = builder.texture(input);
+                    let needs_normalization = multi_input
+                        && (input_plan.domain != primary_plan.domain
+                            || input_plan.width != primary_plan.width
+                            || input_plan.height != primary_plan.height
+                            || input_plan.working_space != program.program.working_space
+                            || input_plan.origin != primary_plan.origin);
+                    if !needs_normalization {
+                        normalized_inputs.push(input);
+                        continue;
+                    }
+                    let normalized = builder.add_texture_with_layout(
+                        GraphTextureSource::Intermediate,
+                        primary_plan.domain,
+                        primary_plan.width,
+                        primary_plan.height,
+                        program.program.working_space,
+                    )?;
+                    builder.add_pass(
+                        RenderPassKind::NormalizeInput,
+                        vec![input],
+                        Some(normalized),
+                        output_damage.clone(),
+                        instance.id,
+                        instance.anchor,
+                        None,
+                    )?;
+                    let normalize_pass = builder
+                        .passes
+                        .last_mut()
+                        .expect("input normalization pass was appended");
+                    normalize_pass.color_conversion =
+                        color_conversion(input_plan.working_space, program.program.working_space);
+                    normalize_pass.visual_group = visual_group;
+                    normalized_inputs.push(normalized);
+                }
+                let inputs = normalized_inputs;
                 let input_plan = builder.texture(inputs[0]);
                 let output = builder.add_texture_with_layout(
                     GraphTextureSource::Intermediate,
                     input_plan.domain,
                     input_plan.width,
                     input_plan.height,
-                    EffectWorkingSpace::LinearSrgb,
+                    program.program.working_space,
                 )?;
                 let kind = match node.kind {
                     EffectNodeKind::Blend(_) => RenderPassKind::Blend,
@@ -720,6 +811,20 @@ fn compile_instance(
                     .last_mut()
                     .expect("stage pass was appended")
                     .parameter_block = instance.parameter_block.clone();
+                builder
+                    .passes
+                    .last_mut()
+                    .expect("stage pass was appended")
+                    .color_conversion = if multi_input {
+                    EffectColorConversion::None
+                } else {
+                    color_conversion(input_plan.working_space, program.program.working_space)
+                };
+                builder
+                    .passes
+                    .last_mut()
+                    .expect("stage pass was appended")
+                    .visual_group = visual_group;
                 outputs.insert(node.id, output);
             }
         }
@@ -734,7 +839,7 @@ fn compile_instance(
         | EffectAnchor::ReplaceSurface(_)
         | EffectAnchor::AfterSurface(_) => RenderPassKind::Composite,
     };
-    builder.add_pass(
+    let composite = builder.add_pass(
         kind,
         vec![final_texture],
         Some(output_texture),
@@ -743,7 +848,34 @@ fn compile_instance(
         instance.anchor,
         None,
     )?;
-    Ok(())
+    let final_working_space = builder.texture(final_texture).working_space;
+    let encode_output = final_working_space == EffectWorkingSpace::LinearSrgb;
+    let final_pass = builder
+        .passes
+        .last_mut()
+        .expect("final composite pass was appended");
+    final_pass.alpha_mode = program.program.alpha_mode;
+    final_pass.color_conversion =
+        color_conversion(final_working_space, EffectWorkingSpace::OutputEncodedSrgb);
+    final_pass.encode_output =
+        encode_output || final_pass.color_conversion == EffectColorConversion::EncodeLinearToSrgb;
+    final_pass.visual_group = visual_group;
+    Ok(composite)
+}
+
+fn color_conversion(
+    input: EffectWorkingSpace,
+    output: EffectWorkingSpace,
+) -> EffectColorConversion {
+    match (input, output) {
+        (EffectWorkingSpace::OutputEncodedSrgb, EffectWorkingSpace::LinearSrgb) => {
+            EffectColorConversion::DecodeSrgbToLinear
+        }
+        (EffectWorkingSpace::LinearSrgb, EffectWorkingSpace::OutputEncodedSrgb) => {
+            EffectColorConversion::EncodeLinearToSrgb
+        }
+        _ => EffectColorConversion::None,
+    }
 }
 
 fn scaled_dimension(value: u32, scale: f32) -> u32 {
@@ -793,6 +925,7 @@ mod tests {
             parameter_block: EffectParameterBlock::default(),
             signature: 7,
             frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
         };
         (ResolvedEffectScene::new(1, vec![instance]), registry)
     }
@@ -825,6 +958,52 @@ mod tests {
             program.nodes[1].kind,
             EffectNodeKind::DualKawaseBlur(_)
         ));
+    }
+
+    #[test]
+    fn encoded_source_only_result_does_not_double_encode() {
+        let source = EffectNodeId::new(1).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(19).unwrap(),
+            nodes: vec![EffectNode::source(source, EffectSource::Backdrop)],
+            output: source,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(19).unwrap(),
+                anchor: EffectAnchor::OutputPostProcess,
+                target_bounds: region.bounding_rect().unwrap(),
+                region: region.clone(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+            }],
+        );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible source effect must compile");
+        };
+        let final_pass = graph.passes.last().unwrap();
+        assert!(!final_pass.encode_output);
+        assert_eq!(final_pass.alpha_mode, EffectAlphaMode::Preserve);
+        assert_eq!(final_pass.color_conversion, EffectColorConversion::None);
     }
 
     #[test]
@@ -937,6 +1116,36 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_backdrop_stacks_expose_ordered_checkpoint_dependencies() {
+        let (scene, registry) = blur_scene();
+        let mut second = scene.instances[0].clone();
+        second.id = EffectInstanceId::new(2).unwrap();
+        second.signature = second.signature.saturating_add(1);
+        let scene = ResolvedEffectScene::new(1, vec![scene.instances[0].clone(), second]);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("overlapping effects must compile to an effect graph");
+        };
+        let captures = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .collect::<Vec<_>>();
+        assert_eq!(captures.len(), 2);
+        assert!(captures[0].checkpoint_dependencies.is_empty());
+        assert_eq!(captures[1].checkpoint_dependencies.len(), 1);
+        assert!(graph.passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::Composite
+                && captures[1].checkpoint_dependencies.contains(&pass.id)
+        }));
+    }
+
+    #[test]
     fn graph_explanation_is_deterministic_and_source_free() {
         let (scene, registry) = blur_scene();
         let plan = compile_frame_execution_plan(
@@ -952,7 +1161,7 @@ mod tests {
         let explanation = graph.explain();
         assert_eq!(explanation, graph.explain());
         assert!(explanation.starts_with(
-            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=2073600\n"
+            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=115200\n"
         ));
         assert!(explanation.contains("capture_scene"));
         assert!(explanation.contains("kawase_down"));
@@ -991,6 +1200,7 @@ mod tests {
                 parameter_block: EffectParameterBlock::default(),
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
@@ -1002,9 +1212,90 @@ mod tests {
         .unwrap() else {
             panic!("visible local stage must compile to an effect graph");
         };
+        assert_eq!(
+            graph.passes.last().unwrap().color_conversion,
+            EffectColorConversion::EncodeLinearToSrgb
+        );
         assert!(graph.passes.iter().any(|pass| {
             pass.kind == RenderPassKind::Fragment
                 && matches!(pass.stage, Some(EffectNodeKind::Tint(_)))
+        }));
+    }
+
+    #[test]
+    fn multi_input_stages_normalize_each_input_to_the_validated_working_space() {
+        let backdrop = EffectNodeId::new(1).unwrap();
+        let target = EffectNodeId::new(2).unwrap();
+        let blend = EffectNodeId::new(3).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(11).unwrap(),
+            nodes: vec![
+                EffectNode::source(backdrop, EffectSource::Backdrop),
+                EffectNode::source(target, EffectSource::TargetContent),
+                EffectNode::blend(
+                    blend,
+                    vec![backdrop, target],
+                    BlendSpec::new(BlendMode::SourceOver, 1.0).unwrap(),
+                ),
+            ],
+            output: blend,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(11).unwrap(),
+                anchor: EffectAnchor::OutputPostProcess,
+                target_bounds: region.bounding_rect().unwrap(),
+                region: region.clone(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+            }],
+        );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("multi-input effect must compile");
+        };
+        let normalize = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::NormalizeInput)
+            .collect::<Vec<_>>();
+        assert_eq!(normalize.len(), 2);
+        assert!(
+            normalize
+                .iter()
+                .all(|pass| { pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear })
+        );
+        let blend_pass = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Blend)
+            .unwrap();
+        assert_eq!(blend_pass.color_conversion, EffectColorConversion::None);
+        assert_eq!(blend_pass.inputs.len(), 2);
+        assert!(blend_pass.inputs.iter().all(|input| {
+            graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == *input)
+                .is_some_and(|texture| texture.working_space == EffectWorkingSpace::LinearSrgb)
         }));
     }
 
@@ -1057,6 +1348,7 @@ mod tests {
                 parameter_block: EffectParameterBlock::default(),
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(

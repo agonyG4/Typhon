@@ -142,6 +142,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
     MoveFocusedWindowToWorkspace {
         workspace: u32,
     },
+    MoveWindowToWorkspace {
+        window_id: WindowId,
+        workspace: u32,
+        reply: Sender<bool>,
+    },
     SetFocusedRootVisualGeometry {
         placement: SurfacePlacement,
         width: u32,
@@ -482,6 +487,18 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             continue;
                         };
                         server.move_focused_window_to_workspace(workspace);
+                    }
+                    ServerCommand::MoveWindowToWorkspace {
+                        window_id,
+                        workspace,
+                        reply,
+                    } => {
+                        let moved = WorkspaceId::new(workspace).is_some_and(|workspace| {
+                            server
+                                .state
+                                .move_window_family_to_workspace(window_id, workspace)
+                        });
+                        let _ = reply.send(moved);
                     }
                     ServerCommand::SetFocusedRootVisualGeometry {
                         placement,

@@ -3,8 +3,8 @@ use oblivion_one::effects::EffectRegion;
 use std::borrow::Cow;
 
 use oblivion_one::compositor::{
-    DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
-    PointerWarpOrigin, ResolvedEffectScene,
+    AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
+    PointerWarpOrigin, PresentationSceneSample, ResolvedEffectScene,
 };
 
 #[derive(Debug)]
@@ -17,13 +17,29 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
     pub(crate) effects: ResolvedEffectScene,
+    pub(crate) presentation: PresentationSceneSample,
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
     pub(crate) fn from_server(server: &'a OwnCompositorServer) -> Self {
-        let surfaces = server.native_frame_renderable_surfaces();
-        let decorations =
-            server.native_decoration_render_instances_for_scale(surfaces.as_ref(), 1.0);
+        let at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        Self::from_server_at(server, at)
+    }
+
+    pub(crate) fn from_server_at(server: &'a OwnCompositorServer, at: AnimationTime) -> Self {
+        let presentation = server.presentation_scene_sample_at(at);
+        let canonical_surfaces = server.native_frame_renderable_surfaces();
+        let surfaces = server.native_frame_renderable_surfaces_with_presentation(&presentation);
+        let decorations = server
+            .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)
+            .into_iter()
+            .map(|decoration| {
+                presentation
+                    .transform_for_root(decoration.root_surface_id())
+                    .and_then(|transform| decoration.with_presentation_transform(transform))
+                    .unwrap_or(decoration)
+            })
+            .collect::<Vec<_>>();
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids();
         let render_generation = server.scene_render_generation();
@@ -35,7 +51,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 .collect(),
             popup_surface_ids.as_ref(),
         );
-        let effects = server.resolved_effect_scene();
+        let effects = server.resolved_effect_scene_for_presentation(&presentation);
         Self {
             surfaces,
             decorations,
@@ -45,6 +61,21 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             visibility: server.fullscreen_render_plan_metrics(),
             snapshot,
             effects,
+            presentation,
+        }
+    }
+
+    pub(crate) fn into_owned(self) -> ResolvedNativeFrameScene<'static> {
+        ResolvedNativeFrameScene {
+            surfaces: Cow::Owned(self.surfaces.into_owned()),
+            decorations: self.decorations,
+            popup_surface_ids: Cow::Owned(self.popup_surface_ids.into_owned()),
+            external_overlay_surface_ids: self.external_overlay_surface_ids,
+            render_generation: self.render_generation,
+            visibility: self.visibility,
+            snapshot: self.snapshot,
+            effects: self.effects,
+            presentation: self.presentation,
         }
     }
 
@@ -955,6 +986,7 @@ impl NativeFrameRenderer {
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
             decoration_instances: &resolved_scene.decorations,
+            presentation_geometry_signature: resolved_scene.presentation.geometry_signature(),
             client_cursor: cursor_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())

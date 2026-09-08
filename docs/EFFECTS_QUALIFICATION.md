@@ -1,7 +1,8 @@
 # Effects qualification
 
-Status: deterministic implementation gates pass; native TTY/DRM qualification
-is deferred.
+Status: fresh deterministic closure gates pass; native TTY/DRM qualification is
+blocked in this environment because the process has no controlling TTY. The
+available DRM node and NVIDIA GPU do not satisfy the real-TTY prerequisite.
 
 This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
@@ -18,8 +19,16 @@ rtk cargo clippy --locked --all-targets -- -D warnings
 rtk cargo test --locked effects
 rtk cargo test --locked egl_renderer
 rtk cargo test --locked native_output
+rtk cargo test --locked
 rtk bin/qualify-presentation --dry-run
 ```
+
+The closure also reruns the focused `resources`, `static_texture`, trusted
+wrapper GLES-link, component-range, and effect-reload filters.
+The current fresh results are: `effects` 103 passed, `egl_renderer` 124 passed,
+`resources` 18 passed, `static_texture` 3 passed, `native_output` 1162 passed,
+and the full suite 3658 passed with 5 ignored. Formatting, all-target
+compilation, and strict Clippy passed. The dry-run enumerated all 18 phases.
 
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
@@ -61,8 +70,10 @@ currently has no reliable timer-query result to report, so GPU effect timing is
 
 ## Current result
 
-No real TTY/DRM run was performed for this checkout. Therefore all native
-baseline, blur, overlap, presentation-combination, and custom-frame-demand
-measurements are `DEFERRED`, and no production-default decision is claimed from
-performance data. Direct Scanout remains conservative and effects continue to
-require composition whenever visible effect pixels are present.
+No live native run was performed for this checkout: `tty` reports `not a tty`,
+although `/dev/dri/card0`, `/dev/dri/renderD128`, and an NVIDIA GeForce RTX
+3060 Ti are available. Therefore all native baseline, blur, overlap,
+presentation-combination, and custom-frame-demand measurements are `DEFERRED`,
+and no production-default decision is claimed from performance data. Direct
+Scanout remains conservative and effects continue to require composition
+whenever visible effect pixels are present.

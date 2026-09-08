@@ -316,6 +316,7 @@ pub(super) enum SurfaceSampling {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct EglDrawCommand {
     pub(super) layer: EglDrawLayer,
+    pub(super) visual_group: Option<oblivion_one::compositor::VisualGroupId>,
     pub(super) bounds: EglRect,
     pub(super) opaque_regions: Vec<EglRect>,
     pub(super) vertex_start: u32,
@@ -380,6 +381,7 @@ pub(super) fn push_draw_command_with_uv(
     if vertex_count > 0 {
         commands.push(EglDrawCommand {
             layer,
+            visual_group: None,
             bounds: rect,
             opaque_regions: Vec::new(),
             vertex_start,
@@ -585,6 +587,7 @@ mod tests {
     fn test_command(bounds: EglRect, opaque_regions: Vec<EglRect>) -> EglDrawCommand {
         EglDrawCommand {
             layer: EglDrawLayer::Solid(ServerFrameColor::OutputBackground),
+            visual_group: None,
             bounds,
             opaque_regions,
             vertex_start: 0,
