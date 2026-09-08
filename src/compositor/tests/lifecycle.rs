@@ -553,6 +553,194 @@ fn direct_presentation_feedback_is_attributed_to_the_scanned_surface() {
 }
 
 #[test]
+fn direct_presentation_feedback_requires_the_current_same_surface_commit() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let feedback_a = presentation.feedback(&surface, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let (batch_reply, batch_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 101,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_a = batch_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (surface_ids_reply, surface_ids_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatchSurfaceIds {
+            batch_id: batch_a,
+            reply: surface_ids_reply,
+        })
+        .unwrap();
+    let surface_id = surface_ids_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .first()
+        .copied()
+        .expect("first surface feedback should be captured");
+    let lineage_a = capture_surface_presentation_lineage(&commands, surface_id)
+        .expect("first surface commit should be published");
+
+    let feedback_b = presentation.feedback(&surface, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let lineage_b = capture_surface_presentation_lineage(&commands, surface_id)
+        .expect("second surface commit should be active");
+    assert_ne!(lineage_a, lineage_b);
+
+    commands
+        .send(ServerCommand::CompleteDirectFrameBatchWithLineage {
+            frame_id: 101,
+            batch_id: batch_a,
+            direct_surface_id: surface_id,
+            direct_lineage: lineage_b,
+            presentation: FramePresentation::synchronized_zero_copy(
+                PresentationClock::Monotonic,
+                1,
+                0,
+                1,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(
+        state
+            .presentation_feedback_event_log
+            .contains(&(feedback_a.id().protocol_id(), "discarded"))
+    );
+
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let (batch_reply, batch_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 102,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_b = batch_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    commands
+        .send(ServerCommand::CompleteDirectFrameBatchWithLineage {
+            frame_id: 102,
+            batch_id: batch_b,
+            direct_surface_id: surface_id,
+            direct_lineage: lineage_b,
+            presentation: FramePresentation::synchronized_zero_copy(
+                PresentationClock::Monotonic,
+                2,
+                0,
+                2,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        state
+            .presentation_feedback_event_log
+            .contains(&(feedback_b.id().protocol_id(), "presented"))
+    );
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(state.presentation_presented_count, 1);
+}
+
+#[test]
+fn render_failure_restore_discards_feedback_for_a_stale_surface_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let feedback = presentation.feedback(&surface, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let (batch_reply, batch_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 111,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands
+        .send(ServerCommand::RestoreFrameBatchAfterRenderFailure(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "discarded")]
+    );
+}
+
+#[test]
 fn presentation_global_advertises_configured_realtime_clock() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();

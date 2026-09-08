@@ -366,6 +366,7 @@ impl CompositorState {
                 }
                 commit.pending.release_target().release();
                 callbacks.extend(commit.frame_callbacks);
+                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 self.resize_flow_metrics
                     .surface_pending_attachments_superseded = self
                     .resize_flow_metrics

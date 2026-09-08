@@ -168,6 +168,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_id: u32,
         reply: Sender<Option<(SurfacePresentationMetadata, SurfacePresentationMetadata)>>,
     },
+    CaptureSurfacePresentationLineage {
+        surface_id: u32,
+        reply: Sender<Option<(u64, SurfaceCommitSequence)>>,
+    },
     CaptureDirectScanoutCandidate(
         Sender<Result<DirectScanoutCandidateSnapshot, DirectScanoutSceneRejection>>,
     ),
@@ -294,6 +298,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
         direct_surface_id: u32,
+        presentation: FramePresentation,
+    },
+    CompleteDirectFrameBatchWithLineage {
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        direct_lineage: (u64, SurfaceCommitSequence),
         presentation: FramePresentation,
     },
     DiscardFrameBatch {
@@ -640,6 +651,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 })
                             });
                         let _ = reply.send(metadata);
+                    }
+                    ServerCommand::CaptureSurfacePresentationLineage { surface_id, reply } => {
+                        let lineage = server
+                            .state
+                            .surface_presentation_generations
+                            .get(&surface_id)
+                            .copied()
+                            .and_then(|generation| {
+                                server
+                                    .state
+                                    .surface_publications
+                                    .get(&surface_id)
+                                    .and_then(|publication| publication.latest_published)
+                                    .map(|commit_sequence| (generation, commit_sequence))
+                            });
+                        let _ = reply.send(lineage);
                     }
                     ServerCommand::CaptureDirectScanoutCandidate(reply) => {
                         let candidate = server.direct_scanout_scene_candidate().map(|candidate| {
@@ -1109,6 +1136,23 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             presentation,
                         );
                     }
+                    ServerCommand::CompleteDirectFrameBatchWithLineage {
+                        frame_id,
+                        batch_id,
+                        direct_surface_id,
+                        direct_lineage,
+                        presentation,
+                    } => {
+                        let prepared = server
+                            .prepare_direct_presented_frame_batch_with_lineage(
+                                frame_id,
+                                batch_id,
+                                direct_surface_id,
+                                Some(direct_lineage),
+                            )
+                            .expect("test direct frame batch should be owned");
+                        server.commit_prepared_direct_presented_frame_batch(prepared, presentation);
+                    }
                     ServerCommand::DiscardFrameBatch { batch_id, reason } => {
                         server.discard_frame_batch(batch_id, reason);
                     }
@@ -1161,6 +1205,20 @@ pub(in crate::compositor::tests) fn capture_surface_presentation_metadata(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should return surface presentation metadata")
+}
+
+pub(in crate::compositor::tests) fn capture_surface_presentation_lineage(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<(u64, SurfaceCommitSequence)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfacePresentationLineage { surface_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should return surface presentation lineage")
 }
 
 pub(in crate::compositor::tests) fn capture_clipboard_state(

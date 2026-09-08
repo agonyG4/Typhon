@@ -547,6 +547,93 @@ fn layer_surface_explicit_sync_waits_then_publishes_and_destroy_pending_is_safe(
 }
 
 #[test]
+fn superseded_unready_explicit_sync_commit_discards_presentation_feedback() {
+    let Some(first_acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(second_acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-explicit-sync-feedback",
+    );
+    layer_surface.set_size(2, 2);
+    let sync_surface = syncobj.get_surface(&surface, &qh, ());
+    let first_acquire_fd = first_acquire_timeline.export_timeline_fd().unwrap();
+    let second_acquire_fd = second_acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let first_acquire = syncobj.import_timeline(first_acquire_fd.as_fd(), &qh, ());
+    let second_acquire = syncobj.import_timeline(second_acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let first_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff44_4444).unwrap();
+    let second_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff55_5555).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    let feedback = presentation.feedback(&surface, &qh, ());
+    sync_surface.set_acquire_point(&first_acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    surface.attach(Some(&first_buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_renderable_surface_count(&commands), 0);
+
+    second_acquire_timeline.signal_point(1).unwrap();
+    sync_surface.set_acquire_point(&second_acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 3);
+    surface.attach(Some(&second_buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "discarded")]
+    );
+}
+
+#[test]
 fn layer_root_publishes_synchronized_subsurface_transaction() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);
@@ -591,6 +678,59 @@ fn layer_root_publishes_synchronized_subsurface_transaction() {
 
     commands.send(ServerCommand::Stop).unwrap();
     let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn synchronized_subsurface_bufferless_commit_discards_older_feedback() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-feedback",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let feedback = presentation.feedback(&child, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 16, 8).unwrap();
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(
+        state.presentation_feedback_event_log,
+        vec![(feedback.id().protocol_id(), "discarded")]
+    );
 }
 
 #[test]
