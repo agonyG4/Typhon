@@ -208,6 +208,34 @@ impl TrustedEffectRegistry {
     }
 }
 
+/// GL-backed owners implement this boundary to make a complete generation
+/// executable before compositor name lookup can observe it.
+pub trait EffectGenerationPublisher {
+    fn publish_effect_generation(
+        &mut self,
+        generation: EffectRegistryGeneration,
+    ) -> Result<(), RegistryReloadError>;
+}
+
+/// Publish one trusted generation as a single runtime transaction.
+///
+/// The renderer-side publisher owns the fallible GL work.  The compositor
+/// registry is updated only after that work succeeds, so a failed candidate
+/// cannot become protocol-resolvable or replace the previous generation.
+pub fn reload_with_publisher<P>(
+    registry: &TrustedEffectRegistry,
+    manifest: EffectManifest,
+    publisher: &mut P,
+) -> Result<Arc<EffectRegistryGeneration>, RegistryReloadError>
+where
+    P: EffectGenerationPublisher,
+{
+    let previous = registry.current();
+    let candidate = build_generation(manifest, previous.generation.saturating_add(1))?;
+    publisher.publish_effect_generation(candidate.clone())?;
+    Ok(registry.publish(candidate))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RegistryReloadError {
     Config(EffectConfigError),
@@ -384,5 +412,84 @@ mod tests {
         );
         assert_eq!(registry.current().generation, previous);
         assert!(registry.current().program("glass.panel").is_none());
+    }
+
+    #[derive(Default)]
+    struct TestGenerationPublisher {
+        published: Vec<u64>,
+        fail_generation: Option<u64>,
+    }
+
+    impl EffectGenerationPublisher for TestGenerationPublisher {
+        fn publish_effect_generation(
+            &mut self,
+            generation: EffectRegistryGeneration,
+        ) -> Result<(), RegistryReloadError> {
+            if self.fail_generation == Some(generation.generation) {
+                return Err(RegistryReloadError::ShaderCompile {
+                    module: ShaderModuleId::new(9).unwrap(),
+                    log: "test compile failure".into(),
+                });
+            }
+            self.published.push(generation.generation);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn publication_transaction_keeps_generations_identical() {
+        let registry = TrustedEffectRegistry::new();
+        let mut publisher = TestGenerationPublisher::default();
+        let generation = reload_with_publisher(&registry, manifest(), &mut publisher).unwrap();
+
+        assert_eq!(generation.generation, 1);
+        assert_eq!(publisher.published, vec![generation.generation]);
+        assert_eq!(registry.current().generation, generation.generation);
+    }
+
+    #[test]
+    fn publication_transaction_retains_previous_generation_on_renderer_failure() {
+        let registry = TrustedEffectRegistry::new();
+        let first = reload_with_publisher(
+            &registry,
+            manifest(),
+            &mut TestGenerationPublisher::default(),
+        )
+        .unwrap();
+        let mut publisher = TestGenerationPublisher {
+            fail_generation: Some(first.generation.saturating_add(1)),
+            ..TestGenerationPublisher::default()
+        };
+
+        let result = reload_with_publisher(&registry, manifest(), &mut publisher);
+
+        assert!(matches!(result, Err(RegistryReloadError::ShaderCompile { .. })));
+        assert_eq!(registry.current().generation, first.generation);
+        assert!(publisher.published.is_empty());
+    }
+
+    #[test]
+    fn successful_reload_removes_old_programs_with_a_new_generation() {
+        let registry = TrustedEffectRegistry::new();
+        let first = reload_with_publisher(
+            &registry,
+            manifest(),
+            &mut TestGenerationPublisher::default(),
+        )
+        .unwrap();
+        let empty = EffectManifest {
+            version: 1,
+            effects: BTreeMap::new(),
+        };
+        let second = reload_with_publisher(
+            &registry,
+            empty,
+            &mut TestGenerationPublisher::default(),
+        )
+        .unwrap();
+
+        assert_eq!(second.generation, first.generation.saturating_add(1));
+        assert!(registry.current().program("glass.panel").is_none());
+        assert_eq!(registry.current().generation, second.generation);
     }
 }
