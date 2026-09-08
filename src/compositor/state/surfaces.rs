@@ -1164,6 +1164,7 @@ impl CompositorState {
         }
         self.active_commit_timing_targets.remove(&surface_id);
         self.fifo_resources.remove(&surface_id);
+        self.release_protocol_surface_effects_for_surface(surface_id);
         self.internal_surface_effects.remove(&surface_id);
         self.background_effect_resources.remove(&surface_id);
         self.background_effect_surface_ids.remove(&surface_id);
@@ -1173,6 +1174,7 @@ impl CompositorState {
         self.presented_surface_commit_generations
             .remove(&surface_id);
         self.surface_presentation_generations.remove(&surface_id);
+        self.active_surface_presentation_commits.remove(&surface_id);
         self.cancel_pending_surface_trees_for_surface(
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,

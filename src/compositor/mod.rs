@@ -140,11 +140,12 @@ pub use explicit_sync::{
 };
 use explicit_sync::{
     AcquireCommitIdAllocator, CapturedExplicitSyncState, PendingAcquireState,
-    PendingExplicitSyncCommit, PendingPresentationFeedback, SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
-    SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS, SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
-    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT, SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-    SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
-    SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
+    PendingExplicitSyncCommit, PendingPresentationFeedback, RequestedPresentationFeedback,
+    SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE, SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS,
+    SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS, SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+    SYNCOBJ_SURFACE_ERROR_NO_BUFFER, SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
+    SYNCOBJ_SURFACE_ERROR_NO_SURFACE, SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
+    SyncobjSurfaceState, SyncobjTimelineData,
 };
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{
@@ -297,6 +298,7 @@ pub use render::{
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
+use state::ActiveSurfacePresentationCommit;
 pub use selection::*;
 pub use server::{OwnCompositorServer, XwaylandClientIdentity};
 pub use server_error::CompositorError;
@@ -695,6 +697,7 @@ pub struct CompositorState {
     surface_presentation_generations: HashMap<u32, u64>,
     next_surface_presentation_generation: u64,
     surface_publications: HashMap<u32, SurfacePublicationState>,
+    active_surface_presentation_commits: HashMap<u32, ActiveSurfacePresentationCommit>,
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
@@ -778,7 +781,7 @@ pub struct CompositorState {
     next_legacy_output_frame_id: u64,
     legacy_prepared_frame_batch: Option<CompositorFrameBatchId>,
     legacy_submitted_frame_batch: Option<CompositorFrameBatchId>,
-    pending_surface_presentation_feedbacks: HashMap<u32, Vec<PendingPresentationFeedback>>,
+    pending_surface_presentation_feedbacks: HashMap<u32, Vec<RequestedPresentationFeedback>>,
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,
     render_generation: u64,

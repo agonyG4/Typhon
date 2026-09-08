@@ -117,7 +117,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 pacing.fifo_wait_ignored_for_synchronized_subsurface = pacing.fifo_wait_barrier
                     && state.is_effectively_synchronized_subsurface(surface_id);
                 let presentation = data.take_pending_presentation();
-                let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
+                let presentation_feedbacks =
+                    state.take_and_bind_surface_presentation_feedbacks(surface_id, commit_sequence);
                 let mut attachment = data.take_pending();
                 if let Some(PendingSurfaceAttachment::Buffer(buffer)) = attachment.as_mut() {
                     buffer.commit_sequence = commit_sequence;

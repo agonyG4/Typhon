@@ -1,3 +1,4 @@
+use super::surface_transactions::ActiveSurfacePresentationCommit;
 use super::*;
 use crate::compositor::frame_batch::FrameCallbackPacingState;
 
@@ -145,6 +146,110 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn discard_presentation_feedbacks(
+        &mut self,
+        feedbacks: Vec<PendingPresentationFeedback>,
+    ) {
+        for feedback in feedbacks {
+            feedback.feedback.discarded();
+        }
+    }
+
+    pub(in crate::compositor) fn activate_surface_presentation_commit(
+        &mut self,
+        surface_id: u32,
+        surface_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+        feedbacks: Vec<PendingPresentationFeedback>,
+    ) {
+        if self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+            != Some(surface_generation)
+        {
+            self.discard_presentation_feedbacks(feedbacks);
+            return;
+        }
+
+        self.active_surface_presentation_commits.insert(
+            surface_id,
+            ActiveSurfacePresentationCommit {
+                surface_generation,
+                commit_sequence,
+            },
+        );
+        self.discard_superseded_uncaptured_presentation_feedbacks(
+            surface_id,
+            surface_generation,
+            commit_sequence,
+        );
+        self.queue_pending_presentation_feedbacks(feedbacks);
+    }
+
+    pub(in crate::compositor) fn activate_current_surface_presentation_commit(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        feedbacks: Vec<PendingPresentationFeedback>,
+    ) {
+        if let Some(surface_generation) = self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+        {
+            self.activate_surface_presentation_commit(
+                surface_id,
+                surface_generation,
+                commit_sequence,
+                feedbacks,
+            );
+        } else {
+            self.discard_presentation_feedbacks(feedbacks);
+        }
+    }
+
+    fn discard_superseded_uncaptured_presentation_feedbacks(
+        &mut self,
+        surface_id: u32,
+        surface_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+    ) {
+        let pending = std::mem::take(&mut self.pending_presentation_feedbacks);
+        self.pending_presentation_feedbacks = pending
+            .into_iter()
+            .filter_map(|feedback| {
+                let superseded = feedback.surface_id == surface_id
+                    && (feedback.surface_presentation_generation != surface_generation
+                        || feedback.commit_sequence < commit_sequence);
+                if superseded {
+                    feedback.feedback.discarded();
+                    None
+                } else {
+                    Some(feedback)
+                }
+            })
+            .collect();
+
+        let visible = std::mem::take(&mut self.visible_pending_presentation_feedbacks);
+        self.visible_pending_presentation_feedbacks = visible
+            .into_iter()
+            .filter_map(|feedback| {
+                let superseded = feedback.surface_id == surface_id
+                    && (feedback.surface_presentation_generation != surface_generation
+                        || feedback.commit_sequence < commit_sequence);
+                if superseded {
+                    feedback.feedback.discarded();
+                    None
+                } else {
+                    Some(feedback)
+                }
+            })
+            .collect();
+        self.visible_pending_presentation_feedback_count =
+            self.visible_pending_presentation_feedbacks.len();
+    }
+
     pub(in crate::compositor) fn capture_frame_callbacks_for_render(&mut self) {
         if self.legacy_prepared_frame_batch.is_some() {
             return;
@@ -228,6 +333,10 @@ impl CompositorState {
         feedbacks: Vec<PendingPresentationFeedback>,
     ) {
         for feedback in feedbacks {
+            if !self.pending_presentation_feedback_matches_active_commit(&feedback) {
+                feedback.feedback.discarded();
+                continue;
+            }
             if self.pending_presentation_feedback_is_visible(&feedback) {
                 self.visible_pending_presentation_feedbacks.push(feedback);
                 self.visible_pending_presentation_feedback_count = self
@@ -237,6 +346,23 @@ impl CompositorState {
                 self.pending_presentation_feedbacks.push(feedback);
             }
         }
+    }
+
+    fn pending_presentation_feedback_matches_active_commit(
+        &self,
+        feedback: &PendingPresentationFeedback,
+    ) -> bool {
+        self.surface_presentation_generations
+            .get(&feedback.surface_id)
+            .copied()
+            == Some(feedback.surface_presentation_generation)
+            && self
+                .active_surface_presentation_commits
+                .get(&feedback.surface_id)
+                .is_some_and(|active| {
+                    active.surface_generation == feedback.surface_presentation_generation
+                        && active.commit_sequence == feedback.commit_sequence
+                })
     }
 
     pub(crate) fn prepare_terminal_callback_ownership(
@@ -640,6 +766,23 @@ impl CompositorState {
         direct_surface_id: u32,
         presentation: FramePresentation,
     ) {
+        self.complete_direct_presented_frame_batch_with_lineage(
+            frame_id,
+            batch_id,
+            direct_surface_id,
+            None,
+            presentation,
+        );
+    }
+
+    pub(crate) fn complete_direct_presented_frame_batch_with_lineage(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        direct_lineage: Option<(u64, SurfaceCommitSequence)>,
+        presentation: FramePresentation,
+    ) {
         self.assert_frame_batch_identity(frame_id, batch_id);
         let (render_completed_ns, callbacks_remaining) = self
             .frame_batches
@@ -665,7 +808,12 @@ impl CompositorState {
         }
         let feedbacks = std::mem::take(&mut batch.presentation_feedbacks);
         self.clear_legacy_batch_reference(batch_id);
-        self.complete_direct_presentation_feedbacks(feedbacks, direct_surface_id, presentation);
+        self.complete_direct_presentation_feedbacks(
+            feedbacks,
+            direct_surface_id,
+            direct_lineage,
+            presentation,
+        );
         let _ = self.complete_frame_batch_releases(batch_id, batch);
     }
 

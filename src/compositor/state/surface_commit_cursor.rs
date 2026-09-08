@@ -7,7 +7,7 @@ impl CompositorState {
         pending: PendingSurfaceBuffer,
         _damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
-    ) {
+    ) -> bool {
         let commit_sequence = pending.commit_sequence;
         let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
         let copy_started = std::time::Instant::now();
@@ -18,7 +18,7 @@ impl CompositorState {
                     self.note_shm_materialization_failure(&pending);
                     self.release_unmaterialized_pending_buffer(pending, false);
                     self.complete_frame_callbacks(frame_callbacks);
-                    return;
+                    return false;
                 }
             };
         let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
@@ -112,6 +112,7 @@ impl CompositorState {
         } else {
             self.complete_frame_callbacks(frame_callbacks);
         }
+        true
     }
 
     pub(in crate::compositor) fn commit_cursor_surface_damage_only(

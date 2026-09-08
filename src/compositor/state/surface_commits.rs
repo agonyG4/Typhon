@@ -10,7 +10,7 @@ impl CompositorState {
         damage: RenderableSurfaceDamage,
         window_geometry: Option<XdgWindowGeometry>,
         source: SurfacePublicationSource,
-    ) {
+    ) -> bool {
         // Every call carries a wl_surface buffer attachment, even when the
         // client reattaches the same wl_buffer. Native presentation therefore
         // treats this boundary as new content rather than metadata-only work.
@@ -29,7 +29,7 @@ impl CompositorState {
             Ok(placement) => placement,
             Err(_) => {
                 self.release_unmaterialized_pending_buffer(pending, false);
-                return;
+                return false;
             }
         };
         let mut placement = resize_placement.unwrap_or_else(|| self.surface_placement(surface_id));
@@ -65,19 +65,19 @@ impl CompositorState {
             Ok(width) => width,
             Err(_) => {
                 self.release_unmaterialized_pending_buffer(pending, false);
-                return;
+                return false;
             }
         };
         let buffer_height = match pending.data.height() {
             Ok(height) => height,
             Err(_) => {
                 self.release_unmaterialized_pending_buffer(pending, false);
-                return;
+                return false;
             }
         };
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
             self.release_unmaterialized_pending_buffer(pending, false);
-            return;
+            return false;
         };
         let surface_size = pending.surface_size.unwrap_or(buffer_size);
         let width = surface_size.width;
@@ -135,7 +135,7 @@ impl CompositorState {
                 source,
                 None,
             );
-            return;
+            return false;
         }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
@@ -150,7 +150,7 @@ impl CompositorState {
                     Err(_) => {
                         self.note_shm_materialization_failure(&pending);
                         self.release_unmaterialized_pending_buffer(pending, false);
-                        return;
+                        return false;
                     }
                 };
             let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
@@ -171,7 +171,7 @@ impl CompositorState {
                 if let Some(release) = shm_release {
                     self.release_materialized_shm(release, copy_to_release_us);
                 }
-                return;
+                return false;
             }
             self.track_committed_buffer_lifetime(surface_id, &pending);
             self.replace_current_surface_buffer(
@@ -211,7 +211,7 @@ impl CompositorState {
             if let Some(surface) = self.surface_resource_by_id(surface_id) {
                 self.reconcile_surface_output_membership(&surface);
             }
-            return;
+            return false;
         }
         let committed_damage = if !visual_mapping_changed {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
@@ -237,14 +237,14 @@ impl CompositorState {
             Err(_) => {
                 self.note_shm_materialization_failure(&pending);
                 self.release_unmaterialized_pending_buffer(pending, false);
-                return;
+                return false;
             }
         };
         let copy_to_release_us = copy_started.elapsed().as_micros() as u64;
         let updated_surface_index = if let Some(index) = renderable_index {
             let visual_placement = {
                 let Some(existing) = self.renderable_surfaces.get_mut(index) else {
-                    return;
+                    return false;
                 };
                 if update_renderable_surface_buffer(
                     existing,
@@ -262,7 +262,7 @@ impl CompositorState {
                     if let Some(release) = shm_release {
                         self.release_materialized_shm(release, copy_to_release_us);
                     }
-                    return;
+                    return false;
                 }
                 existing.placement
             };
@@ -372,6 +372,7 @@ impl CompositorState {
         if visual_state_changed && let Some(surface) = self.surface_resource_by_id(surface_id) {
             self.reconcile_surface_output_membership(&surface);
         }
+        true
     }
     pub(in crate::compositor) fn minimized_root_surface_id_for_surface(
         &self,
@@ -636,6 +637,7 @@ impl CompositorState {
         mut pending: PendingSurfaceBuffer,
         damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
+        presentation_feedbacks: Vec<PendingPresentationFeedback>,
         explicit_sync: Option<CapturedExplicitSyncState>,
         window_geometry: Option<XdgWindowGeometry>,
     ) {
@@ -647,6 +649,7 @@ impl CompositorState {
             if !self.layer_surface_can_publish_buffer(surface_id, pending_surface_size) {
                 pending.release_target().release();
                 self.complete_frame_callbacks(frame_callbacks);
+                self.discard_presentation_feedbacks(presentation_feedbacks);
                 return;
             }
             if self.xdg_surface_is_configured(surface_id) {
@@ -672,6 +675,7 @@ impl CompositorState {
                 pending,
                 damage,
                 callbacks,
+                presentation_feedbacks,
                 source,
                 window_geometry,
             );
@@ -684,6 +688,7 @@ impl CompositorState {
                 SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                 "explicit sync is only supported for linux-dmabuf buffers",
             );
+            self.discard_presentation_feedbacks(presentation_feedbacks);
             return;
         }
 
@@ -693,6 +698,7 @@ impl CompositorState {
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "dmabuf commit is missing an acquire timeline point",
             );
+            self.discard_presentation_feedbacks(presentation_feedbacks);
             return;
         };
         let Some(release) = release else {
@@ -701,6 +707,7 @@ impl CompositorState {
                 SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                 "dmabuf commit is missing a release timeline point",
             );
+            self.discard_presentation_feedbacks(presentation_feedbacks);
             return;
         };
 
@@ -710,6 +717,7 @@ impl CompositorState {
                 SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                 "acquire timeline point must be lower than release point on the same timeline",
             );
+            self.discard_presentation_feedbacks(presentation_feedbacks);
             return;
         }
 
@@ -729,6 +737,7 @@ impl CompositorState {
                         SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                         "explicit sync commit identity space exhausted",
                     );
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
                     return;
                 };
                 self.finalize_pending_buffer_resize_capture(
@@ -746,6 +755,7 @@ impl CompositorState {
                         damage,
                         window_geometry,
                         frame_callbacks,
+                        presentation_feedbacks,
                         acquire,
                         acquire_state: PendingAcquireState::Ready,
                     });
@@ -772,6 +782,7 @@ impl CompositorState {
                 pending,
                 damage,
                 callbacks,
+                presentation_feedbacks,
                 source,
                 window_geometry,
             );
@@ -784,6 +795,7 @@ impl CompositorState {
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "explicit sync commit identity space exhausted",
             );
+            self.discard_presentation_feedbacks(presentation_feedbacks);
             return;
         };
         let mut callbacks =
@@ -820,6 +832,7 @@ impl CompositorState {
                 damage,
                 window_geometry,
                 frame_callbacks: callbacks,
+                presentation_feedbacks,
                 acquire: acquire.clone(),
                 acquire_state: PendingAcquireState::RegistrationPending,
             });
@@ -876,7 +889,7 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         state: BufferlessSurfaceCommitState,
-    ) {
+    ) -> bool {
         let BufferlessSurfaceCommitState {
             commit_sequence,
             damage,
@@ -895,7 +908,7 @@ impl CompositorState {
                     SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                     "explicit sync points were set without an attached buffer",
                 );
-                return;
+                return false;
             }
         }
 
@@ -909,11 +922,11 @@ impl CompositorState {
                     buffer_scale,
                 );
             }
-            return;
+            return true;
         }
 
         if !self.apply_layer_surface_commit(surface_id) {
-            return;
+            return false;
         }
         let mut resize_commit = if resize_capture_finalized {
             captured_resize_commit
@@ -968,6 +981,7 @@ impl CompositorState {
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
+        true
     }
 
     pub(in crate::compositor) fn complete_pending_resize_from_current_geometry(
@@ -1040,7 +1054,7 @@ impl CompositorState {
         commit_sequence: SurfaceCommitSequence,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
-    ) {
+    ) -> bool {
         let decision = self.surface_publication_decision(
             surface_id,
             commit_sequence,
@@ -1055,7 +1069,7 @@ impl CompositorState {
                 decision,
             );
             self.complete_frame_callbacks(frame_callbacks);
-            return;
+            return false;
         }
         let mut callbacks =
             self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
@@ -1081,6 +1095,7 @@ impl CompositorState {
             None,
         );
         self.complete_frame_callbacks(callbacks);
+        true
     }
     pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
         let renderable_ids = self
@@ -1481,7 +1496,7 @@ impl CompositorState {
         pending: PendingSurfaceBuffer,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
-    ) {
+    ) -> bool {
         let commit_sequence = pending.commit_sequence;
         let buffer_id = pending.data.buffer_id();
         let buffer_size = pending.data.width().ok().and_then(|width| {
@@ -1520,6 +1535,7 @@ impl CompositorState {
             None,
         );
         self.complete_frame_callbacks(frame_callbacks);
+        true
     }
 
     pub(in crate::compositor) fn adopt_current_surface_content_for_role(
@@ -1612,18 +1628,20 @@ impl CompositorState {
         pending: PendingSurfaceBuffer,
         damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
+        presentation_feedbacks: Vec<PendingPresentationFeedback>,
         source: SurfacePublicationSource,
         window_geometry: Option<XdgWindowGeometry>,
     ) {
-        match self.surface_role(surface_id) {
+        let commit_sequence = pending.commit_sequence;
+        let activated = match self.surface_role(surface_id) {
             SurfaceRole::Cursor => {
-                self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
+                self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks)
             }
             SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
-                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source)
             }
             SurfaceRole::Xwayland => {
-                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source);
+                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source)
             }
             SurfaceRole::XdgToplevel
             | SurfaceRole::XdgPopup
@@ -1637,7 +1655,7 @@ impl CompositorState {
                     source.publication_context(),
                 ) {
                     SurfacePublicationDecision::Publish => {
-                        self.commit_surface_buffer(
+                        let activated = self.commit_surface_buffer(
                             surface_id,
                             pending,
                             damage,
@@ -1646,6 +1664,7 @@ impl CompositorState {
                         );
                         self.note_layer_surface_buffer_published(surface_id);
                         self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
+                        activated
                     }
                     decision => {
                         self.record_surface_publication_rejection(
@@ -1657,9 +1676,28 @@ impl CompositorState {
                         );
                         pending.release_target().release();
                         self.complete_frame_callbacks(frame_callbacks);
+                        false
                     }
                 }
             }
+        };
+        if activated {
+            if let Some(surface_generation) = self
+                .surface_presentation_generations
+                .get(&surface_id)
+                .copied()
+            {
+                self.activate_surface_presentation_commit(
+                    surface_id,
+                    surface_generation,
+                    commit_sequence,
+                    presentation_feedbacks,
+                );
+            } else {
+                self.discard_presentation_feedbacks(presentation_feedbacks);
+            }
+        } else {
+            self.discard_presentation_feedbacks(presentation_feedbacks);
         }
     }
 }

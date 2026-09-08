@@ -6,7 +6,9 @@ use std::{
     },
 };
 
-use oblivion_one::compositor::{DirectScanoutSceneCandidate, SurfaceDamagePresentation};
+use oblivion_one::compositor::{
+    DirectScanoutSceneCandidate, SurfaceCommitSequence, SurfaceDamagePresentation,
+};
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
 use super::{DirectPlaneValidationKey, DirectScanoutCandidateKey, ImportedDirectFramebuffer};
@@ -16,6 +18,8 @@ pub(crate) struct DirectPrimaryLease {
     key: DirectScanoutCandidateKey,
     validation_key: DirectPlaneValidationKey,
     surface_id: u32,
+    surface_presentation_generation: u64,
+    commit_sequence: SurfaceCommitSequence,
     _buffer: DmabufBufferHandle,
     framebuffer: Arc<ImportedDirectFramebuffer>,
     surface_damage: Option<SurfaceDamagePresentation>,
@@ -36,6 +40,8 @@ impl DirectPrimaryLease {
             key,
             validation_key,
             surface_id: candidate.surface_id,
+            surface_presentation_generation: candidate.surface_presentation_generation,
+            commit_sequence: candidate.commit_sequence,
             _buffer: candidate.buffer,
             framebuffer,
             surface_damage: Some(surface_damage),
@@ -49,6 +55,14 @@ impl DirectPrimaryLease {
 
     pub(crate) const fn surface_id(&self) -> u32 {
         self.surface_id
+    }
+
+    pub(crate) const fn surface_presentation_generation(&self) -> u64 {
+        self.surface_presentation_generation
+    }
+
+    pub(crate) const fn commit_sequence(&self) -> SurfaceCommitSequence {
+        self.commit_sequence
     }
 
     pub(crate) const fn validation_key(&self) -> DirectPlaneValidationKey {
@@ -113,6 +127,8 @@ impl DirectPrimaryLease {
                 key,
                 validation_key: super::test_validation_key(key.output_generation),
                 surface_id: key.content.surface_id,
+                surface_presentation_generation: 1,
+                commit_sequence: SurfaceCommitSequence::initial(),
                 _buffer: buffer,
                 framebuffer,
                 surface_damage,

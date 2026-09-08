@@ -34,11 +34,7 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for CompositorState {
                     .pending_surface_presentation_feedbacks
                     .entry(surface_id)
                     .or_default()
-                    .push(PendingPresentationFeedback {
-                        surface_id,
-                        surface,
-                        feedback,
-                    });
+                    .push(RequestedPresentationFeedback { surface, feedback });
             }
             other => {
                 let _ = other;

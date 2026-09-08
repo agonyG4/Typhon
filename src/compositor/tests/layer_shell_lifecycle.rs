@@ -387,11 +387,11 @@ fn layer_surface_frame_callback_and_presentation_feedback_publish_normally() {
         "layer-frame-presentation",
     );
     _layer_surface.set_size(32, 32);
-    surface.frame(&qh, ());
-    presentation.feedback(&surface, &qh, ());
     surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    surface.frame(&qh, ());
+    presentation.feedback(&surface, &qh, ());
     commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();

@@ -227,7 +227,13 @@ impl CachedSubsurfaceCommit {
         if background_effect.is_some() {
             self.background_effect = background_effect;
         }
-        self.presentation_feedbacks.extend(presentation_feedbacks);
+        // A cached merge eliminates the older Content Update. Presentation
+        // feedback is bound to that exact commit and must not follow the
+        // frame-callback carry-forward rules into the replacement commit.
+        for feedback in self.presentation_feedbacks.drain(..) {
+            feedback.feedback.discarded();
+        }
+        self.presentation_feedbacks = presentation_feedbacks;
         self.presentation = presentation;
         self.pointer_constraint_state = self
             .pointer_constraint_state

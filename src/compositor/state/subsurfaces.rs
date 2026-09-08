@@ -1226,13 +1226,37 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn take_surface_presentation_feedbacks(
+    pub(in crate::compositor) fn take_and_bind_surface_presentation_feedbacks(
         &mut self,
         surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
     ) -> Vec<PendingPresentationFeedback> {
+        let Some(surface_generation) = self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+        else {
+            for feedback in self
+                .pending_surface_presentation_feedbacks
+                .remove(&surface_id)
+                .unwrap_or_default()
+            {
+                feedback.feedback.discarded();
+            }
+            return Vec::new();
+        };
         self.pending_surface_presentation_feedbacks
             .remove(&surface_id)
             .unwrap_or_default()
+            .into_iter()
+            .map(|feedback| PendingPresentationFeedback {
+                surface_id,
+                surface_presentation_generation: surface_generation,
+                commit_sequence,
+                surface: feedback.surface,
+                feedback: feedback.feedback,
+            })
+            .collect()
     }
 
     pub(in crate::compositor) fn set_surface_placement(

@@ -15,6 +15,7 @@ pub struct DirectScanoutSceneCandidate {
     pub root_surface_id: u32,
     pub content_epoch: u64,
     pub generation: u64,
+    pub surface_presentation_generation: u64,
     pub commit_sequence: SurfaceCommitSequence,
     pub buffer_identity: BufferIdentity,
     pub buffer: DmabufBufferHandle,

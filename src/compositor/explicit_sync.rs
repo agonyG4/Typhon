@@ -170,6 +170,7 @@ pub(super) struct PendingExplicitSyncCommit {
     pub(super) damage: RenderableSurfaceDamage,
     pub(super) window_geometry: Option<super::XdgWindowGeometry>,
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
+    pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) acquire: ExplicitSyncPoint,
     pub(super) acquire_state: PendingAcquireState,
 }
@@ -193,8 +194,16 @@ impl CapturedExplicitSyncState {
 }
 
 #[derive(Debug)]
+pub(super) struct RequestedPresentationFeedback {
+    pub(super) surface: wl_surface::WlSurface,
+    pub(super) feedback: wp_presentation_feedback::WpPresentationFeedback,
+}
+
+#[derive(Debug)]
 pub(super) struct PendingPresentationFeedback {
     pub(super) surface_id: u32,
+    pub(super) surface_presentation_generation: u64,
+    pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) surface: wl_surface::WlSurface,
     pub(super) feedback: wp_presentation_feedback::WpPresentationFeedback,
 }

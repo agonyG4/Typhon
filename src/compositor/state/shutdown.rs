@@ -29,6 +29,9 @@ impl CompositorState {
         }
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             self.note_explicit_commit_destroyed(commit.surface_commit_id, "compositor_shutdown");
+            for feedback in commit.presentation_feedbacks {
+                feedback.feedback.discarded();
+            }
             let pending = commit.pending;
             if pending.data.is_shm() {
                 pending.release_target().release();

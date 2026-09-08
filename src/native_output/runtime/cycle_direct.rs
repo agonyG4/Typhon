@@ -73,10 +73,14 @@ pub(super) fn settle_direct_pageflip(
         return Err(io::Error::other("direct pageflip obligation identity mismatch").into());
     }
     let logical_obligations = prepared_logical.obligations();
-    let prepared_frame_batch = match server.prepare_direct_presented_frame_batch(
+    let prepared_frame_batch = match server.prepare_direct_presented_frame_batch_with_lineage(
         direct_info.frame_id,
         direct_info.protocol_batch_id,
         direct_info.surface_id,
+        Some((
+            direct_info.surface_presentation_generation,
+            direct_info.commit_sequence,
+        )),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {

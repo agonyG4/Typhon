@@ -310,11 +310,17 @@ impl CompositorState {
         &mut self,
         feedbacks: Vec<PendingPresentationFeedback>,
         direct_surface_id: u32,
+        direct_lineage: Option<(u64, SurfaceCommitSequence)>,
         presentation: FramePresentation,
     ) {
         let mut direct_feedbacks = Vec::new();
         for pending in feedbacks {
-            if pending.surface_id == direct_surface_id {
+            if pending.surface_id == direct_surface_id
+                && direct_lineage.is_none_or(|(generation, commit_sequence)| {
+                    pending.surface_presentation_generation == generation
+                        && pending.commit_sequence == commit_sequence
+                })
+            {
                 direct_feedbacks.push(pending);
             } else {
                 pending.feedback.discarded();
@@ -1304,6 +1310,7 @@ impl CompositorState {
                 }
                 commit.pending.release_target().release();
                 canceled_callbacks.extend(commit.frame_callbacks);
+                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     canceled_resize_captures.push(resize.commit_sequence);
                 }
@@ -1349,6 +1356,7 @@ impl CompositorState {
                 "bounded_pending_acquire_retention",
             );
             superseded_callbacks.extend(commit.frame_callbacks);
+            self.discard_presentation_feedbacks(commit.presentation_feedbacks);
             if let Some(resize) = commit.pending.resize_commit.as_deref() {
                 released_captures.push(resize.commit_sequence);
             }
@@ -1423,6 +1431,7 @@ impl CompositorState {
             if uses_timeline {
                 commit.pending.release_target().release();
                 callbacks.extend(commit.frame_callbacks);
+                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     released_captures.push((commit.surface_id, resize.commit_sequence));
                 }
@@ -1672,6 +1681,7 @@ impl CompositorState {
                     .entry(commit.surface_id)
                     .or_default()
                     .extend(commit.frame_callbacks);
+                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     released_captures.push((commit.surface_id, resize.commit_sequence));
                 }
@@ -1715,6 +1725,7 @@ impl CompositorState {
                 }
                 commit.pending.release_target().release();
                 self.complete_frame_callbacks(commit.frame_callbacks);
+                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 continue;
             }
             let callbacks = commit.frame_callbacks;
@@ -1736,6 +1747,7 @@ impl CompositorState {
                 commit.pending,
                 commit.damage,
                 callbacks,
+                commit.presentation_feedbacks,
                 SurfacePublicationSource::ExplicitSync,
                 commit.window_geometry,
             );

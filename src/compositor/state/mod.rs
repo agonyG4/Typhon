@@ -138,10 +138,10 @@ pub use surface_pacing::{CommitTimingConstraint, SurfacePacingMetrics};
 pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::{
-    BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction, ReleasedSurfaceTreeState,
-    SurfacePublicationContext, SurfacePublicationDecision, SurfacePublicationSource,
-    SurfacePublicationState, SurfaceTreeAcquireDependency, SurfaceTreeMergeStats,
-    TransactionOrdering,
+    ActiveSurfacePresentationCommit, BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction,
+    ReleasedSurfaceTreeState, SurfacePublicationContext, SurfacePublicationDecision,
+    SurfacePublicationSource, SurfacePublicationState, SurfaceTreeAcquireDependency,
+    SurfaceTreeMergeStats, TransactionOrdering,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;

@@ -48,6 +48,12 @@ pub(in crate::compositor) struct SurfacePublicationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct ActiveSurfacePresentationCommit {
+    pub(in crate::compositor) surface_generation: u64,
+    pub(in crate::compositor) commit_sequence: SurfaceCommitSequence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum SurfacePublicationDecision {
     Publish,
     StaleAlreadyPublished,
@@ -178,7 +184,7 @@ impl CompositorState {
             opaque_region,
             input_region,
             background_effect,
-            presentation_feedbacks,
+            mut presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
             window_geometry,
@@ -252,6 +258,7 @@ impl CompositorState {
                     pending,
                     damage.unwrap_or_else(RenderableSurfaceDamage::full),
                     frame_callbacks,
+                    std::mem::take(&mut presentation_feedbacks),
                     explicit_sync,
                     window_geometry,
                 );
@@ -265,19 +272,34 @@ impl CompositorState {
                         SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                         "explicit sync points were set without an attached buffer",
                     );
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
                     return;
                 }
                 if self.is_cursor_surface(surface_id) {
                     self.commit_cursor_surface_removal_request(surface_id, None);
                     self.note_explicit_commit_published(commit_id);
                     self.complete_frame_callbacks(frame_callbacks);
+                    self.activate_current_surface_presentation_commit(
+                        surface_id,
+                        commit_sequence,
+                        presentation_feedbacks,
+                    );
                 } else {
-                    self.commit_surface_remove_content(
+                    let activated = self.commit_surface_remove_content(
                         surface_id,
                         commit_sequence,
                         frame_callbacks,
                         SurfacePublicationSource::SurfaceTree,
                     );
+                    if activated {
+                        self.activate_current_surface_presentation_commit(
+                            surface_id,
+                            commit_sequence,
+                            presentation_feedbacks,
+                        );
+                    } else {
+                        self.discard_presentation_feedbacks(presentation_feedbacks);
+                    }
                 }
             }
             None => {
@@ -290,12 +312,13 @@ impl CompositorState {
                             SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                             "explicit sync points were set without an attached buffer",
                         );
+                        self.discard_presentation_feedbacks(presentation_feedbacks);
                         return;
                     }
                     Some(explicit_sync) => Some(explicit_sync.state),
                     None => None,
                 };
-                self.commit_surface_without_buffer(
+                let activated = self.commit_surface_without_buffer(
                     surface_id,
                     BufferlessSurfaceCommitState {
                         commit_sequence,
@@ -314,13 +337,21 @@ impl CompositorState {
                 } else {
                     self.complete_frame_callbacks(frame_callbacks);
                 }
+                if activated {
+                    self.activate_current_surface_presentation_commit(
+                        surface_id,
+                        commit_sequence,
+                        presentation_feedbacks,
+                    );
+                } else {
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
+                }
             }
         }
         self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
         if input_region_changed {
             self.refresh_pointer_focus_at_last_position();
         }
-        self.queue_pending_presentation_feedbacks(presentation_feedbacks);
         if background_effect_changed {
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::EffectBinding,

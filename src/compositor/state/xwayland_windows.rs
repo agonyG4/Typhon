@@ -45,6 +45,7 @@ impl CompositorState {
             self.presented_surface_commit_generations
                 .remove(&retired_id);
             self.surface_presentation_generations.remove(&retired_id);
+            self.active_surface_presentation_commits.remove(&retired_id);
             self.clear_resize_state_for_surfaces_with_reason(
                 &[retired_id],
                 WindowInteractionEndReason::SurfaceDestroyed,
@@ -302,23 +303,28 @@ impl CompositorState {
         current: impl Into<CurrentSurfaceBuffer>,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
-    ) {
+    ) -> bool {
         let current = current.into();
         if self.xwayland.retired_surface_ids.contains(&surface_id) {
             if let CurrentSurfaceBuffer::Unmaterialized(pending) = current {
                 self.release_unmaterialized_pending_buffer(pending, false);
             }
             self.complete_frame_callbacks(frame_callbacks);
-            return;
+            return false;
         }
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if self.window_id_for_surface(root_surface_id).is_none() {
             if let CurrentSurfaceBuffer::Unmaterialized(pending) = current {
-                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+                return self.commit_unassigned_surface_buffer(
+                    surface_id,
+                    pending,
+                    frame_callbacks,
+                    source,
+                );
             } else {
                 self.complete_frame_callbacks(frame_callbacks);
             }
-            return;
+            return false;
         }
         let x11_window_minimized = self
             .window_id_for_surface(root_surface_id)
@@ -338,7 +344,7 @@ impl CompositorState {
                         self.note_shm_materialization_failure(&pending);
                         self.release_unmaterialized_pending_buffer(pending, false);
                         self.complete_frame_callbacks(frame_callbacks);
-                        return;
+                        return false;
                     }
                 };
                 (
@@ -535,6 +541,7 @@ impl CompositorState {
         } else {
             self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
         }
+        true
     }
 }
 

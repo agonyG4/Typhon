@@ -357,6 +357,13 @@ impl CompositorState {
         if self.has_pending_frame_prepare_work() {
             return Err(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
         }
+        let Some(surface_presentation_generation) = self
+            .surface_presentation_generations
+            .get(&root.surface_id)
+            .copied()
+        else {
+            return Err(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+        };
 
         Ok(DirectScanoutSceneCandidate {
             surface_id: root.surface_id,
@@ -365,6 +372,7 @@ impl CompositorState {
                 .surface_content_epoch(root.surface_id)
                 .map_or(root.commit_sequence.get(), SurfaceCommitSequence::get),
             generation: root.generation,
+            surface_presentation_generation,
             commit_sequence: root.commit_sequence,
             buffer_identity: root.buffer_identity().clone(),
             buffer,

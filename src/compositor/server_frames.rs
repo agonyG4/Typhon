@@ -7,6 +7,7 @@ pub struct PreparedDirectFrameBatch {
     pub(crate) frame_id: u64,
     pub(crate) batch_id: CompositorFrameBatchId,
     pub(crate) direct_surface_id: u32,
+    pub(crate) direct_lineage: Option<(u64, SurfaceCommitSequence)>,
 }
 
 impl OwnCompositorServer {
@@ -181,6 +182,21 @@ impl OwnCompositorServer {
         batch_id: CompositorFrameBatchId,
         direct_surface_id: u32,
     ) -> io::Result<PreparedDirectFrameBatch> {
+        self.prepare_direct_presented_frame_batch_with_lineage(
+            frame_id,
+            batch_id,
+            direct_surface_id,
+            None,
+        )
+    }
+
+    pub fn prepare_direct_presented_frame_batch_with_lineage(
+        &self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        direct_lineage: Option<(u64, SurfaceCommitSequence)>,
+    ) -> io::Result<PreparedDirectFrameBatch> {
         let batch = self
             .state
             .frame_batches
@@ -195,6 +211,7 @@ impl OwnCompositorServer {
             frame_id,
             batch_id,
             direct_surface_id,
+            direct_lineage,
         })
     }
 
@@ -203,12 +220,14 @@ impl OwnCompositorServer {
         prepared: PreparedDirectFrameBatch,
         presentation: FramePresentation,
     ) {
-        self.state.complete_direct_presented_frame_batch(
-            prepared.frame_id,
-            prepared.batch_id,
-            prepared.direct_surface_id,
-            presentation,
-        );
+        self.state
+            .complete_direct_presented_frame_batch_with_lineage(
+                prepared.frame_id,
+                prepared.batch_id,
+                prepared.direct_surface_id,
+                prepared.direct_lineage,
+                presentation,
+            );
         let _ = self.display.flush_clients();
     }
 
