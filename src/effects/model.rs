@@ -477,6 +477,7 @@ pub enum EffectValidationError {
     MissingOutputNode,
     MissingInputNode(EffectNodeId),
     DuplicateNodeId(EffectNodeId),
+    UnsupportedStaticTexture(StaticTextureId),
     Cycle,
     InvalidArity { node: EffectNodeId },
     TooManyNodes,

@@ -357,4 +357,32 @@ mod tests {
         assert!(registry.current().program("glass.panel").is_some());
         let _ = Path::new(".");
     }
+
+    #[test]
+    fn v1_registry_rejects_static_texture_before_publication() {
+        let registry = TrustedEffectRegistry::new();
+        let previous = registry.current().generation;
+        let static_id = super::super::StaticTextureId::new(9).unwrap();
+        let mut candidate = manifest();
+        let definition = candidate.effects.get_mut("glass.panel").unwrap();
+        definition.program.nodes[0] = super::super::EffectNode::source(
+            super::super::EffectNodeId::new(1).unwrap(),
+            super::super::EffectSource::StaticTexture(static_id),
+        );
+
+        let result = registry.reload(candidate, |_| {
+            panic!("static texture candidates must fail before shader prewarm")
+        });
+
+        assert_eq!(
+            result,
+            Err(RegistryReloadError::Config(
+                EffectConfigError::Validation(
+                    super::super::EffectValidationError::UnsupportedStaticTexture(static_id)
+                )
+            ))
+        );
+        assert_eq!(registry.current().generation, previous);
+        assert!(registry.current().program("glass.panel").is_none());
+    }
 }

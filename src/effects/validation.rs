@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::footprint::node_footprint;
 use super::{
-    EffectFootprint, EffectNodeId, EffectNodeKind, EffectProgram, EffectValidationError,
+    EffectFootprint, EffectNodeId, EffectNodeKind, EffectProgram, EffectSource,
+    EffectValidationError,
     MAX_EFFECT_PROGRAM_NODES,
 };
 
@@ -34,6 +35,9 @@ pub fn validate_effect_program(
     }
 
     for node in &program.nodes {
+        if let EffectNodeKind::Source(EffectSource::StaticTexture(id)) = node.kind {
+            return Err(EffectValidationError::UnsupportedStaticTexture(id));
+        }
         let expected_arity = match &node.kind {
             EffectNodeKind::Source(_) => 0,
             EffectNodeKind::DualKawaseBlur(_)
@@ -172,6 +176,29 @@ mod tests {
         assert_eq!(
             validate_effect_program(program),
             Err(EffectValidationError::MissingOutputNode)
+        );
+    }
+
+    #[test]
+    fn static_texture_is_rejected_before_frame_execution() {
+        let static_id = StaticTextureId::new(7).unwrap();
+        let source = EffectNode::source(
+            EffectNodeId::new(1).unwrap(),
+            EffectSource::StaticTexture(static_id),
+        );
+        let program = EffectProgram {
+            id: EffectProgramId::new(77).unwrap(),
+            nodes: vec![source],
+            output: EffectNodeId::new(1).unwrap(),
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+        assert_eq!(
+            validate_effect_program(program),
+            Err(EffectValidationError::UnsupportedStaticTexture(static_id))
         );
     }
 
