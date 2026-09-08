@@ -807,14 +807,22 @@ impl Drop for NativeRuntime {
             ) {
                 continue;
             }
-            let callback_owner_leaks = direct_terminal_callback_owner_leaks(
-                &mut self.server,
-                transaction_id,
-                transaction.descriptor().obligations(),
-                DirectTerminalCallbackDisposition::Abandoned,
+            let obligations = transaction.descriptor().obligations();
+            presentation_transactions::finish_direct_terminal_callback_cleanup(
+                self.scanout_destroyed,
+                || {
+                    direct_terminal_callback_owner_leaks(
+                        &mut self.server,
+                        transaction_id,
+                        obligations,
+                        DirectTerminalCallbackDisposition::Abandoned,
+                    )
+                },
+                |callback_owner_leaks| {
+                    self.scanout
+                        .note_direct_callback_owner_leaks(callback_owner_leaks);
+                },
             );
-            self.scanout
-                .note_direct_callback_owner_leaks(callback_owner_leaks);
         }
         // SAFETY: scanout is wrapped solely so teardown can disarm DRM cleanup
         // before its normal resource drop. The proven boundary above means

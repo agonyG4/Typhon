@@ -209,6 +209,69 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
     }
 }
 
+pub(super) fn finish_direct_terminal_callback_cleanup<Settle, Note>(
+    scanout_destroyed: bool,
+    settle_callback_ownership: Settle,
+    note_backend_metrics: Note,
+) where
+    Settle: FnOnce() -> DirectCallbackLeakMetrics,
+    Note: FnOnce(DirectCallbackLeakMetrics),
+{
+    let callback_owner_leaks = settle_callback_ownership();
+    if !scanout_destroyed {
+        note_backend_metrics(callback_owner_leaks);
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn destroyed_scanout_still_settles_callbacks_without_backend_access() {
+        let callback_cleanup_count = Cell::new(0);
+        let backend_metric_updates = Cell::new(0);
+        let leaks = DirectCallbackLeakMetrics {
+            leak_events: 1,
+            leaked_callbacks: 2,
+        };
+
+        finish_direct_terminal_callback_cleanup(
+            true,
+            || {
+                callback_cleanup_count.set(callback_cleanup_count.get() + 1);
+                leaks
+            },
+            |_| backend_metric_updates.set(backend_metric_updates.get() + 1),
+        );
+
+        assert_eq!(callback_cleanup_count.get(), 1);
+        assert_eq!(backend_metric_updates.get(), 0);
+    }
+
+    #[test]
+    fn live_scanout_records_terminal_callback_metrics_including_zeroes() {
+        let callback_cleanup_count = Cell::new(0);
+        let backend_metric_updates = Cell::new(0);
+
+        finish_direct_terminal_callback_cleanup(
+            false,
+            || {
+                callback_cleanup_count.set(callback_cleanup_count.get() + 1);
+                DirectCallbackLeakMetrics {
+                    leak_events: 0,
+                    leaked_callbacks: 0,
+                }
+            },
+            |_| backend_metric_updates.set(backend_metric_updates.get() + 1),
+        );
+
+        assert_eq!(callback_cleanup_count.get(), 1);
+        assert_eq!(backend_metric_updates.get(), 1);
+    }
+}
+
 fn settle_accepted_output_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     accepted: AcceptedTerminalTransition,

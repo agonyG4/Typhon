@@ -107,7 +107,9 @@ impl NativeRuntime {
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
-        self.scanout.disarm_drm_cleanup();
+        if !self.scanout_destroyed {
+            self.scanout.disarm_drm_cleanup();
+        }
         if let Some(mut cursor) = self.atomic_cursor.take() {
             cursor.disarm_drm_cleanup();
         }
@@ -161,9 +163,13 @@ impl NativeRuntime {
         let safety = classify_kms_teardown_safety(proof);
         self.kms_teardown_safety = safety;
         if !safety.permits_release() {
-            self.scanout.retain_direct_for_unproven_teardown();
+            if !self.scanout_destroyed {
+                self.scanout.retain_direct_for_unproven_teardown();
+            }
             self.server.disarm_shutdown_releases();
-            self.scanout.disarm_drm_cleanup();
+            if !self.scanout_destroyed {
+                self.scanout.disarm_drm_cleanup();
+            }
             self.kms_backend.disarm_drm_io();
             if let Some(cursor) = self.atomic_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
@@ -177,7 +183,9 @@ impl NativeRuntime {
 
     pub(super) fn retain_unproven_teardown_ownership(&mut self) {
         self.server.disarm_shutdown_releases();
-        self.scanout.disarm_drm_cleanup();
+        if !self.scanout_destroyed {
+            self.scanout.disarm_drm_cleanup();
+        }
         self.kms_backend.disarm_drm_io();
         if let Some(cursor) = self.atomic_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
