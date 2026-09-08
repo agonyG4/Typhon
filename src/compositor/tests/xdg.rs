@@ -540,6 +540,81 @@ fn xdg_toplevel_role_destroy_retires_unpublished_explicit_sync_work() {
 }
 
 #[test]
+fn disconnected_client_retires_pending_explicit_sync_work() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.enable_external_acquire_readiness();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let surface_id;
+    {
+        let connection =
+            Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+        let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+            globals.bind(&qh, 3..=3, ()).unwrap();
+        let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+            globals.bind(&qh, 1..=1, ()).unwrap();
+        let acquire_timeline_fd = acquire_timeline.export_timeline_fd().unwrap();
+        let release_timeline_fd = release_timeline.export_timeline_fd().unwrap();
+        let surface = compositor.create_surface(&qh, ());
+        surface_id = surface.id().protocol_id();
+        let sync_surface = syncobj.get_surface(&surface, &qh, ());
+        let sync_acquire_timeline = syncobj.import_timeline(acquire_timeline_fd.as_fd(), &qh, ());
+        let sync_release_timeline = syncobj.import_timeline(release_timeline_fd.as_fd(), &qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        surface.commit();
+        connection.flush().unwrap();
+        let mut state = RegistryTestState::default();
+        queue.roundtrip(&mut state).unwrap();
+
+        let buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff44_4444).unwrap();
+        sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 1);
+        sync_surface.set_release_point(&sync_release_timeline, 0, 2);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, 2, 2);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        wait_for_server_commands(&commands);
+
+        let blocked = capture_xdg_role_snapshot(&commands, surface_id);
+        assert_eq!(
+            blocked.pending_explicit_sync_commits + blocked.pending_surface_tree_transactions,
+            1
+        );
+        assert_eq!(blocked.pending_surface_tree_transactions, 1);
+        assert!(!blocked.renderable_surface);
+    }
+
+    thread::sleep(Duration::from_millis(20));
+    wait_for_server_commands(&commands);
+    let retired = capture_xdg_role_snapshot(&commands, surface_id);
+    assert_eq!(retired.pending_explicit_sync_commits, 0);
+    assert_eq!(retired.pending_surface_tree_transactions, 0);
+    assert!(!retired.surface_registered);
+    assert!(!retired.renderable_surface);
+    assert!(release_timeline.point_signaled(2).unwrap());
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn xdg_popup_role_destroy_retires_unpublished_explicit_sync_work() {
     let Some(acquire_timeline) =
         test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())

@@ -135,6 +135,7 @@ pub enum AcquireWatchCancelReason {
     Superseded,
     SurfaceDestroyed,
     BufferDestroyed,
+    // Retained for telemetry compatibility; protocol proxy destruction does not emit these.
     SyncSurfaceDestroyed,
     TimelineDestroyed,
     ClientDisconnected,
@@ -256,16 +257,18 @@ impl SyncobjSurfaceState {
         self.surface.is_alive()
     }
 
-    pub(super) fn surface_id(&self) -> Option<u32> {
-        self.surface.upgrade().ok().and_then(|surface| {
-            surface
-                .data::<super::SurfaceData>()
-                .map(|data| data.surface_id())
-        })
-    }
-
     pub(super) fn clear_resource(&self) {
         if let Ok(mut guard) = self.resource.lock() {
+            *guard = None;
+        }
+    }
+
+    pub(super) fn destroy_protocol_binding(&self) {
+        self.clear_resource();
+        if let Ok(mut guard) = self.pending_acquire.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.pending_release.lock() {
             *guard = None;
         }
     }

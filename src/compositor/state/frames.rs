@@ -1413,68 +1413,6 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(in crate::compositor) fn cancel_pending_acquire_commits_for_timeline(
-        &mut self,
-        timeline: &crate::syncobj::DrmSyncobjTimeline,
-        reason: AcquireWatchCancelReason,
-    ) {
-        let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
-        let mut released_captures = Vec::new();
-        let mut callbacks = Vec::new();
-        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
-            let uses_timeline = commit.acquire.timeline.same_timeline(timeline)
-                || commit
-                    .pending
-                    .explicit_release
-                    .as_ref()
-                    .is_some_and(|release| release.timeline.same_timeline(timeline));
-            if uses_timeline {
-                commit.pending.release_target().release();
-                callbacks.extend(commit.frame_callbacks);
-                self.discard_presentation_feedbacks(commit.presentation_feedbacks);
-                if let Some(resize) = commit.pending.resize_commit.as_deref() {
-                    released_captures.push((commit.surface_id, resize.commit_sequence));
-                }
-                if self.external_acquire_readiness {
-                    self.pending_acquire_watch_changes
-                        .push(AcquireWatchChange::Cancel {
-                            commit_id: commit.commit_id,
-                            reason,
-                        });
-                }
-            } else {
-                retained.push(commit);
-            }
-        }
-        self.pending_explicit_sync_commits = retained;
-        self.rebuild_scene_work_index();
-        for (surface_id, commit_sequence) in released_captures {
-            self.release_resize_capture(surface_id, commit_sequence);
-        }
-        self.complete_frame_callbacks(callbacks);
-        let tree_roots = self
-            .pending_surface_tree_transactions
-            .iter()
-            .filter(|transaction| {
-                transaction.dependencies.iter().any(|dependency| {
-                    dependency.acquire.timeline.same_timeline(timeline)
-                }) || transaction.nodes.iter().any(|(_, commit)| {
-                    commit.attachment.as_ref().is_some_and(|attachment| {
-                        matches!(attachment, PendingSurfaceAttachment::Buffer(pending) if pending.explicit_release.as_ref().is_some_and(|release| release.timeline.same_timeline(timeline)))
-                    })
-                })
-            })
-            .map(|transaction| transaction.root_surface_id)
-            .collect::<Vec<_>>();
-        for root_surface_id in tree_roots {
-            let released = self.cancel_pending_surface_trees_for_root(root_surface_id, reason);
-            if let Some(resize_commit) = released.resize_commit {
-                self.release_detached_resize_capture(root_surface_id, resize_commit);
-            }
-            self.complete_frame_callbacks(released.callbacks);
-        }
-    }
-
     pub(in crate::compositor) fn enable_external_acquire_readiness(&mut self) {
         if self.external_acquire_readiness {
             return;
