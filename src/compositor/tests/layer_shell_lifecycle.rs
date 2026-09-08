@@ -634,6 +634,395 @@ fn superseded_unready_explicit_sync_commit_discards_presentation_feedback() {
 }
 
 #[test]
+fn synchronized_subsurface_explicit_sync_survives_bufferless_commit() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-explicit-sync",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_sync();
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff44_4444).unwrap();
+
+    sync_surface.set_acquire_point(&acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    child.attach(Some(&buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    acquire_timeline.signal_point(1).unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(surfaces.len(), 2);
+    assert_ne!(surfaces[1].buffer_id, 0);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn synchronized_subsurface_bufferless_explicit_sync_points_are_rejected_at_commit() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (running, server_thread) = spawn_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-invalid-explicit-sync",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff55_5555).unwrap();
+    acquire_timeline.signal_point(1).unwrap();
+    sync_surface.set_acquire_point(&acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    child.attach(Some(&buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    sync_surface.set_acquire_point(&acquire, 0, 3);
+    sync_surface.set_release_point(&release, 0, 4);
+    child.attach(None, 0, 0);
+    child.commit();
+    connection.flush().unwrap();
+
+    assert!(queue.roundtrip(&mut state).is_err());
+    stop_test_server(running, server_thread);
+}
+
+#[test]
+fn delayed_bufferless_publication_does_not_consume_future_explicit_sync_points() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-future-explicit-sync",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff66_6666).unwrap();
+
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    acquire_timeline.signal_point(1).unwrap();
+    sync_surface.set_acquire_point(&acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    child.attach(Some(&buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(surfaces.len(), 2);
+    assert_ne!(surfaces[1].buffer_id, 0);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn synchronized_subsurface_bufferless_commits_preserve_then_null_clears_attachment_sync() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-bufferless-chain",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff77_7777).unwrap();
+
+    acquire_timeline.signal_point(1).unwrap();
+    sync_surface.set_acquire_point(&acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    child.attach(Some(&buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    child.commit();
+    child.commit();
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let retained = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(retained.len(), 2);
+    assert_ne!(retained[1].buffer_id, 0);
+
+    child.attach(None, 0, 0);
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn synchronized_subsurface_attachment_replacement_uses_new_explicit_sync_state() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "layer-subsurface-replacement-sync",
+        64,
+        32,
+    );
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let first_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff88_8888).unwrap();
+    let second_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff99_9999).unwrap();
+
+    acquire_timeline.signal_point(1).unwrap();
+    sync_surface.set_acquire_point(&acquire, 0, 1);
+    sync_surface.set_release_point(&release, 0, 2);
+    child.attach(Some(&first_buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    sync_surface.set_acquire_point(&acquire, 0, 3);
+    sync_surface.set_release_point(&release, 0, 4);
+    child.attach(Some(&second_buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    acquire_timeline.signal_point(3).unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(surfaces.len(), 2);
+    assert_ne!(surfaces[1].buffer_id, 0);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn layer_root_publishes_synchronized_subsurface_transaction() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);

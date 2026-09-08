@@ -221,22 +221,7 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn commit_cursor_surface_removal_request(
-        &mut self,
-        surface_id: u32,
-        explicit_sync: Option<Arc<SyncobjSurfaceState>>,
-    ) {
-        if let Some(sync_state) = explicit_sync {
-            let (acquire, release) = sync_state.take_points();
-            if acquire.is_some() || release.is_some() {
-                sync_state.post_error_with_metrics(
-                    &mut self.compliance_metrics,
-                    SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                    "explicit sync points were set without an attached buffer",
-                );
-                return;
-            }
-        }
+    pub(in crate::compositor) fn commit_cursor_surface_removal_request(&mut self, surface_id: u32) {
         let removed = self.client_cursor_surfaces.remove(&surface_id).is_some();
         self.remove_current_surface_buffer(surface_id);
         if let Some(release) = self.active_dmabuf_buffers.remove(&surface_id) {

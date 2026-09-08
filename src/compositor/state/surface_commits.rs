@@ -893,25 +893,12 @@ impl CompositorState {
         let BufferlessSurfaceCommitState {
             commit_sequence,
             damage,
-            explicit_sync,
             surface_size,
             buffer_scale,
             resize_commit: captured_resize_commit,
             resize_capture_finalized,
             window_geometry,
         } = state;
-        if let Some(sync_state) = explicit_sync {
-            let (acquire, release) = sync_state.take_points();
-            if acquire.is_some() || release.is_some() {
-                sync_state.post_error_with_metrics(
-                    &mut self.compliance_metrics,
-                    SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                    "explicit sync points were set without an attached buffer",
-                );
-                return false;
-            }
-        }
-
         if self.is_cursor_surface(surface_id) {
             if let Some(damage) = damage {
                 self.commit_cursor_surface_damage_only(

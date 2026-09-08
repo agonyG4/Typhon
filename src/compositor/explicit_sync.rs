@@ -191,6 +191,10 @@ impl CapturedExplicitSyncState {
             release,
         }
     }
+
+    pub(super) fn has_points(&self) -> bool {
+        self.acquire.is_some() || self.release.is_some()
+    }
 }
 
 #[derive(Debug)]

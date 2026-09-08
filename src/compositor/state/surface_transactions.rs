@@ -121,7 +121,6 @@ pub(in crate::compositor) struct SurfaceTreeMergeStats {
 pub(in crate::compositor) struct BufferlessSurfaceCommitState {
     pub(in crate::compositor) commit_sequence: SurfaceCommitSequence,
     pub(in crate::compositor) damage: Option<RenderableSurfaceDamage>,
-    pub(in crate::compositor) explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     pub(in crate::compositor) surface_size: Option<BufferSize>,
     pub(in crate::compositor) buffer_scale: u32,
     pub(in crate::compositor) resize_commit: Option<ResizeCommitSnapshot>,
@@ -264,19 +263,8 @@ impl CompositorState {
                 );
             }
             Some(PendingSurfaceAttachment::RemoveContent) => {
-                if let Some(explicit_sync) = explicit_sync
-                    && (explicit_sync.acquire.is_some() || explicit_sync.release.is_some())
-                {
-                    explicit_sync.state.post_error_with_metrics(
-                        &mut self.compliance_metrics,
-                        SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                        "explicit sync points were set without an attached buffer",
-                    );
-                    self.discard_presentation_feedbacks(presentation_feedbacks);
-                    return;
-                }
                 if self.is_cursor_surface(surface_id) {
-                    self.commit_cursor_surface_removal_request(surface_id, None);
+                    self.commit_cursor_surface_removal_request(surface_id);
                     self.note_explicit_commit_published(commit_id);
                     self.complete_frame_callbacks(frame_callbacks);
                     self.activate_current_surface_presentation_commit(
@@ -303,27 +291,11 @@ impl CompositorState {
                 }
             }
             None => {
-                let explicit_sync = match explicit_sync {
-                    Some(explicit_sync)
-                        if explicit_sync.acquire.is_some() || explicit_sync.release.is_some() =>
-                    {
-                        explicit_sync.state.post_error_with_metrics(
-                            &mut self.compliance_metrics,
-                            SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                            "explicit sync points were set without an attached buffer",
-                        );
-                        self.discard_presentation_feedbacks(presentation_feedbacks);
-                        return;
-                    }
-                    Some(explicit_sync) => Some(explicit_sync.state),
-                    None => None,
-                };
                 let activated = self.commit_surface_without_buffer(
                     surface_id,
                     BufferlessSurfaceCommitState {
                         commit_sequence,
                         damage,
-                        explicit_sync,
                         surface_size,
                         buffer_scale: committed_buffer_scale,
                         resize_commit,

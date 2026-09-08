@@ -4,6 +4,30 @@ use super::*;
 
 impl CompositorState {
     const MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT: usize = 8;
+
+    fn normalize_explicit_sync_commit(&mut self, commit: &mut CachedSubsurfaceCommit) -> bool {
+        let has_buffer = matches!(
+            commit.attachment.as_ref(),
+            Some(PendingSurfaceAttachment::Buffer(_))
+        );
+        let Some(explicit_sync) = commit.explicit_sync.as_ref() else {
+            return true;
+        };
+        if has_buffer {
+            return true;
+        }
+        if explicit_sync.has_points() {
+            explicit_sync.state.post_error_with_metrics(
+                &mut self.compliance_metrics,
+                SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+                "explicit sync points were set without an attached buffer",
+            );
+            return false;
+        }
+        commit.explicit_sync = None;
+        true
+    }
+
     pub(in crate::compositor) fn register_subsurface_relationship(
         &mut self,
         surface_id: u32,
@@ -72,6 +96,10 @@ impl CompositorState {
         surface_id: u32,
         mut commit: CachedSubsurfaceCommit,
     ) {
+        if !self.normalize_explicit_sync_commit(&mut commit) {
+            self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+            return;
+        }
         if commit.attachment.is_some() {
             let mut superseded_callbacks = self.supersede_older_pending_attachments_for_surface(
                 surface_id,
