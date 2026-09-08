@@ -2212,6 +2212,47 @@ struct EglImageResource {
     egl_image: Option<egl::Image>,
 }
 
+struct EglImageGuard<F>
+where
+    F: FnMut(egl::Image),
+{
+    image: Option<egl::Image>,
+    destroy: F,
+}
+
+impl<F> EglImageGuard<F>
+where
+    F: FnMut(egl::Image),
+{
+    fn new(image: egl::Image, destroy: F) -> Self {
+        Self {
+            image: Some(image),
+            destroy,
+        }
+    }
+
+    fn image(&self) -> egl::Image {
+        self.image.expect("EGL image guard must own an image")
+    }
+
+    fn disarm(mut self) -> egl::Image {
+        self.image
+            .take()
+            .expect("EGL image guard must own an image")
+    }
+}
+
+impl<F> Drop for EglImageGuard<F>
+where
+    F: FnMut(egl::Image),
+{
+    fn drop(&mut self) {
+        if let Some(image) = self.image.take() {
+            (self.destroy)(image);
+        }
+    }
+}
+
 struct EglSurfaceResource {
     image: EglImageResource,
     dmabuf_key: Option<DmabufImageKey>,
@@ -2818,15 +2859,17 @@ fn create_dmabuf_resource(
         null_client_buffer,
         attributes.as_slice(),
     )?;
+    let image_guard = EglImageGuard::new(image, |image| {
+        let _ = egl.destroy_image(egl_display, image);
+    });
     let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         configure_texture(gl);
-        egl_image_target_texture_2d(glow::TEXTURE_2D, image.as_ptr());
+        egl_image_target_texture_2d(glow::TEXTURE_2D, image_guard.image().as_ptr());
         let error = gl.get_error();
         if error != glow::NO_ERROR {
             gl.delete_texture(texture);
-            let _ = egl.destroy_image(egl_display, image);
             return Err(io::Error::other(format!(
                 "glEGLImageTargetTexture2DOES failed with GL error 0x{error:x}"
             ))
@@ -2839,7 +2882,7 @@ fn create_dmabuf_resource(
         texture,
         size: (size.width, size.height),
         generation,
-        egl_image: Some(image),
+        egl_image: Some(image_guard.disarm()),
     })
 }
 
@@ -3420,6 +3463,80 @@ mod tests {
         fn drop(&mut self) {
             self.0.set(self.0.get().saturating_add(1));
         }
+    }
+
+    fn fake_egl_image() -> egl::Image {
+        // SAFETY: the fake handle is only passed to the test cleanup probe;
+        // it is never sent to EGL.
+        unsafe { egl::Image::from_ptr(std::ptr::NonNull::<c_void>::dangling().as_ptr()) }
+    }
+
+    #[test]
+    fn failed_image_creation_has_no_cleanup_owner() {
+        let image_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let image_result: Result<egl::Image, ()> = Err(());
+
+        if let Ok(image) = image_result {
+            let cleanup_count = std::rc::Rc::clone(&image_cleanup_count);
+            let _guard = EglImageGuard::new(image, move |_| {
+                cleanup_count.set(cleanup_count.get() + 1);
+            });
+        }
+
+        assert_eq!(image_cleanup_count.get(), 0);
+    }
+
+    #[test]
+    fn texture_creation_failure_destroys_acquired_image_once() {
+        let image_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let texture_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let cleanup_count = std::rc::Rc::clone(&image_cleanup_count);
+            let _guard = EglImageGuard::new(fake_egl_image(), move |_| {
+                cleanup_count.set(cleanup_count.get() + 1);
+            });
+            let _texture: Result<(), ()> = Err(());
+            assert!(_texture.is_err());
+        }
+
+        assert_eq!(image_cleanup_count.get(), 1);
+        assert_eq!(texture_cleanup_count.get(), 0);
+    }
+
+    #[test]
+    fn binding_failure_deletes_texture_and_destroys_image_once() {
+        let image_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let texture_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let cleanup_count = std::rc::Rc::clone(&image_cleanup_count);
+            let _guard = EglImageGuard::new(fake_egl_image(), move |_| {
+                cleanup_count.set(cleanup_count.get() + 1);
+            });
+            texture_cleanup_count.set(texture_cleanup_count.get() + 1);
+        }
+
+        assert_eq!(image_cleanup_count.get(), 1);
+        assert_eq!(texture_cleanup_count.get(), 1);
+    }
+
+    #[test]
+    fn successful_construction_transfers_image_without_double_cleanup() {
+        let image_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let texture_cleanup_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let image = {
+            let cleanup_count = std::rc::Rc::clone(&image_cleanup_count);
+            let guard = EglImageGuard::new(fake_egl_image(), move |_| {
+                cleanup_count.set(cleanup_count.get() + 1);
+            });
+            guard.disarm()
+        };
+
+        texture_cleanup_count.set(texture_cleanup_count.get() + 1);
+        image_cleanup_count.set(image_cleanup_count.get() + 1);
+        let _ = image;
+
+        assert_eq!(image_cleanup_count.get(), 1);
+        assert_eq!(texture_cleanup_count.get(), 1);
     }
 
     fn native_candidate(config_id: egl::Int, native_visual_id: u32) -> NativeEglConfigCandidate {
