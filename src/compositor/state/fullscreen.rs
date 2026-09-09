@@ -548,9 +548,12 @@ impl CompositorState {
                     .toplevel_window_state(owner)
                     .is_some_and(WindowState::is_minimized)
         });
+        let owner_transition_pending = owner_root_surface_id
+            .is_some_and(|owner| self.presentation_animation_pending_for_root(owner));
         let solitary_tree_active = owner_root_surface_id.is_some()
             && eligibility.exactly_covers_output
             && owner_not_minimized
+            && !owner_transition_pending
             && !popup_visible
             && owner_root_surface_id.is_none_or(|owner| {
                 !self.has_visible_application_content_outside_fullscreen_owner(owner)

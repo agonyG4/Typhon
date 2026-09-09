@@ -622,6 +622,79 @@ mod task_05_8_tests {
     }
 
     #[test]
+    fn animated_fullscreen_owner_keeps_background_until_physical_settlement() {
+        let mut state = CompositorState::default();
+        let rear_window = WindowId::from_raw(11).expect("rear window id");
+        let fullscreen_window = WindowId::from_raw(12).expect("fullscreen window id");
+        let mut rear = test_surface(511, 320, 200);
+        rear.placement = SurfacePlacement::root_at(100, 100);
+        let mut owner = test_surface(512, 1280, 800);
+        owner.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![rear, owner],
+            &[(511, rear_window), (512, fullscreen_window)],
+            Some(512),
+        );
+        state.start_test_presentation_transition(
+            512,
+            PresentationRect::new(100.0, 100.0, 320.0, 200.0).expect("owner start rect"),
+            PresentationRect::new(0.0, 0.0, 1280.0, 800.0).expect("owner target rect"),
+            AnimationTime::from_nanos(0),
+        );
+
+        assert!(state.presentation_animation_pending_for_root(512));
+        let metrics = state.fullscreen_render_plan_metrics();
+        assert!(!metrics.solitary_tree_active);
+        assert_eq!(
+            state
+                .native_frame_renderable_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [511, 512]
+        );
+        let targets = state.native_frame_presentation_targets(state.active_scene_surfaces());
+        let sample = state.presentation_scene_sample_for_targets_at(
+            AnimationTime::from_nanos(2_000_000),
+            &targets,
+        );
+        assert!(sample.transform_for_root(512).is_some());
+        assert!(
+            sample
+                .windows
+                .iter()
+                .any(|window| window.key == 512 && window.mathematically_settled)
+        );
+        assert!(state.presentation_animation_pending_for_root(512));
+        assert!(!state.fullscreen_render_plan_metrics().solitary_tree_active);
+
+        let snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            state.presented_window_geometries_for_targets(&sample, &targets),
+        );
+        state.publish_presented_presentation(1, &snapshot);
+        assert!(!state.presentation_animation_pending_for_root(512));
+        assert!(state.fullscreen_render_plan_metrics().solitary_tree_active);
+        assert_eq!(
+            state
+                .native_frame_renderable_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [512]
+        );
+
+        state.start_test_presentation_transition(
+            511,
+            PresentationRect::new(100.0, 100.0, 320.0, 200.0).expect("rear start rect"),
+            PresentationRect::new(140.0, 100.0, 320.0, 200.0).expect("rear target rect"),
+            AnimationTime::from_nanos(0),
+        );
+        assert!(state.fullscreen_render_plan_metrics().solitary_tree_active);
+        assert!(!state.presentation_animation_has_pending_visible());
+    }
+
+    #[test]
     pub(in crate::compositor) fn task_05_8_presented_window_projection_survives_canonical_race() {
         let mut state = CompositorState::default();
         let root_id = 52;

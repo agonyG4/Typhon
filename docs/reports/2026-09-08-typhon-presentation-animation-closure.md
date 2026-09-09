@@ -299,3 +299,37 @@ at the existing integer-consumer boundaries. The known source-layout check still
 reports the repository's pre-existing 42 oversized files; this closure does not
 perform unrelated module extraction. The next compositor task remains Dwindle
 v1.2.
+
+## Final animated-fullscreen coverage closure (2026-09-09)
+
+The native-frame membership closure exposed one remaining coverage edge during
+fullscreen entry. Canonical fullscreen geometry can cover the output before the
+fullscreen owner's floating-to-fullscreen presentation transition has physically
+settled. Treating canonical coverage as proof of current coverage would cull the
+rear desktop while the owner still occupied only part of the physical frame.
+
+Solitary fullscreen composition now additionally requires that the fullscreen
+owner have no pending presentation transition. This uses the existing
+owner-specific animator query, not global frame-visible pending state, so it does
+not create recursive membership resolution and a hidden rear transition cannot
+disable steady-state fullscreen culling. Mathematical settlement is not enough:
+the transition remains pending until its final frame is physically promoted and
+the exact transition ID is acknowledged. The next naturally resolved frame may
+then cull the rear scene without a synthetic cleanup frame, timer, or render
+generation bump.
+
+During entry, normal active-scene membership remains underneath the partially
+presented owner, while the existing window-space presentation transform remains
+authoritative for the owner, subsurfaces, SSD, popups, and effects. XDG and
+XWayland use the same `FullscreenPresentationState` and render-plan policy; no
+backend-specific culling rule was added. Direct Scanout keeps its existing global
+visible-animation blocker: the owner's transition blocks it during entry, while
+hidden rear transitions remain irrelevant after owner settlement.
+
+The regression covers canonical output-sized ownership with a pending owner
+transition, mathematically settled-but-unacknowledged state, exact physical ACK,
+post-ACK solitary culling, and a hidden rear transition that does not disable
+solitude or create visible animation demand. No live DRM/KMS or 1920x1080@165 Hz
+hardware qualification was performed. Existing fractional/subpixel deferral and
+the known 42-file source-layout debt remain unchanged; the next compositor task
+remains Dwindle v1.2.

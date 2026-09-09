@@ -376,6 +376,13 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
         .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace)
         .unwrap();
     wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 1,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let hidden_metrics = capture_fullscreen_render_plan_metrics(&commands);
     assert_eq!(hidden_metrics.owner_root_surface_id, Some(surface_ids[2]));

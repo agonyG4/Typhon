@@ -257,6 +257,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureAndCompleteRenderedLegacyPreparedFrame,
     CaptureLegacySubmittedAndPreparedFrames,
     CapturePreparedFrame(Sender<bool>),
+    PublishTestPresentationAt {
+        frame_id: u64,
+        at: AnimationTime,
+    },
     SettleNoVisualChangeWork {
         owns_frame_batch: bool,
         reply: Sender<bool>,
@@ -1069,6 +1073,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CapturePreparedFrame(reply) => {
                         let _ = reply.send(server.has_prepared_frame_batch());
+                    }
+                    ServerCommand::PublishTestPresentationAt { frame_id, at } => {
+                        server.publish_test_presentation_at(frame_id, at);
                     }
                     ServerCommand::SettleNoVisualChangeWork {
                         owns_frame_batch,

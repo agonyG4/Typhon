@@ -1016,6 +1016,18 @@ impl OwnCompositorServer {
             .start_test_presentation_transition(root_surface_id, start, target, at);
     }
 
+    #[doc(hidden)]
+    pub fn publish_test_presentation_at(&mut self, frame_id: u64, at: AnimationTime) {
+        let (surfaces, _) = self.native_frame_renderable_surfaces_with_metrics();
+        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
+        let presentation = self.presentation_scene_sample_for_targets_at(at, &targets);
+        let snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &presentation,
+            self.presented_window_geometries_for_targets(&presentation, &targets),
+        );
+        self.publish_presented_presentation(frame_id, &snapshot);
+    }
+
     pub fn presentation_scene_sample_at(&self, at: AnimationTime) -> PresentationSceneSample {
         self.state.presentation_scene_sample_at(at)
     }
