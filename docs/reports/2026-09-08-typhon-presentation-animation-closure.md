@@ -255,3 +255,47 @@ file in an existing process cleanup test; the exact test passed in isolation,
 and the final complete locked run passed. No live DRM/KMS or 1920x1080@165 Hz
 hardware qualification is claimed. The next compositor task remains Dwindle
 v1.2.
+
+## Final native-frame membership authority closure (2026-09-09)
+
+The final review found that the native frame builder sampled presentation
+transitions from the active scene before fullscreen composition had selected the
+surfaces that belonged to the frame. A rear window hidden by a solitary
+fullscreen owner could therefore be sampled, included in physical presentation
+metadata, acknowledged by the owner's pageflip, counted as pending visible work,
+or block Direct Scanout even though it was absent from the rendered frame.
+
+Native frame resolution now computes the fullscreen/composition membership once,
+derives one immutable frame-local target set from those canonical surfaces, and
+passes that same set through animation sampling, surface transform application,
+and `PresentedWindowGeometry` creation. Presentation-owner roots are deduplicated
+in deterministic frame-surface order, so subsurfaces and popup trees retain their
+existing owner semantics without re-scanning the active scene. Hidden transitions
+remain stored and continue to use the existing absolute-time analytical clock, but
+they are unsampled, absent from the physical snapshot, not acknowledged, and do
+not create visible animation demand until their owner is frame-visible again.
+
+Physical input now treats an absent tracked toplevel in the latest promoted
+window projection as not hittable. This preserves popup/SSD ownership and
+non-window fallback behavior while closing the fullscreen-exit gap where
+canonical state could become interactive before its restore frame pageflipped.
+The existing replacement semantics of the physical projection and render-ahead
+scene history remain unchanged; a future frame cannot change input membership or
+acknowledge a transition before physical promotion. Direct Scanout behavior is
+unchanged for the fullscreen owner's own transitions, while a transition owned
+only by a culled rear window no longer produces the animation blocker.
+
+Added regressions cover the real native `ResolvedNativeFrameScene` path, hidden
+transition retention and final-frame acknowledgement after fullscreen reveal,
+physical input membership, and the Direct Scanout hidden-versus-owner animation
+blocker distinction. The native frame test also asserts that rendered surface
+membership, presentation-owner target membership, and physical window metadata
+are identical for the fullscreen frame.
+
+Verification for this follow-up reuses the existing `target/` directory. No live
+DRM/KMS or 1920x1080@165 Hz hardware qualification was performed, so no hardware
+qualification claim is made. Fractional/subpixel presentation remains deferred
+at the existing integer-consumer boundaries. The known source-layout check still
+reports the repository's pre-existing 42 oversized files; this closure does not
+perform unrelated module extraction. The next compositor task remains Dwindle
+v1.2.

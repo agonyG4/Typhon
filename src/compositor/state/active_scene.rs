@@ -1,5 +1,6 @@
 use super::*;
 use crate::wm::{SpecialWorkspaceId, WorkspaceId};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct ActiveSceneSelection {
@@ -103,30 +104,109 @@ impl CompositorState {
         )
     }
 
-    fn presentation_window_targets(&self) -> Vec<(u32, PresentationRect)> {
-        self.active_scene_surfaces()
+    fn presentation_targets_for_surfaces(
+        &self,
+        surfaces: &[RenderableSurface],
+    ) -> NativeFramePresentationTargets {
+        let mut seen_roots = std::collections::HashSet::new();
+        let windows = surfaces
             .iter()
-            .enumerate()
-            .filter(|(_, surface)| {
-                surface.placement.parent_surface_id.is_none()
-                    && self.root_surface_id_for_surface(surface.surface_id) == surface.surface_id
-            })
-            .filter_map(|(_, surface)| {
+            .filter_map(|surface| {
+                let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+                if !seen_roots.insert(root_surface_id)
+                    || self.window_id_for_surface(root_surface_id).is_none()
+                {
+                    return None;
+                }
                 let geometry = self
-                    .current_visual_root_window_geometry(surface.surface_id)
-                    .or_else(|| self.current_root_window_geometry(surface.surface_id))?;
-                let rect = self.presentation_rect_for_geometry(surface.surface_id, geometry)?;
-                Some((surface.surface_id, rect))
+                    .current_visual_root_window_geometry(root_surface_id)
+                    .or_else(|| self.current_root_window_geometry(root_surface_id))?;
+                let canonical_rect =
+                    self.presentation_rect_for_geometry(root_surface_id, geometry)?;
+                Some(PresentationWindowTarget::new(
+                    root_surface_id,
+                    canonical_rect,
+                ))
             })
-            .collect()
+            .collect();
+        NativeFramePresentationTargets::from_windows(windows)
+    }
+
+    pub(in crate::compositor) fn native_frame_presentation_targets(
+        &self,
+        surfaces: &[RenderableSurface],
+    ) -> NativeFramePresentationTargets {
+        self.presentation_targets_for_surfaces(surfaces)
+    }
+
+    #[doc(hidden)]
+    pub fn install_native_frame_test_scene(
+        &mut self,
+        surfaces: Vec<RenderableSurface>,
+        windows: &[(u32, WindowId)],
+        fullscreen_owner: Option<u32>,
+    ) {
+        self.renderable_surfaces = surfaces;
+        self.rebuild_renderable_surface_index();
+        self.surface_placements = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| (surface.surface_id, surface.placement))
+            .collect();
+        self.window_by_root_surface.clear();
+        self.desktop_windows.clear();
+        self.window_stacking.clear();
+        for &(root_surface_id, window_id) in windows {
+            self.window_by_root_surface
+                .insert(root_surface_id, window_id);
+            self.desktop_windows.insert(
+                window_id,
+                DesktopWindow::new_xdg(window_id, root_surface_id),
+            );
+            self.window_stacking.push(window_id);
+        }
+        self.fullscreen_presentation =
+            fullscreen_owner.map(|owner_root_surface_id| FullscreenPresentationState {
+                owner_root_surface_id,
+                output_width: self.output_size.width,
+                output_height: self.output_size.height,
+            });
+        self.rebuild_active_scene_view();
+    }
+
+    #[doc(hidden)]
+    pub fn start_test_presentation_transition(
+        &mut self,
+        root_surface_id: u32,
+        start: PresentationRect,
+        target: PresentationRect,
+        at: AnimationTime,
+    ) {
+        let _ = self.presentation_animator.start(
+            root_surface_id,
+            start,
+            target,
+            at,
+            AnimationCurve::easing(Duration::from_millis(1), EasingCurve::Linear),
+        );
     }
 
     pub(in crate::compositor) fn presentation_scene_sample_at(
         &self,
         at: AnimationTime,
     ) -> PresentationSceneSample {
+        let targets = self.presentation_targets_for_surfaces(self.active_scene_surfaces());
         self.presentation_animator
-            .sample_scene(at, &self.presentation_window_targets())
+            .sample_scene(at, targets.windows())
+    }
+
+    pub(in crate::compositor) fn presentation_scene_sample_for_targets_at(
+        &self,
+        at: AnimationTime,
+        targets: &NativeFramePresentationTargets,
+    ) -> PresentationSceneSample {
+        self.presentation_animator
+            .sample_scene(at, targets.windows())
     }
 
     pub(in crate::compositor) fn presentation_animation_has_unsettled_visible_at(
@@ -137,11 +217,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn presentation_animation_has_pending_visible(&self) -> bool {
-        let visible_keys = self
-            .presentation_window_targets()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect::<Vec<_>>();
+        let surfaces = self.native_frame_renderable_surfaces();
+        let targets = self.native_frame_presentation_targets(surfaces.as_ref());
+        let visible_keys = targets.root_surface_ids().collect::<Vec<_>>();
         self.presentation_animator
             .has_pending_visible(&visible_keys)
     }
@@ -188,18 +266,21 @@ impl CompositorState {
         self.presentation_rect_for_geometry(root_surface_id, geometry)
     }
 
-    pub(in crate::compositor) fn native_frame_presented_window_geometries(
+    pub(in crate::compositor) fn presented_window_geometries_for_targets(
         &self,
         presentation: &PresentationSceneSample,
+        targets: &NativeFramePresentationTargets,
     ) -> Vec<PresentedWindowGeometry> {
-        let mut windows = self
-            .presentation_window_targets()
-            .into_iter()
-            .filter(|(root_surface_id, _)| self.window_id_for_surface(*root_surface_id).is_some())
-            .map(|(root_surface_id, canonical_rect)| {
+        let mut windows = targets
+            .windows()
+            .iter()
+            .map(|target| {
+                let root_surface_id = target.root_surface_id();
                 let presented_rect = presentation
                     .transform_for_root(root_surface_id)
-                    .map_or(canonical_rect, |transform| transform.presented_rect);
+                    .map_or(target.canonical_rect(), |transform| {
+                        transform.presented_rect
+                    });
                 PresentedWindowGeometry::new(root_surface_id, presented_rect)
             })
             .collect::<Vec<_>>();

@@ -352,7 +352,7 @@ impl CompositorState {
         hit
     }
 
-    fn presentation_input_point_for_root(
+    pub(in crate::compositor) fn presentation_input_point_for_root(
         &self,
         root_surface_id: u32,
         x: f64,
@@ -365,6 +365,12 @@ impl CompositorState {
             return Some((x, y, (0, 0)));
         };
         let presentation_owner = self.presentation_owner_root_for_surface(root_surface_id);
+        if self.window_id_for_surface(presentation_owner).is_some()
+            && self.presented_presentation_frame_id != 0
+            && self.presented_window_geometry(presentation_owner).is_none()
+        {
+            return None;
+        }
         let interaction_takes_over = self
             .window_interaction
             .is_some_and(|interaction| interaction.root_surface_id == presentation_owner);

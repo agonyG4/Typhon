@@ -145,7 +145,13 @@ impl CompositorState {
                 software_cursor_visible: false,
             };
         };
-        let Some(_toplevel) = self.toplevel_surfaces.get(&owner.owner_root_surface_id) else {
+        let owner_has_toplevel = self
+            .toplevel_surfaces
+            .contains_key(&owner.owner_root_surface_id)
+            || self
+                .window_by_root_surface
+                .contains_key(&owner.owner_root_surface_id);
+        if !owner_has_toplevel {
             return FullscreenPresentationEligibility {
                 owner: Some(owner),
                 eligible: false,
@@ -591,33 +597,42 @@ impl CompositorState {
     pub(in crate::compositor) fn native_frame_renderable_surfaces(
         &self,
     ) -> Cow<'_, [RenderableSurface]> {
+        self.native_frame_renderable_surfaces_with_metrics().0
+    }
+
+    pub(in crate::compositor) fn native_frame_renderable_surfaces_with_metrics(
+        &self,
+    ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {
         let surfaces: Cow<'_, [RenderableSurface]> = Cow::Borrowed(self.active_scene_surfaces());
         let metrics = self.fullscreen_render_plan_metrics();
         if !metrics.solitary_tree_active {
-            return surfaces;
+            return (surfaces, metrics);
         }
         let Some(owner_root_surface_id) = metrics.owner_root_surface_id else {
-            return surfaces;
+            return (surfaces, metrics);
         };
         let overlay_tree_root_ids = self.fullscreen_overlay_tree_root_ids();
-        Cow::Owned(
-            surfaces
-                .iter()
-                .filter(|surface| {
-                    let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-                    root_surface_id == owner_root_surface_id
-                        || overlay_tree_root_ids.contains(&root_surface_id)
-                })
-                .cloned()
-                .collect(),
+        (
+            Cow::Owned(
+                surfaces
+                    .iter()
+                    .filter(|surface| {
+                        let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
+                        root_surface_id == owner_root_surface_id
+                            || overlay_tree_root_ids.contains(&root_surface_id)
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            metrics,
         )
     }
 
-    pub(in crate::compositor) fn native_frame_renderable_surfaces_with_presentation(
+    pub(in crate::compositor) fn apply_presentation_to_native_frame_surfaces<'a>(
         &self,
+        surfaces: Cow<'a, [RenderableSurface]>,
         sample: &PresentationSceneSample,
-    ) -> Cow<'_, [RenderableSurface]> {
-        let surfaces = self.native_frame_renderable_surfaces();
+    ) -> Cow<'a, [RenderableSurface]> {
         if sample.transforms.is_empty() {
             return surfaces;
         }

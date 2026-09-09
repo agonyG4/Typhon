@@ -28,13 +28,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     }
 
     pub(crate) fn from_server_at(server: &'a OwnCompositorServer, at: AnimationTime) -> Self {
-        let presentation = server.presentation_scene_sample_at(at);
-        let canonical_surfaces = server.native_frame_renderable_surfaces();
-        let surfaces = server.native_frame_renderable_surfaces_with_presentation(&presentation);
-        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
-            &presentation,
-            server.native_frame_presented_window_geometries(&presentation),
-        );
+        let (canonical_surfaces, visibility) =
+            server.native_frame_renderable_surfaces_with_metrics();
+        let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
+        let presentation = server.presentation_scene_sample_for_targets_at(at, &targets);
         let decorations = server
             .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)
             .into_iter()
@@ -45,6 +42,12 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                     .unwrap_or(decoration)
             })
             .collect::<Vec<_>>();
+        let surfaces =
+            server.apply_presentation_to_native_frame_surfaces(canonical_surfaces, &presentation);
+        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &presentation,
+            server.presented_window_geometries_for_targets(&presentation, &targets),
+        );
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids();
         let render_generation = server.scene_render_generation();
@@ -63,7 +66,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             popup_surface_ids,
             external_overlay_surface_ids,
             render_generation,
-            visibility: server.fullscreen_render_plan_metrics(),
+            visibility,
             snapshot,
             effects,
             presentation,
@@ -578,7 +581,96 @@ pub(crate) fn update_cursor_output_arbitration(
 
 #[cfg(test)]
 mod tests {
-    use super::NativeCursorOutputArbitration;
+    use super::{NativeCursorOutputArbitration, ResolvedNativeFrameScene};
+    use oblivion_one::compositor::OwnCompositorServer;
+    use oblivion_one::compositor::{
+        AnimationTime, PresentationRect, RenderableSurface, RenderableSurfaceDamage,
+        SurfaceCommitSequence, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
+        WindowId,
+    };
+    use oblivion_one::render_backend::buffer::{
+        BufferIdAllocator, BufferSize, CommittedSurfaceBuffer,
+    };
+    use std::process;
+    use wayland_server::protocol::wl_output;
+
+    fn test_surface(
+        surface_id: u32,
+        width: u32,
+        height: u32,
+        placement: SurfacePlacement,
+    ) -> RenderableSurface {
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement,
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(width, height).expect("test surface size"),
+                vec![0; width as usize * height as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            opaque_region: SurfaceOpaqueRegion::None,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
+
+    #[test]
+    fn resolved_native_frame_scene_excludes_culled_transition_owner() {
+        let socket_name = format!("typhon-frame-membership-{}", process::id());
+        let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind compositor for frame-membership regression");
+        let rear = test_surface(601, 320, 200, SurfacePlacement::root_at(100, 100));
+        let owner = test_surface(602, 1280, 800, SurfacePlacement::absolute_root_at(0, 0));
+        let rear_rect =
+            PresentationRect::new(100.0, 100.0, 320.0, 200.0).expect("rear presentation rect");
+        let settled_rear_rect = PresentationRect::new(140.0, 100.0, 320.0, 200.0)
+            .expect("settled rear presentation rect");
+        server.install_native_frame_test_scene(
+            vec![rear, owner],
+            &[
+                (601, WindowId::from_raw(1).expect("rear window id")),
+                (602, WindowId::from_raw(2).expect("fullscreen window id")),
+            ],
+            Some(602),
+        );
+        server.start_test_presentation_transition(
+            601,
+            rear_rect,
+            settled_rear_rect,
+            AnimationTime::from_nanos(0),
+        );
+
+        let resolved =
+            ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(2_000_000));
+
+        assert_eq!(resolved.surface_ids().collect::<Vec<_>>(), [602]);
+        assert!(resolved.presentation.transform_for_root(601).is_none());
+        assert_eq!(
+            resolved
+                .presentation_snapshot
+                .presented_windows
+                .iter()
+                .map(|window| window.root_surface_id())
+                .collect::<Vec<_>>(),
+            [602]
+        );
+    }
 
     #[test]
     fn stale_atomic_cursor_debt_is_cleared_without_clearing_software_work() {

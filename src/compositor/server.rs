@@ -17,9 +17,9 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    AnimationTime, EffectFrameDemandSnapshot, PresentationAnimationMetrics,
-    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
-    PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
+    AnimationTime, EffectFrameDemandSnapshot, NativeFramePresentationTargets,
+    PresentationAnimationMetrics, PresentationFrameSnapshot, PresentationGroupTransform,
+    PresentationRect, PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
     ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
 };
 #[cfg(test)]
@@ -76,9 +76,9 @@ use super::{
     ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
     SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePresentationMetadata,
-    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowInteractionDebugSnapshot,
-    WindowInteractionEndReason, XwaylandSceneBatchError, XwaylandSceneBatchToken,
-    XwaylandSceneMetricsSnapshot, color,
+    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
         ResolvedPointerConstraintBackendRequest,
@@ -980,16 +980,62 @@ impl OwnCompositorServer {
         self.state.native_frame_renderable_surfaces()
     }
 
+    pub fn native_frame_renderable_surfaces_with_metrics(
+        &self,
+    ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {
+        self.state.native_frame_renderable_surfaces_with_metrics()
+    }
+
+    pub fn native_frame_presentation_targets(
+        &self,
+        surfaces: &[RenderableSurface],
+    ) -> NativeFramePresentationTargets {
+        self.state.native_frame_presentation_targets(surfaces)
+    }
+
+    #[doc(hidden)]
+    pub fn install_native_frame_test_scene(
+        &mut self,
+        surfaces: Vec<RenderableSurface>,
+        windows: &[(u32, WindowId)],
+        fullscreen_owner: Option<u32>,
+    ) {
+        self.state
+            .install_native_frame_test_scene(surfaces, windows, fullscreen_owner);
+    }
+
+    #[doc(hidden)]
+    pub fn start_test_presentation_transition(
+        &mut self,
+        root_surface_id: u32,
+        start: PresentationRect,
+        target: PresentationRect,
+        at: AnimationTime,
+    ) {
+        self.state
+            .start_test_presentation_transition(root_surface_id, start, target, at);
+    }
+
     pub fn presentation_scene_sample_at(&self, at: AnimationTime) -> PresentationSceneSample {
         self.state.presentation_scene_sample_at(at)
     }
 
-    pub fn native_frame_renderable_surfaces_with_presentation(
+    pub fn presentation_scene_sample_for_targets_at(
         &self,
-        sample: &PresentationSceneSample,
-    ) -> Cow<'_, [RenderableSurface]> {
+        at: AnimationTime,
+        targets: &NativeFramePresentationTargets,
+    ) -> PresentationSceneSample {
         self.state
-            .native_frame_renderable_surfaces_with_presentation(sample)
+            .presentation_scene_sample_for_targets_at(at, targets)
+    }
+
+    pub fn apply_presentation_to_native_frame_surfaces<'a>(
+        &self,
+        surfaces: Cow<'a, [RenderableSurface]>,
+        sample: &PresentationSceneSample,
+    ) -> Cow<'a, [RenderableSurface]> {
+        self.state
+            .apply_presentation_to_native_frame_surfaces(surfaces, sample)
     }
 
     pub fn presentation_animation_has_unsettled_visible_at(&self, at: AnimationTime) -> bool {
@@ -1031,12 +1077,13 @@ impl OwnCompositorServer {
             .current_presentation_rect_for_root(root_surface_id)
     }
 
-    pub fn native_frame_presented_window_geometries(
+    pub fn presented_window_geometries_for_targets(
         &self,
         presentation: &PresentationSceneSample,
+        targets: &NativeFramePresentationTargets,
     ) -> Vec<PresentedWindowGeometry> {
         self.state
-            .native_frame_presented_window_geometries(presentation)
+            .presented_window_geometries_for_targets(presentation, targets)
     }
 
     pub fn presented_presentation_frame_id(&self) -> u64 {

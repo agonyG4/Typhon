@@ -487,11 +487,13 @@ mod task_05_8_tests {
         );
         let window_id = WindowId::from_raw(1).expect("CSD window id");
         state.window_by_root_surface.insert(root_id, window_id);
+        let targets = state.native_frame_presentation_targets(state.active_scene_surfaces());
         assert_eq!(
             state
-                .native_frame_presented_window_geometries(&PresentationSceneSample::empty(
-                    AnimationTime::from_nanos(0),
-                ))
+                .presented_window_geometries_for_targets(
+                    &PresentationSceneSample::empty(AnimationTime::from_nanos(0)),
+                    &targets,
+                )
                 .into_iter()
                 .find(|window| window.root_surface_id() == root_id)
                 .expect("identity CSD window projection")
@@ -518,6 +520,104 @@ mod task_05_8_tests {
                 .canonical_rect,
             canonical_window_rect,
             "active transitions must use the canonical window rect"
+        );
+    }
+
+    #[test]
+    fn native_frame_membership_keeps_culled_transition_until_physical_reveal() {
+        let mut state = CompositorState::default();
+        let rear_window = WindowId::from_raw(1).expect("rear window id");
+        let fullscreen_window = WindowId::from_raw(2).expect("fullscreen window id");
+        let mut rear = test_surface(501, 320, 200);
+        rear.placement = SurfacePlacement::root_at(100, 100);
+        let mut owner = test_surface(502, 1280, 800);
+        owner.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![rear, owner],
+            &[(501, rear_window), (502, fullscreen_window)],
+            Some(502),
+        );
+        let rear_start =
+            PresentationRect::new(100.0, 100.0, 320.0, 200.0).expect("rear start rect");
+        let rear_target =
+            PresentationRect::new(140.0, 100.0, 320.0, 200.0).expect("rear target rect");
+        state.start_test_presentation_transition(
+            501,
+            rear_start,
+            rear_target,
+            AnimationTime::from_nanos(0),
+        );
+
+        let canonical = state.native_frame_renderable_surfaces();
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [502]
+        );
+        let hidden_targets = state.native_frame_presentation_targets(canonical.as_ref());
+        assert_eq!(hidden_targets.root_surface_ids().collect::<Vec<_>>(), [502]);
+        let hidden_sample = state.presentation_scene_sample_for_targets_at(
+            AnimationTime::from_nanos(2_000_000),
+            &hidden_targets,
+        );
+        assert!(hidden_sample.transform_for_root(501).is_none());
+        assert!(!state.presentation_animation_has_pending_visible());
+        assert!(
+            !state
+                .direct_scanout_scene_blockers()
+                .reasons()
+                .contains(&DirectScanoutSceneRejection::AnimationTransform)
+        );
+        state.start_test_presentation_transition(
+            502,
+            PresentationRect::new(0.0, 0.0, 1280.0, 800.0).expect("owner start rect"),
+            PresentationRect::new(1.0, 0.0, 1280.0, 800.0).expect("owner target rect"),
+            AnimationTime::from_nanos(0),
+        );
+        assert!(
+            state
+                .direct_scanout_scene_blockers()
+                .reasons()
+                .contains(&DirectScanoutSceneRejection::AnimationTransform)
+        );
+        state.presentation_animator.cancel(502);
+        let fullscreen_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &hidden_sample,
+            state.presented_window_geometries_for_targets(&hidden_sample, &hidden_targets),
+        );
+        state.publish_presented_presentation(1, &fullscreen_snapshot);
+        assert_eq!(state.presentation_animator.active_count(), 1);
+        assert!(
+            state
+                .presentation_input_point_for_root(501, 120.0, 120.0)
+                .is_none()
+        );
+
+        state.clear_fullscreen_presentation_owner(502);
+        let restored = state.native_frame_renderable_surfaces();
+        let restored_targets = state.native_frame_presentation_targets(restored.as_ref());
+        assert_eq!(
+            restored_targets.root_surface_ids().collect::<Vec<_>>(),
+            [501, 502]
+        );
+        let restored_sample = state.presentation_scene_sample_for_targets_at(
+            AnimationTime::from_nanos(2_000_000),
+            &restored_targets,
+        );
+        assert!(restored_sample.transform_for_root(501).is_some());
+        assert!(state.presentation_animation_has_pending_visible());
+        let restored_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &restored_sample,
+            state.presented_window_geometries_for_targets(&restored_sample, &restored_targets),
+        );
+        state.publish_presented_presentation(2, &restored_snapshot);
+        assert_eq!(state.presentation_animator.active_count(), 0);
+        assert!(
+            state
+                .presentation_input_point_for_root(501, 120.0, 120.0)
+                .is_some()
         );
     }
 

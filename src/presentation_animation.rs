@@ -99,6 +99,54 @@ impl PresentationRect {
     }
 }
 
+/// One frame-local presentation owner and its canonical window-space rect.
+///
+/// The native output path constructs these only from its already-filtered
+/// renderable surface set. They are not persistent compositor visibility
+/// state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresentationWindowTarget {
+    root_surface_id: u32,
+    canonical_rect: PresentationRect,
+}
+
+impl PresentationWindowTarget {
+    pub const fn new(root_surface_id: u32, canonical_rect: PresentationRect) -> Self {
+        Self {
+            root_surface_id,
+            canonical_rect,
+        }
+    }
+
+    pub const fn root_surface_id(self) -> u32 {
+        self.root_surface_id
+    }
+
+    pub const fn canonical_rect(self) -> PresentationRect {
+        self.canonical_rect
+    }
+}
+
+/// Immutable frame-local presentation-owner targets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NativeFramePresentationTargets {
+    windows: Vec<PresentationWindowTarget>,
+}
+
+impl NativeFramePresentationTargets {
+    pub(crate) fn from_windows(windows: Vec<PresentationWindowTarget>) -> Self {
+        Self { windows }
+    }
+
+    pub fn windows(&self) -> &[PresentationWindowTarget] {
+        &self.windows
+    }
+
+    pub fn root_surface_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.windows.iter().map(|window| window.root_surface_id())
+    }
+}
+
 /// Frame-local mapping between canonical group space and the pixels rendered
 /// for one presentation sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -930,17 +978,18 @@ impl PresentationAnimator {
     pub fn sample_scene(
         &self,
         now: AnimationTime,
-        windows: &[(u32, PresentationRect)],
+        windows: &[PresentationWindowTarget],
     ) -> PresentationSceneSample {
         let mut sampled_windows = 0;
         let mut sampled = Vec::new();
         let mut transforms = Vec::new();
-        for (key, _target) in windows {
-            if let Some(sample) = self.sample(*key, now) {
+        for window in windows {
+            let key = window.root_surface_id();
+            if let Some(sample) = self.sample(key, now) {
                 sampled_windows += 1;
-                let canonical_rect = *_target;
+                let canonical_rect = window.canonical_rect();
                 transforms.push(PresentationGroupTransform::new(
-                    *key,
+                    key,
                     sample.transition_id,
                     canonical_rect,
                     sample.rect,
@@ -1275,7 +1324,10 @@ mod tests {
         );
         let _ = animator.sample_scene(
             AnimationTime::from_nanos(5_000_000),
-            &[(1, rect(20.0, 0.0, 10.0, 10.0))],
+            &[PresentationWindowTarget::new(
+                1,
+                rect(20.0, 0.0, 10.0, 10.0),
+            )],
         );
         assert_eq!(animator.metrics().sampled_windows, 1);
     }
@@ -1300,7 +1352,10 @@ mod tests {
         );
         let sample = animator.sample_scene(
             AnimationTime::from_nanos(20_000_000),
-            &[(1, rect(20.0, 0.0, 10.0, 10.0))],
+            &[PresentationWindowTarget::new(
+                1,
+                rect(20.0, 0.0, 10.0, 10.0),
+            )],
         );
         assert_eq!(sample.windows.len(), 1);
         assert_eq!(sample.transforms.len(), 1);

@@ -202,8 +202,8 @@ use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
 pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
-    EffectAnchor, EffectFrameDemandSnapshot, EffectSceneSummary, ResolvedEffectInstance,
-    ResolvedEffectScene,
+    EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,
+    EffectSceneSummary, ResolvedEffectInstance, ResolvedEffectScene,
 };
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::DirectScanoutSceneBlockers;
@@ -274,10 +274,11 @@ pub struct KeyboardConfigurationMutation {
     pub modifiers_changed: bool,
 }
 pub use crate::presentation_animation::{
-    AnimationCurve, AnimationTime, EasingCurve, PresentationAnimationMetrics, PresentationAnimator,
-    PresentationDamageRect, PresentationFrameSnapshot, PresentationGeometryTransform,
-    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentationTransition,
-    PresentationVelocity, PresentationWindowSample, PresentedWindowGeometry, SpringSpec,
+    AnimationCurve, AnimationTime, EasingCurve, NativeFramePresentationTargets,
+    PresentationAnimationMetrics, PresentationAnimator, PresentationDamageRect,
+    PresentationFrameSnapshot, PresentationGeometryTransform, PresentationGroupTransform,
+    PresentationRect, PresentationSceneSample, PresentationTransition, PresentationVelocity,
+    PresentationWindowSample, PresentationWindowTarget, PresentedWindowGeometry, SpringSpec,
     TransitionId, presentation_damage,
 };
 use layer_shell::{Layer, LayerSurfaceRole};
