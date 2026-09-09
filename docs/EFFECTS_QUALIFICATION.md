@@ -23,20 +23,20 @@ rtk cargo test --locked
 rtk bin/qualify-presentation --dry-run
 ```
 
-Fresh results for the 2026-09-09 blend-parity repair are: `effects` 114
-passed, `egl_renderer` 128 passed, `native_output` 1166 passed, and the full
-serial suite 3687 passed with 5 ignored and 40 filtered across 31 suites.
-Formatting, locked all-target compilation, and strict all-target Clippy passed.
-The real GLES regression compares all four blend modes at opacities 0, 0.25,
-0.5, 0.75, and 1.0 across all 3x3 destination/source alpha pairs; Multiply
-and Screen also assert exact zero-opacity destination identity. The focused
-real-GLES test passed independently.
+The Surface/VisualGroup effect-surface prerequisite is included in this
+deterministic closure. The four direct regressions cover production public and
+trusted resolution, exact Surface versus complete VisualGroup composition
+ranges, child scene order independent of effect identifiers, and overlapping
+child blur checkpoint dependencies including the lower child content.
 
-The exact parallel `rtk cargo test --locked` invocation passed on the final
-rerun with the same 3687/5/40 result; one earlier invocation reproduced an
-unrelated timing-sensitive `native_output::kms_worker` failure, and the
-race-resistant serial full-suite rerun also passed. The dry-run enumerated all
-18 phases.
+Fresh final results for the 2026-09-09 effect-surface verification are:
+`effects` 132 passed (90 library plus 42 main-target tests), `egl_renderer`
+153 passed, `native_output` 1175 passed, and the full serial suite 3755
+passed with 5 ignored and 40 filtered across 31 suites. Formatting, locked
+all-target compilation, and strict all-target Clippy passed. An intermediate
+isolated `native_output` attempt reproduced a timing-sensitive failure; its
+final isolated rerun passed 1175/1175, and the fresh serial suite also passed.
+The dry-run enumerated all 18 phases.
 
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
@@ -80,8 +80,9 @@ currently has no reliable timer-query result to report, so GPU effect timing is
 
 No live native run was performed for this checkout: `tty` reports `not a tty`,
 `/dev/dri/renderD128` and an NVIDIA GeForce RTX 3060 Ti are available, and no
-controlling `/dev/dri/card0` node is present. Therefore all native baseline, blur, overlap,
-presentation-combination, and custom-frame-demand measurements are `DEFERRED`,
-and no production-default decision is claimed from performance data. Direct
-Scanout remains conservative and effects continue to require composition
-whenever visible effect pixels are present.
+controlling `/dev/dri/card0` node is present. Therefore all native baseline,
+blur, overlap, presentation-combination, custom-frame-demand, and Settings
+visual-acceptance observations are `DEFERRED`, and no production-default
+decision is claimed from performance data. Direct Scanout remains conservative
+and effects continue to require composition whenever visible effect pixels are
+present.

@@ -1402,6 +1402,85 @@ mod tests {
     }
 
     #[test]
+    fn higher_public_child_effect_depends_on_lower_effect_and_its_content() {
+        let (base_scene, registry) = blur_scene();
+        let program = base_scene.instances[0].program;
+        let group = VisualGroupId::new(9).unwrap();
+        let child = |id, surface_id, surface_order| {
+            let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+            ResolvedEffectInstance {
+                id: EffectInstanceId::new(id).unwrap(),
+                program,
+                anchor: EffectAnchor::BeforeSurface(surface_id),
+                target_bounds: region.bounding_rect().unwrap(),
+                region,
+                parameter_block: EffectParameterBlock::default(),
+                signature: id,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: Some(group),
+                anchor_scope: EffectAnchorScope::Surface,
+                scene_order: EffectSceneOrder {
+                    group_order: group.get(),
+                    surface_order,
+                    phase: 0,
+                },
+            }
+        };
+        let lower = child(20, 20, 0);
+        let higher = child(1, 10, 1);
+        let scene = ResolvedEffectScene::new(1, vec![higher.clone(), lower.clone()]);
+        assert_eq!(
+            scene
+                .instances
+                .iter()
+                .map(|instance| instance.id)
+                .collect::<Vec<_>>(),
+            vec![lower.id, higher.id]
+        );
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("overlapping public child effects must compile to an effect graph");
+        };
+        let captures = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .collect::<Vec<_>>();
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].instance, lower.id);
+        assert_eq!(captures[1].instance, higher.id);
+        assert_eq!(captures[0].checkpoint_dependencies, Vec::new());
+        assert_eq!(captures[1].checkpoint_dependencies.len(), 1);
+        assert!(graph.passes.iter().any(|pass| {
+            pass.kind == RenderPassKind::Composite
+                && captures[1].checkpoint_dependencies.contains(&pass.id)
+                && pass.instance == lower.id
+        }));
+        let higher_capture_texture = graph
+            .textures
+            .iter()
+            .find(|texture| {
+                texture.source == GraphTextureSource::CapturedScene
+                    && graph.passes.iter().any(|pass| {
+                        pass.instance == higher.id
+                            && pass.kind == RenderPassKind::SceneCapture
+                            && pass.output == Some(texture.id)
+                    })
+            })
+            .expect("higher child must capture its resolved backdrop");
+        assert_eq!(
+            higher_capture_texture.domain,
+            EffectRect::new(76, 56, 368, 228).unwrap()
+        );
+    }
+
+    #[test]
     fn graph_explanation_is_deterministic_and_source_free() {
         let (scene, registry) = blur_scene();
         let plan = compile_frame_execution_plan(

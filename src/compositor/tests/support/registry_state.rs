@@ -20,6 +20,11 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
 
+use crate::astrea_effects::client::{
+    astrea_effects_manager_v1 as client_astrea_effects_manager_v1,
+    astrea_surface_effect_v1 as client_astrea_surface_effect_v1,
+};
+
 #[path = "registry_pointer.rs"]
 mod registry_pointer;
 
@@ -1939,6 +1944,30 @@ impl Dispatch<client_ext_background_effect_surface_v1::ExtBackgroundEffectSurfac
         _state: &mut Self,
         _proxy: &client_ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
         _event: client_ext_background_effect_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_astrea_effects_manager_v1::AstreaEffectsManagerV1,
+        _event: client_astrea_effects_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_astrea_surface_effect_v1::AstreaSurfaceEffectV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_astrea_surface_effect_v1::AstreaSurfaceEffectV1,
+        _event: client_astrea_surface_effect_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
