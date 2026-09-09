@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn shader_source_only_reload_keeps_the_compatibility_schema() {
+    fn trusted_schema_reload_keeps_source_only_compatibility_schema() {
         let first = build_generation(manifest(), 1).unwrap();
         let mut second_manifest = manifest();
         second_manifest

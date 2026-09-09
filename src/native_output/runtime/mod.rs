@@ -612,7 +612,7 @@ mod trusted_reload_tests {
     use super::request_trusted_effect_reload_redraw;
 
     #[test]
-    fn successful_reload_requests_one_coalesced_redraw() {
+    fn trusted_reload_redraw_is_one_coalesced_request() {
         let mut queued = false;
         request_trusted_effect_reload_redraw(&mut queued);
         assert!(queued);

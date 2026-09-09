@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn inverted_mask_is_the_same_coverage_operation_as_normal_mask() {
+    fn mask_inverted_is_the_same_coverage_operation_as_normal_mask() {
         let input = PremultipliedRgba::new(0.8, 0.4, 0.2, 0.8);
         for alpha in [0.0, 0.25, 0.5, 1.0] {
             let normal = input.apply_mask(alpha, MaskMode::Alpha);

@@ -1,11 +1,8 @@
 # Effects qualification
 
-Status: effects source closure is implemented and the library/strict-library
-checks pass, but fresh all-target/test closure evidence is currently blocked by
-uncommitted unrelated explicit-sync test edits in this checkout. Native
-TTY/DRM qualification is also blocked because the process has no controlling
-TTY. The available DRM node and NVIDIA GPU do not satisfy the real-TTY
-prerequisite.
+Status: fresh deterministic closure gates pass; native TTY/DRM qualification is
+blocked in this environment because the process has no controlling TTY. The
+available render node and NVIDIA GPU do not satisfy the real-TTY prerequisite.
 
 This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
@@ -28,18 +25,21 @@ rtk bin/qualify-presentation --dry-run
 
 The closure also reruns the focused `resources`, `static_texture`, trusted
 wrapper GLES-link, component-range, and effect-reload filters.
-The previous checkpoint recorded: `effects` 103 passed, `egl_renderer` 124
-passed, `resources` 18 passed, `static_texture` 3 passed, `native_output` 1162
-passed, and the full suite 3658 passed with 5 ignored. Those are historical
-checkout evidence, not fresh evidence for this closure.
+Fresh results for this closure are: `effects` 112 passed,
+`egl_renderer` 126 passed, `native_output` 1166 passed on the serial rerun,
+and the full serial suite 3687 passed with 5 ignored and 40 filtered across 31
+suites. Formatting, locked all-target compilation, and strict all-target
+Clippy passed. The focused filters passed: `normalize_input` 1,
+`normalize_nonzero_domain` 1, `normalize_pooled_clear` 1,
+`trusted_output_size` 1, `trusted_reload_redraw` 1,
+`trusted_schema_reload` 1, `parameter_impact` 2, `mask_inverted` 1,
+`premultiplied` 9, and `srgb` 4. The first parallel native-output run had one
+known queue-test race; the required serial rerun passed all 1166 tests. The
+first parallel full-suite run had one process-test PID race; the final serial
+rerun passed all 3687 tests. The dry-run enumerated all 18 phases.
 
-The fresh attempt reached `cargo check --locked --lib` and
-`cargo clippy --locked --lib -- -D warnings` successfully. The required
-all-target/test commands cannot currently compile the checkout because
-uncommitted explicit-sync changes leave `ExplicitSyncPoint` test constructors
-and struct literals inconsistent (`src/compositor/state/frame_tests.rs` and
-`src/compositor/explicit_sync.rs`). No fresh suite count is claimed until that
-pre-existing checkout condition is resolved.
+Additional closure filters passed: `resources` 18, `static_texture` 3,
+`trusted_custom_wrapper` 1, `component_wise` 2, and `effect_reload` 1.
 
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
@@ -82,8 +82,8 @@ currently has no reliable timer-query result to report, so GPU effect timing is
 ## Current result
 
 No live native run was performed for this checkout: `tty` reports `not a tty`,
-although `/dev/dri/card0`, `/dev/dri/renderD128`, and an NVIDIA GeForce RTX
-3060 Ti are available. Therefore all native baseline, blur, overlap,
+`/dev/dri/renderD128` and an NVIDIA GeForce RTX 3060 Ti are available, and no
+controlling `/dev/dri/card0` node is present. Therefore all native baseline, blur, overlap,
 presentation-combination, and custom-frame-demand measurements are `DEFERRED`,
 and no production-default decision is claimed from performance data. Direct
 Scanout remains conservative and effects continue to require composition

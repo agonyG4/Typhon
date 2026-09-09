@@ -1811,4 +1811,22 @@ mod tests {
             assert!(shader.contains("if (value <= 0.04045)"));
         }
     }
+
+    #[test]
+    fn normalize_nonzero_domain_maps_global_position() {
+        assert!(
+            NORMALIZE_FRAGMENT_SHADER
+                .contains("u_effect_output_domain.xy + v_uv * u_effect_output_domain.zw")
+        );
+        assert!(
+            NORMALIZE_FRAGMENT_SHADER.contains("(output_position - u_effect_input_domain.xy) /")
+        );
+    }
+
+    #[test]
+    fn normalize_pooled_clear_writes_transparent_black() {
+        assert!(NORMALIZE_FRAGMENT_SHADER.contains("out_color = vec4(0.0);"));
+        assert!(NORMALIZE_FRAGMENT_SHADER.contains("return;"));
+        assert!(!NORMALIZE_FRAGMENT_SHADER.contains("discard;"));
+    }
 }
