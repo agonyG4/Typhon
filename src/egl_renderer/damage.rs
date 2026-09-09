@@ -296,6 +296,19 @@ pub(crate) fn merge_effect_damage(
     )
 }
 
+pub(crate) fn effect_execution_demand_for_repaint_plan(
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+) -> oblivion_one::effects::EffectExecutionDemand {
+    let repair_region =
+        super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
+    let conservative_full = plan.mode == RepaintMode::Full
+        || (!repair_region.is_empty() && repair_region.bounding_rect().is_none());
+    oblivion_one::effects::plan_effect_execution_demand(graph, &repair_region, conservative_full)
+}
+
 fn coalesce_rects(mut rects: Vec<OutputRect>) -> Vec<OutputRect> {
     let mut output = Vec::<OutputRect>::new();
     while let Some(mut pending) = rects.pop() {
@@ -494,6 +507,28 @@ pub(crate) struct PartialRepaintPlanner {
     partial_enabled: bool,
 }
 
+fn partial_repaint_fallback_reason(
+    repair_damage: &OutputDamage,
+    output_size: (u32, u32),
+) -> Option<FullRepaintReason> {
+    if *repair_damage == OutputDamage::Full {
+        return Some(FullRepaintReason::DamageAreaThreshold);
+    }
+    if repair_damage.rect_count() > MAX_PARTIAL_REPAINT_RECTS {
+        return Some(FullRepaintReason::TooManyRectangles);
+    }
+    let Some(repair_pixels) = repair_damage.pixels(output_size.0, output_size.1) else {
+        return Some(FullRepaintReason::DamageAreaThreshold);
+    };
+    let Some(output_pixels) = u64::from(output_size.0).checked_mul(u64::from(output_size.1)) else {
+        return Some(FullRepaintReason::DamageAreaThreshold);
+    };
+    (output_pixels == 0
+        || repair_pixels.saturating_mul(100)
+            >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT))
+    .then_some(FullRepaintReason::DamageAreaThreshold)
+}
+
 impl PartialRepaintPlanner {
     pub(crate) fn new(
         output_size: (u32, u32),
@@ -623,46 +658,8 @@ impl PartialRepaintPlanner {
                 fallback_reason: None,
             };
         }
-        if repair_damage == OutputDamage::Full {
-            return self.full_plan(
-                current_damage,
-                Some(age),
-                FullRepaintReason::DamageAreaThreshold,
-            );
-        }
-        if repair_damage.rect_count() > MAX_PARTIAL_REPAINT_RECTS {
-            return self.full_plan(
-                current_damage,
-                Some(age),
-                FullRepaintReason::TooManyRectangles,
-            );
-        }
-        let Some(repair_pixels) = repair_damage.pixels(self.output_size.0, self.output_size.1)
-        else {
-            return self.full_plan(
-                current_damage,
-                Some(age),
-                FullRepaintReason::DamageAreaThreshold,
-            );
-        };
-        let Some(output_pixels) =
-            u64::from(self.output_size.0).checked_mul(u64::from(self.output_size.1))
-        else {
-            return self.full_plan(
-                current_damage,
-                Some(age),
-                FullRepaintReason::DamageAreaThreshold,
-            );
-        };
-        if output_pixels == 0
-            || repair_pixels.saturating_mul(100)
-                >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT)
-        {
-            return self.full_plan(
-                current_damage,
-                Some(age),
-                FullRepaintReason::DamageAreaThreshold,
-            );
+        if let Some(reason) = partial_repaint_fallback_reason(&repair_damage, self.output_size) {
+            return self.full_plan(current_damage, Some(age), reason);
         }
         RepaintPlan {
             render_damage: current_damage,
@@ -670,6 +667,22 @@ impl PartialRepaintPlanner {
             buffer_age: Some(age),
             mode: RepaintMode::Partial,
             fallback_reason: None,
+        }
+    }
+
+    pub(crate) fn apply_execution_repair(
+        &self,
+        plan: &mut RepaintPlan,
+        repair_damage: OutputDamage,
+    ) {
+        if plan.mode == RepaintMode::Partial
+            && let Some(reason) = partial_repaint_fallback_reason(&repair_damage, self.output_size)
+        {
+            plan.repair_damage = OutputDamage::Full;
+            plan.mode = RepaintMode::Full;
+            plan.fallback_reason = Some(reason);
+        } else {
+            plan.repair_damage = repair_damage;
         }
     }
 

@@ -231,23 +231,33 @@ impl NativePaintStats {
                     "effect_instances_visible",
                     repaint.effect_instances_visible,
                 ),
+                NativePerfField::usize("effect_instances_pruned", repaint.effect_instances_pruned),
                 NativePerfField::usize(
                     "effect_instances_executed",
                     repaint.effect_instances_executed,
                 ),
                 NativePerfField::usize("effect_instances_failed", repaint.effect_instances_failed),
                 NativePerfField::usize("render_graph_passes", repaint.render_graph_passes),
+                NativePerfField::usize("effect_passes_executed", repaint.effect_passes_executed),
                 NativePerfField::usize(
                     "render_graph_peak_live_textures",
                     repaint.render_graph_peak_live_textures,
                 ),
                 NativePerfField::u64("effect_capture_pixels", repaint.effect_capture_pixels),
+                NativePerfField::u64(
+                    "effect_capture_pixels_executed",
+                    repaint.effect_capture_pixels_executed,
+                ),
                 NativePerfField::u64("effect_output_pixels", repaint.effect_output_pixels),
                 NativePerfField::usize("blur_downsample_passes", repaint.blur_downsample_passes),
                 NativePerfField::usize("blur_upsample_passes", repaint.blur_upsample_passes),
                 NativePerfField::usize(
                     "effect_resource_allocations",
                     repaint.effect_resource_allocations,
+                ),
+                NativePerfField::usize(
+                    "effect_resource_acquisitions",
+                    repaint.effect_resource_acquisitions,
                 ),
                 NativePerfField::usize("effect_resource_reuses", repaint.effect_resource_reuses),
                 NativePerfField::usize(

@@ -40,7 +40,7 @@ pub(crate) use damage::{
 };
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
-    RenderExecution, RepaintPlan, merge_effect_damage,
+    RenderExecution, RepaintPlan, effect_execution_demand_for_repaint_plan, merge_effect_damage,
 };
 use effects::{
     EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
@@ -124,15 +124,19 @@ pub(crate) struct GlesSceneFrameStats {
     pub contradictory_empty_damage: bool,
     pub orphan_decoration_count: u32,
     pub effect_instances_visible: usize,
+    pub effect_instances_pruned: usize,
     pub effect_instances_executed: usize,
     pub effect_instances_failed: usize,
     pub render_graph_passes: usize,
+    pub effect_passes_executed: usize,
     pub render_graph_peak_live_textures: usize,
     pub effect_capture_pixels: u64,
+    pub effect_capture_pixels_executed: u64,
     pub effect_output_pixels: u64,
     pub blur_downsample_passes: usize,
     pub blur_upsample_passes: usize,
     pub effect_resource_allocations: usize,
+    pub effect_resource_acquisitions: usize,
     pub effect_resource_reuses: usize,
     pub effect_resource_evictions: usize,
     pub effect_gpu_cache_bytes: u64,
@@ -818,7 +822,7 @@ impl GlesSceneRenderer {
                 merge_effect_damage(output_damage, &graph.final_damage, width, height)
             }
         };
-        let plan = self.repaint_planner.plan(output_damage, buffer_age);
+        let mut plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
             self.record_effect_resource_metrics();
             self.record_repaint_stats(&plan);
@@ -827,14 +831,51 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
+        let effect_execution_demand = match &execution_plan {
+            FrameExecutionPlan::LegacyScene => None,
+            FrameExecutionPlan::EffectGraph(graph) => {
+                let demand = effect_execution_demand_for_repaint_plan(graph, &plan, width, height);
+                let execution_repair = merge_effect_damage(
+                    plan.repair_damage.clone(),
+                    &demand.execution_region,
+                    width,
+                    height,
+                );
+                let was_partial = plan.mode == RepaintMode::Partial;
+                self.repaint_planner
+                    .apply_execution_repair(&mut plan, execution_repair);
+                if was_partial && plan.mode == RepaintMode::Full {
+                    Some(effect_execution_demand_for_repaint_plan(
+                        graph, &plan, width, height,
+                    ))
+                } else {
+                    Some(demand)
+                }
+            }
+        };
+        if let Some(demand) = &effect_execution_demand {
+            self.frame_stats.effect_instances_pruned = self
+                .frame_stats
+                .effect_instances_visible
+                .saturating_sub(demand.instances.len());
+        }
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
-                match effects::execute_effect_graph(self, &graph, framebuffer_origin, &plan) {
+                let demand = effect_execution_demand
+                    .as_ref()
+                    .expect("effect graph execution must have an execution demand");
+                match effects::execute_effect_graph(self, &graph, framebuffer_origin, &plan, demand)
+                {
                     Ok(execution_stats) => {
-                        self.frame_stats.effect_instances_executed = graph.stats.effect_instances;
+                        self.frame_stats.effect_instances_executed = execution_stats.instances;
+                        self.frame_stats.effect_passes_executed = execution_stats.passes;
                         self.frame_stats.blur_downsample_passes = execution_stats.blur_downsamples;
                         self.frame_stats.blur_upsample_passes = execution_stats.blur_upsamples;
+                        self.frame_stats.effect_capture_pixels_executed =
+                            execution_stats.capture_pixels;
+                        self.frame_stats.effect_resource_acquisitions =
+                            execution_stats.resource_acquisitions;
                         Ok(())
                     }
                     Err(error) => {

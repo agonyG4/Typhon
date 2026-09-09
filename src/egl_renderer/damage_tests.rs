@@ -25,6 +25,24 @@ fn partial_planner(
     planner
 }
 
+fn graph_for_effect_region(
+    id: u64,
+    output_influence_region: oblivion_one::effects::EffectRegion,
+) -> oblivion_one::effects::CompiledFrameGraph {
+    oblivion_one::effects::CompiledFrameGraph {
+        passes: Vec::new(),
+        textures: Vec::new(),
+        instances: vec![oblivion_one::effects::CompiledEffectInstance {
+            id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
+            capture_region: output_influence_region.clone(),
+            output_influence_region,
+            dependencies: Vec::new(),
+        }],
+        final_damage: oblivion_one::effects::EffectRegion::empty(),
+        stats: Default::default(),
+    }
+}
+
 #[test]
 fn output_damage_clips_all_edges_and_discards_empty_rectangles() {
     let damage = OutputDamage::rects(
@@ -99,6 +117,92 @@ fn effect_damage_preserves_buffer_age_history() {
     let plan = planner.plan(current, BufferAge::Value(2));
     assert_eq!(plan.mode, RepaintMode::Partial);
     assert!(plan.repair_damage.pixels(1920, 1080).unwrap() < 1920 * 1080);
+}
+
+#[test]
+fn age_2_repair_revives_unchanged_effect() {
+    let effect_region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 10, 20, 20));
+    let graph = graph_for_effect_region(1, effect_region.clone());
+    let mut planner = partial_planner((100, 80), partial_capabilities());
+
+    let first = planner.plan(
+        OutputDamage::rects(100, 80, [rect(10, 10, 20, 20)]),
+        BufferAge::Value(0),
+    );
+    planner.commit_presented_transition(first.render_damage);
+
+    let plan = planner.plan(
+        OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
+        BufferAge::Value(2),
+    );
+    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert!(
+        plan.render_damage
+            .rects_slice()
+            .contains(&rect(70, 60, 5, 5))
+    );
+    assert!(
+        plan.repair_damage
+            .rects_slice()
+            .contains(&rect(10, 10, 20, 20))
+    );
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+}
+
+#[test]
+fn age_3_repair_revives_effect_from_two_presented_frames_ago() {
+    let effect_region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 10, 20, 20));
+    let graph = graph_for_effect_region(1, effect_region);
+    let mut planner = partial_planner((100, 80), partial_capabilities());
+
+    let first = planner.plan(
+        OutputDamage::rects(100, 80, [rect(10, 10, 20, 20)]),
+        BufferAge::Value(0),
+    );
+    planner.commit_presented_transition(first.render_damage);
+
+    let intermediate = planner.plan(
+        OutputDamage::rects(100, 80, [rect(40, 10, 5, 5)]),
+        BufferAge::Value(1),
+    );
+    planner.commit_presented_transition(intermediate.render_damage);
+
+    let plan = planner.plan(
+        OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
+        BufferAge::Value(3),
+    );
+    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert!(
+        plan.repair_damage
+            .rects_slice()
+            .contains(&rect(10, 10, 20, 20))
+    );
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+}
+
+#[test]
+fn full_repaint_keeps_all_visible_effects_live() {
+    let effect_region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 10, 20, 20));
+    let graph = graph_for_effect_region(1, effect_region);
+    let mut planner = partial_planner((100, 80), partial_capabilities());
+    let first = planner.plan(
+        OutputDamage::rects(100, 80, [rect(10, 10, 20, 20)]),
+        BufferAge::Value(0),
+    );
+    planner.commit_presented_transition(first.render_damage);
+
+    let plan = planner.plan(
+        OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
+        BufferAge::Value(0),
+    );
+    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
 }
 
 #[test]
@@ -191,6 +295,30 @@ fn explicit_render_repair_does_not_require_egl_swap_damage() {
     assert_eq!(
         planner.plan(current, BufferAge::Value(1)).mode,
         RepaintMode::Partial
+    );
+}
+
+#[test]
+fn execution_repair_preserves_partial_area_threshold() {
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let mut plan = RepaintPlan {
+        render_damage: OutputDamage::rects(100, 80, [rect(1, 1, 2, 2)]),
+        repair_damage: OutputDamage::rects(100, 80, [rect(1, 1, 2, 2)]),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    planner.apply_execution_repair(
+        &mut plan,
+        OutputDamage::rects(100, 80, [rect(0, 0, 80, 80)]),
+    );
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
     );
 }
 

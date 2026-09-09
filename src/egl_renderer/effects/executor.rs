@@ -2,10 +2,10 @@ use std::io;
 
 use glow::HasContext;
 use oblivion_one::effects::{
-    CompiledFrameGraph, CompiledRenderPass, EffectColorConversion, EffectNodeKind, EffectRegion,
-    GraphTextureId, GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
-    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind,
-    ShaderModuleId,
+    CompiledFrameGraph, CompiledRenderPass, EffectColorConversion, EffectExecutionDemand,
+    EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId, GraphTextureSource,
+    INTERNAL_EFFECT_SHADER_MODULE_BLEND, INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
+    INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind, ShaderModuleId,
 };
 
 use super::super::geometry::EglDrawLayer;
@@ -339,11 +339,48 @@ void main() {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EffectExecutionStats {
+    pub instances: usize,
     pub passes: usize,
     pub scene_captures: usize,
+    pub capture_pixels: u64,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
+    pub resource_acquisitions: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EffectExecutionSelection {
+    executed_passes: Vec<GraphPassId>,
+    executed_instances: Vec<oblivion_one::effects::EffectInstanceId>,
+    acquired_texture_ids: Vec<GraphTextureId>,
+}
+
+fn select_effect_execution(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+) -> EffectExecutionSelection {
+    let mut selection = EffectExecutionSelection::default();
+    for pass in &graph.passes {
+        if !demand.is_conservative_full() && !demand.contains(pass.instance) {
+            continue;
+        }
+        selection.executed_passes.push(pass.id);
+        if !selection.executed_instances.contains(&pass.instance) {
+            selection.executed_instances.push(pass.instance);
+        }
+        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
+            let is_output = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == texture_id)
+                .is_some_and(|texture| texture.source == GraphTextureSource::Output);
+            if !is_output && !selection.acquired_texture_ids.contains(&texture_id) {
+                selection.acquired_texture_ids.push(texture_id);
+            }
+        }
+    }
+    selection
 }
 
 pub(crate) fn execute_effect_graph(
@@ -351,6 +388,7 @@ pub(crate) fn execute_effect_graph(
     graph: &CompiledFrameGraph,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
 ) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
     let result = execute_graph_passes(
@@ -359,6 +397,7 @@ pub(crate) fn execute_effect_graph(
         &mut textures,
         framebuffer_origin,
         repaint_plan,
+        demand,
     );
     if result.is_err() {
         renderer.establish_ordinary_scene_state();
@@ -378,12 +417,17 @@ fn execute_graph_passes(
     textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: &super::super::damage::RepaintPlan,
+    demand: &EffectExecutionDemand,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
+    let selection = select_effect_execution(graph, demand);
     let repaint_rects = renderer.begin_effect_repaint(repaint_plan, framebuffer_origin)?;
     let mut scene_cursor = 0;
     for pass in &graph.passes {
-        ensure_pass_textures(renderer, graph, pass, textures)?;
+        if !selection.executed_passes.contains(&pass.id) {
+            continue;
+        }
+        ensure_pass_textures(renderer, graph, pass, textures, &mut stats)?;
         if matches!(
             pass.kind,
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
@@ -429,6 +473,7 @@ fn execute_graph_passes(
             textures,
             pass,
             framebuffer_origin,
+            &effective_pass_damage(graph, demand, pass),
             &mut stats,
         )?;
         release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
@@ -442,7 +487,38 @@ fn execute_graph_passes(
     )?;
     renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
     renderer.establish_ordinary_scene_state();
+    stats.instances = selection.executed_instances.len();
     Ok(stats)
+}
+
+fn effective_pass_damage(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    pass: &CompiledRenderPass,
+) -> EffectRegion {
+    let Some(output_region) = demand.output_region(pass.instance) else {
+        return if demand.is_conservative_full() {
+            pass.output
+                .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+                .map_or_else(EffectRegion::empty, |texture| {
+                    EffectRegion::from_rect(texture.domain)
+                })
+        } else {
+            EffectRegion::empty()
+        };
+    };
+    if matches!(
+        pass.kind,
+        RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+    ) {
+        return pass.damage.union(output_region);
+    }
+    pass.output
+        .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+        .map_or_else(
+            || output_region.clone(),
+            |texture| EffectRegion::from_rect(texture.domain),
+        )
 }
 
 fn ensure_pass_textures(
@@ -450,6 +526,7 @@ fn ensure_pass_textures(
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,
     textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     for texture_id in pass.inputs.iter().copied().chain(pass.output) {
         let plan = graph_texture(graph, texture_id)?;
@@ -458,6 +535,7 @@ fn ensure_pass_textures(
         }
         let realized = renderer.effect_resources.acquire_plan(&renderer.gl, plan)?;
         textures.insert(texture_id, realized);
+        stats.resource_acquisitions = stats.resource_acquisitions.saturating_add(1);
     }
     Ok(())
 }
@@ -537,11 +615,20 @@ fn execute_pass(
     textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
+    execution_damage: &EffectRegion,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     match pass.kind {
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
-            execute_capture(renderer, graph, textures, pass, framebuffer_origin)?;
+            execute_capture(
+                renderer,
+                graph,
+                textures,
+                pass,
+                framebuffer_origin,
+                execution_damage,
+                stats,
+            )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
         }
         RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => {
@@ -577,6 +664,7 @@ fn execute_pass(
                 fragment,
                 framebuffer_origin,
                 true,
+                execution_damage,
             )?;
             match pass.kind {
                 RenderPassKind::DualKawaseDownsample => {
@@ -597,6 +685,7 @@ fn execute_pass(
                 NORMALIZE_FRAGMENT_SHADER,
                 framebuffer_origin,
                 false,
+                execution_damage,
             )?;
         }
         RenderPassKind::Fragment | RenderPassKind::Blend | RenderPassKind::Mask => {
@@ -632,6 +721,7 @@ fn execute_pass(
                 fragment,
                 module,
                 framebuffer_origin,
+                execution_damage,
             )?;
         }
         RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
@@ -643,6 +733,7 @@ fn execute_pass(
                 COMPOSITE_FRAGMENT_SHADER,
                 framebuffer_origin,
                 false,
+                execution_damage,
             )?;
             stats.composites = stats.composites.saturating_add(1);
         }
@@ -660,6 +751,7 @@ fn execute_fullscreen_stage(
     fragment_shader: &str,
     module: u64,
     framebuffer_origin: OutputFramebufferOrigin,
+    execution_damage: &EffectRegion,
 ) -> RendererResult<()> {
     let input = pass
         .inputs
@@ -820,7 +912,12 @@ fn execute_fullscreen_stage(
             },
         );
         renderer.gl.bind_vertex_array(Some(vertex_array));
-        draw_damage_scissors(&renderer.gl, &pass.damage, output_plan, framebuffer_origin);
+        draw_damage_scissors(
+            &renderer.gl,
+            execution_damage,
+            output_plan,
+            framebuffer_origin,
+        );
         renderer.gl.bind_vertex_array(None);
         for unit in 0..=pass.inputs.len() {
             let unit = u32::try_from(unit).unwrap_or(u32::MAX);
@@ -1187,6 +1284,8 @@ fn execute_capture(
     textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
+    execution_damage: &EffectRegion,
+    stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     let output = pass
         .output
@@ -1195,6 +1294,9 @@ fn execute_capture(
         .get(&output)
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
+    stats.capture_pixels = stats
+        .capture_pixels
+        .saturating_add(u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height)));
     if !pass.checkpoint_dependencies.is_empty() {
         let target_texture = renderer
             .effect_resources
@@ -1294,10 +1396,10 @@ fn execute_capture(
         pass.visual_group,
         pass.anchor_scope,
     );
-    let scissors = if pass.damage.is_empty() {
+    let scissors = if execution_damage.is_empty() {
         vec![full_output_rect(renderer.current_size)]
     } else {
-        pass.damage
+        execution_damage
             .rects()
             .iter()
             .map(|rect| effect_rect_to_output_rect(*rect))
@@ -1315,6 +1417,7 @@ fn execute_capture(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_fullscreen_pass(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
@@ -1323,6 +1426,7 @@ fn execute_fullscreen_pass(
     fragment_shader: &str,
     framebuffer_origin: OutputFramebufferOrigin,
     blur_shader: bool,
+    execution_damage: &EffectRegion,
 ) -> RendererResult<()> {
     let input = pass
         .inputs
@@ -1554,7 +1658,12 @@ fn execute_fullscreen_pass(
             }
         }
         renderer.gl.bind_vertex_array(Some(vertex_array));
-        draw_damage_scissors(&renderer.gl, &pass.damage, output_plan, framebuffer_origin);
+        draw_damage_scissors(
+            &renderer.gl,
+            execution_damage,
+            output_plan,
+            framebuffer_origin,
+        );
         renderer.gl.bind_vertex_array(None);
         renderer.gl.bind_texture(glow::TEXTURE_2D, None);
         renderer.gl.disable(glow::SCISSOR_TEST);
@@ -1842,5 +1951,86 @@ mod tests {
         assert!(NORMALIZE_FRAGMENT_SHADER.contains("out_color = vec4(0.0);"));
         assert!(NORMALIZE_FRAGMENT_SHADER.contains("return;"));
         assert!(!NORMALIZE_FRAGMENT_SHADER.contains("discard;"));
+    }
+
+    #[test]
+    fn pruned_instance_does_not_realize_textures() {
+        let first = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let second = oblivion_one::effects::EffectInstanceId::new(2).unwrap();
+        let first_input = GraphTextureId::new(1).unwrap();
+        let first_output = GraphTextureId::new(2).unwrap();
+        let second_input = GraphTextureId::new(3).unwrap();
+        let second_output = GraphTextureId::new(4).unwrap();
+        let pass = |id, instance, input, output| CompiledRenderPass {
+            id: GraphPassId::new(id).unwrap(),
+            kind: RenderPassKind::Fragment,
+            inputs: vec![input],
+            output: Some(output),
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+        };
+        let graph = CompiledFrameGraph {
+            passes: vec![
+                pass(1, first, first_input, first_output),
+                pass(2, second, second_input, second_output),
+            ],
+            textures: Vec::new(),
+            instances: vec![
+                oblivion_one::effects::CompiledEffectInstance {
+                    id: first,
+                    output_influence_region: EffectRegion::from_rect(
+                        oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
+                    ),
+                    capture_region: EffectRegion::from_rect(
+                        oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
+                    ),
+                    dependencies: Vec::new(),
+                },
+                oblivion_one::effects::CompiledEffectInstance {
+                    id: second,
+                    output_influence_region: EffectRegion::from_rect(
+                        oblivion_one::effects::EffectRect::new(20, 0, 10, 10).unwrap(),
+                    ),
+                    capture_region: EffectRegion::from_rect(
+                        oblivion_one::effects::EffectRect::new(20, 0, 10, 10).unwrap(),
+                    ),
+                    dependencies: Vec::new(),
+                },
+            ],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demand = oblivion_one::effects::EffectExecutionDemand::new(
+            vec![oblivion_one::effects::EffectInstanceExecutionDemand {
+                id: first,
+                output_region: EffectRegion::from_rect(
+                    oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
+                ),
+            }],
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap()),
+        );
+
+        let selection = select_effect_execution(&graph, &demand);
+
+        assert_eq!(selection.executed_instances, vec![first]);
+        assert_eq!(
+            selection.executed_passes,
+            vec![GraphPassId::new(1).unwrap()]
+        );
+        assert_eq!(
+            selection.acquired_texture_ids,
+            vec![first_input, first_output]
+        );
     }
 }

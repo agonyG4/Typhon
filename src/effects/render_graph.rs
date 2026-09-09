@@ -176,11 +176,27 @@ pub struct EffectInstanceExecutionDemand {
 pub struct EffectExecutionDemand {
     pub instances: Vec<EffectInstanceExecutionDemand>,
     pub execution_region: EffectRegion,
+    pub(crate) conservative_full: bool,
 }
 
 impl EffectExecutionDemand {
+    pub fn new(
+        instances: Vec<EffectInstanceExecutionDemand>,
+        execution_region: EffectRegion,
+    ) -> Self {
+        Self {
+            instances,
+            execution_region,
+            conservative_full: false,
+        }
+    }
+
     pub fn contains(&self, id: EffectInstanceId) -> bool {
         self.instances.iter().any(|instance| instance.id == id)
+    }
+
+    pub fn is_conservative_full(&self) -> bool {
+        self.conservative_full
     }
 
     pub fn output_region(&self, id: EffectInstanceId) -> Option<&EffectRegion> {
@@ -198,6 +214,9 @@ fn all_visible_instances_with_output_regions(graph: &CompiledFrameGraph) -> Effe
         .iter()
         .map(|instance| {
             execution_region = execution_region.union(&instance.output_influence_region);
+            if !instance.dependencies.is_empty() {
+                execution_region = execution_region.union(&instance.capture_region);
+            }
             EffectInstanceExecutionDemand {
                 id: instance.id,
                 output_region: instance.output_influence_region.clone(),
@@ -207,6 +226,7 @@ fn all_visible_instances_with_output_regions(graph: &CompiledFrameGraph) -> Effe
     EffectExecutionDemand {
         instances,
         execution_region,
+        conservative_full: true,
     }
 }
 
@@ -229,7 +249,10 @@ pub fn plan_effect_execution_demand(
     repair_region: &EffectRegion,
     conservative_full: bool,
 ) -> EffectExecutionDemand {
-    if conservative_full || (!repair_region.is_empty() && repair_region.bounding_rect().is_none()) {
+    if conservative_full
+        || (!repair_region.is_empty() && repair_region.bounding_rect().is_none())
+        || !graph_execution_metadata_is_complete(graph)
+    {
         return all_visible_instances_with_output_regions(graph);
     }
 
@@ -283,7 +306,11 @@ pub fn plan_effect_execution_demand(
         .enumerate()
         .filter_map(|(index, output_region)| {
             output_region.map(|output_region| {
+                let instance = &graph.instances[index];
                 execution_region = execution_region.union(&output_region);
+                if !instance.dependencies.is_empty() {
+                    execution_region = execution_region.union(&instance.capture_region);
+                }
                 EffectInstanceExecutionDemand {
                     id: graph.instances[index].id,
                     output_region,
@@ -294,7 +321,29 @@ pub fn plan_effect_execution_demand(
     EffectExecutionDemand {
         instances,
         execution_region,
+        conservative_full: false,
     }
+}
+
+fn graph_execution_metadata_is_complete(graph: &CompiledFrameGraph) -> bool {
+    graph
+        .instances
+        .iter()
+        .enumerate()
+        .all(|(index, instance)| unique_instance_index(graph, instance.id) == Some(index))
+        && graph.passes.iter().all(|pass| {
+            unique_instance_index(graph, pass.instance).is_some()
+                && pass
+                    .inputs
+                    .iter()
+                    .chain(pass.output.iter())
+                    .all(|texture_id| {
+                        graph
+                            .textures
+                            .iter()
+                            .any(|texture| texture.id == *texture_id)
+                    })
+        })
 }
 
 impl CompiledFrameGraph {
@@ -1713,6 +1762,30 @@ mod tests {
         assert_eq!(demand.instances.len(), 2);
         assert!(demand.contains(EffectInstanceId::new(1).unwrap()));
         assert!(demand.contains(EffectInstanceId::new(2).unwrap()));
+    }
+
+    #[test]
+    fn unknown_dependency_falls_back_to_all_visible_effects() {
+        let (scene, registry) = separated_blur_scene();
+        let FrameExecutionPlan::EffectGraph(mut graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+        graph.instances[0].dependencies = vec![EffectInstanceId::new(99).unwrap()];
+
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &graph.instances[0].output_influence_region,
+            false,
+        );
+
+        assert_eq!(demand.instances.len(), 2);
+        assert!(demand.is_conservative_full());
     }
 
     #[test]
