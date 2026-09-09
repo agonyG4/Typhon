@@ -161,3 +161,32 @@
   suite passed with 2,250 library tests, 1,297 main-binary tests, and zero
   failures; source-layout remains a documented 42-file existing debt, and
   hardware qualification remains unavailable.
+
+## Final window-space authority follow-up (2026-09-09)
+
+The remaining correctness closure is narrowly scoped to coordinate-space
+authority. Canonical presentation rectangles, sampled transforms, physical
+presentation metadata, interaction geometry, tiled resize rebasing, and
+Direct Scanout ownership will all describe the toplevel/window rectangle.
+Root `wl_surface` geometry remains render content inside that window frame and
+is never used as the presentation target.
+
+- Add a real CSD compositor regression for the `100,100 944x526` window frame
+  versus the `100,124 944x502` client root, including identity and active
+  transition samples.
+- Build `presentation_window_targets()` from the shared canonical
+  `presentation_rect_for_geometry()` helper.
+- Rename the physical metadata record to `PresentedWindowGeometry`, derive
+  composed-frame records from canonical window geometry plus the frame sample,
+  and centralize integer materialization of physically presented window state.
+- Make presented visual takeover and input use the canonical-window delta to
+  the last physically presented window rectangle; keep popup stack roots and
+  presentation owners distinct.
+- Carry the validated window rectangle through Direct Scanout candidate,
+  lease, submission, and pageflip ownership. Publish it only after a
+  successful direct pageflip, preserving direct assignment and the accepted
+  candidate during canonical races; the next composed pageflip replaces it.
+- Add direct ownership/race/fallback, lifecycle, input, interaction, and
+  tiled CSD/constraint regressions, then rerun all locked verification gates
+  in the existing checkout and update the closure report without hardware
+  qualification claims.

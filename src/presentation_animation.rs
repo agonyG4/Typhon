@@ -253,15 +253,16 @@ impl PresentationGroupTransform {
     }
 }
 
-/// Metadata-only geometry for a root that was actually consumed by the
-/// renderer in one physically presentable frame.
+/// Metadata-only geometry for a toplevel/window that was actually consumed by
+/// the renderer in one physically presentable frame. This is never raw root
+/// `wl_surface` geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PresentedRootGeometry {
+pub struct PresentedWindowGeometry {
     root_surface_id: u32,
     presented_rect: PresentationRect,
 }
 
-impl PresentedRootGeometry {
+impl PresentedWindowGeometry {
     pub const fn new(root_surface_id: u32, presented_rect: PresentationRect) -> Self {
         Self {
             root_surface_id,
@@ -284,7 +285,7 @@ impl PresentedRootGeometry {
 pub struct PresentationFrameSnapshot {
     pub sampled_at: AnimationTime,
     pub transforms: Vec<PresentationGroupTransform>,
-    pub presented_roots: Vec<PresentedRootGeometry>,
+    pub presented_windows: Vec<PresentedWindowGeometry>,
     pub signature: u64,
 }
 
@@ -296,23 +297,23 @@ impl PresentationFrameSnapshot {
     }
 
     pub fn from_sample(sample: &PresentationSceneSample) -> Self {
-        Self::from_sample_with_presented_roots(sample, Vec::new())
+        Self::from_sample_with_presented_windows(sample, Vec::new())
     }
 
-    pub fn from_sample_with_presented_roots(
+    pub fn from_sample_with_presented_windows(
         sample: &PresentationSceneSample,
-        mut presented_roots: Vec<PresentedRootGeometry>,
+        mut presented_windows: Vec<PresentedWindowGeometry>,
     ) -> Self {
-        presented_roots.sort_unstable_by_key(|root| root.root_surface_id());
+        presented_windows.sort_unstable_by_key(|window| window.root_surface_id());
         let mut signature = 0xcbf2_9ce4_8422_2325_u64;
         for transform in &sample.transforms {
             signature ^= transform.signature();
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
-        for root in &presented_roots {
-            signature ^= u64::from(root.root_surface_id());
+        for window in &presented_windows {
+            signature ^= u64::from(window.root_surface_id());
             signature = signature.wrapping_mul(0x1000_0000_01b3);
-            let rect = root.presented_rect();
+            let rect = window.presented_rect();
             for value in [
                 rect.x().to_bits(),
                 rect.y().to_bits(),
@@ -326,7 +327,7 @@ impl PresentationFrameSnapshot {
         Self {
             sampled_at: sample.sampled_at,
             transforms: sample.transforms.clone(),
-            presented_roots,
+            presented_windows,
             signature,
         }
     }
@@ -338,11 +339,14 @@ impl PresentationFrameSnapshot {
             .copied()
     }
 
-    pub fn presented_root_geometry(&self, root_surface_id: u32) -> Option<PresentedRootGeometry> {
-        self.presented_roots
-            .binary_search_by_key(&root_surface_id, PresentedRootGeometry::root_surface_id)
+    pub fn presented_window_geometry(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<PresentedWindowGeometry> {
+        self.presented_windows
+            .binary_search_by_key(&root_surface_id, PresentedWindowGeometry::root_surface_id)
             .ok()
-            .map(|index| self.presented_roots[index])
+            .map(|index| self.presented_windows[index])
     }
 
     pub fn is_identity_for_root(&self, root_surface_id: u32) -> bool {
@@ -356,10 +360,10 @@ impl PresentationFrameSnapshot {
             signature ^= transform.signature();
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
-        for root in &self.presented_roots {
-            signature ^= u64::from(root.root_surface_id());
+        for window in &self.presented_windows {
+            signature ^= u64::from(window.root_surface_id());
             signature = signature.wrapping_mul(0x1000_0000_01b3);
-            let rect = root.presented_rect();
+            let rect = window.presented_rect();
             for value in [
                 rect.x().to_bits(),
                 rect.y().to_bits(),
@@ -1220,11 +1224,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_frame_records_presented_root_geometry_without_transition_state() {
+    fn identity_frame_records_presented_window_geometry_without_transition_state() {
         let sample = PresentationSceneSample::empty(AnimationTime::from_nanos(42));
-        let snapshot = PresentationFrameSnapshot::from_sample_with_presented_roots(
+        let snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &sample,
-            vec![PresentedRootGeometry::new(
+            vec![PresentedWindowGeometry::new(
                 7,
                 rect(100.0, 80.0, 640.0, 480.0),
             )],
@@ -1233,8 +1237,8 @@ mod tests {
         assert!(snapshot.transforms.is_empty());
         assert_eq!(
             snapshot
-                .presented_root_geometry(7)
-                .expect("identity root projection")
+                .presented_window_geometry(7)
+                .expect("identity window projection")
                 .presented_rect(),
             rect(100.0, 80.0, 640.0, 480.0)
         );

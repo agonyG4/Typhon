@@ -13,6 +13,7 @@ pub struct FullscreenPresentationState {
 pub struct DirectScanoutSceneCandidate {
     pub surface_id: u32,
     pub root_surface_id: u32,
+    pub presented_window_rect: crate::compositor::PresentationRect,
     pub content_epoch: u64,
     pub generation: u64,
     pub surface_presentation_generation: u64,

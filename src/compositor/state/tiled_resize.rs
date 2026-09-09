@@ -127,8 +127,8 @@ impl CompositorState {
         preparation: &mut TiledResizePreparation,
     ) {
         let Some(presented_rect) = self
-            .presented_root_geometry(root_surface_id)
-            .map(PresentedRootGeometry::presented_rect)
+            .presented_window_geometry(root_surface_id)
+            .map(PresentedWindowGeometry::presented_rect)
         else {
             return;
         };

@@ -54,23 +54,50 @@ impl ActiveSceneView {
     }
 }
 
+fn materialize_presented_window_geometry(
+    canonical_geometry: WindowGeometry,
+    canonical_rect: PresentationRect,
+    presented_rect: PresentationRect,
+) -> WindowGeometry {
+    let delta_x = saturating_i32_from_f64((presented_rect.x() - canonical_rect.x()).round());
+    let delta_y = saturating_i32_from_f64((presented_rect.y() - canonical_rect.y()).round());
+    WindowGeometry::new(
+        SurfacePlacement {
+            parent_surface_id: None,
+            local_x: canonical_geometry.placement.local_x.saturating_add(delta_x),
+            local_y: canonical_geometry.placement.local_y.saturating_add(delta_y),
+            root_mode: canonical_geometry.placement.root_mode,
+        },
+        saturating_u32_from_f64(presented_rect.width().round()),
+        saturating_u32_from_f64(presented_rect.height().round()),
+    )
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn presentation_rect_for_geometry(
         &self,
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) -> Option<PresentationRect> {
-        let mut surfaces = self.active_scene_surfaces().to_vec();
+        let surfaces = self.active_scene_surfaces();
         let root_index = surfaces.iter().position(|surface| {
             surface.surface_id == root_surface_id && surface.placement.parent_surface_id.is_none()
         })?;
-        surfaces[root_index].render_placement = Some(geometry.placement);
-        let origin = render::surface_origins(&surfaces)
-            .get(root_index)
-            .copied()?;
+        let root_ordinal = surfaces
+            .iter()
+            .take(root_index)
+            .filter(|surface| {
+                surface.placement.parent_surface_id.is_none()
+                    && self.root_surface_id_for_surface(surface.surface_id) == surface.surface_id
+            })
+            .count();
+        let base = match geometry.placement.root_mode {
+            RootPlacementMode::CascadedWindow => render::cascaded_root_position(root_ordinal),
+            RootPlacementMode::Absolute => (0, 0),
+        };
         PresentationRect::new(
-            f64::from(origin.0),
-            f64::from(origin.1),
+            f64::from(base.0.saturating_add(geometry.placement.local_x)),
+            f64::from(base.1.saturating_add(geometry.placement.local_y)),
             f64::from(geometry.width),
             f64::from(geometry.height),
         )
@@ -84,20 +111,12 @@ impl CompositorState {
                 surface.placement.parent_surface_id.is_none()
                     && self.root_surface_id_for_surface(surface.surface_id) == surface.surface_id
             })
-            .filter_map(|(index, surface)| {
+            .filter_map(|(_, surface)| {
                 let geometry = self
                     .current_visual_root_window_geometry(surface.surface_id)
                     .or_else(|| self.current_root_window_geometry(surface.surface_id))?;
-                let origin = self.active_scene_surface_origins().get(index).copied()?;
-                Some((
-                    surface.surface_id,
-                    PresentationRect::new(
-                        f64::from(origin.0),
-                        f64::from(origin.1),
-                        f64::from(geometry.width),
-                        f64::from(geometry.height),
-                    )?,
-                ))
+                let rect = self.presentation_rect_for_geometry(surface.surface_id, geometry)?;
+                Some((surface.surface_id, rect))
             })
             .collect()
     }
@@ -149,12 +168,14 @@ impl CompositorState {
             .transform_for_root(root_surface_id)
     }
 
-    pub(in crate::compositor) fn presented_root_geometry(
+    pub(in crate::compositor) fn presented_window_geometry(
         &self,
         root_surface_id: u32,
-    ) -> Option<PresentedRootGeometry> {
-        self.presented_presentation
-            .presented_root_geometry(root_surface_id)
+    ) -> Option<PresentedWindowGeometry> {
+        self.presented_window_geometries
+            .binary_search_by_key(&root_surface_id, PresentedWindowGeometry::root_surface_id)
+            .ok()
+            .map(|index| self.presented_window_geometries[index])
     }
 
     pub(in crate::compositor) fn current_presentation_rect_for_root(
@@ -167,85 +188,41 @@ impl CompositorState {
         self.presentation_rect_for_geometry(root_surface_id, geometry)
     }
 
-    pub(in crate::compositor) fn native_frame_presented_root_geometries(
+    pub(in crate::compositor) fn native_frame_presented_window_geometries(
         &self,
-        surfaces: &[RenderableSurface],
-    ) -> Vec<PresentedRootGeometry> {
-        let origins = render::surface_origins(surfaces);
-        let mut roots = surfaces
-            .iter()
-            .enumerate()
-            .filter(|(_, surface)| {
-                surface.placement.parent_surface_id.is_none()
-                    && self.root_surface_id_for_surface(surface.surface_id) == surface.surface_id
-                    && self.window_id_for_surface(surface.surface_id).is_some()
-            })
-            .filter_map(|(index, surface)| {
-                let (x, y) = origins.get(index).copied()?;
-                let size = surface.render_target_size.unwrap_or(BufferSize {
-                    width: surface.width,
-                    height: surface.height,
-                });
-                let rect = PresentationRect::new(
-                    f64::from(x),
-                    f64::from(y),
-                    f64::from(size.width),
-                    f64::from(size.height),
-                )?;
-                Some(PresentedRootGeometry::new(surface.surface_id, rect))
+        presentation: &PresentationSceneSample,
+    ) -> Vec<PresentedWindowGeometry> {
+        let mut windows = self
+            .presentation_window_targets()
+            .into_iter()
+            .filter(|(root_surface_id, _)| self.window_id_for_surface(*root_surface_id).is_some())
+            .map(|(root_surface_id, canonical_rect)| {
+                let presented_rect = presentation
+                    .transform_for_root(root_surface_id)
+                    .map_or(canonical_rect, |transform| transform.presented_rect);
+                PresentedWindowGeometry::new(root_surface_id, presented_rect)
             })
             .collect::<Vec<_>>();
-        roots.sort_unstable_by_key(PresentedRootGeometry::root_surface_id);
-        roots
+        windows.sort_unstable_by_key(PresentedWindowGeometry::root_surface_id);
+        windows
     }
 
     pub(in crate::compositor) fn presented_visual_root_window_geometry(
         &self,
         root_surface_id: u32,
     ) -> Option<WindowGeometry> {
-        let presented_rect = self
-            .presented_root_geometry(root_surface_id)
-            .map(PresentedRootGeometry::presented_rect)
-            .or_else(|| {
-                self.presented_presentation_transform(root_surface_id)
-                    .map(|transform| transform.presented_rect)
-            })?;
-        let root_surface = self
-            .active_scene_surfaces()
-            .iter()
-            .find(|surface| surface.surface_id == root_surface_id)?;
-        let root_mode = self
+        let canonical_geometry = self
             .current_visual_root_window_geometry(root_surface_id)
-            .or_else(|| self.current_root_window_geometry(root_surface_id))
-            .map(|geometry| geometry.placement.root_mode)
-            .unwrap_or(root_surface.placement.root_mode);
-        let root_origin_without_window_offset = match root_mode {
-            RootPlacementMode::Absolute => (root_surface.x, root_surface.y),
-            RootPlacementMode::CascadedWindow => {
-                let mut surfaces = self.active_scene_surfaces().to_vec();
-                let root_index = surfaces
-                    .iter()
-                    .position(|surface| surface.surface_id == root_surface_id)?;
-                surfaces[root_index].render_placement = Some(SurfacePlacement::root());
-                render::surface_origins(&surfaces)
-                    .get(root_index)
-                    .copied()
-                    .unwrap_or((root_surface.x, root_surface.y))
-            }
-        };
-        Some(WindowGeometry::new(
-            SurfacePlacement {
-                parent_surface_id: None,
-                local_x: saturating_i32_from_f64(
-                    presented_rect.x().round() - f64::from(root_origin_without_window_offset.0),
-                ),
-                local_y: saturating_i32_from_f64(
-                    presented_rect.y().round() - f64::from(root_origin_without_window_offset.1),
-                ),
-                root_mode,
-            },
-            saturating_u32_from_f64(presented_rect.width().round()),
-            saturating_u32_from_f64(presented_rect.height().round()),
+            .or_else(|| self.current_root_window_geometry(root_surface_id))?;
+        let canonical_rect =
+            self.presentation_rect_for_geometry(root_surface_id, canonical_geometry)?;
+        let presented_rect = self
+            .presented_window_geometry(root_surface_id)
+            .map(PresentedWindowGeometry::presented_rect)?;
+        Some(materialize_presented_window_geometry(
+            canonical_geometry,
+            canonical_rect,
+            presented_rect,
         ))
     }
 
@@ -288,6 +265,7 @@ impl CompositorState {
     ) {
         self.presented_presentation_frame_id = frame_id;
         self.presented_presentation = presentation.clone();
+        self.presented_window_geometries = presentation.presented_windows.clone();
         for transform in &presentation.transforms {
             if transform.mathematically_settled {
                 self.presentation_animator.acknowledge_presented_transition(
@@ -309,7 +287,19 @@ impl CompositorState {
         self.presented_presentation
             .transforms
             .retain(|transform| transform.root_surface_id != root_surface_id);
+        self.presented_window_geometries
+            .retain(|window| window.root_surface_id() != root_surface_id);
         self.presented_presentation.refresh_signature();
+    }
+
+    pub(in crate::compositor) fn publish_presented_window_geometry(
+        &mut self,
+        frame_id: u64,
+        geometry: PresentedWindowGeometry,
+    ) {
+        self.presented_presentation_frame_id = frame_id;
+        self.presented_window_geometries = vec![geometry];
+        self.advance_pointer_hit_generation();
     }
 
     pub(in crate::compositor) fn animate_toplevel_visual_geometry(

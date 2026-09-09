@@ -455,6 +455,136 @@ mod task_05_8_tests {
             ),
             (944, 502)
         );
+
+        let window_geometry = WindowGeometry::new(SurfacePlacement::root_at(100, 100), 944, 526);
+        let canonical_window_rect = state
+            .presentation_rect_for_geometry(root_id, window_geometry)
+            .expect("CSD window geometry should resolve to a presentation rect");
+        assert_eq!(
+            canonical_window_rect,
+            PresentationRect::new(
+                f64::from(render::FIRST_SURFACE_OFFSET.0 + 100),
+                f64::from(render::FIRST_SURFACE_OFFSET.1 + 100),
+                944.0,
+                526.0,
+            )
+            .expect("valid canonical CSD window rect")
+        );
+        assert_ne!(
+            canonical_window_rect,
+            PresentationRect::new(
+                f64::from(origins[0].0),
+                f64::from(origins[0].1),
+                944.0,
+                502.0,
+            )
+            .expect("valid raw CSD root rect")
+        );
+        assert!(
+            PresentationGeometryTransform::new(canonical_window_rect, canonical_window_rect)
+                .is_identity(),
+            "identity presentation must remain identity in window space"
+        );
+        let window_id = WindowId::from_raw(1).expect("CSD window id");
+        state.window_by_root_surface.insert(root_id, window_id);
+        assert_eq!(
+            state
+                .native_frame_presented_window_geometries(&PresentationSceneSample::empty(
+                    AnimationTime::from_nanos(0),
+                ))
+                .into_iter()
+                .find(|window| window.root_surface_id() == root_id)
+                .expect("identity CSD window projection")
+                .presented_rect(),
+            canonical_window_rect,
+            "identity frame projection must use the window rect, not the root surface rect"
+        );
+
+        state.layout_animation_epoch = Some(AnimationTime::from_nanos(0));
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            Some(WindowGeometry::new(
+                SurfacePlacement::root_at(80, 80),
+                944,
+                526,
+            )),
+            window_geometry,
+        );
+        let sampled = state.presentation_scene_sample_at(AnimationTime::from_nanos(1_000_000));
+        assert_eq!(
+            sampled
+                .transform_for_root(root_id)
+                .expect("active CSD transition")
+                .canonical_rect,
+            canonical_window_rect,
+            "active transitions must use the canonical window rect"
+        );
+    }
+
+    #[test]
+    pub(in crate::compositor) fn task_05_8_presented_window_projection_survives_canonical_race() {
+        let mut state = CompositorState::default();
+        let root_id = 52;
+        state.append_renderable_surface(test_surface(root_id, 944, 502));
+        let titlebar_id = 53;
+        let mut titlebar = test_surface(titlebar_id, 944, 24);
+        titlebar.placement = SurfacePlacement::subsurface(root_id, 0, -24);
+        state
+            .surface_placements
+            .insert(titlebar_id, titlebar.placement);
+        state.append_renderable_surface(titlebar);
+        state
+            .surface_window_geometries
+            .insert(root_id, XdgWindowGeometry::new(0, -24, 944, 526));
+        let geometry_a = WindowGeometry::new(SurfacePlacement::root_at(100, 100), 944, 526);
+        state.toplevel_visual_geometries.insert(
+            root_id,
+            ToplevelVisualGeometry {
+                placement: geometry_a.placement,
+                width: geometry_a.width,
+                height: geometry_a.height,
+                active_resize: None,
+                mode_transition: false,
+            },
+        );
+        state.update_toplevel_visual_render_assignment(root_id);
+        let rect_a = state
+            .presentation_rect_for_geometry(root_id, geometry_a)
+            .expect("canonical window A");
+        state.publish_presented_window_geometry(10, PresentedWindowGeometry::new(root_id, rect_a));
+
+        let geometry_b = WindowGeometry::new(SurfacePlacement::root_at(120, 100), 1000, 600);
+        state.toplevel_visual_geometries.insert(
+            root_id,
+            ToplevelVisualGeometry {
+                placement: geometry_b.placement,
+                width: geometry_b.width,
+                height: geometry_b.height,
+                active_resize: None,
+                mode_transition: false,
+            },
+        );
+        assert_eq!(
+            state.presented_visual_root_window_geometry(root_id),
+            Some(WindowGeometry::new(
+                SurfacePlacement::root_at(100, 100),
+                944,
+                526,
+            ))
+        );
+
+        let rect_b = state
+            .presentation_rect_for_geometry(root_id, geometry_b)
+            .expect("canonical window B");
+        let composed = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &PresentationSceneSample::empty(AnimationTime::from_nanos(11)),
+            vec![PresentedWindowGeometry::new(root_id, rect_b)],
+        );
+        state.publish_presented_presentation(11, &composed);
+        assert_eq!(
+            state.presented_visual_root_window_geometry(root_id),
+            Some(geometry_b)
+        );
     }
 
     #[test]

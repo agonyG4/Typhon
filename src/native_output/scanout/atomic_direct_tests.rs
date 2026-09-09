@@ -5,6 +5,7 @@ use crate::native_output::kms_worker::{
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
+use oblivion_one::compositor::PresentationRect;
 use oblivion_one::native::kms::FramebufferId;
 use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
@@ -107,6 +108,46 @@ fn presented_ownership_for_release_test() -> DirectPrimaryOwnership {
         )
         .expect("present direct resource");
     ownership
+}
+
+#[test]
+fn direct_pageflip_info_preserves_the_accepted_window_projection() {
+    let key = test_key();
+    let accepted_rect = PresentationRect::new(12.0, 34.0, 1920.0, 1080.0)
+        .expect("valid accepted direct window rect");
+    let (lease, _cleanup_count) = DirectPrimaryLease::test_fixture_with_probe_and_damage_and_rect(
+        key,
+        42,
+        None,
+        accepted_rect,
+    );
+    let mut ownership = DirectPrimaryOwnership::default();
+    let submitted = test_submitted(91, lease);
+    ownership
+        .accept_submitted(submitted)
+        .expect("accept direct candidate");
+
+    let info = ownership
+        .submitted_pageflip_info(
+            OutputTransactionId::new(std::num::NonZeroU64::new(91).unwrap()),
+            PageFlipToken::new(91).unwrap(),
+        )
+        .expect("submitted direct candidate");
+    assert_eq!(info.root_surface_id, key.content.surface_id);
+    assert_eq!(info.presented_window_rect, accepted_rect);
+
+    ownership
+        .complete_pageflip(
+            OutputTransactionId::new(std::num::NonZeroU64::new(91).unwrap()),
+            PageFlipToken::new(91).unwrap(),
+            MonotonicTimestampNs::new(92),
+        )
+        .expect("present direct candidate");
+    let presented = ownership
+        .presented
+        .as_ref()
+        .expect("presented direct lease");
+    assert_eq!(presented.lease.presented_window_rect(), accepted_rect);
 }
 
 fn expected_presented_identity_for_release_test() -> ExpectedPresentedDirectPrimary {

@@ -31,9 +31,9 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let presentation = server.presentation_scene_sample_at(at);
         let canonical_surfaces = server.native_frame_renderable_surfaces();
         let surfaces = server.native_frame_renderable_surfaces_with_presentation(&presentation);
-        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_roots(
+        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &presentation,
-            server.native_frame_presented_root_geometries(surfaces.as_ref()),
+            server.native_frame_presented_window_geometries(&presentation),
         );
         let decorations = server
             .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)

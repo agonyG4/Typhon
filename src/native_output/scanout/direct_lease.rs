@@ -7,7 +7,7 @@ use std::{
 };
 
 use oblivion_one::compositor::{
-    DirectScanoutSceneCandidate, SurfaceCommitSequence, SurfaceDamagePresentation,
+    DirectScanoutSceneCandidate, PresentationRect, SurfaceCommitSequence, SurfaceDamagePresentation,
 };
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
@@ -18,6 +18,8 @@ pub(crate) struct DirectPrimaryLease {
     key: DirectScanoutCandidateKey,
     validation_key: DirectPlaneValidationKey,
     surface_id: u32,
+    root_surface_id: u32,
+    presented_window_rect: PresentationRect,
     surface_presentation_generation: u64,
     commit_sequence: SurfaceCommitSequence,
     _buffer: DmabufBufferHandle,
@@ -40,6 +42,8 @@ impl DirectPrimaryLease {
             key,
             validation_key,
             surface_id: candidate.surface_id,
+            root_surface_id: candidate.root_surface_id,
+            presented_window_rect: candidate.presented_window_rect,
             surface_presentation_generation: candidate.surface_presentation_generation,
             commit_sequence: candidate.commit_sequence,
             _buffer: candidate.buffer,
@@ -55,6 +59,14 @@ impl DirectPrimaryLease {
 
     pub(crate) const fn surface_id(&self) -> u32 {
         self.surface_id
+    }
+
+    pub(crate) const fn presented_window_rect(&self) -> PresentationRect {
+        self.presented_window_rect
+    }
+
+    pub(crate) const fn root_surface_id(&self) -> u32 {
+        self.root_surface_id
     }
 
     pub(crate) const fn surface_presentation_generation(&self) -> u64 {
@@ -120,6 +132,21 @@ impl DirectPrimaryLease {
         framebuffer_id: u32,
         surface_damage: Option<SurfaceDamagePresentation>,
     ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+        Self::test_fixture_with_probe_and_damage_and_rect(
+            key,
+            framebuffer_id,
+            surface_damage,
+            PresentationRect::new(0.0, 0.0, 1.0, 1.0).expect("valid direct test window rect"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_probe_and_damage_and_rect(
+        key: DirectScanoutCandidateKey,
+        framebuffer_id: u32,
+        surface_damage: Option<SurfaceDamagePresentation>,
+        presented_window_rect: PresentationRect,
+    ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
         let (framebuffer, buffer, cleanup_count) =
             super::test_direct_primary_framebuffer(framebuffer_id);
         (
@@ -127,6 +154,8 @@ impl DirectPrimaryLease {
                 key,
                 validation_key: super::test_validation_key(key.output_generation),
                 surface_id: key.content.surface_id,
+                root_surface_id: key.content.surface_id,
+                presented_window_rect,
                 surface_presentation_generation: 1,
                 commit_sequence: SurfaceCommitSequence::initial(),
                 _buffer: buffer,

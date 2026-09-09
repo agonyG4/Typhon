@@ -296,6 +296,9 @@ impl CompositorState {
         let geometry = self
             .current_visual_root_window_geometry(owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput)?;
+        let presented_window_rect = self
+            .presentation_rect_for_geometry(owner.owner_root_surface_id, geometry)
+            .ok_or(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput)?;
         if geometry.width != self.output_size.width
             || geometry.height != self.output_size.height
             || geometry.placement != SurfacePlacement::absolute_root_at(0, 0)
@@ -374,6 +377,7 @@ impl CompositorState {
         Ok(DirectScanoutSceneCandidate {
             surface_id: root.surface_id,
             root_surface_id: owner.owner_root_surface_id,
+            presented_window_rect,
             content_epoch: self
                 .surface_content_epoch(root.surface_id)
                 .map_or(root.commit_sequence.get(), SurfaceCommitSequence::get),

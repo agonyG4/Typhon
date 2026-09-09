@@ -5,6 +5,7 @@ use super::super::presentation_transactions::{
 };
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::*;
+use oblivion_one::compositor::PresentedWindowGeometry;
 
 pub(super) fn fail_composited_transition(
     worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
@@ -140,6 +141,13 @@ pub(super) fn settle_direct_pageflip(
         timestamp_ns: presented_at.get(),
     });
     server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
+    server.publish_presented_window_geometry(
+        direct_info.frame_id,
+        PresentedWindowGeometry::new(
+            direct_info.root_surface_id,
+            direct_info.presented_window_rect,
+        ),
+    );
     scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
     drop(completion.replaced);
     let target = direct_info.target;

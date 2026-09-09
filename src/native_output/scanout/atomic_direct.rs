@@ -2,6 +2,7 @@ use std::os::fd::OwnedFd;
 
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
+    PresentationRect,
 };
 
 use super::*;
@@ -59,6 +60,8 @@ pub(crate) struct DirectPageflipInfo {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) surface_id: u32,
+    pub(crate) root_surface_id: u32,
+    pub(crate) presented_window_rect: PresentationRect,
     pub(crate) surface_presentation_generation: u64,
     pub(crate) commit_sequence: oblivion_one::compositor::SurfaceCommitSequence,
     pub(crate) candidate_key: DirectScanoutCandidateKey,
@@ -93,7 +96,7 @@ pub(crate) enum DirectRetirementMismatch {
 #[derive(Debug)]
 pub(crate) enum PresentedDirectRetirement {
     Retired {
-        lease: DirectPrimaryLease,
+        lease: Box<DirectPrimaryLease>,
     },
     Mismatch {
         expected: ExpectedPresentedDirectPrimary,
@@ -166,6 +169,8 @@ pub(crate) struct DirectPageflipCompletion {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) surface_id: u32,
+    pub(crate) root_surface_id: u32,
+    pub(crate) presented_window_rect: PresentationRect,
     pub(crate) framebuffer_id: u32,
     pub(crate) candidate_key: DirectScanoutCandidateKey,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
@@ -379,11 +384,12 @@ impl DirectPrimaryOwnership {
             };
         }
         PresentedDirectRetirement::Retired {
-            lease: self
-                .presented
-                .take()
-                .expect("presented ownership checked")
-                .lease,
+            lease: Box::new(
+                self.presented
+                    .take()
+                    .expect("presented ownership checked")
+                    .lease,
+            ),
         }
     }
 
@@ -643,6 +649,8 @@ impl SubmittedDirectPrimary {
             transaction_id: self.transaction_id,
             token: self.token,
             surface_id: self.lease.surface_id(),
+            root_surface_id: self.lease.root_surface_id(),
+            presented_window_rect: self.lease.presented_window_rect(),
             surface_presentation_generation: self.lease.surface_presentation_generation(),
             commit_sequence: self.lease.commit_sequence(),
             candidate_key: self.lease.key(),
@@ -661,6 +669,8 @@ impl PresentedDirectPrimary {
             transaction_id: self.transaction_id,
             token: self.token,
             surface_id: self.lease.surface_id(),
+            root_surface_id: self.lease.root_surface_id(),
+            presented_window_rect: self.lease.presented_window_rect(),
             surface_presentation_generation: self.lease.surface_presentation_generation(),
             commit_sequence: self.lease.commit_sequence(),
             candidate_key: self.lease.key(),
@@ -756,7 +766,7 @@ impl DirectScanoutControl {
                 self.counters.exits = self.counters.exits.saturating_add(1);
                 self.inhibit_until_composited_present = false;
                 CompositedTransitionResult::Completed {
-                    released: Some(Box::new(lease)),
+                    released: Some(lease),
                 }
             }
             PresentedDirectRetirement::Mismatch {

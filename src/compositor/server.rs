@@ -19,8 +19,8 @@ use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, EffectFrameDemandSnapshot, PresentationAnimationMetrics,
     PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
-    PresentationSceneSample, PresentedRootGeometry, ResolvedEffectScene, ShmBufferLifetimeMetrics,
-    SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
+    PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
+    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1016,8 +1016,11 @@ impl OwnCompositorServer {
         self.state.presented_presentation_transform(root_surface_id)
     }
 
-    pub fn presented_root_geometry(&self, root_surface_id: u32) -> Option<PresentedRootGeometry> {
-        self.state.presented_root_geometry(root_surface_id)
+    pub fn presented_window_geometry(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<PresentedWindowGeometry> {
+        self.state.presented_window_geometry(root_surface_id)
     }
 
     pub fn current_presentation_rect_for_root(
@@ -1028,11 +1031,12 @@ impl OwnCompositorServer {
             .current_presentation_rect_for_root(root_surface_id)
     }
 
-    pub fn native_frame_presented_root_geometries(
+    pub fn native_frame_presented_window_geometries(
         &self,
-        surfaces: &[RenderableSurface],
-    ) -> Vec<PresentedRootGeometry> {
-        self.state.native_frame_presented_root_geometries(surfaces)
+        presentation: &PresentationSceneSample,
+    ) -> Vec<PresentedWindowGeometry> {
+        self.state
+            .native_frame_presented_window_geometries(presentation)
     }
 
     pub fn presented_presentation_frame_id(&self) -> u64 {
@@ -1046,6 +1050,15 @@ impl OwnCompositorServer {
     ) {
         self.state
             .publish_presented_presentation(frame_id, presentation);
+    }
+
+    pub fn publish_presented_window_geometry(
+        &mut self,
+        frame_id: u64,
+        geometry: PresentedWindowGeometry,
+    ) {
+        self.state
+            .publish_presented_window_geometry(frame_id, geometry);
     }
 
     pub fn cancel_presentation_for_root(&mut self, root_surface_id: u32) {

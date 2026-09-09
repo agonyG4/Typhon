@@ -277,7 +277,7 @@ pub use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationAnimationMetrics, PresentationAnimator,
     PresentationDamageRect, PresentationFrameSnapshot, PresentationGeometryTransform,
     PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentationTransition,
-    PresentationVelocity, PresentationWindowSample, PresentedRootGeometry, SpringSpec,
+    PresentationVelocity, PresentationWindowSample, PresentedWindowGeometry, SpringSpec,
     TransitionId, presentation_damage,
 };
 use layer_shell::{Layer, LayerSurfaceRole};
@@ -615,6 +615,7 @@ pub struct CompositorState {
     active_scene_view: ActiveSceneView,
     presentation_animator: PresentationAnimator,
     presented_presentation: PresentationFrameSnapshot,
+    presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,
     scene_work_index: SceneWorkIndex,
     pub(in crate::compositor) tiled_layout: TiledLayoutManager,

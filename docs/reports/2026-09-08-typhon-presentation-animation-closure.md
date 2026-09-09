@@ -149,6 +149,9 @@ consumer boundaries, as stated above.
 
 ## Final physical-root and tiled-resize authority closure (2026-09-08)
 
+This section records the preceding closure state; the 2026-09-09 follow-up
+below supersedes its root-surface terminology and physical projection details.
+
 The final review found one remaining ambiguity: a pageflip-confirmed identity
 frame carried no transition transform, so transition-only metadata could not
 prove where an unchanged root was physically displayed. The resolved native
@@ -199,3 +202,56 @@ final shader declaration-order correction. No live DRM/KMS or 1920x1080@165 Hz
 hardware qualification was available, and the previously documented
 fractional-rendering limitation remains unchanged. No additional presentation
 features were added; the next compositor task remains Dwindle v1.2.
+
+## Final window-space authority follow-up (2026-09-09)
+
+The remaining presentation defect was a root/window-space hybrid in the
+animation target path. A CSD toplevel with canonical window geometry
+`(100,100,944,526)` and a client root at `(100,124,944,502)` could derive its
+active target from the raw root surface, shifting the physical target by the
+client frame margin. The target path now uses the canonical window geometry and
+the shared window-space `PresentationRect` helper. The regression test proves
+that the canonical rect differs from the raw root rect, identity remains an
+identity transform, and an active transition stores the window-space rect.
+
+`PresentedRootGeometry` is now `PresentedWindowGeometry`. It is explicitly
+metadata for the physically presented toplevel/window rect, never raw
+`wl_surface` geometry. Composed frames derive this metadata from canonical
+window geometry plus the sampled presentation transform; direct-scanout
+candidates capture the validated window-space rect and carry it through the
+lease, submitted, presented, and completion records. Direct presentation
+publishes that rect only after a successful pageflip, so an accepted A frame
+cannot be replaced by canonical B before A physically presents. Direct-to-
+composited transitions continue to publish through the composed pageflip path;
+no synthetic composed scene is created.
+
+The physical projection is centralized in one saturating materialization helper:
+rounded physical-minus-canonical deltas adjust local placement, physical
+width/height determine the presented window size, and the canonical root mode
+is retained. Input maps canonical window coordinates into the last physically
+presented window, popup visual-stack roots remain distinct from presentation
+owners, and tiled resize rebasing remains presented client edge minus canonical
+client edge. The history/lifecycle model is unchanged apart from this window
+space meaning.
+
+Final verification, all run in the existing checkout while reusing `target/`:
+
+- `rtk run -- cargo fmt --check` — passed.
+- `rtk run -- cargo check --locked --all-targets` — passed.
+- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — passed.
+- `rtk run -- cargo test --locked` — passed on the final run: 2,255 library
+  tests, 1,305 main binary tests, and all auxiliary integration targets
+  completed with zero failures; 2 library tests and the declared optional
+  environment-dependent tests were ignored.
+- Focused CSD, presentation-race, identity, tiled-rebase, and direct-lease
+  ownership tests — passed.
+- `rtk git diff --check` — passed.
+- `rtk run -- bash bin/check-source-layout` — reports the existing 42-file
+  oversized-module debt; no unrelated extraction or source-layout limit change
+  was made.
+
+The first combined test invocation exposed a timing-sensitive empty helper-PID
+file in an existing process cleanup test; the exact test passed in isolation,
+and the final complete locked run passed. No live DRM/KMS or 1920x1080@165 Hz
+hardware qualification is claimed. The next compositor task remains Dwindle
+v1.2.

@@ -383,6 +383,7 @@ fn retry_service_decision(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_retry_state(
     registry: &mut DmabufGpuReleaseRegistry,
     deferred_count: usize,

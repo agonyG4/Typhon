@@ -247,12 +247,12 @@ mod tests {
         let sample = oblivion_one::compositor::PresentationSceneSample::empty(
             oblivion_one::compositor::AnimationTime::from_nanos(frame_id),
         );
-        let presentation = PresentationFrameSnapshot::from_sample_with_presented_roots(
+        let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &sample,
-            vec![oblivion_one::compositor::PresentedRootGeometry::new(
+            vec![oblivion_one::compositor::PresentedWindowGeometry::new(
                 7,
                 oblivion_one::compositor::PresentationRect::new(x, 0.0, 100.0, 80.0)
-                    .expect("valid root rect"),
+                    .expect("valid window rect"),
             )],
         );
         NativeFrameSceneSnapshot {
@@ -290,13 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn presented_root_projection_advances_only_on_physical_promotion() {
+    fn presented_window_projection_advances_only_on_physical_promotion() {
         let mut history = NativeSceneHistory::new(snapshot_with_root(1, 100.0));
         history.replace_ready(snapshot_with_root(2, 200.0));
         assert_eq!(
             history
                 .presented_snapshot()
-                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .and_then(|snapshot| snapshot.presentation.presented_window_geometry(7))
                 .map(|root| root.presented_rect().x()),
             Some(100.0)
         );
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(
             history
                 .presented_snapshot()
-                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .and_then(|snapshot| snapshot.presentation.presented_window_geometry(7))
                 .map(|root| root.presented_rect().x()),
             Some(100.0)
         );
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(
             history
                 .presented_snapshot()
-                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .and_then(|snapshot| snapshot.presentation.presented_window_geometry(7))
                 .map(|root| root.presented_rect().x()),
             Some(200.0)
         );

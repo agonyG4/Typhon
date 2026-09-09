@@ -372,35 +372,26 @@ impl CompositorState {
             return Some((x, y, origin));
         }
 
-        if let Some(presented_root) = self.presented_root_geometry(presentation_owner)
+        if let Some(presented_window) = self.presented_window_geometry(presentation_owner)
             && let Some(canonical_rect) =
                 self.current_presentation_rect_for_root(presentation_owner)
         {
-            let transform =
-                PresentationGeometryTransform::new(canonical_rect, presented_root.presented_rect());
+            let transform = PresentationGeometryTransform::new(
+                canonical_rect,
+                presented_window.presented_rect(),
+            );
             let canonical = transform.inverse_map_point_unbounded((x, y))?;
             return Some((
                 canonical.0,
                 canonical.1,
                 (
-                    saturating_i32_from_f64(presented_root.presented_rect().x().floor()),
-                    saturating_i32_from_f64(presented_root.presented_rect().y().floor()),
+                    saturating_i32_from_f64(presented_window.presented_rect().x().floor()),
+                    saturating_i32_from_f64(presented_window.presented_rect().y().floor()),
                 ),
             ));
         }
 
-        let Some(transform) = self.presented_presentation_transform(presentation_owner) else {
-            return Some((x, y, origin));
-        };
-        let canonical = transform.geometry().inverse_map_point_unbounded((x, y))?;
-        Some((
-            canonical.0,
-            canonical.1,
-            (
-                saturating_i32_from_f64(transform.presented_rect.x().floor()),
-                saturating_i32_from_f64(transform.presented_rect.y().floor()),
-            ),
-        ))
+        Some((x, y, origin))
     }
 
     fn pointer_scene_hit_uncached(
