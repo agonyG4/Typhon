@@ -915,6 +915,7 @@ mod tests {
         let graph = CompiledFrameGraph {
             passes,
             textures,
+            instances: Vec::new(),
             final_damage: EffectRegion::empty(),
             stats: Default::default(),
         };

@@ -153,8 +153,148 @@ pub struct RenderGraphCompileStats {
 pub struct CompiledFrameGraph {
     pub passes: Vec<CompiledRenderPass>,
     pub textures: Vec<GraphTexturePlan>,
+    pub instances: Vec<CompiledEffectInstance>,
     pub final_damage: EffectRegion,
     pub stats: RenderGraphCompileStats,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledEffectInstance {
+    pub id: EffectInstanceId,
+    pub output_influence_region: EffectRegion,
+    pub capture_region: EffectRegion,
+    pub dependencies: Vec<EffectInstanceId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectInstanceExecutionDemand {
+    pub id: EffectInstanceId,
+    pub output_region: EffectRegion,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectExecutionDemand {
+    pub instances: Vec<EffectInstanceExecutionDemand>,
+    pub execution_region: EffectRegion,
+}
+
+impl EffectExecutionDemand {
+    pub fn contains(&self, id: EffectInstanceId) -> bool {
+        self.instances.iter().any(|instance| instance.id == id)
+    }
+
+    pub fn output_region(&self, id: EffectInstanceId) -> Option<&EffectRegion> {
+        self.instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .map(|instance| &instance.output_region)
+    }
+}
+
+fn all_visible_instances_with_output_regions(graph: &CompiledFrameGraph) -> EffectExecutionDemand {
+    let mut execution_region = EffectRegion::empty();
+    let instances = graph
+        .instances
+        .iter()
+        .map(|instance| {
+            execution_region = execution_region.union(&instance.output_influence_region);
+            EffectInstanceExecutionDemand {
+                id: instance.id,
+                output_region: instance.output_influence_region.clone(),
+            }
+        })
+        .collect();
+    EffectExecutionDemand {
+        instances,
+        execution_region,
+    }
+}
+
+fn unique_instance_index(graph: &CompiledFrameGraph, id: EffectInstanceId) -> Option<usize> {
+    let mut found = None;
+    for (index, instance) in graph.instances.iter().enumerate() {
+        if instance.id != id {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
+    }
+    found
+}
+
+pub fn plan_effect_execution_demand(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+) -> EffectExecutionDemand {
+    if conservative_full || (!repair_region.is_empty() && repair_region.bounding_rect().is_none()) {
+        return all_visible_instances_with_output_regions(graph);
+    }
+
+    let mut output_regions = vec![None; graph.instances.len()];
+    for (index, instance) in graph.instances.iter().enumerate() {
+        let direct = repair_region.intersect(&instance.output_influence_region);
+        if !direct.is_empty() {
+            output_regions[index] = Some(direct);
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for consumer_index in 0..graph.instances.len() {
+            if output_regions[consumer_index].is_none() {
+                continue;
+            }
+            let consumer = &graph.instances[consumer_index];
+            for dependency_id in &consumer.dependencies {
+                let Some(dependency_index) = unique_instance_index(graph, *dependency_id) else {
+                    return all_visible_instances_with_output_regions(graph);
+                };
+                let dependency = &graph.instances[dependency_index];
+                let required = dependency
+                    .output_influence_region
+                    .intersect(&consumer.capture_region);
+                if required.is_empty() {
+                    continue;
+                }
+                if output_regions[dependency_index]
+                    .as_ref()
+                    .is_some_and(|existing| existing.intersect(&required) == required)
+                {
+                    continue;
+                }
+                let next = output_regions[dependency_index]
+                    .as_ref()
+                    .map_or_else(|| required.clone(), |existing| existing.union(&required));
+                if output_regions[dependency_index].as_ref() != Some(&next) {
+                    output_regions[dependency_index] = Some(next);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    let mut execution_region = EffectRegion::empty();
+    let instances = output_regions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, output_region)| {
+            output_region.map(|output_region| {
+                execution_region = execution_region.union(&output_region);
+                EffectInstanceExecutionDemand {
+                    id: graph.instances[index].id,
+                    output_region,
+                }
+            })
+        })
+        .collect();
+    EffectExecutionDemand {
+        instances,
+        execution_region,
+    }
 }
 
 impl CompiledFrameGraph {
@@ -445,7 +585,8 @@ pub fn compile_frame_execution_plan(
 
     let (mut builder, output_texture) = GraphBuilder::new(output_bounds)?;
     let mut final_damage = source_damage.clone();
-    let mut checkpoints = Vec::<(GraphPassId, EffectRegion)>::new();
+    let mut checkpoints = Vec::<(GraphPassId, EffectRegion, EffectInstanceId)>::new();
+    let mut compiled_instances = Vec::with_capacity(visible_instances.len());
 
     for instance in visible_instances {
         let program = registry
@@ -460,9 +601,23 @@ pub fn compile_frame_execution_plan(
         final_damage = final_damage.union(&effect_damage.output_damage);
         let dependencies = checkpoints
             .iter()
-            .filter(|(_, region)| region.intersects(&effect_damage.capture_region))
-            .map(|(pass, _)| *pass)
+            .filter(|(_, region, _)| region.intersects(&effect_damage.capture_region))
+            .map(|(pass, _, _)| *pass)
             .collect::<Vec<_>>();
+        let dependency_instances = if program
+            .program
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, EffectNodeKind::Source(EffectSource::Backdrop)))
+        {
+            checkpoints
+                .iter()
+                .filter(|(_, region, _)| region.intersects(&effect_damage.capture_region))
+                .map(|(_, _, instance_id)| *instance_id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let checkpoint = compile_instance(
             &mut builder,
             output_texture,
@@ -475,7 +630,13 @@ pub fn compile_frame_execution_plan(
                 checkpoint_dependencies: &dependencies,
             },
         )?;
-        checkpoints.push((checkpoint, effect_damage.dependency_region));
+        compiled_instances.push(CompiledEffectInstance {
+            id: instance.id,
+            output_influence_region: effect_damage.dependency_region.clone(),
+            capture_region: effect_damage.capture_region,
+            dependencies: dependency_instances,
+        });
+        checkpoints.push((checkpoint, effect_damage.dependency_region, instance.id));
     }
 
     fuse_compatible_local_stages(&mut builder);
@@ -516,6 +677,7 @@ pub fn compile_frame_execution_plan(
     Ok(FrameExecutionPlan::EffectGraph(CompiledFrameGraph {
         passes: builder.passes,
         textures: builder.textures,
+        instances: compiled_instances,
         final_damage,
         stats,
     }))
@@ -961,6 +1123,16 @@ mod tests {
             scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(1)),
         };
         (ResolvedEffectScene::new(1, vec![instance]), registry)
+    }
+
+    fn separated_blur_scene() -> (ResolvedEffectScene, EffectRegistry) {
+        let (scene, registry) = blur_scene();
+        let first = scene.instances[0].clone();
+        let mut second = first.clone();
+        second.id = EffectInstanceId::new(2).unwrap();
+        second.region = EffectRegion::from_rect(EffectRect::new(1200, 80, 320, 180).unwrap());
+        second.target_bounds = second.region.bounding_rect().unwrap();
+        (ResolvedEffectScene::new(1, vec![first, second]), registry)
     }
 
     #[test]
@@ -1496,5 +1668,181 @@ mod tests {
             stages[0].stage,
             Some(EffectNodeKind::ColorMatrix(_))
         ));
+    }
+
+    #[test]
+    fn unrelated_repair_prunes_separated_effect() {
+        let (scene, registry) = separated_blur_scene();
+        let first = scene.instances[0].clone();
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(1400, 500, 20, 20).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
+            false,
+        );
+
+        assert_eq!(demand.instances.len(), 1);
+        assert_eq!(demand.instances[0].id, first.id);
+        assert!(!demand.execution_region.is_empty());
+    }
+
+    #[test]
+    fn full_repair_keeps_all_visible_effects_live() {
+        let (scene, registry) = separated_blur_scene();
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        let demand = plan_effect_execution_demand(&graph, &EffectRegion::empty(), true);
+
+        assert_eq!(demand.instances.len(), 2);
+        assert!(demand.contains(EffectInstanceId::new(1).unwrap()));
+        assert!(demand.contains(EffectInstanceId::new(2).unwrap()));
+    }
+
+    #[test]
+    fn blur_source_halo_keeps_effect_output_demanded() {
+        let (scene, registry) = blur_scene();
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(88, 80, 12, 20).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        assert!(graph.final_damage.contains_point(100, 80));
+        let demand = plan_effect_execution_demand(&graph, &graph.final_damage, false);
+        assert!(demand.contains(EffectInstanceId::new(1).unwrap()));
+    }
+
+    #[test]
+    fn transitive_backdrop_dependencies_keep_the_earliest_effect_live() {
+        let (scene, registry) = blur_scene();
+        let mut first = scene.instances[0].clone();
+        first.region = EffectRegion::from_rect(EffectRect::new(100, 80, 20, 180).unwrap());
+        first.target_bounds = first.region.bounding_rect().unwrap();
+        let mut second = first.clone();
+        second.id = EffectInstanceId::new(2).unwrap();
+        second.region = EffectRegion::from_rect(EffectRect::new(130, 80, 20, 180).unwrap());
+        second.target_bounds = second.region.bounding_rect().unwrap();
+        let mut third = second.clone();
+        third.id = EffectInstanceId::new(3).unwrap();
+        third.region = EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap());
+        third.target_bounds = third.region.bounding_rect().unwrap();
+        let scene = ResolvedEffectScene::new(1, vec![first, second, third]);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        assert!(
+            graph.instances[1]
+                .dependencies
+                .contains(&EffectInstanceId::new(1).unwrap())
+        );
+        assert!(
+            graph.instances[2]
+                .dependencies
+                .contains(&EffectInstanceId::new(2).unwrap())
+        );
+        assert!(
+            !graph.instances[2]
+                .dependencies
+                .contains(&EffectInstanceId::new(1).unwrap())
+        );
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap()),
+            false,
+        );
+        assert_eq!(demand.instances.len(), 3);
+    }
+
+    #[test]
+    fn empty_repair_does_not_make_effects_live() {
+        let (scene, registry) = separated_blur_scene();
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        let demand = plan_effect_execution_demand(&graph, &EffectRegion::empty(), false);
+        assert!(demand.instances.is_empty());
+        assert!(demand.execution_region.is_empty());
+    }
+
+    #[test]
+    fn target_content_does_not_invent_backdrop_dependency() {
+        let (backdrop_scene, mut registry) = blur_scene();
+        let source = EffectNodeId::new(1).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(2).unwrap(),
+            nodes: vec![EffectNode::source(source, EffectSource::TargetContent)],
+            output: source,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        registry.insert(program).unwrap();
+        let mut backdrop = backdrop_scene.instances[0].clone();
+        backdrop.region = EffectRegion::from_rect(EffectRect::new(100, 80, 20, 180).unwrap());
+        backdrop.target_bounds = backdrop.region.bounding_rect().unwrap();
+        let mut target = backdrop.clone();
+        target.id = EffectInstanceId::new(2).unwrap();
+        target.program = EffectProgramId::new(2).unwrap();
+        target.anchor = EffectAnchor::OutputPostProcess;
+        target.scene_order = EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess);
+        target.region = EffectRegion::from_rect(EffectRect::new(130, 80, 20, 180).unwrap());
+        target.target_bounds = target.region.bounding_rect().unwrap();
+        let scene = ResolvedEffectScene::new(1, vec![backdrop, target]);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        assert!(graph.instances[1].dependencies.is_empty());
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::from_rect(EffectRect::new(130, 80, 20, 180).unwrap()),
+            false,
+        );
+        assert!(demand.contains(EffectInstanceId::new(2).unwrap()));
+        assert!(!demand.contains(EffectInstanceId::new(1).unwrap()));
     }
 }
