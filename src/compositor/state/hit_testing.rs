@@ -368,13 +368,31 @@ impl CompositorState {
         let interaction_takes_over = self
             .window_interaction
             .is_some_and(|interaction| interaction.root_surface_id == presentation_owner);
-        let Some(transform) = (!interaction_takes_over)
-            .then(|| self.presented_presentation_transform(presentation_owner))
-            .flatten()
-        else {
+        if interaction_takes_over {
+            return Some((x, y, origin));
+        }
+
+        if let Some(presented_root) = self.presented_root_geometry(presentation_owner)
+            && let Some(canonical_rect) =
+                self.current_presentation_rect_for_root(presentation_owner)
+        {
+            let transform =
+                PresentationGeometryTransform::new(canonical_rect, presented_root.presented_rect());
+            let canonical = transform.inverse_map_point_unbounded((x, y))?;
+            return Some((
+                canonical.0,
+                canonical.1,
+                (
+                    saturating_i32_from_f64(presented_root.presented_rect().x().floor()),
+                    saturating_i32_from_f64(presented_root.presented_rect().y().floor()),
+                ),
+            ));
+        }
+
+        let Some(transform) = self.presented_presentation_transform(presentation_owner) else {
             return Some((x, y, origin));
         };
-        let canonical = transform.inverse_map_point_unbounded((x, y))?;
+        let canonical = transform.geometry().inverse_map_point_unbounded((x, y))?;
         Some((
             canonical.0,
             canonical.1,

@@ -12,8 +12,8 @@ use super::{
     SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
     state_data::{
-        BackgroundEffectRegion, PendingSurfaceAttachment, PendingViewportChange,
-        SurfaceBufferRelease,
+        BackgroundEffectRegion, PendingSurfaceAttachment, PendingSurfaceBuffer,
+        PendingViewportChange,
     },
 };
 
@@ -163,7 +163,7 @@ pub(super) struct CachedSubsurfaceCommit {
 }
 
 impl CachedSubsurfaceCommit {
-    pub(super) fn merge(&mut self, newer: Self) -> Option<SurfaceBufferRelease> {
+    pub(super) fn merge(&mut self, newer: Self) -> Option<PendingSurfaceBuffer> {
         let Self {
             commit_id,
             commit_sequence,
@@ -197,7 +197,7 @@ impl CachedSubsurfaceCommit {
             self.attachment
                 .replace(attachment)
                 .and_then(|previous| match previous {
-                    PendingSurfaceAttachment::Buffer(buffer) => Some(buffer.release_target()),
+                    PendingSurfaceAttachment::Buffer(buffer) => Some(buffer),
                     PendingSurfaceAttachment::RemoveContent => None,
                 })
         });
@@ -648,7 +648,7 @@ impl SubsurfaceTransactionState {
         &mut self,
         surface_id: u32,
         commit: CachedSubsurfaceCommit,
-    ) -> Option<SurfaceBufferRelease> {
+    ) -> Option<PendingSurfaceBuffer> {
         let role = self.roles.get_mut(&surface_id)?;
         if role.cached_commits.is_empty() {
             role.cached_commits.push_back(commit);

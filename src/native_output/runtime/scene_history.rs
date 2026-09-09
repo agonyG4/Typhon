@@ -21,7 +21,7 @@ impl NativeFrameSceneSnapshot {
             render_generation: resolved.render_generation,
             scene: resolved.snapshot(),
             cursor_damage,
-            presentation: resolved.presentation.frame_snapshot(),
+            presentation: resolved.presentation_snapshot.clone(),
         }
     }
 }
@@ -243,6 +243,27 @@ mod tests {
         }
     }
 
+    fn snapshot_with_root(frame_id: u64, x: f64) -> NativeFrameSceneSnapshot {
+        let sample = oblivion_one::compositor::PresentationSceneSample::empty(
+            oblivion_one::compositor::AnimationTime::from_nanos(frame_id),
+        );
+        let presentation = PresentationFrameSnapshot::from_sample_with_presented_roots(
+            &sample,
+            vec![oblivion_one::compositor::PresentedRootGeometry::new(
+                7,
+                oblivion_one::compositor::PresentationRect::new(x, 0.0, 100.0, 80.0)
+                    .expect("valid root rect"),
+            )],
+        );
+        NativeFrameSceneSnapshot {
+            frame_id,
+            render_generation: frame_id,
+            scene: NativeSceneSnapshot::default(),
+            cursor_damage: NativeCursorDamageBounds::default(),
+            presentation,
+        }
+    }
+
     #[test]
     fn rendered_snapshot_advances_presented_history_only_on_matching_pageflip() {
         let mut history = NativeSceneHistory::new(snapshot(1));
@@ -265,6 +286,35 @@ mod tests {
         assert_eq!(
             history.presented.as_ref().map(|frame| frame.frame_id),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn presented_root_projection_advances_only_on_physical_promotion() {
+        let mut history = NativeSceneHistory::new(snapshot_with_root(1, 100.0));
+        history.replace_ready(snapshot_with_root(2, 200.0));
+        assert_eq!(
+            history
+                .presented_snapshot()
+                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .map(|root| root.presented_rect().x()),
+            Some(100.0)
+        );
+        assert!(history.queue_submission(20));
+        assert_eq!(
+            history
+                .presented_snapshot()
+                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .map(|root| root.presented_rect().x()),
+            Some(100.0)
+        );
+        assert!(history.promote_pageflip(20));
+        assert_eq!(
+            history
+                .presented_snapshot()
+                .and_then(|snapshot| snapshot.presentation.presented_root_geometry(7))
+                .map(|root| root.presented_rect().x()),
+            Some(200.0)
         );
     }
 

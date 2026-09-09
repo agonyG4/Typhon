@@ -699,7 +699,10 @@ impl NativeRuntime {
                 &mut self.scanout,
                 &mut self.server,
             ) {
-                Ok(Some(snapshot)) => snapshot,
+                Ok(Some(snapshot)) => {
+                    super::request_trusted_effect_reload_redraw(&mut self.queued_redraw_requested);
+                    snapshot
+                }
                 Ok(None) => {
                     return Some(ControlResponse::failure(
                         request.id,

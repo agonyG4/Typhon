@@ -525,7 +525,7 @@ impl CompositorState {
             log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
-        let tiled_resize_data = if self.window(window_id).is_some_and(|window| {
+        let mut tiled_resize_data = if self.window(window_id).is_some_and(|window| {
             window.state.mode() == ToplevelMode::Normal
                 && window
                     .management
@@ -591,6 +591,9 @@ impl CompositorState {
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
                 .unwrap_or(fallback_geometry),
         };
+        if let Some(preparation) = tiled_resize_data.as_mut() {
+            self.rebase_tiled_resize_preparation(root_surface_id, window_id, preparation);
+        }
         let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
             log_begin_rejection(self, begin, "root_resource_missing");
             return false;

@@ -6,8 +6,9 @@ use std::{
 };
 
 use super::{
-    BUILTIN_EFFECT_PROGRAM_ID, EffectFrameDemand, EffectProgramId,
-    INTERNAL_EFFECT_SHADER_MODULE_IDS, MAX_EFFECT_PROGRAMS, ShaderModuleId, ValidatedEffectProgram,
+    BUILTIN_EFFECT_PROGRAM_ID, EffectFrameDemand, EffectParameterImpact, EffectParameterRange,
+    EffectParameterType, EffectProgramId, EffectUniformValue, INTERNAL_EFFECT_SHADER_MODULE_IDS,
+    MAX_EFFECT_PROGRAMS, ShaderModuleId, ValidatedEffectProgram,
     config::{EffectConfigError, EffectDefinition, EffectManifest, load_manifest},
 };
 
@@ -65,29 +66,98 @@ pub struct RegisteredEffect {
 impl RegisteredEffect {
     pub fn schema_signature(&self) -> u64 {
         let mut signature = 0xcbf2_9ce4_8422_2325_u64;
-        signature = signature.wrapping_mul(0x1000_0000_01b3) ^ self.program.program.id.get();
-        signature = signature.wrapping_mul(0x1000_0000_01b3)
-            ^ match self.program.program.frame_demand {
+        schema_mix(&mut signature, self.program.program.id.get());
+        schema_mix(
+            &mut signature,
+            match self.program.program.frame_demand {
                 EffectFrameDemand::OnDamage => 0,
                 EffectFrameDemand::Continuous => 1,
                 EffectFrameDemand::Manual => 2,
-            };
+            },
+        );
         for (name, parameter) in &self.parameters {
             for byte in name.bytes() {
-                signature = signature.wrapping_mul(0x1000_0000_01b3) ^ u64::from(byte);
+                schema_mix(&mut signature, u64::from(byte));
             }
-            signature = signature.wrapping_mul(0x1000_0000_01b3) ^ parameter.spec.id.get() as u64;
-            signature = signature.wrapping_mul(0x1000_0000_01b3)
-                ^ match parameter.spec.ty {
-                    super::EffectParameterType::Float => 0,
-                    super::EffectParameterType::Vec2 => 1,
-                    super::EffectParameterType::Vec3 => 2,
-                    super::EffectParameterType::Vec4 => 3,
-                    super::EffectParameterType::Int => 4,
-                };
+            schema_mix(&mut signature, 0xff);
+            schema_mix(&mut signature, parameter.spec.id.get() as u64);
+            schema_mix(
+                &mut signature,
+                match parameter.spec.ty {
+                    EffectParameterType::Float => 0,
+                    EffectParameterType::Vec2 => 1,
+                    EffectParameterType::Vec3 => 2,
+                    EffectParameterType::Vec4 => 3,
+                    EffectParameterType::Int => 4,
+                },
+            );
+            match parameter.spec.range {
+                None => schema_mix(&mut signature, 0),
+                Some(EffectParameterRange::Float { min, max }) => {
+                    schema_mix(&mut signature, 1);
+                    schema_mix(&mut signature, u64::from(min.to_bits()));
+                    schema_mix(&mut signature, u64::from(max.to_bits()));
+                }
+                Some(EffectParameterRange::FloatComponents {
+                    min,
+                    max,
+                    components,
+                }) => {
+                    schema_mix(&mut signature, 2);
+                    schema_mix(&mut signature, u64::from(components));
+                    for value in min.into_iter().chain(max) {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                Some(EffectParameterRange::Int { min, max }) => {
+                    schema_mix(&mut signature, 3);
+                    schema_mix(&mut signature, min as u32 as u64);
+                    schema_mix(&mut signature, max as u32 as u64);
+                }
+            }
+            schema_mix(
+                &mut signature,
+                match parameter.spec.impact {
+                    EffectParameterImpact::UniformOnly => 0,
+                    EffectParameterImpact::Footprint => 1,
+                    EffectParameterImpact::Structure => 2,
+                },
+            );
+            match parameter.default {
+                EffectUniformValue::Float(value) => {
+                    schema_mix(&mut signature, 0);
+                    schema_mix(&mut signature, u64::from(value.to_bits()));
+                }
+                EffectUniformValue::Vec2(values) => {
+                    schema_mix(&mut signature, 1);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Vec3(values) => {
+                    schema_mix(&mut signature, 2);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Vec4(values) => {
+                    schema_mix(&mut signature, 3);
+                    for value in values {
+                        schema_mix(&mut signature, u64::from(value.to_bits()));
+                    }
+                }
+                EffectUniformValue::Int(value) => {
+                    schema_mix(&mut signature, 4);
+                    schema_mix(&mut signature, value as u32 as u64);
+                }
+            }
         }
         signature
     }
+}
+
+fn schema_mix(signature: &mut u64, value: u64) {
+    *signature = signature.wrapping_mul(0x1000_0000_01b3) ^ value;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,6 +405,14 @@ pub fn build_generation(
             shader_assets,
             ..
         } = definition;
+        if let Some(parameter) = parameters
+            .values()
+            .find(|parameter| parameter.spec.impact != EffectParameterImpact::UniformOnly)
+        {
+            return Err(RegistryReloadError::Config(
+                EffectConfigError::UnsupportedParameterImpact(parameter.spec.impact),
+            ));
+        }
         if name.starts_with("system.") {
             return Err(RegistryReloadError::ReservedSystemEffectName(name));
         }
@@ -482,6 +560,37 @@ mod tests {
         assert!(registry.current().program("glass.panel").is_none());
     }
 
+    #[test]
+    fn v1_registry_rejects_non_uniform_parameter_impact_before_publication() {
+        let mut candidate = manifest();
+        candidate
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .parameters
+            .insert(
+                "radius".into(),
+                super::super::config::EffectParameterDefinition {
+                    spec: super::super::EffectParameterSpec {
+                        id: super::super::EffectParameterId::new(1).unwrap(),
+                        name: "radius".into(),
+                        ty: super::super::EffectParameterType::Float,
+                        range: None,
+                        impact: super::super::EffectParameterImpact::Footprint,
+                    },
+                    default: super::super::EffectUniformValue::Float(1.0),
+                },
+            );
+        assert_eq!(
+            build_generation(candidate, 1),
+            Err(RegistryReloadError::Config(
+                EffectConfigError::UnsupportedParameterImpact(
+                    super::super::EffectParameterImpact::Footprint
+                )
+            ))
+        );
+    }
+
     #[derive(Default)]
     struct TestGenerationPublisher {
         published: Vec<u64>,
@@ -537,6 +646,79 @@ mod tests {
         ));
         assert_eq!(registry.current().generation, first.generation);
         assert!(publisher.published.is_empty());
+    }
+
+    #[test]
+    fn schema_signature_covers_all_v1_parameter_compatibility_fields() {
+        let mut generation = build_generation(manifest(), 1).unwrap();
+        let parameter = super::super::config::EffectParameterDefinition {
+            spec: super::super::EffectParameterSpec {
+                id: super::super::EffectParameterId::new(1).unwrap(),
+                name: "radius".into(),
+                ty: super::super::EffectParameterType::Float,
+                range: Some(super::super::EffectParameterRange::Float { min: 0.0, max: 1.0 }),
+                impact: super::super::EffectParameterImpact::UniformOnly,
+            },
+            default: super::super::EffectUniformValue::Float(0.5),
+        };
+        let effect = generation.effects.get_mut("glass.panel").unwrap();
+        effect.parameters.insert("radius".into(), parameter);
+        let baseline = effect.schema_signature();
+
+        let effect = generation.effects.get_mut("glass.panel").unwrap();
+        effect.parameters.get_mut("radius").unwrap().spec.range =
+            Some(super::super::EffectParameterRange::Float {
+                min: 0.25,
+                max: 1.0,
+            });
+        assert_ne!(effect.schema_signature(), baseline);
+        let changed_range = effect.schema_signature();
+        effect.parameters.get_mut("radius").unwrap().spec.range =
+            Some(super::super::EffectParameterRange::Float { min: 0.0, max: 2.0 });
+        assert_ne!(effect.schema_signature(), changed_range);
+        effect.parameters.get_mut("radius").unwrap().default =
+            super::super::EffectUniformValue::Float(0.75);
+        assert_ne!(effect.schema_signature(), changed_range);
+        effect.parameters.get_mut("radius").unwrap().spec.impact =
+            super::super::EffectParameterImpact::Footprint;
+        assert_ne!(effect.schema_signature(), changed_range);
+        effect.parameters.get_mut("radius").unwrap().spec.ty =
+            super::super::EffectParameterType::Int;
+        assert_ne!(effect.schema_signature(), changed_range);
+        effect.parameters.insert(
+            "extra".into(),
+            super::super::config::EffectParameterDefinition {
+                spec: super::super::EffectParameterSpec {
+                    id: super::super::EffectParameterId::new(2).unwrap(),
+                    name: "extra".into(),
+                    ty: super::super::EffectParameterType::Float,
+                    range: None,
+                    impact: super::super::EffectParameterImpact::UniformOnly,
+                },
+                default: super::super::EffectUniformValue::Float(0.0),
+            },
+        );
+        let added = effect.schema_signature();
+        assert_ne!(added, changed_range);
+        effect.parameters.remove("extra");
+        assert_ne!(effect.schema_signature(), added);
+    }
+
+    #[test]
+    fn shader_source_only_reload_keeps_the_compatibility_schema() {
+        let first = build_generation(manifest(), 1).unwrap();
+        let mut second_manifest = manifest();
+        second_manifest
+            .effects
+            .get_mut("glass.panel")
+            .unwrap()
+            .shader_assets[0]
+            .source = "changed trusted shader".into();
+        let second = build_generation(second_manifest, 2).unwrap();
+        assert_eq!(
+            first.schema_signature(first.program_id("glass.panel").unwrap()),
+            second.schema_signature(second.program_id("glass.panel").unwrap())
+        );
     }
 
     #[test]

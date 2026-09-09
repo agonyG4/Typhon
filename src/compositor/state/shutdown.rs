@@ -18,7 +18,7 @@ impl CompositorState {
             }
             if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
                 if buffer.data.is_shm() {
-                    buffer.release_target().release();
+                    self.release_surface_buffer_direct(buffer.release_target());
                 } else {
                     releases.push(DmabufReleaseObligation {
                         buffer_id: buffer.data.buffer_id(),
@@ -34,7 +34,7 @@ impl CompositorState {
             }
             let pending = commit.pending;
             if pending.data.is_shm() {
-                pending.release_target().release();
+                self.release_surface_buffer_direct(pending.release_target());
             } else {
                 releases.push(DmabufReleaseObligation {
                     buffer_id: pending.data.buffer_id(),

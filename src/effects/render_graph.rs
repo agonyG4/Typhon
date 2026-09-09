@@ -765,11 +765,18 @@ fn compile_instance(
                         primary_plan.height,
                         program.program.working_space,
                     )?;
+                    let stage_footprint = super::footprint::node_footprint(&node.kind)
+                        .map_err(RenderGraphCompileError::InvalidGraph)?;
+                    let normalized_damage = output_damage.expand_clamped_xy(
+                        stage_footprint.sample_radius_x,
+                        stage_footprint.sample_radius_y,
+                        primary_plan.domain,
+                    );
                     builder.add_pass(
                         RenderPassKind::NormalizeInput,
                         vec![input],
                         Some(normalized),
-                        output_damage.clone(),
+                        normalized_damage,
                         instance.id,
                         instance.anchor,
                         None,
@@ -1297,6 +1304,88 @@ mod tests {
                 .find(|texture| texture.id == *input)
                 .is_some_and(|texture| texture.working_space == EffectWorkingSpace::LinearSrgb)
         }));
+    }
+
+    #[test]
+    fn normalize_input_uses_non_zero_domains_and_consuming_footprint_damage() {
+        let backdrop = EffectNodeId::new(1).unwrap();
+        let target = EffectNodeId::new(2).unwrap();
+        let custom = EffectNodeId::new(3).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(12).unwrap(),
+            nodes: vec![
+                EffectNode::source(backdrop, EffectSource::Backdrop),
+                EffectNode::source(target, EffectSource::TargetContent),
+                EffectNode::custom_fragment(
+                    custom,
+                    backdrop,
+                    CustomFragmentSpec {
+                        shader: ShaderModuleId::new(12).unwrap(),
+                        declared_footprint: EffectFootprint::symmetric(4),
+                        uniforms: Vec::new(),
+                        auxiliary_inputs: vec![target],
+                    },
+                )
+                .unwrap(),
+            ],
+            output: custom,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(500, 200, 30, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(12).unwrap(),
+                anchor: EffectAnchor::OutputPostProcess,
+                target_bounds: region.bounding_rect().unwrap(),
+                region: region.clone(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 1,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+            }],
+        );
+        let source_damage = EffectRegion::from_rect(EffectRect::new(512, 212, 2, 2).unwrap());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &source_damage,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("multi-input custom effect must compile");
+        };
+        let normalize = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::NormalizeInput)
+            .expect("auxiliary input requires normalization");
+        let normalized_domain = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == normalize.output.unwrap())
+            .unwrap()
+            .domain;
+        assert_eq!(normalized_domain.x, 496);
+        assert_eq!(normalized_domain.y, 196);
+        assert!(normalize.damage.contains_point(504, 204));
+        assert!(normalize.damage.contains_point(521, 221));
+        assert!(!normalize.damage.contains_point(496, 196));
+        assert!(
+            normalize
+                .damage
+                .rects()
+                .iter()
+                .all(|rect| rect.intersect(normalized_domain).is_some())
+        );
     }
 
     #[test]

@@ -65,6 +65,25 @@ mod tests {
     }
 
     #[test]
+    fn inverted_mask_is_the_same_coverage_operation_as_normal_mask() {
+        let input = PremultipliedRgba::new(0.8, 0.4, 0.2, 0.8);
+        for alpha in [0.0, 0.25, 0.5, 1.0] {
+            let normal = input.apply_mask(alpha, MaskMode::Alpha);
+            let inverted = input.apply_mask(1.0 - alpha, MaskMode::InvertedAlpha);
+            assert_eq!(normal, inverted);
+            assert!(
+                [inverted.r, inverted.g, inverted.b, inverted.a]
+                    .into_iter()
+                    .all(f32::is_finite)
+            );
+        }
+        assert_eq!(
+            PremultipliedRgba::new(0.8, 0.8, 0.8, 1.0).apply_mask(0.25, MaskMode::Alpha),
+            PremultipliedRgba::new(0.8, 0.8, 0.8, 1.0).apply_mask(0.75, MaskMode::InvertedAlpha)
+        );
+    }
+
+    #[test]
     fn premultiplied_blend_modes_are_finite_and_source_over_is_exact() {
         let destination = PremultipliedRgba::new(0.2, 0.1, 0.05, 0.5);
         let source = PremultipliedRgba::new(0.4, 0.2, 0.1, 0.5);
@@ -77,6 +96,33 @@ mod tests {
                     .into_iter()
                     .all(f32::is_finite)
             );
+        }
+    }
+
+    #[test]
+    fn premultiplied_reference_sanitizes_builtin_extremes() {
+        for alpha in [0.0, 0.25, 0.5, 1.0] {
+            for mode in [BlendMode::Add, BlendMode::Multiply, BlendMode::Screen] {
+                let result = PremultipliedRgba::new(2.0, -1.0, 4.0, alpha).blend(
+                    PremultipliedRgba::new(3.0, -2.0, 5.0, alpha),
+                    mode,
+                    1.0,
+                );
+                assert!(
+                    [result.r, result.g, result.b, result.a]
+                        .into_iter()
+                        .all(f32::is_finite)
+                );
+                assert!((0.0..=1.0).contains(&result.a));
+                assert!(result.r >= 0.0 && result.r <= result.a);
+                assert!(result.g >= 0.0 && result.g <= result.a);
+                assert!(result.b >= 0.0 && result.b <= result.a);
+            }
+            let negative_bias = PremultipliedRgba::new(-4.0, 2.0, -1.0, alpha);
+            assert_eq!(negative_bias.r, 0.0);
+            assert!(negative_bias.g <= negative_bias.a);
+            let noisy = PremultipliedRgba::new(4.0, -3.0, 2.0, alpha);
+            assert!(noisy.r <= noisy.a && noisy.g >= 0.0 && noisy.b <= noisy.a);
         }
     }
 

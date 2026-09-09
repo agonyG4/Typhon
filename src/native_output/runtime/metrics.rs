@@ -572,19 +572,14 @@ impl NativeRuntime {
         let now_ns = monotonic_now_ns()?;
         let pageflip_timeout_owner: NativePageflipTimeoutOwner =
             self.kms_commit_worker_transport.into();
-        let dmabuf_retry_deadline =
-            if matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_)) {
-                self.dmabuf_gpu_release_registry
-                    .update_retry_for_deferred_work(
-                        self.server.deferred_dmabuf_release_count(),
-                        self.server.retryable_deferred_dmabuf_release_count(),
-                        DmabufReleaseRetryReason::NoGpuProofAvailable,
-                        now_ns,
-                    );
-                self.dmabuf_gpu_release_registry.retry_deadline_ns()
-            } else {
-                None
-            };
+        self.dmabuf_gpu_release_registry.update_retry_for_work(
+            self.server.deferred_dmabuf_release_count(),
+            self.server.retryable_deferred_dmabuf_release_count(),
+            self.server.explicit_release_signal_retry_count(),
+            DmabufReleaseRetryReason::NoGpuProofAvailable,
+            now_ns,
+        );
+        let dmabuf_retry_deadline = self.dmabuf_gpu_release_registry.retry_deadline_ns();
         let surface_pacing_deadline = (!self.server.has_surface_pacing_readiness_pending())
             .then(|| self.server.next_surface_pacing_deadline_ns())
             .flatten();

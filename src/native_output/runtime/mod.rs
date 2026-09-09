@@ -603,6 +603,24 @@ pub(super) fn reload_trusted_effects_from_disk(
     ))
 }
 
+pub(super) fn request_trusted_effect_reload_redraw(queued_redraw_requested: &mut bool) {
+    *queued_redraw_requested = true;
+}
+
+#[cfg(test)]
+mod trusted_reload_tests {
+    use super::request_trusted_effect_reload_redraw;
+
+    #[test]
+    fn successful_reload_requests_one_coalesced_redraw() {
+        let mut queued = false;
+        request_trusted_effect_reload_redraw(&mut queued);
+        assert!(queued);
+        request_trusted_effect_reload_redraw(&mut queued);
+        assert!(queued);
+    }
+}
+
 impl NativeRuntime {
     pub(crate) fn bootstrap(config: NativeRuntimeConfig) -> NativeResult<Self> {
         // Block process-directed SIGCHLD before any native driver, graphics
@@ -888,7 +906,7 @@ impl Drop for NativeRuntime {
         self.server.finish_commit_debug_for_shutdown();
         let buffer_release_metrics = self.server.buffer_release_metrics();
         println!(
-            "typhon pacing: event=buffer_release_summary buffer_releases_captured={} buffer_releases_completed={} buffer_releases_deferred={} buffer_releases_restored={} buffer_releases_discarded={} buffer_release_duplicate_attempts={} dmabuf_release_terminal_revalidated={} dmabuf_release_terminal_requeued_current={}",
+            "typhon pacing: event=buffer_release_summary buffer_releases_captured={} buffer_releases_completed={} buffer_releases_deferred={} buffer_releases_restored={} buffer_releases_discarded={} buffer_release_duplicate_attempts={} dmabuf_release_terminal_revalidated={} dmabuf_release_terminal_requeued_current={} explicit_release_signal_failures={} explicit_release_signal_retries={} explicit_release_signal_retry_successes={} explicit_release_signal_retry_requeued_current={}",
             buffer_release_metrics.buffer_releases_captured,
             buffer_release_metrics.buffer_releases_completed,
             buffer_release_metrics.buffer_releases_deferred,
@@ -897,6 +915,10 @@ impl Drop for NativeRuntime {
             buffer_release_metrics.buffer_release_duplicate_attempts,
             buffer_release_metrics.dmabuf_release_terminal_revalidated,
             buffer_release_metrics.dmabuf_release_terminal_requeued_current,
+            buffer_release_metrics.explicit_release_signal_failures,
+            buffer_release_metrics.explicit_release_signal_retries,
+            buffer_release_metrics.explicit_release_signal_retry_successes,
+            buffer_release_metrics.explicit_release_signal_retry_requeued_current,
         );
         let dmabuf_release_metrics = self.dmabuf_gpu_release_metrics();
         println!(

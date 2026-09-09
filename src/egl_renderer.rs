@@ -3949,6 +3949,250 @@ mod tests {
             gl.delete_program(source_over_program);
         }
 
+        let normalization_surface = egl
+            .create_pbuffer_surface(display, config, &[egl::WIDTH, 2, egl::HEIGHT, 1, egl::NONE])
+            .expect("normalization pbuffer surface creates");
+        egl.make_current(
+            display,
+            Some(normalization_surface),
+            Some(normalization_surface),
+            Some(context),
+        )
+        .expect("normalization surface becomes current");
+        let normalization_program = program::create_program_from_sources(
+            &gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                layout(location = 1) in vec2 a_uv;
+                out vec2 v_uv;
+                void main() {
+                    gl_Position = vec4(a_position, 0.0, 1.0);
+                    v_uv = a_uv;
+                }
+            "#,
+            effects::NORMALIZE_FRAGMENT_SHADER,
+        )
+        .expect("normalize regression shader compiles");
+        let input_texture = unsafe { gl.create_texture().expect("normalize input texture") };
+        let (quad, _) = renderer
+            .ensure_effect_quad()
+            .expect("normalize regression quad creates");
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(input_texture));
+            configure_texture(&gl);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                1,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&[255, 0, 0, 255])),
+            );
+            gl.viewport(0, 0, 2, 1);
+            gl.disable(glow::BLEND);
+            gl.clear_color(0.2, 0.3, 0.4, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(normalization_program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(input_texture));
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(normalization_program, "u_effect_input")
+                        .expect("normalize input uniform"),
+                ),
+                0,
+            );
+            gl.uniform_4_f32(
+                Some(
+                    &gl.get_uniform_location(normalization_program, "u_effect_input_domain")
+                        .expect("normalize input domain uniform"),
+                ),
+                500.0,
+                200.0,
+                10.0,
+                10.0,
+            );
+            gl.uniform_4_f32(
+                Some(
+                    &gl.get_uniform_location(normalization_program, "u_effect_output_domain")
+                        .expect("normalize output domain uniform"),
+                ),
+                500.0,
+                200.0,
+                20.0,
+                10.0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(normalization_program, "u_effect_decode_srgb")
+                        .expect("normalize decode uniform"),
+                ),
+                0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(normalization_program, "u_effect_encode_srgb")
+                        .expect("normalize encode uniform"),
+                ),
+                0,
+            );
+            gl.bind_vertex_array(Some(quad));
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.flush();
+            let mut pixels = [0_u8; 8];
+            gl.read_pixels(
+                0,
+                0,
+                2,
+                1,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+            assert!(pixels[0] > 240 && pixels[1] < 10 && pixels[2] < 10 && pixels[3] > 240);
+            assert_eq!(&pixels[4..8], &[0, 0, 0, 0]);
+            gl.delete_texture(input_texture);
+            gl.delete_program(normalization_program);
+        }
+        egl.make_current(display, None, None, None)
+            .expect("EGL releases the normalization context");
+        egl.destroy_surface(display, normalization_surface)
+            .expect("EGL destroys the normalization surface");
+
+        let mask_surface = egl
+            .create_pbuffer_surface(display, config, &[egl::WIDTH, 4, egl::HEIGHT, 1, egl::NONE])
+            .expect("mask pbuffer surface creates");
+        egl.make_current(
+            display,
+            Some(mask_surface),
+            Some(mask_surface),
+            Some(context),
+        )
+        .expect("mask surface becomes current");
+        let mask_program = program::create_program_from_sources(
+            &gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                layout(location = 1) in vec2 a_uv;
+                out vec2 v_uv;
+                void main() {
+                    gl_Position = vec4(a_position, 0.0, 1.0);
+                    v_uv = a_uv;
+                }
+            "#,
+            effects::MASK_STAGE_FRAGMENT_SHADER,
+        )
+        .expect("mask regression shader compiles");
+        let mask_texture = unsafe { gl.create_texture().expect("mask input texture") };
+        let (quad, _) = renderer
+            .ensure_effect_quad()
+            .expect("mask regression quad creates");
+        let alphas = [0.0_f32, 0.25, 0.5, 1.0];
+        let mut mask_pixels = Vec::with_capacity(alphas.len() * 4);
+        for alpha in alphas {
+            let channel = (0.8 * alpha * 255.0).round() as u8;
+            mask_pixels.extend_from_slice(&[
+                channel,
+                channel,
+                channel,
+                (alpha * 255.0).round() as u8,
+            ]);
+        }
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(mask_texture));
+            configure_texture(&gl);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                4,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&mask_pixels)),
+            );
+            gl.viewport(0, 0, 4, 1);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(mask_program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(mask_texture));
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(mask_program, "u_effect_input")
+                        .expect("mask input uniform"),
+                ),
+                0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(mask_program, "u_effect_decode_srgb")
+                        .expect("mask decode uniform"),
+                ),
+                0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(mask_program, "u_effect_encode_srgb")
+                        .expect("mask encode uniform"),
+                ),
+                0,
+            );
+            gl.bind_vertex_array(Some(quad));
+            for inverted in [false, true] {
+                gl.uniform_1_i32(
+                    Some(
+                        &gl.get_uniform_location(mask_program, "u_effect_inverted")
+                            .expect("mask mode uniform"),
+                    ),
+                    i32::from(inverted),
+                );
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                gl.flush();
+                let mut pixels = [0_u8; 16];
+                gl.read_pixels(
+                    0,
+                    0,
+                    4,
+                    1,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+                for (index, alpha) in alphas.into_iter().enumerate() {
+                    let coverage = if inverted { 1.0 - alpha } else { alpha };
+                    let expected = [
+                        (0.8 * alpha * coverage * 255.0).round() as u8,
+                        (0.8 * alpha * coverage * 255.0).round() as u8,
+                        (0.8 * alpha * coverage * 255.0).round() as u8,
+                        (alpha * coverage * 255.0).round() as u8,
+                    ];
+                    let actual = &pixels[index * 4..index * 4 + 4];
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        assert!(
+                            (*actual as i16 - expected as i16).abs() <= 3,
+                            "mask mismatch inverted={inverted} alpha={alpha} coverage={coverage}: actual={actual:?} expected={expected:?}"
+                        );
+                    }
+                }
+            }
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.delete_texture(mask_texture);
+            gl.delete_program(mask_program);
+        }
+        egl.make_current(display, None, None, None)
+            .expect("EGL releases the mask context");
+        egl.destroy_surface(display, mask_surface)
+            .expect("EGL destroys the mask surface");
+
         egl.make_current(display, None, None, None)
             .expect("EGL releases the GLES3 context");
         egl.destroy_surface(display, surface)

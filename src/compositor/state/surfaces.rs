@@ -364,7 +364,8 @@ impl CompositorState {
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     self.release_resize_capture(surface_id, resize.commit_sequence);
                 }
-                commit.pending.release_target().release();
+                let old_buffer_id = commit.pending.data.buffer_id().get();
+                self.release_pending_surface_buffer(commit.pending);
                 callbacks.extend(commit.frame_callbacks);
                 self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 self.resize_flow_metrics
@@ -382,7 +383,7 @@ impl CompositorState {
                         surface_id,
                         commit.commit_sequence.get(),
                         new_sequence.get(),
-                        commit.pending.data.buffer_id().get(),
+                        old_buffer_id,
                         self.external_acquire_readiness,
                     );
                 }

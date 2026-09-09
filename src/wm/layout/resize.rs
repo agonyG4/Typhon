@@ -48,6 +48,35 @@ mod tests {
             .is_none()
         );
     }
+
+    #[test]
+    fn rebasing_moves_only_the_interaction_start_boundary() {
+        let mut tree = DwindleTree::default();
+        tree.insert(window(1), InsertHint::default())
+            .expect("first");
+        tree.insert(window(2), InsertHint::default())
+            .expect("second");
+        let root = tree.root().expect("root");
+        let parent = LayoutRect::new(0, 0, 1000, 800).expect("parent");
+        let handle = TiledResizeHandle::for_window(&tree, window(1), ResizeEdges::RIGHT, parent)
+            .expect("right edge divider");
+        let axis = handle.horizontal().expect("horizontal axis");
+        let rebased = handle.rebase_boundaries(37, 19);
+        let rebased_axis = rebased.horizontal().expect("rebased horizontal axis");
+
+        assert_eq!(axis.split(), root);
+        assert_eq!(rebased_axis.split(), axis.split());
+        assert_eq!(rebased_axis.parent_rect(), axis.parent_rect());
+        assert_eq!(rebased_axis.start_ratio(), axis.start_ratio());
+        assert_eq!(
+            rebased_axis.start_boundary(),
+            axis.start_boundary().saturating_add(37)
+        );
+        assert_eq!(
+            rebased_axis.requested_ratio(0),
+            f64::from(axis.start_boundary().saturating_add(37)) / 1000.0
+        );
+    }
 }
 use super::dwindle::{DwindleNodeId, DwindleNodeKind, DwindleTree};
 use super::geometry::{LayoutRect, SplitAxis, SplitRatio};
@@ -126,6 +155,13 @@ impl TiledResizeAxis {
         self.start_boundary
     }
 
+    pub const fn with_start_boundary(self, start_boundary: i32) -> Self {
+        Self {
+            start_boundary,
+            ..self
+        }
+    }
+
     pub fn requested_ratio(self, displacement: i32) -> f64 {
         let extent = match self.axis {
             SplitAxis::Horizontal => self.parent_rect.width(),
@@ -156,6 +192,27 @@ impl TiledResizeHandle {
 
     pub const fn vertical(self) -> Option<TiledResizeAxis> {
         self.vertical
+    }
+
+    /// Rebase only the interaction-start divider positions. The solved parent
+    /// rectangles, split identities, and starting ratios remain unchanged.
+    pub const fn rebase_boundaries(self, horizontal_delta: i32, vertical_delta: i32) -> Self {
+        Self {
+            horizontal: match self.horizontal {
+                Some(axis) => {
+                    Some(axis.with_start_boundary(
+                        axis.start_boundary().saturating_add(horizontal_delta),
+                    ))
+                }
+                None => None,
+            },
+            vertical: match self.vertical {
+                Some(axis) => Some(
+                    axis.with_start_boundary(axis.start_boundary().saturating_add(vertical_delta)),
+                ),
+                None => None,
+            },
+        }
     }
 
     pub fn for_window(

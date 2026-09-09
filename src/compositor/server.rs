@@ -18,9 +18,9 @@ use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, EffectFrameDemandSnapshot, PresentationAnimationMetrics,
-    PresentationFrameSnapshot, PresentationGroupTransform, PresentationSceneSample,
-    ResolvedEffectScene, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
-    compositor_surface_id,
+    PresentationFrameSnapshot, PresentationGroupTransform, PresentationRect,
+    PresentationSceneSample, PresentedRootGeometry, ResolvedEffectScene, ShmBufferLifetimeMetrics,
+    SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -1014,6 +1014,25 @@ impl OwnCompositorServer {
         root_surface_id: u32,
     ) -> Option<PresentationGroupTransform> {
         self.state.presented_presentation_transform(root_surface_id)
+    }
+
+    pub fn presented_root_geometry(&self, root_surface_id: u32) -> Option<PresentedRootGeometry> {
+        self.state.presented_root_geometry(root_surface_id)
+    }
+
+    pub fn current_presentation_rect_for_root(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<PresentationRect> {
+        self.state
+            .current_presentation_rect_for_root(root_surface_id)
+    }
+
+    pub fn native_frame_presented_root_geometries(
+        &self,
+        surfaces: &[RenderableSurface],
+    ) -> Vec<PresentedRootGeometry> {
+        self.state.native_frame_presented_root_geometries(surfaces)
     }
 
     pub fn presented_presentation_frame_id(&self) -> u64 {

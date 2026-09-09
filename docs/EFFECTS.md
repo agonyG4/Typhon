@@ -72,6 +72,11 @@ published as immutable registry generations. A reload compiles every changed
 trusted shader before publication; a failed generation leaves the previous
 generation active.
 
+Trusted v1 manifests accept only `UniformOnly` parameters. `Footprint` and
+`Structure` remain internal classifications reserved for a future version that
+can recompute graph damage or topology from parameter changes; they are rejected
+with a typed configuration error today.
+
 The reserved `system.*` namespace and the built-in `system.background_blur`
 program are owned by Typhon. Their program and internal shader-module IDs
 cannot be overridden by a trusted manifest. V1 supports `OnDamage` and
@@ -98,13 +103,33 @@ vec4 typhon_effect_main(TyphonEffectContext ctx);
 Typhon owns `main()`, the vertex shader, the primary sampler, context uniforms,
 precision, output, and reserved names. The context is value-only and supplies
 texture size, content rectangle, output size, scale, time, delta, and normalized
-UV. Trusted stages sample the primary input with `typhon_sample_primary(ctx.uv)`
+UV. The fields have these exact meanings:
+
+- `ctx.texture_size` is the physical pixel dimensions of the primary effect
+  input texture.
+- `ctx.output_size` is the physical pixel dimensions of the current compositor
+  output, not the region-local stage texture.
+- `ctx.scale` is the actual output scale metadata.
+- `ctx.content_rect` is the primary effect/input domain in output-space
+  coordinates (`x`, `y`, `width`, `height`).
+- `ctx.uv` is normalized to the current stage texture, and `ctx.time`/`ctx.delta`
+  are compositor-owned monotonic seconds and bounded frame delta.
+
+Multi-input normalization maps each source's output-space domain into the
+primary stage domain. Pixels outside a source domain are written as transparent
+black, and normalized validity covers the consuming stage's declared sampling
+footprint without forcing full-output work. Trusted stages sample the primary input with `typhon_sample_primary(ctx.uv)`
 and bounded auxiliary inputs with `typhon_sample_aux(index, uv)`; the fixed
 sampler ABI is `u_typhon_primary`, `u_typhon_aux0` through `u_typhon_aux7`, and
 `u_typhon_aux_count`. Declared typed uniforms are bound from the validated
 parameter block. Shader bodies cannot define `main()` or collide with reserved
 ABI declarations. The runtime also compiles and links a representative wrapper
 inside a real GLES 3 context at the renderer boundary.
+
+Trusted custom GLSL is responsible for returning finite, normalized
+premultiplied SDR color. Typhon's built-in stages sanitize non-finite values,
+clamp alpha to `[0,1]`, keep RGB within the premultiplied alpha range, and use
+piecewise sRGB conversion that never evaluates `pow()` on a negative base.
 
 The production loader uses the fixed per-user manifest
 `$XDG_CONFIG_HOME/AstreaOS/typhon/effects.json`, falling back to
@@ -120,6 +145,11 @@ stages do not expand it. Disjoint damage rectangles remain disjoint where the
 region limit permits, and effect transition damage is identity-based so an
 unchanged static effect does not dirty itself every frame. Continuous effects
 request localized compositor-owned frame demand.
+
+A successful trusted registry reload invalidates presented effect history and
+queues one compositor-owned redraw. `OnDamage` effects remain one-shot after
+that refresh, `Continuous` effects keep their existing cadence, and failed
+reloads leave both the active generation and redraw state unchanged.
 
 Any visible pixel-modifying effect requires composition, so Direct Scanout is
 rejected with `effect_requires_composition`. Removing the effect invalidates

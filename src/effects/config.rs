@@ -95,6 +95,7 @@ pub enum EffectConfigError {
     UnsupportedFailurePolicy(EffectFailurePolicy),
     UnsupportedFrameDemand(EffectFrameDemand),
     UnsupportedStaticTexture,
+    UnsupportedParameterImpact(EffectParameterImpact),
     LimitExceeded(&'static str),
 }
 
@@ -569,8 +570,16 @@ fn parse_parameters(
         }
         let impact = match optional_string(parameter, "impact")?.unwrap_or("uniform-only") {
             "uniform-only" => EffectParameterImpact::UniformOnly,
-            "footprint" => EffectParameterImpact::Footprint,
-            "structure" => EffectParameterImpact::Structure,
+            "footprint" => {
+                return Err(EffectConfigError::UnsupportedParameterImpact(
+                    EffectParameterImpact::Footprint,
+                ));
+            }
+            "structure" => {
+                return Err(EffectConfigError::UnsupportedParameterImpact(
+                    EffectParameterImpact::Structure,
+                ));
+            }
             value => return Err(invalid(format!("unknown parameter impact {value}"))),
         };
         let spec = EffectParameterSpec {
@@ -956,6 +965,39 @@ mod tests {
             parse_manifest(json.as_bytes(), Path::new(".")),
             Err(EffectConfigError::UnsupportedStaticTexture)
         );
+    }
+
+    #[test]
+    fn rejects_non_uniform_parameter_impacts_in_v1() {
+        for (impact, expected) in [
+            (
+                "footprint",
+                EffectConfigError::UnsupportedParameterImpact(EffectParameterImpact::Footprint),
+            ),
+            (
+                "structure",
+                EffectConfigError::UnsupportedParameterImpact(EffectParameterImpact::Structure),
+            ),
+        ] {
+            let json = format!(
+                r#"{{
+                    "version": 1,
+                    "effects": {{
+                        "glass.panel": {{
+                            "nodes": [{{"id": 1, "kind": "backdrop"}}],
+                            "output": 1,
+                            "parameters": {{
+                                "radius": {{"id": 1, "type": "float", "default": 1.0, "impact": "{impact}"}}
+                            }}
+                        }}
+                    }}
+                }}"#
+            );
+            assert_eq!(
+                parse_manifest(json.as_bytes(), Path::new(".")),
+                Err(expected)
+            );
+        }
     }
 
     #[test]

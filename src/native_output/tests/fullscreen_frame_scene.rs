@@ -59,6 +59,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             active_transitions: 0,
             sampled_windows: 0,
         },
+        presentation_snapshot: PresentationFrameSnapshot::empty(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         1,
@@ -110,6 +111,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         snapshot: NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new()),
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(7)),
+        presentation_snapshot: PresentationFrameSnapshot::empty(),
     };
     let frozen = resolved_scene.into_owned();
     assert_eq!(

@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 use std::{num::NonZeroU64, time::Instant};
 
+#[cfg(test)]
+use std::{collections::VecDeque, sync::Arc};
+
 use wayland_protocols::wp::{
     linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1,
     presentation_time::server::wp_presentation_feedback,
@@ -30,6 +33,8 @@ pub(super) const SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS: u32 = 6;
 pub struct ExplicitSyncPoint {
     pub timeline: DrmSyncobjTimeline,
     pub point: u64,
+    #[cfg(test)]
+    pub(crate) signal_script: Option<Arc<Mutex<VecDeque<bool>>>>,
 }
 
 impl ExplicitSyncPoint {
@@ -37,6 +42,8 @@ impl ExplicitSyncPoint {
         Self {
             timeline,
             point: ((point_hi as u64) << 32) | u64::from(point_lo),
+            #[cfg(test)]
+            signal_script: None,
         }
     }
 
@@ -50,14 +57,38 @@ impl ExplicitSyncPoint {
 
     #[cfg(test)]
     pub(crate) fn for_tests(handle: u32, point: u64) -> Self {
+        Self::for_tests_with_signal_script(handle, point, [true])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_signal_script(
+        handle: u32,
+        point: u64,
+        outcomes: impl IntoIterator<Item = bool>,
+    ) -> Self {
         Self {
             timeline: DrmSyncobjTimeline::invalid_for_tests(handle),
             point,
+            signal_script: Some(Arc::new(Mutex::new(
+                outcomes.into_iter().collect::<VecDeque<_>>(),
+            ))),
         }
     }
 
-    pub(super) fn signal(&self) {
-        let _ = self.timeline.signal_point(self.point);
+    pub(super) fn signal(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(script) = &self.signal_script {
+            let mut script = script
+                .lock()
+                .map_err(|_| std::io::Error::other("explicit-sync test signal script poisoned"))?;
+            if let Some(success) = script.pop_front() {
+                return success
+                    .then_some(())
+                    .ok_or_else(|| std::io::Error::other("scripted explicit-sync signal failure"));
+            }
+            return Ok(());
+        }
+        self.timeline.signal_point(self.point)
     }
 }
 
@@ -347,5 +378,19 @@ mod tests {
         assert!(state.mark_fallback_backed());
         assert_eq!(state, PendingAcquireState::FallbackBacked);
         assert!(state.mark_ready());
+    }
+
+    #[test]
+    fn signal_result_is_propagated() {
+        let point = ExplicitSyncPoint::for_tests_with_signal_script(0, 0, [false]);
+
+        assert!(point.signal().is_err());
+    }
+
+    #[test]
+    fn default_test_signal_is_successful_without_a_drm_device() {
+        let point = ExplicitSyncPoint::for_tests(0, 0);
+
+        assert!(point.signal().is_ok());
     }
 }

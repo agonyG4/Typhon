@@ -167,7 +167,7 @@ impl CompositorState {
                                     .to_string(),
                             );
                         }
-                        pending.release_target().release();
+                        self.release_pending_surface_buffer(pending.clone());
                         self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
                         return;
                     }
@@ -430,7 +430,7 @@ impl CompositorState {
             let replacement_commit_id = incoming.commit_id;
             if let Some(release) = existing.merge(incoming) {
                 stats.attachments_replaced = stats.attachments_replaced.saturating_add(1);
-                release.release();
+                self.release_pending_surface_buffer(release);
             }
             if previous_commit_id != replacement_commit_id {
                 self.note_explicit_commit_merged(
@@ -968,7 +968,7 @@ impl CompositorState {
                 feedback.feedback.discarded();
             }
             if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
-                buffer.release_target().release();
+                self.release_pending_surface_buffer(buffer);
             }
         }
         callbacks
@@ -1001,7 +1001,7 @@ impl CompositorState {
             .subsurface_transactions
             .cache_commit(surface_id, commit)
         {
-            release.release();
+            self.release_pending_surface_buffer(release);
         }
         self.subsurface_transaction_metrics
             .synchronized_child_commits_cached = self
@@ -1231,7 +1231,7 @@ impl CompositorState {
                 feedback.feedback.discarded();
             }
             if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
-                buffer.release_target().release();
+                self.release_pending_surface_buffer(buffer);
             }
         }
     }

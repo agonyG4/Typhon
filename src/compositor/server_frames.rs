@@ -440,6 +440,20 @@ impl OwnCompositorServer {
         self.state.retryable_deferred_dmabuf_release_count()
     }
 
+    pub fn explicit_release_signal_retry_count(&self) -> usize {
+        self.state.explicit_release_signal_retry_count()
+    }
+
+    pub fn service_explicit_release_signal_retries(
+        &mut self,
+    ) -> super::ExplicitReleaseSignalRetryResult {
+        let result = self.state.service_explicit_release_signal_retries();
+        if result.completed > 0 {
+            let _ = self.display.flush_clients();
+        }
+        result
+    }
+
     #[doc(hidden)]
     pub fn transfer_deferred_dmabuf_releases_to_gpu_lease(
         &mut self,

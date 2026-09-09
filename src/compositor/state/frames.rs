@@ -4,9 +4,11 @@ use super::*;
 use crate::compositor::frame_batch::FrameCallbackPacingState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmabufReleaseCompletion {
+pub(in crate::compositor) enum DmabufReleaseCompletion {
     Completed,
+    Discarded,
     DeferredCurrent,
+    SignalRetry,
 }
 
 #[derive(Debug, Default)]
@@ -482,6 +484,10 @@ impl CompositorState {
         self.pending_dmabuf_buffer_releases.len() + self.deferred_dmabuf_buffer_releases.len()
     }
 
+    pub(in crate::compositor) fn explicit_release_signal_retry_count(&self) -> usize {
+        self.explicit_release_signal_retries.len()
+    }
+
     pub(in crate::compositor) fn deferred_dmabuf_release_count(&self) -> usize {
         self.deferred_dmabuf_buffer_releases.len()
     }
@@ -594,8 +600,9 @@ impl CompositorState {
                 .dmabuf_releases_to_complete_on_present
                 .extend(lease.obligations);
         } else {
-            self.deferred_dmabuf_buffer_releases
-                .extend(lease.obligations);
+            for obligation in lease.obligations {
+                self.push_deferred_dmabuf_release(obligation);
+            }
         }
         count
     }
@@ -631,7 +638,9 @@ impl CompositorState {
         let deferred = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
         let deferred_count = deferred.len();
         if !deferred.is_empty() {
-            self.deferred_dmabuf_buffer_releases.extend(deferred);
+            for obligation in deferred {
+                self.push_deferred_dmabuf_release(obligation);
+            }
             client_pacing_log(
                 "buffer_releases_deferred_without_gpu_proof",
                 &[
@@ -969,27 +978,68 @@ impl CompositorState {
         }
     }
 
-    fn complete_dmabuf_release(
+    pub(in crate::compositor) fn complete_dmabuf_release(
         &mut self,
         batch_id: CompositorFrameBatchId,
         frame_id: u64,
         obligation: DmabufReleaseObligation,
-    ) {
+    ) -> DmabufReleaseCompletion {
         let buffer_id = obligation.buffer_id;
-        obligation.release.release();
-        self.buffer_release_metrics.buffer_releases_completed = self
-            .buffer_release_metrics
-            .buffer_releases_completed
-            .saturating_add(1);
-        client_pacing_log(
-            "buffer_release_completed",
-            &[
-                ("frame_batch_id", batch_id.get().to_string()),
-                ("frame_id", frame_id.to_string()),
-                ("buffer_id", buffer_id.get().to_string()),
-                ("kind", "dmabuf".to_string()),
-            ],
-        );
+        match obligation.release.release() {
+            SurfaceBufferReleaseOutcome::Completed => {
+                self.buffer_release_metrics.buffer_releases_completed = self
+                    .buffer_release_metrics
+                    .buffer_releases_completed
+                    .saturating_add(1);
+                client_pacing_log(
+                    "buffer_release_completed",
+                    &[
+                        ("frame_batch_id", batch_id.get().to_string()),
+                        ("frame_id", frame_id.to_string()),
+                        ("buffer_id", buffer_id.get().to_string()),
+                        ("kind", "dmabuf".to_string()),
+                    ],
+                );
+                DmabufReleaseCompletion::Completed
+            }
+            SurfaceBufferReleaseOutcome::Discarded => {
+                self.buffer_release_metrics.buffer_releases_discarded = self
+                    .buffer_release_metrics
+                    .buffer_releases_discarded
+                    .saturating_add(1);
+                client_pacing_log(
+                    "buffer_release_scrubbed",
+                    &[
+                        ("frame_batch_id", batch_id.get().to_string()),
+                        ("frame_id", frame_id.to_string()),
+                        ("buffer_id", buffer_id.get().to_string()),
+                        ("kind", "dmabuf".to_string()),
+                        ("outcome", "terminal_resource_failure".to_string()),
+                    ],
+                );
+                DmabufReleaseCompletion::Discarded
+            }
+            SurfaceBufferReleaseOutcome::ExplicitSyncFailed(point) => {
+                self.buffer_release_metrics.explicit_release_signal_failures = self
+                    .buffer_release_metrics
+                    .explicit_release_signal_failures
+                    .saturating_add(1);
+                self.queue_explicit_release_signal_retry(DmabufReleaseObligation {
+                    buffer_id,
+                    release: SurfaceBufferRelease::ExplicitSync(point),
+                });
+                client_pacing_log(
+                    "buffer_release_signal_failed",
+                    &[
+                        ("frame_batch_id", batch_id.get().to_string()),
+                        ("frame_id", frame_id.to_string()),
+                        ("buffer_id", buffer_id.get().to_string()),
+                        ("kind", "dmabuf".to_string()),
+                    ],
+                );
+                DmabufReleaseCompletion::SignalRetry
+            }
+        }
     }
 
     pub(in crate::compositor) fn dmabuf_release_token_is_active(
@@ -1001,7 +1051,7 @@ impl CompositorState {
             .any(|active| active.same_release_token(obligation))
     }
 
-    fn complete_dmabuf_release_if_inactive(
+    pub(in crate::compositor) fn complete_dmabuf_release_if_inactive(
         &mut self,
         batch_id: CompositorFrameBatchId,
         frame_id: u64,
@@ -1013,7 +1063,7 @@ impl CompositorState {
             .dmabuf_release_terminal_revalidated
             .saturating_add(1);
         if self.dmabuf_release_token_is_active(&obligation) {
-            self.deferred_dmabuf_buffer_releases.push(obligation);
+            self.push_deferred_dmabuf_release(obligation);
             self.buffer_release_metrics
                 .dmabuf_release_terminal_requeued_current = self
                 .buffer_release_metrics
@@ -1021,9 +1071,80 @@ impl CompositorState {
                 .saturating_add(1);
             DmabufReleaseCompletion::DeferredCurrent
         } else {
-            self.complete_dmabuf_release(batch_id, frame_id, obligation);
-            DmabufReleaseCompletion::Completed
+            self.complete_dmabuf_release(batch_id, frame_id, obligation)
         }
+    }
+
+    fn push_deferred_dmabuf_release(&mut self, obligation: DmabufReleaseObligation) {
+        if self
+            .deferred_dmabuf_buffer_releases
+            .iter()
+            .any(|existing| existing.same_release_token(&obligation))
+        {
+            self.note_buffer_release_duplicate_attempt();
+            return;
+        }
+        self.deferred_dmabuf_buffer_releases.push(obligation);
+    }
+
+    fn queue_explicit_release_signal_retry(&mut self, obligation: DmabufReleaseObligation) {
+        debug_assert!(matches!(
+            obligation.release,
+            SurfaceBufferRelease::ExplicitSync(_)
+        ));
+        if self
+            .explicit_release_signal_retries
+            .iter()
+            .any(|existing| existing.same_release_token(&obligation))
+        {
+            self.note_buffer_release_duplicate_attempt();
+            return;
+        }
+        self.explicit_release_signal_retries.push(obligation);
+        self.buffer_release_metrics.explicit_release_signal_retries = self
+            .buffer_release_metrics
+            .explicit_release_signal_retries
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn service_explicit_release_signal_retries(
+        &mut self,
+    ) -> ExplicitReleaseSignalRetryResult {
+        let retries = std::mem::take(&mut self.explicit_release_signal_retries);
+        let mut result = ExplicitReleaseSignalRetryResult::default();
+        for obligation in retries {
+            if self.dmabuf_release_token_is_active(&obligation) {
+                self.push_deferred_dmabuf_release(obligation);
+                result.requeued_current = result.requeued_current.saturating_add(1);
+                self.buffer_release_metrics
+                    .explicit_release_signal_retry_requeued_current = self
+                    .buffer_release_metrics
+                    .explicit_release_signal_retry_requeued_current
+                    .saturating_add(1);
+                continue;
+            }
+            result.attempted = result.attempted.saturating_add(1);
+            match self.complete_dmabuf_release(
+                CompositorFrameBatchId::for_shutdown(),
+                0,
+                obligation,
+            ) {
+                DmabufReleaseCompletion::Completed => {
+                    result.completed = result.completed.saturating_add(1);
+                    self.buffer_release_metrics
+                        .explicit_release_signal_retry_successes = self
+                        .buffer_release_metrics
+                        .explicit_release_signal_retry_successes
+                        .saturating_add(1);
+                }
+                DmabufReleaseCompletion::SignalRetry => {
+                    result.failed = result.failed.saturating_add(1);
+                }
+                DmabufReleaseCompletion::Discarded | DmabufReleaseCompletion::DeferredCurrent => {}
+            }
+        }
+        result.remaining = self.explicit_release_signal_retries.len();
+        result
     }
 
     #[cfg(test)]
@@ -1081,6 +1202,10 @@ impl CompositorState {
 
         let deferred_dmabuf = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
         for obligation in deferred_dmabuf {
+            releases.push(obligation);
+        }
+        let signal_retries = std::mem::take(&mut self.explicit_release_signal_retries);
+        for obligation in signal_retries {
             releases.push(obligation);
         }
         let pending_dmabuf = std::mem::take(&mut self.pending_dmabuf_buffer_releases);
@@ -1141,6 +1266,7 @@ impl CompositorState {
         let same = |obligation: &DmabufReleaseObligation| obligation.same_release_token(candidate);
         self.pending_dmabuf_buffer_releases.iter().any(same)
             || self.deferred_dmabuf_buffer_releases.iter().any(same)
+            || self.explicit_release_signal_retries.iter().any(same)
             || self.frame_batches.values().any(|batch| {
                 batch
                     .dmabuf_releases_to_complete_on_present
@@ -1184,6 +1310,16 @@ impl CompositorState {
             alive
         });
         self.deferred_dmabuf_buffer_releases.retain(|obligation| {
+            let alive = match &obligation.release {
+                SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                SurfaceBufferRelease::ExplicitSync(_) => true,
+            };
+            if !alive {
+                discarded = discarded.saturating_add(1);
+            }
+            alive
+        });
+        self.explicit_release_signal_retries.retain(|obligation| {
             let alive = match &obligation.release {
                 SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
                 SurfaceBufferRelease::ExplicitSync(_) => true,
@@ -1309,11 +1445,16 @@ impl CompositorState {
                         "surface_or_sync_owner_destroyed",
                     ),
                 }
-                commit.pending.release_target().release();
+                let resize_commit = commit
+                    .pending
+                    .resize_commit
+                    .as_deref()
+                    .map(|resize| resize.commit_sequence);
+                self.release_pending_surface_buffer(commit.pending);
                 canceled_callbacks.extend(commit.frame_callbacks);
                 self.discard_presentation_feedbacks(commit.presentation_feedbacks);
-                if let Some(resize) = commit.pending.resize_commit.as_deref() {
-                    canceled_resize_captures.push(resize.commit_sequence);
+                if let Some(resize_commit) = resize_commit {
+                    canceled_resize_captures.push(resize_commit);
                 }
                 if self.external_acquire_readiness {
                     self.pending_acquire_watch_changes
@@ -1662,7 +1803,7 @@ impl CompositorState {
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     self.release_resize_capture(commit.surface_id, resize.commit_sequence);
                 }
-                commit.pending.release_target().release();
+                self.release_pending_surface_buffer(commit.pending);
                 self.complete_frame_callbacks(commit.frame_callbacks);
                 self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 continue;

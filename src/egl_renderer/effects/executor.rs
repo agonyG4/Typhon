@@ -27,41 +27,66 @@ void main() {
 }
 "#;
 
-pub(super) const NORMALIZE_FRAGMENT_SHADER: &str = r#"#version 300 es
+pub(crate) const NORMALIZE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec4 u_effect_input_domain;
-uniform vec2 u_effect_output_size;
+uniform vec4 u_effect_output_domain;
 uniform int u_effect_decode_srgb;
 uniform int u_effect_encode_srgb;
 in vec2 v_uv;
 out vec4 out_color;
 
+float typhon_decode_srgb_channel(float value);
+float typhon_encode_srgb_channel(float value);
+vec4 typhon_sanitize_premultiplied(vec4 value);
+
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(typhon_decode_srgb_channel(straight.r), typhon_decode_srgb_channel(straight.g), typhon_decode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(linear * value.a, value.a));
 }
 
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
+}
+
+float typhon_decode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.04045) return value / 12.92;
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
 }
 
 void main() {
-    vec2 output_position = v_uv * u_effect_output_size;
+    vec2 output_position = u_effect_output_domain.xy + v_uv * u_effect_output_domain.zw;
     vec2 input_uv = (output_position - u_effect_input_domain.xy) /
         u_effect_input_domain.zw;
     if (any(lessThan(input_uv, vec2(0.0))) || any(greaterThan(input_uv, vec2(1.0)))) {
-        discard;
+        out_color = vec4(0.0);
+        return;
     }
     vec4 result = texture(u_effect_input, input_uv);
     if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
-    out_color = result;
+    out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
 
@@ -75,11 +100,24 @@ uniform int u_effect_force_opaque;
 in vec2 v_uv;
 out vec4 out_color;
 
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
 void main() {
@@ -92,7 +130,7 @@ void main() {
     vec4 result = texture(u_effect_input, input_uv);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
-    out_color = result;
+    out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
 
@@ -109,18 +147,42 @@ uniform float u_effect_noise_amount;
 in vec2 v_uv;
 out vec4 out_color;
 
+float typhon_decode_srgb_channel(float value);
+float typhon_encode_srgb_channel(float value);
+vec4 typhon_sanitize_premultiplied(vec4 value);
+
+float typhon_decode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.04045) return value / 12.92;
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(typhon_decode_srgb_channel(straight.r), typhon_decode_srgb_channel(straight.g), typhon_decode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(linear * value.a, value.a));
 }
 
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
 void main() {
@@ -130,12 +192,13 @@ void main() {
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
     float noise = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
     result.rgb += noise * u_effect_noise_amount;
+    result = typhon_sanitize_premultiplied(result);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
-    out_color = result;
+    out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
 
-pub(super) const MASK_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
+pub(crate) const MASK_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform int u_effect_decode_srgb;
@@ -144,34 +207,52 @@ uniform int u_effect_inverted;
 in vec2 v_uv;
 out vec4 out_color;
 
+float typhon_decode_srgb_channel(float value);
+float typhon_encode_srgb_channel(float value);
+vec4 typhon_sanitize_premultiplied(vec4 value);
+
+float typhon_decode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.04045) return value / 12.92;
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(typhon_decode_srgb_channel(straight.r), typhon_decode_srgb_channel(straight.g), typhon_decode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(linear * value.a, value.a));
 }
 
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
 void main() {
     vec4 result = texture(u_effect_input, v_uv);
     if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     float coverage = u_effect_inverted != 0 ? 1.0 - result.a : result.a;
-    if (u_effect_inverted != 0) {
-        vec3 straight = result.a > 0.00001 ? result.rgb / result.a : vec3(0.0);
-        result.a = clamp(coverage, 0.0, 1.0);
-        result.rgb = straight * result.a;
-    } else {
-        result.rgb *= clamp(coverage, 0.0, 1.0);
-        result.a *= clamp(coverage, 0.0, 1.0);
-    }
+    result *= clamp(coverage, 0.0, 1.0);
+    result = typhon_sanitize_premultiplied(result);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
-    out_color = result;
+    out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
 
@@ -186,18 +267,42 @@ uniform float u_effect_blend_opacity;
 in vec2 v_uv;
 out vec4 out_color;
 
+float typhon_decode_srgb_channel(float value);
+float typhon_encode_srgb_channel(float value);
+vec4 typhon_sanitize_premultiplied(vec4 value);
+
+float typhon_decode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.04045) return value / 12.92;
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(typhon_decode_srgb_channel(straight.r), typhon_decode_srgb_channel(straight.g), typhon_decode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(linear * value.a, value.a));
 }
 
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
 void main() {
@@ -225,9 +330,9 @@ void main() {
             ? first.rgb + second.rgb * opacity
             : first.rgb * (1.0 - second_alpha) + second.rgb * (1.0 - first.a) + blended * first.a * second_alpha;
     float alpha = second_alpha + first.a * (1.0 - second_alpha);
-    vec4 result = vec4(rgb, alpha);
+    vec4 result = typhon_sanitize_premultiplied(vec4(rgb, alpha));
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
-    out_color = result;
+    out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
 
@@ -690,7 +795,10 @@ fn execute_fullscreen_stage(
             StageUniformContext {
                 parameters: &pass.parameter_block,
                 input_plan,
-                output_size: (output_plan.width as f32, output_plan.height as f32),
+                output_size: trusted_effect_output_size(
+                    renderer.current_size,
+                    (output_plan.width, output_plan.height),
+                ),
                 output_scale: renderer.effect_output_scale,
                 effect_time_seconds: renderer.effect_time_seconds,
                 effect_delta_seconds: renderer.effect_delta_seconds,
@@ -1400,20 +1508,36 @@ fn execute_fullscreen_pass(
                 renderer.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
             }
         }
-        if !blur_shader
-            && let Some(location) = uniform_location(
+        if !blur_shader {
+            if pass.kind == RenderPassKind::NormalizeInput {
+                if let Some(location) = uniform_location(
+                    &mut renderer.effect_shaders,
+                    &renderer.gl,
+                    shader_key,
+                    program,
+                    "u_effect_output_domain",
+                ) {
+                    renderer.gl.uniform_4_f32(
+                        Some(&location),
+                        output_plan.domain.x as f32,
+                        output_plan.domain.y as f32,
+                        output_plan.domain.width.max(1) as f32,
+                        output_plan.domain.height.max(1) as f32,
+                    );
+                }
+            } else if let Some(location) = uniform_location(
                 &mut renderer.effect_shaders,
                 &renderer.gl,
                 shader_key,
                 program,
                 "u_effect_output_size",
-            )
-        {
-            renderer.gl.uniform_2_f32(
-                Some(&location),
-                output_plan.domain.width.max(1) as f32,
-                output_plan.domain.height.max(1) as f32,
-            );
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    output_plan.domain.width.max(1) as f32,
+                    output_plan.domain.height.max(1) as f32,
+                );
+            }
         }
         renderer.gl.bind_vertex_array(Some(vertex_array));
         draw_damage_scissors(&renderer.gl, &pass.damage, output_plan, framebuffer_origin);
@@ -1536,6 +1660,13 @@ fn restore_output_viewport(renderer: &GlesSceneRenderer) {
     }
 }
 
+fn trusted_effect_output_size(
+    renderer_size: (u32, u32),
+    _stage_texture_size: (u32, u32),
+) -> (f32, f32) {
+    (renderer_size.0 as f32, renderer_size.1 as f32)
+}
+
 #[cfg(test)]
 mod coordinate_tests {
     use super::*;
@@ -1625,6 +1756,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trusted_output_size_uses_the_compositor_output_not_the_stage_texture() {
+        assert_eq!(
+            trusted_effect_output_size((1920, 1080), (300, 200)),
+            (1920.0, 1080.0)
+        );
+    }
+
+    #[test]
     fn full_output_fallback_is_bounded_to_renderer_size() {
         assert_eq!(
             full_output_rect((1920, 1080)),
@@ -1645,5 +1784,31 @@ mod tests {
         assert_eq!(captured.r, 0.5);
         assert_eq!(captured.g, 0.25);
         assert_eq!(captured.b, 0.125);
+    }
+
+    #[test]
+    fn built_in_shader_contract_contains_mask_parity_and_safe_srgb_guards() {
+        assert!(MASK_STAGE_FRAGMENT_SHADER.contains("result *= clamp(coverage"));
+        assert!(NORMALIZE_FRAGMENT_SHADER.contains("u_effect_output_domain"));
+        assert!(NORMALIZE_FRAGMENT_SHADER.contains("out_color = vec4(0.0)"));
+        for shader in [
+            NORMALIZE_FRAGMENT_SHADER,
+            COMPOSITE_FRAGMENT_SHADER,
+            FRAGMENT_STAGE_FRAGMENT_SHADER,
+            MASK_STAGE_FRAGMENT_SHADER,
+            BLEND_STAGE_FRAGMENT_SHADER,
+        ] {
+            assert!(shader.contains("isnan"));
+            assert!(shader.contains("isinf"));
+            assert!(shader.contains("if (value <= 0.0031308)"));
+        }
+        for shader in [
+            NORMALIZE_FRAGMENT_SHADER,
+            FRAGMENT_STAGE_FRAGMENT_SHADER,
+            MASK_STAGE_FRAGMENT_SHADER,
+            BLEND_STAGE_FRAGMENT_SHADER,
+        ] {
+            assert!(shader.contains("if (value <= 0.04045)"));
+        }
     }
 }

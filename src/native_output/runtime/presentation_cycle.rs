@@ -1130,7 +1130,7 @@ impl NativeRuntime {
                     #[rustfmt::skip] let atomic_kms_lane_free = !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
-                        let presentation_snapshot = resolved_scene.presentation.frame_snapshot();
+                        let presentation_snapshot = resolved_scene.presentation_snapshot.clone();
                         let (
                             frame_target,
                             submit_window,
@@ -1277,7 +1277,16 @@ impl NativeRuntime {
                                                 Ok(_) => {
                                                     dmabuf_gpu_release_registry
                                                         .note_no_visual_fence_only();
-                                                    dmabuf_gpu_release_registry.complete_retry();
+                                                    if server.explicit_release_signal_retry_count()
+                                                        == 0
+                                                    {
+                                                        dmabuf_gpu_release_registry.complete_retry();
+                                                    } else {
+                                                        dmabuf_gpu_release_registry.retry_after_failure(
+                                                            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                                                            monotonic_now_ns()?,
+                                                        );
+                                                    }
                                                 }
                                                 Err(_) => {
                                                     dmabuf_gpu_release_registry
@@ -1301,6 +1310,11 @@ impl NativeRuntime {
                                             );
                                         }
                                     }
+                                } else if server.explicit_release_signal_retry_count() > 0 {
+                                    dmabuf_gpu_release_registry.retry_after_failure(
+                                        DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                                        monotonic_now_ns()?,
+                                    );
                                 } else if server.retryable_deferred_dmabuf_release_count() > 0 {
                                     let reason = if release_safety.permits_compositor_gpu_release()
                                     {

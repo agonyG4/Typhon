@@ -454,18 +454,38 @@ vec4 typhon_sample_aux(int index, vec2 uv) {
     return result;
 }
 
+float typhon_decode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.04045) return value / 12.92;
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(typhon_decode_srgb_channel(straight.r), typhon_decode_srgb_channel(straight.g), typhon_decode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(linear * value.a, value.a));
 }
 
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 encoded = mix(straight * 12.92, 1.055 * pow(straight, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), straight));
-    return vec4(encoded * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
 }
 
 "#,

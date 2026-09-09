@@ -240,7 +240,7 @@ impl EffectRegion {
         })
     }
 
-    fn expand_clamped_xy(&self, radius_x: u32, radius_y: u32, bounds: EffectRect) -> Self {
+    pub fn expand_clamped_xy(&self, radius_x: u32, radius_y: u32, bounds: EffectRect) -> Self {
         if self.conservative_full {
             return Self::from_rect(bounds);
         }

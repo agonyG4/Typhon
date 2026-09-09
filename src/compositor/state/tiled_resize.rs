@@ -2,7 +2,7 @@ use super::*;
 
 use crate::wm::LayoutMembership;
 use crate::wm::layout::{
-    RatioOverride, ResizeEdges as LayoutResizeEdges, SplitRatio, TiledLayoutSolution,
+    LayoutRect, RatioOverride, ResizeEdges as LayoutResizeEdges, SplitRatio, TiledLayoutSolution,
     TiledResizeHandle,
 };
 
@@ -118,6 +118,32 @@ impl CompositorState {
             .resize_flow_metrics
             .tiled_resize_interactions_started
             .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn rebase_tiled_resize_preparation(
+        &self,
+        root_surface_id: u32,
+        window_id: WindowId,
+        preparation: &mut TiledResizePreparation,
+    ) {
+        let Some(presented_rect) = self
+            .presented_root_geometry(root_surface_id)
+            .map(PresentedRootGeometry::presented_rect)
+        else {
+            return;
+        };
+        let Some(canonical_client) = preparation
+            .solution
+            .target_for_window(window_id)
+            .map(|target| target.client())
+        else {
+            return;
+        };
+        let (horizontal_delta, vertical_delta) =
+            interaction_boundary_deltas(canonical_client, presented_rect, preparation.edges);
+        preparation.handle = preparation
+            .handle
+            .rebase_boundaries(horizontal_delta, vertical_delta);
     }
 
     pub(in crate::compositor) fn update_pending_tiled_resize(
@@ -353,5 +379,118 @@ impl CompositorState {
         self.tiled_resize_session
             .filter(|session| session.window_id == window_id)
             .map(|session| (session.edges, session.resize_interaction_id))
+    }
+}
+
+fn saturating_i32_from_f64(value: f64) -> i32 {
+    if !value.is_finite() {
+        return if value.is_sign_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        };
+    }
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn interaction_boundary_deltas(
+    canonical_client: LayoutRect,
+    presented_rect: PresentationRect,
+    edges: ResizeEdges,
+) -> (i32, i32) {
+    let horizontal_delta = if edges.left || edges.right {
+        let canonical_edge = if edges.right {
+            canonical_client.right()
+        } else {
+            canonical_client.x()
+        };
+        let presented_edge = if edges.right {
+            presented_rect.x() + presented_rect.width()
+        } else {
+            presented_rect.x()
+        };
+        saturating_i32_from_f64(presented_edge - f64::from(canonical_edge))
+    } else {
+        0
+    };
+    let vertical_delta = if edges.top || edges.bottom {
+        let canonical_edge = if edges.bottom {
+            canonical_client.bottom()
+        } else {
+            canonical_client.y()
+        };
+        let presented_edge = if edges.bottom {
+            presented_rect.y() + presented_rect.height()
+        } else {
+            presented_rect.y()
+        };
+        saturating_i32_from_f64(presented_edge - f64::from(canonical_edge))
+    } else {
+        0
+    };
+    (horizontal_delta, vertical_delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResizeEdges, interaction_boundary_deltas};
+    use crate::compositor::PresentationRect;
+    use crate::wm::layout::LayoutRect;
+
+    #[test]
+    fn constrained_client_offset_is_preserved_when_rebasing_right_edge() {
+        let canonical_client = LayoutRect::new(25, 10, 400, 300).expect("client rect");
+        let presented = PresentationRect::new(40.0, 20.0, 400.0, 300.0).expect("presented rect");
+        let (horizontal, vertical) = interaction_boundary_deltas(
+            canonical_client,
+            presented,
+            edges(false, false, false, true),
+        );
+
+        assert_eq!((horizontal, vertical), (15, 0));
+        assert_eq!(500_i32.saturating_add(horizontal) - 440, 75);
+        assert_ne!(500_i32.saturating_add(horizontal), 440);
+    }
+
+    #[test]
+    fn all_selected_edges_use_the_matching_presented_client_edge() {
+        let canonical_client = LayoutRect::new(25, 10, 400, 300).expect("client rect");
+        let presented = PresentationRect::new(40.0, 20.0, 420.0, 320.0).expect("presented rect");
+
+        assert_eq!(
+            interaction_boundary_deltas(
+                canonical_client,
+                presented,
+                edges(false, false, true, false)
+            ),
+            (15, 0)
+        );
+        assert_eq!(
+            interaction_boundary_deltas(
+                canonical_client,
+                presented,
+                edges(false, true, false, false)
+            ),
+            (0, 30)
+        );
+        assert_eq!(
+            interaction_boundary_deltas(
+                canonical_client,
+                presented,
+                edges(true, false, false, false)
+            ),
+            (0, 10)
+        );
+    }
+
+    const fn edges(top: bool, bottom: bool, left: bool, right: bool) -> ResizeEdges {
+        ResizeEdges {
+            top,
+            bottom,
+            left,
+            right,
+        }
     }
 }

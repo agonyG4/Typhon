@@ -647,7 +647,7 @@ impl CompositorState {
                 BufferSize::new(pending.data.width().ok()?, pending.data.height().ok()?)
             });
             if !self.layer_surface_can_publish_buffer(surface_id, pending_surface_size) {
-                pending.release_target().release();
+                self.release_pending_surface_buffer(pending);
                 self.complete_frame_callbacks(frame_callbacks);
                 self.discard_presentation_feedbacks(presentation_feedbacks);
                 return;
@@ -1361,7 +1361,26 @@ impl CompositorState {
                     .saturating_add(1);
             }
         }
-        self.release_surface_buffer_direct(pending.release_target());
+        self.release_pending_surface_buffer(pending);
+    }
+
+    pub(in crate::compositor) fn release_pending_surface_buffer(
+        &mut self,
+        pending: PendingSurfaceBuffer,
+    ) {
+        if pending.data.is_dmabuf() || pending.explicit_release.is_some() {
+            let obligation = DmabufReleaseObligation {
+                buffer_id: pending.data.buffer_id(),
+                release: pending.release_target(),
+            };
+            let _ = self.complete_dmabuf_release_if_inactive(
+                CompositorFrameBatchId::for_shutdown(),
+                0,
+                obligation,
+            );
+        } else {
+            self.release_surface_buffer_direct(pending.release_target());
+        }
     }
 
     pub(in crate::compositor) fn release_surface_buffer_direct(
@@ -1389,7 +1408,20 @@ impl CompositorState {
                         .saturating_add(1);
                 }
             }
-            SurfaceBufferRelease::ExplicitSync(point) => point.signal(),
+            SurfaceBufferRelease::ExplicitSync(point) => match point.signal() {
+                Ok(()) => {
+                    self.buffer_release_metrics.buffer_releases_completed = self
+                        .buffer_release_metrics
+                        .buffer_releases_completed
+                        .saturating_add(1);
+                }
+                Err(_) => {
+                    self.buffer_release_metrics.explicit_release_signal_failures = self
+                        .buffer_release_metrics
+                        .explicit_release_signal_failures
+                        .saturating_add(1);
+                }
+            },
         }
     }
 
@@ -1661,7 +1693,7 @@ impl CompositorState {
                             source,
                             decision,
                         );
-                        pending.release_target().release();
+                        self.release_pending_surface_buffer(pending);
                         self.complete_frame_callbacks(frame_callbacks);
                         false
                     }

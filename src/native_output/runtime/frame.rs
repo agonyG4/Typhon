@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
-    PointerWarpOrigin, PresentationSceneSample, ResolvedEffectScene,
+    PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample, ResolvedEffectScene,
 };
 
 #[derive(Debug)]
@@ -18,6 +18,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) snapshot: NativeSceneSnapshot,
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) presentation: PresentationSceneSample,
+    pub(crate) presentation_snapshot: PresentationFrameSnapshot,
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
@@ -30,6 +31,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let presentation = server.presentation_scene_sample_at(at);
         let canonical_surfaces = server.native_frame_renderable_surfaces();
         let surfaces = server.native_frame_renderable_surfaces_with_presentation(&presentation);
+        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_roots(
+            &presentation,
+            server.native_frame_presented_root_geometries(surfaces.as_ref()),
+        );
         let decorations = server
             .native_decoration_render_instances_for_scale(canonical_surfaces.as_ref(), 1.0)
             .into_iter()
@@ -62,6 +67,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             snapshot,
             effects,
             presentation,
+            presentation_snapshot,
         }
     }
 
@@ -76,6 +82,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             snapshot: self.snapshot,
             effects: self.effects,
             presentation: self.presentation,
+            presentation_snapshot: self.presentation_snapshot,
         }
     }
 

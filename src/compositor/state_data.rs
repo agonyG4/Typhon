@@ -1799,6 +1799,13 @@ pub(super) enum SurfaceBufferRelease {
     ExplicitSync(ExplicitSyncPoint),
 }
 
+#[derive(Debug)]
+pub(super) enum SurfaceBufferReleaseOutcome {
+    Completed,
+    Discarded,
+    ExplicitSyncFailed(ExplicitSyncPoint),
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DmabufReleaseObligation {
     pub(super) buffer_id: BufferId,
@@ -1822,13 +1829,21 @@ impl SurfaceBufferRelease {
         }
     }
 
-    pub(super) fn release(self) {
+    pub(super) fn release(self) -> SurfaceBufferReleaseOutcome {
         match self {
             Self::WlBuffer(buffer) => {
-                let _ = buffer.send_event(wl_buffer::Event::Release);
+                if !buffer.is_alive() || buffer.send_event(wl_buffer::Event::Release).is_err() {
+                    SurfaceBufferReleaseOutcome::Discarded
+                } else {
+                    SurfaceBufferReleaseOutcome::Completed
+                }
             }
             Self::ExplicitSync(point) => {
-                point.signal();
+                if point.signal().is_ok() {
+                    SurfaceBufferReleaseOutcome::Completed
+                } else {
+                    SurfaceBufferReleaseOutcome::ExplicitSyncFailed(point)
+                }
             }
         }
     }

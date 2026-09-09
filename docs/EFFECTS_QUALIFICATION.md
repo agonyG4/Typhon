@@ -1,8 +1,11 @@
 # Effects qualification
 
-Status: fresh deterministic closure gates pass; native TTY/DRM qualification is
-blocked in this environment because the process has no controlling TTY. The
-available DRM node and NVIDIA GPU do not satisfy the real-TTY prerequisite.
+Status: effects source closure is implemented and the library/strict-library
+checks pass, but fresh all-target/test closure evidence is currently blocked by
+uncommitted unrelated explicit-sync test edits in this checkout. Native
+TTY/DRM qualification is also blocked because the process has no controlling
+TTY. The available DRM node and NVIDIA GPU do not satisfy the real-TTY
+prerequisite.
 
 This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
@@ -25,10 +28,18 @@ rtk bin/qualify-presentation --dry-run
 
 The closure also reruns the focused `resources`, `static_texture`, trusted
 wrapper GLES-link, component-range, and effect-reload filters.
-The current fresh results are: `effects` 103 passed, `egl_renderer` 124 passed,
-`resources` 18 passed, `static_texture` 3 passed, `native_output` 1162 passed,
-and the full suite 3658 passed with 5 ignored. Formatting, all-target
-compilation, and strict Clippy passed. The dry-run enumerated all 18 phases.
+The previous checkpoint recorded: `effects` 103 passed, `egl_renderer` 124
+passed, `resources` 18 passed, `static_texture` 3 passed, `native_output` 1162
+passed, and the full suite 3658 passed with 5 ignored. Those are historical
+checkout evidence, not fresh evidence for this closure.
+
+The fresh attempt reached `cargo check --locked --lib` and
+`cargo clippy --locked --lib -- -D warnings` successfully. The required
+all-target/test commands cannot currently compile the checkout because
+uncommitted explicit-sync changes leave `ExplicitSyncPoint` test constructors
+and struct literals inconsistent (`src/compositor/state/frame_tests.rs` and
+`src/compositor/explicit_sync.rs`). No fresh suite count is claimed until that
+pre-existing checkout condition is resolved.
 
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no

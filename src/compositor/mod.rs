@@ -149,12 +149,15 @@ use explicit_sync::{
 };
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{
-    BufferReleaseMetrics, CompositorFrameBatchId, DmabufGpuReleaseLeaseId, FrameCallbackAdmission,
-    FrameCallbackMetrics, FrameCallbackTimingEvidence,
+    BufferReleaseMetrics, CompositorFrameBatchId, DmabufGpuReleaseLeaseId,
+    ExplicitReleaseSignalRetryResult, FrameCallbackAdmission, FrameCallbackMetrics,
+    FrameCallbackTimingEvidence,
 };
 pub(crate) use frame_batch::{CompositorFrameBatch, DmabufGpuReleaseLease};
 pub use state_data::ShmBufferLifetimeMetrics;
-pub(in crate::compositor) use state_data::{CurrentSurfaceBuffer, DmabufReleaseObligation};
+pub(in crate::compositor) use state_data::{
+    CurrentSurfaceBuffer, DmabufReleaseObligation, SurfaceBufferReleaseOutcome,
+};
 #[allow(unused_imports)]
 pub(in crate::compositor) use toplevel_publication::*;
 use workspace_protocol::WorkspaceProtocolState;
@@ -272,9 +275,10 @@ pub struct KeyboardConfigurationMutation {
 }
 pub use crate::presentation_animation::{
     AnimationCurve, AnimationTime, EasingCurve, PresentationAnimationMetrics, PresentationAnimator,
-    PresentationDamageRect, PresentationFrameSnapshot, PresentationGroupTransform,
-    PresentationRect, PresentationSceneSample, PresentationTransition, PresentationVelocity,
-    PresentationWindowSample, SpringSpec, TransitionId, presentation_damage,
+    PresentationDamageRect, PresentationFrameSnapshot, PresentationGeometryTransform,
+    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentationTransition,
+    PresentationVelocity, PresentationWindowSample, PresentedRootGeometry, SpringSpec,
+    TransitionId, presentation_damage,
 };
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
@@ -769,6 +773,7 @@ pub struct CompositorState {
     active_dmabuf_buffers: HashMap<u32, DmabufReleaseObligation>,
     pending_dmabuf_buffer_releases: Vec<DmabufReleaseObligation>,
     deferred_dmabuf_buffer_releases: Vec<DmabufReleaseObligation>,
+    explicit_release_signal_retries: Vec<DmabufReleaseObligation>,
     dmabuf_gpu_release_leases: HashMap<DmabufGpuReleaseLeaseId, DmabufGpuReleaseLease>,
     buffer_release_metrics: BufferReleaseMetrics,
     shm_buffer_lifetime_metrics: ShmBufferLifetimeMetrics,

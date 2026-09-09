@@ -57,6 +57,19 @@ pub struct BufferReleaseMetrics {
     pub buffer_release_duplicate_attempts: u64,
     pub dmabuf_release_terminal_revalidated: u64,
     pub dmabuf_release_terminal_requeued_current: u64,
+    pub explicit_release_signal_failures: u64,
+    pub explicit_release_signal_retries: u64,
+    pub explicit_release_signal_retry_successes: u64,
+    pub explicit_release_signal_retry_requeued_current: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitReleaseSignalRetryResult {
+    pub attempted: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub requeued_current: usize,
+    pub remaining: usize,
 }
 
 #[doc(hidden)]

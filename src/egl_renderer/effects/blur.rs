@@ -21,10 +21,17 @@ in vec2 v_uv;
 out vec4 out_color;
 
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    value.a = clamp(value.a, 0.0, 1.0);
+    value.rgb = clamp(value.rgb, vec3(0.0), vec3(value.a));
     if (value.a <= 0.00001) return vec4(0.0);
-    vec3 straight = value.rgb / value.a;
-    vec3 linear = mix(straight / 12.92, pow((straight + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), straight));
-    return vec4(linear * value.a, value.a);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 linear = vec3(
+        straight.r <= 0.04045 ? straight.r / 12.92 : pow((straight.r + 0.055) / 1.055, 2.4),
+        straight.g <= 0.04045 ? straight.g / 12.92 : pow((straight.g + 0.055) / 1.055, 2.4),
+        straight.b <= 0.04045 ? straight.b / 12.92 : pow((straight.b + 0.055) / 1.055, 2.4)
+    );
+    return vec4(clamp(linear * value.a, vec3(0.0), vec3(value.a)), value.a);
 }
 
 void main() {
@@ -39,6 +46,9 @@ void main() {
         typhon_decode_premultiplied_srgb(sample_c) +
         typhon_decode_premultiplied_srgb(sample_d)
     ) * 0.25;
+    if (any(isnan(result)) || any(isinf(result))) result = vec4(0.0);
+    result.a = clamp(result.a, 0.0, 1.0);
+    result.rgb = clamp(result.rgb, vec3(0.0), vec3(result.a));
     out_color = result;
 }
 "#;
