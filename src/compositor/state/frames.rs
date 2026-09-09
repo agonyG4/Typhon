@@ -1107,6 +1107,27 @@ impl CompositorState {
             .saturating_add(1);
     }
 
+    pub(in crate::compositor) fn reclassify_reactivated_dmabuf_release(
+        &mut self,
+        obligation: &DmabufReleaseObligation,
+    ) -> bool {
+        let Some(index) = self
+            .explicit_release_signal_retries
+            .iter()
+            .position(|existing| existing.same_release_token(obligation))
+        else {
+            return false;
+        };
+        self.explicit_release_signal_retries.remove(index);
+        self.push_deferred_dmabuf_release(obligation.clone());
+        self.buffer_release_metrics
+            .explicit_release_signal_retry_requeued_current = self
+            .buffer_release_metrics
+            .explicit_release_signal_retry_requeued_current
+            .saturating_add(1);
+        true
+    }
+
     pub(in crate::compositor) fn service_explicit_release_signal_retries(
         &mut self,
     ) -> ExplicitReleaseSignalRetryResult {

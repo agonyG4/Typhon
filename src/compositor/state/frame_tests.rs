@@ -1201,6 +1201,94 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn reactivation_invalidates_signal_only_proof_before_retry_deadline() {
+        let mut state = CompositorState::default();
+        let retired = scripted_dmabuf_release(508, 508, [false, true]);
+        assert!(matches!(
+            state.complete_dmabuf_release(
+                CompositorFrameBatchId::for_shutdown(),
+                0,
+                retired.clone(),
+            ),
+            DmabufReleaseCompletion::SignalRetry
+        ));
+
+        let reactivated = same_explicit_token_for_buffer(&retired, 509);
+        state.active_dmabuf_buffers.insert(77, reactivated.clone());
+        assert!(state.reclassify_reactivated_dmabuf_release(&reactivated));
+        assert!(state.dmabuf_release_token_is_active(&reactivated));
+        assert_eq!(state.explicit_release_signal_retry_count(), 0);
+        assert_eq!(state.deferred_dmabuf_release_count(), 1);
+
+        state.active_dmabuf_buffers.remove(&77);
+        let result = state.service_explicit_release_signal_retries();
+        assert_eq!(result.attempted, 0);
+        assert_eq!(result.completed, 0);
+        assert_eq!(state.explicit_release_signal_retry_count(), 0);
+        assert_eq!(state.deferred_dmabuf_release_count(), 1);
+        assert_eq!(
+            state.deferred_dmabuf_buffer_releases[0].buffer_id.get(),
+            509
+        );
+
+        let lease = DmabufGpuReleaseLeaseId::new(NonZeroU64::new(54).unwrap());
+        assert_eq!(
+            state.transfer_deferred_dmabuf_releases_to_gpu_lease(lease),
+            1
+        );
+        assert_eq!(state.complete_dmabuf_gpu_release_lease(lease), 1);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
+    fn reactivation_of_a_distinct_explicit_token_keeps_signal_retry_owned() {
+        let mut state = CompositorState::default();
+        let retired = scripted_dmabuf_release(510, 510, [false, true]);
+        assert!(matches!(
+            state.complete_dmabuf_release(
+                CompositorFrameBatchId::for_shutdown(),
+                0,
+                retired.clone(),
+            ),
+            DmabufReleaseCompletion::SignalRetry
+        ));
+
+        let distinct = match &retired.release {
+            SurfaceBufferRelease::ExplicitSync(point) => DmabufReleaseObligation {
+                buffer_id: BufferId::for_tests(511),
+                release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint {
+                    timeline: point.timeline.clone(),
+                    point: point.point.saturating_add(1),
+                    signal_script: point.signal_script.clone(),
+                }),
+            },
+            SurfaceBufferRelease::WlBuffer(_) => unreachable!(),
+        };
+        state.active_dmabuf_buffers.insert(78, distinct.clone());
+
+        assert!(!state.reclassify_reactivated_dmabuf_release(&distinct));
+        assert_eq!(state.explicit_release_signal_retry_count(), 1);
+        assert_eq!(state.deferred_dmabuf_release_count(), 0);
+    }
+
+    fn same_explicit_token_for_buffer(
+        obligation: &DmabufReleaseObligation,
+        buffer_id: u64,
+    ) -> DmabufReleaseObligation {
+        match &obligation.release {
+            SurfaceBufferRelease::ExplicitSync(point) => DmabufReleaseObligation {
+                buffer_id: BufferId::for_tests(buffer_id),
+                release: SurfaceBufferRelease::ExplicitSync(ExplicitSyncPoint {
+                    timeline: point.timeline.clone(),
+                    point: point.point,
+                    signal_script: point.signal_script.clone(),
+                }),
+            },
+            SurfaceBufferRelease::WlBuffer(_) => unreachable!(),
+        }
+    }
+
+    #[test]
     fn signal_retry_ownership_is_distinct_from_other_points_and_duplicate_safe() {
         let mut state = CompositorState::default();
         let failed = scripted_dmabuf_release(507, 507, [false]);

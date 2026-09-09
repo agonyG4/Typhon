@@ -366,6 +366,70 @@ pub(crate) struct DmabufGpuReleaseRegistry {
     retry: DmabufReleaseRetryState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufReleaseRetryServiceDecision {
+    ReconcileOnly,
+    ServiceProofRequired,
+}
+
+fn retry_service_decision(
+    deferred_count: usize,
+    retryable_count: usize,
+) -> DmabufReleaseRetryServiceDecision {
+    if deferred_count > 0 && retryable_count > 0 {
+        DmabufReleaseRetryServiceDecision::ServiceProofRequired
+    } else {
+        DmabufReleaseRetryServiceDecision::ReconcileOnly
+    }
+}
+
+fn reconcile_retry_state(
+    registry: &mut DmabufGpuReleaseRegistry,
+    deferred_count: usize,
+    retryable_count: usize,
+    signal_retry_count: usize,
+    signal_retry_failed: bool,
+    proof_service_suppressed: bool,
+    proof_retry_failure: Option<DmabufReleaseRetryReason>,
+    now_ns: u64,
+) {
+    if signal_retry_count > 0 {
+        if signal_retry_failed {
+            registry.retry_after_failure(
+                DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                now_ns,
+            );
+        } else {
+            registry.schedule_retry_if_needed(
+                DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                now_ns,
+            );
+        }
+        return;
+    }
+    if let Some(reason) = proof_retry_failure {
+        registry.retry_after_failure(reason, now_ns);
+        return;
+    }
+    if proof_service_suppressed {
+        if deferred_count > 0 {
+            registry.metrics.retry_skipped_current_token = registry
+                .metrics
+                .retry_skipped_current_token
+                .saturating_add(1);
+        }
+        registry.complete_retry();
+        return;
+    }
+    registry.update_retry_for_work(
+        deferred_count,
+        retryable_count,
+        0,
+        DmabufReleaseRetryReason::NoGpuProofAvailable,
+        now_ns,
+    );
+}
+
 impl DmabufGpuReleaseRegistry {
     pub(crate) fn allocate_lease_id(&mut self) -> io::Result<DmabufGpuReleaseLeaseId> {
         let id = std::num::NonZeroU64::new(self.next_lease_id.max(1))
@@ -794,106 +858,102 @@ impl super::NativeRuntime {
             return Ok(());
         }
         let signal_retry_count = self.server.explicit_release_signal_retry_count();
+        let mut signal_retry_failed = false;
         if signal_retry_count > 0 {
             let retry_result = self.server.service_explicit_release_signal_retries();
-            if retry_result.remaining > 0 {
-                self.dmabuf_gpu_release_registry.retry_after_failure(
-                    DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
-                    now_ns,
-                );
-                return Ok(());
-            }
+            signal_retry_failed = retry_result.remaining > 0;
         }
         let deferred_count = self.server.deferred_dmabuf_release_count();
         let retryable_count = self.server.retryable_deferred_dmabuf_release_count();
-        if deferred_count == 0 || retryable_count == 0 {
-            self.dmabuf_gpu_release_registry.update_retry_for_work(
-                deferred_count,
-                retryable_count,
-                self.server.explicit_release_signal_retry_count(),
-                DmabufReleaseRetryReason::NoGpuProofAvailable,
-                now_ns,
-            );
-            return Ok(());
-        }
-
-        let safety = match &*self.scanout {
-            crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref())
-            }
-            _ => {
-                // Compatibility backends retain their existing conservative
-                // presentation-bound authority; they never enter this retry
-                // loop.
-                self.dmabuf_gpu_release_registry.complete_retry();
-                return Ok(());
-            }
-        };
-        if !safety.permits_compositor_gpu_release() {
-            self.dmabuf_gpu_release_registry
-                .retry_after_failure(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked, now_ns);
-            return Ok(());
-        }
-
-        let lease_id = self.dmabuf_gpu_release_registry.allocate_lease_id()?;
-        let release_fence = match &*self.scanout {
-            crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                match explicit.create_render_fence() {
-                    Ok(fence) => fence,
-                    Err(_) => {
-                        self.dmabuf_gpu_release_registry
-                            .note_fence_creation_failure();
-                        self.dmabuf_gpu_release_registry.retry_after_failure(
-                            DmabufReleaseRetryReason::NoGpuProofAvailable,
-                            now_ns,
-                        );
-                        return Ok(());
+        let mut proof_service_suppressed = false;
+        let mut proof_retry_failure = None;
+        if matches!(
+            retry_service_decision(deferred_count, retryable_count),
+            DmabufReleaseRetryServiceDecision::ServiceProofRequired
+        ) {
+            match &*self.scanout {
+                crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
+                    let safety =
+                        dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref());
+                    if !safety.permits_compositor_gpu_release() {
+                        proof_retry_failure =
+                            Some(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked);
+                    } else {
+                        proof_retry_failure = 'proof: {
+                            let lease_id =
+                                match self.dmabuf_gpu_release_registry.allocate_lease_id() {
+                                    Ok(lease_id) => lease_id,
+                                    Err(_) => {
+                                        break 'proof Some(
+                                            DmabufReleaseRetryReason::NoGpuProofAvailable,
+                                        );
+                                    }
+                                };
+                            let release_fence = match explicit.create_render_fence() {
+                                Ok(fence) => fence,
+                                Err(_) => {
+                                    self.dmabuf_gpu_release_registry
+                                        .note_fence_creation_failure();
+                                    break 'proof Some(
+                                        DmabufReleaseRetryReason::NoGpuProofAvailable,
+                                    );
+                                }
+                            };
+                            let completion_fd = match release_fence.duplicate_completion_fd() {
+                                Ok(fd) => fd,
+                                Err(_) => {
+                                    self.dmabuf_gpu_release_registry
+                                        .note_completion_fd_failure();
+                                    break 'proof Some(
+                                        DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
+                                    );
+                                }
+                            };
+                            let transferred = self
+                                .server
+                                .transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id);
+                            if transferred == 0 {
+                                break 'proof None;
+                            }
+                            self.dmabuf_gpu_release_registry
+                                .note_obligations_armed(transferred);
+                            match self.dmabuf_gpu_release_registry.register_with_origin(
+                                lease_id,
+                                completion_fd,
+                                &mut self.event_loop,
+                                DmabufGpuReleaseOrigin::DeferredRetry,
+                                transferred,
+                                oblivion_one::native::event_loop::monotonic_now_ns()
+                                    .unwrap_or(now_ns),
+                            ) {
+                                Ok(_) => None,
+                                Err(_) => {
+                                    self.dmabuf_gpu_release_registry.note_registration_failure();
+                                    self.server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                    Some(DmabufReleaseRetryReason::ReactorRegistrationFailed)
+                                }
+                            }
+                        };
                     }
                 }
-            }
-            _ => unreachable!("scanout backend changed during DMA-BUF retry"),
-        };
-        let completion_fd = match release_fence.duplicate_completion_fd() {
-            Ok(fd) => fd,
-            Err(_) => {
-                self.dmabuf_gpu_release_registry
-                    .note_completion_fd_failure();
-                self.dmabuf_gpu_release_registry.retry_after_failure(
-                    DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
-                    now_ns,
-                );
-                return Ok(());
-            }
-        };
-        let transferred = self
-            .server
-            .transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id);
-        if transferred == 0 {
-            self.dmabuf_gpu_release_registry.complete_retry();
-            return Ok(());
-        }
-        self.dmabuf_gpu_release_registry
-            .note_obligations_armed(transferred);
-        match self.dmabuf_gpu_release_registry.register_with_origin(
-            lease_id,
-            completion_fd,
-            &mut self.event_loop,
-            DmabufGpuReleaseOrigin::DeferredRetry,
-            transferred,
-            oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(now_ns),
-        ) {
-            Ok(_) => {
-                self.dmabuf_gpu_release_registry.complete_retry();
-            }
-            Err(_) => {
-                self.dmabuf_gpu_release_registry.note_registration_failure();
-                self.server.requeue_dmabuf_gpu_release_lease(lease_id);
-                self.dmabuf_gpu_release_registry.retry_after_failure(
-                    DmabufReleaseRetryReason::ReactorRegistrationFailed,
-                    now_ns,
-                );
+                _ => {
+                    // Compatibility backends retain their existing conservative
+                    // presentation-bound authority; they do not provide a retry
+                    // proof for this scheduler.
+                    proof_service_suppressed = true;
+                }
             }
         }
+        reconcile_retry_state(
+            &mut self.dmabuf_gpu_release_registry,
+            self.server.deferred_dmabuf_release_count(),
+            self.server.retryable_deferred_dmabuf_release_count(),
+            self.server.explicit_release_signal_retry_count(),
+            signal_retry_failed,
+            proof_service_suppressed,
+            proof_retry_failure,
+            now_ns,
+        );
         Ok(())
     }
 }
@@ -1224,6 +1284,90 @@ mod tests {
 
         registry.update_retry_for_work(1, 1, 0, DmabufReleaseRetryReason::NoGpuProofAvailable, 21);
         assert_eq!(registry.retry_deadline_ns(), deadline);
+    }
+
+    #[test]
+    fn signal_retry_failure_still_services_retryable_proof_debt() {
+        assert_eq!(
+            retry_service_decision(1, 1),
+            DmabufReleaseRetryServiceDecision::ServiceProofRequired
+        );
+    }
+
+    #[test]
+    fn retry_reconciliation_keeps_signal_debt_after_proof_progress() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        registry.update_retry_for_work(
+            0,
+            0,
+            1,
+            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+            10,
+        );
+        let deadline = registry.retry_deadline_ns();
+
+        reconcile_retry_state(&mut registry, 1, 0, 1, false, false, None, 20);
+
+        assert_eq!(registry.retry_deadline_ns(), deadline);
+    }
+
+    #[test]
+    fn retry_reconciliation_keeps_proof_debt_after_signal_progress() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        registry.update_retry_for_work(
+            0,
+            0,
+            1,
+            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+            10,
+        );
+        let deadline = registry.retry_deadline_ns();
+
+        reconcile_retry_state(&mut registry, 1, 1, 0, false, false, None, 20);
+
+        assert_eq!(registry.retry_deadline_ns(), deadline);
+    }
+
+    #[test]
+    fn retry_reconciliation_clears_only_when_both_debt_classes_are_empty() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        registry.update_retry_for_work(
+            0,
+            0,
+            1,
+            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+            10,
+        );
+
+        reconcile_retry_state(&mut registry, 0, 0, 0, false, false, None, 20);
+
+        assert_eq!(registry.retry_deadline_ns(), None);
+    }
+
+    #[test]
+    fn retry_reconciliation_advances_backoff_once_for_two_failures() {
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        registry.update_retry_for_work(
+            0,
+            0,
+            1,
+            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+            10,
+        );
+
+        reconcile_retry_state(
+            &mut registry,
+            1,
+            1,
+            1,
+            true,
+            false,
+            Some(DmabufReleaseRetryReason::NoGpuProofAvailable),
+            20,
+        );
+
+        assert_eq!(registry.retry_attempts(), 1);
+        assert_eq!(registry.retry_deadline_ns(), Some(20 + 2_000_000));
     }
 
     fn transaction_id(value: u64) -> crate::native_output::OutputTransactionId {

@@ -1379,49 +1379,28 @@ impl CompositorState {
                 obligation,
             );
         } else {
-            self.release_surface_buffer_direct(pending.release_target());
+            self.release_wl_buffer_direct(pending.resource);
         }
     }
 
-    pub(in crate::compositor) fn release_surface_buffer_direct(
-        &mut self,
-        release: SurfaceBufferRelease,
-    ) {
-        match release {
-            SurfaceBufferRelease::WlBuffer(buffer) => {
-                if !buffer.is_alive() {
-                    self.buffer_release_metrics.buffer_releases_discarded = self
-                        .buffer_release_metrics
-                        .buffer_releases_discarded
-                        .saturating_add(1);
-                    return;
-                }
-                if buffer.send_event(wl_buffer::Event::Release).is_ok() {
-                    self.buffer_release_metrics.buffer_releases_completed = self
-                        .buffer_release_metrics
-                        .buffer_releases_completed
-                        .saturating_add(1);
-                } else {
-                    self.buffer_release_metrics.buffer_releases_discarded = self
-                        .buffer_release_metrics
-                        .buffer_releases_discarded
-                        .saturating_add(1);
-                }
-            }
-            SurfaceBufferRelease::ExplicitSync(point) => match point.signal() {
-                Ok(()) => {
-                    self.buffer_release_metrics.buffer_releases_completed = self
-                        .buffer_release_metrics
-                        .buffer_releases_completed
-                        .saturating_add(1);
-                }
-                Err(_) => {
-                    self.buffer_release_metrics.explicit_release_signal_failures = self
-                        .buffer_release_metrics
-                        .explicit_release_signal_failures
-                        .saturating_add(1);
-                }
-            },
+    pub(in crate::compositor) fn release_wl_buffer_direct(&mut self, buffer: wl_buffer::WlBuffer) {
+        if !buffer.is_alive() {
+            self.buffer_release_metrics.buffer_releases_discarded = self
+                .buffer_release_metrics
+                .buffer_releases_discarded
+                .saturating_add(1);
+            return;
+        }
+        if buffer.send_event(wl_buffer::Event::Release).is_ok() {
+            self.buffer_release_metrics.buffer_releases_completed = self
+                .buffer_release_metrics
+                .buffer_releases_completed
+                .saturating_add(1);
+        } else {
+            self.buffer_release_metrics.buffer_releases_discarded = self
+                .buffer_release_metrics
+                .buffer_releases_discarded
+                .saturating_add(1);
         }
     }
 
@@ -1486,6 +1465,7 @@ impl CompositorState {
             buffer_id: pending.data.buffer_id(),
             release: pending.release_target(),
         };
+        self.reclassify_reactivated_dmabuf_release(&new_release);
         if let Some(previous) = self
             .active_dmabuf_buffers
             .insert(surface_id, new_release.clone())
