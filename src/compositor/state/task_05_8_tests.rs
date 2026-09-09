@@ -511,6 +511,7 @@ mod task_05_8_tests {
                 526,
             )),
             window_geometry,
+            PresentationAnimationKind::LayoutReflow,
         );
         let sampled = state.presentation_scene_sample_at(AnimationTime::from_nanos(1_000_000));
         assert_eq!(
@@ -757,6 +758,43 @@ mod task_05_8_tests {
         assert_eq!(
             state.presented_visual_root_window_geometry(root_id),
             Some(geometry_b)
+        );
+    }
+
+    #[test]
+    fn explicit_animation_kind_selects_the_policy_curve() {
+        let mut state = CompositorState::default();
+        let root_id = 54;
+        state.append_renderable_surface(test_surface(root_id, 640, 480));
+        let previous = WindowGeometry::new(SurfacePlacement::root_at(40, 40), 640, 480);
+        let target = WindowGeometry::new(SurfacePlacement::root_at(120, 72), 800, 560);
+        state.toplevel_visual_geometries.insert(
+            root_id,
+            ToplevelVisualGeometry {
+                placement: previous.placement,
+                width: previous.width,
+                height: previous.height,
+                active_resize: None,
+                mode_transition: false,
+            },
+        );
+        state.update_toplevel_visual_render_assignment(root_id);
+        state.layout_animation_epoch = Some(AnimationTime::from_nanos(0));
+
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            Some(previous),
+            target,
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+
+        assert_eq!(
+            state.presentation_animator.transition_curve(root_id),
+            Some(
+                state
+                    .presentation_animation_policy
+                    .curve_for(PresentationAnimationKind::ProgrammaticMove)
+            )
         );
     }
 

@@ -636,6 +636,50 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
 }
 
 #[test]
+fn xwayland_mode_transition_uses_the_xwayland_policy_curve() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::StateRequested {
+            window: handle,
+            request: crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Fullscreen),
+                second: None,
+            },
+        });
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .transition_curve(fixture.surface_id),
+        Some(
+            fixture
+                .server
+                .state
+                .presentation_animation_policy
+                .curve_for(crate::compositor::PresentationAnimationKind::XwaylandModeChange)
+        )
+    );
+}
+
+#[test]
 fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();

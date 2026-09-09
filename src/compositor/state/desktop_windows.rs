@@ -903,9 +903,19 @@ impl CompositorState {
         }
 
         let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
-        let visual_changed = normal_managed
-            && !resize_active
-            && self.current_visual_root_window_geometry(root_surface_id) != Some(frame);
+        let previous_visual = self.current_visual_root_window_geometry(root_surface_id);
+        let visual_changed = normal_managed && !resize_active && previous_visual != Some(frame);
+        let animation_kind = if visual_changed {
+            previous_visual.map(|previous| {
+                if previous.width != frame.width || previous.height != frame.height {
+                    PresentationAnimationKind::ProgrammaticResize
+                } else {
+                    PresentationAnimationKind::ProgrammaticMove
+                }
+            })
+        } else {
+            None
+        };
         let placement_changed = self.set_surface_placement_with_cause(
             root_surface_id,
             placement,
@@ -916,7 +926,7 @@ impl CompositorState {
             },
         );
         if visual_changed {
-            self.install_x11_visual_geometry(root_surface_id, frame);
+            self.install_x11_visual_geometry_with_animation(root_surface_id, frame, animation_kind);
         } else if placement_changed {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }

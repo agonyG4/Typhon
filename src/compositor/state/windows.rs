@@ -1414,6 +1414,12 @@ impl CompositorState {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
+        let previous_mode = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .map(|window| window.state.mode())
+            .unwrap_or(ToplevelMode::Normal);
+        let animation_kind = mode_transition_animation_kind(previous_mode, mode);
         let restore_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
@@ -1456,7 +1462,7 @@ impl CompositorState {
             geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        self.install_toplevel_visual_geometry(surface_id, geometry);
+        self.install_toplevel_visual_geometry_with_animation(surface_id, geometry, animation_kind);
         configured
     }
 
@@ -1475,6 +1481,11 @@ impl CompositorState {
             .and_then(|window| window.management)
             .filter(|management| management.layout() == LayoutMembership::Tiled)
             .map(|management| management.location());
+        let previous_mode = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .map(|window| window.state.mode())
+            .unwrap_or(ToplevelMode::Normal);
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,
@@ -1518,7 +1529,11 @@ impl CompositorState {
             restore_geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        self.install_toplevel_visual_geometry(surface_id, restore_geometry);
+        self.install_toplevel_visual_geometry_with_animation(
+            surface_id,
+            restore_geometry,
+            mode_transition_animation_kind(previous_mode, ToplevelMode::Normal),
+        );
         configured
     }
 
@@ -1688,9 +1703,55 @@ impl CompositorState {
     }
 }
 
+fn mode_transition_animation_kind(
+    previous: ToplevelMode,
+    target: ToplevelMode,
+) -> Option<PresentationAnimationKind> {
+    match (previous, target) {
+        (previous, ToplevelMode::Fullscreen) if previous != ToplevelMode::Fullscreen => {
+            Some(PresentationAnimationKind::FullscreenEnter)
+        }
+        (ToplevelMode::Fullscreen, target) if target != ToplevelMode::Fullscreen => {
+            Some(PresentationAnimationKind::FullscreenExit)
+        }
+        (previous, ToplevelMode::Maximized) if previous != ToplevelMode::Maximized => {
+            Some(PresentationAnimationKind::MaximizeEnter)
+        }
+        (ToplevelMode::Maximized, target) if target != ToplevelMode::Maximized => {
+            Some(PresentationAnimationKind::MaximizeExit)
+        }
+        _ => None,
+    }
+}
+
 fn popup_debug_log(message: impl FnOnce() -> String) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_POPUP_DEBUG").is_some()) {
         eprintln!("oblivion-one popup: {}", message());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_transition_animation_kind_keeps_maximize_and_fullscreen_distinct() {
+        assert_eq!(
+            mode_transition_animation_kind(ToplevelMode::Normal, ToplevelMode::Maximized),
+            Some(PresentationAnimationKind::MaximizeEnter)
+        );
+        assert_eq!(
+            mode_transition_animation_kind(ToplevelMode::Maximized, ToplevelMode::Normal),
+            Some(PresentationAnimationKind::MaximizeExit)
+        );
+        assert_eq!(
+            mode_transition_animation_kind(ToplevelMode::Normal, ToplevelMode::Fullscreen),
+            Some(PresentationAnimationKind::FullscreenEnter)
+        );
+        assert_eq!(
+            mode_transition_animation_kind(ToplevelMode::Fullscreen, ToplevelMode::Normal),
+            Some(PresentationAnimationKind::FullscreenExit)
+        );
     }
 }

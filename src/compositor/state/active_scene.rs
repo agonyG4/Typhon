@@ -388,6 +388,7 @@ impl CompositorState {
         root_surface_id: u32,
         previous_geometry: Option<WindowGeometry>,
         target_geometry: WindowGeometry,
+        kind: PresentationAnimationKind,
     ) {
         let interaction_active = self.active_toplevel_resizes.contains_key(&root_surface_id)
             || self.window_interaction.is_some_and(|interaction| {
@@ -419,7 +420,7 @@ impl CompositorState {
             self.presentation_animator.cancel(root_surface_id);
             return;
         };
-        let curve = AnimationCurve::spring(SpringSpec::new(180.0, 24.0));
+        let curve = self.presentation_animation_policy.curve_for(kind);
         if self
             .presentation_animator
             .sample(root_surface_id, now)

@@ -451,8 +451,20 @@ impl CompositorState {
         width: u32,
         height: u32,
     ) -> bool {
-        self.send_configure_root_window_to(surface_id, width, height, &[])
-            .is_some()
+        let width = self.clamp_toplevel_width(surface_id, width);
+        let height = self.clamp_toplevel_height(surface_id, height);
+        let configured = self
+            .send_configure_root_window_to(surface_id, width, height, &[])
+            .is_some();
+        if configured {
+            let geometry = WindowGeometry::new(self.surface_placement(surface_id), width, height);
+            self.install_toplevel_visual_geometry_with_animation(
+                surface_id,
+                geometry,
+                Some(PresentationAnimationKind::ProgrammaticResize),
+            );
+        }
+        configured
     }
 
     pub(in crate::compositor) fn send_configure_root_window_to(

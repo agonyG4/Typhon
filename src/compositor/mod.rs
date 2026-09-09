@@ -281,6 +281,10 @@ pub use crate::presentation_animation::{
     PresentationWindowSample, PresentationWindowTarget, PresentedWindowGeometry, SpringSpec,
     TransitionId, presentation_damage,
 };
+pub use crate::presentation_animation_policy::{
+    PresentationAnimationKind, PresentationAnimationPolicy, PresentationAnimationStyle,
+    presentation_animation_style_from_env,
+};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -615,6 +619,7 @@ pub struct CompositorState {
     locality_metrics: Cell<SurfaceLocalityMetrics>,
     active_scene_view: ActiveSceneView,
     presentation_animator: PresentationAnimator,
+    presentation_animation_policy: PresentationAnimationPolicy,
     presented_presentation: PresentationFrameSnapshot,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,

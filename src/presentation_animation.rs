@@ -965,6 +965,13 @@ impl PresentationAnimator {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn transition_curve(&self, key: u32) -> Option<AnimationCurve> {
+        self.transitions
+            .get(&key)
+            .map(|transition| transition.curve)
+    }
+
     pub fn has_pending_visible(&self, visible_keys: &[u32]) -> bool {
         visible_keys
             .iter()

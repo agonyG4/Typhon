@@ -90,7 +90,11 @@ impl CompositorState {
                 target_geometry.placement,
                 RenderGenerationCause::WindowMode,
             );
-            self.install_x11_visual_geometry(root_surface_id, target_geometry);
+            self.install_x11_visual_geometry_with_animation(
+                root_surface_id,
+                target_geometry,
+                Some(PresentationAnimationKind::XwaylandModeChange),
+            );
         }
 
         if minimized
@@ -140,6 +144,15 @@ impl CompositorState {
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) {
+        self.install_x11_visual_geometry_with_animation(root_surface_id, geometry, None);
+    }
+
+    pub(in crate::compositor) fn install_x11_visual_geometry_with_animation(
+        &mut self,
+        root_surface_id: u32,
+        geometry: WindowGeometry,
+        animation_kind: Option<PresentationAnimationKind>,
+    ) {
         let previous_geometry = self
             .current_visual_root_window_geometry(root_surface_id)
             .or_else(|| self.current_root_window_geometry(root_surface_id));
@@ -172,7 +185,16 @@ impl CompositorState {
         }
         if changed {
             self.advance_pointer_hit_generation();
-            self.animate_toplevel_visual_geometry(root_surface_id, previous_geometry, geometry);
+            if let Some(kind) = animation_kind {
+                self.animate_toplevel_visual_geometry(
+                    root_surface_id,
+                    previous_geometry,
+                    geometry,
+                    kind,
+                );
+            } else {
+                self.presentation_animator.cancel(root_surface_id);
+            }
         }
     }
 }

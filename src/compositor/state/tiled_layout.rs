@@ -943,7 +943,11 @@ impl CompositorState {
                     geometry.placement,
                     RenderGenerationCause::LayoutReflow,
                 );
-                self.install_toplevel_visual_geometry(root_surface_id, geometry);
+                self.install_toplevel_visual_geometry_with_animation(
+                    root_surface_id,
+                    geometry,
+                    Some(PresentationAnimationKind::LayoutReflow),
+                );
             }
             WindowBackend::X11(_) => {
                 let _ = self.set_x11_frame_geometry(window_id, geometry);
@@ -952,7 +956,11 @@ impl CompositorState {
                     geometry.placement,
                     RenderGenerationCause::LayoutReflow,
                 );
-                self.install_x11_visual_geometry(root_surface_id, geometry);
+                self.install_x11_visual_geometry_with_animation(
+                    root_surface_id,
+                    geometry,
+                    Some(PresentationAnimationKind::LayoutReflow),
+                );
                 self.queue_backend_configure(window_id, geometry, ToplevelMode::Normal, false);
                 self.queue_backend_state(window_id);
             }

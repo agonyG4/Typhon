@@ -333,3 +333,47 @@ solitude or create visible animation demand. No live DRM/KMS or 1920x1080@165 Hz
 hardware qualification was performed. Existing fractional/subpixel deferral and
 the known 42-file source-layout debt remain unchanged; the next compositor task
 remains Dwindle v1.2.
+
+## Final macOS presentation animation policy closure (2026-09-09)
+
+Typhon now has one explicit geometry-animation policy boundary above the
+existing presentation sampler. `PresentationAnimationKind` identifies
+programmatic move, programmatic resize, tiled/Dwindle reflow, maximize enter and
+exit, fullscreen enter and exit, and managed XWayland mode changes.
+`PresentationAnimationPolicy::curve_for` owns the complete initial macOS spring
+table, while `PresentationAnimator` remains a semantic-free sampler/executor.
+
+The existing `OBLIVION_ONE_ANIMATIONS=on|off` behavior is unchanged. The new
+`OBLIVION_ONE_ANIMATION_STYLE` selector accepts `macos` and `default` (with
+unset/empty values using the same policy); unknown values diagnose and fall back
+to macOS. The policy is resolved once into `CompositorState`, not looked up per
+frame or per transition.
+
+Geometry installers now have explicit animation-capable variants. Tiled/Dwindle
+reflow uses the existing shared layout animation epoch and does not add solves,
+configures, canonical surface mutations, or a second animation engine. Mode
+selection captures the previous mode before mutation, so maximize and fullscreen
+enter/exit remain distinct. Managed XWayland mode transitions use the shared
+`XwaylandModeChange` curve. Non-interactive managed XWayland floating geometry
+classifies pure position and size changes as programmatic move/resize, and the
+compositor-requested floating resize path animates its temporary target after
+sending the configure. Setup, client-owned, output-reconfigure, and pointer
+preview paths remain non-animated.
+
+Pointer-owned movement and resizing still cancel/take over any pending
+presentation transition. Retargets still start from the current sampled
+presentation with existing velocity continuity and physical transition-ID
+acknowledgement. Native-frame membership, fullscreen-entry culling, hidden
+transition dormancy, Direct Scanout blockers, popup/stack-root separation, and
+canonical geometry ownership were not changed.
+
+Added tests cover the eight policy curves and style aliases, explicit entry-point
+curve selection, distinct maximize/fullscreen mode semantics, and managed
+XWayland policy routing. The full library suite remained green, including the
+existing pointer takeover, fullscreen settlement, hidden-transition, and native
+output regressions. Final locked verification passed 2,269 library tests with 2
+ignored, 1,319 main-binary tests, and all integration and documentation tests.
+No minimize, close, workspace-switch, opacity, blur, or retained-lifecycle
+animation was introduced. No live DRM/KMS or 1920x1080@165 Hz hardware
+qualification was performed; the source-layout guard currently reports 43
+oversized repository files, and this task does not perform unrelated extraction.
