@@ -1280,7 +1280,8 @@ impl NativeRuntime {
                                                     if server.explicit_release_signal_retry_count()
                                                         == 0
                                                     {
-                                                        dmabuf_gpu_release_registry.complete_retry();
+                                                        dmabuf_gpu_release_registry
+                                                            .complete_retry();
                                                     } else {
                                                         dmabuf_gpu_release_registry.retry_after_failure(
                                                             DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,

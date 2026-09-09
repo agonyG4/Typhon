@@ -1572,6 +1572,42 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn shutdown_retries_signal_debt_once_and_keeps_failed_owner_observable() {
+        let mut state = CompositorState::default();
+        let obligation = scripted_dmabuf_release(505, 506, [false, false, true]);
+        state.queue_dmabuf_buffer_release(obligation.clone());
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(
+            state
+                .buffer_release_metrics
+                .explicit_release_signal_failures,
+            1
+        );
+        assert_eq!(state.explicit_release_signal_retry_count(), 1);
+        assert!(state.buffer_release_is_owned(&obligation));
+
+        state.release_client_buffers_for_shutdown();
+
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 0);
+        assert_eq!(
+            state
+                .buffer_release_metrics
+                .explicit_release_signal_failures,
+            2
+        );
+        assert_eq!(state.explicit_release_signal_retry_count(), 1);
+        assert_eq!(
+            state
+                .buffer_release_metrics
+                .buffer_release_duplicate_attempts,
+            0
+        );
+    }
+
+    #[test]
     fn disconnect_checks_callbacks_before_owner_removal() {
         let (mut state, batch) = terminal_callback_batch();
 
