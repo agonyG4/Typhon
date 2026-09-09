@@ -1,4 +1,4 @@
-use oblivion_one::compositor::{EffectAnchor, VisualGroupId};
+use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope, VisualGroupId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureLayer {
@@ -29,8 +29,16 @@ pub(crate) fn indices_for_capture(
     anchor: EffectAnchor,
     target_content: bool,
     visual_group: Option<VisualGroupId>,
+    anchor_scope: EffectAnchorScope,
 ) -> Vec<usize> {
-    if let Some(visual_group) = visual_group {
+    if anchor_scope == EffectAnchorScope::VisualGroup {
+        let Some(visual_group) = visual_group else {
+            return if !target_content {
+                indices_below_anchor(layers, anchor)
+            } else {
+                Vec::new()
+            };
+        };
         if target_content {
             return visual_groups
                 .iter()
@@ -86,6 +94,7 @@ mod target_content_tests {
                 EffectAnchor::BeforeSurface(20),
                 true,
                 None,
+                EffectAnchorScope::Surface,
             ),
             vec![2]
         );
@@ -109,6 +118,7 @@ mod target_content_tests {
                 EffectAnchor::BeforeSurface(10),
                 true,
                 Some(group),
+                EffectAnchorScope::VisualGroup,
             ),
             vec![0, 1, 2]
         );
@@ -119,8 +129,28 @@ mod target_content_tests {
                 EffectAnchor::BeforeSurface(20),
                 false,
                 Some(popup_group),
+                EffectAnchorScope::VisualGroup,
             ),
             vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn surface_local_backdrop_capture_includes_prior_same_group_surface() {
+        let group = VisualGroupId::new(1).unwrap();
+        let layers = [CaptureLayer::Surface(10), CaptureLayer::Surface(20)];
+        let groups = [Some(group), Some(group)];
+
+        assert_eq!(
+            indices_for_capture(
+                &layers,
+                &groups,
+                EffectAnchor::BeforeSurface(20),
+                false,
+                Some(group),
+                EffectAnchorScope::Surface,
+            ),
+            vec![0]
         );
     }
 }

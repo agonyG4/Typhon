@@ -23,6 +23,47 @@ pub enum EffectAnchor {
     OutputPostProcess,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum EffectAnchorScope {
+    #[default]
+    Surface,
+    VisualGroup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EffectSceneOrder {
+    pub group_order: u32,
+    pub surface_order: u32,
+    pub phase: u8,
+}
+
+impl EffectSceneOrder {
+    pub const fn for_anchor(anchor: EffectAnchor) -> Self {
+        match anchor {
+            EffectAnchor::BeforeSurface(_) => Self {
+                group_order: u32::MAX.saturating_sub(1),
+                surface_order: 0,
+                phase: 0,
+            },
+            EffectAnchor::ReplaceSurface(_) => Self {
+                group_order: u32::MAX.saturating_sub(1),
+                surface_order: 0,
+                phase: 1,
+            },
+            EffectAnchor::AfterSurface(_) => Self {
+                group_order: u32::MAX.saturating_sub(1),
+                surface_order: 0,
+                phase: 2,
+            },
+            EffectAnchor::OutputPostProcess => Self {
+                group_order: u32::MAX,
+                surface_order: u32::MAX,
+                phase: 3,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum SurfaceEffectSlot {
     Background,
@@ -101,6 +142,8 @@ pub struct ResolvedEffectInstance {
     pub signature: u64,
     pub frame_demand: EffectFrameDemand,
     pub visual_group: Option<VisualGroupId>,
+    pub anchor_scope: EffectAnchorScope,
+    pub scene_order: EffectSceneOrder,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -291,11 +334,56 @@ impl super::CompositorState {
                     region,
                     target_bounds,
                     parameter_block: EffectParameterBlock::default(),
+                    anchor_scope: EffectAnchorScope::Surface,
+                    scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
+                        surface.surface_id,
+                    )),
                 });
             }
         }
+        for instance in &mut instances {
+            instance.scene_order = self.scene_order_for_instance(instance);
+        }
         instances.sort_by_key(effect_semantic_sort_key);
         ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    fn scene_order_for_instance(&self, instance: &ResolvedEffectInstance) -> EffectSceneOrder {
+        let phase = match instance.anchor {
+            EffectAnchor::BeforeSurface(_) => 0,
+            EffectAnchor::ReplaceSurface(_) => 1,
+            EffectAnchor::AfterSurface(_) => 2,
+            EffectAnchor::OutputPostProcess => 3,
+        };
+        let Some(surface_id) = (match instance.anchor {
+            EffectAnchor::BeforeSurface(surface_id)
+            | EffectAnchor::ReplaceSurface(surface_id)
+            | EffectAnchor::AfterSurface(surface_id) => Some(surface_id),
+            EffectAnchor::OutputPostProcess => None,
+        }) else {
+            return EffectSceneOrder {
+                group_order: u32::MAX,
+                surface_order: u32::MAX,
+                phase,
+            };
+        };
+        let group_order = instance
+            .visual_group
+            .map_or(u32::MAX.saturating_sub(1), VisualGroupId::get);
+        let surface_order = match instance.anchor_scope {
+            EffectAnchorScope::Surface => self
+                .active_scene_surfaces()
+                .iter()
+                .position(|surface| surface.surface_id == surface_id)
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(u32::MAX.saturating_sub(1)),
+            EffectAnchorScope::VisualGroup => 0,
+        };
+        EffectSceneOrder {
+            group_order,
+            surface_order,
+            phase,
+        }
     }
 
     pub(in crate::compositor) fn resolved_effect_scene_with_presentation(
@@ -416,6 +504,8 @@ impl super::CompositorState {
             ),
             frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            scene_order: EffectSceneOrder::for_anchor(anchor),
         };
         if self.internal_surface_effects.get(&surface_id) == Some(&instance) {
             return false;
@@ -618,6 +708,8 @@ impl super::CompositorState {
             ),
             frame_demand: registered.program.program.frame_demand,
             visual_group: self.visual_group_for_surface(surface_id),
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            scene_order: EffectSceneOrder::for_anchor(slot.anchor(surface_id)),
         };
         let changed = self
             .protocol_surface_effects
@@ -729,29 +821,8 @@ impl super::CompositorState {
     }
 }
 
-fn effect_semantic_sort_key(instance: &ResolvedEffectInstance) -> (u32, u8, u64) {
-    let (group, phase) = match instance.anchor {
-        EffectAnchor::BeforeSurface(_) => (
-            instance
-                .visual_group
-                .map_or(u32::MAX.saturating_sub(1), VisualGroupId::get),
-            0,
-        ),
-        EffectAnchor::ReplaceSurface(_) => (
-            instance
-                .visual_group
-                .map_or(u32::MAX.saturating_sub(1), VisualGroupId::get),
-            1,
-        ),
-        EffectAnchor::AfterSurface(_) => (
-            instance
-                .visual_group
-                .map_or(u32::MAX.saturating_sub(1), VisualGroupId::get),
-            2,
-        ),
-        EffectAnchor::OutputPostProcess => (u32::MAX, 3),
-    };
-    (group, phase, instance.id.get())
+fn effect_semantic_sort_key(instance: &ResolvedEffectInstance) -> (EffectSceneOrder, u64) {
+    (instance.scene_order, instance.id.get())
 }
 
 fn map_effect_rect(transform: PresentationGroupTransform, rect: EffectRect) -> Option<EffectRect> {
@@ -975,6 +1046,13 @@ fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64
                 | EffectAnchor::AfterSurface(id) => u64::from(id),
                 EffectAnchor::OutputPostProcess => u64::MAX,
             },
+            match instance.anchor_scope {
+                EffectAnchorScope::Surface => 0,
+                EffectAnchorScope::VisualGroup => 1,
+            },
+            u64::from(instance.scene_order.group_order),
+            u64::from(instance.scene_order.surface_order),
+            u64::from(instance.scene_order.phase),
         ] {
             signature ^= value;
             signature = signature.wrapping_mul(0x1000_0000_01b3);
@@ -1020,6 +1098,8 @@ mod tests {
             signature: 1,
             frame_demand,
             visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
         }
     }
 
@@ -1279,6 +1359,11 @@ mod tests {
         );
         foreground.anchor = EffectAnchor::AfterSurface(20);
         foreground.visual_group = VisualGroupId::new(2);
+        foreground.scene_order = EffectSceneOrder {
+            group_order: 2,
+            surface_order: 0,
+            phase: 2,
+        };
         let mut background = test_effect_instance(
             EffectInstanceId::new(20).unwrap(),
             crate::effects::EffectFrameDemand::OnDamage,
@@ -1286,6 +1371,11 @@ mod tests {
         );
         background.anchor = EffectAnchor::BeforeSurface(10);
         background.visual_group = VisualGroupId::new(1);
+        background.scene_order = EffectSceneOrder {
+            group_order: 1,
+            surface_order: 0,
+            phase: 0,
+        };
         let mut content = test_effect_instance(
             EffectInstanceId::new(10).unwrap(),
             crate::effects::EffectFrameDemand::OnDamage,
@@ -1293,6 +1383,11 @@ mod tests {
         );
         content.anchor = EffectAnchor::ReplaceSurface(10);
         content.visual_group = VisualGroupId::new(1);
+        content.scene_order = EffectSceneOrder {
+            group_order: 1,
+            surface_order: 0,
+            phase: 1,
+        };
 
         let scene = ResolvedEffectScene::new(1, vec![foreground, content, background]);
         let order = scene

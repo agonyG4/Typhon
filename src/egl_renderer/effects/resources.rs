@@ -909,6 +909,7 @@ mod tests {
                 color_conversion: oblivion_one::effects::EffectColorConversion::None,
                 checkpoint_dependencies: Vec::new(),
                 visual_group: None,
+                anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
             })
             .collect();
         let graph = CompiledFrameGraph {

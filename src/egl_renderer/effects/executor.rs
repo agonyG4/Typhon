@@ -389,8 +389,12 @@ fn execute_graph_passes(
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
         ) && !pass.checkpoint_dependencies.is_empty()
         {
-            let (draw_end, _) =
-                composition_range(&renderer.commands, pass.anchor, pass.visual_group);
+            let (draw_end, _) = composition_range(
+                &renderer.commands,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
             if draw_end > scene_cursor {
                 renderer.draw_effect_scene_range(
                     &repaint_rects,
@@ -405,8 +409,12 @@ fn execute_graph_passes(
             pass.kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         ) {
-            let (draw_end, next_cursor) =
-                composition_range(&renderer.commands, pass.anchor, pass.visual_group);
+            let (draw_end, next_cursor) = composition_range(
+                &renderer.commands,
+                pass.anchor,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
             renderer.draw_effect_scene_range(
                 &repaint_rects,
                 scene_cursor,
@@ -476,8 +484,12 @@ fn composition_range(
     commands: &[super::super::geometry::EglDrawCommand],
     anchor: oblivion_one::compositor::EffectAnchor,
     visual_group: Option<oblivion_one::compositor::VisualGroupId>,
+    anchor_scope: oblivion_one::compositor::EffectAnchorScope,
 ) -> (usize, usize) {
-    if let Some(visual_group) = visual_group {
+    if anchor_scope == oblivion_one::compositor::EffectAnchorScope::VisualGroup {
+        let Some(visual_group) = visual_group else {
+            return (commands.len(), commands.len());
+        };
         let Some(start) = commands
             .iter()
             .position(|command| command.visual_group == Some(visual_group))
@@ -1280,6 +1292,7 @@ fn execute_capture(
         pass.anchor,
         pass.kind == RenderPassKind::SurfaceCapture,
         pass.visual_group,
+        pass.anchor_scope,
     );
     let scissors = if pass.damage.is_empty() {
         vec![full_output_rect(renderer.current_size)]

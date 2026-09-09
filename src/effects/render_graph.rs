@@ -1,6 +1,8 @@
 use std::{collections::HashMap, fmt::Write as _, num::NonZeroU16};
 
-use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene, VisualGroupId};
+use crate::compositor::{
+    EffectAnchor, EffectAnchorScope, ResolvedEffectInstance, ResolvedEffectScene, VisualGroupId,
+};
 
 use super::registry::EffectRegistry;
 use super::{
@@ -135,6 +137,7 @@ pub struct CompiledRenderPass {
     pub color_conversion: EffectColorConversion,
     pub checkpoint_dependencies: Vec<GraphPassId>,
     pub visual_group: Option<VisualGroupId>,
+    pub anchor_scope: EffectAnchorScope,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -358,6 +361,7 @@ impl GraphBuilder {
         instance: EffectInstanceId,
         anchor: EffectAnchor,
         blur_radius: Option<f32>,
+        anchor_scope: EffectAnchorScope,
     ) -> Result<GraphPassId, RenderGraphCompileError> {
         if self.passes.len() >= MAX_GRAPH_PASSES {
             return Err(RenderGraphCompileError::TooManyPasses);
@@ -385,6 +389,7 @@ impl GraphBuilder {
             color_conversion: EffectColorConversion::None,
             checkpoint_dependencies: Vec::new(),
             visual_group: None,
+            anchor_scope,
         });
         Ok(id)
     }
@@ -399,8 +404,18 @@ impl GraphBuilder {
         instance: EffectInstanceId,
         anchor: EffectAnchor,
         stage: EffectNodeKind,
+        anchor_scope: EffectAnchorScope,
     ) -> Result<GraphPassId, RenderGraphCompileError> {
-        let pass = self.add_pass(kind, inputs, output, damage, instance, anchor, None)?;
+        let pass = self.add_pass(
+            kind,
+            inputs,
+            output,
+            damage,
+            instance,
+            anchor,
+            None,
+            anchor_scope,
+        )?;
         self.passes
             .last_mut()
             .expect("stage pass was appended")
@@ -665,6 +680,7 @@ fn compile_instance(
                         instance.id,
                         instance.anchor,
                         None,
+                        instance.anchor_scope,
                     )?;
                     let capture_pass = builder
                         .passes
@@ -702,6 +718,7 @@ fn compile_instance(
                         instance.id,
                         instance.anchor,
                         Some(spec.radius),
+                        instance.anchor_scope,
                     )?;
                     current = texture;
                 }
@@ -724,6 +741,7 @@ fn compile_instance(
                         instance.id,
                         instance.anchor,
                         Some(spec.radius),
+                        instance.anchor_scope,
                     )?;
                     current = texture;
                 }
@@ -780,6 +798,7 @@ fn compile_instance(
                         instance.id,
                         instance.anchor,
                         None,
+                        instance.anchor_scope,
                     )?;
                     let normalize_pass = builder
                         .passes
@@ -812,6 +831,7 @@ fn compile_instance(
                     instance.id,
                     instance.anchor,
                     node.kind.clone(),
+                    instance.anchor_scope,
                 )?;
                 builder
                     .passes
@@ -854,6 +874,7 @@ fn compile_instance(
         instance.id,
         instance.anchor,
         None,
+        instance.anchor_scope,
     )?;
     let final_working_space = builder.texture(final_texture).working_space;
     let encode_output = final_working_space == EffectWorkingSpace::LinearSrgb;
@@ -896,7 +917,10 @@ fn ceil_div(value: u32, divisor: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compositor::{EffectAnchor, ResolvedEffectInstance, ResolvedEffectScene};
+    use crate::compositor::{
+        EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+        ResolvedEffectScene,
+    };
     use crate::effects::*;
 
     fn blur_scene() -> (ResolvedEffectScene, EffectRegistry) {
@@ -933,6 +957,8 @@ mod tests {
             signature: 7,
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(1)),
         };
         (ResolvedEffectScene::new(1, vec![instance]), registry)
     }
@@ -996,6 +1022,8 @@ mod tests {
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
@@ -1208,6 +1236,8 @@ mod tests {
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
@@ -1268,6 +1298,8 @@ mod tests {
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
@@ -1351,6 +1383,8 @@ mod tests {
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
         let source_damage = EffectRegion::from_rect(EffectRect::new(512, 212, 2, 2).unwrap());
@@ -1438,6 +1472,8 @@ mod tests {
                 signature: 1,
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
             }],
         );
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
