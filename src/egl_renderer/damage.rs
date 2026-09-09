@@ -309,6 +309,60 @@ pub(crate) fn effect_execution_demand_for_repaint_plan(
     oblivion_one::effects::plan_effect_execution_demand(graph, &repair_region, conservative_full)
 }
 
+pub(crate) fn resolve_effect_execution_for_repaint_plan(
+    planner: &PartialRepaintPlanner,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &mut RepaintPlan,
+    output_width: u32,
+    output_height: u32,
+) -> oblivion_one::effects::EffectExecutionDemand {
+    if plan.mode == RepaintMode::Full {
+        return effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+    }
+
+    let max_iterations = graph.instances.len().saturating_add(1).max(1);
+    for _ in 0..max_iterations {
+        let demand =
+            effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height);
+        if demand.is_conservative_full() {
+            plan.repair_damage = OutputDamage::Full;
+            plan.mode = RepaintMode::Full;
+            plan.fallback_reason = Some(FullRepaintReason::EffectExecutionConservative);
+            return effect_execution_demand_for_repaint_plan(
+                graph,
+                plan,
+                output_width,
+                output_height,
+            );
+        }
+
+        let previous_repair = plan.repair_damage.clone();
+        let execution_repair = merge_effect_damage(
+            previous_repair.clone(),
+            &demand.execution_region,
+            output_width,
+            output_height,
+        );
+        planner.apply_execution_repair(plan, execution_repair);
+        if plan.mode == RepaintMode::Full {
+            return effect_execution_demand_for_repaint_plan(
+                graph,
+                plan,
+                output_width,
+                output_height,
+            );
+        }
+        if plan.repair_damage == previous_repair {
+            return demand;
+        }
+    }
+
+    plan.repair_damage = OutputDamage::Full;
+    plan.mode = RepaintMode::Full;
+    plan.fallback_reason = Some(FullRepaintReason::EffectExecutionConservative);
+    effect_execution_demand_for_repaint_plan(graph, plan, output_width, output_height)
+}
+
 fn coalesce_rects(mut rects: Vec<OutputRect>) -> Vec<OutputRect> {
     let mut output = Vec::<OutputRect>::new();
     while let Some(mut pending) = rects.pop() {
@@ -409,6 +463,7 @@ pub(crate) enum FullRepaintReason {
     DamageAreaThreshold,
     ForcedFull,
     PartialRepaintDisabled,
+    EffectExecutionConservative,
 }
 
 impl FullRepaintReason {
@@ -426,6 +481,7 @@ impl FullRepaintReason {
             Self::DamageAreaThreshold => 9,
             Self::ForcedFull => 10,
             Self::PartialRepaintDisabled => 11,
+            Self::EffectExecutionConservative => 12,
         }
     }
 
@@ -443,6 +499,7 @@ impl FullRepaintReason {
             Self::DamageAreaThreshold => "damage_area_threshold",
             Self::ForcedFull => "forced_full",
             Self::PartialRepaintDisabled => "partial_repaint_disabled",
+            Self::EffectExecutionConservative => "effect_execution_conservative",
         }
     }
 }

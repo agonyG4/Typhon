@@ -43,6 +43,68 @@ fn graph_for_effect_region(
     }
 }
 
+fn graph_for_effect_instances(
+    instances: impl IntoIterator<Item = (u64, i32, i32, i32, i32, Vec<u64>)>,
+) -> oblivion_one::effects::CompiledFrameGraph {
+    graph_with_instance_regions(instances.into_iter().map(
+        |(id, output_x, output_width, capture_x, capture_width, dependencies)| {
+            (
+                id,
+                oblivion_one::effects::EffectRegion::from_rect(effect_rect(
+                    output_x,
+                    0,
+                    output_width as u32,
+                    10,
+                )),
+                oblivion_one::effects::EffectRegion::from_rect(effect_rect(
+                    capture_x,
+                    0,
+                    capture_width as u32,
+                    10,
+                )),
+                dependencies,
+            )
+        },
+    ))
+}
+
+fn graph_with_instance_regions(
+    instances: impl IntoIterator<
+        Item = (
+            u64,
+            oblivion_one::effects::EffectRegion,
+            oblivion_one::effects::EffectRegion,
+            Vec<u64>,
+        ),
+    >,
+) -> oblivion_one::effects::CompiledFrameGraph {
+    let instances = instances
+        .into_iter()
+        .map(
+            |(id, output_influence_region, capture_region, dependencies)| {
+                oblivion_one::effects::CompiledEffectInstance {
+                    id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
+                    output_influence_region,
+                    capture_region,
+                    dependencies: dependencies
+                        .into_iter()
+                        .map(|dependency| {
+                            oblivion_one::effects::EffectInstanceId::new(dependency).unwrap()
+                        })
+                        .collect(),
+                }
+            },
+        )
+        .collect();
+    oblivion_one::effects::CompiledFrameGraph {
+        passes: Vec::new(),
+        textures: Vec::new(),
+        instances,
+        final_damage: oblivion_one::effects::EffectRegion::empty(),
+        stats: Default::default(),
+    }
+}
+
 #[test]
 fn output_damage_clips_all_edges_and_discards_empty_rectangles() {
     let damage = OutputDamage::rects(
@@ -131,11 +193,11 @@ fn age_2_repair_revives_unchanged_effect() {
     );
     planner.commit_presented_transition(first.render_damage);
 
-    let plan = planner.plan(
+    let mut plan = planner.plan(
         OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
         BufferAge::Value(2),
     );
-    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
 
     assert_eq!(plan.mode, RepaintMode::Partial);
     assert!(
@@ -169,11 +231,11 @@ fn age_3_repair_revives_effect_from_two_presented_frames_ago() {
     );
     planner.commit_presented_transition(intermediate.render_damage);
 
-    let plan = planner.plan(
+    let mut plan = planner.plan(
         OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
         BufferAge::Value(3),
     );
-    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
 
     assert_eq!(plan.mode, RepaintMode::Partial);
     assert!(
@@ -182,6 +244,179 @@ fn age_3_repair_revives_effect_from_two_presented_frames_ago() {
             .contains(&rect(10, 10, 20, 20))
     );
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+}
+
+#[test]
+fn effect_execution_repair_demand_converges_across_forward_consumers() {
+    let graph = graph_for_effect_instances([
+        (1, 10, 10, 10, 10, vec![]),
+        (2, 30, 10, 10, 40, vec![1]),
+        (3, 45, 10, 45, 25, vec![]),
+        (4, 80, 10, 80, 10, vec![]),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial_render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial_render_damage.clone(),
+        repair_damage: OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+    let execution_repair = merge_effect_damage(
+        plan.repair_damage.clone(),
+        &demand.execution_region,
+        100,
+        80,
+    );
+    planner.apply_execution_repair(&mut plan, execution_repair);
+
+    assert!(
+        plan.repair_damage
+            .rects_slice()
+            .iter()
+            .any(|repair| repair.x <= 45 && repair.right() >= 50)
+    );
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    assert!(!demand.contains(oblivion_one::effects::EffectInstanceId::new(4).unwrap()));
+    assert!(
+        demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()),
+        "the returned demand must match the expanded final repair"
+    );
+    assert_eq!(plan.render_damage, initial_render_damage);
+}
+
+#[test]
+fn effect_execution_repair_demand_converges_across_multiple_forward_hops() {
+    let graph = graph_for_effect_instances([
+        (1, 10, 10, 10, 10, vec![]),
+        (2, 30, 10, 10, 40, vec![1]),
+        (3, 45, 10, 45, 25, vec![2]),
+        (4, 65, 10, 65, 25, vec![]),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial_render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: initial_render_damage.clone(),
+        repair_damage: initial_render_damage.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.fallback_reason, None);
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(4).unwrap()));
+    assert!(
+        plan.repair_damage
+            .rects_slice()
+            .iter()
+            .any(|repair| repair.x <= 65 && repair.right() >= 70)
+    );
+    assert_eq!(plan.render_damage, initial_render_damage);
+}
+
+#[test]
+fn stable_effect_execution_demand_keeps_partial_repair_unchanged() {
+    let graph = graph_for_effect_instances([(1, 30, 10, 30, 10, vec![])]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let initial_repair = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: OutputDamage::rects(100, 80, [rect(1, 0, 2, 2)]),
+        repair_damage: initial_repair.clone(),
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Partial);
+    assert_eq!(plan.repair_damage, initial_repair);
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+}
+
+#[test]
+fn conservative_effect_execution_metadata_forces_full_repair() {
+    let graph =
+        graph_for_effect_instances([(1, 30, 10, 30, 10, vec![99]), (2, 80, 10, 80, 10, vec![])]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: render_damage.clone(),
+        repair_damage: render_damage,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::EffectExecutionConservative)
+    );
+    assert!(demand.is_conservative_full());
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
+}
+
+#[test]
+fn threshold_full_recomputes_effect_demand_from_full_repair() {
+    let graph = graph_with_instance_regions([
+        (
+            1,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 0, 10, 10)),
+            vec![],
+        ),
+        (
+            2,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(30, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(0, 0, 80, 80)),
+            vec![1],
+        ),
+        (
+            3,
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(90, 0, 10, 10)),
+            oblivion_one::effects::EffectRegion::from_rect(effect_rect(90, 0, 10, 10)),
+            vec![],
+        ),
+    ]);
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let render_damage = OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)]);
+    let mut plan = RepaintPlan {
+        render_damage: render_damage.clone(),
+        repair_damage: render_damage,
+        buffer_age: Some(2),
+        mode: RepaintMode::Partial,
+        fallback_reason: None,
+    };
+
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
+
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(
+        plan.fallback_reason,
+        Some(FullRepaintReason::DamageAreaThreshold)
+    );
+    assert!(demand.is_conservative_full());
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(3).unwrap()));
+    assert_eq!(
+        plan.render_damage,
+        OutputDamage::rects(100, 80, [rect(30, 0, 10, 10)])
+    );
 }
 
 #[test]
@@ -195,14 +430,28 @@ fn full_repaint_keeps_all_visible_effects_live() {
     );
     planner.commit_presented_transition(first.render_damage);
 
-    let plan = planner.plan(
+    let mut plan = planner.plan(
         OutputDamage::rects(100, 80, [rect(70, 60, 5, 5)]),
         BufferAge::Value(0),
     );
-    let demand = effect_execution_demand_for_repaint_plan(&graph, &plan, 100, 80);
+    let demand = resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut plan, 100, 80);
 
     assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert!(demand.is_conservative_full());
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+}
+
+#[test]
+fn full_repaint_reason_for_effect_conservatism_has_stable_telemetry_name() {
+    assert_eq!(
+        FullRepaintReason::EffectExecutionConservative.histogram_index(),
+        12
+    );
+    assert_eq!(
+        FullRepaintReason::EffectExecutionConservative.as_str(),
+        "effect_execution_conservative"
+    );
 }
 
 #[test]

@@ -2033,4 +2033,129 @@ mod tests {
             vec![first_input, first_output]
         );
     }
+
+    #[test]
+    fn effect_selection_matches_the_final_converged_repair() {
+        use crate::egl_renderer::damage::{
+            EglPartialRepaintCapabilities, OutputDamage, PartialRepaintPlanner, RepaintMode,
+            RepaintPlan, resolve_effect_execution_for_repaint_plan,
+        };
+
+        let first = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let second = oblivion_one::effects::EffectInstanceId::new(2).unwrap();
+        let third = oblivion_one::effects::EffectInstanceId::new(3).unwrap();
+        let unrelated = oblivion_one::effects::EffectInstanceId::new(4).unwrap();
+        let pass = |id, instance, input, output| CompiledRenderPass {
+            id: GraphPassId::new(id).unwrap(),
+            kind: RenderPassKind::Fragment,
+            inputs: vec![input],
+            output: Some(output),
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+        };
+        let texture = |id| oblivion_one::effects::GraphTexturePlan {
+            id: GraphTextureId::new(id).unwrap(),
+            source: GraphTextureSource::Intermediate,
+            width: 10,
+            height: 10,
+            domain: oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap(),
+            working_space: oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: None,
+            last_use: None,
+        };
+        let instance = |id, output_x, capture_x, capture_width, dependencies| {
+            oblivion_one::effects::CompiledEffectInstance {
+                id,
+                output_influence_region: EffectRegion::from_rect(
+                    oblivion_one::effects::EffectRect::new(output_x, 0, 10, 10).unwrap(),
+                ),
+                capture_region: EffectRegion::from_rect(
+                    oblivion_one::effects::EffectRect::new(capture_x, 0, capture_width, 10)
+                        .unwrap(),
+                ),
+                dependencies,
+            }
+        };
+        let graph = CompiledFrameGraph {
+            passes: vec![
+                pass(
+                    1,
+                    first,
+                    GraphTextureId::new(1).unwrap(),
+                    GraphTextureId::new(2).unwrap(),
+                ),
+                pass(
+                    2,
+                    second,
+                    GraphTextureId::new(3).unwrap(),
+                    GraphTextureId::new(4).unwrap(),
+                ),
+                pass(
+                    3,
+                    third,
+                    GraphTextureId::new(5).unwrap(),
+                    GraphTextureId::new(6).unwrap(),
+                ),
+                pass(
+                    4,
+                    unrelated,
+                    GraphTextureId::new(7).unwrap(),
+                    GraphTextureId::new(8).unwrap(),
+                ),
+            ],
+            textures: (1..=8).map(texture).collect(),
+            instances: vec![
+                instance(first, 10, 10, 10, Vec::new()),
+                instance(second, 30, 10, 40, vec![first]),
+                instance(third, 45, 45, 25, vec![second]),
+                instance(unrelated, 80, 80, 10, Vec::new()),
+            ],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let planner = PartialRepaintPlanner::new(
+            (100, 80),
+            EglPartialRepaintCapabilities {
+                buffer_age: true,
+                partial_render_repair: true,
+                swap_buffers_with_damage: true,
+            },
+        );
+        let initial_damage = OutputDamage::rects(100, 80, [OutputRect::new(30, 0, 10, 10)]);
+        let mut repaint_plan = RepaintPlan {
+            render_damage: initial_damage.clone(),
+            repair_damage: initial_damage,
+            buffer_age: Some(2),
+            mode: RepaintMode::Partial,
+            fallback_reason: None,
+        };
+        let demand =
+            resolve_effect_execution_for_repaint_plan(&planner, &graph, &mut repaint_plan, 100, 80);
+
+        let selection = select_effect_execution(&graph, &demand);
+
+        assert_eq!(selection.executed_instances, vec![first, second, third]);
+        assert_eq!(
+            selection.executed_passes,
+            vec![
+                GraphPassId::new(1).unwrap(),
+                GraphPassId::new(2).unwrap(),
+                GraphPassId::new(3).unwrap(),
+            ]
+        );
+        assert!(!selection.executed_instances.contains(&unrelated));
+        assert_eq!(repaint_plan.mode, RepaintMode::Partial);
+    }
 }

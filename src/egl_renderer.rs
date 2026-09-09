@@ -40,7 +40,7 @@ pub(crate) use damage::{
 };
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, EglPresentedDamageState,
-    RenderExecution, RepaintPlan, effect_execution_demand_for_repaint_plan, merge_effect_damage,
+    RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
 };
 use effects::{
     EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
@@ -834,23 +834,13 @@ impl GlesSceneRenderer {
         let effect_execution_demand = match &execution_plan {
             FrameExecutionPlan::LegacyScene => None,
             FrameExecutionPlan::EffectGraph(graph) => {
-                let demand = effect_execution_demand_for_repaint_plan(graph, &plan, width, height);
-                let execution_repair = merge_effect_damage(
-                    plan.repair_damage.clone(),
-                    &demand.execution_region,
+                Some(resolve_effect_execution_for_repaint_plan(
+                    &self.repaint_planner,
+                    graph,
+                    &mut plan,
                     width,
                     height,
-                );
-                let was_partial = plan.mode == RepaintMode::Partial;
-                self.repaint_planner
-                    .apply_execution_repair(&mut plan, execution_repair);
-                if was_partial && plan.mode == RepaintMode::Full {
-                    Some(effect_execution_demand_for_repaint_plan(
-                        graph, &plan, width, height,
-                    ))
-                } else {
-                    Some(demand)
-                }
+                ))
             }
         };
         if let Some(demand) = &effect_execution_demand {

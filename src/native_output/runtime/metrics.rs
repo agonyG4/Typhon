@@ -16,7 +16,7 @@ use oblivion_one::native::scheduler::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
-const RENDER_REPAINT_REASON_COUNT: usize = 12;
+const RENDER_REPAINT_REASON_COUNT: usize = 13;
 const RENDER_BUFFER_AGE_BUCKET_COUNT: usize = 6;
 
 #[derive(Debug, Default)]
@@ -163,6 +163,7 @@ impl NativeRenderTelemetry {
             FullRepaintReason::DamageAreaThreshold,
             FullRepaintReason::ForcedFull,
             FullRepaintReason::PartialRepaintDisabled,
+            FullRepaintReason::EffectExecutionConservative,
         ];
         let full_repaint_reasons = reasons
             .into_iter()
@@ -1459,5 +1460,22 @@ mod tests {
         assert_eq!(snapshot.partial_repair_pixels, 20);
         assert_eq!(snapshot.full_output_pixels, 100);
         assert_eq!(snapshot.full_repaint_reasons[4], 1);
+
+        telemetry.record_repaint(
+            RepaintMode::Full,
+            Some(2),
+            100,
+            100,
+            Some(FullRepaintReason::EffectExecutionConservative),
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.full_repaint_reasons[12], 1);
+        assert_eq!(
+            telemetry
+                .control_snapshot()
+                .full_repaint_reasons
+                .get("effect_execution_conservative"),
+            Some(&1)
+        );
     }
 }
