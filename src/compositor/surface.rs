@@ -42,6 +42,19 @@ pub struct SurfaceDamageJournal {
     capacity: usize,
 }
 
+/// Authoritative per-surface damage bounds for renderer resource sync.
+///
+/// `complete_since` is the journal commit from which `RenderableSurface::damage`
+/// is complete through `current_commit`. `None` means that the renderer must
+/// conservatively upload a complete SHM snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceResourceSyncState {
+    pub surface_id: u32,
+    pub complete_since: Option<SurfaceCommitCounter>,
+    pub current_commit: SurfaceCommitCounter,
+    pub authoritative: bool,
+}
+
 impl SurfaceDamageJournal {
     pub fn new(capacity: usize) -> Self {
         Self {

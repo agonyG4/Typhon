@@ -26,6 +26,73 @@ impl CompositorState {
             .and_then(|index| self.renderable_surfaces.get(index))
     }
 
+    pub(in crate::compositor) fn surface_resource_sync_states(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<SurfaceResourceSyncState> {
+        let mut surface_ids = surface_ids.into_iter().collect::<Vec<_>>();
+        surface_ids.sort_unstable();
+        surface_ids.dedup();
+        surface_ids
+            .into_iter()
+            .map(|surface_id| {
+                let generation = self
+                    .renderable_surface_indices
+                    .get(&surface_id)
+                    .and_then(|index| self.renderable_surfaces.get(*index))
+                    .map(|surface| surface.generation)
+                    .or_else(|| {
+                        self.client_cursor_surfaces
+                            .get(&surface_id)
+                            .map(|surface| surface.generation)
+                    });
+                let journal = self.surface_damage_journals.get(&surface_id);
+                let current_commit = journal.map_or_else(
+                    SurfaceCommitCounter::default,
+                    SurfaceDamageJournal::current_commit,
+                );
+                let complete_since = match (
+                    generation,
+                    self.presented_surface_commit_generations.get(&surface_id),
+                    self.presented_surface_commits.get(&surface_id),
+                ) {
+                    (Some(generation), Some(presented_generation), Some(commit))
+                        if generation == *presented_generation =>
+                    {
+                        Some(*commit)
+                    }
+                    _ => None,
+                };
+                let surface_size = self
+                    .renderable_surface_indices
+                    .get(&surface_id)
+                    .and_then(|index| self.renderable_surfaces.get(*index))
+                    .map(RenderableSurface::buffer_size)
+                    .or_else(|| {
+                        self.client_cursor_surfaces
+                            .get(&surface_id)
+                            .map(RenderableSurface::buffer_size)
+                    });
+                let complete_since = complete_since.filter(|complete_since| {
+                    journal.is_none_or(|journal| {
+                        surface_size.is_none_or(|size| {
+                            !matches!(
+                                journal.damage_since(*complete_since, size.width, size.height),
+                                DamageSince::HistoryLost
+                            )
+                        })
+                    })
+                });
+                SurfaceResourceSyncState {
+                    surface_id,
+                    complete_since,
+                    current_commit,
+                    authoritative: journal.is_some(),
+                }
+            })
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub(in crate::compositor) fn renderable_surface_mut(
         &mut self,

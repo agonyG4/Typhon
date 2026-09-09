@@ -341,6 +341,7 @@ pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
     SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
+    SurfaceResourceSyncState,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCallbackTime(u32);

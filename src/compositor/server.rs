@@ -20,7 +20,8 @@ use crate::compositor::{
     AnimationTime, EffectFrameDemandSnapshot, NativeFramePresentationTargets,
     PresentationAnimationMetrics, PresentationFrameSnapshot, PresentationGroupTransform,
     PresentationRect, PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
-    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics, compositor_surface_id,
+    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
+    SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
@@ -978,6 +979,13 @@ impl OwnCompositorServer {
 
     pub fn native_frame_renderable_surfaces(&self) -> Cow<'_, [RenderableSurface]> {
         self.state.native_frame_renderable_surfaces()
+    }
+
+    pub fn surface_resource_sync_states(
+        &self,
+        surface_ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<SurfaceResourceSyncState> {
+        self.state.surface_resource_sync_states(surface_ids)
     }
 
     pub fn native_frame_renderable_surfaces_with_metrics(

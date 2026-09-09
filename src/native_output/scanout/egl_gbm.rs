@@ -922,6 +922,10 @@ pub(crate) fn native_egl_gbm_paint_stats(
         dmabuf_cache_entries: scene_stats.dmabuf_cache_entries,
         dmabuf_cache_peak_entries: scene_stats.dmabuf_cache_peak_entries,
         dmabuf_cache_evictions: scene_stats.dmabuf_cache_evictions,
+        surface_resource_candidates: scene_stats.surface_resource_candidates,
+        surface_resource_consumers: scene_stats.surface_resource_consumers,
+        surface_resource_deferred: scene_stats.surface_resource_deferred,
+        shm_full_resyncs: scene_stats.shm_full_resyncs,
         scene_rebuild: if scene_stats.scene_rebuilt {
             DesktopSceneRebuildKind::Full
         } else {

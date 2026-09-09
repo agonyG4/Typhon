@@ -1608,6 +1608,10 @@ impl AtomicRenderedFrameParts {
             dmabuf_cache_entries: self.stats.dmabuf_cache_entries,
             dmabuf_cache_peak_entries: self.stats.dmabuf_cache_peak_entries,
             dmabuf_cache_evictions: self.stats.dmabuf_cache_evictions,
+            surface_resource_candidates: self.stats.surface_resource_candidates,
+            surface_resource_consumers: self.stats.surface_resource_consumers,
+            surface_resource_deferred: self.stats.surface_resource_deferred,
+            shm_full_resyncs: self.stats.shm_full_resyncs,
             scene_rebuild: if self.stats.scene_rebuilt {
                 DesktopSceneRebuildKind::Full
             } else {

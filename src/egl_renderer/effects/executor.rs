@@ -8,7 +8,10 @@ use oblivion_one::effects::{
     INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind, ShaderModuleId,
 };
 
-use super::super::geometry::EglDrawLayer;
+use super::super::geometry::{
+    EglDrawCommand, EglDrawLayer, SurfaceConsumerPlan, add_surface_consumers_for_capture_indices,
+    add_surface_consumers_for_command_range,
+};
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
 use super::{
     blur, capture,
@@ -350,13 +353,13 @@ pub(crate) struct EffectExecutionStats {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct EffectExecutionSelection {
-    executed_passes: Vec<GraphPassId>,
-    executed_instances: Vec<oblivion_one::effects::EffectInstanceId>,
-    acquired_texture_ids: Vec<GraphTextureId>,
+pub(crate) struct EffectExecutionSelection {
+    pub(crate) executed_passes: Vec<GraphPassId>,
+    pub(crate) executed_instances: Vec<oblivion_one::effects::EffectInstanceId>,
+    pub(crate) acquired_texture_ids: Vec<GraphTextureId>,
 }
 
-fn select_effect_execution(
+pub(crate) fn select_effect_execution(
     graph: &CompiledFrameGraph,
     demand: &EffectExecutionDemand,
 ) -> EffectExecutionSelection {
@@ -383,12 +386,108 @@ fn select_effect_execution(
     selection
 }
 
+pub(crate) fn plan_effect_surface_consumers(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    commands: &[EglDrawCommand],
+    repaint_rects: &[OutputRect],
+    output_size: (u32, u32),
+) -> SurfaceConsumerPlan {
+    let mut plan = SurfaceConsumerPlan::default();
+    let mut scene_cursor = 0;
+    let layers = commands
+        .iter()
+        .map(|command| match command.layer {
+            EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+            _ => capture::CaptureLayer::Other,
+        })
+        .collect::<Vec<_>>();
+    let visual_groups = commands
+        .iter()
+        .map(|command| command.visual_group)
+        .collect::<Vec<_>>();
+
+    for pass in &graph.passes {
+        if !selection.executed_passes.contains(&pass.id) {
+            continue;
+        }
+        if matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        ) && !pass.checkpoint_dependencies.is_empty()
+        {
+            let (draw_end, _) =
+                composition_range(commands, pass.anchor, pass.visual_group, pass.anchor_scope);
+            add_surface_consumers_for_command_range(
+                &mut plan,
+                commands,
+                scene_cursor,
+                draw_end,
+                repaint_rects,
+            );
+            scene_cursor = scene_cursor.max(draw_end.min(commands.len()));
+        }
+        if matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) {
+            let (draw_end, next_cursor) =
+                composition_range(commands, pass.anchor, pass.visual_group, pass.anchor_scope);
+            add_surface_consumers_for_command_range(
+                &mut plan,
+                commands,
+                scene_cursor,
+                draw_end,
+                repaint_rects,
+            );
+            scene_cursor = scene_cursor.max(next_cursor.min(commands.len()));
+        }
+        if matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        ) {
+            let indices = capture::indices_for_capture(
+                &layers,
+                &visual_groups,
+                pass.anchor,
+                pass.kind == RenderPassKind::SurfaceCapture,
+                pass.visual_group,
+                pass.anchor_scope,
+            );
+            let execution_damage = effective_pass_damage(graph, demand, pass);
+            let target_domain = pass
+                .output
+                .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+                .map(|texture| texture.domain);
+            let capture_rects =
+                effect_capture_output_rects(&execution_damage, target_domain, output_size);
+            add_surface_consumers_for_capture_indices(
+                &mut plan,
+                commands,
+                &indices,
+                &capture_rects,
+            );
+        }
+    }
+    add_surface_consumers_for_command_range(
+        &mut plan,
+        commands,
+        scene_cursor,
+        commands.len(),
+        repaint_rects,
+    );
+    plan.finish();
+    plan
+}
+
 pub(crate) fn execute_effect_graph(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: &super::super::damage::RepaintPlan,
     demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
 ) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
     let result = execute_graph_passes(
@@ -398,6 +497,7 @@ pub(crate) fn execute_effect_graph(
         framebuffer_origin,
         repaint_plan,
         demand,
+        selection,
     );
     if result.is_err() {
         renderer.establish_ordinary_scene_state();
@@ -418,9 +518,9 @@ fn execute_graph_passes(
     framebuffer_origin: OutputFramebufferOrigin,
     repaint_plan: &super::super::damage::RepaintPlan,
     demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
-    let selection = select_effect_execution(graph, demand);
     let repaint_rects = renderer.begin_effect_repaint(repaint_plan, framebuffer_origin)?;
     let mut scene_cursor = 0;
     for pass in &graph.passes {
@@ -1692,6 +1792,25 @@ fn full_output_rect(size: (u32, u32)) -> OutputRect {
     OutputRect::new(0, 0, size.0, size.1)
 }
 
+fn effect_capture_output_rects(
+    damage: &EffectRegion,
+    target_domain: Option<oblivion_one::effects::EffectRect>,
+    output_size: (u32, u32),
+) -> Vec<OutputRect> {
+    let full_output = oblivion_one::effects::EffectRect::new(0, 0, output_size.0, output_size.1)
+        .expect("renderer dimensions are valid");
+    let rects = if damage.is_empty() {
+        std::slice::from_ref(&full_output)
+    } else {
+        damage.rects()
+    };
+    rects
+        .iter()
+        .filter_map(|rect| target_domain.map_or(Some(*rect), |domain| rect.intersect(domain)))
+        .map(effect_rect_to_output_rect)
+        .collect()
+}
+
 fn effect_rect_to_output_rect(rect: oblivion_one::effects::EffectRect) -> OutputRect {
     OutputRect::new(rect.x.max(0), rect.y.max(0), rect.width, rect.height)
 }
@@ -1793,6 +1912,7 @@ fn trusted_effect_output_size(
 #[cfg(test)]
 mod coordinate_tests {
     use super::*;
+    use crate::egl_renderer::{EglRect, SurfaceSampling};
 
     fn target(
         source: GraphTextureSource,
@@ -1872,11 +1992,89 @@ mod coordinate_tests {
             3
         );
     }
+
+    #[test]
+    fn effect_anchor_scope_selects_exact_surface_or_complete_visual_group_range() {
+        let group = oblivion_one::compositor::VisualGroupId::new(7).unwrap();
+        let command = |layer| EglDrawCommand {
+            layer,
+            visual_group: Some(group),
+            bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::Surface(1)),
+            command(EglDrawLayer::Surface(10)),
+            command(EglDrawLayer::Surface(20)),
+        ];
+        let child_anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(20);
+
+        assert_eq!(
+            composition_range(
+                &commands,
+                child_anchor,
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::Surface,
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            composition_range(
+                &commands,
+                child_anchor,
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            composition_range(
+                &commands,
+                oblivion_one::compositor::EffectAnchor::ReplaceSurface(20),
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (0, 3)
+        );
+        assert_eq!(
+            composition_range(
+                &commands,
+                oblivion_one::compositor::EffectAnchor::AfterSurface(20),
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (3, 3)
+        );
+        assert_eq!(
+            capture::indices_for_capture(
+                &commands
+                    .iter()
+                    .map(|command| match command.layer {
+                        EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+                        _ => capture::CaptureLayer::Other,
+                    })
+                    .collect::<Vec<_>>(),
+                &commands
+                    .iter()
+                    .map(|command| command.visual_group)
+                    .collect::<Vec<_>>(),
+                child_anchor,
+                false,
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::Surface,
+            ),
+            vec![0, 1]
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egl_renderer::{EglRect, SurfaceSampling};
 
     #[test]
     fn trusted_output_size_uses_the_compositor_output_not_the_stage_texture() {
@@ -2032,6 +2230,90 @@ mod tests {
             selection.acquired_texture_ids,
             vec![first_input, first_output]
         );
+    }
+
+    #[test]
+    fn effect_surface_consumer_plan_keeps_capture_only_source() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let pass_id = GraphPassId::new(1).unwrap();
+        let output = GraphTextureId::new(1).unwrap();
+        let full = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
+        let pass = CompiledRenderPass {
+            id: pass_id,
+            kind: RenderPassKind::SceneCapture,
+            inputs: Vec::new(),
+            output: Some(output),
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: oblivion_one::compositor::EffectAnchor::BeforeSurface(2),
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: vec![pass_id],
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
+        };
+        let graph = CompiledFrameGraph {
+            passes: vec![pass],
+            textures: vec![oblivion_one::effects::GraphTexturePlan {
+                id: output,
+                source: GraphTextureSource::Intermediate,
+                width: 100,
+                height: 100,
+                domain: full,
+                working_space: oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+                origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                first_use: None,
+                last_use: None,
+            }],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(full),
+                capture_region: EffectRegion::from_rect(full),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demand = EffectExecutionDemand::new(
+            vec![oblivion_one::effects::EffectInstanceExecutionDemand {
+                id: instance,
+                output_region: EffectRegion::from_rect(full),
+            }],
+            EffectRegion::from_rect(full),
+        );
+        let selection = select_effect_execution(&graph, &demand);
+        let command = |layer| EglDrawCommand {
+            layer,
+            visual_group: None,
+            bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::Surface(1)),
+            EglDrawCommand {
+                opaque_regions: vec![EglRect::new(0.0, 0.0, 100.0, 100.0)],
+                ..command(EglDrawLayer::Surface(2))
+            },
+        ];
+
+        let plan = plan_effect_surface_consumers(
+            &graph,
+            &demand,
+            &selection,
+            &commands,
+            &[OutputRect::new(0, 0, 100, 100)],
+            (100, 100),
+        );
+
+        assert!(plan.surface_ids().contains(&1));
     }
 
     #[test]

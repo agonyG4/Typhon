@@ -223,6 +223,98 @@ pub(super) fn plan_capture_visibility(
     stats
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SurfaceConsumerPlan {
+    surface_ids: Vec<u32>,
+}
+
+impl SurfaceConsumerPlan {
+    pub(crate) fn surface_ids(&self) -> &[u32] {
+        &self.surface_ids
+    }
+
+    pub(crate) fn add_surface(&mut self, surface_id: u32) {
+        self.surface_ids.push(surface_id);
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.surface_ids.extend_from_slice(&other.surface_ids);
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.surface_ids.sort_unstable();
+        self.surface_ids.dedup();
+    }
+}
+
+pub(super) fn plan_surface_consumers(
+    commands: &[EglDrawCommand],
+    repairs: &[super::OutputRect],
+) -> SurfaceConsumerPlan {
+    let mut plan = SurfaceConsumerPlan::default();
+    let mut decisions = Vec::new();
+    for repair in repairs {
+        let repair = EglRect::new(
+            repair.x as f32,
+            repair.y as f32,
+            repair.width as f32,
+            repair.height as f32,
+        );
+        plan_visibility(commands, repair, &mut decisions);
+        for (command, decision) in commands.iter().zip(&decisions) {
+            if *decision == EglVisibilityDecision::Drawable
+                && let EglDrawLayer::Surface(surface_id) = command.layer
+            {
+                plan.add_surface(surface_id);
+            }
+        }
+    }
+    plan.finish();
+    plan
+}
+
+pub(crate) fn add_surface_consumers_for_command_range(
+    plan: &mut SurfaceConsumerPlan,
+    commands: &[EglDrawCommand],
+    start: usize,
+    end: usize,
+    repairs: &[super::OutputRect],
+) {
+    for command in commands
+        .get(start.min(commands.len())..end.min(commands.len()))
+        .into_iter()
+        .flatten()
+    {
+        if repairs
+            .iter()
+            .any(|repair| command.bounds.intersects_output_rect(*repair))
+            && let EglDrawLayer::Surface(surface_id) = command.layer
+        {
+            plan.add_surface(surface_id);
+        }
+    }
+}
+
+pub(crate) fn add_surface_consumers_for_capture_indices(
+    plan: &mut SurfaceConsumerPlan,
+    commands: &[EglDrawCommand],
+    command_indices: &[usize],
+    repairs: &[super::OutputRect],
+) {
+    for &index in command_indices {
+        let Some(command) = commands.get(index) else {
+            continue;
+        };
+        if repairs
+            .iter()
+            .any(|repair| command.bounds.intersects_output_rect(*repair))
+            && let EglDrawLayer::Surface(surface_id) = command.layer
+        {
+            plan.add_surface(surface_id);
+        }
+    }
+}
+
 fn subtract_rect(source: EglRect, excluded: EglRect, pieces: &mut [Option<EglRect>; 4]) -> usize {
     let Some(intersection) = source.intersection(excluded) else {
         pieces[0] = Some(source);
@@ -704,6 +796,110 @@ mod tests {
             ]
         );
         assert_eq!(stats.commands_drawable, 1);
+    }
+
+    #[test]
+    fn surface_consumer_plan_excludes_occluded_and_outside_surfaces() {
+        let commands = vec![
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(1),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(2),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+                opaque_regions: vec![EglRect::new(0.0, 0.0, 100.0, 100.0)],
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(3),
+                visual_group: None,
+                bounds: EglRect::new(200.0, 0.0, 10.0, 10.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+        ];
+
+        let plan = plan_surface_consumers(&commands, &[OutputRect::new(0, 0, 100, 100)]);
+
+        assert_eq!(plan.surface_ids(), &[2]);
+    }
+
+    #[test]
+    fn surface_consumer_plan_keeps_partially_visible_surface() {
+        let commands = vec![
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(1),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(2),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 50.0, 100.0),
+                opaque_regions: vec![EglRect::new(0.0, 0.0, 50.0, 100.0)],
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+        ];
+
+        let plan = plan_surface_consumers(&commands, &[OutputRect::new(0, 0, 100, 100)]);
+
+        assert_eq!(plan.surface_ids(), &[1, 2]);
+    }
+
+    #[test]
+    fn surface_consumer_plan_inherits_visibility_overflow_fallback() {
+        let mut opaque_regions = Vec::new();
+        for row in 0..6 {
+            for column in 0..6 {
+                opaque_regions.push(EglRect::new(
+                    column as f32 * 16.0,
+                    row as f32 * 16.0,
+                    8.0,
+                    8.0,
+                ));
+            }
+        }
+        let commands = vec![
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(1),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+                opaque_regions: Vec::new(),
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+            EglDrawCommand {
+                layer: EglDrawLayer::Surface(2),
+                visual_group: None,
+                bounds: EglRect::new(0.0, 0.0, 100.0, 100.0),
+                opaque_regions,
+                vertex_start: 0,
+                vertex_count: 6,
+                sampling: SurfaceSampling::ScaledLinear,
+            },
+        ];
+
+        let plan = plan_surface_consumers(&commands, &[OutputRect::new(0, 0, 100, 100)]);
+
+        assert_eq!(plan.surface_ids(), &[1, 2]);
     }
 
     #[test]

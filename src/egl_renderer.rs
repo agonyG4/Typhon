@@ -17,8 +17,8 @@ use oblivion_one::effects::{
 use oblivion_one::{
     compositor::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
-        DesktopVisualState, RenderableSurface, SurfaceDamageRect, SurfaceOpaqueRect,
-        SurfaceOpaqueRegion, VisualGroupId,
+        DesktopVisualState, RenderableSurface, SurfaceCommitCounter, SurfaceDamageRect,
+        SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfaceResourceSyncState, VisualGroupId,
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
@@ -48,7 +48,8 @@ use effects::{
 };
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
-    MIN_VERTEX_BUFFER_BYTES, SurfaceSampling, VERTEX_STRIDE, plan_capture_visibility,
+    MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan, SurfaceSampling, VERTEX_STRIDE,
+    add_surface_consumers_for_command_range, plan_capture_visibility, plan_surface_consumers,
     plan_visibility, push_draw_command, push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use program::create_texture_program;
@@ -84,6 +85,9 @@ pub(crate) struct NativeEglConfigCandidate {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlesSceneFrameStats {
     pub scene_rebuilt: bool,
+    pub surface_resource_candidates: usize,
+    pub surface_resource_consumers: usize,
+    pub surface_resource_deferred: usize,
     pub shm_upload_bytes: usize,
     pub dmabuf_imports: usize,
     pub dmabuf_reuses: usize,
@@ -91,6 +95,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub dmabuf_cache_entries: usize,
     pub dmabuf_cache_peak_entries: usize,
     pub dmabuf_cache_evictions: usize,
+    pub shm_full_resyncs: usize,
     pub repaint_mode: RepaintMode,
     pub buffer_age: Option<u32>,
     pub current_damage_rects: usize,
@@ -228,6 +233,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub presentation_geometry_signature: u64,
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
+    pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
 }
 
 pub(crate) struct GlesSceneRenderer {
@@ -649,6 +655,7 @@ impl GlesSceneRenderer {
             popup_surface_ids,
             client_cursor,
             current_damage,
+            surface_resource_sync_states,
         } = request;
         let width = width.max(1);
         let height = height.max(1);
@@ -678,12 +685,27 @@ impl GlesSceneRenderer {
         if scaled_visual_state.cursor.is_some() {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
-        self.sync_surface_resources(
+        self.reconcile_surface_resource_lifetimes(
             egl,
             egl_display,
             surfaces,
             client_cursor.map(|cursor| cursor.surface),
         )?;
+        // The software client cursor remains eager: it is a small, separately
+        // owned overlay path and is not part of ordinary scene realization.
+        if let Some(cursor) = client_cursor.map(|cursor| cursor.surface) {
+            let mut cursor_consumers = SurfaceConsumerPlan::default();
+            cursor_consumers.add_surface(cursor.surface_id);
+            cursor_consumers.finish();
+            self.realize_surface_resources_for_consumers(
+                egl,
+                egl_display,
+                surfaces,
+                Some(cursor),
+                &cursor_consumers,
+                &surface_resource_sync_states,
+            )?;
+        }
 
         let (base_surfaces, overlay_surfaces) =
             split_external_overlay_surfaces(surfaces, external_overlay_surface_ids);
@@ -824,6 +846,8 @@ impl GlesSceneRenderer {
         };
         let mut plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
+            self.frame_stats.surface_resource_candidates = surfaces.len();
+            self.frame_stats.surface_resource_deferred = surfaces.len();
             self.record_effect_resource_metrics();
             self.record_repaint_stats(&plan);
             return Ok(EglFrameOutcome::Skipped {
@@ -849,14 +873,70 @@ impl GlesSceneRenderer {
                 .effect_instances_visible
                 .saturating_sub(demand.instances.len());
         }
+        let repair_rects = repaint_plan_output_rects(&plan, width, height);
+        let mut consumer_plan = plan_surface_consumers(&self.commands, &repair_rects);
+        add_surface_consumers_for_command_range(
+            &mut consumer_plan,
+            &self.cursor_commands,
+            0,
+            self.cursor_commands.len(),
+            &repair_rects,
+        );
+        let effect_selection = match (&execution_plan, &effect_execution_demand) {
+            (FrameExecutionPlan::EffectGraph(graph), Some(demand)) => {
+                let selection = effects::select_effect_execution(graph, demand);
+                consumer_plan.extend(&effects::plan_effect_surface_consumers(
+                    graph,
+                    demand,
+                    &selection,
+                    &self.commands,
+                    &repair_rects,
+                    (width, height),
+                ));
+                Some(selection)
+            }
+            _ => None,
+        };
+        consumer_plan.finish();
+        self.frame_stats.surface_resource_candidates = surfaces.len();
+        self.frame_stats.surface_resource_consumers = consumer_plan
+            .surface_ids()
+            .iter()
+            .filter(|surface_id| {
+                surfaces
+                    .iter()
+                    .any(|surface| surface.surface_id == **surface_id)
+            })
+            .count();
+        self.frame_stats.surface_resource_deferred = self
+            .frame_stats
+            .surface_resource_candidates
+            .saturating_sub(self.frame_stats.surface_resource_consumers);
+        self.realize_surface_resources_for_consumers(
+            egl,
+            egl_display,
+            surfaces,
+            client_cursor.map(|cursor| cursor.surface),
+            &consumer_plan,
+            &surface_resource_sync_states,
+        )?;
         let draw_result = match execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
                 let demand = effect_execution_demand
                     .as_ref()
                     .expect("effect graph execution must have an execution demand");
-                match effects::execute_effect_graph(self, &graph, framebuffer_origin, &plan, demand)
-                {
+                let selection = effect_selection
+                    .as_ref()
+                    .expect("effect graph execution must have an execution selection");
+                match effects::execute_effect_graph(
+                    self,
+                    &graph,
+                    framebuffer_origin,
+                    &plan,
+                    demand,
+                    selection,
+                ) {
                     Ok(execution_stats) => {
                         self.frame_stats.effect_instances_executed = execution_stats.instances;
                         self.frame_stats.effect_passes_executed = execution_stats.passes;
@@ -1095,7 +1175,7 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
-    fn sync_surface_resources(
+    fn reconcile_surface_resource_lifetimes(
         &mut self,
         egl: &EglInstance,
         egl_display: egl::Display,
@@ -1125,101 +1205,156 @@ impl GlesSceneRenderer {
             self.failed_surface_generations.remove(&surface_id);
         }
 
+        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
+        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        Ok(())
+    }
+
+    fn realize_surface_resources_for_consumers(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surfaces: &[RenderableSurface],
+        client_cursor: Option<&RenderableSurface>,
+        consumers: &SurfaceConsumerPlan,
+        sync_states: &[SurfaceResourceSyncState],
+    ) -> RendererResult<()> {
         for surface in surfaces.iter().chain(client_cursor) {
-            let update = self
-                .surface_resources
-                .get(&surface.surface_id)
-                .map_or(EglSurfaceResourceUpdate::Recreate, |resource| {
-                    resource.update_for(surface)
+            if consumers
+                .surface_ids()
+                .binary_search(&surface.surface_id)
+                .is_err()
+            {
+                continue;
+            }
+            let sync_state = sync_states
+                .iter()
+                .find(|state| state.surface_id == surface.surface_id)
+                .copied()
+                .unwrap_or(SurfaceResourceSyncState {
+                    surface_id: surface.surface_id,
+                    complete_since: None,
+                    current_commit: SurfaceCommitCounter::default(),
+                    authoritative: false,
                 });
-            match update {
-                EglSurfaceResourceUpdate::Reuse => continue,
-                EglSurfaceResourceUpdate::ReuseDmabuf => {
-                    if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                        resource.image.generation = surface.generation;
-                    }
-                    self.frame_stats.dmabuf_reuses =
-                        self.frame_stats.dmabuf_reuses.saturating_add(1);
-                    continue;
-                }
-                EglSurfaceResourceUpdate::UploadDamage => {
-                    if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                        self.frame_stats.shm_upload_bytes = self
-                            .frame_stats
-                            .shm_upload_bytes
-                            .saturating_add(resource.write_shm_damage(
-                                &self.gl,
-                                surface,
-                                &mut self.texture_upload_rgba,
-                            ));
-                    }
-                    continue;
-                }
-                EglSurfaceResourceUpdate::Recreate if surface.dmabuf_handle().is_some() => {
-                    self.switch_dmabuf_surface_resource(egl, egl_display, surface)?;
-                    continue;
-                }
-                EglSurfaceResourceUpdate::Recreate => {}
-                EglSurfaceResourceUpdate::UnsupportedBuffer => {
-                    if let Some(resource) = self.surface_resources.remove(&surface.surface_id) {
-                        destroy_surface_resource(&self.gl, egl, egl_display, resource);
-                    }
-                    self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
-                    continue;
-                }
-            }
+            self.realize_surface_resource(egl, egl_display, surface, sync_state)?;
+        }
+        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
+        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        Ok(())
+    }
 
-            if let Some(old) = self.surface_resources.remove(&surface.surface_id) {
-                destroy_surface_resource(&self.gl, egl, egl_display, old);
+    fn realize_surface_resource(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surface: &RenderableSurface,
+        sync_state: SurfaceResourceSyncState,
+    ) -> RendererResult<()> {
+        let update = self
+            .surface_resources
+            .get(&surface.surface_id)
+            .map_or(EglSurfaceResourceUpdate::Recreate, |resource| {
+                resource.update_for(surface, sync_state)
+            });
+        match update {
+            EglSurfaceResourceUpdate::Reuse => return Ok(()),
+            EglSurfaceResourceUpdate::ReuseShm => {
+                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
+                    resource.shm_synced_commit = Some(sync_state.current_commit);
+                }
+                return Ok(());
             }
-            if surface.dmabuf_handle().is_none() {
+            EglSurfaceResourceUpdate::ReuseDmabuf => {
+                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
+                    resource.image.generation = surface.generation;
+                }
+                self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
+                return Ok(());
+            }
+            EglSurfaceResourceUpdate::UploadDamage | EglSurfaceResourceUpdate::FullShmResync => {
+                if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
+                    let force_full = update == EglSurfaceResourceUpdate::FullShmResync;
+                    self.frame_stats.shm_upload_bytes = self
+                        .frame_stats
+                        .shm_upload_bytes
+                        .saturating_add(resource.write_shm_damage(
+                            &self.gl,
+                            surface,
+                            force_full,
+                            sync_state.current_commit,
+                            &mut self.texture_upload_rgba,
+                        ));
+                    if force_full {
+                        self.frame_stats.shm_full_resyncs =
+                            self.frame_stats.shm_full_resyncs.saturating_add(1);
+                    }
+                }
+                return Ok(());
+            }
+            EglSurfaceResourceUpdate::Recreate if surface.dmabuf_handle().is_some() => {
+                self.switch_dmabuf_surface_resource(egl, egl_display, surface)?;
+                return Ok(());
+            }
+            EglSurfaceResourceUpdate::Recreate => {}
+            EglSurfaceResourceUpdate::UnsupportedBuffer => {
+                if let Some(resource) = self.surface_resources.remove(&surface.surface_id) {
+                    destroy_surface_resource(&self.gl, egl, egl_display, resource);
+                }
                 self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
-            }
-
-            match create_surface_resource(
-                &self.gl,
-                egl,
-                egl_display,
-                self.egl_image_target_texture_2d,
-                surface,
-                &mut self.texture_upload_rgba,
-            ) {
-                Ok(resource) => {
-                    if surface.cpu_pixels().is_some() {
-                        self.frame_stats.shm_upload_bytes = self
-                            .frame_stats
-                            .shm_upload_bytes
-                            .saturating_add(surface_upload_byte_len(surface));
-                    } else if surface.dmabuf_handle().is_some() {
-                        self.frame_stats.dmabuf_imports =
-                            self.frame_stats.dmabuf_imports.saturating_add(1);
-                    }
-                    self.failed_surface_generations.remove(&surface.surface_id);
-                    self.surface_resources.insert(surface.surface_id, resource);
-                }
-                Err(error) => {
-                    if surface.dmabuf_handle().is_some() {
-                        self.frame_stats.dmabuf_import_failures =
-                            self.frame_stats.dmabuf_import_failures.saturating_add(1);
-                    }
-                    let should_log = self
-                        .failed_surface_generations
-                        .get(&surface.surface_id)
-                        .is_none_or(|generation| *generation != surface.generation);
-                    if should_log {
-                        eprintln!(
-                            "oblivion-one compositor: failed to import surface {} on EGL/GLES: {error}",
-                            surface.surface_id
-                        );
-                        self.failed_surface_generations
-                            .insert(surface.surface_id, surface.generation);
-                    }
-                }
+                return Ok(());
             }
         }
 
-        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
-        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        if let Some(old) = self.surface_resources.remove(&surface.surface_id) {
+            destroy_surface_resource(&self.gl, egl, egl_display, old);
+        }
+        if surface.dmabuf_handle().is_none() {
+            self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
+        }
+
+        match create_surface_resource(
+            &self.gl,
+            egl,
+            egl_display,
+            self.egl_image_target_texture_2d,
+            surface,
+            (surface.cpu_pixels().is_some() && sync_state.authoritative)
+                .then_some(sync_state.current_commit),
+            &mut self.texture_upload_rgba,
+        ) {
+            Ok(resource) => {
+                if surface.cpu_pixels().is_some() {
+                    self.frame_stats.shm_upload_bytes = self
+                        .frame_stats
+                        .shm_upload_bytes
+                        .saturating_add(surface_upload_byte_len(surface));
+                } else if surface.dmabuf_handle().is_some() {
+                    self.frame_stats.dmabuf_imports =
+                        self.frame_stats.dmabuf_imports.saturating_add(1);
+                }
+                self.failed_surface_generations.remove(&surface.surface_id);
+                self.surface_resources.insert(surface.surface_id, resource);
+            }
+            Err(error) => {
+                if surface.dmabuf_handle().is_some() {
+                    self.frame_stats.dmabuf_import_failures =
+                        self.frame_stats.dmabuf_import_failures.saturating_add(1);
+                }
+                let should_log = self
+                    .failed_surface_generations
+                    .get(&surface.surface_id)
+                    .is_none_or(|generation| *generation != surface.generation);
+                if should_log {
+                    eprintln!(
+                        "oblivion-one compositor: failed to import surface {} on EGL/GLES: {error}",
+                        surface.surface_id
+                    );
+                    self.failed_surface_generations
+                        .insert(surface.surface_id, surface.generation);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1251,6 +1386,7 @@ impl GlesSceneRenderer {
                     image: cached.image,
                     dmabuf_key: Some(key),
                     buffer_lifetime: Some(surface.buffer_identity().downgrade()),
+                    shm_synced_commit: None,
                 },
             ) {
                 self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
@@ -1273,6 +1409,7 @@ impl GlesSceneRenderer {
                 egl_display,
                 self.egl_image_target_texture_2d,
                 surface,
+                None,
                 &mut self.texture_upload_rgba,
             )?;
             self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
@@ -1287,6 +1424,7 @@ impl GlesSceneRenderer {
             egl_display,
             self.egl_image_target_texture_2d,
             surface,
+            None,
             &mut self.texture_upload_rgba,
         )?;
         self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
@@ -1591,11 +1729,7 @@ impl GlesSceneRenderer {
             );
         }
 
-        if let Some(cursor) = client_cursor
-            && self
-                .surface_resources
-                .contains_key(&cursor.surface.surface_id)
-        {
+        if let Some(cursor) = client_cursor {
             let visual_target = compositor::SurfaceTargetRect::new(
                 compositor::scale_logical_coordinate(
                     cursor.logical_x.saturating_add(cursor.surface.x),
@@ -2408,6 +2542,7 @@ struct EglSurfaceResource {
     image: EglImageResource,
     dmabuf_key: Option<DmabufImageKey>,
     buffer_lifetime: Option<WeakBufferIdentity>,
+    shm_synced_commit: Option<SurfaceCommitCounter>,
 }
 
 struct CachedDmabufResource<R> {
@@ -2426,16 +2561,42 @@ fn dead_cached_dmabuf_keys<R>(
 }
 
 impl EglSurfaceResource {
-    fn update_for(&self, surface: &RenderableSurface) -> EglSurfaceResourceUpdate {
+    fn update_for(
+        &self,
+        surface: &RenderableSurface,
+        sync_state: SurfaceResourceSyncState,
+    ) -> EglSurfaceResourceUpdate {
         let buffer_size = surface.buffer_size();
         if self.image.size != (buffer_size.width, buffer_size.height) {
             return EglSurfaceResourceUpdate::Recreate;
         }
+        if surface.cpu_pixels().is_some() {
+            if self.image.egl_image.is_some() {
+                return EglSurfaceResourceUpdate::Recreate;
+            }
+            if !sync_state.authoritative {
+                return EglSurfaceResourceUpdate::FullShmResync;
+            }
+            if self.shm_synced_commit == Some(sync_state.current_commit) {
+                return EglSurfaceResourceUpdate::Reuse;
+            }
+            if surface.damage.is_history_lost() {
+                return EglSurfaceResourceUpdate::FullShmResync;
+            }
+            if sync_state.complete_since.is_some_and(|complete_since| {
+                self.shm_synced_commit
+                    .is_some_and(|synced| synced >= complete_since)
+            }) {
+                return if surface.damage.is_empty() {
+                    EglSurfaceResourceUpdate::ReuseShm
+                } else {
+                    EglSurfaceResourceUpdate::UploadDamage
+                };
+            }
+            return EglSurfaceResourceUpdate::FullShmResync;
+        }
         if self.image.generation == surface.generation {
             return EglSurfaceResourceUpdate::Reuse;
-        }
-        if surface.cpu_pixels().is_some() && self.image.egl_image.is_none() {
-            return EglSurfaceResourceUpdate::UploadDamage;
         }
         if surface
             .dmabuf_handle()
@@ -2454,11 +2615,19 @@ impl EglSurfaceResource {
         &mut self,
         gl: &glow::Context,
         surface: &RenderableSurface,
+        force_full_upload: bool,
+        synced_commit: SurfaceCommitCounter,
         upload_rgba: &mut Vec<u8>,
     ) -> usize {
-        let upload_bytes =
-            write_surface_pixels_to_resource(gl, &self.image, surface, false, upload_rgba);
+        let upload_bytes = write_surface_pixels_to_resource(
+            gl,
+            &self.image,
+            surface,
+            force_full_upload,
+            upload_rgba,
+        );
         self.image.generation = surface.generation;
+        self.shm_synced_commit = Some(synced_commit);
         upload_bytes
     }
 }
@@ -2466,8 +2635,10 @@ impl EglSurfaceResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EglSurfaceResourceUpdate {
     Reuse,
+    ReuseShm,
     ReuseDmabuf,
     UploadDamage,
+    FullShmResync,
     Recreate,
     UnsupportedBuffer,
 }
@@ -2950,6 +3121,7 @@ fn create_surface_resource(
     egl_display: egl::Display,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     surface: &RenderableSurface,
+    shm_synced_commit: Option<SurfaceCommitCounter>,
     upload_rgba: &mut Vec<u8>,
 ) -> RendererResult<EglSurfaceResource> {
     let image = if surface.cpu_pixels().is_some() {
@@ -2989,6 +3161,7 @@ fn create_surface_resource(
         buffer_lifetime: surface
             .dmabuf_handle()
             .map(|_| surface.buffer_identity().downgrade()),
+        shm_synced_commit,
     })
 }
 
@@ -3365,6 +3538,18 @@ fn effect_region_from_output_damage(
     }
 }
 
+fn repaint_plan_output_rects(plan: &RepaintPlan, width: u32, height: u32) -> Vec<OutputRect> {
+    match plan.mode {
+        RepaintMode::Skip => Vec::new(),
+        RepaintMode::Full => vec![OutputRect::new(0, 0, width, height)],
+        RepaintMode::Partial => match &plan.repair_damage {
+            OutputDamage::Empty => Vec::new(),
+            OutputDamage::Full => vec![OutputRect::new(0, 0, width, height)],
+            OutputDamage::Rects(rects) => rects.clone(),
+        },
+    }
+}
+
 impl EffectGenerationPublisher for GlesSceneRenderer {
     fn publish_effect_generation(
         &mut self,
@@ -3622,13 +3807,140 @@ pub(crate) fn egl_swap_buffers_with_damage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oblivion_one::compositor::{
+        RenderableSurfaceDamage, SurfaceCommitCounter, SurfaceCommitSequence, SurfaceOpaqueRegion,
+        SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
+    };
     use oblivion_one::render_backend::buffer::{
-        BufferIdAllocator, BufferSize, DmabufBufferHandle, DmabufImageKey, DmabufPlane,
-        DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+        BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufImageKey,
+        DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    fn test_shm_surface(damage: RenderableSurfaceDamage) -> RenderableSurface {
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 2,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(2, 2).expect("test surface size"),
+                vec![0xff00_0000; 4],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            opaque_region: SurfaceOpaqueRegion::None,
+            damage,
+        }
+    }
+
+    fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> EglSurfaceResource {
+        EglSurfaceResource {
+            image: EglImageResource {
+                texture: glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+                size: (2, 2),
+                generation: 1,
+                egl_image: None,
+            },
+            dmabuf_key: None,
+            buffer_lifetime: None,
+            shm_synced_commit: synced_commit,
+        }
+    }
+
+    #[test]
+    fn shm_resource_update_requires_full_resync_when_baseline_is_behind() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]));
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(1)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(2)),
+            current_commit: SurfaceCommitCounter(3),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::FullShmResync
+        );
+    }
+
+    #[test]
+    fn shm_resource_update_keeps_partial_upload_when_damage_is_complete() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]));
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(2)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(2)),
+            current_commit: SurfaceCommitCounter(3),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::UploadDamage
+        );
+    }
+
+    #[test]
+    fn shm_resource_update_reuses_exact_current_commit_without_upload() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Empty);
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(3)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(2)),
+            current_commit: SurfaceCommitCounter(3),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::Reuse
+        );
+    }
+
+    #[test]
+    fn shm_resource_update_history_loss_requires_full_resync() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::HistoryLost);
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(2)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(2)),
+            current_commit: SurfaceCommitCounter(3),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::FullShmResync
+        );
+    }
 
     #[test]
     fn output_background_uses_dedicated_solid_scene_layer() {

@@ -1075,6 +1075,19 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
+        let surface_resource_sync_states = server.surface_resource_sync_states(
+            resolved_scene
+                .surfaces
+                .iter()
+                .map(|surface| surface.surface_id)
+                .chain(
+                    cursor_mode
+                        .is_software()
+                        .then(|| server.client_cursor_render_state())
+                        .flatten()
+                        .map(|cursor| cursor.surface.surface_id),
+                ),
+        );
         EglSceneDrawRequest {
             width,
             height,
@@ -1092,6 +1105,7 @@ impl NativeFrameRenderer {
                 .flatten(),
             current_damage,
             effects: &resolved_scene.effects,
+            surface_resource_sync_states,
         }
     }
 }
