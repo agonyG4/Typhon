@@ -3949,6 +3949,186 @@ mod tests {
             gl.delete_program(source_over_program);
         }
 
+        let blend_program = program::create_program_from_sources(
+            &gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                layout(location = 1) in vec2 a_uv;
+                out vec2 v_uv;
+                void main() {
+                    gl_Position = vec4(a_position, 0.0, 1.0);
+                    v_uv = a_uv;
+                }
+            "#,
+            effects::BLEND_STAGE_FRAGMENT_SHADER,
+        )
+        .expect("blend regression shader compiles");
+        let destination_texture =
+            unsafe { gl.create_texture().expect("blend destination texture") };
+        let source_texture = unsafe { gl.create_texture().expect("blend source texture") };
+        let (quad, _) = renderer
+            .ensure_effect_quad()
+            .expect("blend regression quad creates");
+        let blend_modes = [
+            (0, oblivion_one::effects::BlendMode::SourceOver),
+            (1, oblivion_one::effects::BlendMode::Add),
+            (2, oblivion_one::effects::BlendMode::Multiply),
+            (3, oblivion_one::effects::BlendMode::Screen),
+        ];
+        let opacities = [0.0_f32, 0.25, 0.5, 0.75, 1.0];
+        let destination_straight = [0.3_f32, 0.6, 0.2];
+        let source_straight = [0.8_f32, 0.25, 0.7];
+        unsafe {
+            gl.viewport(0, 0, 1, 1);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(blend_program));
+            gl.bind_vertex_array(Some(quad));
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(blend_program, "u_effect_input")
+                        .expect("blend input uniform"),
+                ),
+                0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(blend_program, "u_effect_input_secondary")
+                        .expect("blend secondary input uniform"),
+                ),
+                1,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(blend_program, "u_effect_decode_srgb")
+                        .expect("blend decode uniform"),
+                ),
+                0,
+            );
+            gl.uniform_1_i32(
+                Some(
+                    &gl.get_uniform_location(blend_program, "u_effect_encode_srgb")
+                        .expect("blend encode uniform"),
+                ),
+                0,
+            );
+            let mode_location = gl
+                .get_uniform_location(blend_program, "u_effect_blend_mode")
+                .expect("blend mode uniform");
+            let opacity_location = gl
+                .get_uniform_location(blend_program, "u_effect_blend_opacity")
+                .expect("blend opacity uniform");
+            for destination_alpha in [0.25_f32, 0.5, 1.0] {
+                for source_alpha in [0.25_f32, 0.5, 1.0] {
+                    let destination = oblivion_one::effects::PremultipliedRgba::new(
+                        destination_straight[0] * destination_alpha,
+                        destination_straight[1] * destination_alpha,
+                        destination_straight[2] * destination_alpha,
+                        destination_alpha,
+                    );
+                    let source = oblivion_one::effects::PremultipliedRgba::new(
+                        source_straight[0] * source_alpha,
+                        source_straight[1] * source_alpha,
+                        source_straight[2] * source_alpha,
+                        source_alpha,
+                    );
+                    let destination_pixels = [
+                        (destination.r * 255.0).round() as u8,
+                        (destination.g * 255.0).round() as u8,
+                        (destination.b * 255.0).round() as u8,
+                        (destination.a * 255.0).round() as u8,
+                    ];
+                    let source_pixels = [
+                        (source.r * 255.0).round() as u8,
+                        (source.g * 255.0).round() as u8,
+                        (source.b * 255.0).round() as u8,
+                        (source.a * 255.0).round() as u8,
+                    ];
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(destination_texture));
+                    configure_texture(&gl);
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA as i32,
+                        1,
+                        1,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&destination_pixels)),
+                    );
+                    gl.active_texture(glow::TEXTURE1);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(source_texture));
+                    configure_texture(&gl);
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA as i32,
+                        1,
+                        1,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&source_pixels)),
+                    );
+                    for (shader_mode, mode) in blend_modes {
+                        gl.uniform_1_i32(Some(&mode_location), shader_mode);
+                        for opacity in opacities {
+                            let expected = destination.blend(source, mode, opacity);
+                            gl.uniform_1_f32(Some(&opacity_location), opacity);
+                            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                            gl.clear(glow::COLOR_BUFFER_BIT);
+                            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                            gl.flush();
+                            let mut actual = [0_u8; 4];
+                            gl.read_pixels(
+                                0,
+                                0,
+                                1,
+                                1,
+                                glow::RGBA,
+                                glow::UNSIGNED_BYTE,
+                                glow::PixelPackData::Slice(Some(&mut actual)),
+                            );
+                            let expected = [
+                                (expected.r * 255.0).round() as u8,
+                                (expected.g * 255.0).round() as u8,
+                                (expected.b * 255.0).round() as u8,
+                                (expected.a * 255.0).round() as u8,
+                            ];
+                            if opacity == 0.0
+                                && matches!(
+                                    mode,
+                                    oblivion_one::effects::BlendMode::Multiply
+                                        | oblivion_one::effects::BlendMode::Screen
+                                )
+                            {
+                                assert_eq!(
+                                    actual, destination_pixels,
+                                    "zero-opacity {:?} must preserve the destination exactly",
+                                    mode
+                                );
+                            }
+                            for (actual, expected) in actual.iter().zip(expected) {
+                                assert!(
+                                    (*actual as i16 - expected as i16).abs() <= 3,
+                                    "blend mismatch mode={mode:?} opacity={opacity} destination_alpha={destination_alpha} source_alpha={source_alpha}: actual={actual:?} expected={expected:?}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            gl.bind_vertex_array(None);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.delete_texture(destination_texture);
+            gl.delete_texture(source_texture);
+            gl.delete_program(blend_program);
+        }
+
         let normalization_surface = egl
             .create_pbuffer_surface(display, config, &[egl::WIDTH, 2, egl::HEIGHT, 1, egl::NONE])
             .expect("normalization pbuffer surface creates");

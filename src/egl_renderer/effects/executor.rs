@@ -256,7 +256,7 @@ void main() {
 }
 "#;
 
-pub(super) const BLEND_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
+pub(crate) const BLEND_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
 uniform sampler2D u_effect_input_secondary;
@@ -314,6 +314,7 @@ void main() {
     }
     float opacity = clamp(u_effect_blend_opacity, 0.0, 1.0);
     float second_alpha = clamp(second.a * opacity, 0.0, 1.0);
+    vec3 second_premultiplied = second.rgb * opacity;
     vec3 blended = second.rgb;
     if (u_effect_blend_mode == 1) {
         blended = first.rgb + second.rgb;
@@ -328,7 +329,7 @@ void main() {
         ? second.rgb * opacity + first.rgb * (1.0 - second_alpha)
         : u_effect_blend_mode == 1
             ? first.rgb + second.rgb * opacity
-            : first.rgb * (1.0 - second_alpha) + second.rgb * (1.0 - first.a) + blended * first.a * second_alpha;
+            : first.rgb * (1.0 - second_alpha) + second_premultiplied * (1.0 - first.a) + blended * first.a * second_alpha;
     float alpha = second_alpha + first.a * (1.0 - second_alpha);
     vec4 result = typhon_sanitize_premultiplied(vec4(rgb, alpha));
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);

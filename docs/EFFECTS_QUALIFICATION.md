@@ -23,23 +23,20 @@ rtk cargo test --locked
 rtk bin/qualify-presentation --dry-run
 ```
 
-The closure also reruns the focused `resources`, `static_texture`, trusted
-wrapper GLES-link, component-range, and effect-reload filters.
-Fresh results for this closure are: `effects` 112 passed,
-`egl_renderer` 126 passed, `native_output` 1166 passed on the serial rerun,
-and the full serial suite 3687 passed with 5 ignored and 40 filtered across 31
-suites. Formatting, locked all-target compilation, and strict all-target
-Clippy passed. The focused filters passed: `normalize_input` 1,
-`normalize_nonzero_domain` 1, `normalize_pooled_clear` 1,
-`trusted_output_size` 1, `trusted_reload_redraw` 1,
-`trusted_schema_reload` 1, `parameter_impact` 2, `mask_inverted` 1,
-`premultiplied` 9, and `srgb` 4. The first parallel native-output run had one
-known queue-test race; the required serial rerun passed all 1166 tests. The
-first parallel full-suite run had one process-test PID race; the final serial
-rerun passed all 3687 tests. The dry-run enumerated all 18 phases.
+Fresh results for the 2026-09-09 blend-parity repair are: `effects` 114
+passed, `egl_renderer` 128 passed, `native_output` 1166 passed, and the full
+serial suite 3687 passed with 5 ignored and 40 filtered across 31 suites.
+Formatting, locked all-target compilation, and strict all-target Clippy passed.
+The real GLES regression compares all four blend modes at opacities 0, 0.25,
+0.5, 0.75, and 1.0 across all 3x3 destination/source alpha pairs; Multiply
+and Screen also assert exact zero-opacity destination identity. The focused
+real-GLES test passed independently.
 
-Additional closure filters passed: `resources` 18, `static_texture` 3,
-`trusted_custom_wrapper` 1, `component_wise` 2, and `effect_reload` 1.
+The exact parallel `rtk cargo test --locked` invocation passed on the final
+rerun with the same 3687/5/40 result; one earlier invocation reproduced an
+unrelated timing-sensitive `native_output::kms_worker` failure, and the
+race-resistant serial full-suite rerun also passed. The dry-run enumerated all
+18 phases.
 
 The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
