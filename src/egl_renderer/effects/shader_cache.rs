@@ -230,11 +230,25 @@ impl ShaderProgramCache {
         program: GlProgram,
         name: &str,
     ) -> Option<glow::UniformLocation> {
+        self.uniform_location_with(key, name, || unsafe {
+            gl.get_uniform_location(program, name)
+        })
+    }
+
+    fn uniform_location_with<F>(
+        &mut self,
+        key: ShaderProgramKey,
+        name: &str,
+        resolve: F,
+    ) -> Option<glow::UniformLocation>
+    where
+        F: FnOnce() -> Option<glow::UniformLocation>,
+    {
         let entry = self.entries.get_mut(&key)?;
         if let Some(location) = entry.uniform_locations.get(name) {
             return *location;
         }
-        let location = unsafe { gl.get_uniform_location(program, name) };
+        let location = resolve();
         entry.uniform_locations.insert(name.to_owned(), location);
         location
     }
@@ -643,5 +657,45 @@ mod tests {
         let key = key(1, 0);
         assert!(cache.lookup(key).is_err());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn uniform_locations_cache_hits_missing_results_and_reset_with_generation() {
+        let mut cache = ShaderProgramCache::new(2).unwrap();
+        let key = key(1, 0);
+        cache.remember_source(key, "source").unwrap();
+
+        let mut resolved_calls = 0;
+        let first = cache.uniform_location_with(key, "u_color", || {
+            resolved_calls += 1;
+            Some(glow::NativeUniformLocation(7))
+        });
+        let second = cache.uniform_location_with(key, "u_color", || {
+            resolved_calls += 1;
+            Some(glow::NativeUniformLocation(8))
+        });
+        assert_eq!(first, Some(glow::NativeUniformLocation(7)));
+        assert_eq!(second, first);
+        assert_eq!(resolved_calls, 1);
+
+        let mut missing_calls = 0;
+        assert_eq!(
+            cache.uniform_location_with(key, "u_missing", || {
+                missing_calls += 1;
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            cache.uniform_location_with(key, "u_missing", || {
+                missing_calls += 1;
+                Some(glow::NativeUniformLocation(9))
+            }),
+            None
+        );
+        assert_eq!(missing_calls, 1);
+
+        let replacement = ShaderProgramCache::new(2).unwrap();
+        assert_eq!(replacement.len(), 0);
     }
 }

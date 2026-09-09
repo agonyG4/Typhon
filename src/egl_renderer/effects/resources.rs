@@ -754,6 +754,48 @@ mod tests {
     }
 
     #[test]
+    fn eviction_notifications_stay_consumable_during_repeated_churn() {
+        let mut pool = EffectResourcePool::with_budget(2048).unwrap();
+        let keys = [key(16, 16), key(32, 16)];
+        let initial = pool.checkout(keys[0]).unwrap();
+        pool.return_texture(initial).unwrap();
+
+        const CHURN_COUNT: usize = 512;
+        for index in 0..CHURN_COUNT {
+            let texture = pool.checkout(keys[(index + 1) % keys.len()]).unwrap();
+            assert_eq!(pool.drain_evicted_texture_ids().len(), 1);
+            assert!(pool.evicted_texture_ids().is_empty());
+            assert_eq!(pool.metrics().eviction_count, index + 1);
+            pool.return_texture(texture).unwrap();
+        }
+
+        for _ in 0..16 {
+            let texture = pool.checkout(keys[0]).unwrap();
+            assert!(pool.drain_evicted_texture_ids().is_empty());
+            pool.return_texture(texture).unwrap();
+        }
+        assert_eq!(pool.metrics().eviction_count, CHURN_COUNT);
+    }
+
+    #[test]
+    fn failed_oversized_acquisition_retains_eviction_notification() {
+        let mut pool = EffectResourcePool::with_budget(2048).unwrap();
+        let idle = pool.checkout(key(16, 16)).unwrap();
+        pool.return_texture(idle.clone()).unwrap();
+
+        assert!(matches!(
+            pool.checkout(key(64, 64)),
+            Err(EffectResourceError::BudgetExceeded { .. })
+        ));
+        assert_eq!(pool.evicted_texture_ids(), vec![idle.id]);
+        assert_eq!(pool.metrics().eviction_count, 1);
+
+        assert_eq!(pool.drain_evicted_texture_ids(), vec![idle.id]);
+        assert!(pool.drain_evicted_texture_ids().is_empty());
+        assert_eq!(pool.metrics().eviction_count, 1);
+    }
+
+    #[test]
     fn size_history_cleanup_removes_idle_entries_but_keeps_live_textures() {
         let mut pool = EffectResourcePool::with_budget(16 * 1024).unwrap();
         let idle = pool.checkout(key(8, 8)).unwrap();

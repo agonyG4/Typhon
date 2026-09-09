@@ -21,6 +21,54 @@ pub fn run(
     runtime.run()
 }
 
+#[cfg(test)]
+mod trace_export_tests {
+    use super::{NativeResult, TraceExport, write_presentation_trace_export};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_trace_path() -> (PathBuf, PathBuf) {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "typhon-presentation-trace-export-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        (root.clone(), root.join("trace.jsonl"))
+    }
+
+    #[test]
+    fn failed_trace_export_keeps_cursor_for_retry() -> NativeResult<()> {
+        let (root, path) = unique_trace_path();
+        std::fs::create_dir_all(&path)?;
+        let previous = Some((4, 0));
+        let mut export_cursor = previous;
+
+        assert!(
+            write_presentation_trace_export(
+                &path,
+                TraceExport::Append("event\n".to_owned()),
+                (5, 0),
+                &mut export_cursor,
+            )
+            .is_err()
+        );
+        assert_eq!(export_cursor, previous);
+
+        std::fs::remove_dir_all(&path)?;
+        write_presentation_trace_export(
+            &path,
+            TraceExport::Append("event\n".to_owned()),
+            (5, 0),
+            &mut export_cursor,
+        )?;
+        assert_eq!(export_cursor, Some((5, 0)));
+        assert_eq!(std::fs::read_to_string(&path)?, "event\n");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct AcquirePrepareOutcome {
     acquire_service_ran: bool,
@@ -551,28 +599,12 @@ impl NativeRuntime {
             .presentation_trace
             .export_delta(self.presentation_trace_export_cursor);
         let cursor = self.presentation_trace.export_cursor();
-        match export {
-            TraceExport::Unchanged => return Ok(()),
-            TraceExport::Append(delta) => {
-                if delta.is_empty() {
-                    self.presentation_trace_export_cursor = Some(cursor);
-                    return Ok(());
-                }
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?
-                    .write_all(delta.as_bytes())?;
-            }
-            TraceExport::Replace(contents) => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(path, contents)?;
-            }
-        }
-        self.presentation_trace_export_cursor = Some(cursor);
-        Ok(())
+        write_presentation_trace_export(
+            path,
+            export,
+            cursor,
+            &mut self.presentation_trace_export_cursor,
+        )
     }
 
     pub(super) fn advance_shutdown_lifecycle(
@@ -1355,4 +1387,34 @@ impl NativeRuntime {
         }
         Ok(outcome)
     }
+}
+
+fn write_presentation_trace_export(
+    path: &std::path::Path,
+    export: TraceExport,
+    cursor: (usize, u64),
+    export_cursor: &mut Option<(usize, u64)>,
+) -> NativeResult<()> {
+    match export {
+        TraceExport::Unchanged => return Ok(()),
+        TraceExport::Append(delta) => {
+            if delta.is_empty() {
+                *export_cursor = Some(cursor);
+                return Ok(());
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?
+                .write_all(delta.as_bytes())?;
+        }
+        TraceExport::Replace(contents) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, contents)?;
+        }
+    }
+    *export_cursor = Some(cursor);
+    Ok(())
 }

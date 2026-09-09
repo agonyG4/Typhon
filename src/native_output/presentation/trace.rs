@@ -430,6 +430,44 @@ mod tests {
     }
 
     #[test]
+    fn multiple_new_events_export_in_chronological_order() {
+        let mut ring = PresentationTransactionTraceRing::new(8);
+        ring.push(event(1));
+        let cursor = ring.export_cursor();
+        ring.push(event(2));
+        ring.push(event(3));
+        ring.push(event(4));
+
+        let TraceExport::Append(delta) = ring.export_delta(Some(cursor)) else {
+            panic!("expected append-only export");
+        };
+        assert_eq!(delta.lines().count(), 3);
+        let timestamp_2 = delta.find("\"timestamp_ns\":2").unwrap();
+        let timestamp_3 = delta.find("\"timestamp_ns\":3").unwrap();
+        let timestamp_4 = delta.find("\"timestamp_ns\":4").unwrap();
+        assert!(timestamp_2 < timestamp_3);
+        assert!(timestamp_3 < timestamp_4);
+        assert!(!delta.contains("\"timestamp_ns\":1"));
+    }
+
+    #[test]
+    fn large_exported_history_does_not_expand_a_new_event_delta() {
+        let mut ring = PresentationTransactionTraceRing::new(1024);
+        for timestamp in 0..512 {
+            ring.push(event(timestamp));
+        }
+        let cursor = ring.export_cursor();
+        ring.push(event(512));
+
+        let TraceExport::Append(delta) = ring.export_delta(Some(cursor)) else {
+            panic!("expected append-only export");
+        };
+        assert_eq!(delta.lines().count(), 1);
+        assert!(delta.contains("\"timestamp_ns\":512"));
+        assert!(!delta.contains("\"timestamp_ns\":511"));
+    }
+
+    #[test]
     fn ring_overwrite_requires_a_bounded_full_replacement() {
         let mut ring = PresentationTransactionTraceRing::new(1);
         ring.push(event(1));
