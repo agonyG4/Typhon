@@ -166,6 +166,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
+    CapturePresentationTransitionCurve(Sender<Option<AnimationCurve>>),
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
     CaptureFullscreenRenderPlanMetrics(Sender<FullscreenRenderPlanMetrics>),
     CaptureConfigureSerial(Sender<u32>),
@@ -650,6 +651,22 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 None
                             };
                         let _ = reply.send(visual);
+                    }
+                    ServerCommand::CapturePresentationTransitionCurve(reply) => {
+                        let curve =
+                            if server.state.toplevel_surfaces.len() == 1 {
+                                server.state.toplevel_surfaces.keys().next().and_then(
+                                    |surface_id| {
+                                        server
+                                            .state
+                                            .presentation_animator
+                                            .transition_curve(*surface_id)
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                        let _ = reply.send(curve);
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
                         let _ = reply.send(server.state.fullscreen_presentation_eligibility());
@@ -1518,6 +1535,18 @@ pub(in crate::compositor::tests) fn capture_toplevel_visual_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report toplevel visual geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_presentation_transition_curve(
+    commands: &Sender<ServerCommand>,
+) -> Option<AnimationCurve> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePresentationTransitionCurve(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report presentation transition curve")
 }
 
 pub(in crate::compositor::tests) fn capture_fullscreen_presentation_eligibility(

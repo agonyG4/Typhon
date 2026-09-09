@@ -58,7 +58,9 @@ claim fractional values survive those legacy integer structures.
 
 All commands were run in the existing checkout and reused `target/`:
 
-- `rtk run -- cargo fmt --check` — passed.
+- `rtk run -- cargo fmt --check` — blocked by unrelated pre-existing
+  formatting in `src/compositor/state/surfaces.rs`, `src/egl_renderer.rs`, and
+  `src/egl_renderer/geometry.rs`; the task-owned Rust files are formatted.
 - `rtk run -- cargo check --locked --all-targets` — passed.
 - `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — passed.
 - `rtk run -- cargo test --locked` — passed: 2,216 library tests, 1,288 main
@@ -377,3 +379,77 @@ No minimize, close, workspace-switch, opacity, blur, or retained-lifecycle
 animation was introduced. No live DRM/KMS or 1920x1080@165 Hz hardware
 qualification was performed; the source-layout guard currently reports 43
 oversized repository files, and this task does not perform unrelated extraction.
+
+## macOS animation tuning v1.1 (2026-09-09)
+
+This follow-up keeps the v1 macOS spring stiffness/damping table unchanged:
+Move `260/34`, Resize `240/32`, Layout `230/30`, Maximize enter `210/28`,
+Maximize exit `220/29`, Fullscreen enter `205/28`, Fullscreen exit `215/29`,
+and XWayland mode `230/31`. The generic `SpringSpec::new` defaults remain
+`0.01/0.01`; the change is owned by the macOS policy only.
+
+The policy now applies one named settlement profile to all eight curves:
+`0.5 px` maximum displacement and `8 px/s` maximum velocity. A half-pixel
+residual is below the integer-compatible materialization scale. At 165 Hz,
+`8 px/s` is approximately `0.048 px` per frame; at 60 Hz it is approximately
+`0.133 px` per frame. These are conservative perceptual thresholds selected
+for Typhon's existing materialization boundary, not Apple private
+WindowServer constants. Immutable `SpringSpec` getters make the policy
+profile inspectable without exposing mutable animator state.
+
+The deterministic actual-sampler envelope below reports the first 1 ms sample
+that satisfies both settlement thresholds. Each row is ordered by the
+representative displacement samples `200/500/1,000/1,920 px`:
+
+| Curve kind | Settlement envelope (ms) |
+| --- | --- |
+| Programmatic move | 579 / 658 / 718 / 774 |
+| Programmatic resize | 576 / 652 / 710 / 765 |
+| Layout reflow | 525 / 588 / 635 / 678 |
+| Maximize enter | 514 / 571 / 613 / 649 |
+| Maximize exit | 519 / 577 / 622 / 663 |
+| Fullscreen enter | 538 / 599 / 643 / 685 |
+| Fullscreen exit | 543 / 608 / 656 / 701 |
+| XWayland mode change | 573 / 648 / 705 / 758 |
+
+The sampler regression checks every kind at `t=0`, an early 50 ms sample,
+and a final exact-target/zero-velocity sample by 800 ms. Real compositor-route
+regressions now cover XDG maximize enter/exit, XDG fullscreen enter/exit, and
+tiled/Dwindle reflow through `reflow_tiled_location`; the existing real
+XWayland mode route remains covered. The tests observe the selected policy
+curve through a test-only immutable capture command rather than calling the
+animation helper directly.
+
+Exact final materialization, physical pageflip acknowledgement, fullscreen
+pending-owner culling, hidden-transition dormancy, pointer takeover, popup
+ownership, and Direct Scanout blocker behavior remain covered by the existing
+presentation/native-output regressions. No minimize, close, workspace-switch,
+opacity, blur, or retained-lifecycle animation was added. No live DRM/KMS or
+1920x1080@165 Hz hardware qualification was performed, so no hardware claim
+is made; stiffness/damping retuning remains deferred until such evidence is
+available.
+
+Verification for this follow-up reused the existing checkout and `target/`
+directory:
+
+- `rtk run -- cargo fmt --check` — passed.
+- `rtk run -- cargo check --locked --all-targets` — passed with the three
+  existing unused `SurfaceConsumerPlan` warnings in the unrelated EGL
+  renderer path.
+- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — blocked by
+  those same unrelated EGL renderer dead-code warnings promoted to errors;
+  no clippy error was reported in the animation-policy or compositor-route
+  files changed by this follow-up.
+- `rtk run -- cargo clippy --locked --lib -- -D warnings` — passed for the
+  library and compositor animation-policy/test paths.
+- `rtk run -- cargo test --locked` — passed: 2,276 library tests, 1,326 main
+  binary tests, and all auxiliary integration/documentation targets completed
+  with zero failures; 2 library tests and the declared environment-dependent
+  tests were ignored.
+- `rtk git diff --check` — passed.
+- `rtk run -- bash bin/check-source-layout` — remains non-zero for 43 existing
+  oversized repository files; no unrelated extraction or limit change was
+  made.
+- Codebase-memory coverage for every operated source/report path returned
+  `no_recorded_issue` with matching filesystem metadata. This remains a
+  best-effort coverage signal, not a completeness proof.

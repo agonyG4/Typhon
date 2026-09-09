@@ -539,6 +539,14 @@ impl SpringSpec {
         self.damping
     }
 
+    pub const fn displacement_epsilon(self) -> f64 {
+        self.displacement_epsilon
+    }
+
+    pub const fn velocity_epsilon(self) -> f64 {
+        self.velocity_epsilon
+    }
+
     fn valid(self) -> bool {
         self.stiffness.is_finite()
             && self.damping.is_finite()

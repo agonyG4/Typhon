@@ -269,6 +269,56 @@ fn window_unmaximize_restores_previous_toplevel_geometry() {
 }
 
 #[test]
+fn window_maximize_entry_uses_the_macos_policy_curve_through_real_state() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_toggle_maximize(&socket_path, &commands).unwrap();
+    let curve = capture_presentation_transition_curve(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        curve,
+        Some(
+            PresentationAnimationPolicy::macos()
+                .curve_for(PresentationAnimationKind::MaximizeEnter,)
+        )
+    );
+}
+
+#[test]
+fn window_maximize_exit_uses_the_macos_policy_curve_through_real_state() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::ToggleMaximizeFocused,
+            ServerCommand::ToggleMaximizeFocused,
+        ],
+    )
+    .unwrap();
+    let curve = capture_presentation_transition_curve(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        curve,
+        Some(
+            PresentationAnimationPolicy::macos()
+                .curve_for(PresentationAnimationKind::MaximizeExit,)
+        )
+    );
+}
+
+#[test]
 fn window_fullscreen_configures_focused_toplevel_and_restores_geometry() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -276,11 +326,48 @@ fn window_fullscreen_configures_focused_toplevel_and_restores_geometry() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     let state = create_buffered_toplevel_then_toggle_fullscreen(&socket_path, &commands).unwrap();
+    let curve = capture_presentation_transition_curve(&commands);
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert_eq!(state.toplevel_width, 1280);
     assert_eq!(state.toplevel_height, 800);
     assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!(
+        curve,
+        Some(
+            PresentationAnimationPolicy::macos()
+                .curve_for(PresentationAnimationKind::FullscreenEnter,)
+        )
+    );
+}
+
+#[test]
+fn window_fullscreen_exit_uses_the_macos_policy_curve_through_real_state() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::ToggleFullscreenFocused,
+            ServerCommand::ToggleFullscreenFocused,
+        ],
+    )
+    .unwrap();
+    let curve = capture_presentation_transition_curve(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!(
+        curve,
+        Some(
+            PresentationAnimationPolicy::macos()
+                .curve_for(PresentationAnimationKind::FullscreenExit,)
+        )
+    );
 }
 
 #[test]

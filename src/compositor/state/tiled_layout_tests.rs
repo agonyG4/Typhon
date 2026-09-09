@@ -3,6 +3,81 @@ use super::*;
 use crate::wm::layout::TiledResizeHandle;
 use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation};
 
+fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("test buffer identity");
+    RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        placement: SurfacePlacement::root(),
+        render_backend: SurfaceRenderBackend::NativeWayland,
+        render_placement: None,
+        visual_clip: None,
+        render_target_size: None,
+        generation: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
+        buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(width, height).expect("test buffer size"),
+            vec![0; width as usize * height as usize],
+        ),
+        viewport_source: None,
+        viewport_destination: None,
+        buffer_scale: 1,
+        buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+        damage: RenderableSurfaceDamage::Full,
+    }
+}
+
+#[test]
+fn tiled_dwindle_reflow_uses_the_macos_layout_policy_curve() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    let first = state.allocate_window_id().expect("first window id");
+    let second = state.allocate_window_id().expect("second window id");
+
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first, 250))
+        .expect("first window");
+    state.window_mut(first).expect("first window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .tiled_layout
+        .insert(location, first, crate::wm::layout::InsertHint::default())
+        .expect("first tiled insert");
+    state.append_renderable_surface(test_renderable_surface(250, 16, 16));
+    state.install_toplevel_visual_geometry(
+        250,
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(37, 49), 640, 480),
+    );
+    assert!(state.reflow_tiled_location(location));
+    state.presentation_animator.cancel(250);
+
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second, 251))
+        .expect("second window");
+    state.window_mut(second).expect("second window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .tiled_layout
+        .insert(location, second, crate::wm::layout::InsertHint::default())
+        .expect("second tiled insert");
+
+    assert!(state.reflow_tiled_location(location));
+    assert_eq!(
+        state.presentation_animator.transition_curve(250),
+        Some(
+            PresentationAnimationPolicy::macos()
+                .curve_for(PresentationAnimationKind::LayoutReflow,)
+        )
+    );
+}
+
 #[test]
 fn focused_regular_window_toggles_layout_without_recreating_or_moving_workspace_membership() {
     let mut state = CompositorState::new(None);

@@ -2,6 +2,20 @@
 
 use crate::presentation_animation::{AnimationCurve, SpringSpec};
 
+// A half-pixel residual is below the integer-compatible materialization scale.
+// At 165 Hz, 8 px/s is about 0.048 px per frame; at 60 Hz it is about 0.133
+// px per frame. This is a conservative perceptual threshold, not an Apple
+// private WindowServer constant.
+const MACOS_SETTLEMENT_DISPLACEMENT_PX: f64 = 0.5;
+const MACOS_SETTLEMENT_VELOCITY_PX_PER_SEC: f64 = 8.0;
+
+const fn macos_spring(stiffness: f64, damping: f64) -> AnimationCurve {
+    AnimationCurve::spring(SpringSpec::new(stiffness, damping).with_settlement(
+        MACOS_SETTLEMENT_DISPLACEMENT_PX,
+        MACOS_SETTLEMENT_VELOCITY_PX_PER_SEC,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationAnimationKind {
     ProgrammaticMove,
@@ -50,28 +64,28 @@ impl PresentationAnimationPolicy {
     pub const fn curve_for(self, kind: PresentationAnimationKind) -> AnimationCurve {
         match (self.style, kind) {
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::ProgrammaticMove) => {
-                AnimationCurve::spring(SpringSpec::new(260.0, 34.0))
+                macos_spring(260.0, 34.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::ProgrammaticResize) => {
-                AnimationCurve::spring(SpringSpec::new(240.0, 32.0))
+                macos_spring(240.0, 32.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::LayoutReflow) => {
-                AnimationCurve::spring(SpringSpec::new(230.0, 30.0))
+                macos_spring(230.0, 30.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::MaximizeEnter) => {
-                AnimationCurve::spring(SpringSpec::new(210.0, 28.0))
+                macos_spring(210.0, 28.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::MaximizeExit) => {
-                AnimationCurve::spring(SpringSpec::new(220.0, 29.0))
+                macos_spring(220.0, 29.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::FullscreenEnter) => {
-                AnimationCurve::spring(SpringSpec::new(205.0, 28.0))
+                macos_spring(205.0, 28.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::FullscreenExit) => {
-                AnimationCurve::spring(SpringSpec::new(215.0, 29.0))
+                macos_spring(215.0, 29.0)
             }
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::XwaylandModeChange) => {
-                AnimationCurve::spring(SpringSpec::new(230.0, 31.0))
+                macos_spring(230.0, 31.0)
             }
         }
     }
@@ -98,6 +112,9 @@ pub fn presentation_animation_style_from_env(value: Option<&str>) -> Presentatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presentation_animation::{
+        PresentationRect, PresentationVelocity, PresentationWindowTarget,
+    };
 
     #[test]
     fn macos_policy_resolves_the_expected_curve_for_each_geometry_kind() {
@@ -119,6 +136,147 @@ mod tests {
             };
             close(spec.stiffness(), stiffness);
             close(spec.damping(), damping);
+            close(spec.displacement_epsilon(), 0.5);
+            close(spec.velocity_epsilon(), 8.0);
+        }
+    }
+
+    #[test]
+    fn macos_policy_keeps_geometry_springs_near_critical_damping() {
+        let kinds = [
+            PresentationAnimationKind::ProgrammaticMove,
+            PresentationAnimationKind::ProgrammaticResize,
+            PresentationAnimationKind::LayoutReflow,
+            PresentationAnimationKind::MaximizeEnter,
+            PresentationAnimationKind::MaximizeExit,
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+            PresentationAnimationKind::XwaylandModeChange,
+        ];
+
+        for kind in kinds {
+            let AnimationCurve::Spring(spec) = PresentationAnimationPolicy::macos().curve_for(kind)
+            else {
+                panic!("macOS policy should use spring curves for {kind:?}");
+            };
+            let damping_ratio = spec.damping() / (2.0 * spec.stiffness().sqrt());
+            assert!(
+                (0.90..=1.10).contains(&damping_ratio),
+                "{kind:?}: {damping_ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_policy_springs_settle_a_1920_pixel_transition_within_800_ms() {
+        let kinds = [
+            PresentationAnimationKind::ProgrammaticMove,
+            PresentationAnimationKind::ProgrammaticResize,
+            PresentationAnimationKind::LayoutReflow,
+            PresentationAnimationKind::MaximizeEnter,
+            PresentationAnimationKind::MaximizeExit,
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+            PresentationAnimationKind::XwaylandModeChange,
+        ];
+        let start = PresentationRect::new(0.0, 0.0, 1.0, 1.0).expect("start rect");
+        let target = PresentationRect::new(1_920.0, 0.0, 1.0, 1.0).expect("target rect");
+        let target_window = PresentationWindowTarget::new(1, target);
+
+        for kind in kinds {
+            let mut animator = crate::presentation_animation::PresentationAnimator::enabled();
+            animator
+                .start(
+                    1,
+                    start,
+                    target,
+                    crate::presentation_animation::AnimationTime::from_nanos(0),
+                    PresentationAnimationPolicy::macos().curve_for(kind),
+                )
+                .expect("transition should start");
+
+            let initial = animator.sample_scene(
+                crate::presentation_animation::AnimationTime::from_nanos(0),
+                &[target_window],
+            );
+            assert!(
+                !initial.windows[0].mathematically_settled,
+                "{kind:?} settled at t=0"
+            );
+
+            let early = animator.sample_scene(
+                crate::presentation_animation::AnimationTime::from_nanos(50_000_000),
+                &[target_window],
+            );
+            assert!(
+                !early.windows[0].mathematically_settled,
+                "{kind:?} settled too early"
+            );
+            assert_ne!(early.windows[0].rect, target, "{kind:?} snapped too early");
+
+            let settled = animator.sample_scene(
+                crate::presentation_animation::AnimationTime::from_nanos(800_000_000),
+                &[target_window],
+            );
+            assert!(
+                settled.windows[0].mathematically_settled,
+                "{kind:?} remained pending beyond the v1.1 ceiling"
+            );
+            assert_eq!(settled.windows[0].rect, target);
+            assert_eq!(settled.windows[0].velocity, PresentationVelocity::default());
+        }
+    }
+
+    #[test]
+    fn macos_policy_settlement_envelope_is_deterministic_for_representative_displacements() {
+        let kinds = [
+            PresentationAnimationKind::ProgrammaticMove,
+            PresentationAnimationKind::ProgrammaticResize,
+            PresentationAnimationKind::LayoutReflow,
+            PresentationAnimationKind::MaximizeEnter,
+            PresentationAnimationKind::MaximizeExit,
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+            PresentationAnimationKind::XwaylandModeChange,
+        ];
+        let displacements = [200.0, 500.0, 1_000.0, 1_920.0];
+
+        for kind in kinds {
+            let mut envelope = Vec::new();
+            for displacement in displacements {
+                let start = PresentationRect::new(0.0, 0.0, 1.0, 1.0).expect("start rect");
+                let target =
+                    PresentationRect::new(displacement, 0.0, 1.0, 1.0).expect("target rect");
+                let target_window = PresentationWindowTarget::new(1, target);
+                let mut animator = crate::presentation_animation::PresentationAnimator::enabled();
+                animator
+                    .start(
+                        1,
+                        start,
+                        target,
+                        crate::presentation_animation::AnimationTime::from_nanos(0),
+                        PresentationAnimationPolicy::macos().curve_for(kind),
+                    )
+                    .expect("transition should start");
+
+                let settled_at_ms = (0u32..=800).find(|milliseconds| {
+                    animator
+                        .sample_scene(
+                            crate::presentation_animation::AnimationTime::from_nanos(
+                                u64::from(*milliseconds) * 1_000_000,
+                            ),
+                            &[target_window],
+                        )
+                        .windows[0]
+                        .mathematically_settled
+                });
+                let settled_at_ms = settled_at_ms.unwrap_or_else(|| {
+                    panic!("{kind:?} did not settle {displacement} px by 800 ms")
+                });
+                assert!(settled_at_ms <= 800);
+                envelope.push(settled_at_ms);
+            }
+            eprintln!("macos settlement envelope {kind:?}: {envelope:?} ms");
         }
     }
 
