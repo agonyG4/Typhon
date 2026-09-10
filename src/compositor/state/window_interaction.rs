@@ -791,7 +791,7 @@ impl CompositorState {
         true
     }
 
-    fn restore_maximized_window_for_interaction(
+    pub(in crate::compositor) fn restore_maximized_window_for_interaction(
         &mut self,
         window_id: WindowId,
         root_surface_id: u32,
