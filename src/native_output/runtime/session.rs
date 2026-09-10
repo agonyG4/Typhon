@@ -64,6 +64,7 @@ pub(crate) enum NativeSessionTransition {
     BeginSuspend,
     Suspended,
     BeginResume,
+    AbortResumeForSuspend,
     Active,
     Failed,
 }
@@ -137,8 +138,18 @@ impl NativeSessionLifecycle {
                 self.state = NativeSessionState::Resuming;
                 Some(NativeSessionTransition::BeginResume)
             }
+            (NativeSessionState::Resuming, NativeSeatEvent::Disabled) => {
+                Some(NativeSessionTransition::AbortResumeForSuspend)
+            }
             _ => None,
         }
+    }
+
+    pub(crate) fn finish_resume_abort_for_suspend(&mut self) -> Option<NativeSessionTransition> {
+        (self.state == NativeSessionState::Resuming).then(|| {
+            self.state = NativeSessionState::Suspended;
+            NativeSessionTransition::Suspended
+        })
     }
 
     pub(crate) fn finish_suspend(&mut self) -> Option<NativeSessionTransition> {
@@ -218,6 +229,24 @@ mod tests {
             Some(NativeSessionTransition::BeginResume)
         );
         assert_eq!(lifecycle.begin_for_event(NativeSeatEvent::Enabled), None);
+    }
+
+    #[test]
+    fn disabling_while_resuming_requests_an_explicit_resume_abort() {
+        let mut lifecycle = NativeSessionLifecycle {
+            state: NativeSessionState::Resuming,
+        };
+
+        assert_eq!(
+            lifecycle.begin_for_event(NativeSeatEvent::Disabled),
+            Some(NativeSessionTransition::AbortResumeForSuspend)
+        );
+        assert_eq!(
+            lifecycle.finish_resume_abort_for_suspend(),
+            Some(NativeSessionTransition::Suspended)
+        );
+        assert_eq!(lifecycle.state(), NativeSessionState::Suspended);
+        assert_eq!(lifecycle.begin_for_event(NativeSeatEvent::Disabled), None);
     }
 
     #[test]

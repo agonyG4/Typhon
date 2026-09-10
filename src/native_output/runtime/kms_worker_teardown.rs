@@ -64,19 +64,20 @@ impl NativeRuntime {
         if !matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
             return Ok(());
         }
-        let Some(submission_fence) = (match &mut job.primary {
-            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
-            KmsPrimaryUpdate::Unchanged => None,
-        }) else {
-            return Ok(());
-        };
-        self.scanout
-            .restore_worker_queued_submission_fence(job.token, submission_fence)
-            .map_err(Into::into)
+        match &mut job.primary {
+            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => self
+                .scanout
+                .restore_worker_queued_submission_fence(job.token, in_fence)
+                .map_err(Into::into),
+            KmsPrimaryUpdate::Unchanged => Ok(()),
+        }
     }
 
     fn retain_returned_worker_job(&mut self, mut job: KmsCommitJob) -> NativeResult<()> {
-        self.restore_pre_submit_worker_fence(&mut job)?;
+        if let Err(error) = self.restore_pre_submit_worker_fence(&mut job) {
+            self.emergency_quarantined_worker_jobs.push(job);
+            return Err(error);
+        }
         self.worker_quarantine.jobs.push(job);
         Ok(())
     }
@@ -239,8 +240,10 @@ impl NativeRuntime {
                     first_error = Some(error);
                 }
                 uncertain_submit = true;
-            } else {
-                self.worker_quarantine.jobs.push(fatal_job.job);
+            } else if let Err(error) = self.retain_returned_worker_job(fatal_job.job)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
         }
         if uncertain_submit
@@ -267,25 +270,31 @@ impl NativeRuntime {
                 }
                 KmsWorkerEvent::TestRejected { job, .. }
                 | KmsWorkerEvent::SubmitRejected { job, .. }
-                | KmsWorkerEvent::BusyExhausted { job, .. } => {
-                    self.worker_quarantine.jobs.push(job);
-                    Ok(())
+                | KmsWorkerEvent::BusyExhausted { job, .. }
+                | KmsWorkerEvent::ValidationBaseInvalidated { job, .. } => {
+                    self.retain_returned_worker_job(job)
                 }
                 KmsWorkerEvent::Quiesced {
                     returned_jobs,
                     returned_sidecar,
                 } => {
-                    self.worker_quarantine.jobs.extend(returned_jobs);
+                    let mut returned_job_error = None;
+                    for job in returned_jobs {
+                        if let Err(error) = self.retain_returned_worker_job(job)
+                            && returned_job_error.is_none()
+                        {
+                            returned_job_error = Some(error);
+                        }
+                    }
                     self.worker_quarantine
                         .cursor_sidecars
                         .extend(returned_sidecar);
-                    Ok(())
+                    returned_job_error.map_or(Ok(()), Err)
                 }
                 KmsWorkerEvent::Fatal { .. }
                 | KmsWorkerEvent::BusyDeferred { .. }
                 | KmsWorkerEvent::PageflipTimeout { .. }
-                | KmsWorkerEvent::CursorSidecarReturned { .. }
-                | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),
+                | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
             };
             if let Err(error) = result
                 && first_error.is_none()

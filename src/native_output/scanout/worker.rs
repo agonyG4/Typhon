@@ -33,7 +33,7 @@ impl NativeScanoutBackend {
     pub(crate) fn suspend_abandon_worker_submission(
         &mut self,
         token: PageFlipToken,
-        completion_fence: Option<OwnedFd>,
+        completion_fence: &mut Option<OwnedFd>,
     ) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => {
@@ -48,7 +48,7 @@ impl NativeScanoutBackend {
     pub(crate) fn restore_worker_queued_submission_fence(
         &mut self,
         token: PageFlipToken,
-        submission_fence: OwnedFd,
+        submission_fence: &mut Option<OwnedFd>,
     ) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => {
@@ -63,17 +63,13 @@ impl NativeScanoutBackend {
     pub(crate) fn return_worker_submission_for_replan(
         &mut self,
         token: PageFlipToken,
-        submission_fence: Option<OwnedFd>,
+        submission_fence: &mut Option<OwnedFd>,
         cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<()> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.return_worker_submission_for_replan(
-                token,
-                submission_fence.ok_or_else(|| {
-                    io::Error::other("explicit worker re-plan is missing its input fence")
-                })?,
-                cursor_owner,
-            ),
+            Self::AtomicEglGbm(scanout) => {
+                scanout.return_worker_submission_for_replan(token, submission_fence, cursor_owner)
+            }
             Self::NativeEglGbm(scanout) => {
                 if submission_fence.is_some() {
                     return Err(io::Error::other(

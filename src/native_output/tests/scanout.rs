@@ -510,6 +510,7 @@ fn ready_frame_cursor_owner_round_trips_through_replan_and_second_admission() {
             MonotonicTimestampNs::new(1),
         )
         .unwrap();
+    let mut submission_fence = Some(submission_fence);
     assert_eq!(job_owner.as_ref().unwrap().revision, revision);
     assert_eq!(Arc::strong_count(&lease), 2);
 
@@ -517,7 +518,7 @@ fn ready_frame_cursor_owner_round_trips_through_replan_and_second_admission() {
         swapchain
             .return_worker_queued_for_replan(
                 PageFlipToken::new(43).unwrap(),
-                submission_fence,
+                &mut submission_fence,
                 &mut job_owner,
             )
             .unwrap()
@@ -594,14 +595,17 @@ fn failed_ready_cursor_owner_replan_keeps_owner_with_caller() {
             MonotonicTimestampNs::new(1),
         )
         .unwrap();
+    let raw_submission_fd = submission_fence.as_raw_fd();
+    let mut submission_fence = Some(submission_fence);
 
     let error = swapchain.return_worker_queued_for_replan(
         PageFlipToken::new(46).unwrap(),
-        submission_fence,
+        &mut submission_fence,
         &mut job_owner,
     );
     assert!(error.is_err());
     assert!(job_owner.is_some());
+    assert!(unsafe { libc::fcntl(raw_submission_fd, libc::F_GETFD) } >= 0);
     assert_eq!(Arc::strong_count(&lease), 2);
 }
 
@@ -1016,11 +1020,12 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
     let (submission_fence, _) = swapchain
         .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
         .unwrap();
+    let mut submission_fence = Some(submission_fence);
 
     let mut cursor_owner = None;
     assert!(
         swapchain
-            .return_worker_queued_for_replan(token, submission_fence, &mut cursor_owner)
+            .return_worker_queued_for_replan(token, &mut submission_fence, &mut cursor_owner)
             .unwrap()
     );
     assert_eq!(swapchain.worker_queued_slot(), None);
@@ -1034,11 +1039,12 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
         )
         .unwrap();
     let mut retry_cursor_owner = None;
+    let mut retry_fence = Some(retry_fence);
     assert_eq!(swapchain.worker_queued_slot(), Some(slot));
     swapchain
         .return_worker_queued_for_replan(
             PageFlipToken::new(722).unwrap(),
-            retry_fence,
+            &mut retry_fence,
             &mut retry_cursor_owner,
         )
         .unwrap();

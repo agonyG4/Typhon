@@ -141,7 +141,8 @@ pub(crate) use session::{
 #[cfg(test)]
 pub(crate) use session_io::NativeIoRecorder;
 pub(crate) use session_io::{
-    NativeIoOperation, NativeSessionIo, NativeSuspendedReadiness, continue_native_output_recovery,
+    NativeIoOperation, NativeSessionIo, NativeSuspendedReadiness,
+    abort_native_output_recovery_for_suspend, continue_native_output_recovery,
     quiesce_and_acknowledge, recover_native_output, service_suspended_sources,
     teardown_without_drm_io,
 };

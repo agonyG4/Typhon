@@ -11,6 +11,13 @@ use oblivion_one::native::kms::FramebufferId;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+#[test]
+fn seat_disable_wins_over_a_same_batch_recovery_fence_wake() {
+    assert!(!should_continue_resuming_recovery(true, true, true));
+    assert!(should_continue_resuming_recovery(true, true, false));
+    assert!(!should_continue_resuming_recovery(true, false, false));
+}
+
 fn worker_test_target() -> PresentationTarget {
     PresentationTarget {
         sequence: 1,

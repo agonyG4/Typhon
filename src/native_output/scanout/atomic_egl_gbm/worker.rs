@@ -50,7 +50,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn suspend_abandon_worker_submission(
         &mut self,
         token: PageFlipToken,
-        completion_fence: Option<OwnedFd>,
+        completion_fence: &mut Option<OwnedFd>,
     ) -> io::Result<()> {
         self.swapchain_mut()?
             .suspend_abandon_worker_queued_with_completion_fence(token, completion_fence)?;
@@ -60,7 +60,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn restore_worker_queued_submission_fence(
         &mut self,
         token: PageFlipToken,
-        submission_fence: OwnedFd,
+        submission_fence: &mut Option<OwnedFd>,
     ) -> io::Result<()> {
         self.swapchain_mut()?
             .restore_worker_queued_submission_fence(token, submission_fence)
@@ -69,7 +69,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn return_worker_submission_for_replan(
         &mut self,
         token: PageFlipToken,
-        submission_fence: OwnedFd,
+        submission_fence: &mut Option<OwnedFd>,
         cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<()> {
         if !self.swapchain_mut()?.return_worker_queued_for_replan(

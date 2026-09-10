@@ -842,7 +842,7 @@ impl NativeRuntime {
                 } else {
                     self.scanout.suspend_abandon_worker_submission(
                         ownership.job.token,
-                        ownership.out_fence.take(),
+                        &mut ownership.out_fence,
                     )
                 };
                 if let Err(error) = result {

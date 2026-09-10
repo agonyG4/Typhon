@@ -775,17 +775,16 @@ impl NativeRuntime {
         ));
     }
 
-    fn dispatch_runtime_seat_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
+    fn dispatch_runtime_seat_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<bool> {
         if !wakeup.reasons.seat() {
-            return Ok(());
+            return Ok(false);
         }
         let Some(seat) = self.seat_session.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         NativeSessionIo::observe(self, NativeIoOperation::SeatDispatch);
         seat.dispatch()?;
-        self.consume_pending_seat_events(&seat)?;
-        Ok(())
+        self.consume_pending_seat_events(&seat)
     }
 
     fn consume_pending_seat_events(&mut self, seat: &NativeSeatSession) -> NativeResult<bool> {
@@ -806,6 +805,24 @@ impl NativeRuntime {
                 Some(NativeSessionTransition::BeginSuspend) => self.suspend_native_session(seat)?,
                 Some(NativeSessionTransition::BeginResume) if self.shutdown.is_running() => {
                     self.resume_native_session()?
+                }
+                Some(NativeSessionTransition::AbortResumeForSuspend) => {
+                    abort_native_output_recovery_for_suspend(self)?;
+                    if seat.acknowledge_disable()? {
+                        NativeSessionIo::observe(self, NativeIoOperation::SeatDisableAcknowledged);
+                    } else {
+                        return Err(io::Error::other(
+                            "stale libseat disable acknowledgment during recovery abort",
+                        )
+                        .into());
+                    }
+                    self.session
+                        .finish_resume_abort_for_suspend()
+                        .ok_or_else(|| {
+                            io::Error::other("native session recovery abort lost Resuming state")
+                        })?;
+                    self.log_session_transition("resuming", "suspended", "disable_during_recovery");
+                    self.arm_suspended_deadline()?;
                 }
                 Some(NativeSessionTransition::BeginResume) => {
                     self.session.cancel_resume_for_shutdown();

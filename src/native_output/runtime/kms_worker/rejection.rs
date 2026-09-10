@@ -8,8 +8,10 @@ use super::super::presentation_transactions::{
 };
 use super::direct_rejection::WorkerRejectionKind;
 use crate::native_output::scanout::{AtomicEglGbmScanout, FrozenCursorPlaneOwner};
+#[cfg(test)]
 use std::os::fd::OwnedFd;
 
+#[cfg(test)]
 fn take_primary_submission_fence(job: &mut KmsCommitJob) -> Option<OwnedFd> {
     match &mut job.primary {
         KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
@@ -31,6 +33,7 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     kms_commit_worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+    emergency_worker_jobs: &mut Vec<KmsCommitJob>,
 ) -> NativeResult<()> {
     scene_history.discard_submission(job.token.get());
     let sidecar_transaction_id = job
@@ -52,8 +55,6 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
                     PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                 )
             });
-    let completion_fence =
-        (!compatibility_primary).then(|| take_primary_submission_fence(&mut job));
     if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
         let cursor = atomic_cursor
             .as_mut()
@@ -92,9 +93,22 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             )
             .into());
         } else {
-            scanout
-                .suspend_abandon_worker_submission(job.token, completion_fence.flatten())
-                .map_err(io::Error::other)?;
+            let transfer = match &mut job.primary {
+                KmsPrimaryUpdate::Framebuffer { in_fence, .. } => {
+                    scanout.suspend_abandon_worker_submission(job.token, in_fence)
+                }
+                KmsPrimaryUpdate::Unchanged => {
+                    let mut no_completion_fence = None;
+                    scanout.suspend_abandon_worker_submission(job.token, &mut no_completion_fence)
+                }
+            };
+            if let Err(error) = transfer {
+                eprintln!(
+                    "native KMS worker: queued output suspension failed; retaining emergency ownership: {error}"
+                );
+                emergency_worker_jobs.push(job);
+                return Err(io::Error::other(error).into());
+            }
         }
     }
     let direct_obligations = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
@@ -293,15 +307,6 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
-        let explicit_primary_fence =
-            if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
-                && !compatibility_primary
-            {
-                take_primary_submission_fence(&mut job)
-            } else {
-                None
-            };
-
         if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
@@ -336,20 +341,38 @@ impl NativeRuntime {
         };
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
             if compatibility_primary {
+                let mut no_submission_fence = None;
                 self.scanout
-                    .return_worker_submission_for_replan(job.token, None, &mut cursor_owner)
+                    .return_worker_submission_for_replan(
+                        job.token,
+                        &mut no_submission_fence,
+                        &mut cursor_owner,
+                    )
                     .map_err(io::Error::other)?;
             } else {
-                let result = self.scanout.return_worker_submission_for_replan(
-                    job.token,
-                    explicit_primary_fence,
-                    &mut cursor_owner,
-                );
+                let result = match &mut job.primary {
+                    KmsPrimaryUpdate::Framebuffer { in_fence, .. } => {
+                        self.scanout.return_worker_submission_for_replan(
+                            job.token,
+                            in_fence,
+                            &mut cursor_owner,
+                        )
+                    }
+                    KmsPrimaryUpdate::Unchanged => {
+                        let mut no_submission_fence = None;
+                        self.scanout.return_worker_submission_for_replan(
+                            job.token,
+                            &mut no_submission_fence,
+                            &mut cursor_owner,
+                        )
+                    }
+                };
                 if let Err(error) = result {
                     if let Some(owner) = cursor_owner.take() {
                         debug_assert!(job.cursor_pin.is_none());
                         job.cursor_pin = owner.pin;
                     }
+                    self.emergency_quarantined_worker_jobs.push(job);
                     return Err(io::Error::other(error).into());
                 }
             }
@@ -571,8 +594,6 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
-        let completion_fence =
-            (!compatibility_primary).then(|| take_primary_submission_fence(&mut job));
         if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
@@ -614,9 +635,23 @@ impl NativeRuntime {
                     .suspend_abandon_worker_compatibility(job.token)
                     .map_err(io::Error::other)?;
             } else {
-                self.scanout
-                    .suspend_abandon_worker_submission(job.token, completion_fence.flatten())
-                    .map_err(io::Error::other)?;
+                let transfer = match &mut job.primary {
+                    KmsPrimaryUpdate::Framebuffer { in_fence, .. } => self
+                        .scanout
+                        .suspend_abandon_worker_submission(job.token, in_fence),
+                    KmsPrimaryUpdate::Unchanged => {
+                        let mut no_completion_fence = None;
+                        self.scanout
+                            .suspend_abandon_worker_submission(job.token, &mut no_completion_fence)
+                    }
+                };
+                if let Err(error) = transfer {
+                    eprintln!(
+                        "native KMS worker: queued output suspension failed; retaining emergency ownership: {error}"
+                    );
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(io::Error::other(error).into());
+                }
             }
         }
         let direct_obligations = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {

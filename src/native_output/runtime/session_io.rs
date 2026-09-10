@@ -28,6 +28,7 @@ pub(crate) enum NativeIoOperation {
     DrmSourceUnregister,
     DrmSourceRegister,
     KmsRecovery,
+    SessionRecoveryAbort,
     KmsRestore,
     KmsTargetDestroy,
     AtomicCommit,
@@ -72,6 +73,9 @@ pub(crate) trait NativeSessionIo {
     fn unregister_drm_source(&mut self) -> NativeResult<()>;
     fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()>;
     fn recover_kms_pipeline(&mut self) -> NativeResult<()>;
+    fn abort_recovery_for_session_suspend(&mut self) -> NativeResult<()> {
+        Ok(())
+    }
     fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress>;
     fn register_suspended_recovery_fence(
         &mut self,
@@ -155,6 +159,13 @@ pub(crate) fn recover_native_output(
     io.observe(NativeIoOperation::KmsRecovery);
     io.recover_kms_pipeline()?;
     finish_native_output_recovery(io)
+}
+
+pub(crate) fn abort_native_output_recovery_for_suspend(
+    io: &mut impl NativeSessionIo,
+) -> NativeResult<()> {
+    io.observe(NativeIoOperation::SessionRecoveryAbort);
+    io.abort_recovery_for_session_suspend()
 }
 
 pub(crate) fn continue_native_output_recovery(
@@ -375,6 +386,20 @@ impl NativeSessionIo for NativeRuntime {
                 NativePerfField::u64("prepared_generation", generation),
             ]
         });
+        Ok(())
+    }
+
+    fn abort_recovery_for_session_suspend(&mut self) -> NativeResult<()> {
+        if let Some(token) = self.output_render_fence_token.take()
+            && let Err(error) = self.event_loop.unregister(token)
+        {
+            self.output_render_fence_token = Some(token);
+            return Err(error.into());
+        }
+        self.pending_session_recovery = None;
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.suspend_for_session();
+        }
         Ok(())
     }
 
@@ -650,6 +675,7 @@ mod tests {
         CursorSessionRetire,
         DisableAck,
         KmsRecovery,
+        RecoveryAbort,
         PageflipRetire,
         SuspendedFenceWatch,
         ExplicitSyncRearm,
@@ -824,6 +850,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn abort_recovery_for_session_suspend(&mut self) -> NativeResult<()> {
+            self.push(Operation::RecoveryAbort);
+            Ok(())
         }
         fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress> {
             if self.recovery_completed {
@@ -1082,6 +1112,110 @@ mod tests {
         assert_eq!(recorder.suspended_fence_watch_count, 1);
         assert!(!recorder.operations.contains(&Operation::PageflipSubmit));
         assert!(!recorder.operations.contains(&Operation::ScanoutPresent));
+    }
+
+    #[test]
+    fn disable_while_resume_waits_aborts_recovery_before_acknowledging_suspend() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        lifecycle.begin_for_event(NativeSeatEvent::Disabled);
+        lifecycle.finish_suspend();
+        lifecycle.begin_for_event(NativeSeatEvent::Enabled);
+        let mut recorder = Recorder {
+            suspended_fences_remaining: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::WaitingForSuspendedFence
+        );
+
+        abort_native_output_recovery_for_suspend(&mut recorder).unwrap();
+        recorder.observe(NativeIoOperation::SeatDisableAcknowledged);
+        recorder.push(Operation::DisableAck);
+        lifecycle.finish_resume_abort_for_suspend();
+
+        assert_eq!(lifecycle.state(), NativeSessionState::Suspended);
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|operation| **operation == Operation::DisableAck)
+                .count(),
+            1
+        );
+        assert!(recorder.operations.contains(&Operation::RecoveryAbort));
+        assert!(!recorder.operations.contains(&Operation::InputResume));
+        assert!(!recorder.operations.contains(&Operation::SchedulerRearm));
+        assert!(!recorder.operations.contains(&Operation::DrmRegister));
+        assert!(!recorder.operations.contains(&Operation::ExplicitSyncRearm));
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|operation| **operation == Operation::PageflipRetire)
+                .count(),
+            1
+        );
+        let abort = recorder
+            .native_io
+            .operations()
+            .iter()
+            .position(|operation| *operation == NativeIoOperation::SessionRecoveryAbort)
+            .unwrap();
+        let ack = recorder
+            .native_io
+            .operations()
+            .iter()
+            .position(|operation| *operation == NativeIoOperation::SeatDisableAcknowledged)
+            .unwrap();
+        assert!(abort < ack);
+    }
+
+    #[test]
+    fn aborted_resume_can_start_a_fresh_recovery_without_double_retirement() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        lifecycle.begin_for_event(NativeSeatEvent::Disabled);
+        lifecycle.finish_suspend();
+        lifecycle.begin_for_event(NativeSeatEvent::Enabled);
+        let mut recorder = Recorder {
+            suspended_fences_remaining: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::WaitingForSuspendedFence
+        );
+        abort_native_output_recovery_for_suspend(&mut recorder).unwrap();
+        recorder.push(Operation::DisableAck);
+        lifecycle.finish_resume_abort_for_suspend();
+        assert_eq!(lifecycle.state(), NativeSessionState::Suspended);
+
+        lifecycle.begin_for_event(NativeSeatEvent::Enabled);
+        recorder.suspended_fences_remaining = 0;
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::Complete
+        );
+        lifecycle.finish_resume();
+
+        assert_eq!(lifecycle.state(), NativeSessionState::Active);
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|operation| **operation == Operation::InputResume)
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|operation| **operation == Operation::PageflipRetire)
+                .count(),
+            2
+        );
     }
 
     #[test]

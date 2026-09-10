@@ -9,7 +9,7 @@ use super::super::presentation_worker::promote_pageflip_and_publish;
 use super::super::*;
 use super::cycle_direct;
 use crate::native_output::kms_worker::{
-    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
+    KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
     KmsWorkerQueuedCancellation,
 };
 use crate::native_output::presentation::plane::{
@@ -204,6 +204,7 @@ fn abandon_overtaken_worker_queued(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
+    emergency_worker_jobs: &mut Vec<KmsCommitJob>,
 ) -> NativeResult<()> {
     let owner_target = owner
         .frame
@@ -235,6 +236,7 @@ fn abandon_overtaken_worker_queued(
                 server,
                 output_transactions,
                 Some(worker),
+                emergency_worker_jobs,
             )
         }
         KmsWorkerQueuedCancellation::NotQueued { phase } => Err(io::Error::other(format!(
@@ -262,6 +264,14 @@ fn register_suspended_fence_if_needed(
     Ok(())
 }
 
+fn should_continue_resuming_recovery(
+    output_render_fence_wake: bool,
+    session_is_resuming: bool,
+    disabled_observed: bool,
+) -> bool {
+    output_render_fence_wake && session_is_resuming && !disabled_observed
+}
+
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
@@ -276,9 +286,12 @@ impl NativeRuntime {
         let deferred_worker_pageflip = self.deferred_worker_pageflip.take();
         let deferred_worker_completion = self.deferred_worker_completion.take();
         let worker_timeout_pending = self.worker_timeout_pending.take();
-        self.dispatch_runtime_seat_events(&wakeup)?;
-        let resuming_recovery_wake =
-            wakeup.reasons.output_render_fence() && self.session.is_resuming();
+        let disabled_observed = self.dispatch_runtime_seat_events(&wakeup)?;
+        let resuming_recovery_wake = should_continue_resuming_recovery(
+            wakeup.reasons.output_render_fence(),
+            self.session.is_resuming(),
+            disabled_observed,
+        );
         if resuming_recovery_wake {
             if let Some(token) = self.output_render_fence_token.take() {
                 self.event_loop.unregister(token)?;
@@ -326,6 +339,7 @@ impl NativeRuntime {
             kms_commit_worker,
             kms_commit_worker_transport,
             submitted_worker_ownership,
+            emergency_quarantined_worker_jobs,
             deferred_worker_pageflip: _,
             deferred_worker_completion: _,
             worker_timeout_pending: _,
@@ -388,7 +402,7 @@ impl NativeRuntime {
                 ]
             });
         }
-        if wakeup.reasons.output_render_fence() && !resuming_recovery_wake {
+        if wakeup.reasons.output_render_fence() && !resuming_recovery_wake && !disabled_observed {
             if let Some(token) = output_render_fence_token.take() {
                 event_loop.unregister(token)?;
             }
@@ -1002,6 +1016,7 @@ impl NativeRuntime {
                                     atomic_commit_arbiter,
                                     server,
                                     output_transactions,
+                                    emergency_quarantined_worker_jobs,
                                 )
                                 .is_ok();
                                 frame_pacing.note_physical_claim_overtake_recovery(recovered);

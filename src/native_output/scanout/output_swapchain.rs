@@ -832,7 +832,7 @@ impl AtomicOutputSwapchain {
     pub(crate) fn return_worker_queued_for_replan(
         &mut self,
         token: PageFlipToken,
-        submission_fence: OwnedFd,
+        submission_fence: &mut Option<OwnedFd>,
         cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<bool> {
         if self.quarantine.is_some() {
@@ -845,27 +845,33 @@ impl AtomicOutputSwapchain {
                 "cannot return worker output while another frame is ready",
             ));
         }
-        let Some(mut queued) = self.worker_queued.take() else {
+        let Some(queued) = self.worker_queued.as_ref() else {
             return Ok(false);
         };
         if queued.token != token {
-            self.worker_queued = Some(queued);
             return Err(io::Error::other(
                 "re-planned worker output token does not match queued ownership",
             ));
         }
         if queued.frame.pool_generation != self.pool_generation {
-            self.worker_queued = Some(queued);
             return Err(io::Error::other(
                 "re-planned worker output frame belongs to an old pool generation",
             ));
         }
         if queued.frame.frozen_cursor_plane_owner.is_some() {
-            self.worker_queued = Some(queued);
             return Err(io::Error::other(
                 "re-planned worker output frame already owns a frozen cursor",
             ));
         }
+        if submission_fence.is_none() {
+            return Err(io::Error::other(
+                "re-planned worker output is missing its input fence",
+            ));
+        }
+        let mut queued = self
+            .worker_queued
+            .take()
+            .expect("worker was observed above");
         if let Err(error) = queued
             .frame
             .render_fence
@@ -1029,13 +1035,14 @@ impl AtomicOutputSwapchain {
         &mut self,
         token: PageFlipToken,
     ) -> io::Result<bool> {
-        self.suspend_abandon_worker_queued_with_completion_fence(token, None)
+        let mut no_completion_fence = None;
+        self.suspend_abandon_worker_queued_with_completion_fence(token, &mut no_completion_fence)
     }
 
     pub(crate) fn suspend_abandon_worker_queued_with_completion_fence(
         &mut self,
         token: PageFlipToken,
-        completion_fence: Option<OwnedFd>,
+        completion_fence: &mut Option<OwnedFd>,
     ) -> io::Result<bool> {
         self.ensure_suspendable()?;
         let Some(queued) = self.worker_queued.as_ref() else {
@@ -1056,11 +1063,13 @@ impl AtomicOutputSwapchain {
             .worker_queued
             .take()
             .expect("worker was observed above");
-        let timing_fence = queued
-            .frame
-            .render_fence
-            .take_timing_fd()
-            .or(completion_fence);
+        let timing_fence = queued.frame.render_fence.take_timing_fd();
+        let timing_fence = if timing_fence.is_some() {
+            let _ = completion_fence.take();
+            timing_fence
+        } else {
+            completion_fence.take()
+        };
         self.suspend_owned_slot(
             suspended_index,
             queued.frame.slot,
@@ -1073,7 +1082,7 @@ impl AtomicOutputSwapchain {
     pub(crate) fn restore_worker_queued_submission_fence(
         &mut self,
         token: PageFlipToken,
-        submission_fence: OwnedFd,
+        submission_fence: &mut Option<OwnedFd>,
     ) -> io::Result<()> {
         let queued = self
             .worker_queued
@@ -2121,7 +2130,7 @@ mod tests {
     use crate::native_output::presentation::plane::{
         FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation, PresentedCursorDelivery,
     };
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_render_fence() -> NativeRenderFence {
@@ -2132,6 +2141,145 @@ mod tests {
         );
         unsafe { libc::close(pipe[1]) };
         NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) })
+    }
+
+    fn fd_is_open(fd: i32) -> bool {
+        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+    }
+
+    #[test]
+    fn suspend_worker_completion_proof_stays_owned_on_token_error() {
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            OutputSlotSet::new([
+                OutputSlotId::new(0).unwrap(),
+                OutputSlotId::new(1).unwrap(),
+                OutputSlotId::new(2).unwrap(),
+            ])
+            .unwrap(),
+            OutputSlotId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let slot = swapchain.acquire_render_slot().unwrap();
+        swapchain
+            .finish_render(slot, 1, test_render_fence())
+            .unwrap();
+        let token = PageFlipToken::new(2).unwrap();
+        let (completion_fence, _) = swapchain
+            .take_ready_for_worker(token, MonotonicTimestampNs::new(1))
+            .unwrap();
+        let raw_fd = completion_fence.as_raw_fd();
+        let mut completion_fence = Some(completion_fence);
+
+        assert!(
+            swapchain
+                .suspend_abandon_worker_queued_with_completion_fence(
+                    PageFlipToken::new(3).unwrap(),
+                    &mut completion_fence,
+                )
+                .is_err()
+        );
+        assert!(fd_is_open(raw_fd));
+    }
+
+    #[test]
+    fn returned_worker_input_fence_stays_owned_on_token_error() {
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            OutputSlotSet::new([
+                OutputSlotId::new(0).unwrap(),
+                OutputSlotId::new(1).unwrap(),
+                OutputSlotId::new(2).unwrap(),
+            ])
+            .unwrap(),
+            OutputSlotId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let slot = swapchain.acquire_render_slot().unwrap();
+        swapchain
+            .finish_render(slot, 1, test_render_fence())
+            .unwrap();
+        let token = PageFlipToken::new(4).unwrap();
+        let (submission_fence, _) = swapchain
+            .take_ready_for_worker(token, MonotonicTimestampNs::new(1))
+            .unwrap();
+        let raw_fd = submission_fence.as_raw_fd();
+        let mut submission_fence = Some(submission_fence);
+
+        assert!(
+            swapchain
+                .restore_worker_queued_submission_fence(
+                    PageFlipToken::new(5).unwrap(),
+                    &mut submission_fence,
+                )
+                .is_err()
+        );
+        assert!(fd_is_open(raw_fd));
+    }
+
+    #[test]
+    fn returned_worker_input_fence_stays_owned_when_queue_is_missing() {
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            OutputSlotSet::new([
+                OutputSlotId::new(0).unwrap(),
+                OutputSlotId::new(1).unwrap(),
+                OutputSlotId::new(2).unwrap(),
+            ])
+            .unwrap(),
+            OutputSlotId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut fence = test_render_fence();
+        let submission_fence = fence.take_submission_fd().unwrap();
+        let raw_fd = submission_fence.as_raw_fd();
+        let mut submission_fence = Some(submission_fence);
+
+        assert!(
+            swapchain
+                .restore_worker_queued_submission_fence(
+                    PageFlipToken::new(6).unwrap(),
+                    &mut submission_fence,
+                )
+                .is_err()
+        );
+        assert!(submission_fence.is_some());
+        assert!(fd_is_open(raw_fd));
+    }
+
+    #[test]
+    fn suspend_worker_completion_proof_stays_owned_when_fatal_quarantine_blocks_suspend() {
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            OutputSlotSet::new([
+                OutputSlotId::new(0).unwrap(),
+                OutputSlotId::new(1).unwrap(),
+                OutputSlotId::new(2).unwrap(),
+            ])
+            .unwrap(),
+            OutputSlotId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let rendering_slot = swapchain.acquire_render_slot().unwrap();
+        swapchain
+            .quarantine_rendering(None, OutputQuarantineReason::AtomicSubmitFailure)
+            .unwrap();
+        assert_eq!(swapchain.quarantine_slot_id(), Some(rendering_slot));
+
+        let mut fence = test_render_fence();
+        let submission_fence = fence.take_submission_fd().unwrap();
+        let raw_fd = submission_fence.as_raw_fd();
+        let mut completion_fence = Some(submission_fence);
+        assert!(
+            swapchain
+                .suspend_abandon_worker_queued_with_completion_fence(
+                    PageFlipToken::new(7).unwrap(),
+                    &mut completion_fence,
+                )
+                .is_err()
+        );
+        assert!(completion_fence.is_some());
+        assert!(fd_is_open(raw_fd));
     }
 
     #[test]
@@ -2207,9 +2355,11 @@ mod tests {
             .take_ready_for_worker(token, now(1))
             .expect("frame enters worker queue")
             .0;
+        let mut submission_fence = Some(submission_fence);
         swapchain
-            .suspend_abandon_worker_queued_with_completion_fence(token, Some(submission_fence))
+            .suspend_abandon_worker_queued_with_completion_fence(token, &mut submission_fence)
             .expect("worker frame is retained for suspend");
+        assert!(submission_fence.is_none());
 
         assert!(
             !swapchain

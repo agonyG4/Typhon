@@ -83,7 +83,6 @@ where
     };
     let monotonic_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
     let fields = fields();
-    let line = render_line(trace_seq, monotonic_ns, event, &fields);
     if lifecycle {
         retain_lifecycle_line(&render_lifecycle_line(
             trace_seq,
@@ -95,6 +94,7 @@ where
     if !trace_enabled {
         return;
     }
+    let line = render_line(trace_seq, monotonic_ns, event, &fields);
     if !trace_output_allowed(lifecycle, output_index) {
         TRACE_RECORDS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -114,6 +114,15 @@ pub fn take_recent_lifecycle_trace() -> Vec<String> {
     let lines = std::mem::take(&mut records.lines);
     records.bytes = 0;
     lines.into_iter().collect()
+}
+
+#[cfg(test)]
+fn lifecycle_retained_bytes_for_test() -> usize {
+    LIFECYCLE_RECORDS
+        .get_or_init(|| Mutex::new(LifecycleRecords::default()))
+        .lock()
+        .expect("XWayland trace lifecycle mutex poisoned")
+        .bytes
 }
 
 pub fn render_line(trace_seq: u64, monotonic_ns: u64, event: &str, fields: &TraceFields) -> String {
@@ -297,7 +306,6 @@ mod tests {
     fn lifecycle_retention_is_bounded_for_pathological_text_properties() {
         let _guard = test_lock();
         reset_retention_for_test();
-        const TEST_BYTE_BUDGET: usize = 512 * 1024;
         let pathological = "x".repeat(64 * 1024);
         let fields = TraceFields::new()
             .field("app_id", pathological.clone())
@@ -308,15 +316,32 @@ mod tests {
         assert!(retained_line.len() <= MAX_LIFECYCLE_LINE_BYTES);
         assert!(retained_line.contains("app_id="));
         assert!(retained_line.contains("title="));
-        for index in 0..16 {
+        let record_count = MAX_LIFECYCLE_BYTES / MAX_LIFECYCLE_LINE_BYTES + 64;
+        for index in 0..record_count {
             retain_lifecycle_for_test(format!(
                 "window-{index} app_id={pathological} title={pathological}"
             ));
         }
 
         let retained = recent_lifecycle_records_for_test();
-        assert!(retained.iter().all(|line| line.len() <= 1024));
-        assert!(retained.iter().map(String::len).sum::<usize>() <= TEST_BYTE_BUDGET);
+        assert!(
+            retained
+                .iter()
+                .all(|line| line.len() <= MAX_LIFECYCLE_LINE_BYTES)
+        );
+        assert!(lifecycle_retained_bytes_for_test() <= MAX_LIFECYCLE_BYTES);
+        assert!(retained.len() <= MAX_LIFECYCLE_RECORDS);
+        assert!(!retained.iter().any(|line| line.contains("window-0")));
+        assert!(
+            retained
+                .last()
+                .is_some_and(|line| line.contains(&format!("window-{}", record_count - 1)))
+        );
+
+        let dumped = take_recent_lifecycle_trace();
+        assert_eq!(dumped, retained);
+        assert!(take_recent_lifecycle_trace().is_empty());
+        assert_eq!(lifecycle_retained_bytes_for_test(), 0);
     }
 
     #[test]
