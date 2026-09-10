@@ -271,20 +271,20 @@ prepared-detach atomicity and single-leaf cases, and managed XWayland restore
 and detach cases. No separate XWayland policy or scene/layout architecture was
 introduced.
 
-The focused closure checks passed on the clean v2.1 implementation before the
-shared checkout received unrelated blur-policy work: the maximized floating
-ledger regression, the tiled-maximized detach/reflow/restore/anchor regression,
-prepared-detach unit tests, and the XWayland ledger test. The exact required
-verification commands were then run against the shared checkout as follows:
+The focused closure checks passed on the current checkout: the maximized
+floating ledger regression, the tiled-maximized detach/reflow/restore/anchor
+regression, prepared-detach unit tests, and managed XWayland restore/detach
+tests. The exact required verification commands were then run against the
+shared checkout as follows:
 
-- `rtk run -- cargo fmt --check` — passed.
-- `rtk run -- cargo check --locked --all-targets` — blocked before closure
-  compilation by the unrelated, uncommitted blur-policy changes in the shared
-  checkout (`Cargo.toml`/`src/lib.rs` and incomplete `state_data.rs` updates).
-- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — same
-  unrelated pre-existing checkout blocker; not a closure diagnostic.
-- `rtk run -- cargo test --locked` — same unrelated checkout blocker; no
-  v2.1 test failure was reported.
+- `rtk run -- cargo fmt --check` — failed only on unrelated, uncommitted
+  blur-policy formatting changes; the closure files pass targeted rustfmt.
+- `rtk run -- cargo check --locked --all-targets` — passed.
+- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — blocked by
+  unrelated blur-assignment test errors (`resolver()` calls in the shared
+  uncommitted work).
+- `rtk run -- cargo test --locked` — blocked by the same unrelated
+  blur-assignment test errors; no closure test failed.
 - `rtk git diff --check` — passed.
 - `rtk run -- bash bin/check-source-layout` — retains the repository's
   existing source-layout debt; no broad refactor was added here.
