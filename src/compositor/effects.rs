@@ -320,10 +320,7 @@ impl super::CompositorState {
                 else {
                     continue;
                 };
-                if assignment.source
-                    != crate::compositor::blur_assignment::BlurAssignmentSource::Client
-                    && self.has_existing_background_blur_instance(surface.surface_id)
-                {
+                if !self.is_effective_blur_assignment(&assignment) {
                     continue;
                 }
                 let Some(target_bounds) = assignment.region.bounding_rect() else {
@@ -844,6 +841,14 @@ impl super::CompositorState {
             )
             .any(|instance| instance.program == program && instance.anchor == anchor)
     }
+
+    pub(in crate::compositor) fn is_effective_blur_assignment(
+        &self,
+        assignment: &crate::compositor::blur_assignment::ResolvedBlurAssignment,
+    ) -> bool {
+        assignment.source == crate::compositor::blur_assignment::BlurAssignmentSource::Client
+            || !self.has_existing_background_blur_instance(assignment.target_surface_id)
+    }
 }
 
 fn effect_semantic_sort_key(instance: &ResolvedEffectInstance) -> (EffectSceneOrder, u64) {
@@ -1259,6 +1264,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn blur_status_effectiveness_uses_scene_suppression_predicate() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let region = EffectRegion::from_rect(EffectRect::new(10, 20, 80, 40).unwrap());
+        let synthesized = crate::compositor::blur_assignment::ResolvedBlurAssignment {
+            source: crate::compositor::blur_assignment::BlurAssignmentSource::WaylandAuto,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            target_surface_id: 42,
+            region: region.clone(),
+        };
+        let client = crate::compositor::blur_assignment::ResolvedBlurAssignment {
+            source: crate::compositor::blur_assignment::BlurAssignmentSource::Client,
+            anchor_scope: EffectAnchorScope::Surface,
+            target_surface_id: 42,
+            region: region.clone(),
+        };
+
+        assert!(state.is_effective_blur_assignment(&synthesized));
+        assert!(state.set_internal_surface_effect(
+            42,
+            EffectAnchor::BeforeSurface(42),
+            crate::effects::builtin_background_blur_program_id(),
+            region,
+        ));
+        assert!(!state.is_effective_blur_assignment(&synthesized));
+        assert!(state.is_effective_blur_assignment(&client));
     }
 
     #[test]

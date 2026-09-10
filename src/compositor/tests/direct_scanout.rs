@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::blur_policy::{BlurRuleAction, BlurWindowMatch, BlurWindowRule};
+use crate::blur_policy::{BlurBackend, BlurRuleAction, BlurWindowMatch, BlurWindowRule};
 
 fn fullscreen_enable_rule_config() -> crate::blur_policy::BlurPolicyConfig {
     let mut config = crate::blur_policy::BlurPolicyConfig::default();
@@ -9,7 +9,7 @@ fn fullscreen_enable_rule_config() -> crate::blur_policy::BlurPolicyConfig {
         matcher: BlurWindowMatch {
             app_id: Some("^oblivion\\.identity-viewport-test$".to_string()),
             title: None,
-            backend: Some("wayland".to_string()),
+            backend: Some(BlurBackend::Wayland),
         },
         action: BlurRuleAction::Enable,
     });

@@ -122,7 +122,7 @@ pub struct BlurWindowMatch {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
-    pub backend: Option<String>,
+    pub backend: Option<BlurBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +248,10 @@ mod tests {
         assert_eq!(
             config.window_rules[0].matcher.app_id.as_deref(),
             Some("^kitty$")
+        );
+        assert_eq!(
+            config.window_rules[0].matcher.backend,
+            Some(BlurBackend::Wayland)
         );
         assert_eq!(
             config.layer_rules[0].matcher.namespace.as_deref(),

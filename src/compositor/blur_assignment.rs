@@ -1,8 +1,8 @@
 use super::{RenderableSurface, SurfaceData, SurfaceOpaqueRegion, WindowBackend};
 use crate::blur_policy::{
-    BlurApplicationMode, BlurAssignment, BlurAssignmentCounts, BlurBackend, BlurPolicyConfig,
-    BlurPolicySnapshot, BlurRuleAction, BlurTargetKind, BlurWindowTarget, CompiledBlurRules,
-    SurfaceAlphaCapability,
+    BlurApplicationMode, BlurAssignment, BlurAssignmentCounts, BlurBackend, BlurLayerMode,
+    BlurPolicyConfig, BlurPolicySnapshot, BlurRuleAction, BlurTargetKind, BlurWindowTarget,
+    BlurXwaylandMode, CompiledBlurRules, SurfaceAlphaCapability,
 };
 use crate::compositor::effects::EffectAnchorScope;
 use crate::effects::{EffectRect, EffectRegion};
@@ -232,14 +232,19 @@ impl BlurAssignmentResolver {
         fullscreen: bool,
         client_request_committed: bool,
     ) -> Option<ResolvedBlurAssignment> {
+        let matching_action = self
+            .rules
+            .last_layer_action(crate::blur_policy::BlurLayerTarget { namespace });
         let decision = self.resolve_decision(
             BlurTargetKind::Layer,
-            self.rules
-                .last_layer_action(crate::blur_policy::BlurLayerTarget { namespace }),
+            matching_action,
             alpha_capability,
             full_opaque,
             fullscreen,
             client_request_committed,
+            self.config.layers.default == BlurLayerMode::ClientOnly
+                || matching_action == Some(BlurRuleAction::Enable),
+            true,
             false,
         )?;
         self.materialize_assignment(
@@ -262,6 +267,18 @@ impl BlurAssignmentResolver {
         fullscreen: bool,
         client_request_committed: bool,
     ) -> Option<BlurAssignmentDecision> {
+        let (client_allowed, enable_allowed, automatic_eligible) = match backend {
+            BlurBackend::Wayland => (
+                true,
+                self.config.applications.wayland != BlurApplicationMode::Disabled,
+                self.config.applications.wayland == BlurApplicationMode::Auto,
+            ),
+            BlurBackend::Xwayland => (
+                false,
+                self.config.applications.xwayland == BlurXwaylandMode::RulesOnly,
+                false,
+            ),
+        };
         self.resolve_decision(
             BlurTargetKind::Window,
             self.rules.last_window_action(BlurWindowTarget {
@@ -273,8 +290,9 @@ impl BlurAssignmentResolver {
             full_opaque,
             fullscreen,
             client_request_committed,
-            backend == BlurBackend::Wayland
-                && self.config.applications.wayland == BlurApplicationMode::Auto,
+            client_allowed,
+            enable_allowed,
+            automatic_eligible,
         )
     }
 
@@ -287,6 +305,8 @@ impl BlurAssignmentResolver {
         full_opaque: bool,
         fullscreen: bool,
         client_request_committed: bool,
+        client_allowed: bool,
+        enable_allowed: bool,
         automatic_eligible: bool,
     ) -> Option<BlurAssignmentDecision> {
         if !self.renderer_supported || !self.config.enabled {
@@ -295,13 +315,13 @@ impl BlurAssignmentResolver {
         if matching_action == Some(BlurRuleAction::Disable) {
             return None;
         }
-        if client_request_committed {
+        if client_request_committed && client_allowed {
             return Some(BlurAssignmentDecision {
                 source: BlurAssignmentSource::Client,
                 anchor_scope: EffectAnchorScope::Surface,
             });
         }
-        if matching_action == Some(BlurRuleAction::Enable) {
+        if matching_action == Some(BlurRuleAction::Enable) && enable_allowed {
             return Some(BlurAssignmentDecision {
                 source: if kind == BlurTargetKind::Window {
                     BlurAssignmentSource::WindowRule
@@ -455,6 +475,9 @@ impl super::CompositorState {
             else {
                 continue;
             };
+            if !self.is_effective_blur_assignment(&assignment) {
+                continue;
+            }
             match assignment.source {
                 BlurAssignmentSource::Client => counts.client += 1,
                 BlurAssignmentSource::WaylandAuto => counts.wayland_auto += 1,
@@ -688,6 +711,282 @@ mod tests {
         assert_eq!(client.source, BlurAssignmentSource::Client);
         assert_eq!(client.anchor_scope, EffectAnchorScope::Surface);
         assert!(client.region.contains_point(10, 50));
+    }
+
+    #[test]
+    fn wayland_modes_have_distinct_runtime_behavior() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let empty = EffectRegion::empty();
+
+        for mode in [BlurApplicationMode::Auto, BlurApplicationMode::RulesOnly] {
+            let mut config = BlurPolicyConfig::default();
+            config.applications.wayland = mode;
+            let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+            let client = resolver
+                .resolve_window_assignment(
+                    1,
+                    candidate.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::AlphaCapable,
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(client.source, BlurAssignmentSource::Client);
+        }
+
+        let mut config = BlurPolicyConfig::default();
+        config.applications.wayland = BlurApplicationMode::Auto;
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        let automatic = resolver
+            .resolve_window_assignment(
+                2,
+                empty.clone(),
+                candidate.clone(),
+                &empty,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Wayland,
+                SurfaceAlphaCapability::AlphaCapable,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(automatic.source, BlurAssignmentSource::WaylandAuto);
+
+        let mut config = BlurPolicyConfig::default();
+        config.applications.wayland = BlurApplicationMode::RulesOnly;
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        assert!(
+            resolver
+                .resolve_window_assignment(
+                    3,
+                    empty.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::AlphaCapable,
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+
+        let mut config = BlurPolicyConfig::default();
+        config.applications.wayland = BlurApplicationMode::Disabled;
+        config.window_rules = vec![window_rule(BlurRuleAction::Enable)];
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        let client = resolver
+            .resolve_window_assignment(
+                4,
+                candidate.clone(),
+                candidate.clone(),
+                &empty,
+                false,
+                Some("org.example.app"),
+                None,
+                BlurBackend::Wayland,
+                SurfaceAlphaCapability::Opaque,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(client.source, BlurAssignmentSource::Client);
+        assert!(
+            resolver
+                .resolve_window_assignment(
+                    5,
+                    empty,
+                    candidate,
+                    &EffectRegion::empty(),
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Wayland,
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xwayland_modes_control_rule_synthesized_blur() {
+        let mut config = BlurPolicyConfig {
+            window_rules: vec![BlurWindowRule {
+                name: "xwayland-rule".to_string(),
+                matcher: BlurWindowMatch {
+                    app_id: Some("org.example.app".to_string()),
+                    title: None,
+                    backend: Some(BlurBackend::Xwayland),
+                },
+                action: BlurRuleAction::Enable,
+            }],
+            ..BlurPolicyConfig::default()
+        };
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let empty = EffectRegion::empty();
+        let resolver = BlurAssignmentResolver::from_config(config.clone(), true).unwrap();
+        assert_eq!(
+            resolver
+                .resolve_window_assignment(
+                    1,
+                    empty.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Xwayland,
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .source,
+            BlurAssignmentSource::WindowRule
+        );
+
+        config.applications.xwayland = crate::blur_policy::BlurXwaylandMode::Disabled;
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        assert!(
+            resolver
+                .resolve_window_assignment(
+                    2,
+                    empty,
+                    candidate,
+                    &EffectRegion::empty(),
+                    false,
+                    Some("org.example.app"),
+                    None,
+                    BlurBackend::Xwayland,
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    false,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn layer_default_controls_unmatched_clients_but_rules_override_it() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 20).unwrap());
+        let empty = EffectRegion::empty();
+
+        let resolver = resolver();
+        assert_eq!(
+            resolver
+                .resolve_layer_assignment(
+                    1,
+                    candidate.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    "waybar",
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    true,
+                )
+                .unwrap()
+                .source,
+            BlurAssignmentSource::Client
+        );
+
+        let mut config = BlurPolicyConfig::default();
+        config.layers.default = crate::blur_policy::BlurLayerMode::Disabled;
+        config.layer_rules = vec![BlurLayerRule {
+            name: "waybar-enable".to_string(),
+            matcher: BlurLayerMatch {
+                namespace: Some("^waybar$".to_string()),
+            },
+            action: BlurRuleAction::Enable,
+        }];
+        let resolver = BlurAssignmentResolver::from_config(config, true).unwrap();
+        assert!(
+            resolver
+                .resolve_layer_assignment(
+                    2,
+                    candidate.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    "other-bar",
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    true,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            resolver
+                .resolve_layer_assignment(
+                    3,
+                    empty.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    "waybar",
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .source,
+            BlurAssignmentSource::LayerRule
+        );
+        assert_eq!(
+            resolver
+                .resolve_layer_assignment(
+                    4,
+                    candidate.clone(),
+                    candidate.clone(),
+                    &empty,
+                    false,
+                    "waybar",
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    true,
+                )
+                .unwrap()
+                .source,
+            BlurAssignmentSource::Client
+        );
+
+        let mut disable_config = BlurPolicyConfig::default();
+        disable_config.layers.default = crate::blur_policy::BlurLayerMode::Disabled;
+        disable_config.layer_rules = vec![BlurLayerRule {
+            name: "waybar-disable".to_string(),
+            matcher: BlurLayerMatch {
+                namespace: Some("^waybar$".to_string()),
+            },
+            action: BlurRuleAction::Disable,
+        }];
+        let resolver = BlurAssignmentResolver::from_config(disable_config, true).unwrap();
+        assert!(
+            resolver
+                .resolve_layer_assignment(
+                    5,
+                    candidate.clone(),
+                    candidate,
+                    &empty,
+                    false,
+                    "waybar",
+                    SurfaceAlphaCapability::Opaque,
+                    false,
+                    true,
+                )
+                .is_none()
+        );
     }
 
     #[test]

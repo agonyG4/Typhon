@@ -297,7 +297,7 @@ fn public_child_effects_follow_production_scene_order_not_identifiers() {
             matcher: crate::blur_policy::BlurWindowMatch {
                 app_id: Some("^org\\.example\\.visual-group$".to_string()),
                 title: None,
-                backend: Some("wayland".to_string()),
+                backend: Some(crate::blur_policy::BlurBackend::Wayland),
             },
             action: crate::blur_policy::BlurRuleAction::Enable,
         });

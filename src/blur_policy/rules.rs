@@ -58,7 +58,7 @@ struct CompiledWindowRule {
     name: String,
     app_id: Option<Regex>,
     title: Option<Regex>,
-    backend: Option<Regex>,
+    backend: Option<BlurBackend>,
     action: BlurRuleAction,
 }
 
@@ -89,7 +89,7 @@ impl CompiledBlurRules {
                     name: rule.name.clone(),
                     app_id: compile_optional(rule.matcher.app_id.as_deref(), "app_id")?,
                     title: compile_optional(rule.matcher.title.as_deref(), "title")?,
-                    backend: compile_optional(rule.matcher.backend.as_deref(), "backend")?,
+                    backend: rule.matcher.backend,
                     action: rule.action,
                 })
             })
@@ -121,10 +121,7 @@ impl CompiledBlurRules {
             .filter(|rule| {
                 matches_optional(&rule.app_id, target.app_id)
                     && matches_optional(&rule.title, target.title)
-                    && rule
-                        .backend
-                        .as_ref()
-                        .is_none_or(|pattern| pattern.is_match(target.backend.as_str()))
+                    && rule.backend.is_none_or(|backend| backend == target.backend)
             })
             .map(|rule| (rule.name.as_str(), rule.action))
             .next_back()
@@ -194,7 +191,7 @@ mod tests {
         name: &str,
         app_id: Option<&str>,
         title: Option<&str>,
-        backend: Option<&str>,
+        backend: Option<BlurBackend>,
         action: BlurRuleAction,
     ) -> BlurWindowRule {
         BlurWindowRule {
@@ -202,7 +199,7 @@ mod tests {
             matcher: super::super::model::BlurWindowMatch {
                 app_id: app_id.map(str::to_string),
                 title: title.map(str::to_string),
-                backend: backend.map(str::to_string),
+                backend,
             },
             action,
         }
@@ -216,7 +213,7 @@ mod tests {
                     "enable-editor",
                     Some("org.example.*"),
                     Some("Editor.*"),
-                    Some("wayland"),
+                    Some(BlurBackend::Wayland),
                     BlurRuleAction::Enable,
                 ),
                 window_rule(
@@ -253,6 +250,57 @@ mod tests {
                 backend: BlurBackend::Wayland
             }),
             Some(BlurRuleAction::Disable)
+        );
+    }
+
+    #[test]
+    fn backend_matching_is_exact_not_regex_substring_matching() {
+        let wayland_rules = CompiledBlurRules::compile(
+            &[window_rule(
+                "wayland-only",
+                None,
+                None,
+                Some(BlurBackend::Wayland),
+                BlurRuleAction::Enable,
+            )],
+            &[],
+        )
+        .expect("compile wayland backend rule");
+        assert_eq!(
+            wayland_rules.last_window_action(BlurWindowTarget {
+                app_id: None,
+                title: None,
+                backend: BlurBackend::Wayland,
+            }),
+            Some(BlurRuleAction::Enable)
+        );
+        assert_eq!(
+            wayland_rules.last_window_action(BlurWindowTarget {
+                app_id: None,
+                title: None,
+                backend: BlurBackend::Xwayland,
+            }),
+            None
+        );
+
+        let xwayland_rules = CompiledBlurRules::compile(
+            &[window_rule(
+                "xwayland-only",
+                None,
+                None,
+                Some(BlurBackend::Xwayland),
+                BlurRuleAction::Enable,
+            )],
+            &[],
+        )
+        .expect("compile xwayland backend rule");
+        assert_eq!(
+            xwayland_rules.last_window_action(BlurWindowTarget {
+                app_id: None,
+                title: None,
+                backend: BlurBackend::Xwayland,
+            }),
+            Some(BlurRuleAction::Enable)
         );
     }
 
