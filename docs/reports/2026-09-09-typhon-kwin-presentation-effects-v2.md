@@ -196,12 +196,15 @@ existing build directory. The final mandated verification results are:
 - `rtk run -- cargo fmt --check` — passed.
 - `rtk run -- cargo check --locked --all-targets` — passed.
 - `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — passed.
-- `rtk run -- cargo test --locked` — the focused and earlier full run passed
-  all presentation-related tests and 2,302 unit tests, with two ignored and
-  the integration/doc-test targets passing. A fresh final full run passed
-  2,301 tests and reported one unrelated XDG popup descriptor-growth failure
-  (`rapid_xdg_popup_cycles_leave_no_stale_popup_state`); rerunning that test
-  in isolation passed. No presentation-effects test failed.
+- `rtk run -- cargo test --locked` — an earlier complete run passed all
+  presentation-related tests and 2,302 unit tests, with two ignored and the
+  integration/doc-test targets passing. Two later complete attempts exposed
+  unrelated timing-sensitive failures: one reported XDG popup descriptor
+  growth (`rapid_xdg_popup_cycles_leave_no_stale_popup_state`), and another
+  reported that the KMS worker did not reach its in-flight state
+  (`completion_drain_is_one_shot_and_does_not_duplicate_settlement`). Each
+  failed test passed when rerun in isolation. No presentation-effects test
+  failed.
 - `rtk git diff --check` — passed.
 - `rtk run -- bash bin/check-source-layout` — failed on the repository's
   existing line-count policy violations. The task-touched files already over
@@ -217,10 +220,10 @@ The final codebase-memory coverage check reported `no_recorded_issue` with
 `metadata_match` for every operated source path. This is a best-effort index
 signal and not a completeness proof.
 
-The checkout contains unrelated renderer/Effects work in the shared history
-and a separate layer-shell test synchronization change in the working tree.
-Those changes were not included in the presentation-effects commit and were
-preserved separately.
+The checkout contains unrelated renderer/Effects work in the shared history.
+The one-line layer-shell command-barrier synchronization correction remains
+unstaged as a separate working-tree change; it does not alter presentation
+architecture.
 
 ## Hardware qualification status
 
