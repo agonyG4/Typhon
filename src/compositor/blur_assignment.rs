@@ -699,6 +699,7 @@ mod tests {
             window_rule(BlurRuleAction::Enable),
             window_rule(BlurRuleAction::Disable),
         ];
+        invalid.window_rules[0].matcher.app_id = Some("[".to_string());
         assert!(r.replace_config(invalid).is_err());
         assert_eq!(r.snapshot().generation, generation);
         let status = r.status(BlurAssignmentCounts {
