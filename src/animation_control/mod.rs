@@ -44,7 +44,7 @@ impl Default for AnimationControlState {
 impl AnimationControlState {
     pub fn from_environment() -> Self {
         let store = AnimationConfigurationStore::from_environment()
-            .unwrap_or_else(|error| AnimationConfigurationStore::unavailable(error));
+            .unwrap_or_else(AnimationConfigurationStore::unavailable);
         Self::from_store(store)
     }
 
@@ -101,13 +101,13 @@ impl AnimationControlState {
 
     pub fn effective_effect(&self, slot: AnimationSlot) -> AnimationEffect {
         let mut requested = self.configuration.requested_effect(slot).0;
-        if !self.configuration.overrides.contains_key(&slot) {
-            if let (Some(style), Some(_)) = (self.legacy_style, slot.geometry_kind()) {
-                requested = match style {
-                    PresentationAnimationStyle::Macos => AnimationEffect::GeometryMacos,
-                    PresentationAnimationStyle::Kde => AnimationEffect::GeometryKde,
-                };
-            }
+        if !self.configuration.overrides.contains_key(&slot)
+            && let (Some(style), Some(_)) = (self.legacy_style, slot.geometry_kind())
+        {
+            requested = match style {
+                PresentationAnimationStyle::Macos => AnimationEffect::GeometryMacos,
+                PresentationAnimationStyle::Kde => AnimationEffect::GeometryKde,
+            };
         }
         effect_for_request(slot, requested, self.configuration.enabled)
     }
@@ -253,8 +253,10 @@ mod tests {
             AnimationConfigurationStore::unavailable(AnimationPersistenceError::WriteFailed);
         let mut state = AnimationControlState::from_store(store);
         let before = state.snapshot();
-        let mut candidate = AnimationConfiguration::default();
-        candidate.preset = AnimationPreset::Macos;
+        let candidate = AnimationConfiguration {
+            preset: AnimationPreset::Macos,
+            ..AnimationConfiguration::default()
+        };
         assert_eq!(
             state.set_configuration(candidate),
             Err(AnimationPersistenceError::WriteFailed)
