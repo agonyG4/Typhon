@@ -18,7 +18,13 @@ pub const MAX_DOCUMENT_BYTES: usize = 16 * 1024;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnimationPersistenceError { Missing, Invalid, Insecure, Unavailable, WriteFailed }
+pub enum AnimationPersistenceError {
+    Missing,
+    Invalid,
+    Insecure,
+    Unavailable,
+    WriteFailed,
+}
 
 impl std::fmt::Display for AnimationPersistenceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,8 +74,13 @@ impl AnimationConfigurationStore {
         }
     }
 
-    fn new_with_policy(config_home: PathBuf, create_missing_config_home: bool) -> Result<Self, AnimationPersistenceError> {
-        if !config_home.is_absolute() { return Err(AnimationPersistenceError::Insecure); }
+    fn new_with_policy(
+        config_home: PathBuf,
+        create_missing_config_home: bool,
+    ) -> Result<Self, AnimationPersistenceError> {
+        if !config_home.is_absolute() {
+            return Err(AnimationPersistenceError::Insecure);
+        }
         let configuration_directory = config_home.join(ASTREA_DIRECTORY).join(TYPHON_DIRECTORY);
         Ok(Self {
             config_home,
@@ -81,78 +92,126 @@ impl AnimationConfigurationStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn configuration_file(&self) -> &Path { &self.configuration_file }
+    pub(crate) fn configuration_file(&self) -> &Path {
+        &self.configuration_file
+    }
 
     pub fn read(&self) -> Result<AnimationConfiguration, AnimationPersistenceError> {
         self.check_available()?;
         let metadata = match fs::symlink_metadata(&self.configuration_file) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(AnimationPersistenceError::Missing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(AnimationPersistenceError::Missing);
+            }
             Err(_) => return Err(AnimationPersistenceError::Insecure),
         };
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file()
-            || metadata.permissions().mode() & 0o777 != PRIVATE_FILE_MODE {
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.permissions().mode() & 0o777 != PRIVATE_FILE_MODE
+        {
             return Err(AnimationPersistenceError::Insecure);
         }
-        if metadata.len() > MAX_DOCUMENT_BYTES as u64 { return Err(AnimationPersistenceError::Invalid); }
-        let mut file = File::open(&self.configuration_file).map_err(|_| AnimationPersistenceError::Insecure)?;
+        if metadata.len() > MAX_DOCUMENT_BYTES as u64 {
+            return Err(AnimationPersistenceError::Invalid);
+        }
+        let mut file = File::open(&self.configuration_file)
+            .map_err(|_| AnimationPersistenceError::Insecure)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes).map_err(|_| AnimationPersistenceError::Invalid)?;
-        let document: AnimationConfigurationDocument = serde_json::from_slice(&bytes).map_err(|_| AnimationPersistenceError::Invalid)?;
-        AnimationConfiguration::from_document(document).map_err(|_| AnimationPersistenceError::Invalid)
+        file.read_to_end(&mut bytes)
+            .map_err(|_| AnimationPersistenceError::Invalid)?;
+        let document: AnimationConfigurationDocument =
+            serde_json::from_slice(&bytes).map_err(|_| AnimationPersistenceError::Invalid)?;
+        AnimationConfiguration::from_document(document)
+            .map_err(|_| AnimationPersistenceError::Invalid)
     }
 
-    pub fn write(&self, configuration: &AnimationConfiguration) -> Result<(), AnimationPersistenceError> {
+    pub fn write(
+        &self,
+        configuration: &AnimationConfiguration,
+    ) -> Result<(), AnimationPersistenceError> {
         self.check_available()?;
-        configuration.validate().map_err(|_| AnimationPersistenceError::Invalid)?;
-        let document = serde_json::to_vec(&configuration.to_document()).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-        if document.len() > MAX_DOCUMENT_BYTES { return Err(AnimationPersistenceError::Invalid); }
+        configuration
+            .validate()
+            .map_err(|_| AnimationPersistenceError::Invalid)?;
+        let document = serde_json::to_vec(&configuration.to_document())
+            .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+        if document.len() > MAX_DOCUMENT_BYTES {
+            return Err(AnimationPersistenceError::Invalid);
+        }
         self.open_directories_for_write()?;
         if let Ok(metadata) = fs::symlink_metadata(&self.configuration_file)
-            && (metadata.file_type().is_symlink() || !metadata.file_type().is_file()
-                || metadata.permissions().mode() & 0o777 != PRIVATE_FILE_MODE) {
+            && (metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || metadata.permissions().mode() & 0o777 != PRIVATE_FILE_MODE)
+        {
             return Err(AnimationPersistenceError::Insecure);
         }
         let temporary = self.configuration_directory.join(format!(
-            ".animations.json.tmp-{}-{}", std::process::id(), NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ".animations.json.tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| {
-            let mut file = OpenOptions::new().read(true).write(true).create_new(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).mode(PRIVATE_FILE_MODE)
-                .open(&temporary).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-            file.write_all(&document).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-            file.flush().map_err(|_| AnimationPersistenceError::WriteFailed)?;
-            file.sync_all().map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .mode(PRIVATE_FILE_MODE)
+                .open(&temporary)
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            file.write_all(&document)
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            file.flush()
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            file.sync_all()
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
             drop(file);
-            fs::rename(&temporary, &self.configuration_file).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-            File::open(&self.configuration_directory).and_then(|directory| directory.sync_all())
+            fs::rename(&temporary, &self.configuration_file)
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            File::open(&self.configuration_directory)
+                .and_then(|directory| directory.sync_all())
                 .map_err(|_| AnimationPersistenceError::WriteFailed)
         })();
-        if result.is_err() { let _ = fs::remove_file(&temporary); }
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
         result
     }
 
-    fn check_available(&self) -> Result<(), AnimationPersistenceError> { self.unavailable.map_or(Ok(()), Err) }
+    fn check_available(&self) -> Result<(), AnimationPersistenceError> {
+        self.unavailable.map_or(Ok(()), Err)
+    }
 
     fn open_directories_for_write(&self) -> Result<(), AnimationPersistenceError> {
         if !self.config_home.exists() {
-            if !self.create_missing_config_home { return Err(AnimationPersistenceError::WriteFailed); }
-            fs::create_dir_all(&self.config_home).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-            fs::set_permissions(&self.config_home, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            if !self.create_missing_config_home {
+                return Err(AnimationPersistenceError::WriteFailed);
+            }
+            fs::create_dir_all(&self.config_home)
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            fs::set_permissions(
+                &self.config_home,
+                fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+            )
+            .map_err(|_| AnimationPersistenceError::WriteFailed)?;
         }
         validate_directory(&self.config_home, false)?;
         let astrea = self.config_home.join(ASTREA_DIRECTORY);
         fs::create_dir_all(&astrea).map_err(|_| AnimationPersistenceError::WriteFailed)?;
         validate_directory(&astrea, true)?;
-        fs::create_dir_all(&self.configuration_directory).map_err(|_| AnimationPersistenceError::WriteFailed)?;
+        fs::create_dir_all(&self.configuration_directory)
+            .map_err(|_| AnimationPersistenceError::WriteFailed)?;
         validate_directory(&self.configuration_directory, true)
     }
 }
 
 fn validate_directory(path: &Path, require_private: bool) -> Result<(), AnimationPersistenceError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| AnimationPersistenceError::Insecure)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir()
-        || (require_private && metadata.permissions().mode() & 0o777 != PRIVATE_DIRECTORY_MODE) {
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || (require_private && metadata.permissions().mode() & 0o777 != PRIVATE_DIRECTORY_MODE)
+    {
         return Err(AnimationPersistenceError::Insecure);
     }
     Ok(())
@@ -161,10 +220,20 @@ fn validate_directory(path: &Path, require_private: bool) -> Result<(), Animatio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("typhon-animation-persistence-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "typhon-animation-persistence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
@@ -185,7 +254,14 @@ mod tests {
         let configuration = AnimationConfiguration::default();
         store.write(&configuration).unwrap();
         assert_eq!(store.read().unwrap(), configuration);
-        assert_eq!(fs::metadata(store.configuration_file()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(store.configuration_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -195,11 +271,23 @@ mod tests {
         let store = AnimationConfigurationStore::new(directory.clone()).unwrap();
         store.write(&AnimationConfiguration::default()).unwrap();
         fs::write(store.configuration_file(), b"not-json").unwrap();
-        fs::set_permissions(store.configuration_file(), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            store.configuration_file(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         assert_eq!(store.read(), Err(AnimationPersistenceError::Invalid));
         let value = serde_json::json!({"version": 99, "enabled": true, "preset": "astrea", "speed": 1.0, "overrides": {}});
-        fs::write(store.configuration_file(), serde_json::to_vec(&value).unwrap()).unwrap();
-        fs::set_permissions(store.configuration_file(), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            store.configuration_file(),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            store.configuration_file(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         assert_eq!(store.read(), Err(AnimationPersistenceError::Invalid));
         let _ = fs::remove_dir_all(directory);
     }

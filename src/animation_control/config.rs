@@ -19,13 +19,20 @@ pub struct AnimationConfiguration {
 
 impl Default for AnimationConfiguration {
     fn default() -> Self {
-        Self { enabled: true, preset: AnimationPreset::Astrea, speed: 1.0, overrides: BTreeMap::new() }
+        Self {
+            enabled: true,
+            preset: AnimationPreset::Astrea,
+            speed: 1.0,
+            overrides: BTreeMap::new(),
+        }
     }
 }
 
 impl AnimationConfiguration {
     pub fn validate(&self) -> Result<(), AnimationConfigurationError> {
-        if !self.speed.is_finite() || !(MIN_ANIMATION_SPEED..=MAX_ANIMATION_SPEED).contains(&self.speed) {
+        if !self.speed.is_finite()
+            || !(MIN_ANIMATION_SPEED..=MAX_ANIMATION_SPEED).contains(&self.speed)
+        {
             return Err(AnimationConfigurationError::InvalidSpeed);
         }
         if self.overrides.len() > MAX_ANIMATION_OVERRIDES {
@@ -49,7 +56,9 @@ impl AnimationConfiguration {
         }
     }
 
-    pub fn clear_overrides(&mut self) { self.overrides.clear(); }
+    pub fn clear_overrides(&mut self) {
+        self.overrides.clear();
+    }
 
     pub fn to_document(&self) -> AnimationConfigurationDocument {
         AnimationConfigurationDocument {
@@ -57,13 +66,21 @@ impl AnimationConfiguration {
             enabled: self.enabled,
             preset: self.preset.id().to_string(),
             speed: self.speed,
-            overrides: self.overrides.iter().map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string())).collect(),
+            overrides: self
+                .overrides
+                .iter()
+                .map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string()))
+                .collect(),
         }
     }
 
-    pub fn from_document(document: AnimationConfigurationDocument) -> Result<Self, AnimationConfigurationError> {
+    pub fn from_document(
+        document: AnimationConfigurationDocument,
+    ) -> Result<Self, AnimationConfigurationError> {
         if document.version != ANIMATION_CONFIGURATION_VERSION {
-            return Err(AnimationConfigurationError::UnsupportedVersion(document.version));
+            return Err(AnimationConfigurationError::UnsupportedVersion(
+                document.version,
+            ));
         }
         if document.overrides.len() > MAX_ANIMATION_OVERRIDES {
             return Err(AnimationConfigurationError::TooManyOverrides);
@@ -72,13 +89,20 @@ impl AnimationConfiguration {
             .ok_or_else(|| AnimationConfigurationError::UnknownPreset(document.preset.clone()))?;
         let mut overrides = BTreeMap::new();
         for (slot_id, effect_id) in document.overrides {
-            let slot = AnimationSlot::parse(&slot_id).ok_or(AnimationConfigurationError::UnknownSlot(slot_id))?;
-            let effect = AnimationEffect::parse(&effect_id).ok_or(AnimationConfigurationError::UnknownEffect(effect_id))?;
+            let slot = AnimationSlot::parse(&slot_id)
+                .ok_or(AnimationConfigurationError::UnknownSlot(slot_id))?;
+            let effect = AnimationEffect::parse(&effect_id)
+                .ok_or(AnimationConfigurationError::UnknownEffect(effect_id))?;
             if overrides.insert(slot, effect).is_some() {
                 return Err(AnimationConfigurationError::DuplicateSlot(slot));
             }
         }
-        let configuration = Self { enabled: document.enabled, preset, speed: document.speed, overrides };
+        let configuration = Self {
+            enabled: document.enabled,
+            preset,
+            speed: document.speed,
+            overrides,
+        };
         configuration.validate()?;
         Ok(configuration)
     }
@@ -104,8 +128,14 @@ pub enum AnimationConfigurationError {
     DuplicateSlot(AnimationSlot),
     InvalidSpeed,
     TooManyOverrides,
-    PlannedEffect { slot: AnimationSlot, effect: AnimationEffect },
-    IncompatibleEffect { slot: AnimationSlot, effect: AnimationEffect },
+    PlannedEffect {
+        slot: AnimationSlot,
+        effect: AnimationEffect,
+    },
+    IncompatibleEffect {
+        slot: AnimationSlot,
+        effect: AnimationEffect,
+    },
 }
 
 impl std::fmt::Display for AnimationConfigurationError {
@@ -118,8 +148,18 @@ impl std::fmt::Display for AnimationConfigurationError {
             Self::DuplicateSlot(slot) => write!(formatter, "duplicate slot {}", slot.id()),
             Self::InvalidSpeed => formatter.write_str("animation speed is outside 0.5..=2.0"),
             Self::TooManyOverrides => formatter.write_str("too many animation overrides"),
-            Self::PlannedEffect { slot, effect } => write!(formatter, "effect {} for slot {} is planned", effect.id(), slot.id()),
-            Self::IncompatibleEffect { slot, effect } => write!(formatter, "effect {} is incompatible with slot {}", effect.id(), slot.id()),
+            Self::PlannedEffect { slot, effect } => write!(
+                formatter,
+                "effect {} for slot {} is planned",
+                effect.id(),
+                slot.id()
+            ),
+            Self::IncompatibleEffect { slot, effect } => write!(
+                formatter,
+                "effect {} is incompatible with slot {}",
+                effect.id(),
+                slot.id()
+            ),
         }
     }
 }
@@ -142,26 +182,47 @@ mod tests {
     #[test]
     fn override_wins_and_clearing_restores_the_preset() {
         let mut config = AnimationConfiguration::default();
-        config.overrides.insert(AnimationSlot::WindowMove, AnimationEffect::GeometryMacos);
-        assert_eq!(config.requested_effect(AnimationSlot::WindowMove), (AnimationEffect::GeometryMacos, true));
+        config
+            .overrides
+            .insert(AnimationSlot::WindowMove, AnimationEffect::GeometryMacos);
+        assert_eq!(
+            config.requested_effect(AnimationSlot::WindowMove),
+            (AnimationEffect::GeometryMacos, true)
+        );
         config.clear_overrides();
-        assert_eq!(config.requested_effect(AnimationSlot::WindowMove), (AnimationEffect::GeometryKde, false));
+        assert_eq!(
+            config.requested_effect(AnimationSlot::WindowMove),
+            (AnimationEffect::GeometryKde, false)
+        );
     }
 
     #[test]
     fn invalid_speed_and_planned_manual_override_are_rejected() {
         let mut document = AnimationConfiguration::default().to_document();
         document.speed = 3.0;
-        assert_eq!(AnimationConfiguration::from_document(document), Err(AnimationConfigurationError::InvalidSpeed));
+        assert_eq!(
+            AnimationConfiguration::from_document(document),
+            Err(AnimationConfigurationError::InvalidSpeed)
+        );
         let mut document = AnimationConfiguration::default().to_document();
-        document.overrides.insert("window.minimize".into(), "minimize.lamp".into());
-        assert!(matches!(AnimationConfiguration::from_document(document), Err(AnimationConfigurationError::PlannedEffect { .. })));
+        document
+            .overrides
+            .insert("window.minimize".into(), "minimize.lamp".into());
+        assert!(matches!(
+            AnimationConfiguration::from_document(document),
+            Err(AnimationConfigurationError::PlannedEffect { .. })
+        ));
     }
 
     #[test]
     fn document_round_trips() {
         let mut config = AnimationConfiguration::default();
-        config.overrides.insert(AnimationSlot::WindowMove, AnimationEffect::GeometryMacos);
-        assert_eq!(AnimationConfiguration::from_document(config.to_document()).unwrap(), config);
+        config
+            .overrides
+            .insert(AnimationSlot::WindowMove, AnimationEffect::GeometryMacos);
+        assert_eq!(
+            AnimationConfiguration::from_document(config.to_document()).unwrap(),
+            config
+        );
     }
 }

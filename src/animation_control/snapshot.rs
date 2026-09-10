@@ -19,22 +19,35 @@ impl From<&AnimationConfiguration> for AnimationConfigurationSnapshot {
             enabled: configuration.enabled,
             preset: configuration.preset.id().to_string(),
             speed: configuration.speed,
-            overrides: configuration.overrides.iter().map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string())).collect(),
+            overrides: configuration
+                .overrides
+                .iter()
+                .map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string()))
+                .collect(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AnimationPresetCapability { pub id: String }
+pub struct AnimationPresetCapability {
+    pub id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AnimationSlotCapability { pub id: String, pub compatible_effects: Vec<String> }
+pub struct AnimationSlotCapability {
+    pub id: String,
+    pub compatible_effects: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AnimationEffectCapability { pub id: String, pub availability: String, pub compatible_slots: Vec<String> }
+pub struct AnimationEffectCapability {
+    pub id: String,
+    pub availability: String,
+    pub compatible_slots: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,16 +60,35 @@ pub struct AnimationCatalogSnapshot {
 impl Default for AnimationCatalogSnapshot {
     fn default() -> Self {
         Self {
-            presets: AnimationPreset::ALL.into_iter().map(|preset| AnimationPresetCapability { id: preset.id().to_string() }).collect(),
-            slots: AnimationSlot::ALL.into_iter().map(|slot| AnimationSlotCapability {
-                id: slot.id().to_string(),
-                compatible_effects: AnimationEffect::ALL.into_iter().filter(|effect| effect.compatible_with(slot)).map(|effect| effect.id().to_string()).collect(),
-            }).collect(),
-            effects: AnimationEffect::ALL.into_iter().map(|effect| AnimationEffectCapability {
-                id: effect.id().to_string(),
-                availability: effect.availability().to_string(),
-                compatible_slots: AnimationSlot::ALL.into_iter().filter(|slot| effect.compatible_with(*slot)).map(|slot| slot.id().to_string()).collect(),
-            }).collect(),
+            presets: AnimationPreset::ALL
+                .into_iter()
+                .map(|preset| AnimationPresetCapability {
+                    id: preset.id().to_string(),
+                })
+                .collect(),
+            slots: AnimationSlot::ALL
+                .into_iter()
+                .map(|slot| AnimationSlotCapability {
+                    id: slot.id().to_string(),
+                    compatible_effects: AnimationEffect::ALL
+                        .into_iter()
+                        .filter(|effect| effect.compatible_with(slot))
+                        .map(|effect| effect.id().to_string())
+                        .collect(),
+                })
+                .collect(),
+            effects: AnimationEffect::ALL
+                .into_iter()
+                .map(|effect| AnimationEffectCapability {
+                    id: effect.id().to_string(),
+                    availability: effect.availability().to_string(),
+                    compatible_slots: AnimationSlot::ALL
+                        .into_iter()
+                        .filter(|slot| effect.compatible_with(*slot))
+                        .map(|slot| slot.id().to_string())
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -86,9 +118,22 @@ mod tests {
         for slot in AnimationSlot::ALL {
             let effect = configuration.requested_effect(slot).0;
             requested.insert(slot.id().to_string(), effect.id().to_string());
-            effective.insert(slot.id().to_string(), effect_for_request(slot, effect, configuration.enabled).id().to_string());
+            effective.insert(
+                slot.id().to_string(),
+                effect_for_request(slot, effect, configuration.enabled)
+                    .id()
+                    .to_string(),
+            );
         }
-        let snapshot = AnimationControlSnapshot { generation: 0, source: "default".into(), startup_override: false, config: (&configuration).into(), requested, effective, catalog: AnimationCatalogSnapshot::default() };
+        let snapshot = AnimationControlSnapshot {
+            generation: 0,
+            source: "default".into(),
+            startup_override: false,
+            config: (&configuration).into(),
+            requested,
+            effective,
+            catalog: AnimationCatalogSnapshot::default(),
+        };
         assert_eq!(snapshot.requested["window.minimize"], "minimize.lamp");
         assert_eq!(snapshot.effective["window.minimize"], "none");
         assert!(serde_json::to_vec(&snapshot).unwrap().len() < 16 * 1024);

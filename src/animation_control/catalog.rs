@@ -119,7 +119,11 @@ impl AnimationEffect {
     }
 
     pub const fn availability(self) -> &'static str {
-        if self.is_available() { "available" } else { "planned" }
+        if self.is_available() {
+            "available"
+        } else {
+            "planned"
+        }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -134,7 +138,10 @@ impl AnimationEffect {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
             Self::MinimizeLamp | Self::MinimizeSquash => {
-                matches!(slot, AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore)
+                matches!(
+                    slot,
+                    AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore
+                )
             }
             Self::WorkspaceSlide => matches!(
                 slot,
@@ -213,7 +220,10 @@ mod tests {
         assert_eq!(AnimationSlot::ALL[0].id(), "window.move");
         assert_eq!(AnimationSlot::ALL[10].id(), "workspace.window-move");
         assert_eq!(AnimationEffect::ALL[5].id(), "minimize.lamp");
-        assert_eq!(AnimationPreset::ALL.map(AnimationPreset::id), ["astrea", "kde", "macos"]);
+        assert_eq!(
+            AnimationPreset::ALL.map(AnimationPreset::id),
+            ["astrea", "kde", "macos"]
+        );
     }
 
     #[test]
@@ -221,7 +231,10 @@ mod tests {
         let slot = AnimationSlot::WindowMinimize;
         let requested = AnimationPreset::Astrea.requested_effect(slot);
         assert_eq!(requested, AnimationEffect::MinimizeLamp);
-        assert_eq!(effect_for_request(slot, requested, true), AnimationEffect::None);
+        assert_eq!(
+            effect_for_request(slot, requested, true),
+            AnimationEffect::None
+        );
     }
 
     #[test]
@@ -233,9 +246,18 @@ mod tests {
             AnimationSlot::WindowMaximize,
             AnimationSlot::WindowFullscreen,
         ] {
-            assert_eq!(AnimationPreset::Astrea.requested_effect(slot), AnimationEffect::GeometryKde);
-            assert_eq!(AnimationPreset::Kde.requested_effect(slot), AnimationEffect::GeometryKde);
-            assert_eq!(AnimationPreset::Macos.requested_effect(slot), AnimationEffect::GeometryMacos);
+            assert_eq!(
+                AnimationPreset::Astrea.requested_effect(slot),
+                AnimationEffect::GeometryKde
+            );
+            assert_eq!(
+                AnimationPreset::Kde.requested_effect(slot),
+                AnimationEffect::GeometryKde
+            );
+            assert_eq!(
+                AnimationPreset::Macos.requested_effect(slot),
+                AnimationEffect::GeometryMacos
+            );
         }
     }
 

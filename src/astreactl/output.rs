@@ -169,8 +169,17 @@ fn format_animation(snapshot: &crate::animation_control::AnimationControlSnapsho
         String::new(),
     ];
     lines.extend(snapshot.effective.iter().map(|(slot, effect)| {
-        let requested = snapshot.requested.get(slot).map(String::as_str).unwrap_or(effect);
-        format!("{}: {} (requested {})", sanitize_terminal_text(slot), sanitize_terminal_text(effect), sanitize_terminal_text(requested))
+        let requested = snapshot
+            .requested
+            .get(slot)
+            .map(String::as_str)
+            .unwrap_or(effect);
+        format!(
+            "{}: {} (requested {})",
+            sanitize_terminal_text(slot),
+            sanitize_terminal_text(effect),
+            sanitize_terminal_text(requested)
+        )
     }));
     lines.join("\n")
 }

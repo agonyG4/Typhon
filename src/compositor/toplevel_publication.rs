@@ -490,7 +490,9 @@ impl AstreaToplevelPublisher {
         &self,
         window_id: WindowId,
     ) -> Option<MinimizeAnchorRect> {
-        self.minimize_anchors.get(&window_id).map(|anchor| anchor.rect)
+        self.minimize_anchors
+            .get(&window_id)
+            .map(|anchor| anchor.rect)
     }
 
     pub(in crate::compositor) fn needs_full_reconciliation(&self) -> bool {

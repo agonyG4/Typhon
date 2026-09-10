@@ -17,7 +17,10 @@ impl crate::compositor::CompositorState {
     pub(crate) fn set_animation_configuration(
         &mut self,
         configuration: crate::animation_control::AnimationConfiguration,
-    ) -> Result<crate::animation_control::AnimationControlSnapshot, crate::animation_control::AnimationPersistenceError> {
+    ) -> Result<
+        crate::animation_control::AnimationControlSnapshot,
+        crate::animation_control::AnimationPersistenceError,
+    > {
         let enabled = configuration.enabled;
         let snapshot = self.animation_control.set_configuration(configuration)?;
         self.presentation_animator.set_enabled(enabled);
@@ -26,16 +29,17 @@ impl crate::compositor::CompositorState {
 }
 
 impl OwnCompositorServer {
-    pub fn animation_control_snapshot(
-        &self,
-    ) -> crate::animation_control::AnimationControlSnapshot {
+    pub fn animation_control_snapshot(&self) -> crate::animation_control::AnimationControlSnapshot {
         self.state.animation_control_snapshot()
     }
 
     pub fn set_animation_configuration(
         &mut self,
         configuration: crate::animation_control::AnimationConfiguration,
-    ) -> Result<crate::animation_control::AnimationControlSnapshot, crate::animation_control::AnimationPersistenceError> {
+    ) -> Result<
+        crate::animation_control::AnimationControlSnapshot,
+        crate::animation_control::AnimationPersistenceError,
+    > {
         self.state.set_animation_configuration(configuration)
     }
 }
