@@ -456,14 +456,20 @@ impl CompositorState {
             self.presentation_animator.cancel(root_surface_id);
             return;
         };
-        if self.presentation_animator.sample(root_surface_id, now).is_some() {
+        if self
+            .presentation_animator
+            .sample(root_surface_id, now)
+            .is_some()
+        {
             if let Some(curve) = self.presentation_animator.transition_curve(root_surface_id) {
-                self.presentation_animator.retarget(root_surface_id, target, now, curve);
+                self.presentation_animator
+                    .retarget(root_surface_id, target, now, curve);
             } else {
                 self.presentation_animator.cancel(root_surface_id);
             }
         } else if let Some(curve) = self.animation_control.curve_for(kind) {
-            self.presentation_animator.start(root_surface_id, previous, target, now, curve);
+            self.presentation_animator
+                .start(root_surface_id, previous, target, now, curve);
         } else {
             self.presentation_animator.cancel(root_surface_id);
         }
