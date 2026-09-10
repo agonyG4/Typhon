@@ -621,6 +621,7 @@ pub struct CompositorState {
     locality_metrics: Cell<SurfaceLocalityMetrics>,
     active_scene_view: ActiveSceneView,
     presentation_animator: PresentationAnimator,
+    #[allow(dead_code)]
     presentation_animation_policy: PresentationAnimationPolicy,
     pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,
     presented_presentation: PresentationFrameSnapshot,

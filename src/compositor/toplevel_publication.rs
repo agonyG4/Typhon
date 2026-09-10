@@ -38,13 +38,13 @@ pub(crate) struct MinimizeAnchorRect {
     pub(crate) height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MinimizeAnchorOwner {
     client_id: ClientId,
     resource_id: ObjectId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MinimizeAnchor {
     rect: MinimizeAnchorRect,
     owner: MinimizeAnchorOwner,
@@ -485,6 +485,7 @@ impl AstreaToplevelPublisher {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn minimize_anchor_for_test(
         &self,
         window_id: WindowId,

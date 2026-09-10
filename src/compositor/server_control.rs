@@ -26,13 +26,13 @@ impl crate::compositor::CompositorState {
 }
 
 impl OwnCompositorServer {
-    pub(crate) fn animation_control_snapshot(
+    pub fn animation_control_snapshot(
         &self,
     ) -> crate::animation_control::AnimationControlSnapshot {
         self.state.animation_control_snapshot()
     }
 
-    pub(crate) fn set_animation_configuration(
+    pub fn set_animation_configuration(
         &mut self,
         configuration: crate::animation_control::AnimationConfiguration,
     ) -> Result<crate::animation_control::AnimationControlSnapshot, crate::animation_control::AnimationPersistenceError> {

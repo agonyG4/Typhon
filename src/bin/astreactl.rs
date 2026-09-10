@@ -387,7 +387,7 @@ fn parse_animation_command(
     match subcommand.as_str() {
         "get" if positionals.len() == 1 => Ok(("animation", "animation.config.get", serde_json::json!({}))),
         "set" if positionals.len() == 2 => {
-            let value = serde_json::from_str(&positionals[1])
+            let value: serde_json::Value = serde_json::from_str(&positionals[1])
                 .map_err(|_| AstreactlError::Usage("animation set requires a JSON configuration object".to_string()))?;
             if !value.is_object() {
                 return Err(AstreactlError::Usage("animation set requires a JSON configuration object".to_string()));
