@@ -333,6 +333,7 @@ fn quickshell_top_panel_reserves_usable_output_and_reconfigures_on_resize() {
             height: 900,
         })
         .unwrap();
+    wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.layer_surface_width, 1600);
     assert_eq!(state.layer_surface_height, 32);
