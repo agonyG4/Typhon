@@ -2171,6 +2171,49 @@ mod tests {
     }
 
     #[test]
+    fn c2_geometry_changes_repeat_graph_work_with_new_texture_geometry() {
+        let (scene, registry) = blur_scene();
+        let mut changed_instance = scene.instances[0].clone();
+        changed_instance.region =
+            EffectRegion::from_rect(EffectRect::new(100, 80, 640, 240).unwrap());
+        changed_instance.target_bounds = changed_instance.region.bounding_rect().unwrap();
+        let changed_scene = ResolvedEffectScene::new(scene.generation, vec![changed_instance]);
+        let source_damage = EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap());
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+
+        reset_peak_live_work_counters();
+        let FrameExecutionPlan::EffectGraph(original) =
+            compile_frame_execution_plan(&scene, &source_damage, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("original geometry workload must compile to an effect graph");
+        };
+        let original_counters = peak_live_work_counters();
+
+        reset_peak_live_work_counters();
+        let FrameExecutionPlan::EffectGraph(changed) =
+            compile_frame_execution_plan(&changed_scene, &source_damage, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("changed geometry workload must compile to an effect graph");
+        };
+        let changed_counters = peak_live_work_counters();
+
+        println!(
+            "C2 geometry-animation original={original_counters:?} changed={changed_counters:?}"
+        );
+        assert_ne!(original.textures, changed.textures);
+        assert_eq!(original_counters.graph_compiles, 1);
+        assert_eq!(changed_counters.graph_compiles, 1);
+        assert_eq!(original_counters.instance_compiles, 1);
+        assert_eq!(changed_counters.instance_compiles, 1);
+        assert_eq!(original_counters.program_lookup_map_builds, 1);
+        assert_eq!(changed_counters.program_lookup_map_builds, 1);
+        assert_eq!(original_counters.output_map_builds, 1);
+        assert_eq!(changed_counters.output_map_builds, 1);
+    }
+
+    #[test]
     fn unrelated_repair_prunes_separated_effect() {
         let (scene, registry) = separated_blur_scene();
         let first = scene.instances[0].clone();
