@@ -106,26 +106,6 @@
 
     <request name="destroy" type="destructor"/>
 
-    <request name="activate" since="2">
-      <arg name="token_hi" type="uint"/>
-      <arg name="token_lo" type="uint"/>
-    </request>
-
-    <request name="minimize" since="2">
-      <arg name="token_hi" type="uint"/>
-      <arg name="token_lo" type="uint"/>
-    </request>
-
-    <request name="restore" since="2">
-      <arg name="token_hi" type="uint"/>
-      <arg name="token_lo" type="uint"/>
-    </request>
-
-    <request name="close" since="2">
-      <arg name="token_hi" type="uint"/>
-      <arg name="token_lo" type="uint"/>
-    </request>
-
     <event name="identifier">
       <arg name="identifier" type="string"/>
     </event>
@@ -153,6 +133,26 @@
       <arg name="revision_lo" type="uint"/>
     </event>
     <event name="closed"/>
+
+    <request name="activate" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="minimize" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="restore" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="close" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
 
     <request name="set_minimize_anchor" since="3">
       <description summary="set the trusted shell minimize destination">

@@ -4,7 +4,7 @@ use super::config::{AnimationConfiguration, AnimationConfigurationDocument};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -210,11 +210,18 @@ fn validate_directory(path: &Path, require_private: bool) -> Result<(), Animatio
     let metadata = fs::symlink_metadata(path).map_err(|_| AnimationPersistenceError::Insecure)?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_dir()
+        || metadata.uid() != effective_uid()
+        || metadata.permissions().mode() & 0o022 != 0
         || (require_private && metadata.permissions().mode() & 0o777 != PRIVATE_DIRECTORY_MODE)
     {
         return Err(AnimationPersistenceError::Insecure);
     }
     Ok(())
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    unsafe { libc::geteuid() as u32 }
 }
 
 #[cfg(test)]

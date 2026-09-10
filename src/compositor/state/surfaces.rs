@@ -822,6 +822,12 @@ impl CompositorState {
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()
         };
+        // PresentationAnimator has its own compatibility defaults for older
+        // callers. The compositor-owned control plane is authoritative for
+        // the real runtime configuration, including persisted disablement.
+        state
+            .presentation_animator
+            .set_enabled(state.animation_control.enabled());
         state.rebuild_active_scene_view();
         state
     }
