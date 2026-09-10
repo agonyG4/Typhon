@@ -1,6 +1,64 @@
 use super::*;
 use std::collections::HashSet;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeSnapshotWorkCounters {
+    pub(crate) snapshot_builds: usize,
+    pub(crate) surface_projection_visits: usize,
+    pub(crate) visual_group_builds: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_SNAPSHOT_WORK_COUNTERS: std::cell::Cell<NativeSnapshotWorkCounters> =
+        const {
+            std::cell::Cell::new(NativeSnapshotWorkCounters {
+                snapshot_builds: 0,
+                surface_projection_visits: 0,
+                visual_group_builds: 0,
+            })
+        };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_native_snapshot_work_counters() {
+    NATIVE_SNAPSHOT_WORK_COUNTERS
+        .with(|counters| counters.set(NativeSnapshotWorkCounters::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn native_snapshot_work_counters() -> NativeSnapshotWorkCounters {
+    NATIVE_SNAPSHOT_WORK_COUNTERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_native_snapshot_build() {
+    NATIVE_SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.snapshot_builds += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_native_snapshot_surface_projection() {
+    NATIVE_SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.surface_projection_visits += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_native_snapshot_visual_group_build() {
+    NATIVE_SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.visual_group_builds += 1;
+        counters.set(value);
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeDamageSummary {
     pub(crate) kind: NativeDamageKind,
@@ -307,8 +365,12 @@ impl NativeSceneSnapshot {
         decorations: Vec<DecorationSceneSnapshot>,
         popup_surface_ids: &[u32],
     ) -> Self {
+        #[cfg(test)]
+        note_native_snapshot_build();
         let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
-        let visual_root_by_surface_id =
+        let visual_root_by_surface_id = {
+            #[cfg(test)]
+            note_native_snapshot_visual_group_build();
             oblivion_one::compositor::visual_stack_groups(surfaces, popup_surface_ids)
                 .into_iter()
                 .flat_map(|group| {
@@ -318,11 +380,14 @@ impl NativeSceneSnapshot {
                         .map(|&index| (surfaces[index].surface_id, group.root_surface_id()))
                         .collect::<Vec<_>>()
                 })
-                .collect::<HashMap<_, _>>();
+                .collect::<HashMap<_, _>>()
+        };
         let surfaces: Vec<NativeSceneSurfaceSnapshot> = elements
             .iter()
             .zip(surfaces)
             .map(|(element, surface)| {
+                #[cfg(test)]
+                note_native_snapshot_surface_projection();
                 let RenderSceneElementId::Surface(surface_id) = element.id();
                 let buffer_size = element.buffer_size();
                 let damage = match &surface.damage {

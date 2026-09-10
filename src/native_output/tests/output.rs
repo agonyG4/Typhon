@@ -5,6 +5,60 @@ use oblivion_one::effects::{EffectRect, EffectRegion};
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
 
 #[test]
+fn c2_native_snapshot_workloads_report_surface_and_visual_group_reconstruction() {
+    for surface_count in [1_usize, 16, 128] {
+        let surfaces = (0..surface_count)
+            .map(|index| {
+                test_renderable_surface(
+                    700 + u32::try_from(index).expect("test surface id fits"),
+                    i32::try_from(index % 16).expect("test x fits") * 24,
+                    i32::try_from(index / 16).expect("test y fits") * 24,
+                    16,
+                    16,
+                    RenderableSurfaceDamage::Empty,
+                )
+            })
+            .collect::<Vec<_>>();
+        reset_native_snapshot_work_counters();
+        let _snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(
+            &surfaces,
+            Vec::new(),
+            &surfaces
+                .last()
+                .map(|surface| surface.surface_id)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        let counters = native_snapshot_work_counters();
+        println!("C2 native surfaces={surface_count} counters={counters:?}");
+        assert_eq!(counters.snapshot_builds, 1);
+        assert_eq!(counters.surface_projection_visits, surface_count);
+        assert_eq!(counters.visual_group_builds, 1);
+    }
+
+    let mut deep_tree = Vec::with_capacity(32);
+    for index in 0..32_u32 {
+        let mut surface =
+            test_renderable_surface(900 + index, 0, 0, 16, 16, RenderableSurfaceDamage::Empty);
+        if index > 0 {
+            surface.placement = SurfacePlacement::subsurface(900 + index - 1, 1, 1);
+        }
+        deep_tree.push(surface);
+    }
+    reset_native_snapshot_work_counters();
+    let _snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(
+        &deep_tree,
+        Vec::new(),
+        &[deep_tree.last().expect("deep tree has a leaf").surface_id],
+    );
+    let counters = native_snapshot_work_counters();
+    println!("C2 native deep_tree=32 counters={counters:?}");
+    assert_eq!(counters.snapshot_builds, 1);
+    assert_eq!(counters.surface_projection_visits, 32);
+    assert_eq!(counters.visual_group_builds, 1);
+}
+
+#[test]
 fn native_damage_includes_old_and_new_effect_regions() {
     let previous = NativeSceneSnapshot::default();
     let current = NativeSceneSnapshot {

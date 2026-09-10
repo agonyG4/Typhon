@@ -919,7 +919,7 @@ impl AtomicEglGbmScanout {
             surface_damage,
             hardware_cursor_surface_id,
         ) = {
-            let resolved_snapshot = resolved_scene.snapshot();
+            let resolved_snapshot = resolved_scene.snapshot_owned();
             let resolved_scene_signature = resolved_scene.scene_identity_signature();
             let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
             let exact_cursor_commit = cursor_mode

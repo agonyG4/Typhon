@@ -35,6 +35,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             1,
         ),
     ];
+    let snapshot = NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new());
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Owned(renderer_surfaces.clone()),
         decorations: Vec::new(),
@@ -50,7 +51,8 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             visible_overlay_count: 0,
             rejection: None,
         },
-        snapshot: NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new()),
+        scene_identity_signature: snapshot.identity_signature(),
+        snapshot,
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample {
             sampled_at: AnimationTime::from_nanos(0),
@@ -101,6 +103,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         .expect("test surface uses SHM")
         .as_ptr();
     let surfaces = vec![surface];
+    let snapshot = NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new());
     let resolved_scene = ResolvedNativeFrameScene {
         surfaces: Cow::Borrowed(&surfaces),
         decorations: Vec::new(),
@@ -108,7 +111,8 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         external_overlay_surface_ids: Vec::new(),
         render_generation: 1,
         visibility: FullscreenRenderPlanMetrics::default(),
-        snapshot: NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new()),
+        scene_identity_signature: snapshot.identity_signature(),
+        snapshot,
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(7)),
         presentation_snapshot: PresentationFrameSnapshot::empty(),

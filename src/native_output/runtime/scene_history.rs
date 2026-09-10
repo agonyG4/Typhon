@@ -19,7 +19,7 @@ impl NativeFrameSceneSnapshot {
         Self {
             frame_id,
             render_generation: resolved.render_generation,
-            scene: resolved.snapshot(),
+            scene: resolved.snapshot_owned(),
             cursor_damage,
             presentation: resolved.presentation_snapshot.clone(),
         }

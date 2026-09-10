@@ -7,6 +7,63 @@ use oblivion_one::compositor::{
     PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample, ResolvedEffectScene,
 };
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SnapshotWorkCounters {
+    snapshot_finalizations: usize,
+    snapshot_owned_clones: usize,
+    identity_computations: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_WORK_COUNTERS: std::cell::Cell<SnapshotWorkCounters> =
+        const {
+            std::cell::Cell::new(SnapshotWorkCounters {
+                snapshot_finalizations: 0,
+                snapshot_owned_clones: 0,
+                identity_computations: 0,
+            })
+        };
+}
+
+#[cfg(test)]
+fn reset_snapshot_work_counters() {
+    SNAPSHOT_WORK_COUNTERS.with(|counters| counters.set(SnapshotWorkCounters::default()));
+}
+
+#[cfg(test)]
+fn snapshot_work_counters() -> SnapshotWorkCounters {
+    SNAPSHOT_WORK_COUNTERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_snapshot_finalization() {
+    SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.snapshot_finalizations += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_snapshot_owned_clone() {
+    SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.snapshot_owned_clones += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_identity_computation() {
+    SNAPSHOT_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.identity_computations += 1;
+        counters.set(value);
+    });
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) surfaces: Cow<'a, [RenderableSurface]>,
@@ -16,6 +73,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) render_generation: u64,
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
+    pub(crate) scene_identity_signature: u64,
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) presentation: PresentationSceneSample,
     pub(crate) presentation_snapshot: PresentationFrameSnapshot,
@@ -51,6 +109,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids();
         let render_generation = server.scene_render_generation();
+        let effects = server.resolved_effect_scene_for_presentation(&presentation);
         let snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(
             surfaces.as_ref(),
             decorations
@@ -59,7 +118,18 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 .collect(),
             popup_surface_ids.as_ref(),
         );
-        let effects = server.resolved_effect_scene_for_presentation(&presentation);
+        let (snapshot, scene_identity_signature) = finalize_snapshot(
+            snapshot,
+            popup_surface_ids.as_ref(),
+            &external_overlay_surface_ids,
+            visibility,
+            &effects,
+        );
+        #[cfg(test)]
+        {
+            note_snapshot_finalization();
+            note_identity_computation();
+        }
         Self {
             surfaces,
             decorations,
@@ -68,6 +138,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation,
             visibility,
             snapshot,
+            scene_identity_signature,
             effects,
             presentation,
             presentation_snapshot,
@@ -83,6 +154,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             render_generation: self.render_generation,
             visibility: self.visibility,
             snapshot: self.snapshot,
+            scene_identity_signature: self.scene_identity_signature,
             effects: self.effects,
             presentation: self.presentation,
             presentation_snapshot: self.presentation_snapshot,
@@ -100,10 +172,45 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             .map(|snapshot| snapshot.identity())
     }
 
-    pub(crate) fn visibility_signature(&self) -> u64 {
-        let metrics = self.visibility;
-        let mut signature = 0xcbf2_9ce4_8422_2325_u64;
-        for value in [
+    pub(crate) fn snapshot_ref(&self) -> &NativeSceneSnapshot {
+        self.debug_assert_snapshot_consistency();
+        &self.snapshot
+    }
+
+    pub(crate) fn snapshot_owned(&self) -> NativeSceneSnapshot {
+        self.debug_assert_snapshot_consistency();
+        #[cfg(test)]
+        note_snapshot_owned_clone();
+        self.snapshot.clone()
+    }
+
+    fn debug_assert_snapshot_consistency(&self) {
+        debug_assert!(
+            self.surface_ids().eq(self
+                .snapshot
+                .surfaces
+                .iter()
+                .map(|surface| surface.surface_id)),
+            "resolved frame scene and its snapshot diverged on surfaces"
+        );
+        debug_assert!(
+            self.decoration_identities().eq(self
+                .snapshot
+                .decorations
+                .iter()
+                .map(DecorationSceneSnapshot::identity)),
+            "resolved frame scene and its snapshot diverged on decorations"
+        );
+    }
+
+    pub(crate) fn scene_identity_signature(&self) -> u64 {
+        self.scene_identity_signature
+    }
+}
+
+fn visibility_signature(metrics: FullscreenRenderPlanMetrics) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [
             metrics.fullscreen_active as u64,
             u64::from(metrics.owner_root_surface_id.unwrap_or(0)),
             metrics.solitary_tree_active as u64,
@@ -126,53 +233,30 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             signature ^= value;
             signature = signature.wrapping_mul(0x1000_0000_01b3);
         }
-        signature
-    }
+    signature
+}
 
-    pub(crate) fn snapshot(&self) -> NativeSceneSnapshot {
-        let snapshot_surface_ids = self
-            .snapshot
-            .surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .collect::<Vec<_>>();
-        debug_assert_eq!(
-            self.surface_ids().collect::<Vec<_>>(),
-            snapshot_surface_ids,
-            "resolved frame scene and its snapshot diverged on surfaces"
-        );
-        let snapshot_decoration_ids = self
-            .snapshot
-            .decorations
-            .iter()
-            .map(DecorationSceneSnapshot::identity)
-            .collect::<Vec<_>>();
-        debug_assert_eq!(
-            self.decoration_identities().collect::<Vec<_>>(),
-            snapshot_decoration_ids,
-            "resolved frame scene and its snapshot diverged on decorations"
-        );
-        let mut snapshot = self.snapshot.clone();
-        snapshot.popup_surface_ids = self.popup_surface_ids.to_vec();
-        snapshot.external_overlay_surface_ids = self.external_overlay_surface_ids.clone();
-        snapshot.visibility_signature = self.visibility_signature();
-        snapshot.effect_damage = self
-            .effects
-            .instances
-            .iter()
-            .fold(EffectRegion::empty(), |damage, instance| {
-                damage.union(&instance.region)
-            });
-        snapshot.effect_identity_signature = self.effects.signature;
-        snapshot
-    }
-
-    pub(crate) fn scene_identity_signature(&self) -> u64 {
-        let mut signature = self.snapshot().identity_signature();
-        signature ^= self.effects.signature;
-        signature = signature.wrapping_mul(0x1000_0000_01b3);
-        signature
-    }
+fn finalize_snapshot(
+    mut snapshot: NativeSceneSnapshot,
+    popup_surface_ids: &[u32],
+    external_overlay_surface_ids: &[u32],
+    visibility: FullscreenRenderPlanMetrics,
+    effects: &ResolvedEffectScene,
+) -> (NativeSceneSnapshot, u64) {
+    snapshot.popup_surface_ids = popup_surface_ids.to_vec();
+    snapshot.external_overlay_surface_ids = external_overlay_surface_ids.to_vec();
+    snapshot.visibility_signature = visibility_signature(visibility);
+    snapshot.effect_damage = effects
+        .instances
+        .iter()
+        .fold(EffectRegion::empty(), |damage, instance| {
+            damage.union(&instance.region)
+        });
+    snapshot.effect_identity_signature = effects.signature;
+    let mut scene_identity_signature = snapshot.identity_signature();
+    scene_identity_signature ^= effects.signature;
+    scene_identity_signature = scene_identity_signature.wrapping_mul(0x1000_0000_01b3);
+    (snapshot, scene_identity_signature)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,12 +665,23 @@ pub(crate) fn update_cursor_output_arbitration(
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeCursorOutputArbitration, ResolvedNativeFrameScene};
-    use oblivion_one::compositor::OwnCompositorServer;
+    use super::{
+        NativeCursorOutputArbitration, NativeSceneSnapshot, ResolvedNativeFrameScene,
+        finalize_snapshot, reset_snapshot_work_counters, snapshot_work_counters,
+        visibility_signature,
+    };
     use oblivion_one::compositor::{
-        AnimationTime, PresentationRect, RenderableSurface, RenderableSurfaceDamage,
-        SurfaceCommitSequence, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
-        WindowId,
+        AnimationTime, FullscreenRenderPlanMetrics, PresentationRect, RenderableSurface,
+        RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitSequence, SurfaceOpaqueRegion,
+        SurfacePlacement, SurfaceRenderBackend, WindowId,
+    };
+    use oblivion_one::compositor::{
+        EffectAnchor, EffectAnchorScope, EffectSceneOrder, OwnCompositorServer,
+        ResolvedEffectInstance,
+    };
+    use oblivion_one::effects::{
+        EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect,
+        EffectRegion,
     };
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferSize, CommittedSurfaceBuffer,
@@ -670,6 +765,133 @@ mod tests {
                 .collect::<Vec<_>>(),
             [602]
         );
+    }
+
+    #[test]
+    fn scene_identity_and_damage_reuse_finalized_snapshot() {
+        let socket_name = format!("typhon-c2a-snapshot-{}", process::id());
+        let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind compositor for C2a snapshot regression");
+        server.install_native_frame_test_scene(
+            vec![test_surface(701, 320, 200, SurfacePlacement::root_at(0, 0))],
+            &[(701, WindowId::from_raw(1).expect("test window id"))],
+            None,
+        );
+        reset_snapshot_work_counters();
+        let resolved =
+            ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(0));
+        let construction_counters = snapshot_work_counters();
+        assert_eq!(construction_counters.snapshot_finalizations, 1);
+        assert_eq!(construction_counters.identity_computations, 1);
+        let mut expected_signature = resolved.snapshot_ref().identity_signature();
+        expected_signature ^= resolved.effects.signature;
+        expected_signature = expected_signature.wrapping_mul(0x1000_0000_01b3);
+        assert_eq!(resolved.scene_identity_signature(), expected_signature);
+        reset_snapshot_work_counters();
+
+        let _current = resolved.snapshot_ref();
+        let _identity = resolved.scene_identity_signature();
+
+        let counters = snapshot_work_counters();
+        assert_eq!(counters.snapshot_finalizations, 0);
+        assert_eq!(counters.snapshot_owned_clones, 0);
+        assert_eq!(counters.identity_computations, 0);
+
+        let owned = resolved.snapshot_owned();
+        assert_eq!(owned, *resolved.snapshot_ref());
+        assert_eq!(snapshot_work_counters().snapshot_owned_clones, 1);
+    }
+
+    #[test]
+    fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
+        let effect_region = EffectRegion::from_rect(EffectRect::new(20, 30, 40, 50).unwrap());
+        let effects = ResolvedEffectScene::new(
+            9,
+            vec![ResolvedEffectInstance {
+                id: EffectInstanceId::new(1).unwrap(),
+                program: EffectProgramId::new(2).unwrap(),
+                anchor: EffectAnchor::BeforeSurface(701),
+                region: effect_region.clone(),
+                target_bounds: effect_region.bounding_rect().unwrap(),
+                parameter_block: EffectParameterBlock::default(),
+                signature: 17,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(701)),
+            }],
+        );
+        let visibility = FullscreenRenderPlanMetrics {
+            fullscreen_active: true,
+            owner_root_surface_id: Some(701),
+            solitary_tree_active: false,
+            culled_surface_count: 3,
+            wallpaper_culled: true,
+            visible_overlay_count: 2,
+            rejection: None,
+        };
+
+        let (snapshot, cached_signature) = finalize_snapshot(
+            NativeSceneSnapshot::default(),
+            &[701, 702],
+            &[703],
+            visibility,
+            &effects,
+        );
+
+        assert_eq!(snapshot.popup_surface_ids, [701, 702]);
+        assert_eq!(snapshot.external_overlay_surface_ids, [703]);
+        assert_eq!(
+            snapshot.visibility_signature,
+            visibility_signature(visibility)
+        );
+        assert_eq!(snapshot.effect_damage, effect_region);
+        assert_eq!(snapshot.effect_identity_signature, effects.signature);
+        let mut expected_signature = snapshot.identity_signature();
+        expected_signature ^= effects.signature;
+        expected_signature = expected_signature.wrapping_mul(0x1000_0000_01b3);
+        assert_eq!(cached_signature, expected_signature);
+    }
+
+    #[test]
+    fn presentation_animation_samples_keep_distinct_frame_local_snapshots() {
+        let socket_name = format!("typhon-c2a-animation-{}", process::id());
+        let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind compositor for C2a animation regression");
+        server.install_native_frame_test_scene(
+            vec![test_surface(702, 320, 200, SurfacePlacement::root_at(0, 0))],
+            &[(702, WindowId::from_raw(2).expect("test window id"))],
+            None,
+        );
+        server.start_test_presentation_transition(
+            702,
+            PresentationRect::new(0.0, 0.0, 320.0, 200.0).expect("animation start"),
+            PresentationRect::new(100.0, 0.0, 320.0, 200.0).expect("animation target"),
+            AnimationTime::from_nanos(0),
+        );
+
+        reset_snapshot_work_counters();
+        let first =
+            ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(250_000));
+        let first_counters = snapshot_work_counters();
+        reset_snapshot_work_counters();
+        let second =
+            ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(750_000));
+        let second_counters = snapshot_work_counters();
+
+        assert_eq!(first.render_generation, second.render_generation);
+        assert_ne!(
+            first.snapshot_ref().surfaces[0].bounds,
+            second.snapshot_ref().surfaces[0].bounds
+        );
+        assert_ne!(
+            first.scene_identity_signature(),
+            second.scene_identity_signature()
+        );
+        assert_eq!(first_counters.snapshot_finalizations, 1);
+        assert_eq!(second_counters.snapshot_finalizations, 1);
+        assert_eq!(first_counters.identity_computations, 1);
+        assert_eq!(second_counters.identity_computations, 1);
     }
 
     #[test]

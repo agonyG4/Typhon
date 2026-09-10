@@ -279,7 +279,7 @@ pub(super) fn native_scene_damage_for_resolved_scene(
         width,
         height,
         previous_scene,
-        &resolved_scene.snapshot(),
+        resolved_scene.snapshot_ref(),
         cursor_damage,
     )
 }
