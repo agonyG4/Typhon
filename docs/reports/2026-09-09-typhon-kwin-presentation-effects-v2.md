@@ -279,17 +279,16 @@ regression, prepared-detach unit tests, and managed XWayland restore/detach
 tests. The exact required verification commands were then run against the
 shared checkout as follows:
 
-- `rtk run -- cargo fmt --check` — failed only on unrelated, uncommitted
-  blur-policy formatting changes; the closure files pass targeted rustfmt.
+- `rtk run -- cargo fmt --check` — passed.
 - `rtk run -- cargo check --locked --all-targets` — passed.
-- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — blocked by
-  unrelated blur-assignment test errors (`resolver()` calls in the shared
-  uncommitted work).
-- `rtk run -- cargo test --locked` — blocked by the same unrelated
-  blur-assignment test errors; no closure test failed.
+- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — passed.
+- `rtk run -- cargo test --locked` — 2318 passed, 6 failed, and 2 ignored.
+  The six failures were in unrelated background-effect, surface-frame, and
+  resize tests from concurrent renderer work; all v2.1 closure tests passed.
 - `rtk git diff --check` — passed.
-- `rtk run -- bash bin/check-source-layout` — retains the repository's
-  existing source-layout debt; no broad refactor was added here.
+- `rtk run -- bash bin/check-source-layout` — exited successfully while
+  reporting the repository's existing source-layout debt; no broad refactor
+  was added here.
 
 Hardware qualification was not available in this session. The known
 1920x1080@165 Hz maximize-drag and repeated-stress checks remain to be run on
