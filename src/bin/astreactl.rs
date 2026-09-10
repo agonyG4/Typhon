@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|keyboard configure [typed options]|cursor ...|decoration ...|effects reload|blur status|blur reload|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard ...|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -307,6 +307,11 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             ));
         }
         parse_blur_command(&positionals[1..])?
+    } else if command == "animation" {
+        if keyboard_configure.has_any() || cursor_theme.is_some() || cursor_size.is_some() || wallpaper_fit.is_some() {
+            return Err(AstreactlError::Usage("animation commands do not accept unrelated options".to_string()));
+        }
+        parse_animation_command(&positionals[1..])?
     } else if command == "keyboard" {
         if cursor_theme.is_some() || cursor_size.is_some() || wallpaper_fit.is_some() {
             return Err(AstreactlError::Usage(
@@ -371,6 +376,28 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(7);
     }
     Ok(0)
+}
+
+fn parse_animation_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    let subcommand = positionals
+        .first()
+        .ok_or_else(|| AstreactlError::Usage("missing animation subcommand".to_string()))?;
+    match subcommand.as_str() {
+        "get" if positionals.len() == 1 => Ok(("animation", "animation.config.get", serde_json::json!({}))),
+        "set" if positionals.len() == 2 => {
+            let value = serde_json::from_str(&positionals[1])
+                .map_err(|_| AstreactlError::Usage("animation set requires a JSON configuration object".to_string()))?;
+            if !value.is_object() {
+                return Err(AstreactlError::Usage("animation set requires a JSON configuration object".to_string()));
+            }
+            Ok(("animation", "animation.config.set", value))
+        }
+        "get" => Err(AstreactlError::Usage("animation get takes no arguments".to_string())),
+        "set" => Err(AstreactlError::Usage("animation set requires exactly one JSON configuration object".to_string())),
+        _ => Err(AstreactlError::Usage(format!("unknown animation subcommand {subcommand}"))),
+    }
 }
 
 fn parse_keyboard_command(

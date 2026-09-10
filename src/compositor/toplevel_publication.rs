@@ -28,6 +28,27 @@ pub(crate) const MAX_ASTREA_TERMINAL_MANAGERS_TOTAL: usize = 32;
 pub(crate) const MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE: usize = 256;
 pub(crate) const MAX_ASTREA_ELIGIBLE_WINDOWS: usize = 65_536;
 const MAX_ASTREA_TOPLEVEL_DIRTY_WINDOWS: usize = 8192;
+pub(crate) const MAX_MINIMIZE_ANCHOR_DIMENSION: u32 = 16_384;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MinimizeAnchorRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MinimizeAnchorOwner {
+    client_id: ClientId,
+    resource_id: ObjectId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MinimizeAnchor {
+    rect: MinimizeAnchorRect,
+    owner: MinimizeAnchorOwner,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AstreaToplevelKind {
@@ -257,6 +278,7 @@ pub(in crate::compositor) struct AstreaToplevelPublisher {
         BTreeMap<WindowId, Option<AstreaToplevelSnapshot>>,
     pub(in crate::compositor) next_structure_dirty: bool,
     pub(in crate::compositor) metrics: AstreaToplevelMetrics,
+    minimize_anchors: BTreeMap<WindowId, MinimizeAnchor>,
 }
 
 struct ToplevelPublicationBatch<'a> {
@@ -287,6 +309,7 @@ impl Default for AstreaToplevelPublisher {
             next_dirty_snapshots: BTreeMap::new(),
             next_structure_dirty: false,
             metrics: AstreaToplevelMetrics::default(),
+            minimize_anchors: BTreeMap::new(),
         }
     }
 }
@@ -415,9 +438,58 @@ impl AstreaToplevelPublisher {
     }
 
     pub(in crate::compositor) fn mark_window_removed(&mut self, window_id: WindowId) {
+        self.minimize_anchors.remove(&window_id);
         self.removed_windows.insert(window_id);
         self.mark_window_dirty(window_id);
         self.mark_structure_dirty();
+    }
+
+    pub(in crate::compositor) fn set_minimize_anchor(
+        &mut self,
+        client_id: ClientId,
+        resource_id: ObjectId,
+        window_id: WindowId,
+        rect: MinimizeAnchorRect,
+    ) -> Result<(), ()> {
+        if rect.width == 0
+            || rect.height == 0
+            || rect.width > MAX_MINIMIZE_ANCHOR_DIMENSION
+            || rect.height > MAX_MINIMIZE_ANCHOR_DIMENSION
+        {
+            return Err(());
+        }
+        self.minimize_anchors.insert(
+            window_id,
+            MinimizeAnchor {
+                rect,
+                owner: MinimizeAnchorOwner {
+                    client_id,
+                    resource_id,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    pub(in crate::compositor) fn clear_minimize_anchor(
+        &mut self,
+        client_id: &ClientId,
+        resource_id: &ObjectId,
+        window_id: WindowId,
+    ) {
+        if self.minimize_anchors.get(&window_id).is_some_and(|anchor| {
+            anchor.owner.client_id == *client_id && anchor.owner.resource_id == *resource_id
+        }) {
+            self.minimize_anchors.remove(&window_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn minimize_anchor_for_test(
+        &self,
+        window_id: WindowId,
+    ) -> Option<MinimizeAnchorRect> {
+        self.minimize_anchors.get(&window_id).map(|anchor| anchor.rect)
     }
 
     pub(in crate::compositor) fn needs_full_reconciliation(&self) -> bool {
@@ -1238,6 +1310,7 @@ impl AstreaToplevelPublisher {
         window_id: WindowId,
         resource_id: &ObjectId,
     ) {
+        self.clear_minimize_anchor(client_id, resource_id, window_id);
         if self.retired_handles.get(resource_id).is_some_and(|handle| {
             handle.client_id == *client_id
                 && handle.manager_id == *manager_id
@@ -1269,6 +1342,8 @@ impl AstreaToplevelPublisher {
     }
 
     pub(in crate::compositor) fn remove_client(&mut self, client_id: &ClientId) {
+        self.minimize_anchors
+            .retain(|_, anchor| anchor.owner.client_id != *client_id);
         let before_managers = self.manager_count_for_client(client_id);
         self.managers.retain(|_, binding| {
             if binding.client_id == *client_id {
@@ -1372,6 +1447,7 @@ impl AstreaToplevelPublisher {
                 .saturating_add(1);
         }
         let resource_id = handle.resource.id();
+        self.clear_minimize_anchor(&binding.client_id, &resource_id, window_id);
         self.retired_handles.insert(
             resource_id.clone(),
             RetiredAstreaToplevelHandle {

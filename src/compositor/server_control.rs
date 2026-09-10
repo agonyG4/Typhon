@@ -7,6 +7,39 @@ use crate::control_snapshots::{
 };
 use crate::wm::WindowManagementState;
 
+impl crate::compositor::CompositorState {
+    pub(crate) fn animation_control_snapshot(
+        &self,
+    ) -> crate::animation_control::AnimationControlSnapshot {
+        self.animation_control.snapshot()
+    }
+
+    pub(crate) fn set_animation_configuration(
+        &mut self,
+        configuration: crate::animation_control::AnimationConfiguration,
+    ) -> Result<crate::animation_control::AnimationControlSnapshot, crate::animation_control::AnimationPersistenceError> {
+        let enabled = configuration.enabled;
+        let snapshot = self.animation_control.set_configuration(configuration)?;
+        self.presentation_animator.set_enabled(enabled);
+        Ok(snapshot)
+    }
+}
+
+impl OwnCompositorServer {
+    pub(crate) fn animation_control_snapshot(
+        &self,
+    ) -> crate::animation_control::AnimationControlSnapshot {
+        self.state.animation_control_snapshot()
+    }
+
+    pub(crate) fn set_animation_configuration(
+        &mut self,
+        configuration: crate::animation_control::AnimationConfiguration,
+    ) -> Result<crate::animation_control::AnimationControlSnapshot, crate::animation_control::AnimationPersistenceError> {
+        self.state.set_animation_configuration(configuration)
+    }
+}
+
 impl OwnCompositorServer {
     pub fn revoke_astrea_shell_pid(&mut self, pid: u32) {
         self.state.revoke_astrea_shell_pid(pid);

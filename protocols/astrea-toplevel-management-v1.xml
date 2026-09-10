@@ -4,7 +4,7 @@
     Copyright 2026 AstreaOS contributors
   </copyright>
 
-  <interface name="astrea_toplevel_manager_v1" version="2">
+  <interface name="astrea_toplevel_manager_v1" version="3">
     <description summary="authoritative Astrea toplevel list and actions">
       This private protocol publishes compositor-managed application toplevels.
       Version 1 has no window mutation requests. Handle events are grouped into
@@ -12,13 +12,15 @@
       atomic completion boundary. Version 2 adds exact WindowId-handle actions
       whose completion is reported by this manager because a handle may close.
       A failed manager is terminal and does not disconnect other managers owned
-      by the same client.
+      by the same client. Version 3 adds trusted shell-owned minimize anchor
+      metadata to each exact toplevel handle.
     </description>
 
     <enum name="error">
       <entry name="unauthorized" value="0"/>
       <entry name="manager_limit" value="1"/>
       <entry name="resource_limit" value="2"/>
+      <entry name="invalid_anchor" value="3" since="3"/>
     </enum>
 
     <enum name="failure_reason">
@@ -82,7 +84,7 @@
     </event>
   </interface>
 
-  <interface name="astrea_toplevel_v1" version="2">
+  <interface name="astrea_toplevel_v1" version="3">
     <description summary="one compositor-managed Astrea toplevel">
       The handle is read-only. Its identifier is the stable decimal Typhon
       WindowId, and its lifetime is independent of the underlying compositor
@@ -151,5 +153,19 @@
       <arg name="revision_lo" type="uint"/>
     </event>
     <event name="closed"/>
+
+    <request name="set_minimize_anchor" since="3">
+      <description summary="set the trusted shell minimize destination">
+        Coordinates are compositor-global logical coordinates. Negative x and
+        y values are valid for outputs positioned left of or above the global
+        origin. Width and height must be positive and bounded.
+      </description>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </request>
+
+    <request name="clear_minimize_anchor" since="3"/>
   </interface>
 </protocol>

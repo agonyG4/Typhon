@@ -763,6 +763,7 @@ pub enum AstreactlResult {
     DecorationThemes(DecorationThemeListSnapshot),
     TrustedEffects(TrustedEffectsReloadSnapshot),
     Blur(crate::blur_policy::BlurPolicySnapshot),
+    Animation(crate::animation_control::AnimationControlSnapshot),
     Wallpaper(WallpaperSnapshot),
     WallpaperList(WallpaperListSnapshot),
 }

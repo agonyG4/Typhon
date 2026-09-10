@@ -998,7 +998,6 @@ impl PresentationAnimator {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn transition_curve(&self, key: u32) -> Option<AnimationCurve> {
         self.transitions
             .get(&key)

@@ -622,6 +622,7 @@ pub struct CompositorState {
     active_scene_view: ActiveSceneView,
     presentation_animator: PresentationAnimator,
     presentation_animation_policy: PresentationAnimationPolicy,
+    pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,
     presented_presentation: PresentationFrameSnapshot,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,

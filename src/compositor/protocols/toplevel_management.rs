@@ -330,6 +330,66 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     AstreaActionToken::new(token_hi, token_lo),
                 );
             }
+            astrea_toplevel_v1::Request::SetMinimizeAnchor {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if resource.version() < 3 {
+                    return;
+                }
+                if !state.astrea_shell_mutation_allowed(client) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        astrea_toplevel_manager_v1::Error::Unauthorized,
+                        "client is not an authorized Astrea shell client",
+                    );
+                    return;
+                }
+                if state
+                    .astrea_toplevel_publisher
+                    .set_minimize_anchor(
+                        data.client_id.clone(),
+                        resource.id(),
+                        data.window_id,
+                        MinimizeAnchorRect {
+                            x,
+                            y,
+                            width,
+                            height,
+                        },
+                    )
+                    .is_err()
+                {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        astrea_toplevel_manager_v1::Error::InvalidAnchor,
+                        "minimize anchor dimensions are invalid",
+                    );
+                }
+            }
+            astrea_toplevel_v1::Request::ClearMinimizeAnchor => {
+                if resource.version() < 3 {
+                    return;
+                }
+                if !state.astrea_shell_mutation_allowed(client) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        astrea_toplevel_manager_v1::Error::Unauthorized,
+                        "client is not an authorized Astrea shell client",
+                    );
+                    return;
+                }
+                state.astrea_toplevel_publisher.clear_minimize_anchor(
+                    &data.client_id,
+                    &resource.id(),
+                    data.window_id,
+                );
+            }
         }
     }
 

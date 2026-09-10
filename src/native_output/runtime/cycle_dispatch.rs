@@ -124,6 +124,17 @@ struct EmptyCursorArgs {}
 struct EmptyKeyboardLayoutArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnimationConfigurationSetArgs {
+    version: u32,
+    enabled: bool,
+    preset: String,
+    speed: f64,
+    #[serde(default)]
+    overrides: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyboardLayoutSetArgs {
     index: u32,
@@ -684,6 +695,75 @@ impl NativeRuntime {
                 Err(_) => return Some(keyboard_configuration_argument_failure(request.id)),
             };
             return self.queue_keyboard_configuration(token, request.id, args.into_config());
+        }
+        if command == ControlCommand::AnimationConfigurationGet {
+            if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "animation.config.get takes no arguments",
+                    ),
+                ));
+            }
+            return Some(match serde_json::to_value(self.server.animation_control_snapshot()) {
+                Ok(result) => ControlResponse::success(request.id, result),
+                Err(_) => ControlResponse::failure(
+                    request.id,
+                    ControlError::new(ControlErrorCode::Internal, "animation snapshot failed"),
+                ),
+            });
+        }
+        if command == ControlCommand::AnimationConfigurationSet {
+            let args = match serde_json::from_value::<AnimationConfigurationSetArgs>(request.args) {
+                Ok(args) => args,
+                Err(_) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid animation configuration",
+                        ),
+                    ));
+                }
+            };
+            let document = oblivion_one::animation_control::AnimationConfigurationDocument {
+                version: args.version,
+                enabled: args.enabled,
+                preset: args.preset,
+                speed: args.speed,
+                overrides: args.overrides,
+            };
+            let configuration = match oblivion_one::animation_control::AnimationConfiguration::from_document(document) {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::InvalidArgument,
+                            "invalid animation configuration",
+                        )
+                        .with_detail(error.to_string()),
+                    ));
+                }
+            };
+            return Some(match self.server.set_animation_configuration(configuration) {
+                Ok(snapshot) => match serde_json::to_value(snapshot) {
+                    Ok(result) => ControlResponse::success(request.id, result),
+                    Err(_) => ControlResponse::failure(
+                        request.id,
+                        ControlError::new(ControlErrorCode::Internal, "animation snapshot failed"),
+                    ),
+                },
+                Err(error) => ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "animation configuration was not saved",
+                    )
+                    .with_detail(error.to_string()),
+                ),
+            });
         }
         if command == ControlCommand::EffectsReload {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {

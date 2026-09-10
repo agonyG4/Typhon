@@ -109,14 +109,14 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.effect_count,
         ),
         AstreactlResult::Blur(snapshot) => format!(
-            "Enabled: {}\nRenderer: {}\nGeneration: {}\nWayland: {:?}\nXWayland: {:?}\nAuto fullscreen: {}\nLayer default: {:?}\nRules: {}/{}\nActive assignments: {}\nSources: client={} wayland_auto={} window_rule={} layer_rule={}\nConfig: {}\nLast error: {}",
+            "Enabled: {}\nRenderer: {}\nGeneration: {}\nWayland: {}\nXWayland: {}\nAuto fullscreen: {}\nLayer default: {}\nRules: {}/{}\nActive assignments: {}\nSources: client={} wayland_auto={} window_rule={} layer_rule={}\nConfig: {}\nLast error: {}",
             snapshot.enabled,
             snapshot.renderer_supported,
             snapshot.generation,
-            snapshot.wayland_mode,
-            snapshot.xwayland_mode,
+            sanitize_terminal_text(&format!("{:?}", snapshot.wayland_mode)),
+            sanitize_terminal_text(&format!("{:?}", snapshot.xwayland_mode)),
             snapshot.auto_fullscreen,
-            snapshot.layer_default,
+            sanitize_terminal_text(&format!("{:?}", snapshot.layer_default)),
             snapshot.window_rule_count,
             snapshot.layer_rule_count,
             snapshot.active_assignment_count,
@@ -127,6 +127,7 @@ pub fn human(result: &AstreactlResult) -> String {
             sanitize_terminal_text(&snapshot.config_path),
             sanitize_optional_text(snapshot.last_reload_error.as_deref()),
         ),
+        AstreactlResult::Animation(snapshot) => format_animation(snapshot),
         AstreactlResult::Wallpaper(snapshot) => format!(
             "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
             sanitize_terminal_text(&snapshot.state),
@@ -154,6 +155,24 @@ pub fn human(result: &AstreactlResult) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     }
+}
+
+fn format_animation(snapshot: &crate::animation_control::AnimationControlSnapshot) -> String {
+    let config = &snapshot.config;
+    let mut lines = vec![
+        format!("Enabled: {}", config.enabled),
+        format!("Preset: {}", sanitize_terminal_text(&config.preset)),
+        format!("Speed: {:.2}x", config.speed),
+        format!("Generation: {}", snapshot.generation),
+        format!("Source: {}", sanitize_terminal_text(&snapshot.source)),
+        format!("Startup override: {}", snapshot.startup_override),
+        String::new(),
+    ];
+    lines.extend(snapshot.effective.iter().map(|(slot, effect)| {
+        let requested = snapshot.requested.get(slot).map(String::as_str).unwrap_or(effect);
+        format!("{}: {} (requested {})", sanitize_terminal_text(slot), sanitize_terminal_text(effect), sanitize_terminal_text(requested))
+    }));
+    lines.join("\n")
 }
 
 fn format_keyboard_layout(snapshot: &KeyboardLayoutSnapshot) -> String {
