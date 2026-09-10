@@ -198,11 +198,21 @@ impl AnimationConfigurationStore {
         }
         validate_directory(&self.config_home, false)?;
         let astrea = self.config_home.join(ASTREA_DIRECTORY);
-        fs::create_dir_all(&astrea).map_err(|_| AnimationPersistenceError::WriteFailed)?;
-        validate_directory(&astrea, true)?;
-        fs::create_dir_all(&self.configuration_directory)
-            .map_err(|_| AnimationPersistenceError::WriteFailed)?;
-        validate_directory(&self.configuration_directory, true)
+        ensure_private_directory(&astrea)?;
+        ensure_private_directory(&self.configuration_directory)
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), AnimationPersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_directory(path, true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+                .map_err(|_| AnimationPersistenceError::WriteFailed)?;
+            validate_directory(path, true)
+        }
+        Err(_) => Err(AnimationPersistenceError::Insecure),
     }
 }
 
