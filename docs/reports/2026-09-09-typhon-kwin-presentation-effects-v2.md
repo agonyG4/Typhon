@@ -221,8 +221,8 @@ The final codebase-memory coverage check reported `no_recorded_issue` with
 signal and not a completeness proof.
 
 The checkout contains unrelated renderer/Effects work in the shared history.
-The one-line layer-shell command-barrier synchronization correction remains
-unstaged as a separate working-tree change; it does not alter presentation
+The one-line layer-shell command-barrier synchronization correction is kept
+in the separate companion commit `2e39d88`; it does not alter presentation
 architecture.
 
 ## Hardware qualification status
