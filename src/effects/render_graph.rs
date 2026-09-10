@@ -6,11 +6,10 @@ use crate::compositor::{
 
 use super::registry::EffectRegistry;
 use super::{
-    plan_effect_damage, validate_effect_program, DualKawaseBlurSpec, EffectAlphaMode,
-    EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId,
-    EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId, EffectRect, EffectRegion,
-    EffectSource, EffectValidationError, EffectWorkingSpace, ValidatedEffectProgram,
-    BUILTIN_EFFECT_PROGRAM_ID,
+    BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
+    EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
+    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectSource, EffectValidationError,
+    EffectWorkingSpace, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -1739,11 +1738,13 @@ mod tests {
         let FrameExecutionPlan::EffectGraph(graph) = plan else {
             panic!("visible effects must compile to an effect graph");
         };
-        assert!(graph
-            .textures
-            .iter()
-            .filter(|texture| texture.source == GraphTextureSource::Intermediate)
-            .all(|texture| texture.first_use.is_some() && texture.last_use.is_some()));
+        assert!(
+            graph
+                .textures
+                .iter()
+                .filter(|texture| texture.source == GraphTextureSource::Intermediate)
+                .all(|texture| texture.first_use.is_some() && texture.last_use.is_some())
+        );
         assert!(graph.stats.peak_live_intermediates > 0);
     }
 
@@ -1770,14 +1771,16 @@ mod tests {
             dimensions,
             vec![(184, 114), (92, 57), (184, 114), (368, 228)]
         );
-        assert!(graph
-            .passes
-            .iter()
-            .filter(|pass| matches!(
-                pass.kind,
-                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
-            ))
-            .all(|pass| pass.blur_radius == Some(4.0)));
+        assert!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| matches!(
+                    pass.kind,
+                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+                ))
+                .all(|pass| pass.blur_radius == Some(4.0))
+        );
     }
 
     #[test]
@@ -2047,9 +2050,11 @@ mod tests {
             .filter(|pass| pass.kind == RenderPassKind::NormalizeInput)
             .collect::<Vec<_>>();
         assert_eq!(normalize.len(), 2);
-        assert!(normalize
-            .iter()
-            .all(|pass| { pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear }));
+        assert!(
+            normalize
+                .iter()
+                .all(|pass| { pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear })
+        );
         let blend_pass = graph
             .passes
             .iter()
@@ -2141,11 +2146,13 @@ mod tests {
         assert!(normalize.damage.contains_point(504, 204));
         assert!(normalize.damage.contains_point(521, 221));
         assert!(!normalize.damage.contains_point(496, 196));
-        assert!(normalize
-            .damage
-            .rects()
-            .iter()
-            .all(|rect| rect.intersect(normalized_domain).is_some()));
+        assert!(
+            normalize
+                .damage
+                .rects()
+                .iter()
+                .all(|rect| rect.intersect(normalized_domain).is_some())
+        );
     }
 
     #[test]
@@ -2247,10 +2254,12 @@ mod tests {
             .map(|pass| pass.id.get())
             .collect::<Vec<_>>();
         assert!(pass_ids.windows(2).any(|pair| pair[1] > pair[0] + 1));
-        assert!(graph
-            .passes
-            .iter()
-            .any(|pass| !pass.fused_stages.is_empty()));
+        assert!(
+            graph
+                .passes
+                .iter()
+                .any(|pass| !pass.fused_stages.is_empty())
+        );
         assert_eq!(
             graph.stats.peak_live_intermediates,
             brute_force_peak(&graph.passes, &graph.textures)
@@ -2582,15 +2591,21 @@ mod tests {
             panic!("visible effects must compile to an effect graph");
         };
 
-        assert!(graph.instances[1]
-            .dependencies
-            .contains(&EffectInstanceId::new(1).unwrap()));
-        assert!(graph.instances[2]
-            .dependencies
-            .contains(&EffectInstanceId::new(2).unwrap()));
-        assert!(!graph.instances[2]
-            .dependencies
-            .contains(&EffectInstanceId::new(1).unwrap()));
+        assert!(
+            graph.instances[1]
+                .dependencies
+                .contains(&EffectInstanceId::new(1).unwrap())
+        );
+        assert!(
+            graph.instances[2]
+                .dependencies
+                .contains(&EffectInstanceId::new(2).unwrap())
+        );
+        assert!(
+            !graph.instances[2]
+                .dependencies
+                .contains(&EffectInstanceId::new(1).unwrap())
+        );
         let demand = plan_effect_execution_demand(
             &graph,
             &EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap()),
