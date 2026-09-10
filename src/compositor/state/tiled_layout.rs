@@ -930,6 +930,12 @@ impl CompositorState {
             self.mark_astrea_toplevel_dirty(window_id);
             return;
         }
+        let transition = current.map_or(VisualGeometryTransition::Immediate, |source| {
+            VisualGeometryTransition::Animated {
+                source,
+                kind: PresentationAnimationKind::LayoutReflow,
+            }
+        });
         match backend {
             WindowBackend::Xdg(_) => {
                 let _ = self.send_configure_root_window_to(
@@ -943,10 +949,10 @@ impl CompositorState {
                     geometry.placement,
                     RenderGenerationCause::LayoutReflow,
                 );
-                self.install_toplevel_visual_geometry_with_animation(
+                self.install_toplevel_visual_geometry_with_transition(
                     root_surface_id,
                     geometry,
-                    Some(PresentationAnimationKind::LayoutReflow),
+                    transition,
                 );
             }
             WindowBackend::X11(_) => {
@@ -956,10 +962,10 @@ impl CompositorState {
                     geometry.placement,
                     RenderGenerationCause::LayoutReflow,
                 );
-                self.install_x11_visual_geometry_with_animation(
+                self.install_x11_visual_geometry_with_transition(
                     root_surface_id,
                     geometry,
-                    Some(PresentationAnimationKind::LayoutReflow),
+                    transition,
                 );
                 self.queue_backend_configure(window_id, geometry, ToplevelMode::Normal, false);
                 self.queue_backend_state(window_id);

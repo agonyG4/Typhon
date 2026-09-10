@@ -511,10 +511,11 @@ impl CompositorState {
             pointer_motion_surface_id,
             decoration_owned,
         } = begin;
-        let Some(root_surface) = self
+        let Some((root_placement, root_width, root_height)) = self
             .renderable_surfaces
             .iter()
             .find(|surface| surface.surface_id == root_surface_id)
+            .map(|surface| (surface.placement, surface.width, surface.height))
         else {
             log_begin_rejection(self, begin, "root_missing");
             return false;
@@ -575,21 +576,32 @@ impl CompositorState {
                 return false;
             }
         }
-        let fallback_geometry = WindowGeometry::new(
-            root_surface.placement,
-            root_surface.width,
-            root_surface.height,
-        );
-        let start_geometry = match kind {
-            WindowInteractionKind::Resize(_) => self
-                .presented_visual_root_window_geometry(root_surface_id)
-                .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
-                .unwrap_or(fallback_geometry),
-            WindowInteractionKind::Move => self
-                .presented_visual_root_window_geometry(root_surface_id)
-                .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
-                .or_else(|| self.current_root_window_geometry(root_surface_id))
-                .unwrap_or(fallback_geometry),
+        if kind == WindowInteractionKind::Move
+            && self
+                .window(window_id)
+                .is_some_and(|window| window.state.mode() == ToplevelMode::Maximized)
+            && !self.restore_maximized_window_for_interaction(window_id, root_surface_id, x, y)
+        {
+            log_begin_rejection(self, begin, "maximized_restore_failed");
+            return false;
+        }
+        let fallback_geometry = WindowGeometry::new(root_placement, root_width, root_height);
+        let canonical_geometry = self
+            .current_visual_root_window_geometry(root_surface_id)
+            .or_else(|| self.current_root_window_geometry(root_surface_id))
+            .unwrap_or(fallback_geometry);
+        let start_geometry = if tiled_resize_data.is_some() {
+            canonical_geometry
+        } else {
+            self.presented_visual_root_window_geometry(root_surface_id)
+                .map(|presented| {
+                    WindowGeometry::new(
+                        presented.placement,
+                        canonical_geometry.width,
+                        canonical_geometry.height,
+                    )
+                })
+                .unwrap_or(canonical_geometry)
         };
         if let Some(preparation) = tiled_resize_data.as_mut() {
             self.rebase_tiled_resize_preparation(root_surface_id, window_id, preparation);
@@ -607,11 +619,18 @@ impl CompositorState {
                 WindowInteractionKind::Move => RenderGenerationCause::WindowMove,
                 WindowInteractionKind::Resize(_) => RenderGenerationCause::WindowResize,
             };
-            self.take_over_presented_visual_geometry(
-                root_surface_id,
-                start_geometry,
-                takeover_cause,
-            );
+            if tiled_resize_data.is_some() {
+                // The Dwindle solution and the rebased split handle own tiled
+                // resize geometry. Cancelling the effect is sufficient; do
+                // not turn a presentation sample into canonical placement.
+                self.presentation_animator.cancel(root_surface_id);
+            } else {
+                self.rebase_interaction_to_presented_origin(
+                    root_surface_id,
+                    start_geometry.placement,
+                    takeover_cause,
+                );
+            }
         }
         if source == WindowInteractionSource::NativeBinding {
             let _ = self.activate_desktop_window(window_id, WindowFocusReason::PointerPress);
@@ -761,6 +780,57 @@ impl CompositorState {
             );
         }
         true
+    }
+
+    fn restore_maximized_window_for_interaction(
+        &mut self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) -> bool {
+        let Some(restore_geometry) = self
+            .window(window_id)
+            .and_then(|window| window.state.restore_geometry())
+        else {
+            return false;
+        };
+        let Some(canonical_geometry) = self
+            .current_visual_root_window_geometry(root_surface_id)
+            .or_else(|| self.current_root_window_geometry(root_surface_id))
+        else {
+            return false;
+        };
+        let physical_geometry = self
+            .presented_visual_root_window_geometry(root_surface_id)
+            .unwrap_or(canonical_geometry);
+        let Some(physical_rect) = self
+            .presented_window_geometry(root_surface_id)
+            .map(PresentedWindowGeometry::presented_rect)
+            .or_else(|| self.presentation_rect_for_geometry(root_surface_id, physical_geometry))
+        else {
+            return false;
+        };
+        let restore_rect = self
+            .presentation_rect_for_geometry(root_surface_id, restore_geometry)
+            .unwrap_or(physical_rect);
+        let horizontal_ratio =
+            ((pointer_x - physical_rect.x()) / physical_rect.width().max(1.0)).clamp(0.0, 1.0);
+        let vertical_offset = pointer_y - physical_rect.y();
+        let desired_x = pointer_x - horizontal_ratio * f64::from(restore_geometry.width);
+        let desired_y = pointer_y - vertical_offset;
+        let delta_x = (desired_x - restore_rect.x()).round() as i32;
+        let delta_y = (desired_y - restore_rect.y()).round() as i32;
+        let target = WindowGeometry::new(
+            SurfacePlacement {
+                local_x: restore_geometry.placement.local_x.saturating_add(delta_x),
+                local_y: restore_geometry.placement.local_y.saturating_add(delta_y),
+                ..restore_geometry.placement
+            },
+            restore_geometry.width,
+            restore_geometry.height,
+        );
+        self.restore_root_window_for_interaction(root_surface_id, target)
     }
 
     fn set_interaction_cursor_override(&mut self, kind: WindowInteractionKind) {
@@ -1564,11 +1634,11 @@ pub(in crate::compositor) fn window_interaction_allowed_for_mode(
     mode: ToplevelMode,
     kind: WindowInteractionKind,
 ) -> bool {
-    mode != ToplevelMode::Fullscreen
-        || !matches!(
-            kind,
-            WindowInteractionKind::Move | WindowInteractionKind::Resize(_)
-        )
+    match mode {
+        ToplevelMode::Normal => true,
+        ToplevelMode::Maximized => matches!(kind, WindowInteractionKind::Move),
+        ToplevelMode::Fullscreen => false,
+    }
 }
 
 fn log_begin_rejection(state: &CompositorState, begin: BeginWindowInteraction, reason: &str) {

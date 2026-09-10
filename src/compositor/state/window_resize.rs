@@ -1,5 +1,16 @@
 use super::*;
 
+/// Describes whether a new visual geometry is installed immediately or
+/// animated from an explicitly captured pre-mutation source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum VisualGeometryTransition {
+    Immediate,
+    Animated {
+        source: WindowGeometry,
+        kind: PresentationAnimationKind,
+    },
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn begin_x11_resize_for_test(
         &mut self,
@@ -455,18 +466,19 @@ impl CompositorState {
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) {
-        self.install_toplevel_visual_geometry_with_animation(root_surface_id, geometry, None);
+        self.install_toplevel_visual_geometry_with_transition(
+            root_surface_id,
+            geometry,
+            VisualGeometryTransition::Immediate,
+        );
     }
 
-    pub(in crate::compositor) fn install_toplevel_visual_geometry_with_animation(
+    pub(in crate::compositor) fn install_toplevel_visual_geometry_with_transition(
         &mut self,
         root_surface_id: u32,
         geometry: WindowGeometry,
-        animation_kind: Option<PresentationAnimationKind>,
+        transition: VisualGeometryTransition,
     ) {
-        let previous_geometry = self
-            .current_visual_root_window_geometry(root_surface_id)
-            .or_else(|| self.current_root_window_geometry(root_surface_id));
         let target_cleared = self
             .renderable_surfaces
             .iter_mut()
@@ -490,15 +502,13 @@ impl CompositorState {
         }
         if changed {
             self.advance_pointer_hit_generation();
-            if let Some(kind) = animation_kind {
-                self.animate_toplevel_visual_geometry(
-                    root_surface_id,
-                    previous_geometry,
-                    geometry,
-                    kind,
-                );
-            } else {
-                self.presentation_animator.cancel(root_surface_id);
+            match transition {
+                VisualGeometryTransition::Immediate => {
+                    self.presentation_animator.cancel(root_surface_id);
+                }
+                VisualGeometryTransition::Animated { source, kind } => {
+                    self.animate_toplevel_visual_geometry(root_surface_id, source, geometry, kind);
+                }
             }
         }
     }

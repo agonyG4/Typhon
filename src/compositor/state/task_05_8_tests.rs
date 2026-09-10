@@ -505,11 +505,7 @@ mod task_05_8_tests {
         state.layout_animation_epoch = Some(AnimationTime::from_nanos(0));
         state.animate_toplevel_visual_geometry(
             root_id,
-            Some(WindowGeometry::new(
-                SurfacePlacement::root_at(80, 80),
-                944,
-                526,
-            )),
+            WindowGeometry::new(SurfacePlacement::root_at(80, 80), 944, 526),
             window_geometry,
             PresentationAnimationKind::LayoutReflow,
         );
@@ -783,7 +779,7 @@ mod task_05_8_tests {
 
         state.animate_toplevel_visual_geometry(
             root_id,
-            Some(previous),
+            previous,
             target,
             PresentationAnimationKind::ProgrammaticMove,
         );

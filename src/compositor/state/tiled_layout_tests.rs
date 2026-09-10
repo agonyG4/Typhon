@@ -34,7 +34,7 @@ fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> Renderab
 }
 
 #[test]
-fn tiled_dwindle_reflow_uses_the_macos_layout_policy_curve() {
+fn tiled_dwindle_reflow_uses_the_kde_layout_policy_curve() {
     let mut state = CompositorState::new(None);
     assert!(state.set_output_size(1_920, 1_080));
     let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
@@ -72,10 +72,46 @@ fn tiled_dwindle_reflow_uses_the_macos_layout_policy_curve() {
     assert_eq!(
         state.presentation_animator.transition_curve(250),
         Some(
-            PresentationAnimationPolicy::macos()
-                .curve_for(PresentationAnimationKind::LayoutReflow,)
+            PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::LayoutReflow,)
         )
     );
+}
+
+#[test]
+fn tiled_dwindle_reflow_starts_from_pre_mutation_geometry_without_visual_history() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, 260))
+        .expect("window");
+    state.window_mut(window_id).expect("window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .tiled_layout
+        .insert(
+            location,
+            window_id,
+            crate::wm::layout::InsertHint::default(),
+        )
+        .expect("tiled insert");
+    state.append_renderable_surface(test_renderable_surface(260, 640, 480));
+    let source = WindowGeometry::new(SurfacePlacement::absolute_root_at(37, 49), 640, 480);
+    state.surface_placements.insert(260, source.placement);
+    state.renderable_surfaces[0].placement = source.placement;
+    state.install_toplevel_visual_geometry(260, source);
+    state.toplevel_visual_geometries.remove(&260);
+
+    assert!(state.reflow_tiled_location(location));
+    let start = state
+        .presentation_animator
+        .sample_at_transition_start(260)
+        .expect("layout transition should be active");
+    let expected = state
+        .presentation_rect_for_geometry(260, source)
+        .expect("source presentation rect");
+    assert_eq!(start.rect, expected);
 }
 
 #[test]

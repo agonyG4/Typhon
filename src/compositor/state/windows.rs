@@ -1420,7 +1420,7 @@ impl CompositorState {
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
         let animation_kind = mode_transition_animation_kind(previous_mode, mode);
-        let restore_geometry = self
+        let source_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
@@ -1440,7 +1440,7 @@ impl CompositorState {
         }
 
         if let Some(window) = self.toplevel_window_state_mut(surface_id) {
-            window.capture_restore_geometry(restore_geometry);
+            window.capture_restore_geometry(source_geometry);
             window.set_mode(mode);
         }
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
@@ -1462,7 +1462,13 @@ impl CompositorState {
             geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        self.install_toplevel_visual_geometry_with_animation(surface_id, geometry, animation_kind);
+        let transition = animation_kind.map_or(VisualGeometryTransition::Immediate, |kind| {
+            VisualGeometryTransition::Animated {
+                source: source_geometry,
+                kind,
+            }
+        });
+        self.install_toplevel_visual_geometry_with_transition(surface_id, geometry, transition);
         configured
     }
 
@@ -1475,6 +1481,38 @@ impl CompositorState {
         {
             return self.transition_x11_window_mode(window_id, ToplevelMode::Normal, false);
         }
+        self.restore_normal_root_window_with_transition(surface_id, None)
+    }
+
+    pub(in crate::compositor) fn restore_root_window_for_interaction(
+        &mut self,
+        surface_id: u32,
+        geometry: WindowGeometry,
+    ) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && matches!(
+                self.window(window_id).map(|window| window.backend),
+                Some(WindowBackend::X11(_))
+            )
+        {
+            let restored = self.transition_x11_window_mode_for_interaction(window_id, geometry);
+            if restored {
+                self.cancel_presentation_for_root(surface_id);
+            }
+            return restored;
+        }
+        let restored = self.restore_normal_root_window_with_transition(surface_id, Some(geometry));
+        if restored {
+            self.cancel_presentation_for_root(surface_id);
+        }
+        restored
+    }
+
+    fn restore_normal_root_window_with_transition(
+        &mut self,
+        surface_id: u32,
+        interaction_geometry: Option<WindowGeometry>,
+    ) -> bool {
         let tiled_location = self
             .window_id_for_surface(surface_id)
             .and_then(|window_id| self.window(window_id))
@@ -1486,6 +1524,10 @@ impl CompositorState {
             .and_then(|window_id| self.window(window_id))
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
+        let source_geometry = self
+            .current_visual_root_window_geometry(surface_id)
+            .or_else(|| self.current_root_window_geometry(surface_id))
+            .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,
@@ -1498,19 +1540,27 @@ impl CompositorState {
         }
         self.clear_fullscreen_presentation_owner(surface_id);
         let window_id = self.window_id_for_surface(surface_id);
-        let restore_geometry = {
-            let Some(window) = self.toplevel_window_state_mut(surface_id) else {
+        let stored_restore_geometry = {
+            let Some(window) = self.toplevel_window_state(surface_id) else {
                 return false;
             };
-            window.set_mode(ToplevelMode::Normal);
-            window.take_restore_geometry()
+            window.restore_geometry()
         };
+        if let Some(window) = self.toplevel_window_state_mut(surface_id) {
+            window.set_mode(ToplevelMode::Normal);
+        } else {
+            return false;
+        }
         if let Some(window_id) = window_id {
             self.mark_astrea_toplevel_dirty(window_id);
         }
+        let restore_geometry = interaction_geometry.or(stored_restore_geometry);
         if let Some(location) = tiled_location {
-            let _ = self.reflow_tiled_location(location);
-            return true;
+            let reflowed = self.reflow_tiled_location(location);
+            if reflowed && let Some(window) = self.toplevel_window_state_mut(surface_id) {
+                let _ = window.take_restore_geometry();
+            }
+            return reflowed;
         }
         let restore_geometry = restore_geometry
             .or_else(|| self.current_root_window_geometry(surface_id))
@@ -1529,11 +1579,25 @@ impl CompositorState {
             restore_geometry.placement,
             RenderGenerationCause::WindowMode,
         );
-        self.install_toplevel_visual_geometry_with_animation(
+        let transition = if interaction_geometry.is_some() {
+            VisualGeometryTransition::Immediate
+        } else {
+            mode_transition_animation_kind(previous_mode, ToplevelMode::Normal).map_or(
+                VisualGeometryTransition::Immediate,
+                |kind| VisualGeometryTransition::Animated {
+                    source: source_geometry,
+                    kind,
+                },
+            )
+        };
+        self.install_toplevel_visual_geometry_with_transition(
             surface_id,
             restore_geometry,
-            mode_transition_animation_kind(previous_mode, ToplevelMode::Normal),
+            transition,
         );
+        if configured && let Some(window) = self.toplevel_window_state_mut(surface_id) {
+            let _ = window.take_restore_geometry();
+        }
         configured
     }
 
@@ -1703,7 +1767,7 @@ impl CompositorState {
     }
 }
 
-fn mode_transition_animation_kind(
+pub(in crate::compositor) fn mode_transition_animation_kind(
     previous: ToplevelMode,
     target: ToplevelMode,
 ) -> Option<PresentationAnimationKind> {

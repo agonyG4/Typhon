@@ -31,6 +31,89 @@ fn fullscreen_window_interaction_eligibility_rejects_move_and_all_resize_edges()
 }
 
 #[test]
+fn maximized_window_interaction_eligibility_rejects_resize() {
+    assert!(window_interaction_allowed_for_mode(
+        ToplevelMode::Maximized,
+        WindowInteractionKind::Move,
+    ));
+    assert!(!window_interaction_allowed_for_mode(
+        ToplevelMode::Maximized,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+    ));
+}
+
+#[test]
+fn presented_origin_rebase_cancels_animation_without_baking_presented_size() {
+    let surface_id = 42;
+    let mut state = CompositorState::new(None);
+    state.append_renderable_surface(test_renderable_surface(surface_id, 1_000, 700));
+    let canonical = WindowGeometry::new(SurfacePlacement::absolute_root_at(640, 320), 1_000, 700);
+    state.install_toplevel_visual_geometry(surface_id, canonical);
+    let canonical_rect = state
+        .presentation_rect_for_geometry(surface_id, canonical)
+        .expect("canonical presentation rect");
+    let presented_rect =
+        PresentationRect::new(500.0, 200.0, 820.0, 574.0).expect("presented presentation rect");
+    state.start_test_presentation_transition(
+        surface_id,
+        canonical_rect,
+        presented_rect,
+        AnimationTime::from_nanos(0),
+    );
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(surface_id, presented_rect),
+    );
+
+    let rebased = state
+        .rebase_interaction_to_presented_origin(
+            surface_id,
+            SurfacePlacement::absolute_root_at(500, 200),
+            RenderGenerationCause::WindowMove,
+        )
+        .expect("canonical geometry should be available");
+
+    assert_eq!(rebased.width, canonical.width);
+    assert_eq!(rebased.height, canonical.height);
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(500, 200),
+            canonical.width,
+            canonical.height,
+        ))
+    );
+    assert_eq!(state.presentation_animator.active_count(), 0);
+}
+
+#[test]
+fn tiled_resize_rebases_the_split_handle_without_replacing_canonical_geometry() {
+    let (mut state, window_id, _location, _handle) = tiled_resize_fixture();
+    let surface_id = 700;
+    state.append_renderable_surface(test_renderable_surface(surface_id, 800, 600));
+    let canonical = WindowGeometry::new(SurfacePlacement::absolute_root_at(40, 50), 800, 600);
+    state.set_surface_placement(surface_id, canonical.placement);
+    state.install_toplevel_visual_geometry(surface_id, canonical);
+    let presented_rect =
+        PresentationRect::new(120.0, 90.0, 680.0, 520.0).expect("presented tiled window rect");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(surface_id, presented_rect),
+    );
+
+    let mut preparation = state
+        .prepare_tiled_resize(window_id, ResizeEdges::new(false, false, false, true))
+        .expect("tiled resize handle");
+    state.rebase_tiled_resize_preparation(surface_id, window_id, &mut preparation);
+
+    assert_eq!(state.surface_placement(surface_id), canonical.placement);
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(canonical)
+    );
+}
+
+#[test]
 fn initial_map_focus_does_not_override_client_owned_pointer_activity() {
     let mut state = CompositorState::new(None);
     assert!(state.map_focus_allowed());
@@ -472,6 +555,99 @@ fn tiled_resize_cancellation_discards_pending_pointer_value() {
     assert!(state.pending_tiled_resize.is_none());
     assert!(state.tiled_resize_session.is_none());
     assert_eq!(state.resize_flow_metrics.tiled_resize_frame_flushes, 0);
+}
+
+#[test]
+fn tiled_resize_interruption_cancels_presentation_without_baking_visual_size() {
+    let (mut state, window_id, location, handle) = tiled_resize_fixture();
+    let root_surface_id = 700;
+    state.append_renderable_surface(test_renderable_surface(root_surface_id, 640, 480));
+    state.set_surface_placement(root_surface_id, SurfacePlacement::absolute_root_at(40, 50));
+    let canonical = WindowGeometry::new(SurfacePlacement::absolute_root_at(40, 50), 640, 480);
+    state.toplevel_visual_geometries.insert(
+        root_surface_id,
+        ToplevelVisualGeometry {
+            placement: canonical.placement,
+            width: canonical.width,
+            height: canonical.height,
+            active_resize: None,
+            mode_transition: false,
+        },
+    );
+    state
+        .presentation_animator
+        .start(
+            root_surface_id,
+            PresentationRect::new(40.0, 50.0, 640.0, 480.0).expect("canonical rect"),
+            PresentationRect::new(90.0, 80.0, 410.0, 300.0).expect("presented rect"),
+            AnimationTime::from_nanos(0),
+            AnimationCurve::easing(
+                std::time::Duration::from_millis(200),
+                EasingCurve::EaseOutCubic,
+            ),
+        )
+        .expect("layout presentation should start");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::new(
+            root_surface_id,
+            PresentationRect::new(90.0, 80.0, 410.0, 300.0).expect("presented geometry"),
+        ),
+    );
+    let topology_generation = state
+        .tiled_layout
+        .tree(location)
+        .expect("tiled tree")
+        .topology_generation();
+    let mut preparation = TiledResizePreparation {
+        location,
+        edges: ResizeEdges::new(false, false, false, true),
+        handle,
+        solution: state
+            .tiled_layout
+            .calculate(
+                location,
+                state.layout_root_rect(),
+                &state
+                    .tiled_layout
+                    .tree(location)
+                    .expect("tiled tree")
+                    .windows()
+                    .map(crate::wm::layout::LayoutWindowSnapshot::new)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("tiled solution"),
+    };
+
+    state.rebase_tiled_resize_preparation(root_surface_id, window_id, &mut preparation);
+    let rebased = state
+        .rebase_interaction_to_presented_origin(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(90, 80),
+            RenderGenerationCause::WindowResize,
+        )
+        .expect("canonical geometry for interaction rebase");
+
+    assert_eq!((rebased.width, rebased.height), (640, 480));
+    assert_eq!(
+        state.toplevel_visual_geometries[&root_surface_id].placement,
+        SurfacePlacement::absolute_root_at(90, 80)
+    );
+    assert!(
+        state
+            .presentation_animator
+            .sample(root_surface_id, AnimationTime::from_nanos(1))
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .tiled_layout
+            .tree(location)
+            .expect("tiled tree")
+            .topology_generation(),
+        topology_generation
+    );
+    assert_ne!(preparation.handle, handle);
 }
 
 #[test]

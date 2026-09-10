@@ -1,6 +1,8 @@
 //! Presentation animation policy selection and geometry-transition curves.
 
-use crate::presentation_animation::{AnimationCurve, SpringSpec};
+use std::time::Duration;
+
+use crate::presentation_animation::{AnimationCurve, EasingCurve, SpringSpec};
 
 // A half-pixel residual is below the integer-compatible materialization scale.
 // At 165 Hz, 8 px/s is about 0.048 px per frame; at 60 Hz it is about 0.133
@@ -25,12 +27,12 @@ pub enum PresentationAnimationKind {
     MaximizeExit,
     FullscreenEnter,
     FullscreenExit,
-    XwaylandModeChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationAnimationStyle {
     Macos,
+    Kde,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,12 @@ impl PresentationAnimationPolicy {
     pub const fn macos() -> Self {
         Self {
             style: PresentationAnimationStyle::Macos,
+        }
+    }
+
+    pub const fn kde() -> Self {
+        Self {
+            style: PresentationAnimationStyle::Kde,
         }
     }
 
@@ -84,8 +92,18 @@ impl PresentationAnimationPolicy {
             (PresentationAnimationStyle::Macos, PresentationAnimationKind::FullscreenExit) => {
                 macos_spring(215.0, 29.0)
             }
-            (PresentationAnimationStyle::Macos, PresentationAnimationKind::XwaylandModeChange) => {
-                macos_spring(230.0, 31.0)
+            (PresentationAnimationStyle::Kde, PresentationAnimationKind::ProgrammaticMove) => {
+                AnimationCurve::easing(Duration::from_millis(160), EasingCurve::EaseOutCubic)
+            }
+            (PresentationAnimationStyle::Kde, PresentationAnimationKind::ProgrammaticResize)
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::LayoutReflow) => {
+                AnimationCurve::easing(Duration::from_millis(200), EasingCurve::EaseOutCubic)
+            }
+            (PresentationAnimationStyle::Kde, PresentationAnimationKind::MaximizeEnter)
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::MaximizeExit)
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenEnter)
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenExit) => {
+                AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutCubic)
             }
         }
     }
@@ -99,12 +117,13 @@ impl Default for PresentationAnimationPolicy {
 
 pub fn presentation_animation_style_from_env(value: Option<&str>) -> PresentationAnimationStyle {
     match value {
-        None | Some("") | Some("default") | Some("macos") => PresentationAnimationStyle::Macos,
+        None | Some("") | Some("default") | Some("kde") => PresentationAnimationStyle::Kde,
+        Some("macos") => PresentationAnimationStyle::Macos,
         Some(value) => {
             eprintln!(
-                "oblivion-one presentation animation: unknown OBLIVION_ONE_ANIMATION_STYLE={value:?}; using macos policy"
+                "oblivion-one presentation animation: unknown OBLIVION_ONE_ANIMATION_STYLE={value:?}; using kde policy"
             );
-            PresentationAnimationStyle::Macos
+            PresentationAnimationStyle::Kde
         }
     }
 }
@@ -126,7 +145,6 @@ mod tests {
             (PresentationAnimationKind::MaximizeExit, 220.0, 29.0),
             (PresentationAnimationKind::FullscreenEnter, 205.0, 28.0),
             (PresentationAnimationKind::FullscreenExit, 215.0, 29.0),
-            (PresentationAnimationKind::XwaylandModeChange, 230.0, 31.0),
         ];
 
         let policy = PresentationAnimationPolicy::macos();
@@ -151,7 +169,6 @@ mod tests {
             PresentationAnimationKind::MaximizeExit,
             PresentationAnimationKind::FullscreenEnter,
             PresentationAnimationKind::FullscreenExit,
-            PresentationAnimationKind::XwaylandModeChange,
         ];
 
         for kind in kinds {
@@ -177,7 +194,6 @@ mod tests {
             PresentationAnimationKind::MaximizeExit,
             PresentationAnimationKind::FullscreenEnter,
             PresentationAnimationKind::FullscreenExit,
-            PresentationAnimationKind::XwaylandModeChange,
         ];
         let start = PresentationRect::new(0.0, 0.0, 1.0, 1.0).expect("start rect");
         let target = PresentationRect::new(1_920.0, 0.0, 1.0, 1.0).expect("target rect");
@@ -237,7 +253,6 @@ mod tests {
             PresentationAnimationKind::MaximizeExit,
             PresentationAnimationKind::FullscreenEnter,
             PresentationAnimationKind::FullscreenExit,
-            PresentationAnimationKind::XwaylandModeChange,
         ];
         let displacements = [200.0, 500.0, 1_000.0, 1_920.0];
 
@@ -281,17 +296,44 @@ mod tests {
     }
 
     #[test]
-    fn animation_style_aliases_resolve_to_the_macos_policy() {
-        for value in [None, Some(""), Some("default"), Some("macos")] {
+    fn animation_style_aliases_resolve_to_the_intended_policy() {
+        for value in [None, Some(""), Some("default"), Some("kde")] {
             assert_eq!(
                 presentation_animation_style_from_env(value),
-                PresentationAnimationStyle::Macos
+                PresentationAnimationStyle::Kde
             );
         }
         assert_eq!(
-            presentation_animation_style_from_env(Some("unknown")),
+            presentation_animation_style_from_env(Some("macos")),
             PresentationAnimationStyle::Macos
         );
+        assert_eq!(
+            presentation_animation_style_from_env(Some("unknown")),
+            PresentationAnimationStyle::Kde
+        );
+    }
+
+    #[test]
+    fn kde_policy_uses_the_fixed_duration_geometry_table() {
+        let expected = [
+            (PresentationAnimationKind::ProgrammaticMove, 160),
+            (PresentationAnimationKind::ProgrammaticResize, 200),
+            (PresentationAnimationKind::LayoutReflow, 200),
+            (PresentationAnimationKind::MaximizeEnter, 250),
+            (PresentationAnimationKind::MaximizeExit, 250),
+            (PresentationAnimationKind::FullscreenEnter, 250),
+            (PresentationAnimationKind::FullscreenExit, 250),
+        ];
+
+        for (kind, duration_ms) in expected {
+            assert_eq!(
+                PresentationAnimationPolicy::kde().curve_for(kind),
+                AnimationCurve::easing(
+                    Duration::from_millis(duration_ms),
+                    EasingCurve::EaseOutCubic,
+                )
+            );
+        }
     }
 
     fn close(actual: f64, expected: f64) {

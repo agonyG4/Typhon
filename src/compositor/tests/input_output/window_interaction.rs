@@ -4,6 +4,36 @@ use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_toplevel_decoration_v1 as client_zxdg_toplevel_decoration_v1,
 };
 
+fn map_server_decorated_toplevel(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<client_zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, Box<dyn std::error::Error>>
+{
+    let connection = Connection::from_socket(UnixStream::connect(socket_path)?)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ())?;
+    let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+    let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+    Ok(decoration)
+}
+
 #[test]
 fn overlapping_server_decoration_does_not_focus_window_underneath() {
     let socket_name = unique_socket_name();
@@ -311,6 +341,265 @@ fn overlapping_server_decoration_does_not_focus_window_underneath() {
 
     let _ = decoration_a;
     let _ = decoration_b;
+}
+
+#[test]
+fn titlebar_drag_interrupts_scaled_presentation_without_baking_scaled_size() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let _decoration = map_server_decorated_toplevel(&socket_path, &commands).unwrap();
+
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(640, 320),
+        800,
+        600,
+    );
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("decorated root should be renderable")
+        .surface_id;
+
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishFocusedPresentationAfter {
+            frame_id: 2,
+            elapsed_nanos: 125_000_000,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let physical = capture_focused_presentation_after(&commands, 125_000_000)
+        .expect("maximize presentation should still be active midway");
+    assert_ne!(physical.rect.width(), 800.0);
+    assert_ne!(physical.rect.height(), 600.0);
+
+    let titlebar_x = physical.rect.x() + 20.0;
+    let titlebar_y = physical.rect.y() - 13.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: titlebar_x,
+            y: titlebar_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::BeginMove {
+            x: titlebar_x,
+            y: titlebar_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let interaction = capture_window_interaction_debug_snapshot(&commands)
+        .expect("transformed titlebar must start a move interaction");
+    let visual =
+        capture_root_window_geometry(&commands, root_surface_id).expect("restored visual geometry");
+    let transition_curve = capture_presentation_transition_curve(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(interaction.root_surface_id, root_surface_id);
+    assert_eq!(interaction.kind, WindowInteractionKind::Move);
+    assert!(interaction.decoration_owned);
+    assert_eq!(visual.width, 800);
+    assert_eq!(visual.height, 600);
+    assert_eq!(transition_curve, None);
+}
+
+#[test]
+fn titlebar_move_interrupts_size_presentation_without_baking_scaled_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("decorated root should be renderable")
+        .surface_id;
+    focus_root_window(&commands, root_surface_id);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 100),
+        300,
+        200,
+    );
+    commands
+        .send(ServerCommand::ResizeFocusedTo {
+            width: 500,
+            height: 350,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let before = capture_toplevel_visual_geometry(&commands).expect("resized visual geometry");
+    assert_eq!((before.width, before.height), (500, 350));
+    assert!(capture_presentation_transition_curve(&commands).is_some());
+
+    commands
+        .send(ServerCommand::BeginMove { x: 120.0, y: 87.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let interaction = capture_window_interaction_debug_snapshot(&commands)
+        .expect("titlebar move should begin during presentation");
+    let after = capture_toplevel_visual_geometry(&commands).expect("canonical visual geometry");
+    let transition_after_interaction = capture_presentation_transition_curve(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(interaction.kind, WindowInteractionKind::Move);
+    assert_eq!((after.width, after.height), (500, 350));
+    assert_eq!(after.local_y, 100);
+    assert!(transition_after_interaction.is_none());
+    drop(decoration);
+}
+
+#[test]
+fn maximized_titlebar_move_restores_normal_window_under_pointer() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("decorated root should be renderable")
+        .surface_id;
+    focus_root_window(&commands, root_surface_id);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 100),
+        300,
+        200,
+    );
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        capture_focused_toplevel_mode(&commands),
+        Some(ToplevelMode::Maximized)
+    );
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let maximized_visual = capture_toplevel_visual_geometry(&commands);
+    assert!(
+        maximized_visual.is_some(),
+        "maximized visual should remain installed"
+    );
+
+    commands
+        .send(ServerCommand::BeginMove { x: 120.0, y: 87.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let mode = capture_focused_toplevel_mode(&commands);
+    let interaction = capture_window_interaction_debug_snapshot(&commands);
+    let committed = capture_root_window_geometry(&commands, root_surface_id);
+    let transition = capture_presentation_transition_curve(&commands);
+    commands
+        .send(ServerCommand::UpdateInteraction { x: 140.0, y: 87.0 })
+        .unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let moved = capture_root_window_geometry(&commands, root_surface_id);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(mode, Some(ToplevelMode::Normal));
+    assert_eq!(
+        interaction.map(|interaction| interaction.kind),
+        Some(WindowInteractionKind::Move)
+    );
+    assert_eq!(
+        committed.map(|geometry| (geometry.width, geometry.height)),
+        Some((300, 200))
+    );
+    assert_eq!(
+        moved.map(|geometry| geometry.placement.local_x),
+        committed.map(|geometry| geometry.placement.local_x.saturating_add(20))
+    );
+    assert!(transition.is_none());
+    drop(decoration);
+}
+
+#[test]
+fn maximized_resize_is_rejected_by_the_real_pointer_entry_path() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let _decoration = map_server_decorated_toplevel(&socket_path, &commands).unwrap();
+
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(100, 100),
+        300,
+        200,
+    );
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::BeginResize {
+            x: 1278.0,
+            y: 798.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let interaction = capture_window_interaction_debug_snapshot(&commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert!(interaction.is_none(), "maximized resize must be rejected");
 }
 
 #[test]

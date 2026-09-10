@@ -166,7 +166,21 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
+    CaptureRootWindowGeometry {
+        root_surface_id: u32,
+        reply: Sender<Option<WindowGeometry>>,
+    },
     CapturePresentationTransitionCurve(Sender<Option<AnimationCurve>>),
+    CapturePresentationTransitionStart {
+        root_surface_id: u32,
+        reply: Sender<Option<PresentationWindowSample>>,
+    },
+    CaptureFocusedPresentationAfter {
+        elapsed_nanos: u64,
+        reply: Sender<Option<PresentationWindowSample>>,
+    },
+    DropFocusedToplevelVisualGeometry,
+    CancelFocusedPresentationTransition,
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
     CaptureFullscreenRenderPlanMetrics(Sender<FullscreenRenderPlanMetrics>),
     CaptureConfigureSerial(Sender<u32>),
@@ -211,6 +225,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
     CaptureKeyboardFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedWindowId(Sender<Option<WindowId>>),
+    CaptureFocusedToplevelMode(Sender<Option<ToplevelMode>>),
     CaptureWindowIdForSurface {
         surface_id: u32,
         reply: Sender<Option<WindowId>>,
@@ -261,6 +276,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     PublishTestPresentationAt {
         frame_id: u64,
         at: AnimationTime,
+    },
+    PublishFocusedPresentationAfter {
+        frame_id: u64,
+        elapsed_nanos: u64,
     },
     SettleNoVisualChangeWork {
         owns_frame_batch: bool,
@@ -652,6 +671,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             };
                         let _ = reply.send(visual);
                     }
+                    ServerCommand::CaptureRootWindowGeometry {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let geometry = server
+                            .state
+                            .current_visual_root_window_geometry(root_surface_id)
+                            .or_else(|| server.state.current_root_window_geometry(root_surface_id));
+                        let _ = reply.send(geometry);
+                    }
                     ServerCommand::CapturePresentationTransitionCurve(reply) => {
                         let curve =
                             if server.state.toplevel_surfaces.len() == 1 {
@@ -667,6 +696,52 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 None
                             };
                         let _ = reply.send(curve);
+                    }
+                    ServerCommand::CapturePresentationTransitionStart {
+                        root_surface_id,
+                        reply,
+                    } => {
+                        let sample = server
+                            .state
+                            .presentation_animator
+                            .sample_at_transition_start(root_surface_id);
+                        let _ = reply.send(sample);
+                    }
+                    ServerCommand::CaptureFocusedPresentationAfter {
+                        elapsed_nanos,
+                        reply,
+                    } => {
+                        let sample =
+                            server
+                                .state
+                                .focused_root_surface_id()
+                                .and_then(|root_surface_id| {
+                                    server
+                                        .state
+                                        .presentation_animator
+                                        .transition_started_at(root_surface_id)
+                                        .and_then(|started_at| {
+                                            server.state.presentation_animator.sample(
+                                                root_surface_id,
+                                                AnimationTime::from_nanos(
+                                                    started_at
+                                                        .as_nanos()
+                                                        .saturating_add(elapsed_nanos),
+                                                ),
+                                            )
+                                        })
+                                });
+                        let _ = reply.send(sample);
+                    }
+                    ServerCommand::DropFocusedToplevelVisualGeometry => {
+                        if let Some(surface_id) = server.state.focused_root_surface_id() {
+                            server.state.toplevel_visual_geometries.remove(&surface_id);
+                        }
+                    }
+                    ServerCommand::CancelFocusedPresentationTransition => {
+                        if let Some(surface_id) = server.state.focused_root_surface_id() {
+                            server.state.presentation_animator.cancel(surface_id);
+                        }
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
                         let _ = reply.send(server.state.fullscreen_presentation_eligibility());
@@ -995,6 +1070,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureFocusedWindowId(reply) => {
                         let _ = reply.send(server.state.focused_window_id);
                     }
+                    ServerCommand::CaptureFocusedToplevelMode(reply) => {
+                        let mode = server
+                            .state
+                            .focused_root_surface_id()
+                            .and_then(|surface_id| server.state.window_id_for_surface(surface_id))
+                            .and_then(|window_id| server.state.window(window_id))
+                            .map(|window| window.state.mode());
+                        let _ = reply.send(mode);
+                    }
                     ServerCommand::CaptureWindowIdForSurface { surface_id, reply } => {
                         let _ = reply.send(server.state.window_id_for_surface(surface_id));
                     }
@@ -1093,6 +1177,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::PublishTestPresentationAt { frame_id, at } => {
                         server.publish_test_presentation_at(frame_id, at);
+                    }
+                    ServerCommand::PublishFocusedPresentationAfter {
+                        frame_id,
+                        elapsed_nanos,
+                    } => {
+                        if let Some(root_surface_id) = server.state.focused_root_surface_id()
+                            && let Some(started_at) = server
+                                .state
+                                .presentation_animator
+                                .transition_started_at(root_surface_id)
+                        {
+                            server.publish_test_presentation_at(
+                                frame_id,
+                                AnimationTime::from_nanos(
+                                    started_at.as_nanos().saturating_add(elapsed_nanos),
+                                ),
+                            );
+                        }
                     }
                     ServerCommand::SettleNoVisualChangeWork {
                         owns_frame_batch,
@@ -1452,6 +1554,18 @@ pub(in crate::compositor::tests) fn capture_focused_window_id(
         .expect("server should report focused window")
 }
 
+pub(in crate::compositor::tests) fn capture_focused_toplevel_mode(
+    commands: &Sender<ServerCommand>,
+) -> Option<ToplevelMode> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedToplevelMode(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report focused toplevel mode")
+}
+
 pub(in crate::compositor::tests) fn capture_window_id_for_surface(
     commands: &Sender<ServerCommand>,
     surface_id: u32,
@@ -1537,6 +1651,22 @@ pub(in crate::compositor::tests) fn capture_toplevel_visual_geometry(
         .expect("server should report toplevel visual geometry")
 }
 
+pub(in crate::compositor::tests) fn capture_root_window_geometry(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> Option<WindowGeometry> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureRootWindowGeometry {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report root window geometry")
+}
+
 pub(in crate::compositor::tests) fn capture_presentation_transition_curve(
     commands: &Sender<ServerCommand>,
 ) -> Option<AnimationCurve> {
@@ -1547,6 +1677,47 @@ pub(in crate::compositor::tests) fn capture_presentation_transition_curve(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report presentation transition curve")
+}
+
+pub(in crate::compositor::tests) fn capture_presentation_transition_start(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> Option<PresentationWindowSample> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePresentationTransitionStart {
+            root_surface_id,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report presentation transition start")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_presentation_after(
+    commands: &Sender<ServerCommand>,
+    elapsed_nanos: u64,
+) -> Option<PresentationWindowSample> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedPresentationAfter {
+            elapsed_nanos,
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report presentation sample")
+}
+
+pub(in crate::compositor::tests) fn drop_focused_toplevel_visual_geometry(
+    commands: &Sender<ServerCommand>,
+) {
+    commands
+        .send(ServerCommand::DropFocusedToplevelVisualGeometry)
+        .unwrap();
+    wait_for_server_commands(commands);
 }
 
 pub(in crate::compositor::tests) fn capture_fullscreen_presentation_eligibility(

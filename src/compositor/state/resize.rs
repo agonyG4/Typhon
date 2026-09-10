@@ -453,16 +453,21 @@ impl CompositorState {
     ) -> bool {
         let width = self.clamp_toplevel_width(surface_id, width);
         let height = self.clamp_toplevel_height(surface_id, height);
+        let source = self
+            .current_visual_root_window_geometry(surface_id)
+            .or_else(|| self.current_root_window_geometry(surface_id));
         let configured = self
             .send_configure_root_window_to(surface_id, width, height, &[])
             .is_some();
         if configured {
             let geometry = WindowGeometry::new(self.surface_placement(surface_id), width, height);
-            self.install_toplevel_visual_geometry_with_animation(
-                surface_id,
-                geometry,
-                Some(PresentationAnimationKind::ProgrammaticResize),
-            );
+            let transition = source.map_or(VisualGeometryTransition::Immediate, |source| {
+                VisualGeometryTransition::Animated {
+                    source,
+                    kind: PresentationAnimationKind::ProgrammaticResize,
+                }
+            });
+            self.install_toplevel_visual_geometry_with_transition(surface_id, geometry, transition);
         }
         configured
     }

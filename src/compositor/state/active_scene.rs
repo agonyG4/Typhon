@@ -307,29 +307,57 @@ impl CompositorState {
         ))
     }
 
-    pub(in crate::compositor) fn take_over_presented_visual_geometry(
+    pub(in crate::compositor) fn rebase_interaction_to_presented_origin(
         &mut self,
         root_surface_id: u32,
-        geometry: WindowGeometry,
+        presented_origin: SurfacePlacement,
         cause: RenderGenerationCause,
-    ) {
+    ) -> Option<WindowGeometry> {
+        let canonical_geometry = self
+            .current_visual_root_window_geometry(root_surface_id)
+            .or_else(|| self.current_root_window_geometry(root_surface_id))?;
+
         // Keep the last physically presented transform until the next frame
         // publishes its replacement. This preserves the direct-scanout
         // blocker while input and canonical layout take over immediately.
         self.presentation_animator.cancel(root_surface_id);
         let placement_changed =
-            self.set_surface_placement_with_cause(root_surface_id, geometry.placement, cause);
-        let visual = ToplevelVisualGeometry {
-            placement: geometry.placement,
-            width: geometry.width,
-            height: geometry.height,
-            active_resize: None,
-            mode_transition: false,
-        };
-        let visual_changed = self
-            .toplevel_visual_geometries
-            .insert(root_surface_id, visual)
-            != Some(visual);
+            self.set_surface_placement_with_cause(root_surface_id, presented_origin, cause);
+        if let Some(window_id) = self.window_id_for_surface(root_surface_id)
+            && self
+                .window(window_id)
+                .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            self.set_x11_frame_geometry(
+                window_id,
+                WindowGeometry::new(
+                    presented_origin,
+                    canonical_geometry.width,
+                    canonical_geometry.height,
+                ),
+            );
+        }
+        let visual_changed =
+            if let Some(visual) = self.toplevel_visual_geometries.get_mut(&root_surface_id) {
+                if visual.placement != presented_origin {
+                    visual.placement = presented_origin;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                self.toplevel_visual_geometries.insert(
+                    root_surface_id,
+                    ToplevelVisualGeometry {
+                        placement: presented_origin,
+                        width: canonical_geometry.width,
+                        height: canonical_geometry.height,
+                        active_resize: None,
+                        mode_transition: false,
+                    },
+                );
+                true
+            };
         self.update_toplevel_visual_render_assignment(root_surface_id);
         if visual_changed && !placement_changed {
             self.advance_render_generation(cause);
@@ -337,6 +365,11 @@ impl CompositorState {
         if visual_changed || placement_changed {
             self.advance_pointer_hit_generation();
         }
+        Some(WindowGeometry::new(
+            presented_origin,
+            canonical_geometry.width,
+            canonical_geometry.height,
+        ))
     }
 
     pub(in crate::compositor) fn publish_presented_presentation(
@@ -386,7 +419,7 @@ impl CompositorState {
     pub(in crate::compositor) fn animate_toplevel_visual_geometry(
         &mut self,
         root_surface_id: u32,
-        previous_geometry: Option<WindowGeometry>,
+        previous_geometry: WindowGeometry,
         target_geometry: WindowGeometry,
         kind: PresentationAnimationKind,
     ) {
@@ -409,8 +442,8 @@ impl CompositorState {
             self.presentation_animator.cancel(root_surface_id);
             return;
         }
-        let Some(previous) = previous_geometry
-            .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry))
+        let Some(previous) =
+            self.presentation_rect_for_geometry(root_surface_id, previous_geometry)
         else {
             self.presentation_animator.cancel(root_surface_id);
             return;

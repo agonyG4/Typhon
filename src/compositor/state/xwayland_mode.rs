@@ -9,6 +9,29 @@ impl CompositorState {
         mode: ToplevelMode,
         minimized: bool,
     ) -> bool {
+        self.transition_x11_window_mode_with_target(window_id, mode, minimized, None)
+    }
+
+    pub(in crate::compositor) fn transition_x11_window_mode_for_interaction(
+        &mut self,
+        window_id: WindowId,
+        target_geometry: WindowGeometry,
+    ) -> bool {
+        self.transition_x11_window_mode_with_target(
+            window_id,
+            ToplevelMode::Normal,
+            false,
+            Some((target_geometry, VisualGeometryTransition::Immediate)),
+        )
+    }
+
+    fn transition_x11_window_mode_with_target(
+        &mut self,
+        window_id: WindowId,
+        mode: ToplevelMode,
+        minimized: bool,
+        interaction_target: Option<(WindowGeometry, VisualGeometryTransition)>,
+    ) -> bool {
         let Some((root_surface_id, current_mode, current_minimized, current_geometry)) = self
             .window(window_id)
             .filter(|window| matches!(window.backend, WindowBackend::X11(_)))
@@ -29,10 +52,17 @@ impl CompositorState {
             return false;
         }
 
+        let source_geometry = self
+            .toplevel_visual_geometries
+            .contains_key(&root_surface_id)
+            .then(|| self.current_visual_root_window_geometry(root_surface_id))
+            .flatten()
+            .or(current_geometry)
+            .or_else(|| self.current_visual_root_window_geometry(root_surface_id))
+            .or_else(|| self.current_root_window_geometry(root_surface_id))
+            .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(root_surface_id), 1, 1));
         let restore_geometry = if mode_changed && mode != ToplevelMode::Normal {
-            self.current_visual_root_window_geometry(root_surface_id)
-                .or_else(|| self.current_root_window_geometry(root_surface_id))
-                .or(current_geometry)
+            Some(source_geometry)
         } else {
             None
         };
@@ -64,7 +94,9 @@ impl CompositorState {
             self.restore_minimized_desktop_window(window_id);
         }
 
-        let target_geometry = if mode == ToplevelMode::Normal && mode_changed {
+        let target_geometry = if let Some((target_geometry, _)) = interaction_target {
+            target_geometry
+        } else if mode == ToplevelMode::Normal && mode_changed {
             self.current_tiled_geometry(window_id)
                 .or_else(|| {
                     self.window_mut(window_id)
@@ -83,6 +115,18 @@ impl CompositorState {
         }
 
         let geometry_changed = current_geometry != Some(target_geometry);
+        let transition = interaction_target.map_or_else(
+            || {
+                mode_transition_animation_kind(current_mode, mode).map_or(
+                    VisualGeometryTransition::Immediate,
+                    |kind| VisualGeometryTransition::Animated {
+                        source: source_geometry,
+                        kind,
+                    },
+                )
+            },
+            |(_, transition)| transition,
+        );
         if geometry_changed || mode_changed || minimized_changed {
             let _ = self.set_x11_frame_geometry(window_id, target_geometry);
             self.set_surface_placement_with_cause(
@@ -90,10 +134,10 @@ impl CompositorState {
                 target_geometry.placement,
                 RenderGenerationCause::WindowMode,
             );
-            self.install_x11_visual_geometry_with_animation(
+            self.install_x11_visual_geometry_with_transition(
                 root_surface_id,
                 target_geometry,
-                Some(PresentationAnimationKind::XwaylandModeChange),
+                transition,
             );
         }
 
@@ -115,6 +159,11 @@ impl CompositorState {
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
+        if interaction_target.is_some()
+            && let Some(window) = self.window_mut(window_id)
+        {
+            let _ = window.state.take_restore_geometry();
+        }
         true
     }
 
@@ -144,18 +193,19 @@ impl CompositorState {
         root_surface_id: u32,
         geometry: WindowGeometry,
     ) {
-        self.install_x11_visual_geometry_with_animation(root_surface_id, geometry, None);
+        self.install_x11_visual_geometry_with_transition(
+            root_surface_id,
+            geometry,
+            VisualGeometryTransition::Immediate,
+        );
     }
 
-    pub(in crate::compositor) fn install_x11_visual_geometry_with_animation(
+    pub(in crate::compositor) fn install_x11_visual_geometry_with_transition(
         &mut self,
         root_surface_id: u32,
         geometry: WindowGeometry,
-        animation_kind: Option<PresentationAnimationKind>,
+        transition: VisualGeometryTransition,
     ) {
-        let previous_geometry = self
-            .current_visual_root_window_geometry(root_surface_id)
-            .or_else(|| self.current_root_window_geometry(root_surface_id));
         let target_cleared = self
             .renderable_surfaces
             .iter_mut()
@@ -185,15 +235,13 @@ impl CompositorState {
         }
         if changed {
             self.advance_pointer_hit_generation();
-            if let Some(kind) = animation_kind {
-                self.animate_toplevel_visual_geometry(
-                    root_surface_id,
-                    previous_geometry,
-                    geometry,
-                    kind,
-                );
-            } else {
-                self.presentation_animator.cancel(root_surface_id);
+            match transition {
+                VisualGeometryTransition::Immediate => {
+                    self.presentation_animator.cancel(root_surface_id);
+                }
+                VisualGeometryTransition::Animated { source, kind } => {
+                    self.animate_toplevel_visual_geometry(root_surface_id, source, geometry, kind);
+                }
             }
         }
     }

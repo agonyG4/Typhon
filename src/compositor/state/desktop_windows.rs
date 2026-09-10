@@ -885,6 +885,9 @@ impl CompositorState {
             )
             | None => SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
         };
+        let previous_visual = self
+            .current_visual_root_window_geometry(root_surface_id)
+            .or_else(|| self.current_root_window_geometry(root_surface_id));
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
         {
@@ -903,7 +906,6 @@ impl CompositorState {
         }
 
         let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
-        let previous_visual = self.current_visual_root_window_geometry(root_surface_id);
         let visual_changed = normal_managed && !resize_active && previous_visual != Some(frame);
         let animation_kind = if visual_changed {
             previous_visual.map(|previous| {
@@ -926,7 +928,13 @@ impl CompositorState {
             },
         );
         if visual_changed {
-            self.install_x11_visual_geometry_with_animation(root_surface_id, frame, animation_kind);
+            let transition = animation_kind.map_or(VisualGeometryTransition::Immediate, |kind| {
+                VisualGeometryTransition::Animated {
+                    source: previous_visual.expect("visual change has a source geometry"),
+                    kind,
+                }
+            });
+            self.install_x11_visual_geometry_with_transition(root_surface_id, frame, transition);
         } else if placement_changed {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }

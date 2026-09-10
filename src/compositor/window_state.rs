@@ -25,6 +25,10 @@ impl WindowState {
         self.minimized
     }
 
+    pub(super) fn restore_geometry(&self) -> Option<WindowGeometry> {
+        self.restore_geometry
+    }
+
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
         self.minimized = true;
         self.minimized_surfaces = surfaces;

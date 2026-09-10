@@ -269,7 +269,133 @@ fn window_unmaximize_restores_previous_toplevel_geometry() {
 }
 
 #[test]
-fn window_maximize_entry_uses_the_macos_policy_curve_through_real_state() {
+fn fullscreen_transition_starts_from_pre_mutation_geometry_when_visual_history_is_missing() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::DropFocusedToplevelVisualGeometry,
+            ServerCommand::SetFocusedRootVisualGeometry {
+                placement: SurfacePlacement::absolute_root_at(640, 320),
+                width: 800,
+                height: 600,
+            },
+            ServerCommand::ToggleFullscreenFocused,
+        ],
+    )
+    .unwrap();
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("fullscreen root should remain renderable")
+        .surface_id;
+    let target = capture_root_window_geometry(&commands, root_surface_id)
+        .expect("fullscreen target geometry should be installed");
+    let start = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("fullscreen transition should be active");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!(
+        start.rect,
+        PresentationRect::new(640.0, 320.0, 800.0, 600.0).expect("source rect")
+    );
+    assert_ne!(start.rect.x(), 0.0);
+    assert_ne!(start.rect.y(), 0.0);
+    assert_eq!(target.placement.local_x, 0);
+    assert_eq!(target.placement.local_y, 0);
+    assert_eq!((target.width, target.height), (1280, 800));
+}
+
+#[test]
+fn maximize_transition_starts_from_pre_mutation_geometry_when_visual_history_is_missing() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::DropFocusedToplevelVisualGeometry,
+            ServerCommand::SetFocusedRootVisualGeometry {
+                placement: SurfacePlacement::absolute_root_at(640, 320),
+                width: 800,
+                height: 600,
+            },
+            ServerCommand::ToggleMaximizeFocused,
+        ],
+    )
+    .unwrap();
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("maximized root should remain renderable")
+        .surface_id;
+    let start = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("maximize transition should be active");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        start.rect,
+        PresentationRect::new(640.0, 320.0, 800.0, 600.0).expect("source rect")
+    );
+}
+
+#[test]
+fn restore_transition_starts_from_previous_mode_geometry_when_visual_history_is_missing() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::DropFocusedToplevelVisualGeometry,
+            ServerCommand::SetFocusedRootVisualGeometry {
+                placement: SurfacePlacement::absolute_root_at(640, 320),
+                width: 800,
+                height: 600,
+            },
+            ServerCommand::ToggleMaximizeFocused,
+            ServerCommand::DropFocusedToplevelVisualGeometry,
+            ServerCommand::SetFocusedRootVisualGeometry {
+                placement: SurfacePlacement::absolute_root_at(0, 0),
+                width: 1280,
+                height: 800,
+            },
+            ServerCommand::CancelFocusedPresentationTransition,
+            ServerCommand::ToggleMaximizeFocused,
+        ],
+    )
+    .unwrap();
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("restored root should remain renderable")
+        .surface_id;
+    let start = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("restore transition should be active");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        start.rect,
+        PresentationRect::new(0.0, 0.0, 1280.0, 800.0).expect("maximized source rect")
+    );
+}
+
+#[test]
+fn window_maximize_entry_uses_the_kde_policy_curve_through_real_state() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -283,14 +409,13 @@ fn window_maximize_entry_uses_the_macos_policy_curve_through_real_state() {
     assert_eq!(
         curve,
         Some(
-            PresentationAnimationPolicy::macos()
-                .curve_for(PresentationAnimationKind::MaximizeEnter,)
+            PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::MaximizeEnter,)
         )
     );
 }
 
 #[test]
-fn window_maximize_exit_uses_the_macos_policy_curve_through_real_state() {
+fn window_maximize_exit_uses_the_kde_policy_curve_through_real_state() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -312,14 +437,13 @@ fn window_maximize_exit_uses_the_macos_policy_curve_through_real_state() {
     assert_eq!(
         curve,
         Some(
-            PresentationAnimationPolicy::macos()
-                .curve_for(PresentationAnimationKind::MaximizeExit,)
+            PresentationAnimationPolicy::kde().curve_for(PresentationAnimationKind::MaximizeExit,)
         )
     );
 }
 
 #[test]
-fn window_fullscreen_configures_focused_toplevel_and_restores_geometry() {
+fn window_fullscreen_configures_focused_toplevel_and_uses_the_kde_policy_curve() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -335,14 +459,14 @@ fn window_fullscreen_configures_focused_toplevel_and_restores_geometry() {
     assert_eq!(
         curve,
         Some(
-            PresentationAnimationPolicy::macos()
+            PresentationAnimationPolicy::kde()
                 .curve_for(PresentationAnimationKind::FullscreenEnter,)
         )
     );
 }
 
 #[test]
-fn window_fullscreen_exit_uses_the_macos_policy_curve_through_real_state() {
+fn window_fullscreen_exit_uses_the_kde_policy_curve_through_real_state() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -364,7 +488,7 @@ fn window_fullscreen_exit_uses_the_macos_policy_curve_through_real_state() {
     assert_eq!(
         curve,
         Some(
-            PresentationAnimationPolicy::macos()
+            PresentationAnimationPolicy::kde()
                 .curve_for(PresentationAnimationKind::FullscreenExit,)
         )
     );

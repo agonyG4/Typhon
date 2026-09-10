@@ -1,5 +1,7 @@
 use super::*;
-use crate::compositor::{CurrentSurfaceBuffer, WindowInteractionKind, WindowInteractionSource};
+use crate::compositor::{
+    CurrentSurfaceBuffer, WindowGeometry, WindowInteractionKind, WindowInteractionSource,
+};
 use crate::render_backend::buffer::BufferSize;
 
 #[test]
@@ -636,7 +638,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
 }
 
 #[test]
-fn xwayland_mode_transition_uses_the_xwayland_policy_curve() {
+fn xwayland_mode_transition_uses_the_fullscreen_policy_curve() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();
     snapshot.surface_id = fixture.surface_id;
@@ -674,7 +676,7 @@ fn xwayland_mode_transition_uses_the_xwayland_policy_curve() {
                 .server
                 .state
                 .presentation_animation_policy
-                .curve_for(crate::compositor::PresentationAnimationKind::XwaylandModeChange)
+                .curve_for(crate::compositor::PresentationAnimationKind::FullscreenEnter)
         )
     );
 }
@@ -761,6 +763,75 @@ fn xwayland_fullscreen_shortcut_uses_same_geometry_transition() {
             .state
             .current_visual_root_window_geometry(fixture.surface_id),
         Some(floating)
+    );
+}
+
+#[test]
+fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.set_x11_frame_geometry(
+        window_id,
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(100, 100), 640, 480),
+    ));
+    fixture
+        .server
+        .state
+        .toplevel_visual_geometries
+        .remove(&fixture.surface_id);
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::StateRequested {
+            window: handle,
+            request: crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Fullscreen),
+                second: None,
+            },
+        });
+
+    let start = fixture
+        .server
+        .state
+        .presentation_animator
+        .sample_at_transition_start(fixture.surface_id)
+        .expect("XWayland fullscreen transition should be active");
+    assert_eq!(
+        start.rect,
+        crate::presentation_animation::PresentationRect::new(100.0, 100.0, 640.0, 480.0)
+            .expect("XWayland source frame")
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .presentation_animator
+            .transition_curve(fixture.surface_id),
+        Some(
+            fixture
+                .server
+                .state
+                .presentation_animation_policy
+                .curve_for(crate::compositor::PresentationAnimationKind::FullscreenEnter)
+        )
     );
 }
 

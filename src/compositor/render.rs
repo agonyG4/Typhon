@@ -4663,10 +4663,20 @@ mod tests {
         .expect("test decoration layout");
         let plan = crate::compositor::decoration::render_plan::DecorationRenderPlan {
             layout: layout.clone(),
-            primitives: vec![DecorationRenderPrimitive::SolidRect {
+            primitives: std::iter::once(DecorationRenderPrimitive::SolidRect {
                 rect: layout.titlebar,
                 color: [51, 51, 51, 255],
-            }],
+            })
+            .chain(
+                layout
+                    .buttons
+                    .iter()
+                    .map(|button| DecorationRenderPrimitive::SolidRect {
+                        rect: button.visual,
+                        color: [204, 204, 204, 255],
+                    }),
+            )
+            .collect(),
             theme_generation: 1,
         };
         DecorationRenderInstance {
@@ -4701,6 +4711,59 @@ mod tests {
         assert_eq!(
             projected.plan.layout.outer.height,
             instance.plan.layout.outer.height.saturating_mul(2)
+        );
+    }
+
+    #[test]
+    fn decorated_window_visual_group_keeps_client_subsurface_titlebar_and_buttons_attached() {
+        let instance = test_decoration_instance(100, 100);
+        let transform = PresentationGroupTransform::new(
+            1,
+            crate::presentation_animation::TransitionId::new(
+                std::num::NonZeroU64::new(4).expect("non-zero transition id"),
+            ),
+            PresentationRect::new(100.0, 100.0, 20.0, 20.0).expect("canonical group"),
+            PresentationRect::new(160.0, 130.0, 30.0, 30.0).expect("presented group"),
+            false,
+        );
+        let projected = instance
+            .with_presentation_transform(transform)
+            .expect("decoration projection");
+
+        let client = PresentationRect::new(100.0, 120.0, 20.0, 20.0).expect("client rect");
+        let subsurface = PresentationRect::new(104.0, 124.0, 6.0, 6.0).expect("subsurface rect");
+        assert_eq!(
+            transform.map_rect(client),
+            Some(PresentationRect::new(160.0, 160.0, 30.0, 30.0).expect("mapped client"))
+        );
+        assert_eq!(
+            transform.map_rect(subsurface),
+            Some(PresentationRect::new(166.0, 166.0, 9.0, 9.0).expect("mapped subsurface"))
+        );
+
+        let canonical_outer = PresentationRect::new(
+            100.0 + f64::from(instance.plan.layout.outer.x),
+            100.0 + f64::from(instance.plan.layout.outer.y),
+            f64::from(instance.plan.layout.outer.width),
+            f64::from(instance.plan.layout.outer.height),
+        )
+        .expect("canonical decoration bounds");
+        let presented_outer = PresentationRect::new(
+            f64::from(projected.origin_x + projected.plan.layout.outer.x),
+            f64::from(projected.origin_y + projected.plan.layout.outer.y),
+            f64::from(projected.plan.layout.outer.width),
+            f64::from(projected.plan.layout.outer.height),
+        )
+        .expect("presented decoration bounds");
+        let mapped_outer = transform.map_rect(canonical_outer).expect("mapped outer");
+        assert_eq!(presented_outer.x(), mapped_outer.x().floor());
+        assert_eq!(presented_outer.y(), mapped_outer.y().floor());
+        assert!(presented_outer.width() >= mapped_outer.width());
+        assert!(presented_outer.height() >= mapped_outer.height());
+        assert_eq!(
+            projected.plan.primitives.len(),
+            instance.plan.primitives.len(),
+            "titlebar and every button must remain in the same transformed plan"
         );
     }
 

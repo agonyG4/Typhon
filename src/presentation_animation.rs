@@ -482,6 +482,9 @@ pub enum EasingCurve {
     EaseIn,
     EaseOut,
     EaseInOut,
+    EaseInCubic,
+    EaseOutCubic,
+    EaseInOutCubic,
 }
 
 impl EasingCurve {
@@ -499,6 +502,28 @@ impl EasingCurve {
                 } else {
                     let remaining = 1.0 - progress;
                     (1.0 - 2.0 * remaining * remaining, 4.0 * remaining)
+                }
+            }
+            Self::EaseInCubic => (progress * progress * progress, 3.0 * progress * progress),
+            Self::EaseOutCubic => {
+                let remaining = 1.0 - progress;
+                (
+                    1.0 - remaining * remaining * remaining,
+                    3.0 * remaining * remaining,
+                )
+            }
+            Self::EaseInOutCubic => {
+                if progress < 0.5 {
+                    (
+                        4.0 * progress * progress * progress,
+                        12.0 * progress * progress,
+                    )
+                } else {
+                    let remaining = 1.0 - progress;
+                    (
+                        1.0 - 4.0 * remaining * remaining * remaining,
+                        12.0 * remaining * remaining,
+                    )
                 }
             }
         }
@@ -980,6 +1005,22 @@ impl PresentationAnimator {
             .map(|transition| transition.curve)
     }
 
+    #[cfg(test)]
+    pub(crate) fn sample_at_transition_start(&self, key: u32) -> Option<PresentationWindowSample> {
+        self.transitions.get(&key).map(|transition| {
+            let mut sample = transition.sample(transition.started_at);
+            sample.key = key;
+            sample
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_started_at(&self, key: u32) -> Option<AnimationTime> {
+        self.transitions
+            .get(&key)
+            .map(|transition| transition.started_at)
+    }
+
     pub fn has_pending_visible(&self, visible_keys: &[u32]) -> bool {
         visible_keys
             .iter()
@@ -1130,6 +1171,40 @@ mod tests {
         assert_eq!(start.rect, rect(0.0, 10.0, 100.0, 80.0));
         assert_eq!(end.rect, rect(100.0, 50.0, 200.0, 160.0));
         assert!(end.mathematically_settled);
+    }
+
+    #[test]
+    fn cubic_easing_has_analytic_midpoints_and_endpoint_derivatives() {
+        let expected = [
+            (EasingCurve::EaseInCubic, 0.125, 0.75, 0.0, 3.0),
+            (EasingCurve::EaseOutCubic, 0.875, 0.75, 3.0, 0.0),
+            (EasingCurve::EaseInOutCubic, 0.5, 3.0, 0.0, 0.0),
+        ];
+
+        for (curve, midpoint, midpoint_derivative, start_derivative, end_derivative) in expected {
+            let (value, derivative) = curve.evaluate(0.5);
+            close(value, midpoint);
+            close(derivative, midpoint_derivative);
+            close(curve.evaluate(0.0).1, start_derivative);
+            close(curve.evaluate(1.0).1, end_derivative);
+        }
+    }
+
+    #[test]
+    fn cubic_easing_is_monotonic_over_normalized_progress() {
+        for curve in [
+            EasingCurve::EaseInCubic,
+            EasingCurve::EaseOutCubic,
+            EasingCurve::EaseInOutCubic,
+        ] {
+            let mut previous = 0.0;
+            for index in 0..=100 {
+                let progress = f64::from(index) / 100.0;
+                let value = curve.evaluate(progress).0;
+                assert!(value >= previous, "{curve:?} regressed at {progress}");
+                previous = value;
+            }
+        }
     }
 
     #[test]
