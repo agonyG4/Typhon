@@ -16,6 +16,107 @@ pub const MAX_GRAPH_TEXTURES: usize = 4096;
 pub const MAX_GRAPH_PASSES: usize = 4096;
 pub const BUILTIN_BACKGROUND_BLUR_NAME: &str = "system.background_blur";
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PeakLiveWorkCounters {
+    interval_insertions: usize,
+    sweep_steps: usize,
+    graph_compiles: usize,
+    instance_compiles: usize,
+    node_visits: usize,
+    program_lookup_map_builds: usize,
+    output_map_builds: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PEAK_LIVE_WORK_COUNTERS: std::cell::Cell<PeakLiveWorkCounters> =
+        const {
+            std::cell::Cell::new(PeakLiveWorkCounters {
+                interval_insertions: 0,
+                sweep_steps: 0,
+                graph_compiles: 0,
+                instance_compiles: 0,
+                node_visits: 0,
+                program_lookup_map_builds: 0,
+                output_map_builds: 0,
+            })
+        };
+}
+
+#[cfg(test)]
+fn reset_peak_live_work_counters() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| counters.set(PeakLiveWorkCounters::default()));
+}
+
+#[cfg(test)]
+fn peak_live_work_counters() -> PeakLiveWorkCounters {
+    PEAK_LIVE_WORK_COUNTERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_peak_live_interval_insertion() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.interval_insertions += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_peak_live_sweep_step() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.sweep_steps += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_graph_compile() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.graph_compiles += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_instance_compile() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.instance_compiles += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_node_visit() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.node_visits += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_program_lookup_map_build() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.program_lookup_map_builds += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_output_map_build() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.output_map_builds += 1;
+        counters.set(value);
+    });
+}
+
 pub fn builtin_background_blur_program_id() -> EffectProgramId {
     EffectProgramId::new(BUILTIN_EFFECT_PROGRAM_ID).expect("builtin effect program id is non-zero")
 }
@@ -623,6 +724,8 @@ pub fn compile_frame_execution_plan(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
+    #[cfg(test)]
+    note_graph_compile();
     let visible_instances = scene
         .instances
         .iter()
@@ -694,24 +797,7 @@ pub fn compile_frame_execution_plan(
         .iter()
         .filter(|texture| texture.source == GraphTextureSource::Intermediate)
         .count();
-    let peak_live_intermediates = (0..builder.passes.len())
-        .map(|pass_index| {
-            builder
-                .textures
-                .iter()
-                .filter(|texture| {
-                    texture.source == GraphTextureSource::Intermediate
-                        && texture
-                            .first_use
-                            .is_some_and(|first| usize::from(first.get() - 1) <= pass_index)
-                        && texture
-                            .last_use
-                            .is_some_and(|last| usize::from(last.get() - 1) >= pass_index)
-                })
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
+    let peak_live_intermediates = peak_live_intermediates(&builder.textures, builder.passes.len());
     let stats = RenderGraphCompileStats {
         effect_instances: scene
             .instances
@@ -730,6 +816,52 @@ pub fn compile_frame_execution_plan(
         final_damage,
         stats,
     }))
+}
+
+fn peak_live_intermediates(textures: &[GraphTexturePlan], pass_count: usize) -> usize {
+    if pass_count == 0 {
+        return 0;
+    }
+
+    let mut delta = vec![0_i32; pass_count + 1];
+    for texture in textures
+        .iter()
+        .filter(|texture| texture.source == GraphTextureSource::Intermediate)
+    {
+        let (first, last) = match (texture.first_use, texture.last_use) {
+            (None, None) => continue,
+            (None, Some(_)) | (Some(_), None) => {
+                debug_assert!(false, "intermediate texture must have a complete lifetime");
+                continue;
+            }
+            (Some(first), Some(last)) => (first, last),
+        };
+        let first = usize::from(first.get() - 1);
+        let last = usize::from(last.get() - 1);
+        if first >= pass_count {
+            debug_assert!(first < pass_count);
+            continue;
+        }
+        let last = last.min(pass_count - 1);
+        if first > last {
+            debug_assert!(first <= last);
+            continue;
+        }
+        #[cfg(test)]
+        note_peak_live_interval_insertion();
+        delta[first] += 1;
+        delta[last + 1] -= 1;
+    }
+
+    let mut live = 0_i32;
+    let mut peak = 0_i32;
+    for change in delta.into_iter().take(pass_count) {
+        #[cfg(test)]
+        note_peak_live_sweep_step();
+        live += change;
+        peak = peak.max(live);
+    }
+    usize::try_from(peak).unwrap_or(0)
 }
 
 fn fuse_compatible_local_stages(builder: &mut GraphBuilder) {
@@ -820,6 +952,8 @@ fn compile_instance(
     program: &ValidatedEffectProgram,
     plan: InstanceCompilePlan<'_>,
 ) -> Result<GraphPassId, RenderGraphCompileError> {
+    #[cfg(test)]
+    note_instance_compile();
     let InstanceCompilePlan {
         capture_damage,
         output_damage,
@@ -832,10 +966,16 @@ fn compile_instance(
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
+    #[cfg(test)]
+    note_program_lookup_map_build();
     let visual_group = instance.visual_group;
     let mut outputs = HashMap::<EffectNodeId, GraphTextureId>::new();
+    #[cfg(test)]
+    note_output_map_build();
 
     for node_id in &program.topological_order {
+        #[cfg(test)]
+        note_node_visit();
         let node = nodes
             .get(node_id)
             .copied()
@@ -1182,6 +1322,100 @@ mod tests {
         second.region = EffectRegion::from_rect(EffectRect::new(1200, 80, 320, 180).unwrap());
         second.target_bounds = second.region.bounding_rect().unwrap();
         (ResolvedEffectScene::new(1, vec![first, second]), registry)
+    }
+
+    fn lifetime_texture(
+        id: u16,
+        first_use: Option<u16>,
+        last_use: Option<u16>,
+        source: GraphTextureSource,
+    ) -> GraphTexturePlan {
+        GraphTexturePlan {
+            id: GraphTextureId::new(id).expect("test texture id must be non-zero"),
+            source,
+            width: 1,
+            height: 1,
+            domain: EffectRect::new(0, 0, 1, 1).expect("test texture domain"),
+            working_space: EffectWorkingSpace::LinearSrgb,
+            origin: GraphTextureOrigin::BottomLeft,
+            first_use: first_use
+                .map(|value| GraphPassId::new(value).expect("test pass id must be non-zero")),
+            last_use: last_use
+                .map(|value| GraphPassId::new(value).expect("test pass id must be non-zero")),
+        }
+    }
+
+    fn brute_force_peak(textures: &[GraphTexturePlan], pass_count: usize) -> usize {
+        (0..pass_count)
+            .map(|pass_index| {
+                textures
+                    .iter()
+                    .filter(|texture| {
+                        texture.source == GraphTextureSource::Intermediate
+                            && texture
+                                .first_use
+                                .is_some_and(|first| usize::from(first.get() - 1) <= pass_index)
+                            && texture
+                                .last_use
+                                .is_some_and(|last| usize::from(last.get() - 1) >= pass_index)
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn interval_sweep_matches_brute_force_reference_fixtures() {
+        let fixtures = [
+            (
+                1,
+                vec![lifetime_texture(
+                    1,
+                    Some(1),
+                    Some(1),
+                    GraphTextureSource::Intermediate,
+                )],
+            ),
+            (
+                4,
+                vec![
+                    lifetime_texture(1, Some(1), Some(3), GraphTextureSource::Intermediate),
+                    lifetime_texture(2, Some(2), Some(4), GraphTextureSource::Intermediate),
+                ],
+            ),
+            (
+                6,
+                vec![
+                    lifetime_texture(1, Some(1), Some(2), GraphTextureSource::Intermediate),
+                    lifetime_texture(2, Some(4), Some(6), GraphTextureSource::Intermediate),
+                ],
+            ),
+            (
+                6,
+                vec![
+                    lifetime_texture(1, Some(1), Some(6), GraphTextureSource::Intermediate),
+                    lifetime_texture(2, Some(2), Some(5), GraphTextureSource::Intermediate),
+                    lifetime_texture(3, Some(3), Some(4), GraphTextureSource::Intermediate),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    lifetime_texture(1, Some(2), Some(2), GraphTextureSource::Intermediate),
+                    lifetime_texture(2, None, None, GraphTextureSource::Intermediate),
+                    lifetime_texture(3, Some(1), Some(3), GraphTextureSource::Output),
+                ],
+            ),
+        ];
+
+        for (pass_count, textures) in fixtures {
+            assert_eq!(
+                peak_live_intermediates(&textures, pass_count),
+                brute_force_peak(&textures, pass_count),
+                "fixture with {pass_count} passes"
+            );
+        }
     }
 
     #[test]
@@ -1796,6 +2030,144 @@ mod tests {
             stages[0].stage,
             Some(EffectNodeKind::ColorMatrix(_))
         ));
+        assert_eq!(
+            graph.stats.peak_live_intermediates,
+            brute_force_peak(&graph.textures, graph.passes.len())
+        );
+    }
+
+    #[test]
+    fn peak_live_work_scales_with_intervals_and_passes() {
+        let textures = (1..=512)
+            .map(|id| lifetime_texture(id, Some(1), Some(256), GraphTextureSource::Intermediate))
+            .collect::<Vec<_>>();
+        reset_peak_live_work_counters();
+
+        assert_eq!(peak_live_intermediates(&textures, 256), 512);
+        assert_eq!(
+            peak_live_work_counters(),
+            PeakLiveWorkCounters {
+                interval_insertions: 512,
+                sweep_steps: 256,
+                graph_compiles: 0,
+                instance_compiles: 0,
+                node_visits: 0,
+                program_lookup_map_builds: 0,
+                output_map_builds: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn c2_effect_workloads_report_repeated_instance_metadata() {
+        let (single_scene, registry) = blur_scene();
+        reset_peak_live_work_counters();
+        let single_plan = compile_frame_execution_plan(
+            &single_scene,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        let single_counters = peak_live_work_counters();
+
+        let base_instance = single_scene.instances[0].clone();
+        let single_stats = match &single_plan {
+            FrameExecutionPlan::EffectGraph(graph) => graph.stats,
+            FrameExecutionPlan::LegacyScene => panic!("single effect must compile to a graph"),
+        };
+        println!("C2 effect one={single_counters:?} stats={single_stats:?}");
+        assert_eq!(single_counters.graph_compiles, 1);
+        assert_eq!(single_counters.instance_compiles, 1);
+
+        for effect_count in [8_usize, 32] {
+            let many_instances = (0..effect_count)
+                .map(|index| {
+                    let mut instance = base_instance.clone();
+                    let id = u64::try_from(index + 1).expect("test effect id fits");
+                    let region = EffectRegion::from_rect(
+                        EffectRect::new(100 + (index as i32) * 40, 80, 160, 120)
+                            .expect("test effect region"),
+                    );
+                    instance.id = EffectInstanceId::new(id).expect("test effect id is non-zero");
+                    instance.region = region.clone();
+                    instance.target_bounds = region.bounding_rect().expect("test effect bounds");
+                    instance.signature = id;
+                    instance
+                })
+                .collect::<Vec<_>>();
+            let many_scene = ResolvedEffectScene::new(single_scene.generation, many_instances);
+            reset_peak_live_work_counters();
+            let many_plan = compile_frame_execution_plan(
+                &many_scene,
+                &EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap()),
+                EffectRect::new(0, 0, 1920, 1080).unwrap(),
+                &registry,
+            )
+            .unwrap();
+            let many_counters = peak_live_work_counters();
+            let many_stats = match &many_plan {
+                FrameExecutionPlan::EffectGraph(graph) => graph.stats,
+                FrameExecutionPlan::LegacyScene => panic!("many effects must compile to a graph"),
+            };
+            println!(
+                "C2 effect count={effect_count} counters={many_counters:?} stats={many_stats:?}"
+            );
+            assert_eq!(many_counters.graph_compiles, 1);
+            assert_eq!(many_counters.instance_compiles, effect_count);
+            assert_eq!(many_counters.program_lookup_map_builds, effect_count);
+            assert_eq!(many_counters.output_map_builds, effect_count);
+            assert!(many_counters.node_visits > single_counters.node_visits);
+        }
+    }
+
+    #[test]
+    fn c2_uniform_only_parameter_changes_repeat_graph_work_without_topology_change() {
+        let (scene, registry) = blur_scene();
+        let mut changed_instance = scene.instances[0].clone();
+        changed_instance
+            .parameter_block
+            .insert(
+                EffectParameterId::new(1).expect("test parameter id"),
+                EffectUniformValue::Float(0.75),
+            )
+            .expect("test uniform value");
+        changed_instance.signature = changed_instance.signature.wrapping_add(1);
+        let changed_scene = ResolvedEffectScene::new(scene.generation, vec![changed_instance]);
+        let source_damage = EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap());
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+
+        reset_peak_live_work_counters();
+        let FrameExecutionPlan::EffectGraph(original) =
+            compile_frame_execution_plan(&scene, &source_damage, output_bounds, &registry).unwrap()
+        else {
+            panic!("uniform-only workload must compile to an effect graph");
+        };
+        let original_counters = peak_live_work_counters();
+
+        reset_peak_live_work_counters();
+        let FrameExecutionPlan::EffectGraph(changed) =
+            compile_frame_execution_plan(&changed_scene, &source_damage, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("uniform-only workload must compile to an effect graph");
+        };
+        let changed_counters = peak_live_work_counters();
+
+        println!("C2 uniform-only original={original_counters:?} changed={changed_counters:?}");
+        assert_eq!(
+            (
+                original.stats.passes,
+                original.stats.textures,
+                original.stats.peak_live_intermediates
+            ),
+            (
+                changed.stats.passes,
+                changed.stats.textures,
+                changed.stats.peak_live_intermediates
+            )
+        );
+        assert_eq!(original_counters, changed_counters);
     }
 
     #[test]
