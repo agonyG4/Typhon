@@ -1,8 +1,8 @@
-use super::model::BlurPolicySnapshot;
+use super::model::BlurPolicyConfig;
 use std::{fmt, fs, io, path::Path, path::PathBuf};
 
-pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
-pub const MAX_RULES: usize = 256;
+pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
+pub const MAX_RULES: usize = 128;
 
 #[derive(Debug)]
 pub enum BlurPolicyConfigError {
@@ -21,7 +21,7 @@ impl fmt::Display for BlurPolicyConfigError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported blur policy version {version}")
             }
-            Self::TooLarge => write!(formatter, "blur policy exceeds 64 KiB"),
+            Self::TooLarge => write!(formatter, "blur policy exceeds 256 KiB"),
             Self::TooManyRules => write!(formatter, "blur policy has too many rules"),
         }
     }
@@ -49,37 +49,36 @@ pub fn config_path() -> PathBuf {
     base.join("AstreaOS").join("typhon").join("blur.json")
 }
 
-pub fn load() -> Result<(PathBuf, BlurPolicySnapshot), BlurPolicyConfigError> {
+pub fn load() -> Result<(PathBuf, BlurPolicyConfig), BlurPolicyConfigError> {
     let path = config_path();
-    let mut snapshot = match fs::read(&path) {
+    let config = match fs::read(&path) {
         Ok(bytes) => parse_bytes(&bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => BlurPolicySnapshot::default(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BlurPolicyConfig::default(),
         Err(error) => return Err(error.into()),
     };
-    snapshot.config_path = path.display().to_string();
-    Ok((path, snapshot))
+    Ok((path, config))
 }
 
-pub fn load_from_path(path: &Path) -> Result<BlurPolicySnapshot, BlurPolicyConfigError> {
+pub fn load_from_path(path: &Path) -> Result<BlurPolicyConfig, BlurPolicyConfigError> {
     match fs::read(path) {
         Ok(bytes) => parse_bytes(&bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BlurPolicySnapshot::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BlurPolicyConfig::default()),
         Err(error) => Err(error.into()),
     }
 }
 
-fn parse_bytes(bytes: &[u8]) -> Result<BlurPolicySnapshot, BlurPolicyConfigError> {
+fn parse_bytes(bytes: &[u8]) -> Result<BlurPolicyConfig, BlurPolicyConfigError> {
     if bytes.len() > MAX_CONFIG_BYTES {
         return Err(BlurPolicyConfigError::TooLarge);
     }
-    let snapshot = serde_json::from_slice::<BlurPolicySnapshot>(bytes)?;
-    if snapshot.version != 1 {
-        return Err(BlurPolicyConfigError::UnsupportedVersion(snapshot.version));
+    let config = serde_json::from_slice::<BlurPolicyConfig>(bytes)?;
+    if config.version != 1 {
+        return Err(BlurPolicyConfigError::UnsupportedVersion(config.version));
     }
-    if snapshot.window_rules.len() > MAX_RULES || snapshot.layer_rules.len() > MAX_RULES {
+    if config.window_rules.len() > MAX_RULES || config.layer_rules.len() > MAX_RULES {
         return Err(BlurPolicyConfigError::TooManyRules);
     }
-    Ok(snapshot)
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -95,7 +94,7 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("astrea-blur-missing-{unique}.json"));
         let snapshot = load_from_path(&path).expect("missing config is not an error");
-        assert_eq!(snapshot, BlurPolicySnapshot::default());
+        assert_eq!(snapshot, BlurPolicyConfig::default());
     }
 
     #[test]
@@ -122,5 +121,15 @@ mod tests {
             snapshot.applications.wayland,
             super::super::model::BlurApplicationMode::Auto
         );
+    }
+
+    #[test]
+    fn config_rejects_more_than_128_rules() {
+        let rules = (0..=MAX_RULES)
+            .map(|index| format!("{{\"name\":\"rule-{index}\",\"match\":{{}},\"blur\":\"enable\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"version":1,"enabled":true,"applications":{{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":false}},"layers":{{"default":"client_only"}},"window_rules":[{rules}],"layer_rules":[]}}"#);
+        assert!(matches!(parse_bytes(json.as_bytes()), Err(BlurPolicyConfigError::TooManyRules)));
     }
 }

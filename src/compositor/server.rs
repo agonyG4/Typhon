@@ -384,7 +384,11 @@ impl OwnCompositorServer {
 
         let mut state = CompositorState::new(syncobj_device);
         state.set_background_effect_enabled(renderer_capabilities.background_effect);
-        let _ = state.reload_blur_policy_from_disk();
+        if let Err(error) = state.reload_blur_policy_from_disk() {
+            eprintln!(
+                "oblivion-one compositor: blur policy load failed; using built-in defaults: {error}"
+            );
+        }
         state.load_persisted_decoration_theme();
         state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
         let verifier: AstreaShellCapabilityVerifier = astrea_shell_capability.verifier();

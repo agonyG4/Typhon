@@ -228,6 +228,35 @@ impl EffectRegion {
         result
     }
 
+    pub fn subtract(&self, excluded: &Self) -> Self {
+        if self.is_empty() || excluded.conservative_full {
+            return Self::empty();
+        }
+        if excluded.is_empty() || self.conservative_full {
+            return self.clone();
+        }
+        let mut result = Self::empty();
+        for source in &self.rects {
+            let mut remaining = Self::from_rect(*source);
+            for excluded_rect in &excluded.rects {
+                if remaining.is_empty() {
+                    break;
+                }
+                let mut next = Self::empty();
+                for candidate in remaining.rects() {
+                    for piece in subtract_effect_rect(*candidate, *excluded_rect) {
+                        next.push(piece);
+                    }
+                }
+                remaining = next;
+            }
+            for rect in remaining.rects() {
+                result.push(*rect);
+            }
+        }
+        result
+    }
+
     pub fn intersects(&self, other: &Self) -> bool {
         if self.conservative_full || other.conservative_full {
             return !self.is_empty() && !other.is_empty();
@@ -256,6 +285,30 @@ impl EffectRegion {
     pub fn expand_clamped(&self, radius: u32, bounds: EffectRect) -> Self {
         self.expand_clamped_xy(radius, radius, bounds)
     }
+}
+
+fn subtract_effect_rect(source: EffectRect, excluded: EffectRect) -> Vec<EffectRect> {
+    let Some(overlap) = source.intersect(excluded) else {
+        return vec![source];
+    };
+    let mut result = Vec::with_capacity(4);
+    let source_right = source.right();
+    let source_bottom = source.bottom();
+    let overlap_right = overlap.right();
+    let overlap_bottom = overlap.bottom();
+    if overlap.y > source.y {
+        result.push(EffectRect::new(source.x, source.y, source.width, (overlap.y - source.y) as u32).unwrap());
+    }
+    if overlap_bottom < source_bottom {
+        result.push(EffectRect::new(source.x, overlap_bottom, source.width, (source_bottom - overlap_bottom) as u32).unwrap());
+    }
+    if overlap.x > source.x {
+        result.push(EffectRect::new(source.x, overlap.y, (overlap.x - source.x) as u32, overlap.height).unwrap());
+    }
+    if overlap_right < source_right {
+        result.push(EffectRect::new(overlap_right, overlap.y, (source_right - overlap_right) as u32, overlap.height).unwrap());
+    }
+    result
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -466,5 +519,38 @@ mod tests {
         );
         assert!(!lower.intersects(&higher_visible));
         assert!(lower.intersects(&higher.capture_region));
+    }
+
+    #[test]
+    fn subtraction_preserves_transparent_sides() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 10).unwrap());
+        let opaque = EffectRegion::from_rect(EffectRect::new(2, 2, 6, 6).unwrap());
+        let result = candidate.subtract(&opaque);
+        assert!(!result.contains_point(5, 5));
+        assert!(result.contains_point(1, 5));
+        assert!(result.contains_point(8, 5));
+        assert!(result.contains_point(5, 1));
+        assert!(result.contains_point(5, 8));
+    }
+
+    #[test]
+    fn subtraction_is_deterministic_for_multiple_opaque_rectangles() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 20, 10).unwrap());
+        let mut opaque = EffectRegion::from_rect(EffectRect::new(0, 0, 5, 10).unwrap());
+        opaque.push(EffectRect::new(10, 0, 5, 10).unwrap());
+        assert_eq!(
+            candidate.subtract(&opaque).rects(),
+            &[
+                EffectRect::new(5, 0, 5, 10).unwrap(),
+                EffectRect::new(15, 0, 5, 10).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_and_empty_exclusion_have_expected_results() {
+        let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 10).unwrap());
+        assert!(candidate.subtract(&candidate).is_empty());
+        assert_eq!(candidate.subtract(&EffectRegion::empty()), candidate);
     }
 }
