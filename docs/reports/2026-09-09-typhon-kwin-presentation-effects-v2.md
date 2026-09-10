@@ -261,7 +261,9 @@ For a floating-managed maximized window, restore continues to use
 will detach, it prefers `DesktopWindow::floating_geometry`, falling back to
 the mode restore geometry only when necessary. The existing physical-rectangle
 horizontal ratio and titlebar vertical offset keep the restored window under
-the pointer, with ordinary integer placement rounding.
+the pointer, with ordinary integer placement rounding. A successful maximize
+handoff starts Move from that anchored target rather than rebasing it back to
+the old physical origin.
 
 The RED tests first observed the physical ledger changing from a promoted
 frame to `(None, None)` before another pageflip, and observed the invalid
