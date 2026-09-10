@@ -737,21 +737,25 @@ pub fn compile_frame_execution_plan(
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
     #[cfg(test)]
     note_graph_compile();
-    let visible_instances = scene
+    let visible_instance_count = scene
         .instances
         .iter()
         .filter(|instance| !instance.region.is_empty())
-        .collect::<Vec<_>>();
-    if visible_instances.is_empty() {
+        .count();
+    if visible_instance_count == 0 {
         return Ok(FrameExecutionPlan::LegacyScene);
     }
 
     let (mut builder, output_texture) = GraphBuilder::new(output_bounds)?;
     let mut final_damage = source_damage.clone();
     let mut checkpoints = Vec::<(GraphPassId, EffectRegion, EffectInstanceId)>::new();
-    let mut compiled_instances = Vec::with_capacity(visible_instances.len());
+    let mut compiled_instances = Vec::with_capacity(visible_instance_count);
 
-    for instance in visible_instances {
+    for instance in scene
+        .instances
+        .iter()
+        .filter(|instance| !instance.region.is_empty())
+    {
         let program = registry
             .get(instance.program)
             .ok_or(RenderGraphCompileError::MissingProgram(instance.program))?;
@@ -810,11 +814,7 @@ pub fn compile_frame_execution_plan(
         .count();
     let peak_live_intermediates = peak_live_intermediates(&builder.passes, &builder.textures);
     let stats = RenderGraphCompileStats {
-        effect_instances: scene
-            .instances
-            .iter()
-            .filter(|instance| !instance.region.is_empty())
-            .count(),
+        effect_instances: visible_instance_count,
         passes: builder.passes.len(),
         textures: builder.textures.len(),
         intermediate_textures,
@@ -829,12 +829,13 @@ pub fn compile_frame_execution_plan(
     }))
 }
 
-fn peak_live_intermediates(passes: &[CompiledRenderPass], textures: &[GraphTexturePlan]) -> usize {
-    if passes.is_empty() {
-        return 0;
-    }
-
-    let mut position_by_id = vec![None; MAX_GRAPH_PASSES + 1];
+fn build_pass_position_map(passes: &[CompiledRenderPass]) -> Vec<Option<usize>> {
+    let max_pass_id = passes
+        .iter()
+        .map(|pass| usize::from(pass.id.get()))
+        .max()
+        .unwrap_or(0);
+    let mut position_by_id = vec![None; max_pass_id.saturating_add(1)];
     for (position, pass) in passes.iter().enumerate() {
         let id = usize::from(pass.id.get());
         debug_assert!(
@@ -851,6 +852,15 @@ fn peak_live_intermediates(passes: &[CompiledRenderPass], textures: &[GraphTextu
             *mapped_position = Some(position);
         }
     }
+    position_by_id
+}
+
+fn peak_live_intermediates(passes: &[CompiledRenderPass], textures: &[GraphTexturePlan]) -> usize {
+    if passes.is_empty() {
+        return 0;
+    }
+
+    let position_by_id = build_pass_position_map(passes);
 
     let mut delta = vec![0_i32; passes.len() + 1];
     for texture in textures
@@ -913,6 +923,10 @@ fn fuse_compatible_local_stages(builder: &mut GraphBuilder) {
             index += 1;
             continue;
         };
+        let Some(first_output) = first.output else {
+            index += 1;
+            continue;
+        };
         let Some(second_stage) = builder.passes[index + 1].stage.as_ref() else {
             index += 1;
             continue;
@@ -920,14 +934,15 @@ fn fuse_compatible_local_stages(builder: &mut GraphBuilder) {
         let can_fuse = first.kind == RenderPassKind::Fragment
             && second.kind == RenderPassKind::Fragment
             && first.instance == second.instance
-            && first.output.is_some()
-            && second.inputs == first.output.into_iter().collect::<Vec<_>>()
+            && second.inputs.len() == 1
+            && second.inputs[0] == first_output
             && first.fused_stages.is_empty()
             && second.fused_stages.is_empty()
             && compatible_local_stage_order(first_stage, second_stage)
-            && first
-                .output
-                .and_then(|id| builder.textures.iter().find(|texture| texture.id == id))
+            && builder
+                .textures
+                .iter()
+                .find(|texture| texture.id == first_output)
                 .is_some_and(|texture| texture.last_use == Some(second.id));
         if !can_fuse {
             index += 1;
@@ -1483,6 +1498,126 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pass_position_map_uses_actual_maximum_id() {
+        let passes = [1, 2, 4, 5].into_iter().map(test_pass).collect::<Vec<_>>();
+
+        let position_by_id = build_pass_position_map(&passes);
+
+        assert_eq!(position_by_id.len(), 6);
+    }
+
+    #[test]
+    fn pass_position_map_preserves_high_gapped_ids() {
+        let passes = [1, 3, 8].into_iter().map(test_pass).collect::<Vec<_>>();
+
+        let position_by_id = build_pass_position_map(&passes);
+
+        assert_eq!(position_by_id[1], Some(0));
+        assert_eq!(position_by_id[3], Some(1));
+        assert_eq!(position_by_id[8], Some(2));
+        assert_eq!(position_by_id[2], None);
+        assert_eq!(position_by_id[7], None);
+    }
+
+    fn fusion_candidate_builder(additional_input: bool, wrong_input: bool) -> GraphBuilder {
+        let bounds = EffectRect::new(0, 0, 16, 16).expect("test bounds");
+        let (mut builder, source) = GraphBuilder::new(bounds).expect("test graph builder");
+        let first_output = builder
+            .add_texture_with_layout(
+                GraphTextureSource::Intermediate,
+                bounds,
+                bounds.width,
+                bounds.height,
+                EffectWorkingSpace::LinearSrgb,
+            )
+            .expect("first output texture");
+        let second_output = builder
+            .add_texture_with_layout(
+                GraphTextureSource::Intermediate,
+                bounds,
+                bounds.width,
+                bounds.height,
+                EffectWorkingSpace::LinearSrgb,
+            )
+            .expect("second output texture");
+        let unrelated = builder
+            .add_texture_with_layout(
+                GraphTextureSource::Intermediate,
+                bounds,
+                bounds.width,
+                bounds.height,
+                EffectWorkingSpace::LinearSrgb,
+            )
+            .expect("unrelated input texture");
+        let instance = EffectInstanceId::new(1).expect("test instance id");
+        let damage = EffectRegion::from_rect(bounds);
+        let anchor = EffectAnchor::OutputPostProcess;
+        let anchor_scope = EffectAnchorScope::VisualGroup;
+        builder
+            .add_stage_pass(
+                RenderPassKind::Fragment,
+                vec![source],
+                Some(first_output),
+                damage.clone(),
+                instance,
+                anchor,
+                EffectNodeKind::ColorMatrix(ColorMatrixSpec::IDENTITY),
+                anchor_scope,
+            )
+            .expect("first stage pass");
+        let second_id = GraphPassId::new(2).expect("test second pass id");
+        builder.touch(first_output, second_id);
+        let second_inputs = if wrong_input {
+            vec![unrelated]
+        } else if additional_input {
+            vec![first_output, unrelated]
+        } else {
+            vec![first_output]
+        };
+        builder
+            .add_stage_pass(
+                RenderPassKind::Fragment,
+                second_inputs,
+                Some(second_output),
+                damage,
+                instance,
+                anchor,
+                EffectNodeKind::Tint(TintSpec::WHITE),
+                anchor_scope,
+            )
+            .expect("second stage pass");
+        builder
+    }
+
+    #[test]
+    fn fusion_accepts_exact_single_matching_input() {
+        let mut builder = fusion_candidate_builder(false, false);
+
+        fuse_compatible_local_stages(&mut builder);
+
+        assert_eq!(builder.passes.len(), 1);
+        assert_eq!(builder.passes[0].fused_stages.len(), 1);
+    }
+
+    #[test]
+    fn fusion_rejects_additional_second_input() {
+        let mut builder = fusion_candidate_builder(true, false);
+
+        fuse_compatible_local_stages(&mut builder);
+
+        assert_eq!(builder.passes.len(), 2);
+    }
+
+    #[test]
+    fn fusion_rejects_wrong_single_input() {
+        let mut builder = fusion_candidate_builder(false, true);
+
+        fuse_compatible_local_stages(&mut builder);
+
+        assert_eq!(builder.passes.len(), 2);
+    }
+
     fn brute_force_peak(passes: &[CompiledRenderPass], textures: &[GraphTexturePlan]) -> usize {
         passes
             .iter()
@@ -1627,6 +1762,25 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(plan, FrameExecutionPlan::LegacyScene));
+    }
+
+    #[test]
+    fn compile_counts_only_visible_effect_instances() {
+        let (mut scene, registry) = fused_local_stage_scene(3);
+        scene.instances[1].region = EffectRegion::empty();
+        let source_damage = EffectRegion::from_rect(EffectRect::new(0, 0, 200, 100).unwrap());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &source_damage,
+            EffectRect::new(0, 0, 200, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+
+        assert_eq!(graph.stats.effect_instances, 2);
+        assert_eq!(graph.instances.len(), 2);
     }
 
     #[test]
