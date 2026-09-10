@@ -126,10 +126,17 @@ mod tests {
     #[test]
     fn config_rejects_more_than_128_rules() {
         let rules = (0..=MAX_RULES)
-            .map(|index| format!("{{\"name\":\"rule-{index}\",\"match\":{{}},\"blur\":\"enable\"}}"))
+            .map(|index| {
+                format!("{{\"name\":\"rule-{index}\",\"match\":{{}},\"blur\":\"enable\"}}")
+            })
             .collect::<Vec<_>>()
             .join(",");
-        let json = format!(r#"{{"version":1,"enabled":true,"applications":{{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":false}},"layers":{{"default":"client_only"}},"window_rules":[{rules}],"layer_rules":[]}}"#);
-        assert!(matches!(parse_bytes(json.as_bytes()), Err(BlurPolicyConfigError::TooManyRules)));
+        let json = format!(
+            r#"{{"version":1,"enabled":true,"applications":{{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":false}},"layers":{{"default":"client_only"}},"window_rules":[{rules}],"layer_rules":[]}}"#
+        );
+        assert!(matches!(
+            parse_bytes(json.as_bytes()),
+            Err(BlurPolicyConfigError::TooManyRules)
+        ));
     }
 }

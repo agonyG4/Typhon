@@ -1,5 +1,29 @@
 use super::*;
 
+use crate::blur_policy::{BlurRuleAction, BlurWindowMatch, BlurWindowRule};
+
+fn fullscreen_enable_rule_config() -> crate::blur_policy::BlurPolicyConfig {
+    let mut config = crate::blur_policy::BlurPolicyConfig::default();
+    config.window_rules.push(BlurWindowRule {
+        name: "fullscreen-identity-blur".to_string(),
+        matcher: BlurWindowMatch {
+            app_id: Some("^oblivion\\.identity-viewport-test$".to_string()),
+            title: None,
+            backend: Some("wayland".to_string()),
+        },
+        action: BlurRuleAction::Enable,
+    });
+    config
+}
+
+fn background_effect_count(scene: &ResolvedEffectScene) -> usize {
+    scene
+        .instances
+        .iter()
+        .filter(|instance| instance.program == crate::effects::builtin_background_blur_program_id())
+        .count()
+}
+
 #[test]
 fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
     let socket_name = unique_socket_name();
@@ -70,4 +94,50 @@ fn fullscreen_scaled_viewport_is_rejected_before_direct_scanout_import() {
         rejection,
         DirectScanoutSceneRejection::ViewportDestinationNonIdentity
     );
+}
+
+#[test]
+fn resolved_blur_scene_controls_direct_scanout_transition() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_with_capabilities(
+        &socket_name,
+        true,
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::qualified_native(),
+    )
+    .unwrap();
+    server
+        .state
+        .blur_assignment
+        .replace_config(crate::blur_policy::BlurPolicyConfig::default())
+        .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _state = create_fullscreen_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
+    assert_eq!(
+        background_effect_count(&capture_resolved_effect_scene(&commands)),
+        0
+    );
+    assert!(capture_direct_scanout_candidate(&commands).is_ok());
+
+    replace_blur_policy_config(&commands, fullscreen_enable_rule_config());
+    assert_eq!(
+        background_effect_count(&capture_resolved_effect_scene(&commands)),
+        1
+    );
+    assert_eq!(
+        capture_direct_scanout_candidate(&commands),
+        Err(DirectScanoutSceneRejection::EffectRequiresComposition)
+    );
+
+    replace_blur_policy_config(&commands, crate::blur_policy::BlurPolicyConfig::default());
+    assert_eq!(
+        background_effect_count(&capture_resolved_effect_scene(&commands)),
+        0
+    );
+    assert!(capture_direct_scanout_candidate(&commands).is_ok());
+
+    let _server = stop_controllable_test_server(commands, server_thread);
 }

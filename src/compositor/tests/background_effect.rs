@@ -290,6 +290,17 @@ fn public_child_effects_follow_production_scene_order_not_identifiers() {
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
     let mut blur_policy = server.state.blur_assignment.config();
     blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::RulesOnly;
+    blur_policy
+        .window_rules
+        .push(crate::blur_policy::BlurWindowRule {
+            name: "visual-group-root".to_string(),
+            matcher: crate::blur_policy::BlurWindowMatch {
+                app_id: Some("^org\\.example\\.visual-group$".to_string()),
+                title: None,
+                backend: Some("wayland".to_string()),
+            },
+            action: crate::blur_policy::BlurRuleAction::Enable,
+        });
     server
         .state
         .blur_assignment
@@ -309,8 +320,9 @@ fn public_child_effects_follow_production_scene_order_not_identifiers() {
             globals.bind(&qh, 1..=1, ())?;
         let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
         let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
-        let (parent, _xdg_surface, _toplevel) =
+        let (parent, _xdg_surface, toplevel) =
             create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 80)?;
+        toplevel.set_app_id("org.example.visual-group".to_string());
         let child_a = compositor.create_surface(&qh, ());
         let child_a_subsurface = subcompositor.get_subsurface(&child_a, &parent, &qh, ());
         child_a_subsurface.set_position(0, 0);
@@ -351,11 +363,20 @@ fn public_child_effects_follow_production_scene_order_not_identifiers() {
                 EffectAnchor::OutputPostProcess => 0,
             })
             .collect::<Vec<_>>();
-        assert_eq!(effect_order.len(), 2);
+        assert_eq!(effect_order.len(), 3);
+        let root_effect = scene
+            .instances
+            .iter()
+            .find(|instance| instance.anchor_scope == EffectAnchorScope::VisualGroup)
+            .expect("desktop rule must synthesize a visual-group background effect");
+        assert_eq!(root_effect.anchor_scope, EffectAnchorScope::VisualGroup);
+        assert_eq!(root_effect.scene_order.surface_order, 0);
+        assert!(root_effect.visual_group.is_some());
         assert_eq!(
             scene
                 .instances
                 .iter()
+                .filter(|instance| instance.anchor != root_effect.anchor)
                 .map(|instance| instance.scene_order.surface_order)
                 .collect::<Vec<_>>(),
             vec![1, 2]
@@ -367,7 +388,8 @@ fn public_child_effects_follow_production_scene_order_not_identifiers() {
             scene
                 .instances
                 .iter()
-                .all(|instance| instance.anchor_scope == EffectAnchorScope::Surface)
+                .skip(1)
+                .all(|instance| { instance.anchor_scope == EffectAnchorScope::Surface })
         );
         Ok(())
     })();

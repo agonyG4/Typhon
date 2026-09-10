@@ -11,9 +11,16 @@ pub const MAX_RULE_NAME_BYTES: usize = 128;
 pub enum BlurRuleCompileError {
     EmptyName,
     NameTooLarge,
-    DuplicateName { name: String },
-    PatternTooLarge { field: &'static str },
-    InvalidPattern { field: &'static str, error: regex::Error },
+    DuplicateName {
+        name: String,
+    },
+    PatternTooLarge {
+        field: &'static str,
+    },
+    InvalidPattern {
+        field: &'static str,
+        error: regex::Error,
+    },
 }
 
 impl fmt::Display for BlurRuleCompileError {
@@ -205,39 +212,102 @@ mod tests {
     fn all_window_fields_are_anded_and_last_matching_rule_wins() {
         let rules = CompiledBlurRules::compile(
             &[
-                window_rule("enable-editor", Some("org.example.*"), Some("Editor.*"), Some("wayland"), BlurRuleAction::Enable),
-                window_rule("disable-app", Some("org.example.app"), None, None, BlurRuleAction::Disable),
+                window_rule(
+                    "enable-editor",
+                    Some("org.example.*"),
+                    Some("Editor.*"),
+                    Some("wayland"),
+                    BlurRuleAction::Enable,
+                ),
+                window_rule(
+                    "disable-app",
+                    Some("org.example.app"),
+                    None,
+                    None,
+                    BlurRuleAction::Disable,
+                ),
             ],
             &[],
         )
         .expect("compile rules");
-        assert_eq!(rules.last_window_action(BlurWindowTarget { app_id: Some("org.example.app"), title: Some("Editor — file"), backend: BlurBackend::Wayland }), Some(BlurRuleAction::Disable));
-        assert_eq!(rules.last_window_action(BlurWindowTarget { app_id: Some("org.example.other"), title: Some("Editor — file"), backend: BlurBackend::Wayland }), Some(BlurRuleAction::Enable));
-        assert_eq!(rules.last_window_action(BlurWindowTarget { app_id: Some("org.example.app"), title: Some("Terminal"), backend: BlurBackend::Wayland }), Some(BlurRuleAction::Disable));
+        assert_eq!(
+            rules.last_window_action(BlurWindowTarget {
+                app_id: Some("org.example.app"),
+                title: Some("Editor — file"),
+                backend: BlurBackend::Wayland
+            }),
+            Some(BlurRuleAction::Disable)
+        );
+        assert_eq!(
+            rules.last_window_action(BlurWindowTarget {
+                app_id: Some("org.example.other"),
+                title: Some("Editor — file"),
+                backend: BlurBackend::Wayland
+            }),
+            Some(BlurRuleAction::Enable)
+        );
+        assert_eq!(
+            rules.last_window_action(BlurWindowTarget {
+                app_id: Some("org.example.app"),
+                title: Some("Terminal"),
+                backend: BlurBackend::Wayland
+            }),
+            Some(BlurRuleAction::Disable)
+        );
     }
 
     #[test]
     fn malformed_or_unbounded_patterns_are_rejected_at_compile_time() {
         let invalid = window_rule("invalid", Some("["), None, None, BlurRuleAction::Enable);
-        assert!(matches!(CompiledBlurRules::compile(&[invalid], &[]), Err(BlurRuleCompileError::InvalidPattern { field: "app_id", .. })));
+        assert!(matches!(
+            CompiledBlurRules::compile(&[invalid], &[]),
+            Err(BlurRuleCompileError::InvalidPattern {
+                field: "app_id",
+                ..
+            })
+        ));
         let too_large = "a".repeat(MAX_PATTERN_BYTES + 1);
-        let too_large = window_rule("large", Some(&too_large), None, None, BlurRuleAction::Enable);
-        assert!(matches!(CompiledBlurRules::compile(&[too_large], &[]), Err(BlurRuleCompileError::PatternTooLarge { field: "app_id" })));
+        let too_large = window_rule(
+            "large",
+            Some(&too_large),
+            None,
+            None,
+            BlurRuleAction::Enable,
+        );
+        assert!(matches!(
+            CompiledBlurRules::compile(&[too_large], &[]),
+            Err(BlurRuleCompileError::PatternTooLarge { field: "app_id" })
+        ));
     }
 
     #[test]
     fn rule_names_are_nonempty_bounded_and_unique_across_kinds() {
         let mut empty = window_rule("", None, None, None, BlurRuleAction::Enable);
         empty.name.clear();
-        assert!(matches!(CompiledBlurRules::compile(&[empty], &[]), Err(BlurRuleCompileError::EmptyName)));
-        let long = window_rule(&"n".repeat(MAX_RULE_NAME_BYTES + 1), None, None, None, BlurRuleAction::Enable);
-        assert!(matches!(CompiledBlurRules::compile(&[long], &[]), Err(BlurRuleCompileError::NameTooLarge)));
+        assert!(matches!(
+            CompiledBlurRules::compile(&[empty], &[]),
+            Err(BlurRuleCompileError::EmptyName)
+        ));
+        let long = window_rule(
+            &"n".repeat(MAX_RULE_NAME_BYTES + 1),
+            None,
+            None,
+            None,
+            BlurRuleAction::Enable,
+        );
+        assert!(matches!(
+            CompiledBlurRules::compile(&[long], &[]),
+            Err(BlurRuleCompileError::NameTooLarge)
+        ));
         let duplicate = super::super::model::BlurLayerRule {
             name: "enable".to_string(),
             matcher: super::super::model::BlurLayerMatch { namespace: None },
             action: BlurRuleAction::Enable,
         };
         let first = window_rule("enable", None, None, None, BlurRuleAction::Enable);
-        assert!(matches!(CompiledBlurRules::compile(&[first], &[duplicate]), Err(BlurRuleCompileError::DuplicateName { .. })));
+        assert!(matches!(
+            CompiledBlurRules::compile(&[first], &[duplicate]),
+            Err(BlurRuleCompileError::DuplicateName { .. })
+        ));
     }
 }

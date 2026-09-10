@@ -297,16 +297,48 @@ fn subtract_effect_rect(source: EffectRect, excluded: EffectRect) -> Vec<EffectR
     let overlap_right = overlap.right();
     let overlap_bottom = overlap.bottom();
     if overlap.y > source.y {
-        result.push(EffectRect::new(source.x, source.y, source.width, (overlap.y - source.y) as u32).unwrap());
+        result.push(
+            EffectRect::new(
+                source.x,
+                source.y,
+                source.width,
+                (overlap.y - source.y) as u32,
+            )
+            .unwrap(),
+        );
     }
     if overlap_bottom < source_bottom {
-        result.push(EffectRect::new(source.x, overlap_bottom, source.width, (source_bottom - overlap_bottom) as u32).unwrap());
+        result.push(
+            EffectRect::new(
+                source.x,
+                overlap_bottom,
+                source.width,
+                (source_bottom - overlap_bottom) as u32,
+            )
+            .unwrap(),
+        );
     }
     if overlap.x > source.x {
-        result.push(EffectRect::new(source.x, overlap.y, (overlap.x - source.x) as u32, overlap.height).unwrap());
+        result.push(
+            EffectRect::new(
+                source.x,
+                overlap.y,
+                (overlap.x - source.x) as u32,
+                overlap.height,
+            )
+            .unwrap(),
+        );
     }
     if overlap_right < source_right {
-        result.push(EffectRect::new(overlap_right, overlap.y, (source_right - overlap_right) as u32, overlap.height).unwrap());
+        result.push(
+            EffectRect::new(
+                overlap_right,
+                overlap.y,
+                (source_right - overlap_right) as u32,
+                overlap.height,
+            )
+            .unwrap(),
+        );
     }
     result
 }

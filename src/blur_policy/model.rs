@@ -245,15 +245,31 @@ mod tests {
         )
         .expect("approved schema");
         assert_eq!(config.window_rules[0].name, "force-terminal-blur");
-        assert_eq!(config.window_rules[0].matcher.app_id.as_deref(), Some("^kitty$"));
-        assert_eq!(config.layer_rules[0].matcher.namespace.as_deref(), Some("^waybar$"));
+        assert_eq!(
+            config.window_rules[0].matcher.app_id.as_deref(),
+            Some("^kitty$")
+        );
+        assert_eq!(
+            config.layer_rules[0].matcher.namespace.as_deref(),
+            Some("^waybar$")
+        );
     }
 
     #[test]
     fn runtime_fields_and_unapproved_modes_are_rejected() {
         let runtime = r#"{"version":1,"enabled":true,"applications":{"wayland":"auto","xwayland":"rules_only","auto_fullscreen":false},"layers":{"default":"client_only"},"window_rules":[],"layer_rules":[],"renderer_supported":true}"#;
         assert!(serde_json::from_str::<BlurPolicyConfig>(runtime).is_err());
-        assert!(serde_json::from_str::<BlurPolicyConfig>(&runtime.replace("\"rules_only\"", "\"auto\"")).is_err());
-        assert!(serde_json::from_str::<BlurPolicyConfig>(&runtime.replace("\"client_only\"", "\"auto\"")).is_err());
+        assert!(
+            serde_json::from_str::<BlurPolicyConfig>(
+                &runtime.replace("\"rules_only\"", "\"auto\"")
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<BlurPolicyConfig>(
+                &runtime.replace("\"client_only\"", "\"auto\"")
+            )
+            .is_err()
+        );
     }
 }

@@ -157,6 +157,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
+    ReplaceBlurPolicyConfig {
+        config: crate::blur_policy::BlurPolicyConfig,
+        reply: Sender<bool>,
+    },
     CaptureFocusGeneration(Sender<u64>),
     CapturePointerInputMetrics(Sender<PointerInputMetrics>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
@@ -595,6 +599,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
+                    }
+                    ServerCommand::ReplaceBlurPolicyConfig { config, reply } => {
+                        let changed = server.state.blur_assignment.replace_config(config).is_ok();
+                        if changed {
+                            server.state.advance_render_generation_with_scene_effect(
+                                RenderGenerationCause::EffectBinding,
+                                true,
+                            );
+                            server.state.refresh_effect_scene_summary();
+                        }
+                        let _ = reply.send(changed);
                     }
                     ServerCommand::CaptureFocusGeneration(reply) => {
                         let _ = reply.send(server.state.focus_generation);
@@ -1873,6 +1888,33 @@ pub(in crate::compositor::tests) fn capture_direct_scanout_candidate(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report direct scanout candidate")
+}
+
+pub(in crate::compositor::tests) fn capture_resolved_effect_scene(
+    commands: &Sender<ServerCommand>,
+) -> ResolvedEffectScene {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureResolvedEffectScene(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report resolved effect scene")
+}
+
+pub(in crate::compositor::tests) fn replace_blur_policy_config(
+    commands: &Sender<ServerCommand>,
+    config: crate::blur_policy::BlurPolicyConfig,
+) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::ReplaceBlurPolicyConfig { config, reply })
+        .unwrap();
+    assert!(
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should replace blur policy config")
+    );
 }
 
 pub(in crate::compositor::tests) fn focus_root_window(
