@@ -120,7 +120,6 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         );
         let (snapshot, scene_identity_signature) = finalize_snapshot(
             snapshot,
-            popup_surface_ids.as_ref(),
             &external_overlay_surface_ids,
             visibility,
             &effects,
@@ -238,12 +237,10 @@ fn visibility_signature(metrics: FullscreenRenderPlanMetrics) -> u64 {
 
 fn finalize_snapshot(
     mut snapshot: NativeSceneSnapshot,
-    popup_surface_ids: &[u32],
     external_overlay_surface_ids: &[u32],
     visibility: FullscreenRenderPlanMetrics,
     effects: &ResolvedEffectScene,
 ) -> (NativeSceneSnapshot, u64) {
-    snapshot.popup_surface_ids = popup_surface_ids.to_vec();
     snapshot.external_overlay_surface_ids = external_overlay_surface_ids.to_vec();
     snapshot.visibility_signature = visibility_signature(visibility);
     snapshot.effect_damage = effects
@@ -679,6 +676,7 @@ mod tests {
         EffectAnchor, EffectAnchorScope, EffectSceneOrder, OwnCompositorServer,
         ResolvedEffectInstance,
     };
+    use oblivion_one::compositor::{PresentationFrameSnapshot, PresentationSceneSample};
     use oblivion_one::effects::{
         EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect,
         EffectRegion,
@@ -686,6 +684,7 @@ mod tests {
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferSize, CommittedSurfaceBuffer,
     };
+    use std::borrow::Cow;
     use std::process;
     use wayland_server::protocol::wl_output;
 
@@ -803,6 +802,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
+        fn assert_popup_ids(popup_surface_ids: &[u32]) {
+            let surfaces: &[RenderableSurface] = &[];
+            let resolved = ResolvedNativeFrameScene {
+                surfaces: Cow::Borrowed(surfaces),
+                decorations: Vec::new(),
+                popup_surface_ids: Cow::Borrowed(popup_surface_ids),
+                external_overlay_surface_ids: Vec::new(),
+                render_generation: 1,
+                visibility: FullscreenRenderPlanMetrics::default(),
+                snapshot: NativeSceneSnapshot::from_surfaces_with_popup_ids(
+                    surfaces,
+                    Vec::new(),
+                    popup_surface_ids,
+                ),
+                scene_identity_signature: 0,
+                effects: ResolvedEffectScene::default(),
+                presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(0)),
+                presentation_snapshot: PresentationFrameSnapshot::empty(),
+            };
+            assert_eq!(resolved.snapshot_ref().popup_surface_ids, popup_surface_ids);
+        }
+
+        assert_popup_ids(&[]);
+        assert_popup_ids(&[701, 702, 701]);
+    }
+
+    #[test]
     fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
         let effect_region = EffectRegion::from_rect(EffectRect::new(20, 30, 40, 50).unwrap());
         let effects = ResolvedEffectScene::new(
@@ -832,8 +859,7 @@ mod tests {
         };
 
         let (snapshot, cached_signature) = finalize_snapshot(
-            NativeSceneSnapshot::default(),
-            &[701, 702],
+            NativeSceneSnapshot::from_surfaces_with_popup_ids(&[], Vec::new(), &[701, 702]),
             &[703],
             visibility,
             &effects,

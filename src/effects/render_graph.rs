@@ -6,10 +6,11 @@ use crate::compositor::{
 
 use super::registry::EffectRegistry;
 use super::{
-    BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
-    EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
-    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectSource, EffectValidationError,
-    EffectWorkingSpace, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
+    plan_effect_damage, validate_effect_program, DualKawaseBlurSpec, EffectAlphaMode,
+    EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId,
+    EffectNodeKind, EffectOutsets, EffectProgram, EffectProgramId, EffectRect, EffectRegion,
+    EffectSource, EffectValidationError, EffectWorkingSpace, ValidatedEffectProgram,
+    BUILTIN_EFFECT_PROGRAM_ID,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -19,6 +20,7 @@ pub const BUILTIN_BACKGROUND_BLUR_NAME: &str = "system.background_blur";
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PeakLiveWorkCounters {
+    pass_position_map_entries: usize,
     interval_insertions: usize,
     sweep_steps: usize,
     graph_compiles: usize,
@@ -33,6 +35,7 @@ thread_local! {
     static PEAK_LIVE_WORK_COUNTERS: std::cell::Cell<PeakLiveWorkCounters> =
         const {
             std::cell::Cell::new(PeakLiveWorkCounters {
+                pass_position_map_entries: 0,
                 interval_insertions: 0,
                 sweep_steps: 0,
                 graph_compiles: 0,
@@ -59,6 +62,15 @@ fn note_peak_live_interval_insertion() {
     PEAK_LIVE_WORK_COUNTERS.with(|counters| {
         let mut value = counters.get();
         value.interval_insertions += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
+fn note_peak_live_pass_position_map_entry() {
+    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.pass_position_map_entries += 1;
         counters.set(value);
     });
 }
@@ -797,7 +809,7 @@ pub fn compile_frame_execution_plan(
         .iter()
         .filter(|texture| texture.source == GraphTextureSource::Intermediate)
         .count();
-    let peak_live_intermediates = peak_live_intermediates(&builder.textures, builder.passes.len());
+    let peak_live_intermediates = peak_live_intermediates(&builder.passes, &builder.textures);
     let stats = RenderGraphCompileStats {
         effect_instances: scene
             .instances
@@ -818,12 +830,30 @@ pub fn compile_frame_execution_plan(
     }))
 }
 
-fn peak_live_intermediates(textures: &[GraphTexturePlan], pass_count: usize) -> usize {
-    if pass_count == 0 {
+fn peak_live_intermediates(passes: &[CompiledRenderPass], textures: &[GraphTexturePlan]) -> usize {
+    if passes.is_empty() {
         return 0;
     }
 
-    let mut delta = vec![0_i32; pass_count + 1];
+    let mut position_by_id = vec![None; MAX_GRAPH_PASSES + 1];
+    for (position, pass) in passes.iter().enumerate() {
+        let id = usize::from(pass.id.get());
+        debug_assert!(
+            id <= MAX_GRAPH_PASSES,
+            "compiled pass ID must fit the graph pass bound"
+        );
+        #[cfg(test)]
+        note_peak_live_pass_position_map_entry();
+        if let Some(mapped_position) = position_by_id.get_mut(id) {
+            debug_assert!(
+                mapped_position.is_none(),
+                "compiled pass IDs must be unique for peak-live mapping"
+            );
+            *mapped_position = Some(position);
+        }
+    }
+
+    let mut delta = vec![0_i32; passes.len() + 1];
     for texture in textures
         .iter()
         .filter(|texture| texture.source == GraphTextureSource::Intermediate)
@@ -836,26 +866,38 @@ fn peak_live_intermediates(textures: &[GraphTexturePlan], pass_count: usize) -> 
             }
             (Some(first), Some(last)) => (first, last),
         };
-        let first = usize::from(first.get() - 1);
-        let last = usize::from(last.get() - 1);
-        if first >= pass_count {
-            debug_assert!(first < pass_count);
-            continue;
-        }
-        let last = last.min(pass_count - 1);
-        if first > last {
-            debug_assert!(first <= last);
-            continue;
-        }
+        let interval = match (
+            position_by_id
+                .get(usize::from(first.get()))
+                .copied()
+                .flatten(),
+            position_by_id
+                .get(usize::from(last.get()))
+                .copied()
+                .flatten(),
+        ) {
+            (Some(first), Some(last)) if first <= last => (first, last),
+            (Some(first), Some(last)) => {
+                debug_assert!(first <= last);
+                continue;
+            }
+            _ => {
+                debug_assert!(
+                    false,
+                    "intermediate texture lifetime references a removed pass"
+                );
+                (0, passes.len() - 1)
+            }
+        };
         #[cfg(test)]
         note_peak_live_interval_insertion();
-        delta[first] += 1;
-        delta[last + 1] -= 1;
+        delta[interval.0] += 1;
+        delta[interval.1 + 1] -= 1;
     }
 
     let mut live = 0_i32;
     let mut peak = 0_i32;
-    for change in delta.into_iter().take(pass_count) {
+    for change in delta.into_iter().take(passes.len()) {
         #[cfg(test)]
         note_peak_live_sweep_step();
         live += change;
@@ -1324,6 +1366,81 @@ mod tests {
         (ResolvedEffectScene::new(1, vec![first, second]), registry)
     }
 
+    fn fused_local_stage_scene(instance_count: usize) -> (ResolvedEffectScene, EffectRegistry) {
+        let source = EffectNodeId::new(1).unwrap();
+        let matrix = EffectNodeId::new(2).unwrap();
+        let tint = EffectNodeId::new(3).unwrap();
+        let mut nodes = vec![
+            EffectNode::source(source, EffectSource::Backdrop),
+            EffectNode::color_matrix(
+                matrix,
+                source,
+                ColorMatrixSpec {
+                    matrix: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ],
+                    bias: [0.0; 4],
+                },
+            )
+            .unwrap(),
+            EffectNode::tint(tint, matrix, TintSpec::WHITE),
+        ];
+        let custom = EffectNodeId::new(4).unwrap();
+        nodes.push(
+            EffectNode::custom_fragment(
+                custom,
+                tint,
+                CustomFragmentSpec {
+                    shader: ShaderModuleId::new(12).unwrap(),
+                    declared_footprint: EffectFootprint::symmetric(0),
+                    uniforms: Vec::new(),
+                    auxiliary_inputs: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        let output = custom;
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(13).unwrap(),
+            nodes,
+            output,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let instances = (0..instance_count)
+            .map(|index| {
+                let region = EffectRegion::from_rect(
+                    EffectRect::new(10 + (index as i32) * 40, 10, 20, 20)
+                        .expect("test effect region"),
+                );
+                ResolvedEffectInstance {
+                    id: EffectInstanceId::new(
+                        u64::try_from(index + 1).expect("test instance id fits"),
+                    )
+                    .expect("test instance id is non-zero"),
+                    program: EffectProgramId::new(13).unwrap(),
+                    anchor: EffectAnchor::OutputPostProcess,
+                    target_bounds: region.bounding_rect().unwrap(),
+                    region,
+                    parameter_block: EffectParameterBlock::default(),
+                    signature: u64::try_from(index + 1).expect("test signature fits"),
+                    frame_demand: EffectFrameDemand::OnDamage,
+                    visual_group: None,
+                    anchor_scope: EffectAnchorScope::VisualGroup,
+                    scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
+                }
+            })
+            .collect();
+        (ResolvedEffectScene::new(1, instances), registry)
+    }
+
     fn lifetime_texture(
         id: u16,
         first_use: Option<u16>,
@@ -1345,19 +1462,51 @@ mod tests {
         }
     }
 
-    fn brute_force_peak(textures: &[GraphTexturePlan], pass_count: usize) -> usize {
-        (0..pass_count)
-            .map(|pass_index| {
+    fn test_pass(id: u16) -> CompiledRenderPass {
+        CompiledRenderPass {
+            id: GraphPassId::new(id).expect("test pass id must be non-zero"),
+            kind: RenderPassKind::Fragment,
+            inputs: Vec::new(),
+            output: None,
+            damage: EffectRegion::empty(),
+            instance: EffectInstanceId::new(1).expect("test instance id must be non-zero"),
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+        }
+    }
+
+    fn brute_force_peak(passes: &[CompiledRenderPass], textures: &[GraphTexturePlan]) -> usize {
+        passes
+            .iter()
+            .enumerate()
+            .map(|(current_position, _)| {
                 textures
                     .iter()
                     .filter(|texture| {
                         texture.source == GraphTextureSource::Intermediate
-                            && texture
-                                .first_use
-                                .is_some_and(|first| usize::from(first.get() - 1) <= pass_index)
-                            && texture
-                                .last_use
-                                .is_some_and(|last| usize::from(last.get() - 1) >= pass_index)
+                            && texture.first_use.zip(texture.last_use).is_some_and(
+                                |(first, last)| {
+                                    let first_position = passes
+                                        .iter()
+                                        .position(|pass| pass.id == first)
+                                        .expect("reference lifetime first pass must survive");
+                                    let last_position = passes
+                                        .iter()
+                                        .position(|pass| pass.id == last)
+                                        .expect("reference lifetime last pass must survive");
+                                    first_position <= current_position
+                                        && current_position <= last_position
+                                },
+                            )
                     })
                     .count()
             })
@@ -1410,10 +1559,61 @@ mod tests {
         ];
 
         for (pass_count, textures) in fixtures {
+            let passes = (1..=pass_count)
+                .map(|id| test_pass(u16::try_from(id).expect("test pass count fits")))
+                .collect::<Vec<_>>();
             assert_eq!(
-                peak_live_intermediates(&textures, pass_count),
-                brute_force_peak(&textures, pass_count),
+                peak_live_intermediates(&passes, &textures),
+                brute_force_peak(&passes, &textures),
                 "fixture with {pass_count} passes"
+            );
+        }
+    }
+
+    #[test]
+    fn post_fusion_peak_live_handles_gapped_ids_and_inclusive_lifetimes() {
+        let fixtures = [
+            (
+                vec![1, 2, 4, 5],
+                vec![lifetime_texture(
+                    1,
+                    Some(4),
+                    Some(5),
+                    GraphTextureSource::Intermediate,
+                )],
+                1,
+            ),
+            (
+                vec![1, 3, 5],
+                vec![lifetime_texture(
+                    1,
+                    Some(5),
+                    Some(5),
+                    GraphTextureSource::Intermediate,
+                )],
+                1,
+            ),
+            (
+                vec![1, 3, 6, 8],
+                vec![
+                    lifetime_texture(1, Some(3), Some(6), GraphTextureSource::Intermediate),
+                    lifetime_texture(2, Some(6), Some(6), GraphTextureSource::Intermediate),
+                ],
+                2,
+            ),
+        ];
+
+        for (ids, textures, expected_peak) in fixtures {
+            let passes = ids.into_iter().map(test_pass).collect::<Vec<_>>();
+            assert_eq!(
+                brute_force_peak(&passes, &textures),
+                expected_peak,
+                "semantic reference fixture should define the expected peak"
+            );
+            assert_eq!(
+                peak_live_intermediates(&passes, &textures),
+                brute_force_peak(&passes, &textures),
+                "stable IDs must resolve through surviving pass order"
             );
         }
     }
@@ -1539,13 +1739,11 @@ mod tests {
         let FrameExecutionPlan::EffectGraph(graph) = plan else {
             panic!("visible effects must compile to an effect graph");
         };
-        assert!(
-            graph
-                .textures
-                .iter()
-                .filter(|texture| texture.source == GraphTextureSource::Intermediate)
-                .all(|texture| texture.first_use.is_some() && texture.last_use.is_some())
-        );
+        assert!(graph
+            .textures
+            .iter()
+            .filter(|texture| texture.source == GraphTextureSource::Intermediate)
+            .all(|texture| texture.first_use.is_some() && texture.last_use.is_some()));
         assert!(graph.stats.peak_live_intermediates > 0);
     }
 
@@ -1572,16 +1770,14 @@ mod tests {
             dimensions,
             vec![(184, 114), (92, 57), (184, 114), (368, 228)]
         );
-        assert!(
-            graph
-                .passes
-                .iter()
-                .filter(|pass| matches!(
-                    pass.kind,
-                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
-                ))
-                .all(|pass| pass.blur_radius == Some(4.0))
-        );
+        assert!(graph
+            .passes
+            .iter()
+            .filter(|pass| matches!(
+                pass.kind,
+                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+            ))
+            .all(|pass| pass.blur_radius == Some(4.0)));
     }
 
     #[test]
@@ -1851,11 +2047,9 @@ mod tests {
             .filter(|pass| pass.kind == RenderPassKind::NormalizeInput)
             .collect::<Vec<_>>();
         assert_eq!(normalize.len(), 2);
-        assert!(
-            normalize
-                .iter()
-                .all(|pass| { pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear })
-        );
+        assert!(normalize
+            .iter()
+            .all(|pass| { pass.color_conversion == EffectColorConversion::DecodeSrgbToLinear }));
         let blend_pass = graph
             .passes
             .iter()
@@ -1947,13 +2141,11 @@ mod tests {
         assert!(normalize.damage.contains_point(504, 204));
         assert!(normalize.damage.contains_point(521, 221));
         assert!(!normalize.damage.contains_point(496, 196));
-        assert!(
-            normalize
-                .damage
-                .rects()
-                .iter()
-                .all(|rect| rect.intersect(normalized_domain).is_some())
-        );
+        assert!(normalize
+            .damage
+            .rects()
+            .iter()
+            .all(|rect| rect.intersect(normalized_domain).is_some()));
     }
 
     #[test]
@@ -2032,21 +2224,87 @@ mod tests {
         ));
         assert_eq!(
             graph.stats.peak_live_intermediates,
-            brute_force_peak(&graph.textures, graph.passes.len())
+            brute_force_peak(&graph.passes, &graph.textures)
+        );
+    }
+
+    #[test]
+    fn compiled_mid_graph_fusion_preserves_surviving_pass_order_for_peak_live() {
+        let (scene, registry) = fused_local_stage_scene(1);
+        let region = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("fused local stage scene must compile to an effect graph");
+        };
+        let pass_ids = graph
+            .passes
+            .iter()
+            .map(|pass| pass.id.get())
+            .collect::<Vec<_>>();
+        assert!(pass_ids.windows(2).any(|pair| pair[1] > pair[0] + 1));
+        assert!(graph
+            .passes
+            .iter()
+            .any(|pass| !pass.fused_stages.is_empty()));
+        assert_eq!(
+            graph.stats.peak_live_intermediates,
+            brute_force_peak(&graph.passes, &graph.textures)
+        );
+    }
+
+    #[test]
+    fn compiled_multiple_fusions_keep_peak_live_exact_for_late_ids() {
+        let (scene, registry) = fused_local_stage_scene(3);
+        let region = EffectRegion::from_rect(EffectRect::new(0, 0, 200, 100).unwrap());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 200, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("multiple fused local stage scene must compile to an effect graph");
+        };
+        let pass_ids = graph
+            .passes
+            .iter()
+            .map(|pass| pass.id.get())
+            .collect::<Vec<_>>();
+        let gap_count = pass_ids
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0] + 1)
+            .count();
+        assert!(gap_count >= 2, "expected multiple fusion-created ID gaps");
+        assert!(graph.textures.iter().any(|texture| {
+            texture.source == GraphTextureSource::Intermediate
+                && texture
+                    .first_use
+                    .is_some_and(|first| usize::from(first.get()) > graph.passes.len())
+        }));
+        assert_eq!(
+            graph.stats.peak_live_intermediates,
+            brute_force_peak(&graph.passes, &graph.textures)
         );
     }
 
     #[test]
     fn peak_live_work_scales_with_intervals_and_passes() {
+        let passes = (1..=256).map(test_pass).collect::<Vec<_>>();
         let textures = (1..=512)
             .map(|id| lifetime_texture(id, Some(1), Some(256), GraphTextureSource::Intermediate))
             .collect::<Vec<_>>();
         reset_peak_live_work_counters();
 
-        assert_eq!(peak_live_intermediates(&textures, 256), 512);
+        assert_eq!(peak_live_intermediates(&passes, &textures), 512);
         assert_eq!(
             peak_live_work_counters(),
             PeakLiveWorkCounters {
+                pass_position_map_entries: 256,
                 interval_insertions: 512,
                 sweep_steps: 256,
                 graph_compiles: 0,
@@ -2183,8 +2441,7 @@ mod tests {
 
         reset_peak_live_work_counters();
         let FrameExecutionPlan::EffectGraph(original) =
-            compile_frame_execution_plan(&scene, &source_damage, output_bounds, &registry)
-                .unwrap()
+            compile_frame_execution_plan(&scene, &source_damage, output_bounds, &registry).unwrap()
         else {
             panic!("original geometry workload must compile to an effect graph");
         };
@@ -2325,21 +2582,15 @@ mod tests {
             panic!("visible effects must compile to an effect graph");
         };
 
-        assert!(
-            graph.instances[1]
-                .dependencies
-                .contains(&EffectInstanceId::new(1).unwrap())
-        );
-        assert!(
-            graph.instances[2]
-                .dependencies
-                .contains(&EffectInstanceId::new(2).unwrap())
-        );
-        assert!(
-            !graph.instances[2]
-                .dependencies
-                .contains(&EffectInstanceId::new(1).unwrap())
-        );
+        assert!(graph.instances[1]
+            .dependencies
+            .contains(&EffectInstanceId::new(1).unwrap()));
+        assert!(graph.instances[2]
+            .dependencies
+            .contains(&EffectInstanceId::new(2).unwrap()));
+        assert!(!graph.instances[2]
+            .dependencies
+            .contains(&EffectInstanceId::new(1).unwrap()));
         let demand = plan_effect_execution_demand(
             &graph,
             &EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap()),
