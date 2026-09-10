@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard ...|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
                 );
                 return Ok(0);
             }
