@@ -716,7 +716,13 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
     );
     assert_ne!((tiled_geometry.width, tiled_geometry.height), (700, 450));
     assert!(survivor_transition.is_some());
-    let expected_x = pointer_x - 700.0 * 0.4;
+    let physical_rect = presented_before
+        .1
+        .expect("physical presentation geometry")
+        .presented_rect();
+    let horizontal_ratio =
+        ((pointer_x - physical_rect.x()) / physical_rect.width().max(1.0)).clamp(0.0, 1.0);
+    let expected_x = pointer_x - horizontal_ratio * 700.0;
     let actual_x = restored_geometry
         .expect("restored geometry")
         .placement
