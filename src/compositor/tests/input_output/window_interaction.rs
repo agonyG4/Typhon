@@ -649,6 +649,16 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
     wait_for_server_commands(&commands);
     let maximized_geometry = capture_root_window_geometry(&commands, root_a)
         .expect("maximized geometry should be installed");
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 4,
+            at: AnimationTime::from_nanos(125_000_000),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let presented_before = capture_presented_presentation(&commands, root_a);
     let pointer_x =
         maximized_geometry.placement.local_x as f64 + maximized_geometry.width as f64 * 0.4;
     let pointer_y = maximized_geometry.placement.local_y as f64 + 120.0;
@@ -665,6 +675,24 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
     let management_b = capture_window_management(&commands, window_b);
     let restored_geometry = capture_root_window_geometry(&commands, root_a);
     let survivor_transition = capture_presentation_transition_curve_for_root(&commands, root_b);
+    let presented_after_begin = capture_presented_presentation(&commands, root_a);
+    assert_eq!(presented_after_begin, presented_before);
+    commands
+        .send(ServerCommand::UpdateInteraction {
+            x: pointer_x + 20.0,
+            y: pointer_y,
+        })
+        .unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 5,
+            at: AnimationTime::from_nanos(125_000_000),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let presented_after_frame = capture_presented_presentation(&commands, root_a);
     commands.send(ServerCommand::EndInteraction).unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
@@ -694,6 +722,8 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
         .placement
         .local_x as f64;
     assert!((actual_x - expected_x).abs() <= 1.0);
+    assert!(presented_after_frame.0 > presented_before.0);
+    assert_ne!(presented_after_frame.1, presented_before.1);
 }
 
 #[test]
