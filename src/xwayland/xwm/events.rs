@@ -901,6 +901,18 @@ pub(crate) mod tests {
                 if snapshot.handle == handle && snapshot.surface_id == 42
         ));
         assert_eq!(ready_surface_id(&events), Some(42));
+        let lifecycle = crate::xwayland::trace::take_recent_lifecycle_trace();
+        let ready_trace = lifecycle
+            .iter()
+            .find(|line| {
+                line.contains("x_event_type=window_ready_emitted") && line.contains("xid=100")
+            })
+            .expect("window readiness trace should correlate the X11 and Wayland state");
+        assert!(ready_trace.contains("generation=1"));
+        assert!(ready_trace.contains("map_serial=1"));
+        assert!(ready_trace.contains("association_serial=4660"));
+        assert!(ready_trace.contains("surface_id=42"));
+        assert!(ready_trace.contains("buffer_ready=true"));
     }
 
     #[test]

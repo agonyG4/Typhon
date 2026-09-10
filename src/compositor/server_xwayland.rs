@@ -1,5 +1,5 @@
 use super::*;
-use crate::xwayland::trace::{self, TraceFields};
+use crate::xwayland::trace::{self, TraceCategory, TraceFields};
 use crate::xwayland::xwm::XwmAssociationEvent;
 
 impl OwnCompositorServer {
@@ -107,23 +107,27 @@ impl OwnCompositorServer {
                 else {
                     return;
                 };
-                trace::emit("xwayland_surface_attached", || {
-                    TraceFields::new()
-                        .field("source", "compositor")
-                        .field("xid", window.xid())
-                        .field("generation", generation.get())
-                        .optional("old_surface_id", replaced_surface_id)
-                        .field("surface_id", surface_id)
-                        .field("replacement", replaced_surface_id.is_some())
-                        .field(
-                            "teardown_reason",
-                            if replaced_surface_id.is_some() {
-                                "attachment_replacement"
-                            } else {
-                                "association_committed"
-                            },
-                        )
-                });
+                trace::emit_category(
+                    TraceCategory::Lifecycle,
+                    "xwayland_surface_attached",
+                    || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", window.xid())
+                            .field("generation", generation.get())
+                            .optional("old_surface_id", replaced_surface_id)
+                            .field("surface_id", surface_id)
+                            .field("replacement", replaced_surface_id.is_some())
+                            .field(
+                                "teardown_reason",
+                                if replaced_surface_id.is_some() {
+                                    "attachment_replacement"
+                                } else {
+                                    "association_committed"
+                                },
+                            )
+                    },
+                );
                 let _ = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
@@ -146,15 +150,19 @@ impl OwnCompositorServer {
                 self.state.retire_xwayland_attachment(surface_id);
                 self.state.detach_x11_surface(surface_id);
                 self.state.refresh_pointer_focus_at_last_position();
-                trace::emit("xwayland_surface_detached", || {
-                    TraceFields::new()
-                        .field("source", "compositor")
-                        .field("xid", window.xid())
-                        .field("generation", generation.get())
-                        .field("surface_id", surface_id)
-                        .field("replacement", false)
-                        .field("teardown_reason", "wayland_association_removed")
-                });
+                trace::emit_category(
+                    TraceCategory::Lifecycle,
+                    "xwayland_surface_detached",
+                    || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", window.xid())
+                            .field("generation", generation.get())
+                            .field("surface_id", surface_id)
+                            .field("replacement", false)
+                            .field("teardown_reason", "wayland_association_removed")
+                    },
+                );
             }
         }
     }

@@ -34,6 +34,7 @@ use crate::native_output::presentation::{
 use oblivion_one::native::buffering::PresentationOpportunityFrontier;
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
+const SUSPENDED_OUTPUT_SLOT_CAPACITY: usize = EXPLICIT_OUTPUT_SLOT_CAPACITY - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OutputSlotId(u8);
@@ -146,18 +147,12 @@ impl OutputSlotOwnership {
     }
 }
 
+/// Fatal output ownership failures. Recoverable session ownership lives in `suspended`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputQuarantineReason {
     PostDrawRenderFailure,
     RenderFenceExportFailure,
     AtomicSubmitFailure,
-    SuspendAbandonment,
-}
-
-impl OutputQuarantineReason {
-    const fn is_fatal(self) -> bool {
-        !matches!(self, Self::SuspendAbandonment)
-    }
 }
 
 #[derive(Debug)]
@@ -166,6 +161,14 @@ pub(crate) struct QuarantinedOutputSlot {
     pub(crate) pool_generation: u64,
     pub(crate) timing_fence: Option<OwnedFd>,
     pub(crate) reason: OutputQuarantineReason,
+    abandoned_frame: Option<RenderedOutputFrame>,
+}
+
+#[derive(Debug)]
+struct SuspendedOutputSlot {
+    slot: OutputSlotId,
+    pool_generation: u64,
+    timing_fence: Option<OwnedFd>,
     abandoned_frame: Option<RenderedOutputFrame>,
 }
 
@@ -357,6 +360,7 @@ pub(crate) struct AtomicOutputSwapchain {
     ready: Option<RenderedOutputFrame>,
     rendering: Option<OutputSlotId>,
     quarantine: Option<QuarantinedOutputSlot>,
+    suspended: [Option<SuspendedOutputSlot>; SUSPENDED_OUTPUT_SLOT_CAPACITY],
     next_frame_id: u64,
     presentation_serial: u64,
     current_framebuffer_id: Option<FramebufferId>,
@@ -381,6 +385,7 @@ impl AtomicOutputSwapchain {
             ready: None,
             rendering: None,
             quarantine: None,
+            suspended: std::array::from_fn(|_| None),
             next_frame_id: 1,
             presentation_serial: 0,
             current_framebuffer_id: None,
@@ -436,6 +441,7 @@ impl AtomicOutputSwapchain {
 
     pub(crate) fn render_target_available_for_limit(&self, future_primary_limit: u8) -> bool {
         self.quarantine.is_none()
+            && !self.has_suspended_ownership()
             && self.rendering.is_none()
             && self.ready.is_none()
             && !(future_primary_limit < 2 && self.pending.is_some())
@@ -1002,20 +1008,20 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<bool> {
-        if self.quarantine.is_some() {
-            return Err(io::Error::other("an output slot is already quarantined"));
-        }
-        let Some(mut frame) = self.ready.take() else {
+        self.ensure_suspendable()?;
+        let Some(ready) = self.ready.as_ref() else {
             return Ok(false);
         };
-        let slot = frame.slot;
+        let slot = ready.slot;
+        if self.suspended_slot_id(slot).is_some() {
+            return Err(io::Error::other(
+                "output slot is already owned by suspended output",
+            ));
+        }
+        let suspended_index = self.empty_suspended_slot_index()?;
+        let mut frame = self.ready.take().expect("ready was observed above");
         let timing_fence = frame.render_fence.take_timing_fd();
-        self.quarantine_slot(
-            slot,
-            timing_fence,
-            OutputQuarantineReason::SuspendAbandonment,
-            Some(frame),
-        )?;
+        self.suspend_owned_slot(suspended_index, slot, timing_fence, frame);
         Ok(true)
     }
 
@@ -1023,97 +1029,103 @@ impl AtomicOutputSwapchain {
         &mut self,
         token: PageFlipToken,
     ) -> io::Result<bool> {
-        if self.quarantine.is_some() {
-            return Err(io::Error::other("an output slot is already quarantined"));
-        }
-        let Some(mut queued) = self.worker_queued.take() else {
+        self.ensure_suspendable()?;
+        let Some(queued) = self.worker_queued.as_ref() else {
             return Ok(false);
         };
         if queued.token != token {
-            self.worker_queued = Some(queued);
             return Err(io::Error::other(
                 "suspended worker output token does not match queued ownership",
             ));
         }
+        if self.suspended_slot_id(queued.frame.slot).is_some() {
+            return Err(io::Error::other(
+                "output slot is already owned by suspended output",
+            ));
+        }
+        let suspended_index = self.empty_suspended_slot_index()?;
+        let mut queued = self
+            .worker_queued
+            .take()
+            .expect("worker was observed above");
         let timing_fence = queued.frame.render_fence.take_timing_fd();
-        self.quarantine_slot(
+        self.suspend_owned_slot(
+            suspended_index,
             queued.frame.slot,
             timing_fence,
-            OutputQuarantineReason::SuspendAbandonment,
-            Some(queued.frame),
-        )?;
+            queued.frame,
+        );
         Ok(true)
     }
 
-    pub(crate) fn suspended_ready_fence_signaled(&self) -> io::Result<bool> {
-        let Some(quarantine) = self.quarantine.as_ref() else {
-            return Ok(true);
-        };
-        if quarantine.reason != OutputQuarantineReason::SuspendAbandonment {
+    /// Move all rendered frames that cannot participate in the next session
+    /// generation into bounded suspend ownership in one preflighted operation.
+    pub(crate) fn suspend_abandon_future_frames(&mut self) -> io::Result<()> {
+        self.ensure_suspendable()?;
+        let required =
+            usize::from(self.worker_queued.is_some()) + usize::from(self.ready.is_some());
+        let available = self
+            .suspended
+            .iter()
+            .filter(|entry| entry.is_none())
+            .count();
+        if available < required {
             return Err(io::Error::other(
-                "fatal output quarantine cannot recover to normal operation",
+                "suspended output ownership exceeds explicit pool capacity",
             ));
         }
-        if quarantine.timing_fence.is_none() {
-            return quarantine
-                .abandoned_frame
-                .as_ref()
-                .map_or(Ok(false), |frame| {
-                    frame.render_fence.is_signaled_nonblocking()
-                });
+        if let Some(token) = self.worker_queued_token() {
+            self.suspend_abandon_worker_queued(token)?;
         }
-        let fence = quarantine.timing_fence.as_ref().expect("checked above");
-        let mut pollfd = libc::pollfd {
-            fd: fence.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
-        if ready < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err(io::Error::other(
-                "suspended output render fence reported poll failure",
-            ));
-        }
-        Ok(ready > 0 && pollfd.revents & libc::POLLIN != 0)
+        self.suspend_abandon_ready()?;
+        Ok(())
     }
 
-    pub(crate) fn suspended_ready_fence_fd(&self) -> Option<RawFd> {
-        self.quarantine
-            .as_ref()
-            .filter(|quarantine| quarantine.reason == OutputQuarantineReason::SuspendAbandonment)
-            .and_then(|quarantine| {
-                quarantine
+    pub(crate) fn suspended_fences_signaled(&self) -> io::Result<bool> {
+        self.suspended
+            .iter()
+            .flatten()
+            .try_fold(true, |all_signaled, suspended| {
+                let signaled = self.suspended_slot_fence_signaled(suspended)?;
+                Ok(all_signaled && signaled)
+            })
+    }
+
+    pub(crate) fn suspended_fence_fd(&self) -> io::Result<Option<RawFd>> {
+        for suspended in self.suspended.iter().flatten() {
+            if !self.suspended_slot_fence_signaled(suspended)? {
+                return Ok(suspended
                     .timing_fence
                     .as_ref()
                     .map(AsRawFd::as_raw_fd)
                     .or_else(|| {
-                        quarantine
+                        suspended
                             .abandoned_frame
                             .as_ref()
                             .and_then(|frame| frame.render_fence.readiness_fd())
                             .map(AsRawFd::as_raw_fd)
-                    })
-            })
+                    }));
+            }
+        }
+        Ok(None)
     }
 
-    pub(crate) fn has_suspended_ready_frame(&self) -> bool {
-        self.quarantine.as_ref().is_some_and(|quarantine| {
-            quarantine.reason == OutputQuarantineReason::SuspendAbandonment
-                && quarantine.abandoned_frame.is_some()
-        })
+    pub(crate) fn has_suspended_frame(&self) -> bool {
+        self.suspended
+            .iter()
+            .flatten()
+            .any(|suspended| suspended.abandoned_frame.is_some())
     }
 
     pub(crate) fn retire_pending_after_recovery(&mut self) -> Option<RenderedOutputFrame> {
         self.pending.take().map(|submitted| submitted.frame)
     }
 
-    pub(crate) fn take_suspended_ready_frame(&mut self) -> Option<RenderedOutputFrame> {
-        self.quarantine
-            .as_mut()
-            .and_then(|quarantine| quarantine.abandoned_frame.take())
+    pub(crate) fn take_suspended_frame(&mut self) -> Option<RenderedOutputFrame> {
+        self.suspended
+            .iter_mut()
+            .flatten()
+            .find_map(|suspended| suspended.abandoned_frame.take())
     }
 
     pub(crate) fn rebind_pool_generation(&mut self, pool_generation: u64) -> io::Result<()> {
@@ -1122,6 +1134,7 @@ impl AtomicOutputSwapchain {
             || self.ready.is_some()
             || self.rendering.is_some()
             || self.quarantine.is_some()
+            || self.has_suspended_ownership()
         {
             return Err(io::Error::other(
                 "output pool generation cannot change while a non-current slot is owned",
@@ -1135,25 +1148,29 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn recover_suspended_slot(&mut self, fence_signaled: bool) -> io::Result<()> {
-        let Some(quarantine) = self.quarantine.as_ref() else {
-            return Ok(());
-        };
-        if quarantine.reason != OutputQuarantineReason::SuspendAbandonment {
+        if self.quarantine.is_some() {
             return Err(io::Error::other(
                 "fatal output quarantine cannot recover to normal operation",
             ));
         }
-        if !fence_signaled {
+        if !fence_signaled || !self.suspended_fences_signaled()? {
             return Err(io::Error::other(
                 "suspended output slot render fence is not signaled",
             ));
         }
-        if quarantine.abandoned_frame.is_some() {
+        if self
+            .suspended
+            .iter()
+            .flatten()
+            .any(|suspended| suspended.abandoned_frame.is_some())
+        {
             return Err(io::Error::other(
-                "suspended ready frame release ownership has not been retired",
+                "suspended output frame release ownership has not been retired",
             ));
         }
-        self.quarantine = None;
+        for suspended in &mut self.suspended {
+            *suspended = None;
+        }
         Ok(())
     }
 
@@ -1589,9 +1606,7 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.quarantine
-            .as_ref()
-            .is_some_and(|quarantine| quarantine.reason.is_fatal())
+        self.quarantine.is_some()
     }
 
     pub(crate) fn free_slot_count(&self) -> usize {
@@ -1611,6 +1626,13 @@ impl AtomicOutputSwapchain {
             self.quarantine_slot_id(),
         ];
         let occupied: Vec<_> = roles.into_iter().flatten().collect();
+        let mut occupied = occupied;
+        occupied.extend(
+            self.suspended
+                .iter()
+                .flatten()
+                .map(|suspended| suspended.slot),
+        );
         if occupied.iter().any(|slot| !self.slots.contains(*slot)) {
             return Err(io::Error::other(
                 "output role references a slot outside the explicit pool",
@@ -1661,6 +1683,20 @@ impl AtomicOutputSwapchain {
                         "output frame belongs to an old presentation generation",
                     ));
                 }
+            }
+        }
+        for suspended in self.suspended.iter().flatten() {
+            if suspended.pool_generation != self.pool_generation {
+                return Err(io::Error::other(
+                    "suspended output slot belongs to an old swapchain generation",
+                ));
+            }
+            if suspended.abandoned_frame.as_ref().is_some_and(|frame| {
+                frame.pool_generation != self.pool_generation || frame.slot != suspended.slot
+            }) {
+                return Err(io::Error::other(
+                    "suspended output slot frame belongs to an invalid owner",
+                ));
             }
         }
         let frontier = PresentationOpportunityFrontier::from_claims(
@@ -1716,6 +1752,11 @@ impl AtomicOutputSwapchain {
         if self.quarantine.is_some() {
             return Err(io::Error::other("an output slot is already quarantined"));
         }
+        if self.suspended_slot_id(slot).is_some() {
+            return Err(io::Error::other(
+                "output slot is already owned by suspended output",
+            ));
+        }
         self.quarantine = Some(QuarantinedOutputSlot {
             slot,
             pool_generation: self.pool_generation,
@@ -1736,7 +1777,96 @@ impl AtomicOutputSwapchain {
                 caller.line(),
             )));
         }
+        if self.has_suspended_ownership() {
+            return Err(io::Error::other(
+                "explicit output swapchain has suspend-owned slots and is non-renderable",
+            ));
+        }
         Ok(())
+    }
+
+    fn ensure_suspendable(&self) -> io::Result<()> {
+        if self.quarantine.is_some() {
+            return Err(io::Error::other(
+                "fatal output quarantine blocks session suspension recovery",
+            ));
+        }
+        Ok(())
+    }
+
+    fn suspend_owned_slot(
+        &mut self,
+        suspended_index: usize,
+        slot: OutputSlotId,
+        timing_fence: Option<OwnedFd>,
+        frame: RenderedOutputFrame,
+    ) {
+        assert!(
+            self.suspended_slot_id(slot).is_none(),
+            "output slot is already owned by suspended output"
+        );
+        let entry = self
+            .suspended
+            .get_mut(suspended_index)
+            .expect("suspended output ownership index was preflighted");
+        assert!(
+            entry.is_none(),
+            "suspended output ownership slot was preflighted as empty"
+        );
+        *entry = Some(SuspendedOutputSlot {
+            slot,
+            pool_generation: self.pool_generation,
+            timing_fence,
+            abandoned_frame: Some(frame),
+        });
+    }
+
+    fn empty_suspended_slot_index(&self) -> io::Result<usize> {
+        self.suspended
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| {
+                io::Error::other("suspended output ownership exceeds explicit pool capacity")
+            })
+    }
+
+    fn suspended_slot_id(&self, slot: OutputSlotId) -> Option<OutputSlotId> {
+        self.suspended
+            .iter()
+            .flatten()
+            .find(|suspended| suspended.slot == slot)
+            .map(|suspended| suspended.slot)
+    }
+
+    fn has_suspended_ownership(&self) -> bool {
+        self.suspended.iter().any(Option::is_some)
+    }
+
+    fn suspended_slot_fence_signaled(&self, suspended: &SuspendedOutputSlot) -> io::Result<bool> {
+        if suspended.timing_fence.is_none() {
+            return suspended
+                .abandoned_frame
+                .as_ref()
+                .map_or(Ok(true), |frame| {
+                    frame.render_fence.is_signaled_nonblocking()
+                });
+        }
+        let fence = suspended.timing_fence.as_ref().expect("checked above");
+        let mut pollfd = libc::pollfd {
+            fd: fence.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other(
+                "suspended output render fence reported poll failure",
+            ));
+        }
+        Ok(ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
 
     fn validate_worker_queued_frame(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
@@ -1881,6 +2011,7 @@ impl AtomicOutputSwapchain {
             && self.ready_slot() != Some(slot)
             && self.rendering != Some(slot)
             && self.quarantine_slot_id() != Some(slot)
+            && self.suspended_slot_id(slot).is_none()
     }
 }
 
@@ -2365,16 +2496,16 @@ mod tests {
                 .expect("waiting successor terminal settlement")
         );
         assert!(swapchain.ready_identity().is_none());
-        assert_eq!(swapchain.quarantine_slot_id(), Some(ready_identity.slot));
+        assert_eq!(swapchain.quarantine_slot_id(), None);
         assert!(
             swapchain
-                .take_suspended_ready_frame()
+                .take_suspended_frame()
                 .expect("abandoned waiting successor")
                 .is_deferred_o1()
         );
         swapchain
             .recover_suspended_slot(true)
-            .expect("waiting successor quarantine recovery");
+            .expect("waiting successor suspend recovery");
         assert_eq!(swapchain.quarantine_slot_id(), None);
         assert_eq!(swapchain.pending_token(), Some(predecessor_token));
         assert_eq!(swapchain.worker_queued_token(), None);

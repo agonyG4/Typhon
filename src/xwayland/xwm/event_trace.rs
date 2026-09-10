@@ -132,6 +132,9 @@ pub(super) fn trace_window_state(
                 "window_types",
                 format!("{:?}", record.properties.window_types),
             )
+            .optional("app_id", record.properties.app_id.as_deref())
+            .optional("title", record.properties.title.as_deref())
+            .optional("pid", record.properties.pid)
             .optional(
                 "transient_for",
                 record.properties.transient_for.map(|parent| parent.xid()),

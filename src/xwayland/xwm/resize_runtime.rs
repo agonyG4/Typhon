@@ -609,6 +609,12 @@ impl Xwm {
             .try_ready(handle)
             .map_err(XwmError::InvalidCommand)?;
         if let Some(snapshot) = snapshot {
+            super::event_trace::trace_window_state(
+                self,
+                "window_ready_emitted",
+                handle,
+                TraceFields::new(),
+            );
             self.outgoing_events
                 .push_back(XwmEvent::WindowReady(snapshot));
             return Ok(true);

@@ -248,13 +248,13 @@ fn abandon_overtaken_worker_queued(
     }
 }
 
-fn register_suspended_ready_fence_if_needed(
+fn register_suspended_fence_if_needed(
     explicit: &AtomicEglGbmScanout,
     event_loop: &mut NativeEventLoop,
     output_render_fence_token: &mut Option<ReactorToken>,
 ) -> NativeResult<()> {
     if output_render_fence_token.is_none()
-        && let Some(fd) = explicit.suspended_ready_fence_fd()
+        && let Some(fd) = explicit.suspended_fence_fd()?
     {
         *output_render_fence_token =
             Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
@@ -384,10 +384,15 @@ impl NativeRuntime {
             if let Some(token) = output_render_fence_token.take() {
                 event_loop.unregister(token)?;
             }
-            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
-                && explicit.recover_suspended_ready_if_signaled()?
-            {
-                *queued_redraw_requested = true;
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                if explicit.recover_suspended_ready_if_signaled()? {
+                    *queued_redraw_requested = true;
+                }
+                register_suspended_fence_if_needed(
+                    explicit,
+                    event_loop,
+                    output_render_fence_token,
+                )?;
             }
             if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
                 && let Some(timing) = explicit
@@ -963,7 +968,7 @@ impl NativeRuntime {
                                     .into());
                                 }
                                 *queued_redraw_requested = true;
-                                register_suspended_ready_fence_if_needed(
+                                register_suspended_fence_if_needed(
                                     explicit,
                                     event_loop,
                                     output_render_fence_token,
@@ -999,7 +1004,7 @@ impl NativeRuntime {
                                     .into());
                                 }
                                 *queued_redraw_requested = true;
-                                register_suspended_ready_fence_if_needed(
+                                register_suspended_fence_if_needed(
                                     explicit,
                                     event_loop,
                                     output_render_fence_token,

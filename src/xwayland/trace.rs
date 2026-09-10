@@ -268,6 +268,8 @@ mod tests {
             "destroy_window_processed",
             "xwm_map_notify",
             "xwayland_window_admission_failed",
+            "window_ready_emitted",
+            "xwayland_surface_attached",
         ] {
             emit_category(TraceCategory::Lifecycle, event, TraceFields::new);
         }
@@ -276,13 +278,15 @@ mod tests {
         }
 
         let retained = take_recent_lifecycle_trace();
-        assert_eq!(retained.len(), 5);
+        assert_eq!(retained.len(), 7);
         for event in [
             "window_destroyed",
             "window_withdrawn",
             "destroy_window_processed",
             "xwm_map_notify",
             "xwayland_window_admission_failed",
+            "window_ready_emitted",
+            "xwayland_surface_attached",
         ] {
             assert!(
                 retained

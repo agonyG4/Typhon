@@ -192,10 +192,7 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn suspend_for_session(&mut self) -> io::Result<()> {
         self.direct_scanout_suspend()?;
-        if let Some(token) = self.swapchain()?.worker_queued_token() {
-            self.swapchain_mut()?.suspend_abandon_worker_queued(token)?;
-        }
-        self.swapchain_mut()?.suspend_abandon_ready()?;
+        self.swapchain_mut()?.suspend_abandon_future_frames()?;
         Ok(())
     }
 
@@ -212,18 +209,17 @@ impl AtomicEglGbmScanout {
                 "explicit output recovery token no longer matches the active pool",
             ));
         }
-        let fence_signaled = swapchain.suspended_ready_fence_signaled()?;
+        let fence_signaled = swapchain.suspended_fences_signaled()?;
         if !fence_signaled {
             return Err(io::Error::other(
-                "suspended-ready output fence is not signaled after recovery modeset",
+                "suspended output fence is not signaled after recovery modeset",
             ));
         }
-        let abandoned_ready = self.swapchain_mut()?.take_suspended_ready_frame();
-        self.swapchain_mut()?.recover_suspended_slot(true)?;
-        if let Some(frame) = abandoned_ready {
+        while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
+        self.swapchain_mut()?.recover_suspended_slot(true)?;
         if let Some(frame) = self.swapchain_mut()?.retire_pending_after_recovery() {
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
@@ -1407,26 +1403,26 @@ impl AtomicEglGbmScanout {
             .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
     }
 
-    pub(crate) fn suspended_ready_fence_fd(&self) -> Option<std::os::fd::RawFd> {
+    pub(crate) fn suspended_fence_fd(&self) -> io::Result<Option<std::os::fd::RawFd>> {
         self.swapchain()
-            .ok()
-            .and_then(AtomicOutputSwapchain::suspended_ready_fence_fd)
+            .and_then(AtomicOutputSwapchain::suspended_fence_fd)
     }
 
     pub(crate) fn recover_suspended_ready_if_signaled(&mut self) -> io::Result<bool> {
-        if !self.swapchain()?.has_suspended_ready_frame() {
+        if !self.swapchain()?.has_suspended_frame() {
             return Ok(false);
         }
-        if !self.swapchain()?.suspended_ready_fence_signaled()? {
+        if !self.swapchain()?.suspended_fences_signaled()? {
             return Ok(false);
         }
-        let abandoned = self.swapchain_mut()?.take_suspended_ready_frame();
-        self.swapchain_mut()?.recover_suspended_slot(true)?;
-        if let Some(frame) = abandoned {
+        let mut recovered = false;
+        while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
+            recovered = true;
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
-        Ok(true)
+        self.swapchain_mut()?.recover_suspended_slot(true)?;
+        Ok(recovered)
     }
 
     pub(crate) fn note_physical_primary_presentation(
