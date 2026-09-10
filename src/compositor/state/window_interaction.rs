@@ -558,15 +558,19 @@ impl CompositorState {
             log_begin_rejection(self, begin, "root_resource_missing");
             return false;
         };
-        if kind == WindowInteractionKind::Move
+        let maximized_restore = if kind == WindowInteractionKind::Move
             && self
                 .window(window_id)
                 .is_some_and(|window| window.state.mode() == ToplevelMode::Maximized)
-            && !self.restore_maximized_window_for_interaction(window_id, root_surface_id, x, y)
         {
-            log_begin_rejection(self, begin, "maximized_restore_failed");
-            return false;
-        }
+            if !self.restore_maximized_window_for_interaction(window_id, root_surface_id, x, y) {
+                log_begin_rejection(self, begin, "maximized_restore_failed");
+                return false;
+            }
+            true
+        } else {
+            false
+        };
         let mut tiled_resize_data = if self.window(window_id).is_some_and(|window| {
             window.state.mode() == ToplevelMode::Normal
                 && window
@@ -594,7 +598,7 @@ impl CompositorState {
             .current_visual_root_window_geometry(root_surface_id)
             .or_else(|| self.current_root_window_geometry(root_surface_id))
             .unwrap_or(fallback_geometry);
-        let start_geometry = if tiled_resize_data.is_some() {
+        let start_geometry = if tiled_resize_data.is_some() || maximized_restore {
             canonical_geometry
         } else {
             self.presented_visual_root_window_geometry(root_surface_id)
@@ -624,6 +628,10 @@ impl CompositorState {
                 // resize geometry. Cancelling the effect is sufficient; do
                 // not turn a presentation sample into canonical placement.
                 self.presentation_animator.cancel(root_surface_id);
+            } else if maximized_restore {
+                // The synchronous maximize handoff already installed the
+                // pointer-anchored target. Keep it as the Move origin while
+                // the last physical pageflip record remains preserved.
             } else {
                 self.rebase_interaction_to_presented_origin(
                     root_surface_id,

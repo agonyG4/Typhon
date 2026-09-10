@@ -727,7 +727,10 @@ fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
         .expect("restored geometry")
         .placement
         .local_x as f64;
-    assert!((actual_x - expected_x).abs() <= 1.0);
+    assert!(
+        (actual_x - expected_x).abs() <= 1.0,
+        "actual_x={actual_x} expected_x={expected_x} pointer_x={pointer_x} physical={physical_rect:?}"
+    );
     assert!(presented_after_frame.0 > presented_before.0);
     assert_ne!(presented_after_frame.1, presented_before.1);
 }
