@@ -234,3 +234,61 @@ regressions and timing-policy tests are the evidence available here. Physical
 qualification should repeat maximize, fullscreen, restore, layout reflow,
 titlebar interruption, and representative XWayland transitions on the actual
 165 Hz setup.
+
+## v2.1 follow-up: interaction ownership closure
+
+The v2.1 audit found that `restore_root_window_for_interaction` redundantly
+called `cancel_presentation_for_root` after the immediate visual installer had
+already cancelled the animator. That helper is destructive: it also removed
+the last pageflip-confirmed `PresentedWindowGeometry` and any published
+presentation transform. Interaction handoff now cancels only the animator and
+keeps the physical ledger, including a non-identity transform, until the next
+pageflip. The destructive helper remains reserved for root teardown.
+
+The same audit found that tiled classification was computed before a
+maximized Move restore. A `Maximized + Tiled` window could therefore become
+`Normal + Tiled` while starting a floating Move. Interaction classification is
+now reread after the mode handoff. Maximized tiled Move first prepares a
+candidate Dwindle tree and surviving solution, then commits the detach and
+changes membership to `Floating`; the dragged window is restored immediately,
+while surviving tiled windows use the normal `LayoutReflow` policy. Preparation
+failure leaves mode, membership, and the live tree unchanged. Normal tiled
+Move remains rejected, maximized Resize remains rejected, and programmatic
+unmaximize still follows the tiled restore path.
+
+For a floating-managed maximized window, restore continues to use
+`WindowState::restore_geometry()`. For a tiled-managed maximized window that
+will detach, it prefers `DesktopWindow::floating_geometry`, falling back to
+the mode restore geometry only when necessary. The existing physical-rectangle
+horizontal ratio and titlebar vertical offset keep the restored window under
+the pointer, with ordinary integer placement rounding.
+
+The RED tests first observed the physical ledger changing from a promoted
+frame to `(None, None)` before another pageflip, and observed the invalid
+`Normal + Tiled + Move` ownership combination. GREEN coverage now exercises
+the replacement publication path, floating and tiled XDG interaction, the
+prepared-detach atomicity and single-leaf cases, and managed XWayland restore
+and detach cases. No separate XWayland policy or scene/layout architecture was
+introduced.
+
+The focused closure checks passed on the clean v2.1 implementation before the
+shared checkout received unrelated blur-policy work: the maximized floating
+ledger regression, the tiled-maximized detach/reflow/restore/anchor regression,
+prepared-detach unit tests, and the XWayland ledger test. The exact required
+verification commands were then run against the shared checkout as follows:
+
+- `rtk run -- cargo fmt --check` — passed.
+- `rtk run -- cargo check --locked --all-targets` — blocked before closure
+  compilation by the unrelated, uncommitted blur-policy changes in the shared
+  checkout (`Cargo.toml`/`src/lib.rs` and incomplete `state_data.rs` updates).
+- `rtk run -- cargo clippy --locked --all-targets -- -D warnings` — same
+  unrelated pre-existing checkout blocker; not a closure diagnostic.
+- `rtk run -- cargo test --locked` — same unrelated checkout blocker; no
+  v2.1 test failure was reported.
+- `rtk git diff --check` — passed.
+- `rtk run -- bash bin/check-source-layout` — retains the repository's
+  existing source-layout debt; no broad refactor was added here.
+
+Hardware qualification was not available in this session. The known
+1920x1080@165 Hz maximize-drag and repeated-stress checks remain to be run on
+the actual compositor hardware.
