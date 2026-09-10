@@ -226,6 +226,69 @@ fn tiled_to_floating_restores_the_last_floating_geometry() {
 }
 
 #[test]
+fn prepared_tiled_detach_is_atomic_when_tree_ownership_is_invalid() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 253))
+        .expect("window");
+    state.window_mut(id).expect("window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .window_mut(id)
+        .expect("window")
+        .state
+        .set_mode(ToplevelMode::Maximized);
+
+    assert!(state.prepare_tiled_detach(id).is_none());
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state
+            .window(id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Tiled
+    );
+    assert!(state.tiled_layout.tree(location).is_none());
+}
+
+#[test]
+fn prepared_tiled_detach_handles_the_only_leaf() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let id = state.allocate_window_id().expect("window id");
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 254))
+        .expect("window");
+    state.window_mut(id).expect("window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .tiled_layout
+        .insert(location, id, crate::wm::layout::InsertHint::default())
+        .expect("tiled insert");
+
+    let prepared = state.prepare_tiled_detach(id).expect("detach preparation");
+    assert!(state.commit_prepared_tiled_detach(prepared, None));
+    assert!(state.tiled_layout.tree(location).is_none());
+    assert_eq!(
+        state
+            .window(id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Floating
+    );
+}
+
+#[test]
 fn impossible_live_constraint_update_auto_floats_the_culprit_without_partial_layout() {
     let mut state = CompositorState::new(None);
     let first = state.allocate_window_id().expect("first window id");

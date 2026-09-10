@@ -526,28 +526,6 @@ impl CompositorState {
             log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
-        let mut tiled_resize_data = if self.window(window_id).is_some_and(|window| {
-            window.state.mode() == ToplevelMode::Normal
-                && window
-                    .management
-                    .is_some_and(|management| management.layout() == LayoutMembership::Tiled)
-        }) {
-            match kind {
-                WindowInteractionKind::Move => {
-                    log_begin_rejection(self, begin, "tiled_window_move_forbidden");
-                    return false;
-                }
-                WindowInteractionKind::Resize(edges) => {
-                    let Some(data) = self.prepare_tiled_resize(window_id, edges) else {
-                        log_begin_rejection(self, begin, "tiled_window_resize_not_adjustable");
-                        return false;
-                    };
-                    Some(data)
-                }
-            }
-        } else {
-            None
-        };
         if self
             .window(window_id)
             .is_some_and(|window| !window_interaction_allowed_for_mode(window.state.mode(), kind))
@@ -576,6 +554,10 @@ impl CompositorState {
                 return false;
             }
         }
+        let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
+            log_begin_rejection(self, begin, "root_resource_missing");
+            return false;
+        };
         if kind == WindowInteractionKind::Move
             && self
                 .window(window_id)
@@ -585,6 +567,28 @@ impl CompositorState {
             log_begin_rejection(self, begin, "maximized_restore_failed");
             return false;
         }
+        let mut tiled_resize_data = if self.window(window_id).is_some_and(|window| {
+            window.state.mode() == ToplevelMode::Normal
+                && window
+                    .management
+                    .is_some_and(|management| management.layout() == LayoutMembership::Tiled)
+        }) {
+            match kind {
+                WindowInteractionKind::Move => {
+                    log_begin_rejection(self, begin, "tiled_window_move_forbidden");
+                    return false;
+                }
+                WindowInteractionKind::Resize(edges) => {
+                    let Some(data) = self.prepare_tiled_resize(window_id, edges) else {
+                        log_begin_rejection(self, begin, "tiled_window_resize_not_adjustable");
+                        return false;
+                    };
+                    Some(data)
+                }
+            }
+        } else {
+            None
+        };
         let fallback_geometry = WindowGeometry::new(root_placement, root_width, root_height);
         let canonical_geometry = self
             .current_visual_root_window_geometry(root_surface_id)
@@ -606,10 +610,6 @@ impl CompositorState {
         if let Some(preparation) = tiled_resize_data.as_mut() {
             self.rebase_tiled_resize_preparation(root_surface_id, window_id, preparation);
         }
-        let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
-            log_begin_rejection(self, begin, "root_resource_missing");
-            return false;
-        };
         if self
             .presented_presentation_transform(root_surface_id)
             .is_some()
@@ -694,6 +694,15 @@ impl CompositorState {
         }
         let id = self.allocate_window_interaction_id();
         let tiled_resize = tiled_resize_data.is_some();
+        debug_assert!(
+            kind != WindowInteractionKind::Move
+                || tiled_resize
+                || self.window(window_id).is_none_or(|window| {
+                    window
+                        .management
+                        .is_none_or(|management| management.layout() != LayoutMembership::Tiled)
+                })
+        );
         self.pending_window_interaction_pointer = None;
         self.pending_floating_resize = None;
         self.window_interaction = Some(WindowInteraction {
@@ -789,11 +798,32 @@ impl CompositorState {
         pointer_x: f64,
         pointer_y: f64,
     ) -> bool {
-        let Some(restore_geometry) = self
-            .window(window_id)
-            .and_then(|window| window.state.restore_geometry())
-        else {
+        let Some(window) = self.window(window_id) else {
             return false;
+        };
+        let tiled_detach_required = window
+            .management
+            .is_some_and(|management| management.layout() == LayoutMembership::Tiled);
+        // A tiled maximize stores the tiled geometry in WindowState. A titlebar
+        // drag abandons that layout, so its restore base is the last floating
+        // geometry instead.
+        let restore_geometry = if tiled_detach_required {
+            window
+                .floating_geometry
+                .or_else(|| window.state.restore_geometry())
+        } else {
+            window.state.restore_geometry()
+        };
+        let Some(restore_geometry) = restore_geometry else {
+            return false;
+        };
+        let prepared_tiled_detach = if tiled_detach_required {
+            let Some(prepared) = self.prepare_tiled_detach(window_id) else {
+                return false;
+            };
+            Some(prepared)
+        } else {
+            None
         };
         let Some(canonical_geometry) = self
             .current_visual_root_window_geometry(root_surface_id)
@@ -830,6 +860,11 @@ impl CompositorState {
             restore_geometry.width,
             restore_geometry.height,
         );
+        if let Some(prepared) = prepared_tiled_detach
+            && !self.commit_prepared_tiled_detach(prepared, None)
+        {
+            return false;
+        }
         self.restore_root_window_for_interaction(root_surface_id, target)
     }
 

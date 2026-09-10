@@ -561,6 +561,15 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
         .unwrap();
     commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
+    // PresentFrame drives the render-side work; this command models the
+    // following pageflip promotion through the normal presentation path.
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 3,
+            at: AnimationTime::from_nanos(125_000_000),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
     let moved = capture_root_window_geometry(&commands, root_surface_id);
     let presented_after_frame = capture_presented_presentation(&commands, root_surface_id);
     commands.send(ServerCommand::EndInteraction).unwrap();

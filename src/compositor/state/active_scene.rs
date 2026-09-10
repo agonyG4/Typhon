@@ -397,6 +397,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn cancel_presentation_for_root(&mut self, root_surface_id: u32) {
+        // Destructive physical-identity removal is for root teardown. An
+        // interaction handoff cancels the animator through its immediate
+        // visual installer and keeps the last pageflip ledger intact.
         self.presentation_animator.cancel(root_surface_id);
         self.presented_presentation
             .transforms

@@ -1495,17 +1495,11 @@ impl CompositorState {
                 Some(WindowBackend::X11(_))
             )
         {
-            let restored = self.transition_x11_window_mode_for_interaction(window_id, geometry);
-            if restored {
-                self.cancel_presentation_for_root(surface_id);
-            }
-            return restored;
+            return self.transition_x11_window_mode_for_interaction(window_id, geometry);
         }
-        let restored = self.restore_normal_root_window_with_transition(surface_id, Some(geometry));
-        if restored {
-            self.cancel_presentation_for_root(surface_id);
-        }
-        restored
+        // The immediate installer cancels the animator. The last pageflip
+        // record remains authoritative until the interaction frame replaces it.
+        self.restore_normal_root_window_with_transition(surface_id, Some(geometry))
     }
 
     fn restore_normal_root_window_with_transition(

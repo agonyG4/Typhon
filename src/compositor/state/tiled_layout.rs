@@ -6,7 +6,7 @@ use crate::wm::layout::{
     DwindleTree, InsertHint, LayoutConstraints, LayoutError, LayoutPoint, LayoutRect,
     LayoutWindowSnapshot, TiledFallbackReason, TiledLayoutManager, TiledLayoutSolution,
 };
-use crate::wm::{LayoutMembership, WorkspaceLocation};
+use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceLocation};
 
 #[derive(Debug)]
 pub(in crate::compositor) struct PreparedTiledMigration {
@@ -24,6 +24,15 @@ struct PreparedLocationReflow {
     final_solution: TiledLayoutSolution,
     fallback_windows: Vec<WindowId>,
     floating_restores: Vec<(WindowId, WindowGeometry)>,
+}
+
+#[derive(Debug)]
+pub(in crate::compositor) struct PreparedTiledDetach {
+    window_id: WindowId,
+    management: WindowManagementState,
+    location: WorkspaceLocation,
+    candidate_tree: DwindleTree,
+    surviving_solution: TiledLayoutSolution,
 }
 
 impl CompositorState {
@@ -45,7 +54,7 @@ impl CompositorState {
         };
         match management.layout() {
             LayoutMembership::Floating => self.toggle_window_to_tiled(window_id, management),
-            LayoutMembership::Tiled => self.toggle_window_to_floating(window_id, management),
+            LayoutMembership::Tiled => self.toggle_window_to_floating(window_id),
         }
     }
 
@@ -89,37 +98,70 @@ impl CompositorState {
         true
     }
 
-    fn toggle_window_to_floating(
-        &mut self,
-        window_id: WindowId,
-        management: crate::wm::WindowManagementState,
-    ) -> bool {
-        let location = management.location();
-        let root = self.layout_root_rect();
+    fn toggle_window_to_floating(&mut self, window_id: WindowId) -> bool {
         let Some(window) = self.window(window_id).cloned() else {
             return false;
         };
         let floating_geometry = window.floating_geometry;
-        let original_layout = self.tiled_layout.clone();
-        if self.tiled_layout.remove(location, window_id).is_err() {
+        let Some(prepared) = self.prepare_tiled_detach(window_id) else {
+            return false;
+        };
+        self.commit_prepared_tiled_detach(
+            prepared,
+            floating_geometry.map(|geometry| (window_id, geometry)),
+        )
+    }
+
+    pub(in crate::compositor) fn prepare_tiled_detach(
+        &self,
+        window_id: WindowId,
+    ) -> Option<PreparedTiledDetach> {
+        let window = self.window(window_id)?;
+        let management = window
+            .management
+            .filter(|management| management.layout() == LayoutMembership::Tiled)?;
+        let location = management.location();
+        let root = self.layout_root_rect();
+        let mut candidate_tree = self.tiled_layout.tree(location)?.clone();
+        candidate_tree.remove(window_id).ok()?;
+        let snapshots = self.candidate_layout_snapshots_for_tree(&candidate_tree);
+        let surviving_solution =
+            TiledLayoutManager::calculate_tree(&candidate_tree, location, root, &snapshots).ok()?;
+        Some(PreparedTiledDetach {
+            window_id,
+            management,
+            location,
+            candidate_tree,
+            surviving_solution,
+        })
+    }
+
+    pub(in crate::compositor) fn commit_prepared_tiled_detach(
+        &mut self,
+        prepared: PreparedTiledDetach,
+        floating_restore: Option<(WindowId, WindowGeometry)>,
+    ) -> bool {
+        if !self
+            .window(prepared.window_id)
+            .is_some_and(|window| window.management == Some(prepared.management))
+        {
             return false;
         }
-        let snapshots = self.layout_snapshots(location);
-        let plan = match self.tiled_layout.calculate(location, root, &snapshots) {
-            Ok(plan) => plan,
-            Err(_) => {
-                self.tiled_layout = original_layout;
-                return false;
-            }
-        };
-        if let Some(window) = self.window_mut(window_id) {
-            window.management = Some(management.with_layout(LayoutMembership::Floating));
-        }
-        self.mark_astrea_toplevel_dirty(window_id);
-        self.apply_tiled_layout_plan(
-            plan,
-            floating_geometry.map(|geometry| (window_id, geometry)),
+        debug_assert!(
+            self.window(prepared.window_id)
+                .is_some_and(|window| { window.management == Some(prepared.management) })
         );
+        self.cancel_tiled_resize_for_location(
+            prepared.location,
+            WindowInteractionEndReason::ExplicitCancel,
+        );
+        self.tiled_layout
+            .replace_tree(prepared.location, prepared.candidate_tree);
+        if let Some(window) = self.window_mut(prepared.window_id) {
+            window.management = Some(prepared.management.with_layout(LayoutMembership::Floating));
+        }
+        self.mark_astrea_toplevel_dirty(prepared.window_id);
+        self.apply_tiled_layout_plan(prepared.surviving_solution, floating_restore);
         true
     }
 

@@ -87,6 +87,178 @@ fn presented_origin_rebase_cancels_animation_without_baking_presented_size() {
 }
 
 #[test]
+fn x11_maximized_interaction_restore_preserves_presented_ledger() {
+    let surface_id = 43;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
+    let restore = WindowGeometry::new(SurfacePlacement::absolute_root_at(70, 80), 300, 200);
+    state.install_x11_visual_geometry(surface_id, restore);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .capture_restore_geometry(restore);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Maximized);
+    let canonical_rect =
+        PresentationRect::new(0.0, 0.0, 1_280.0, 800.0).expect("canonical presentation rect");
+    let presented_rect =
+        PresentationRect::new(20.0, 30.0, 1_000.0, 650.0).expect("presented presentation rect");
+    state.start_test_presentation_transition(
+        surface_id,
+        canonical_rect,
+        presented_rect,
+        AnimationTime::from_nanos(0),
+    );
+    state.publish_presented_window_geometry(
+        7,
+        PresentedWindowGeometry::new(surface_id, presented_rect),
+    );
+
+    let target = WindowGeometry::new(SurfacePlacement::absolute_root_at(100, 110), 300, 200);
+    assert!(state.restore_root_window_for_interaction(surface_id, target));
+    assert_eq!(state.presentation_animator.active_count(), 0);
+    assert_eq!(state.presented_presentation_frame_id(), 7);
+    assert_eq!(
+        state.presented_window_geometry(surface_id),
+        Some(PresentedWindowGeometry::new(surface_id, presented_rect))
+    );
+}
+
+#[test]
+fn maximized_tiled_restore_failure_keeps_mode_and_layout_ownership() {
+    let surface_id = 44;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
+    state.window_mut(window_id).expect("window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    let restore = WindowGeometry::new(SurfacePlacement::absolute_root_at(70, 80), 300, 200);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .floating_geometry = Some(restore);
+    state.install_x11_visual_geometry(surface_id, restore);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .capture_restore_geometry(restore);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Maximized);
+    state.publish_presented_window_geometry(
+        8,
+        PresentedWindowGeometry::new(
+            surface_id,
+            PresentationRect::new(0.0, 0.0, 1_280.0, 800.0).expect("presented presentation rect"),
+        ),
+    );
+
+    assert!(!state.restore_maximized_window_for_interaction(window_id, surface_id, 512.0, 120.0,));
+    assert_eq!(
+        state.window(window_id).expect("window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Tiled
+    );
+    assert!(state.tiled_layout.tree(location).is_none());
+}
+
+#[test]
+fn x11_maximized_tiled_restore_detaches_the_only_leaf_from_dwindle() {
+    let surface_id = 45;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    let location = WorkspaceLocation::Regular(WorkspaceId::new(1).expect("workspace"));
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state.append_renderable_surface(test_renderable_surface(surface_id, 300, 200));
+    state.window_mut(window_id).expect("window").management =
+        Some(WindowManagementState::new(location).with_layout(LayoutMembership::Tiled));
+    state
+        .tiled_layout
+        .insert(
+            location,
+            window_id,
+            crate::wm::layout::InsertHint::default(),
+        )
+        .expect("tiled insert");
+    let floating = WindowGeometry::new(SurfacePlacement::absolute_root_at(220, 140), 700, 450);
+    let tiled = WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 960, 1_080);
+    state
+        .window_mut(window_id)
+        .expect("window")
+        .floating_geometry = Some(floating);
+    state.install_x11_visual_geometry(surface_id, tiled);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .capture_restore_geometry(tiled);
+    state
+        .window_mut(window_id)
+        .expect("X11 window")
+        .state
+        .set_mode(ToplevelMode::Maximized);
+    state.publish_presented_window_geometry(
+        9,
+        PresentedWindowGeometry::new(
+            surface_id,
+            PresentationRect::new(0.0, 0.0, 1_280.0, 800.0).expect("presented presentation rect"),
+        ),
+    );
+
+    assert!(state.restore_maximized_window_for_interaction(window_id, surface_id, 512.0, 120.0,));
+    assert!(state.tiled_layout.tree(location).is_none());
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("window")
+            .management
+            .expect("management")
+            .layout(),
+        LayoutMembership::Floating
+    );
+    assert_eq!(
+        state.window(window_id).expect("window").state.mode(),
+        ToplevelMode::Normal
+    );
+    assert_eq!(
+        state.current_visual_root_window_geometry(surface_id),
+        Some(WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(232, 0),
+            700,
+            450,
+        ))
+    );
+}
+
+#[test]
 fn tiled_resize_rebases_the_split_handle_without_replacing_canonical_geometry() {
     let (mut state, window_id, _location, _handle) = tiled_resize_fixture();
     let surface_id = 700;
