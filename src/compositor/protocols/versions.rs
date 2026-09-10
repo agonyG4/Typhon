@@ -556,7 +556,7 @@ pub(crate) const ASTREA_SHORTCUTS_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_AUTH_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_EFFECTS_MANAGER_V1: u32 = 1;
-pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 2;
+pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 3;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
 // Wayland 1.26 adds wl_pointer.warp at wl_pointer/wl_seat version 11. All

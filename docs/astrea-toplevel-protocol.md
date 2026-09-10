@@ -1,10 +1,10 @@
-# Astrea Toplevel Management v2
+# Astrea Toplevel Management v3
 
-Astrea Toplevel Management v2 is a private, compositor-owned Wayland protocol
+Astrea Toplevel Management v3 is a private, compositor-owned Wayland protocol
 for the Eclipse Dock and AltTab backends. Typhon is the authority for the
 published window list and exact window actions.
 
-The global is `astrea_toplevel_manager_v1`, advertised at version 2. Version 1
+The global is `astrea_toplevel_manager_v1`, advertised at version 3. Version 1
 clients remain read-only and compatible: the only version-1 requests on both
 the manager and toplevel objects are their destructor requests. Version 2 adds
 exact activate, minimize, restore, and close requests to toplevel handles, with

@@ -1,5 +1,51 @@
 use super::*;
 use std::num::NonZeroU64;
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use wayland_client::Proxy;
+use wayland_server::Display;
+
+struct AnchorTestOwners {
+    _display: Display<()>,
+    _clients: Vec<wayland_server::Client>,
+    _peers: Vec<UnixStream>,
+    identities: Vec<(ClientId, ObjectId)>,
+}
+
+impl AnchorTestOwners {
+    fn new(count: usize) -> Self {
+        let display = Display::<()>::new().expect("anchor test display");
+        let mut clients = Vec::with_capacity(count);
+        let mut peers = Vec::with_capacity(count);
+        let mut identities = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (server_stream, peer) = UnixStream::pair().expect("anchor test socket pair");
+            let client = display
+                .handle()
+                .insert_client(server_stream, Arc::new(()))
+                .expect("anchor test client");
+            let client_id = client.id();
+            let resource_id = display
+                .handle()
+                .backend_handle()
+                .object_for_protocol_id(
+                    client_id.clone(),
+                    wayland_client::protocol::wl_display::WlDisplay::interface(),
+                    1,
+                )
+                .expect("anchor test display resource");
+            identities.push((client_id, resource_id));
+            clients.push(client);
+            peers.push(peer);
+        }
+        Self {
+            _display: display,
+            _clients: clients,
+            _peers: peers,
+            identities,
+        }
+    }
+}
 
 fn id(value: u64) -> WindowId {
     WindowId::new(NonZeroU64::new(value).expect("nonzero test id"))
@@ -79,6 +125,141 @@ fn dirty_windows_are_coalesced_and_bounded() {
     assert_eq!(publisher.dirty_window_ids(), vec![id(1), id(2)]);
     assert_eq!(publisher.metrics.dirty_windows_queued, 2);
     assert_eq!(publisher.metrics.dirty_updates_coalesced, 1);
+}
+
+#[test]
+fn minimize_anchor_state_accepts_negative_coordinates_and_rejects_invalid_dimensions() {
+    let owners = AnchorTestOwners::new(1);
+    let (client_id, resource_id) = owners.identities[0].clone();
+    let window_id = id(10);
+    let mut publisher = AstreaToplevelPublisher::default();
+    let valid = MinimizeAnchorRect {
+        x: -300,
+        y: 900,
+        width: 64,
+        height: 64,
+    };
+
+    assert_eq!(
+        publisher.set_minimize_anchor(client_id.clone(), resource_id.clone(), window_id, valid),
+        Ok(())
+    );
+    assert_eq!(publisher.minimize_anchor_for_test(window_id), Some(valid));
+    for invalid in [
+        MinimizeAnchorRect { width: 0, ..valid },
+        MinimizeAnchorRect { height: 0, ..valid },
+        MinimizeAnchorRect {
+            width: MAX_MINIMIZE_ANCHOR_DIMENSION + 1,
+            ..valid
+        },
+        MinimizeAnchorRect {
+            height: MAX_MINIMIZE_ANCHOR_DIMENSION + 1,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            publisher.set_minimize_anchor(
+                client_id.clone(),
+                resource_id.clone(),
+                window_id,
+                invalid
+            ),
+            Err(())
+        );
+        assert_eq!(publisher.minimize_anchor_for_test(window_id), Some(valid));
+    }
+}
+
+#[test]
+fn minimize_anchor_state_replaces_same_owner_and_ignores_stale_owner_teardown() {
+    let owners = AnchorTestOwners::new(2);
+    let (client_a, resource_a) = owners.identities[0].clone();
+    let (client_b, resource_b) = owners.identities[1].clone();
+    let window_id = id(11);
+    let rect_a = MinimizeAnchorRect {
+        x: 1,
+        y: 2,
+        width: 32,
+        height: 32,
+    };
+    let rect_a_replaced = MinimizeAnchorRect {
+        x: 3,
+        y: 4,
+        width: 40,
+        height: 40,
+    };
+    let rect_b = MinimizeAnchorRect {
+        x: 5,
+        y: 6,
+        width: 48,
+        height: 48,
+    };
+    let mut publisher = AstreaToplevelPublisher::default();
+
+    publisher
+        .set_minimize_anchor(client_a.clone(), resource_a.clone(), window_id, rect_a)
+        .unwrap();
+    publisher
+        .set_minimize_anchor(
+            client_a.clone(),
+            resource_a.clone(),
+            window_id,
+            rect_a_replaced,
+        )
+        .unwrap();
+    assert_eq!(
+        publisher.minimize_anchor_for_test(window_id),
+        Some(rect_a_replaced)
+    );
+    publisher
+        .set_minimize_anchor(client_b.clone(), resource_b.clone(), window_id, rect_b)
+        .unwrap();
+    publisher.remove_handle(&client_a, &resource_a, window_id, &resource_a);
+    assert_eq!(publisher.minimize_anchor_for_test(window_id), Some(rect_b));
+    publisher.remove_handle(&client_b, &resource_b, window_id, &resource_b);
+    assert_eq!(publisher.minimize_anchor_for_test(window_id), None);
+}
+
+#[test]
+fn minimize_anchor_state_client_and_window_teardown_are_scoped() {
+    let owners = AnchorTestOwners::new(2);
+    let (client_a, resource_a) = owners.identities[0].clone();
+    let (client_b, resource_b) = owners.identities[1].clone();
+    let window_a = id(12);
+    let window_b = id(13);
+    let mut publisher = AstreaToplevelPublisher::default();
+    publisher
+        .set_minimize_anchor(
+            client_a.clone(),
+            resource_a.clone(),
+            window_a,
+            MinimizeAnchorRect {
+                x: 1,
+                y: 1,
+                width: 24,
+                height: 24,
+            },
+        )
+        .unwrap();
+    publisher
+        .set_minimize_anchor(
+            client_b.clone(),
+            resource_b.clone(),
+            window_b,
+            MinimizeAnchorRect {
+                x: 2,
+                y: 2,
+                width: 24,
+                height: 24,
+            },
+        )
+        .unwrap();
+    publisher.remove_client(&client_a);
+    assert_eq!(publisher.minimize_anchor_for_test(window_a), None);
+    assert!(publisher.minimize_anchor_for_test(window_b).is_some());
+
+    publisher.mark_window_removed(window_b);
+    assert_eq!(publisher.minimize_anchor_for_test(window_b), None);
 }
 
 #[test]

@@ -8,6 +8,61 @@ mod task_05_8_tests {
     use crate::compositor::interaction::MAX_IN_FLIGHT_RESIZE_CONFIGURES;
     use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceSwitchOutcome};
     use std::borrow::Cow;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn animation_test_directory() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "typhon-semantic-animation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&path).expect("animation test directory");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("animation test directory permissions");
+        path
+    }
+
+    fn configure_test_animation(
+        state: &mut CompositorState,
+        configuration: crate::animation_control::AnimationConfiguration,
+    ) {
+        let directory = animation_test_directory();
+        state.animation_control = crate::animation_control::AnimationControlState::from_store(
+            crate::animation_control::AnimationConfigurationStore::new(directory.clone())
+                .expect("animation test store"),
+        );
+        state
+            .animation_control
+            .set_configuration(configuration)
+            .expect("animation test configuration");
+        let _ = fs::remove_dir_all(directory);
+        state.presentation_animator.set_enabled(true);
+    }
+
+    fn prepare_semantic_animation_state() -> (CompositorState, WindowGeometry, u32) {
+        let mut state = CompositorState::default();
+        let root_id = 55;
+        state.append_renderable_surface(test_surface(root_id, 640, 480));
+        let previous = WindowGeometry::new(SurfacePlacement::root_at(40, 40), 640, 480);
+        state.toplevel_visual_geometries.insert(
+            root_id,
+            ToplevelVisualGeometry {
+                placement: previous.placement,
+                width: previous.width,
+                height: previous.height,
+                active_resize: None,
+                mode_transition: false,
+            },
+        );
+        state.update_toplevel_visual_render_assignment(root_id);
+        state.layout_animation_epoch = Some(AnimationTime::from_nanos(0));
+        (state, previous, root_id)
+    }
 
     pub(in crate::compositor) fn test_surface(
         surface_id: u32,
@@ -792,6 +847,144 @@ mod task_05_8_tests {
                     .curve_for(PresentationAnimationKind::ProgrammaticMove)
             )
         );
+    }
+
+    #[test]
+    fn semantic_retarget_uses_current_curve_after_preset_change() {
+        let (mut state, previous, root_id) = prepare_semantic_animation_state();
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(120, 72), 800, 560),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        let retarget_at = AnimationTime::from_nanos(10_000_000);
+        let before = state
+            .presentation_animator
+            .sample(root_id, retarget_at)
+            .expect("active KDE transition");
+        assert_eq!(
+            state.presentation_animator.transition_curve(root_id),
+            Some(
+                PresentationAnimationPolicy::kde()
+                    .curve_for(PresentationAnimationKind::ProgrammaticMove)
+            )
+        );
+
+        configure_test_animation(
+            &mut state,
+            crate::animation_control::AnimationConfiguration {
+                preset: crate::animation_control::AnimationPreset::Macos,
+                ..crate::animation_control::AnimationConfiguration::default()
+            },
+        );
+        assert_eq!(
+            state.presentation_animator.transition_curve(root_id),
+            Some(
+                PresentationAnimationPolicy::kde()
+                    .curve_for(PresentationAnimationKind::ProgrammaticMove)
+            ),
+            "configuration changes must not mutate an active transition"
+        );
+
+        state.layout_animation_epoch = Some(retarget_at);
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(180, 96), 820, 580),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        let after = state
+            .presentation_animator
+            .sample(root_id, retarget_at)
+            .expect("retargeted macOS transition");
+        assert_eq!(
+            state.presentation_animator.transition_curve(root_id),
+            Some(
+                PresentationAnimationPolicy::macos()
+                    .curve_for(PresentationAnimationKind::ProgrammaticMove)
+            )
+        );
+        assert_eq!(after.rect, before.rect);
+        assert!((after.velocity.x() - before.velocity.x()).abs() < 1.0e-9);
+        assert!((after.velocity.y() - before.velocity.y()).abs() < 1.0e-9);
+        assert!((after.velocity.width() - before.velocity.width()).abs() < 1.0e-9);
+        assert!((after.velocity.height() - before.velocity.height()).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn semantic_retarget_uses_current_curve_after_reverse_preset_change() {
+        let (mut state, previous, root_id) = prepare_semantic_animation_state();
+        configure_test_animation(
+            &mut state,
+            crate::animation_control::AnimationConfiguration {
+                preset: crate::animation_control::AnimationPreset::Macos,
+                ..crate::animation_control::AnimationConfiguration::default()
+            },
+        );
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(120, 72), 800, 560),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        let retarget_at = AnimationTime::from_nanos(10_000_000);
+        let before = state
+            .presentation_animator
+            .sample(root_id, retarget_at)
+            .expect("active macOS transition");
+        configure_test_animation(
+            &mut state,
+            crate::animation_control::AnimationConfiguration::default(),
+        );
+        state.layout_animation_epoch = Some(retarget_at);
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(180, 96), 820, 580),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        let after = state
+            .presentation_animator
+            .sample(root_id, retarget_at)
+            .expect("retargeted KDE transition");
+        assert_eq!(
+            state.presentation_animator.transition_curve(root_id),
+            Some(
+                PresentationAnimationPolicy::kde()
+                    .curve_for(PresentationAnimationKind::ProgrammaticMove)
+            )
+        );
+        assert_eq!(after.rect, before.rect);
+        assert!((after.velocity.x() - before.velocity.x()).abs() < 1.0e-9);
+        assert!((after.velocity.y() - before.velocity.y()).abs() < 1.0e-9);
+        assert!((after.velocity.width() - before.velocity.width()).abs() < 1.0e-9);
+        assert!((after.velocity.height() - before.velocity.height()).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn semantic_retarget_cancels_old_curve_when_current_slot_is_none() {
+        let (mut state, previous, root_id) = prepare_semantic_animation_state();
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(120, 72), 800, 560),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        let mut configuration = crate::animation_control::AnimationConfiguration::default();
+        configuration.overrides.insert(
+            crate::animation_control::AnimationSlot::WindowMove,
+            crate::animation_control::AnimationEffect::None,
+        );
+        configure_test_animation(&mut state, configuration);
+        state.layout_animation_epoch = Some(AnimationTime::from_nanos(10_000_000));
+        state.animate_toplevel_visual_geometry(
+            root_id,
+            previous,
+            WindowGeometry::new(SurfacePlacement::root_at(180, 96), 820, 580),
+            PresentationAnimationKind::ProgrammaticMove,
+        );
+        assert_eq!(state.presentation_animator.active_count(), 0);
     }
 
     #[test]

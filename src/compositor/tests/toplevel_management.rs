@@ -3,8 +3,8 @@ use super::support::frame_buffer_client::create_test_buffered_toplevel;
 use super::support::locked_relative::{runtime_socket_path, unique_socket_name};
 use super::support::registry_state::RegistryTestState;
 use super::support::server_runtime::{
-    ServerCommand, create_test_shm_file, spawn_controllable_test_server, spawn_test_server,
-    stop_controllable_test_server, stop_test_server,
+    ServerCommand, capture_minimize_anchor, create_test_shm_file, spawn_controllable_test_server,
+    spawn_test_server, stop_controllable_test_server, stop_test_server,
 };
 use super::support::window_ops::create_buffered_toplevel_then_window_commands;
 use crate::astrea_shell_auth::client::astrea_shell_auth_manager_v1 as client_astrea_shell_auth_manager_v1;
@@ -742,6 +742,130 @@ fn authorized_v2_exact_xdg_actions_complete_on_the_manager() {
         5
     );
     assert!(!state.toplevels.values().next().unwrap().closed);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v3_client_sets_and_clears_global_minimize_anchor() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let mut state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &connection,
+        &globals,
+        &qh,
+        &mut queue,
+        &mut state,
+    );
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+
+    let window_id = WindowId::from_raw(1).expect("first test window id");
+    state.handles[0].set_minimize_anchor(-300, 900, 64, 64);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_minimize_anchor(&commands, window_id),
+        Some(MinimizeAnchorRect {
+            x: -300,
+            y: 900,
+            width: 64,
+            height: 64,
+        })
+    );
+
+    state.handles[0].clear_minimize_anchor();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_minimize_anchor(&commands, window_id), None);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v3_invalid_minimize_anchor_is_a_protocol_error() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let mut state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &connection,
+        &globals,
+        &qh,
+        &mut queue,
+        &mut state,
+    );
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    state.handles[0].set_minimize_anchor(1, 2, 0, 64);
+    connection.flush().unwrap();
+    assert!(queue.roundtrip(&mut state).is_err());
+
+    let returned = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(
+        returned
+            .state
+            .astrea_toplevel_publisher
+            .minimize_anchor_for_test(WindowId::from_raw(1).expect("first test window id")),
+        None
+    );
+}
+
+#[test]
+fn unauthenticated_v3_client_cannot_set_minimize_anchor() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    assert!(queue.roundtrip(&mut state).is_err());
+    assert!(state.handles.is_empty());
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }

@@ -17,7 +17,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::WL_SEAT, 11);
     assert_eq!(versions::WP_CURSOR_SHAPE_MANAGER_V1, 2);
     assert_eq!(versions::XWAYLAND_SHELL_V1, 1);
-    assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 2);
+    assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 3);
     assert_eq!(versions::ASTREA_SHELL_AUTH_MANAGER_V1, 1);
     assert_eq!(versions::EXT_BACKGROUND_EFFECT_MANAGER_V1, 1);
 
@@ -31,7 +31,7 @@ fn advertised_global_versions_are_centralized() {
     assert!(globals.contains(&GlobalAdvertisement::new("wl_seat", 11)));
     assert!(globals.contains(&GlobalAdvertisement::new("wp_cursor_shape_manager_v1", 2)));
     assert!(globals.contains(&GlobalAdvertisement::new("xwayland_shell_v1", 1)));
-    assert!(globals.contains(&GlobalAdvertisement::new("astrea_toplevel_manager_v1", 2)));
+    assert!(globals.contains(&GlobalAdvertisement::new("astrea_toplevel_manager_v1", 3)));
     assert!(globals.contains(&GlobalAdvertisement::new("astrea_shell_auth_manager_v1", 1)));
     assert!(globals.contains(&GlobalAdvertisement::new(
         "ext_background_effect_manager_v1",

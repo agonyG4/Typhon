@@ -175,6 +175,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         root_surface_id: u32,
         reply: Sender<Option<WindowGeometry>>,
     },
+    CaptureMinimizeAnchor {
+        window_id: WindowId,
+        reply: Sender<Option<MinimizeAnchorRect>>,
+    },
     CapturePresentationTransitionCurve(Sender<Option<AnimationCurve>>),
     CapturePresentationTransitionCurveForRoot {
         root_surface_id: u32,
@@ -715,6 +719,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .current_visual_root_window_geometry(root_surface_id)
                             .or_else(|| server.state.current_root_window_geometry(root_surface_id));
                         let _ = reply.send(geometry);
+                    }
+                    ServerCommand::CaptureMinimizeAnchor { window_id, reply } => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .astrea_toplevel_publisher
+                                .minimize_anchor_for_test(window_id),
+                        );
                     }
                     ServerCommand::CapturePresentationTransitionCurve(reply) => {
                         let curve =
@@ -1749,6 +1761,19 @@ pub(in crate::compositor::tests) fn capture_root_window_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report root window geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_minimize_anchor(
+    commands: &Sender<ServerCommand>,
+    window_id: WindowId,
+) -> Option<MinimizeAnchorRect> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureMinimizeAnchor { window_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report minimize anchor")
 }
 
 pub(in crate::compositor::tests) fn capture_presentation_transition_curve(
