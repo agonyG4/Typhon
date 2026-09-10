@@ -7,7 +7,7 @@ use std::{
 
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel};
 use wayland_server::{
-    Resource,
+    Resource, WEnum,
     backend::ClientId,
     protocol::{wl_buffer, wl_callback, wl_output, wl_surface},
 };
@@ -18,7 +18,7 @@ use crate::compositor::{
     XdgAssociationReservation,
 };
 use crate::render_backend::buffer::{
-    BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
+    BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DrmFormat,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1640,10 +1640,20 @@ impl PendingSurfaceBuffer {
                         (previous.clone(), Some(damage))
                     }
                     _ => (
-                        CommittedSurfaceBuffer::shm_snapshot(
+                        CommittedSurfaceBuffer::shm_snapshot_with_format(
                             shm.identity.clone(),
                             size,
                             shm.read_pixels()?,
+                            match shm.format {
+                                WEnum::Value(
+                                    wayland_server::protocol::wl_shm::Format::Argb8888,
+                                ) => DrmFormat::Argb8888,
+                                WEnum::Value(
+                                    wayland_server::protocol::wl_shm::Format::Xrgb8888,
+                                ) => DrmFormat::Xrgb8888,
+                                WEnum::Value(_) => DrmFormat::Other(0),
+                                WEnum::Unknown(value) => DrmFormat::Other(value),
+                            },
                         ),
                         None,
                     ),

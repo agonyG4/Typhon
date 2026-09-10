@@ -70,6 +70,7 @@ use wayland_server::{
     },
 };
 mod astrea_shell_capability;
+pub mod blur_assignment;
 mod clipboard_bridge;
 mod color;
 mod commit_debug;
@@ -819,6 +820,7 @@ pub struct CompositorState {
     surface_effect_binding_owners: SurfaceEffectBindingOwners,
     trusted_effect_registry: crate::effects::TrustedEffectRegistry,
     background_effect_enabled: bool,
+    blur_assignment: crate::compositor::blur_assignment::BlurAssignmentResolver,
     background_effect_resources: HashMap<u32, ObjectId>,
     background_effect_surface_ids: HashSet<u32>,
     #[allow(dead_code)] // Consumed by the internal effect assignment API as presets are enabled.

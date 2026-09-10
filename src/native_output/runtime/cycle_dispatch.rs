@@ -732,6 +732,44 @@ impl NativeRuntime {
                 },
             );
         }
+        if matches!(
+            command,
+            ControlCommand::BlurStatus | ControlCommand::BlurReload
+        ) {
+            if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "blur command takes no arguments",
+                    ),
+                ));
+            }
+            let snapshot = if command == ControlCommand::BlurStatus {
+                Ok(self.server.blur_policy_snapshot())
+            } else {
+                self.server.reload_blur_policy()
+            };
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(ControlErrorCode::Internal, error),
+                    ));
+                }
+            };
+            if command == ControlCommand::BlurReload {
+                self.queued_redraw_requested = true;
+            }
+            return Some(match serde_json::to_value(snapshot) {
+                Ok(result) => ControlResponse::success(request.id, result),
+                Err(_) => ControlResponse::failure(
+                    request.id,
+                    ControlError::new(ControlErrorCode::Internal, "blur policy snapshot failed"),
+                ),
+            });
+        }
         let result = match command {
             ControlCommand::Version => serde_json::to_value(VersionSnapshot {
                 protocol_version: oblivion_one::control::CONTROL_VERSION,

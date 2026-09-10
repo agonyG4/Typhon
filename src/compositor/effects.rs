@@ -297,7 +297,7 @@ impl super::CompositorState {
                 .values()
                 .filter_map(|binding| binding.instance.clone()),
         );
-        if self.background_effect_enabled && !self.background_effect_surface_ids.is_empty() {
+        if self.background_effect_enabled {
             for (surface, origin) in self
                 .active_scene_surfaces()
                 .iter()
@@ -309,12 +309,37 @@ impl super::CompositorState {
                 let Some(surface_data) = surface_resource.data::<SurfaceData>() else {
                     continue;
                 };
-                let region = background_effect_output_region(
-                    &surface_data.committed_background_effect(),
-                    *origin,
-                    surface.width,
-                    surface.height,
-                );
+                let client_request_committed =
+                    !surface_data.committed_background_effect().ops().is_empty();
+                let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
+                if root_surface_id != surface.surface_id && !client_request_committed {
+                    continue;
+                }
+                let assignment = self.blur_assignment_for_surface(surface, surface_data);
+                let region = match assignment {
+                    crate::blur_policy::BlurAssignment::None => continue,
+                    crate::blur_policy::BlurAssignment::ClientExact => {
+                        background_effect_output_region(
+                            &surface_data.committed_background_effect(),
+                            *origin,
+                            surface.width,
+                            surface.height,
+                        )
+                    }
+                    crate::blur_policy::BlurAssignment::CompositorSynthesized => {
+                        let Some(rect) =
+                            EffectRect::new(origin.0, origin.1, surface.width, surface.height)
+                        else {
+                            continue;
+                        };
+                        EffectRegion::from_rect(rect)
+                    }
+                };
+                if assignment == crate::blur_policy::BlurAssignment::CompositorSynthesized
+                    && self.has_existing_background_blur_instance(surface.surface_id)
+                {
+                    continue;
+                }
                 let Some(target_bounds) = region.bounding_rect() else {
                     continue;
                 };
@@ -430,7 +455,8 @@ impl super::CompositorState {
     }
 
     pub(in crate::compositor) fn set_background_effect_enabled(&mut self, enabled: bool) {
-        if self.background_effect_enabled == enabled {
+        let resolver_changed = self.blur_assignment.set_renderer_supported(enabled);
+        if self.background_effect_enabled == enabled && !resolver_changed {
             return;
         }
         self.background_effect_enabled = enabled;
@@ -818,6 +844,19 @@ impl super::CompositorState {
         );
         self.set_effect_scene_summary(self.resolved_effect_scene().summary);
         true
+    }
+
+    fn has_existing_background_blur_instance(&self, surface_id: u32) -> bool {
+        let program = crate::effects::builtin_background_blur_program_id();
+        let anchor = EffectAnchor::BeforeSurface(surface_id);
+        self.internal_surface_effects
+            .values()
+            .chain(
+                self.protocol_surface_effects
+                    .values()
+                    .filter_map(|binding| binding.instance.as_ref()),
+            )
+            .any(|instance| instance.program == program && instance.anchor == anchor)
     }
 }
 

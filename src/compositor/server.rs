@@ -384,6 +384,7 @@ impl OwnCompositorServer {
 
         let mut state = CompositorState::new(syncobj_device);
         state.set_background_effect_enabled(renderer_capabilities.background_effect);
+        let _ = state.reload_blur_policy_from_disk();
         state.load_persisted_decoration_theme();
         state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
         let verifier: AstreaShellCapabilityVerifier = astrea_shell_capability.verifier();
@@ -1345,6 +1346,14 @@ impl OwnCompositorServer {
 
     pub fn resolved_effect_scene(&self) -> ResolvedEffectScene {
         self.state.resolved_effect_scene()
+    }
+
+    pub fn blur_policy_snapshot(&self) -> crate::blur_policy::BlurPolicySnapshot {
+        self.state.blur_policy_snapshot()
+    }
+
+    pub fn reload_blur_policy(&mut self) -> Result<crate::blur_policy::BlurPolicySnapshot, String> {
+        self.state.reload_blur_policy_from_disk()
     }
 
     pub fn resolved_effect_scene_for_presentation(

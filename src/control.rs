@@ -64,6 +64,8 @@ pub enum ControlCommand {
     DecorationReload,
     DecorationList,
     EffectsReload,
+    BlurStatus,
+    BlurReload,
     WindowActivate,
     WindowMinimize,
     WindowRestore,
@@ -96,6 +98,8 @@ impl ControlCommand {
             Self::DecorationReload => "decoration.reload",
             Self::DecorationList => "decoration.list",
             Self::EffectsReload => "effects.reload",
+            Self::BlurStatus => "blur.status",
+            Self::BlurReload => "blur.reload",
             Self::WindowActivate => "window.activate",
             Self::WindowMinimize => "window.minimize",
             Self::WindowRestore => "window.restore",
@@ -128,6 +132,8 @@ impl ControlCommand {
             "decoration.reload" => Self::DecorationReload,
             "decoration.list" => Self::DecorationList,
             "effects.reload" => Self::EffectsReload,
+            "blur.status" => Self::BlurStatus,
+            "blur.reload" => Self::BlurReload,
             "window.activate" => Self::WindowActivate,
             "window.minimize" => Self::WindowMinimize,
             "window.restore" => Self::WindowRestore,
@@ -387,5 +393,20 @@ mod tests {
         );
         assert_eq!(ControlCommand::EffectsReload.as_str(), "effects.reload");
         assert_eq!(ControlCommand::parse("effects"), None);
+    }
+
+    #[test]
+    fn blur_commands_are_separate_from_effect_reload() {
+        assert_eq!(
+            ControlCommand::parse("blur.status"),
+            Some(ControlCommand::BlurStatus)
+        );
+        assert_eq!(
+            ControlCommand::parse("blur.reload"),
+            Some(ControlCommand::BlurReload)
+        );
+        assert_eq!(ControlCommand::BlurStatus.as_str(), "blur.status");
+        assert_eq!(ControlCommand::BlurReload.as_str(), "blur.reload");
+        assert_eq!(ControlCommand::parse("blur.set-enabled"), None);
     }
 }

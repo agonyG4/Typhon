@@ -312,6 +312,7 @@ pub enum CommittedSurfaceBuffer {
     ShmSnapshot {
         identity: BufferIdentity,
         snapshot: ShmBufferSnapshot,
+        format: DrmFormat,
     },
     DmabufHandle {
         identity: BufferIdentity,
@@ -321,10 +322,20 @@ pub enum CommittedSurfaceBuffer {
 
 impl CommittedSurfaceBuffer {
     pub fn shm_snapshot(identity: BufferIdentity, size: BufferSize, pixels: Vec<u32>) -> Self {
+        Self::shm_snapshot_with_format(identity, size, pixels, DrmFormat::Argb8888)
+    }
+
+    pub fn shm_snapshot_with_format(
+        identity: BufferIdentity,
+        size: BufferSize,
+        pixels: Vec<u32>,
+        format: DrmFormat,
+    ) -> Self {
         Self::ShmSnapshot {
             identity,
             snapshot: ShmBufferSnapshot::new(size, pixels)
                 .expect("wl_shm snapshots must match their committed buffer size"),
+            format,
         }
     }
 
@@ -350,6 +361,18 @@ impl CommittedSurfaceBuffer {
         match self {
             Self::ShmSnapshot { .. } => SurfaceBufferSource::Shm,
             Self::DmabufHandle { .. } => SurfaceBufferSource::Dmabuf,
+        }
+    }
+
+    pub const fn alpha_capability(&self) -> crate::blur_policy::SurfaceAlphaCapability {
+        let format = match self {
+            Self::ShmSnapshot { format, .. } => *format,
+            Self::DmabufHandle { handle, .. } => handle.format(),
+        };
+        match format {
+            DrmFormat::Argb8888 => crate::blur_policy::SurfaceAlphaCapability::AlphaCapable,
+            DrmFormat::Xrgb8888 => crate::blur_policy::SurfaceAlphaCapability::Opaque,
+            DrmFormat::Other(_) => crate::blur_policy::SurfaceAlphaCapability::Unknown,
         }
     }
 
@@ -442,5 +465,41 @@ mod identity_tests {
         clone.shm_pixels_mut().expect("mutable snapshot")[0] = 9;
         assert_eq!(original.cpu_pixels(), Some(&[1, 2][..]));
         assert_eq!(clone.cpu_pixels(), Some(&[9, 2][..]));
+    }
+
+    #[test]
+    fn alpha_capability_comes_from_the_declared_buffer_format() {
+        let mut allocator = BufferIdAllocator::default();
+        let size = BufferSize::new(1, 1).expect("buffer size");
+        let argb = CommittedSurfaceBuffer::shm_snapshot_with_format(
+            allocator.allocate().expect("argb identity"),
+            size,
+            vec![0],
+            DrmFormat::Argb8888,
+        );
+        let xrgb = CommittedSurfaceBuffer::shm_snapshot_with_format(
+            allocator.allocate().expect("xrgb identity"),
+            size,
+            vec![0],
+            DrmFormat::Xrgb8888,
+        );
+        let other = CommittedSurfaceBuffer::shm_snapshot_with_format(
+            allocator.allocate().expect("other identity"),
+            size,
+            vec![0],
+            DrmFormat::Other(7),
+        );
+        assert_eq!(
+            argb.alpha_capability(),
+            crate::blur_policy::SurfaceAlphaCapability::AlphaCapable
+        );
+        assert_eq!(
+            xrgb.alpha_capability(),
+            crate::blur_policy::SurfaceAlphaCapability::Opaque
+        );
+        assert_eq!(
+            other.alpha_capability(),
+            crate::blur_policy::SurfaceAlphaCapability::Unknown
+        );
     }
 }

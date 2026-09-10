@@ -86,7 +86,14 @@ fn duplicate_background_effect_object_is_the_exact_manager_error() {
 #[test]
 fn background_effect_state_is_copied_and_double_buffered() {
     let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let mut blur_policy = server.state.blur_policy_snapshot();
+    blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::RulesOnly;
+    server
+        .state
+        .blur_assignment
+        .replace_snapshot(blur_policy)
+        .unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
@@ -280,7 +287,14 @@ fn production_resolution_assigns_public_surface_and_trusted_visual_group_scopes(
 #[test]
 fn public_child_effects_follow_production_scene_order_not_identifiers() {
     let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let mut blur_policy = server.state.blur_policy_snapshot();
+    blur_policy.applications.wayland = crate::blur_policy::BlurApplicationMode::RulesOnly;
+    server
+        .state
+        .blur_assignment
+        .replace_snapshot(blur_policy)
+        .unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 

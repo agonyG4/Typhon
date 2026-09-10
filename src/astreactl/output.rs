@@ -108,6 +108,14 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.generation,
             snapshot.effect_count,
         ),
+        AstreactlResult::Blur(snapshot) => format!(
+            "Enabled: {}\nRenderer: {}\nGeneration: {}\nConfig: {}\nLast error: {}",
+            snapshot.enabled,
+            snapshot.renderer_supported,
+            snapshot.generation,
+            sanitize_terminal_text(&snapshot.config_path),
+            sanitize_optional_text(snapshot.last_error.as_deref()),
+        ),
         AstreactlResult::Wallpaper(snapshot) => format!(
             "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
             sanitize_terminal_text(&snapshot.state),

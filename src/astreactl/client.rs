@@ -133,6 +133,10 @@ fn decode_command_result(
             .map(AstreactlResult::DecorationThemes),
         "effects.reload" => serde_json::from_value::<TrustedEffectsReloadSnapshot>(value)
             .map(AstreactlResult::TrustedEffects),
+        "blur.status" | "blur.reload" => {
+            serde_json::from_value::<crate::blur_policy::BlurPolicySnapshot>(value)
+                .map(AstreactlResult::Blur)
+        }
         _ => return Err(AstreactlError::Usage("unknown control command".to_string())),
     };
     decoded.map_err(|_| AstreactlError::MalformedResponse)
