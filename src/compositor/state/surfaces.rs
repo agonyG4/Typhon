@@ -36,28 +36,25 @@ impl CompositorState {
         surface_ids
             .into_iter()
             .map(|surface_id| {
-                let generation = self
-                    .renderable_surface_indices
+                // `SurfacePresentationKey::generation` is the authority for
+                // presented damage baselines. RenderableSurface::generation
+                // belongs to the render-state namespace and is unrelated.
+                let presentation_generation = self
+                    .surface_presentation_generations
                     .get(&surface_id)
-                    .and_then(|index| self.renderable_surfaces.get(*index))
-                    .map(|surface| surface.generation)
-                    .or_else(|| {
-                        self.client_cursor_surfaces
-                            .get(&surface_id)
-                            .map(|surface| surface.generation)
-                    });
+                    .copied();
                 let journal = self.surface_damage_journals.get(&surface_id);
                 let current_commit = journal.map_or_else(
                     SurfaceCommitCounter::default,
                     SurfaceDamageJournal::current_commit,
                 );
                 let complete_since = match (
-                    generation,
+                    presentation_generation,
                     self.presented_surface_commit_generations.get(&surface_id),
                     self.presented_surface_commits.get(&surface_id),
                 ) {
-                    (Some(generation), Some(presented_generation), Some(commit))
-                        if generation == *presented_generation =>
+                    (Some(presentation_generation), Some(presented_generation), Some(commit))
+                        if presentation_generation == *presented_generation =>
                     {
                         Some(*commit)
                     }
@@ -1472,6 +1469,178 @@ mod ordered_publication_tests {
             ),
             SurfacePublicationDecision::StaleAlreadyPublished
         );
+    }
+
+    #[test]
+    fn resource_sync_baseline_uses_presentation_generation_namespace() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        let mut surface = test_cursor_surface(surface_id, SurfaceCommitSequence(2));
+        surface.generation = 42;
+        state.append_renderable_surface(surface);
+        state.surface_presentation_generations.insert(surface_id, 7);
+
+        let mut journal = SurfaceDamageJournal::new(4);
+        let baseline = journal.record_for_surface_commit(
+            SurfaceCommitSequence(1),
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]),
+            2,
+            2,
+        );
+        let current = journal.record_for_surface_commit(
+            SurfaceCommitSequence(2),
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]),
+            2,
+            2,
+        );
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        assert_eq!(
+            state.surface_resource_sync_states([surface_id]),
+            vec![SurfaceResourceSyncState {
+                surface_id,
+                complete_since: Some(baseline),
+                current_commit: current,
+                authoritative: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn resource_sync_baseline_rejects_stale_presentation_generation() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(1)));
+        state.surface_presentation_generations.insert(surface_id, 8);
+        let mut journal = SurfaceDamageJournal::new(4);
+        let baseline = journal.record(RenderableSurfaceDamage::Full, 2, 2);
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        assert_eq!(
+            state.surface_resource_sync_states([surface_id])[0].complete_since,
+            None
+        );
+    }
+
+    #[test]
+    fn resource_sync_baseline_rejects_history_lost_presented_commit() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(1)));
+        state.surface_presentation_generations.insert(surface_id, 7);
+        let mut journal = SurfaceDamageJournal::new(1);
+        let baseline = journal.record(RenderableSurfaceDamage::Full, 2, 2);
+        journal.record(RenderableSurfaceDamage::Empty, 2, 2);
+        journal.record(RenderableSurfaceDamage::Empty, 2, 2);
+        let current = journal.current_commit();
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        let sync_state = state.surface_resource_sync_states([surface_id]);
+        assert_eq!(sync_state[0].complete_since, None);
+        assert_eq!(sync_state[0].current_commit, current);
+        assert!(sync_state[0].authoritative);
+    }
+
+    #[test]
+    fn resource_sync_baseline_can_follow_no_visual_change_settlement() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(2)));
+        state.surface_presentation_generations.insert(surface_id, 7);
+        let mut journal = SurfaceDamageJournal::new(4);
+        let resource_baseline = journal.record(RenderableSurfaceDamage::Full, 2, 2);
+        let settled = journal.record(RenderableSurfaceDamage::Empty, 2, 2);
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, settled);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        let sync_state = state.surface_resource_sync_states([surface_id]);
+        assert_eq!(resource_baseline, SurfaceCommitCounter(1));
+        assert_eq!(sync_state[0].complete_since, Some(settled));
+        assert_eq!(sync_state[0].current_commit, settled);
+    }
+
+    #[test]
+    fn resource_sync_baseline_keeps_accumulated_hidden_damage_complete_from_presented_commit() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(3)));
+        state.surface_presentation_generations.insert(surface_id, 7);
+        let mut journal = SurfaceDamageJournal::new(4);
+        let baseline = journal.record(RenderableSurfaceDamage::Full, 2, 2);
+        journal.record(
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]),
+            2,
+            2,
+        );
+        let current = journal.record(
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            }]),
+            2,
+            2,
+        );
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        let sync_state = state.surface_resource_sync_states([surface_id]);
+        assert_eq!(sync_state[0].complete_since, Some(baseline));
+        assert_eq!(sync_state[0].current_commit, current);
+    }
+
+    #[test]
+    fn resource_sync_baseline_proves_empty_damage_through_current_commit() {
+        let mut state = CompositorState::default();
+        let surface_id = 7;
+        state.append_renderable_surface(test_cursor_surface(surface_id, SurfaceCommitSequence(2)));
+        state.surface_presentation_generations.insert(surface_id, 7);
+        let mut journal = SurfaceDamageJournal::new(4);
+        let baseline = journal.record(RenderableSurfaceDamage::Full, 2, 2);
+        let current = journal.record(RenderableSurfaceDamage::Empty, 2, 2);
+        state.surface_damage_journals.insert(surface_id, journal);
+        state.presented_surface_commits.insert(surface_id, baseline);
+        state
+            .presented_surface_commit_generations
+            .insert(surface_id, 7);
+
+        let sync_state = state.surface_resource_sync_states([surface_id]);
+        assert_eq!(sync_state[0].complete_since, Some(baseline));
+        assert_eq!(sync_state[0].current_commit, current);
     }
 
     #[test]

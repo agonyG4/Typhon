@@ -1191,6 +1191,30 @@ impl GlesSceneRenderer {
         self.active_surface_ids.sort_unstable();
         self.active_surface_ids.dedup();
 
+        for surface in surfaces.iter().chain(client_cursor) {
+            let Some((action, resource)) =
+                reconcile_surface_resource_backing(&mut self.surface_resources, surface)
+            else {
+                continue;
+            };
+            match action {
+                SurfaceResourceLifetimeAction::DemoteDmabuf => {
+                    self.cache_or_destroy_dmabuf_resource(
+                        egl,
+                        egl_display,
+                        surface.surface_id,
+                        resource,
+                    );
+                }
+                SurfaceResourceLifetimeAction::Destroy => {
+                    destroy_surface_resource(&self.gl, egl, egl_display, resource);
+                }
+                SurfaceResourceLifetimeAction::Keep => {
+                    unreachable!("current surface resource reconciliation never removes Keep")
+                }
+            }
+        }
+
         let stale_ids = self
             .surface_resources
             .keys()
@@ -1261,7 +1285,7 @@ impl GlesSceneRenderer {
             EglSurfaceResourceUpdate::Reuse => return Ok(()),
             EglSurfaceResourceUpdate::ReuseShm => {
                 if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                    resource.shm_synced_commit = Some(sync_state.current_commit);
+                    resource.advance_shm_sync_baseline(sync_state.current_commit);
                 }
                 return Ok(());
             }
@@ -2545,6 +2569,13 @@ struct EglSurfaceResource {
     shm_synced_commit: Option<SurfaceCommitCounter>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceResourceLifetimeAction {
+    Keep,
+    DemoteDmabuf,
+    Destroy,
+}
+
 struct CachedDmabufResource<R> {
     image: R,
     buffer_lifetime: WeakBufferIdentity,
@@ -2560,7 +2591,49 @@ fn dead_cached_dmabuf_keys<R>(
         .collect()
 }
 
+fn classify_surface_resource_lifetime(
+    resource: &EglSurfaceResource,
+    surface: &RenderableSurface,
+) -> SurfaceResourceLifetimeAction {
+    if let Some(installed_key) = resource.dmabuf_key.as_ref() {
+        let current_key = surface
+            .dmabuf_handle()
+            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle));
+        return if current_key.as_ref() == Some(installed_key) {
+            SurfaceResourceLifetimeAction::Keep
+        } else {
+            SurfaceResourceLifetimeAction::DemoteDmabuf
+        };
+    }
+
+    let size = surface.buffer_size();
+    if surface.cpu_pixels().is_some() && resource.image.size == (size.width, size.height) {
+        SurfaceResourceLifetimeAction::Keep
+    } else {
+        SurfaceResourceLifetimeAction::Destroy
+    }
+}
+
+fn reconcile_surface_resource_backing(
+    surface_resources: &mut HashMap<u32, EglSurfaceResource>,
+    surface: &RenderableSurface,
+) -> Option<(SurfaceResourceLifetimeAction, EglSurfaceResource)> {
+    let action = surface_resources
+        .get(&surface.surface_id)
+        .map(|resource| classify_surface_resource_lifetime(resource, surface))?;
+    if action == SurfaceResourceLifetimeAction::Keep {
+        return None;
+    }
+    surface_resources
+        .remove(&surface.surface_id)
+        .map(|resource| (action, resource))
+}
+
 impl EglSurfaceResource {
+    fn advance_shm_sync_baseline(&mut self, synced_commit: SurfaceCommitCounter) {
+        self.shm_synced_commit = Some(synced_commit);
+    }
+
     fn update_for(
         &self,
         surface: &RenderableSurface,
@@ -3812,8 +3885,8 @@ mod tests {
         SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
     };
     use oblivion_one::render_backend::buffer::{
-        BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufImageKey,
-        DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+        BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
+        DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
@@ -3940,6 +4013,73 @@ mod tests {
             resource.update_for(&surface, state),
             EglSurfaceResourceUpdate::FullShmResync
         );
+    }
+
+    #[test]
+    fn shm_resource_update_requires_full_resync_when_presentation_settlement_outruns_baseline() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Empty);
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(1)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(2)),
+            current_commit: SurfaceCommitCounter(2),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::FullShmResync
+        );
+    }
+
+    #[test]
+    fn shm_resource_update_keeps_accumulated_hidden_damage_partial() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Partial(vec![
+            SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            SurfaceDamageRect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
+        ]));
+        let resource = test_shm_resource(Some(SurfaceCommitCounter(1)));
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(1)),
+            current_commit: SurfaceCommitCounter(3),
+            authoritative: true,
+        };
+
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::UploadDamage
+        );
+    }
+
+    #[test]
+    fn shm_resource_update_advances_empty_damage_baseline_without_upload() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Empty);
+        let mut resource = test_shm_resource(Some(SurfaceCommitCounter(1)));
+        let current_commit = SurfaceCommitCounter(2);
+        let state = SurfaceResourceSyncState {
+            surface_id: surface.surface_id,
+            complete_since: Some(SurfaceCommitCounter(1)),
+            current_commit,
+            authoritative: true,
+        };
+        assert_eq!(
+            resource.update_for(&surface, state),
+            EglSurfaceResourceUpdate::ReuseShm
+        );
+
+        resource.advance_shm_sync_baseline(current_commit);
+        assert_eq!(resource.shm_synced_commit, Some(current_commit));
     }
 
     #[test]
@@ -5484,6 +5624,217 @@ mod tests {
         drop(cache);
 
         assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn obsolete_dmabuf_resource_is_removed_when_current_backing_changes() {
+        let mut ids = BufferIdAllocator::default();
+        let identity_a = ids.allocate().expect("first test buffer identity");
+        let identity_b = ids.allocate().expect("second test buffer identity");
+        let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let handle_b = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let surface = test_dmabuf_surface(7, identity_b, handle_b, 2);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity_a, &handle_a, 1))]);
+
+        let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
+            .expect("obsolete resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+        assert!(!resources.contains_key(&surface.surface_id));
+    }
+
+    #[test]
+    fn exact_current_dmabuf_resource_is_kept_across_render_generation_change() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("test buffer identity");
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let surface = test_dmabuf_surface(7, identity.clone(), handle.clone(), 2);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity, &handle, 1))]);
+
+        assert_eq!(
+            classify_surface_resource_lifetime(&resources[&7], &surface),
+            SurfaceResourceLifetimeAction::Keep
+        );
+        assert!(reconcile_surface_resource_backing(&mut resources, &surface).is_none());
+        assert!(resources.contains_key(&surface.surface_id));
+    }
+
+    #[test]
+    fn repeated_hidden_dmabuf_rotations_do_not_create_replacement_resources() {
+        let mut ids = BufferIdAllocator::default();
+        let identity_a = ids.allocate().expect("initial test buffer identity");
+        let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity_a, &handle_a, 1))]);
+
+        for generation in 2..=5 {
+            let identity = ids.allocate().expect("rotated test buffer identity");
+            let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+            let surface = test_dmabuf_surface(7, identity, handle, generation);
+            let action = reconcile_surface_resource_backing(&mut resources, &surface)
+                .map(|(action, _)| action);
+            if generation == 2 {
+                assert_eq!(action, Some(SurfaceResourceLifetimeAction::DemoteDmabuf));
+            } else {
+                assert_eq!(action, None);
+            }
+            assert!(resources.is_empty());
+        }
+    }
+
+    #[test]
+    fn dead_obsolete_dmabuf_resource_is_not_cacheable() {
+        let mut ids = BufferIdAllocator::default();
+        let identity_a = ids.allocate().expect("initial test buffer identity");
+        let identity_b = ids.allocate().expect("replacement test buffer identity");
+        let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let handle_b = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity_a, &handle_a, 1))]);
+        let surface = test_dmabuf_surface(7, identity_b, handle_b, 2);
+        drop(identity_a);
+
+        let (action, resource) = reconcile_surface_resource_backing(&mut resources, &surface)
+            .expect("obsolete resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+        assert!(
+            !resource
+                .buffer_lifetime
+                .expect("dmabuf resource lifetime")
+                .is_alive()
+        );
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn dmabuf_to_shm_retires_dmabuf_without_creating_shm_resource() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("test buffer identity");
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity, &handle, 1))]);
+        let surface = test_shm_surface(RenderableSurfaceDamage::Empty);
+
+        let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
+            .expect("obsolete dmabuf resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn shm_to_dmabuf_destroys_shm_without_importing_dmabuf() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("replacement test buffer identity");
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let surface = test_dmabuf_surface(7, identity, handle, 2);
+        let mut resources = HashMap::from([(7, test_shm_resource(Some(SurfaceCommitCounter(1))))]);
+
+        let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
+            .expect("obsolete shm resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::Destroy);
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn compatible_hidden_shm_update_keeps_stale_texture_and_commit_baseline() {
+        let surface = test_shm_surface(RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]));
+        let synced_commit = Some(SurfaceCommitCounter(1));
+        let mut resources = HashMap::from([(7, test_shm_resource(synced_commit))]);
+
+        assert!(reconcile_surface_resource_backing(&mut resources, &surface).is_none());
+        assert_eq!(resources[&7].shm_synced_commit, synced_commit);
+    }
+
+    #[test]
+    fn hidden_shm_resize_retires_incompatible_texture_without_replacement() {
+        let mut surface = test_shm_surface(RenderableSurfaceDamage::Empty);
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("resized test buffer identity");
+        surface.buffer = CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(3, 2).expect("resized test surface size"),
+            vec![0; 6],
+        );
+        let mut resources = HashMap::from([(7, test_shm_resource(Some(SurfaceCommitCounter(1))))]);
+
+        let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
+            .expect("incompatible shm resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::Destroy);
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn obsolete_resource_is_absent_before_hidden_replacement_can_be_realized() {
+        let mut ids = BufferIdAllocator::default();
+        let identity_a = ids.allocate().expect("initial test buffer identity");
+        let identity_b = ids.allocate().expect("replacement test buffer identity");
+        let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let handle_b = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity_a, &handle_a, 1))]);
+        let surface_b = test_dmabuf_surface(7, identity_b, handle_b, 2);
+
+        let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface_b)
+            .expect("obsolete resource must be reconciled");
+
+        assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+        assert!(!resources.contains_key(&surface_b.surface_id));
+        assert!(reconcile_surface_resource_backing(&mut resources, &surface_b).is_none());
+    }
+
+    fn test_dmabuf_surface(
+        surface_id: u32,
+        identity: BufferIdentity,
+        handle: DmabufBufferHandle,
+        generation: u64,
+    ) -> RenderableSurface {
+        let size = handle.size();
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width: size.width,
+            height: size.height,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::dmabuf_handle(identity, handle),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            opaque_region: SurfaceOpaqueRegion::None,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
+
+    fn test_dmabuf_resource(
+        identity: &BufferIdentity,
+        handle: &DmabufBufferHandle,
+        generation: u64,
+    ) -> EglSurfaceResource {
+        let size = handle.size();
+        EglSurfaceResource {
+            image: EglImageResource {
+                texture: glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+                size: (size.width, size.height),
+                generation,
+                egl_image: Some(fake_egl_image()),
+            },
+            dmabuf_key: Some(DmabufImageKey::from_handle(identity.id(), handle)),
+            buffer_lifetime: Some(identity.downgrade()),
+            shm_synced_commit: None,
+        }
     }
 
     fn test_dmabuf_handle(

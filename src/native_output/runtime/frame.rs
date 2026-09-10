@@ -1075,6 +1075,11 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
+        // The resolved scene and this authority lookup are borrowed from the
+        // same immutable compositor state on the native compositor thread.
+        // Keeping the lookup at this synchronous request boundary prevents a
+        // deferred renderer from pairing frozen surfaces with newer journal
+        // metadata; such a renderer would need an explicit snapshot identity.
         let surface_resource_sync_states = server.surface_resource_sync_states(
             resolved_scene
                 .surfaces

@@ -45,8 +45,9 @@ pub struct SurfaceDamageJournal {
 /// Authoritative per-surface damage bounds for renderer resource sync.
 ///
 /// `complete_since` is the journal commit from which `RenderableSurface::damage`
-/// is complete through `current_commit`. `None` means that the renderer must
-/// conservatively upload a complete SHM snapshot.
+/// is complete through `current_commit`. Its presentation-lifetime identity is
+/// validated separately from `RenderableSurface::generation`. `None` means
+/// that the renderer must conservatively upload a complete SHM snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceResourceSyncState {
     pub surface_id: u32,
