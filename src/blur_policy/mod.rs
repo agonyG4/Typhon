@@ -4,9 +4,10 @@ mod rules;
 
 pub use config::{BlurPolicyConfigError, config_path, load, load_from_path};
 pub use model::{
-    BlurApplicationMode, BlurApplicationPolicy, BlurAssignment, BlurBackend, BlurLayerMode,
-    BlurLayerPolicy, BlurLayerRule, BlurPolicySnapshot, BlurRuleAction, BlurTargetKind,
-    BlurWindowRule, SurfaceAlphaCapability,
+    BlurApplicationMode, BlurApplicationPolicy, BlurAssignment, BlurAssignmentCounts, BlurBackend,
+    BlurLayerMatch, BlurLayerMode, BlurLayerPolicy, BlurLayerRule, BlurPolicyConfig,
+    BlurPolicySnapshot, BlurRuleAction, BlurTargetKind, BlurWindowMatch, BlurWindowRule,
+    BlurXwaylandMode, SurfaceAlphaCapability,
 };
 pub use rules::{BlurLayerTarget, BlurRuleCompileError, BlurWindowTarget, CompiledBlurRules};
 

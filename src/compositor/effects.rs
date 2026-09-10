@@ -315,32 +315,18 @@ impl super::CompositorState {
                 if root_surface_id != surface.surface_id && !client_request_committed {
                     continue;
                 }
-                let assignment = self.blur_assignment_for_surface(surface, surface_data);
-                let region = match assignment {
-                    crate::blur_policy::BlurAssignment::None => continue,
-                    crate::blur_policy::BlurAssignment::ClientExact => {
-                        background_effect_output_region(
-                            &surface_data.committed_background_effect(),
-                            *origin,
-                            surface.width,
-                            surface.height,
-                        )
-                    }
-                    crate::blur_policy::BlurAssignment::CompositorSynthesized => {
-                        let Some(rect) =
-                            EffectRect::new(origin.0, origin.1, surface.width, surface.height)
-                        else {
-                            continue;
-                        };
-                        EffectRegion::from_rect(rect)
-                    }
+                let Some(assignment) =
+                    self.blur_assignment_for_surface(surface, surface_data, *origin)
+                else {
+                    continue;
                 };
-                if assignment == crate::blur_policy::BlurAssignment::CompositorSynthesized
+                if assignment.source
+                    != crate::compositor::blur_assignment::BlurAssignmentSource::Client
                     && self.has_existing_background_blur_instance(surface.surface_id)
                 {
                     continue;
                 }
-                let Some(target_bounds) = region.bounding_rect() else {
+                let Some(target_bounds) = assignment.region.bounding_rect() else {
                     continue;
                 };
                 instances.push(ResolvedEffectInstance {
@@ -351,15 +337,15 @@ impl super::CompositorState {
                         surface.surface_id,
                         EffectAnchor::BeforeSurface(surface.surface_id),
                         crate::effects::builtin_background_blur_program_id(),
-                        &region,
+                        &assignment.region,
                         &EffectParameterBlock::default(),
                     ),
                     frame_demand: EffectFrameDemand::OnDamage,
                     visual_group: self.visual_group_for_surface(surface.surface_id),
-                    region,
+                    region: assignment.region,
                     target_bounds,
                     parameter_block: EffectParameterBlock::default(),
-                    anchor_scope: EffectAnchorScope::Surface,
+                    anchor_scope: assignment.anchor_scope,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
                     )),
