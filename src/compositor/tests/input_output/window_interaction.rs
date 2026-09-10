@@ -1,4 +1,5 @@
 use super::*;
+use crate::wm::LayoutMembership;
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1 as client_zxdg_decoration_manager_v1,
     zxdg_toplevel_decoration_v1 as client_zxdg_toplevel_decoration_v1,
@@ -534,6 +535,16 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
         maximized_visual.is_some(),
         "maximized visual should remain installed"
     );
+    commands
+        .send(ServerCommand::PublishFocusedPresentationAfter {
+            frame_id: 2,
+            elapsed_nanos: 125_000_000,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let presented_before = capture_presented_presentation(&commands, root_surface_id);
+    assert_eq!(presented_before.0, 2);
+    assert!(presented_before.1.is_some());
 
     commands
         .send(ServerCommand::BeginMove { x: 120.0, y: 87.0 })
@@ -543,12 +554,15 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
     let interaction = capture_window_interaction_debug_snapshot(&commands);
     let committed = capture_root_window_geometry(&commands, root_surface_id);
     let transition = capture_presentation_transition_curve(&commands);
+    let presented_after_begin = capture_presented_presentation(&commands, root_surface_id);
+    assert_eq!(presented_after_begin, presented_before);
     commands
         .send(ServerCommand::UpdateInteraction { x: 140.0, y: 87.0 })
         .unwrap();
     commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
     let moved = capture_root_window_geometry(&commands, root_surface_id);
+    let presented_after_frame = capture_presented_presentation(&commands, root_surface_id);
     commands.send(ServerCommand::EndInteraction).unwrap();
     wait_for_server_commands(&commands);
     let _server = stop_controllable_test_server(commands, server_thread);
@@ -567,7 +581,110 @@ fn maximized_titlebar_move_restores_normal_window_under_pointer() {
         committed.map(|geometry| geometry.placement.local_x.saturating_add(20))
     );
     assert!(transition.is_none());
+    assert!(presented_after_frame.0 > presented_before.0);
+    assert_ne!(presented_after_frame.1, presented_before.1);
     drop(decoration);
+}
+
+#[test]
+fn tiled_maximized_move_detaches_before_direct_pointer_ownership() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let mut client = LiveTestClient::connect(&socket_path).unwrap();
+    let _surface_a = client
+        .create_toplevel_surface("oblivion.tiled-maximized-move-a", 300, 200)
+        .unwrap();
+    let _surface_b = client
+        .create_toplevel_surface("oblivion.tiled-maximized-move-b", 300, 200)
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let roots = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .filter(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 2);
+    focus_root_window(&commands, roots[0]);
+    let window_a = capture_focused_window_id(&commands).expect("window A should be focused");
+    focus_root_window(&commands, roots[1]);
+    let window_b = capture_focused_window_id(&commands).expect("window B should be focused");
+    assert_ne!(window_a, window_b);
+    let root_a = roots[0];
+    let root_b = roots[1];
+
+    focus_root_window(&commands, root_a);
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(220, 140),
+        700,
+        450,
+    );
+    commands
+        .send(ServerCommand::ToggleFocusedWindowLayout)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    focus_root_window(&commands, root_b);
+    commands
+        .send(ServerCommand::ToggleFocusedWindowLayout)
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    focus_root_window(&commands, root_a);
+    let tiled_geometry = capture_root_window_geometry(&commands, root_a)
+        .expect("tiled geometry should be installed before maximize");
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    let maximized_geometry = capture_root_window_geometry(&commands, root_a)
+        .expect("maximized geometry should be installed");
+    let pointer_x =
+        maximized_geometry.placement.local_x as f64 + maximized_geometry.width as f64 * 0.4;
+    let pointer_y = maximized_geometry.placement.local_y as f64 + 120.0;
+    commands
+        .send(ServerCommand::BeginMove {
+            x: pointer_x,
+            y: pointer_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let interaction = capture_window_interaction_debug_snapshot(&commands);
+    let management_a = capture_window_management(&commands, window_a);
+    let management_b = capture_window_management(&commands, window_b);
+    let restored_geometry = capture_root_window_geometry(&commands, root_a);
+    let survivor_transition = capture_presentation_transition_curve_for_root(&commands, root_b);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        interaction.map(|interaction| (interaction.window_id, interaction.kind)),
+        Some((window_a.get(), WindowInteractionKind::Move))
+    );
+    assert_eq!(
+        management_a.map(|management| management.0),
+        Some(LayoutMembership::Floating)
+    );
+    assert_eq!(management_a.map(|management| management.2), Some(false));
+    assert_eq!(
+        management_b.map(|management| management.0),
+        Some(LayoutMembership::Tiled)
+    );
+    assert_eq!(management_b.map(|management| management.2), Some(true));
+    assert_eq!(
+        restored_geometry.map(|geometry| (geometry.width, geometry.height)),
+        Some((700, 450))
+    );
+    assert_ne!((tiled_geometry.width, tiled_geometry.height), (700, 450));
+    assert!(survivor_transition.is_some());
+    let expected_x = pointer_x - 700.0 * 0.4;
+    let actual_x = restored_geometry
+        .expect("restored geometry")
+        .placement
+        .local_x as f64;
+    assert!((actual_x - expected_x).abs() <= 1.0);
 }
 
 #[test]
