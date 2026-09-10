@@ -880,29 +880,53 @@ impl NativeRuntime {
     }
     fn resume_native_session(&mut self) -> NativeResult<()> {
         self.log_session_transition("suspended", "resuming", "seat_enable");
-        let result = recover_native_output(self);
-        if let Err(error) = result {
-            if let Some(token) = self.drm_reactor_token.take() {
-                let _ = self.event_loop.unregister(token);
+        match recover_native_output(self) {
+            Ok(NativeSessionRecoveryProgress::Complete) => {
+                self.finish_native_session_recovery();
             }
-            if let Ok(parked) = self
-                .acquire_watches
-                .park_for_session_suspend(&mut self.event_loop)
-            {
-                self.parked_acquire_watches.extend(parked);
-            }
-            if let Some(mut cursor) = self.legacy_cursor.take() {
-                cursor.disarm_drm_cleanup();
-            }
-            self.pending_session_recovery = None;
-            teardown_without_drm_io(self);
-            self.session.fail_resume();
-            self.log_session_transition("resuming", "failed", "recovery_failed");
-            return Err(error);
+            Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence) => {}
+            Err(error) => return self.fail_native_session_recovery(error),
         }
+        Ok(())
+    }
+
+    fn finish_native_session_recovery(&mut self) {
         self.session.finish_resume();
         self.log_session_transition("resuming", "active", "output_recovered");
-        Ok(())
+    }
+
+    fn fail_native_session_recovery(&mut self, error: Box<dyn Error>) -> NativeResult<()> {
+        if let Some(token) = self.drm_reactor_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        if let Some(token) = self.output_render_fence_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        if let Ok(parked) = self
+            .acquire_watches
+            .park_for_session_suspend(&mut self.event_loop)
+        {
+            self.parked_acquire_watches.extend(parked);
+        }
+        if let Some(mut cursor) = self.legacy_cursor.take() {
+            cursor.disarm_drm_cleanup();
+        }
+        self.pending_session_recovery = None;
+        teardown_without_drm_io(self);
+        self.session.fail_resume();
+        self.log_session_transition("resuming", "failed", "recovery_failed");
+        Err(error)
+    }
+
+    fn continue_native_session_recovery(&mut self) -> NativeResult<()> {
+        match continue_native_output_recovery(self) {
+            Ok(NativeSessionRecoveryProgress::Complete) => {
+                self.finish_native_session_recovery();
+                Ok(())
+            }
+            Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence) => Ok(()),
+            Err(error) => self.fail_native_session_recovery(error),
+        }
     }
     pub(super) fn rearm_parked_acquire_watches(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;

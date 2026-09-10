@@ -812,7 +812,7 @@ impl NativeRuntime {
 
     pub(super) fn quarantine_submitted_ownership(
         &mut self,
-        ownership: KmsSubmittedOwnership,
+        mut ownership: KmsSubmittedOwnership,
     ) -> NativeResult<()> {
         if matches!(ownership.job.kind, AtomicCommitKind::DirectPrimary { .. }) {
             // The submitted direct lease is the complete physical ownership
@@ -840,8 +840,10 @@ impl NativeRuntime {
                     self.scanout
                         .suspend_abandon_worker_compatibility(ownership.job.token)
                 } else {
-                    self.scanout
-                        .suspend_abandon_worker_submission(ownership.job.token)
+                    self.scanout.suspend_abandon_worker_submission(
+                        ownership.job.token,
+                        ownership.out_fence.take(),
+                    )
                 };
                 if let Err(error) = result {
                     eprintln!(

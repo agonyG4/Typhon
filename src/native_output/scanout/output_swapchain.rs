@@ -1029,6 +1029,14 @@ impl AtomicOutputSwapchain {
         &mut self,
         token: PageFlipToken,
     ) -> io::Result<bool> {
+        self.suspend_abandon_worker_queued_with_completion_fence(token, None)
+    }
+
+    pub(crate) fn suspend_abandon_worker_queued_with_completion_fence(
+        &mut self,
+        token: PageFlipToken,
+        completion_fence: Option<OwnedFd>,
+    ) -> io::Result<bool> {
         self.ensure_suspendable()?;
         let Some(queued) = self.worker_queued.as_ref() else {
             return Ok(false);
@@ -1048,7 +1056,11 @@ impl AtomicOutputSwapchain {
             .worker_queued
             .take()
             .expect("worker was observed above");
-        let timing_fence = queued.frame.render_fence.take_timing_fd();
+        let timing_fence = queued
+            .frame
+            .render_fence
+            .take_timing_fd()
+            .or(completion_fence);
         self.suspend_owned_slot(
             suspended_index,
             queued.frame.slot,
@@ -1056,6 +1068,26 @@ impl AtomicOutputSwapchain {
             queued.frame,
         );
         Ok(true)
+    }
+
+    pub(crate) fn restore_worker_queued_submission_fence(
+        &mut self,
+        token: PageFlipToken,
+        submission_fence: OwnedFd,
+    ) -> io::Result<()> {
+        let queued = self
+            .worker_queued
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker fence returned without queued output"))?;
+        if queued.token != token {
+            return Err(io::Error::other(
+                "returned worker fence token mismatches queued output",
+            ));
+        }
+        queued
+            .frame
+            .render_fence
+            .restore_submission_fd(submission_fence)
     }
 
     /// Move all rendered frames that cannot participate in the next session
@@ -1091,6 +1123,41 @@ impl AtomicOutputSwapchain {
             })
     }
 
+    pub(crate) fn pending_fence_signaled(&self) -> io::Result<bool> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(true);
+        };
+        if let Some(timing_fence) = pending.frame.render_fence.timing_fd() {
+            return poll_completion_fd(
+                timing_fence.as_raw_fd(),
+                "pending output render fence reported poll failure",
+            );
+        }
+        if let Some(out_fence) = pending.out_fence.as_ref() {
+            return poll_completion_fd(
+                out_fence.as_raw_fd(),
+                "pending output KMS out-fence reported poll failure",
+            );
+        }
+        Err(io::Error::other(
+            "pending output frame has no completion proof",
+        ))
+    }
+
+    pub(crate) fn pending_fence_fd(&self) -> io::Result<Option<RawFd>> {
+        if self.pending_fence_signaled()? {
+            return Ok(None);
+        }
+        Ok(self.pending.as_ref().and_then(|pending| {
+            pending
+                .frame
+                .render_fence
+                .timing_fd()
+                .map(AsRawFd::as_raw_fd)
+                .or_else(|| pending.out_fence.as_ref().map(AsRawFd::as_raw_fd))
+        }))
+    }
+
     pub(crate) fn suspended_fence_fd(&self) -> io::Result<Option<RawFd>> {
         for suspended in self.suspended.iter().flatten() {
             if !self.suspended_slot_fence_signaled(suspended)? {
@@ -1107,7 +1174,7 @@ impl AtomicOutputSwapchain {
                     }));
             }
         }
-        Ok(None)
+        self.pending_fence_fd()
     }
 
     pub(crate) fn has_suspended_frame(&self) -> bool {
@@ -1852,21 +1919,10 @@ impl AtomicOutputSwapchain {
                 });
         }
         let fence = suspended.timing_fence.as_ref().expect("checked above");
-        let mut pollfd = libc::pollfd {
-            fd: fence.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
-        if ready < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err(io::Error::other(
-                "suspended output render fence reported poll failure",
-            ));
-        }
-        Ok(ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+        poll_completion_fd(
+            fence.as_raw_fd(),
+            "suspended output render fence reported poll failure",
+        )
     }
 
     fn validate_worker_queued_frame(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
@@ -2015,6 +2071,22 @@ impl AtomicOutputSwapchain {
     }
 }
 
+fn poll_completion_fd(fd: RawFd, error_message: &str) -> io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::other(error_message));
+    }
+    Ok(ready > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+}
+
 fn validate_strictly_later_target(
     earlier: PresentationTarget,
     later: PresentationTarget,
@@ -2094,6 +2166,151 @@ mod tests {
         assert_eq!(second.signaled_at, first.signaled_at);
         assert_eq!(second.quality, first.quality);
         assert!(second.render_sample_recorded);
+    }
+
+    #[test]
+    fn worker_suspend_retains_returned_submission_fence_when_timing_duplication_failed() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let mut frame = test_frame(
+            &swapchain,
+            slot,
+            test_target(1, 10, PresentationTargetReason::ReactiveDouble),
+        );
+        frame.render_fence =
+            NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) });
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let _ = frame.render_fence.take_timing_fd();
+        assert!(frame.render_fence.timing_fd().is_none());
+        swapchain
+            .finish_render_owned(frame)
+            .expect("frame becomes ready");
+
+        let token = PageFlipToken::new(100).expect("worker token");
+        let submission_fence = swapchain
+            .take_ready_for_worker(token, now(1))
+            .expect("frame enters worker queue")
+            .0;
+        swapchain
+            .suspend_abandon_worker_queued_with_completion_fence(token, Some(submission_fence))
+            .expect("worker frame is retained for suspend");
+
+        assert!(
+            !swapchain
+                .suspended_fences_signaled()
+                .expect("returned submission fence is the completion proof")
+        );
+        assert!(swapchain.acquire_render_slot().is_err());
+        assert!(swapchain.suspended_fence_fd().unwrap().is_some());
+        drop(writer);
+        assert!(swapchain.suspended_fences_signaled().unwrap());
+        assert!(swapchain.take_suspended_frame().is_some());
+        swapchain
+            .recover_suspended_slot(true)
+            .expect("suspended frame is now safe to retire");
+        assert!(swapchain.acquire_render_slot().is_ok());
+    }
+
+    #[test]
+    fn pending_frame_without_render_or_kms_completion_proof_is_not_releasable() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let mut frame = test_frame(
+            &swapchain,
+            slot,
+            test_target(1, 10, PresentationTargetReason::ReactiveDouble),
+        );
+        let _ = frame.render_fence.take_timing_fd();
+        let _ = frame
+            .render_fence
+            .take_submission_fd()
+            .expect("test submission fence");
+        let token = PageFlipToken::new(101).expect("pageflip token");
+        swapchain
+            .submission_succeeded(frame, token, None, now(1), now(2))
+            .expect("frame enters pending ownership");
+
+        assert!(swapchain.pending_fence_signaled().is_err());
+        assert_eq!(swapchain.pending_slot(), Some(slot));
+    }
+
+    #[test]
+    fn pending_kms_out_fence_proves_render_ownership_when_timing_fd_is_missing() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let mut frame = test_frame(
+            &swapchain,
+            slot,
+            test_target(1, 10, PresentationTargetReason::ReactiveDouble),
+        );
+        let _ = frame.render_fence.take_timing_fd();
+        let _ = frame
+            .render_fence
+            .take_submission_fd()
+            .expect("test submission fence");
+        let mut out_pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(out_pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let out_writer = unsafe { OwnedFd::from_raw_fd(out_pipe[1]) };
+        swapchain
+            .submission_succeeded(
+                frame,
+                PageFlipToken::new(102).expect("pageflip token"),
+                Some(unsafe { OwnedFd::from_raw_fd(out_pipe[0]) }),
+                now(1),
+                now(2),
+            )
+            .expect("frame enters pending ownership");
+
+        assert!(
+            !swapchain
+                .pending_fence_signaled()
+                .expect("out-fence is a valid completion proof")
+        );
+        assert!(swapchain.pending_fence_fd().unwrap().is_some());
+        drop(out_writer);
+        assert!(swapchain.pending_fence_signaled().unwrap());
+        assert!(swapchain.retire_pending_after_recovery().is_some());
     }
 
     fn test_target(

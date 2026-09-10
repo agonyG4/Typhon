@@ -1,5 +1,6 @@
 use super::super::kms_worker::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsSubmittedOwnership, KmsWorkerEvent, KmsWorkerFatalJob,
+    KmsCommitJob, KmsCommitWorkerHandle, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsWorkerEvent,
+    KmsWorkerFatalJob,
 };
 use super::kms_worker::{FatalWorkerJobHandler, UncertainJobRetention};
 use super::*;
@@ -59,6 +60,27 @@ pub(super) const fn proof_from_restoration(outcome: RestorationOutcome) -> Optio
 }
 
 impl NativeRuntime {
+    fn restore_pre_submit_worker_fence(&mut self, job: &mut KmsCommitJob) -> NativeResult<()> {
+        if !matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
+            return Ok(());
+        }
+        let Some(submission_fence) = (match &mut job.primary {
+            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
+            KmsPrimaryUpdate::Unchanged => None,
+        }) else {
+            return Ok(());
+        };
+        self.scanout
+            .restore_worker_queued_submission_fence(job.token, submission_fence)
+            .map_err(Into::into)
+    }
+
+    fn retain_returned_worker_job(&mut self, mut job: KmsCommitJob) -> NativeResult<()> {
+        self.restore_pre_submit_worker_fence(&mut job)?;
+        self.worker_quarantine.jobs.push(job);
+        Ok(())
+    }
+
     pub(super) fn process_kms_worker_event_after_join_safely(
         &mut self,
         event: KmsWorkerEvent,
@@ -69,15 +91,17 @@ impl NativeRuntime {
             }
             KmsWorkerEvent::TestRejected { job, .. }
             | KmsWorkerEvent::SubmitRejected { job, .. }
-            | KmsWorkerEvent::BusyExhausted { job, .. } => {
-                self.worker_quarantine.jobs.push(job);
-                Ok(())
+            | KmsWorkerEvent::BusyExhausted { job, .. }
+            | KmsWorkerEvent::ValidationBaseInvalidated { job, .. } => {
+                self.retain_returned_worker_job(job)
             }
             KmsWorkerEvent::Quiesced {
                 returned_jobs,
                 returned_sidecar,
             } => {
-                self.worker_quarantine.jobs.extend(returned_jobs);
+                for job in returned_jobs {
+                    self.retain_returned_worker_job(job)?;
+                }
                 self.worker_quarantine
                     .cursor_sidecars
                     .extend(returned_sidecar);
@@ -86,8 +110,7 @@ impl NativeRuntime {
             KmsWorkerEvent::Fatal { .. }
             | KmsWorkerEvent::BusyDeferred { .. }
             | KmsWorkerEvent::PageflipTimeout { .. }
-            | KmsWorkerEvent::CursorSidecarReturned { .. }
-            | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),
+            | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
         }
     }
 

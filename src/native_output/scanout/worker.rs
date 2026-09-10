@@ -33,11 +33,29 @@ impl NativeScanoutBackend {
     pub(crate) fn suspend_abandon_worker_submission(
         &mut self,
         token: PageFlipToken,
+        completion_fence: Option<OwnedFd>,
     ) -> io::Result<()> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.suspend_abandon_worker_submission(token),
+            Self::AtomicEglGbm(scanout) => {
+                scanout.suspend_abandon_worker_submission(token, completion_fence)
+            }
             _ => Err(io::Error::other(
                 "worker suspension requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn restore_worker_queued_submission_fence(
+        &mut self,
+        token: PageFlipToken,
+        submission_fence: OwnedFd,
+    ) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.restore_worker_queued_submission_fence(token, submission_fence)
+            }
+            _ => Err(io::Error::other(
+                "worker fence restoration requires explicit Atomic scanout",
             )),
         }
     }

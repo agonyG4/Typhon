@@ -199,7 +199,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: AtomicExplicitRecovery,
-    ) -> io::Result<()> {
+    ) -> io::Result<NativeSessionRecoveryProgress> {
         let swapchain = self.swapchain()?;
         if swapchain.pool_generation() != recovery.pool_generation
             || swapchain.current() != recovery.current
@@ -209,11 +209,10 @@ impl AtomicEglGbmScanout {
                 "explicit output recovery token no longer matches the active pool",
             ));
         }
-        let fence_signaled = swapchain.suspended_fences_signaled()?;
-        if !fence_signaled {
-            return Err(io::Error::other(
-                "suspended output fence is not signaled after recovery modeset",
-            ));
+        let suspended_fences_signaled = swapchain.suspended_fences_signaled()?;
+        let pending_fence_signaled = swapchain.pending_fence_signaled()?;
+        if !suspended_fences_signaled || !pending_fence_signaled {
+            return Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence);
         }
         while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
             self.scene.discard_rendered(frame.scene_commit);
@@ -231,7 +230,7 @@ impl AtomicEglGbmScanout {
             } => {
                 drop(presented);
                 drop(suspended);
-                Ok(())
+                Ok(NativeSessionRecoveryProgress::Complete)
             }
             DirectReleaseOutcome::Deferred { reason } => Err(io::Error::other(format!(
                 "direct ownership release remained deferred after recovery: {reason:?}"

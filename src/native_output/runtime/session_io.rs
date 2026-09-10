@@ -72,7 +72,12 @@ pub(crate) trait NativeSessionIo {
     fn unregister_drm_source(&mut self) -> NativeResult<()>;
     fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()>;
     fn recover_kms_pipeline(&mut self) -> NativeResult<()>;
-    fn retire_quarantined_pageflip(&mut self) -> NativeResult<()>;
+    fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress>;
+    fn register_suspended_recovery_fence(
+        &mut self,
+    ) -> NativeResult<NativeSessionRecoveryFenceRegistration> {
+        Ok(NativeSessionRecoveryFenceRegistration::Registered)
+    }
     fn rearm_explicit_sync(&mut self) -> NativeResult<()>;
     fn recover_hardware_cursor(&mut self) -> NativeResult<()>;
     fn register_drm_source(&mut self) -> NativeResult<()>;
@@ -105,11 +110,30 @@ pub(crate) fn quiesce_and_acknowledge<I: NativeSessionIo>(
     acknowledge(io)
 }
 
-pub(crate) fn recover_native_output(io: &mut impl NativeSessionIo) -> NativeResult<()> {
-    io.observe(NativeIoOperation::KmsRecovery);
-    io.recover_kms_pipeline()?;
+fn finish_native_output_recovery(
+    io: &mut impl NativeSessionIo,
+) -> NativeResult<NativeSessionRecoveryProgress> {
     io.observe(NativeIoOperation::PageflipRetire);
-    io.retire_quarantined_pageflip()?;
+    match io.retire_quarantined_pageflip()? {
+        NativeSessionRecoveryProgress::WaitingForSuspendedFence => {
+            match io.register_suspended_recovery_fence()? {
+                NativeSessionRecoveryFenceRegistration::Registered => {
+                    return Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence);
+                }
+                NativeSessionRecoveryFenceRegistration::AlreadySignaled => {
+                    io.observe(NativeIoOperation::PageflipRetire);
+                    if io.retire_quarantined_pageflip()? != NativeSessionRecoveryProgress::Complete
+                    {
+                        return Err(io::Error::other(
+                            "suspended recovery fence disappeared without becoming complete",
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        NativeSessionRecoveryProgress::Complete => {}
+    }
     io.observe(NativeIoOperation::PresentedPlaneRebase);
     io.observe(NativeIoOperation::ExplicitSyncRearm);
     io.observe(NativeIoOperation::ExplicitSyncNotifier);
@@ -121,7 +145,22 @@ pub(crate) fn recover_native_output(io: &mut impl NativeSessionIo) -> NativeResu
     io.observe(NativeIoOperation::SchedulerRearm);
     io.rearm_scheduler()?;
     io.observe(NativeIoOperation::InputResume);
-    io.resume_input()
+    io.resume_input()?;
+    Ok(NativeSessionRecoveryProgress::Complete)
+}
+
+pub(crate) fn recover_native_output(
+    io: &mut impl NativeSessionIo,
+) -> NativeResult<NativeSessionRecoveryProgress> {
+    io.observe(NativeIoOperation::KmsRecovery);
+    io.recover_kms_pipeline()?;
+    finish_native_output_recovery(io)
+}
+
+pub(crate) fn continue_native_output_recovery(
+    io: &mut impl NativeSessionIo,
+) -> NativeResult<NativeSessionRecoveryProgress> {
+    finish_native_output_recovery(io)
 }
 
 pub(crate) fn service_suspended_sources(
@@ -339,11 +378,14 @@ impl NativeSessionIo for NativeRuntime {
         Ok(())
     }
 
-    fn retire_quarantined_pageflip(&mut self) -> NativeResult<()> {
+    fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress> {
         let recovery = self.pending_session_recovery.as_ref().ok_or_else(|| {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
-        self.scanout.complete_session_recovery(recovery.scanout)?;
+        let recovery_progress = self.scanout.complete_session_recovery(recovery.scanout)?;
+        if recovery_progress != NativeSessionRecoveryProgress::Complete {
+            return Ok(recovery_progress);
+        }
         self.confirmed_output_presentation = ConfirmedOutputPresentationState::default();
         self.submitted_worker_ownership.clear();
         self.worker_quarantine.jobs.clear();
@@ -435,7 +477,29 @@ impl NativeSessionIo for NativeRuntime {
                 NativePerfField::u64("snapshot_revision_after", self.presented_planes.revision.get()),
             ]
         });
-        Ok(())
+        Ok(NativeSessionRecoveryProgress::Complete)
+    }
+
+    fn register_suspended_recovery_fence(
+        &mut self,
+    ) -> NativeResult<NativeSessionRecoveryFenceRegistration> {
+        if self.output_render_fence_token.is_some() {
+            return Ok(NativeSessionRecoveryFenceRegistration::Registered);
+        }
+        let Some(fd) = self
+            .scanout
+            .explicit_output_swapchain()
+            .map(|swapchain| swapchain.suspended_fence_fd())
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(NativeSessionRecoveryFenceRegistration::AlreadySignaled);
+        };
+        self.output_render_fence_token = Some(
+            self.event_loop
+                .register(fd, NativeEventSource::OutputRenderFence)?,
+        );
+        Ok(NativeSessionRecoveryFenceRegistration::Registered)
     }
 
     fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
@@ -569,6 +633,8 @@ impl NativeSessionIo for NativeRuntime {
 mod tests {
     use std::{cell::RefCell, io, rc::Rc};
 
+    use crate::native_output::runtime::session::NativeSessionState;
+
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +651,7 @@ mod tests {
         DisableAck,
         KmsRecovery,
         PageflipRetire,
+        SuspendedFenceWatch,
         ExplicitSyncRearm,
         CursorRecover,
         DrmRegister,
@@ -612,6 +679,11 @@ mod tests {
         operations: Vec<Operation>,
         native_io: NativeIoRecorder,
         recovery_fails: bool,
+        suspended_fences_remaining: usize,
+        suspended_fence_watch_count: usize,
+        suspended_fence_query_fails: bool,
+        suspended_fence_signaled_during_registration: bool,
+        recovery_completed: bool,
     }
 
     struct DestructionRecorder {
@@ -649,8 +721,8 @@ mod tests {
         fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
             Ok(())
         }
-        fn retire_quarantined_pageflip(&mut self) -> NativeResult<()> {
-            Ok(())
+        fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress> {
+            Ok(NativeSessionRecoveryProgress::Complete)
         }
         fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
             Ok(())
@@ -753,9 +825,31 @@ mod tests {
                 Ok(())
             }
         }
-        fn retire_quarantined_pageflip(&mut self) -> NativeResult<()> {
+        fn retire_quarantined_pageflip(&mut self) -> NativeResult<NativeSessionRecoveryProgress> {
+            if self.recovery_completed {
+                return Err(io::Error::other("duplicate suspended recovery retirement").into());
+            }
             self.push(Operation::PageflipRetire);
-            Ok(())
+            if self.suspended_fence_query_fails {
+                return Err(io::Error::other("injected suspended fence query failure").into());
+            }
+            if self.suspended_fences_remaining > 0 {
+                Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence)
+            } else {
+                self.recovery_completed = true;
+                Ok(NativeSessionRecoveryProgress::Complete)
+            }
+        }
+        fn register_suspended_recovery_fence(
+            &mut self,
+        ) -> NativeResult<NativeSessionRecoveryFenceRegistration> {
+            self.push(Operation::SuspendedFenceWatch);
+            self.suspended_fence_watch_count += 1;
+            if self.suspended_fence_signaled_during_registration {
+                self.suspended_fences_remaining = 0;
+                return Ok(NativeSessionRecoveryFenceRegistration::AlreadySignaled);
+            }
+            Ok(NativeSessionRecoveryFenceRegistration::Registered)
         }
         fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
             self.push(Operation::ExplicitSyncRearm);
@@ -963,6 +1057,121 @@ mod tests {
             .position(|operation| *operation == NativeIoOperation::ExplicitSyncRearm)
             .expect("recovery must observe explicit-sync rearm");
         assert!(baseline < rearm);
+    }
+
+    #[test]
+    fn unsignaled_suspended_fence_keeps_resume_pending_instead_of_failing() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        lifecycle.begin_for_event(NativeSeatEvent::Disabled);
+        lifecycle.finish_suspend();
+        assert_eq!(
+            lifecycle.begin_for_event(NativeSeatEvent::Enabled),
+            Some(NativeSessionTransition::BeginResume)
+        );
+        let mut recorder = Recorder {
+            suspended_fences_remaining: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::WaitingForSuspendedFence
+        );
+        assert_eq!(lifecycle.state(), NativeSessionState::Resuming);
+        assert!(!recorder.operations.contains(&Operation::InputResume));
+        assert_eq!(recorder.suspended_fence_watch_count, 1);
+        assert!(!recorder.operations.contains(&Operation::PageflipSubmit));
+        assert!(!recorder.operations.contains(&Operation::ScanoutPresent));
+    }
+
+    #[test]
+    fn already_signaled_recovery_fence_completes_during_watch_installation() {
+        let mut recorder = Recorder {
+            suspended_fences_remaining: 1,
+            suspended_fence_signaled_during_registration: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::Complete
+        );
+        assert!(recorder.operations.contains(&Operation::ExplicitSyncRearm));
+        assert_eq!(recorder.operations.last(), Some(&Operation::InputResume));
+    }
+
+    #[test]
+    fn suspended_recovery_waits_for_each_fence_before_rebinding_generation() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+        lifecycle.begin_for_event(NativeSeatEvent::Disabled);
+        lifecycle.finish_suspend();
+        lifecycle.begin_for_event(NativeSeatEvent::Enabled);
+        let mut recorder = Recorder {
+            suspended_fences_remaining: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::WaitingForSuspendedFence
+        );
+        assert_eq!(recorder.suspended_fence_watch_count, 1);
+        assert!(!recorder.operations.contains(&Operation::ExplicitSyncRearm));
+        assert!(!lifecycle.permits_output());
+
+        recorder.suspended_fences_remaining = 1;
+        assert_eq!(
+            continue_native_output_recovery(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::WaitingForSuspendedFence
+        );
+        assert_eq!(recorder.suspended_fence_watch_count, 2);
+        assert!(!recorder.operations.contains(&Operation::InputResume));
+
+        recorder.suspended_fences_remaining = 0;
+        assert_eq!(
+            continue_native_output_recovery(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::Complete
+        );
+        lifecycle.finish_resume();
+        assert!(lifecycle.permits_output());
+        assert_eq!(recorder.operations.last(), Some(&Operation::InputResume));
+        assert!(recorder.operations.contains(&Operation::ExplicitSyncRearm));
+    }
+
+    #[test]
+    fn duplicate_suspended_recovery_wake_cannot_retire_again() {
+        let mut recorder = Recorder::default();
+        assert_eq!(
+            recover_native_output(&mut recorder).unwrap(),
+            NativeSessionRecoveryProgress::Complete
+        );
+        let retirements = recorder
+            .operations
+            .iter()
+            .filter(|operation| **operation == Operation::PageflipRetire)
+            .count();
+
+        assert!(continue_native_output_recovery(&mut recorder).is_err());
+        assert_eq!(
+            recorder
+                .operations
+                .iter()
+                .filter(|operation| **operation == Operation::PageflipRetire)
+                .count(),
+            retirements
+        );
+    }
+
+    #[test]
+    fn suspended_fence_query_error_remains_fatal() {
+        let mut recorder = Recorder {
+            suspended_fence_query_fails: true,
+            ..Default::default()
+        };
+
+        assert!(recover_native_output(&mut recorder).is_err());
+        assert!(!recorder.operations.contains(&Operation::InputResume));
+        assert!(!recorder.operations.contains(&Operation::ExplicitSyncRearm));
     }
 
     #[test]

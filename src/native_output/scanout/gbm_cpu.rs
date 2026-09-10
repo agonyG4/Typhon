@@ -447,7 +447,7 @@ impl NativeGbmScanout {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: NativeIndexedScanoutRecovery,
-    ) -> io::Result<()> {
+    ) -> io::Result<NativeSessionRecoveryProgress> {
         self.deferred_promotion_token = None;
         let framebuffer_ids = self
             .buffers
@@ -461,6 +461,7 @@ impl NativeGbmScanout {
             &mut self.pending_index,
             recovery,
         )
+        .map(|()| NativeSessionRecoveryProgress::Complete)
     }
 
     pub(crate) fn rebind_session_generation(&mut self, generation: u64) {

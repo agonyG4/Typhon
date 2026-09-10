@@ -8,10 +8,18 @@ use super::super::presentation_transactions::{
 };
 use super::direct_rejection::WorkerRejectionKind;
 use crate::native_output::scanout::{AtomicEglGbmScanout, FrozenCursorPlaneOwner};
+use std::os::fd::OwnedFd;
+
+fn take_primary_submission_fence(job: &mut KmsCommitJob) -> Option<OwnedFd> {
+    match &mut job.primary {
+        KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
+        KmsPrimaryUpdate::Unchanged => None,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_parts(
-    job: KmsCommitJob,
+    mut job: KmsCommitJob,
     drop_reason: OutputTransactionDropReason,
     scene_history: &mut NativeSceneHistory,
     scanout: &mut AtomicEglGbmScanout,
@@ -44,6 +52,8 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
                     PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                 )
             });
+    let completion_fence =
+        (!compatibility_primary).then(|| take_primary_submission_fence(&mut job));
     if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
         let cursor = atomic_cursor
             .as_mut()
@@ -83,7 +93,7 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             .into());
         } else {
             scanout
-                .suspend_abandon_worker_submission(job.token)
+                .suspend_abandon_worker_submission(job.token, completion_fence.flatten())
                 .map_err(io::Error::other)?;
         }
     }
@@ -287,10 +297,7 @@ impl NativeRuntime {
             if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
                 && !compatibility_primary
             {
-                match &mut job.primary {
-                    KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
-                    KmsPrimaryUpdate::Unchanged => None,
-                }
+                take_primary_submission_fence(&mut job)
             } else {
                 None
             };
@@ -540,7 +547,7 @@ impl NativeRuntime {
 
     pub(crate) fn drop_queued_worker_job_with_reason(
         &mut self,
-        job: KmsCommitJob,
+        mut job: KmsCommitJob,
         drop_reason: OutputTransactionDropReason,
     ) -> NativeResult<()> {
         self.scene_history.discard_submission(job.token.get());
@@ -564,6 +571,8 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
+        let completion_fence =
+            (!compatibility_primary).then(|| take_primary_submission_fence(&mut job));
         if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
@@ -606,7 +615,7 @@ impl NativeRuntime {
                     .map_err(io::Error::other)?;
             } else {
                 self.scanout
-                    .suspend_abandon_worker_submission(job.token)
+                    .suspend_abandon_worker_submission(job.token, completion_fence.flatten())
                     .map_err(io::Error::other)?;
             }
         }
@@ -846,6 +855,29 @@ mod ownership_tests {
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(fd >= 0);
         unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn returned_primary_job_keeps_its_input_fence_for_suspend_proof() {
+        let mut job = embedded_job(8800, CursorPlaneAssignment::Unchanged, None);
+        let input_fence_fd = match &job.primary {
+            KmsPrimaryUpdate::Framebuffer {
+                in_fence: Some(fence),
+                ..
+            } => fence.as_raw_fd(),
+            _ => panic!("test job has no primary input fence"),
+        };
+
+        let input_fence = take_primary_submission_fence(&mut job);
+
+        assert_eq!(
+            input_fence.map(|fence| fence.as_raw_fd()),
+            Some(input_fence_fd)
+        );
+        assert!(matches!(
+            job.primary,
+            KmsPrimaryUpdate::Framebuffer { in_fence: None, .. }
+        ));
     }
 
     #[test]

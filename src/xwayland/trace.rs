@@ -8,11 +8,20 @@ use std::{
 static TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_TRACE_RECORDS_PER_PROCESS: u64 = 20_000;
 const MAX_LIFECYCLE_RECORDS: usize = 4_096;
+const MAX_LIFECYCLE_BYTES: usize = 512 * 1024;
+const MAX_LIFECYCLE_LINE_BYTES: usize = 1_024;
+const MAX_LIFECYCLE_FIELD_BYTES: usize = 128;
 static TRACE_RECORDS_EMITTED: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECORDS_EMITTED: AtomicU64 = AtomicU64::new(0);
 static TRACE_RECORDS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
-static LIFECYCLE_RECORDS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static LIFECYCLE_RECORDS: OnceLock<Mutex<LifecycleRecords>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct LifecycleRecords {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceCategory {
@@ -73,9 +82,15 @@ where
         TRACE_RECORDS_EMITTED.fetch_add(1, Ordering::Relaxed)
     };
     let monotonic_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
-    let line = render_line(trace_seq, monotonic_ns, event, &fields());
+    let fields = fields();
+    let line = render_line(trace_seq, monotonic_ns, event, &fields);
     if lifecycle {
-        retain_lifecycle_line(line.clone());
+        retain_lifecycle_line(&render_lifecycle_line(
+            trace_seq,
+            monotonic_ns,
+            event,
+            &fields,
+        ));
     }
     if !trace_enabled {
         return;
@@ -92,11 +107,13 @@ pub fn suppressed_records() -> u64 {
 }
 
 pub fn take_recent_lifecycle_trace() -> Vec<String> {
-    let records = LIFECYCLE_RECORDS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let records = LIFECYCLE_RECORDS.get_or_init(|| Mutex::new(LifecycleRecords::default()));
     let mut records = records
         .lock()
         .expect("XWayland trace lifecycle mutex poisoned");
-    std::mem::take(&mut *records).into_iter().collect()
+    let lines = std::mem::take(&mut records.lines);
+    records.bytes = 0;
+    lines.into_iter().collect()
 }
 
 pub fn render_line(trace_seq: u64, monotonic_ns: u64, event: &str, fields: &TraceFields) -> String {
@@ -142,15 +159,60 @@ fn trace_output_allowed(lifecycle: bool, output_index: u64) -> bool {
     output_index < limit
 }
 
-fn retain_lifecycle_line(line: String) {
-    let records = LIFECYCLE_RECORDS.get_or_init(|| Mutex::new(VecDeque::new()));
+fn render_lifecycle_line(
+    trace_seq: u64,
+    monotonic_ns: u64,
+    event: &str,
+    fields: &TraceFields,
+) -> String {
+    let mut line = format!(
+        "oblivion-one xwayland: trace_seq={trace_seq} monotonic_ns={monotonic_ns} x_event_type={event}"
+    );
+    for (key, value) in &fields.entries {
+        let value = truncate_text(value, MAX_LIFECYCLE_FIELD_BYTES);
+        let _ = write!(line, " {key}={}", encode_value(&value));
+    }
+    line
+}
+
+fn retain_lifecycle_line(line: &str) {
+    let line = truncate_text(line, MAX_LIFECYCLE_LINE_BYTES);
+    let line_bytes = line.len();
+    if line_bytes > MAX_LIFECYCLE_BYTES {
+        return;
+    }
+    let records = LIFECYCLE_RECORDS.get_or_init(|| Mutex::new(LifecycleRecords::default()));
     let mut records = records
         .lock()
         .expect("XWayland trace lifecycle mutex poisoned");
-    if records.len() == MAX_LIFECYCLE_RECORDS {
-        records.pop_front();
+    while (records.lines.len() >= MAX_LIFECYCLE_RECORDS
+        || records.bytes.saturating_add(line_bytes) > MAX_LIFECYCLE_BYTES)
+        && !records.lines.is_empty()
+    {
+        if let Some(old) = records.lines.pop_front() {
+            records.bytes = records.bytes.saturating_sub(old.len());
+        }
     }
-    records.push_back(line);
+    records.bytes = records.bytes.saturating_add(line_bytes);
+    records.lines.push_back(line);
+}
+
+fn truncate_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    const SUFFIX: &str = "…";
+    let end_limit = max_bytes.saturating_sub(SUFFIX.len());
+    let end = value
+        .char_indices()
+        .take_while(|(index, _)| *index <= end_limit)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    let mut truncated = String::with_capacity(end.saturating_add(SUFFIX.len()));
+    truncated.push_str(&value[..end]);
+    truncated.push_str(SUFFIX);
+    truncated
 }
 
 #[cfg(test)]
@@ -168,22 +230,24 @@ mod tests {
     }
 
     fn reset_retention_for_test() {
-        LIFECYCLE_RECORDS
-            .get_or_init(|| Mutex::new(VecDeque::new()))
+        let mut records = LIFECYCLE_RECORDS
+            .get_or_init(|| Mutex::new(LifecycleRecords::default()))
             .lock()
-            .expect("trace retention mutex")
-            .clear();
+            .expect("trace retention mutex");
+        records.lines.clear();
+        records.bytes = 0;
     }
 
     fn retain_lifecycle_for_test(line: String) {
-        retain_lifecycle_line(line);
+        retain_lifecycle_line(&line);
     }
 
     fn recent_lifecycle_records_for_test() -> Vec<String> {
         LIFECYCLE_RECORDS
-            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .get_or_init(|| Mutex::new(LifecycleRecords::default()))
             .lock()
             .expect("trace retention mutex")
+            .lines
             .iter()
             .cloned()
             .collect()
@@ -227,6 +291,32 @@ mod tests {
         assert!(!trace_output_allowed(false, MAX_TRACE_RECORDS_PER_PROCESS));
         assert!(trace_output_allowed(true, MAX_LIFECYCLE_RECORDS as u64 - 1));
         assert!(!trace_output_allowed(true, MAX_LIFECYCLE_RECORDS as u64));
+    }
+
+    #[test]
+    fn lifecycle_retention_is_bounded_for_pathological_text_properties() {
+        let _guard = test_lock();
+        reset_retention_for_test();
+        const TEST_BYTE_BUDGET: usize = 512 * 1024;
+        let pathological = "x".repeat(64 * 1024);
+        let fields = TraceFields::new()
+            .field("app_id", pathological.clone())
+            .field("title", pathological.clone());
+        let full_line = render_line(1, 2, "window_state", &fields);
+        let retained_line = render_lifecycle_line(1, 2, "window_state", &fields);
+        assert!(full_line.len() > MAX_LIFECYCLE_LINE_BYTES);
+        assert!(retained_line.len() <= MAX_LIFECYCLE_LINE_BYTES);
+        assert!(retained_line.contains("app_id="));
+        assert!(retained_line.contains("title="));
+        for index in 0..16 {
+            retain_lifecycle_for_test(format!(
+                "window-{index} app_id={pathological} title={pathological}"
+            ));
+        }
+
+        let retained = recent_lifecycle_records_for_test();
+        assert!(retained.iter().all(|line| line.len() <= 1024));
+        assert!(retained.iter().map(String::len).sum::<usize>() <= TEST_BYTE_BUDGET);
     }
 
     #[test]

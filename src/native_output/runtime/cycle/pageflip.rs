@@ -277,6 +277,14 @@ impl NativeRuntime {
         let deferred_worker_completion = self.deferred_worker_completion.take();
         let worker_timeout_pending = self.worker_timeout_pending.take();
         self.dispatch_runtime_seat_events(&wakeup)?;
+        let resuming_recovery_wake =
+            wakeup.reasons.output_render_fence() && self.session.is_resuming();
+        if resuming_recovery_wake {
+            if let Some(token) = self.output_render_fence_token.take() {
+                self.event_loop.unregister(token)?;
+            }
+            self.continue_native_session_recovery()?;
+        }
         if self.session.permits_output()
             && (wakeup.reasons.drm()
                 || (wakeup.reasons.timer()
@@ -380,7 +388,7 @@ impl NativeRuntime {
                 ]
             });
         }
-        if wakeup.reasons.output_render_fence() {
+        if wakeup.reasons.output_render_fence() && !resuming_recovery_wake {
             if let Some(token) = output_render_fence_token.take() {
                 event_loop.unregister(token)?;
             }

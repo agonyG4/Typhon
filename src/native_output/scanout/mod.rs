@@ -458,7 +458,7 @@ impl NativeScanoutBackend {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: NativeScanoutRecovery,
-    ) -> io::Result<()> {
+    ) -> io::Result<NativeSessionRecoveryProgress> {
         match (self, recovery) {
             (Self::AtomicEglGbm(scanout), NativeScanoutRecovery::AtomicEglGbm(recovery)) => {
                 scanout.complete_session_recovery(recovery)
@@ -472,7 +472,7 @@ impl NativeScanoutBackend {
             (Self::Dumb(framebuffer), NativeScanoutRecovery::Dumb(recovery))
                 if framebuffer.fb_id == recovery.get() =>
             {
-                Ok(())
+                Ok(NativeSessionRecoveryProgress::Complete)
             }
             _ => Err(io::Error::other(
                 "scanout recovery token does not match the active backend",

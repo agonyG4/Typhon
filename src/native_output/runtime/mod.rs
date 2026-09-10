@@ -141,8 +141,9 @@ pub(crate) use session::{
 #[cfg(test)]
 pub(crate) use session_io::NativeIoRecorder;
 pub(crate) use session_io::{
-    NativeIoOperation, NativeSessionIo, NativeSuspendedReadiness, quiesce_and_acknowledge,
-    recover_native_output, service_suspended_sources, teardown_without_drm_io,
+    NativeIoOperation, NativeSessionIo, NativeSuspendedReadiness, continue_native_output_recovery,
+    quiesce_and_acknowledge, recover_native_output, service_suspended_sources,
+    teardown_without_drm_io,
 };
 pub(crate) use shutdown::{
     NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,

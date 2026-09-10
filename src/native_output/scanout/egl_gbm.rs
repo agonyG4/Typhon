@@ -640,10 +640,11 @@ impl NativeEglGbmScanout {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: NativePageFlipRecovery,
-    ) -> io::Result<()> {
+    ) -> io::Result<NativeSessionRecoveryProgress> {
         self.deferred_promotion_token = None;
         self.buffers
             .complete_session_recovery(recovery, |buffer| buffer.fb_id)
+            .map(|()| NativeSessionRecoveryProgress::Complete)
     }
 
     pub(crate) fn finish_initial_scanout(&mut self) {

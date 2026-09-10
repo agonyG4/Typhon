@@ -120,6 +120,10 @@ impl NativeSessionLifecycle {
         self.state.permits_output()
     }
 
+    pub(crate) const fn is_resuming(self) -> bool {
+        matches!(self.state, NativeSessionState::Resuming)
+    }
+
     pub(crate) fn begin_for_event(
         &mut self,
         event: NativeSeatEvent,

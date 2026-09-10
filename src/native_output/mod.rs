@@ -96,6 +96,18 @@ use std::sync::Mutex;
 
 type NativeResult<T> = Result<T, Box<dyn Error>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSessionRecoveryProgress {
+    Complete,
+    WaitingForSuspendedFence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSessionRecoveryFenceRegistration {
+    Registered,
+    AlreadySignaled,
+}
+
 #[cfg(test)]
 pub(crate) static ASTREA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
