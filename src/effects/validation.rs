@@ -14,6 +14,27 @@ pub struct ValidatedEffectProgram {
     pub requires_offscreen: bool,
     pub requires_composition: bool,
     pub estimated_passes: u16,
+    pub(crate) lowering: ValidatedEffectLowering,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ValidatedEffectLowering {
+    pub(crate) steps: Vec<ValidatedEffectStep>,
+    pub(crate) output_slot: usize,
+    pub(crate) uses_backdrop: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ValidatedEffectStep {
+    pub(crate) node_index: usize,
+    pub(crate) input_slots: Vec<usize>,
+    pub(crate) stage_footprint: EffectFootprint,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedNodeMetadata {
+    declaration_index: usize,
+    stage_footprint: EffectFootprint,
 }
 
 pub fn validate_effect_program(
@@ -24,8 +45,8 @@ pub fn validate_effect_program(
     }
 
     let mut nodes = HashMap::with_capacity(program.nodes.len());
-    for node in &program.nodes {
-        if nodes.insert(node.id, node).is_some() {
+    for (declaration_index, node) in program.nodes.iter().enumerate() {
+        if nodes.insert(node.id, declaration_index).is_some() {
             return Err(EffectValidationError::DuplicateNodeId(node.id));
         }
     }
@@ -33,7 +54,9 @@ pub fn validate_effect_program(
         return Err(EffectValidationError::MissingOutputNode);
     }
 
-    for node in &program.nodes {
+    let mut validated_nodes = HashMap::with_capacity(program.nodes.len());
+    let mut uses_backdrop = false;
+    for (declaration_index, node) in program.nodes.iter().enumerate() {
         if let EffectNodeKind::Source(EffectSource::StaticTexture(id)) = node.kind {
             return Err(EffectValidationError::UnsupportedStaticTexture(id));
         }
@@ -55,7 +78,15 @@ pub fn validate_effect_program(
                 return Err(EffectValidationError::MissingInputNode(*input));
             }
         }
-        node_footprint(&node.kind)?;
+        let stage_footprint = node_footprint(&node.kind)?;
+        uses_backdrop |= matches!(node.kind, EffectNodeKind::Source(EffectSource::Backdrop));
+        validated_nodes.insert(
+            node.id,
+            ValidatedNodeMetadata {
+                declaration_index,
+                stage_footprint,
+            },
+        );
     }
 
     let mut indegree: HashMap<EffectNodeId, usize> = program
@@ -97,11 +128,31 @@ pub fn validate_effect_program(
         return Err(EffectValidationError::Cycle);
     }
 
+    let mut slot_by_id = HashMap::with_capacity(topological_order.len());
+    for (slot, id) in topological_order.iter().copied().enumerate() {
+        slot_by_id.insert(id, slot);
+    }
+    let lowering_steps = topological_order
+        .iter()
+        .map(|id| {
+            let metadata = validated_nodes[id];
+            let node = &program.nodes[metadata.declaration_index];
+            let input_slots = node.inputs.iter().map(|input| slot_by_id[input]).collect();
+            ValidatedEffectStep {
+                node_index: metadata.declaration_index,
+                input_slots,
+                stage_footprint: metadata.stage_footprint,
+            }
+        })
+        .collect();
+    let output_slot = slot_by_id[&program.output];
+
     let mut aggregate = HashMap::with_capacity(program.nodes.len());
     let mut estimated_passes = 0u16;
     for id in &topological_order {
-        let node = nodes[id];
-        let stage = node_footprint(&node.kind)?;
+        let metadata = validated_nodes[id];
+        let node = &program.nodes[metadata.declaration_index];
+        let stage = metadata.stage_footprint;
         let input_footprint = node
             .inputs
             .iter()
@@ -138,6 +189,11 @@ pub fn validate_effect_program(
         requires_offscreen: requires_composition,
         requires_composition,
         estimated_passes,
+        lowering: ValidatedEffectLowering {
+            steps: lowering_steps,
+            output_slot,
+            uses_backdrop,
+        },
     })
 }
 
@@ -271,13 +327,96 @@ mod tests {
 
     #[test]
     fn validation_order_is_deterministic_when_declarations_are_reordered() {
-        let mut first = test_backdrop_blur_program();
+        let first = test_backdrop_blur_program();
         let mut second = first.clone();
         second.nodes.reverse();
-        first.nodes.swap(0, 1);
+        let first = validate_effect_program(first).unwrap();
+        let second = validate_effect_program(second).unwrap();
+        assert_eq!(first.topological_order, second.topological_order);
+        assert_eq!(first.lowering.steps.len(), first.program.nodes.len());
+        assert_eq!(first.lowering.steps.len(), first.topological_order.len());
         assert_eq!(
-            validate_effect_program(first).unwrap().topological_order,
-            validate_effect_program(second).unwrap().topological_order
+            first
+                .lowering
+                .steps
+                .iter()
+                .map(|step| step.input_slots.clone())
+                .collect::<Vec<_>>(),
+            second
+                .lowering
+                .steps
+                .iter()
+                .map(|step| step.input_slots.clone())
+                .collect::<Vec<_>>()
         );
+        for (slot, step) in first.lowering.steps.iter().enumerate() {
+            assert!(step.node_index < first.program.nodes.len());
+            assert!(step.input_slots.iter().all(|input_slot| *input_slot < slot));
+        }
+        assert!(first.lowering.output_slot < first.lowering.steps.len());
+        assert!(first.lowering.uses_backdrop);
+    }
+
+    #[test]
+    fn sparse_node_ids_use_dense_lowering_slots() {
+        let source = EffectNodeId::new(1).unwrap();
+        let tint = EffectNodeId::new(30_000).unwrap();
+        let noise = EffectNodeId::new(u16::MAX).unwrap();
+        let program = EffectProgram {
+            id: EffectProgramId::new(2).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::TargetContent),
+                EffectNode::tint(tint, source, TintSpec::WHITE),
+                EffectNode::noise(noise, tint, NoiseSpec::new(NoiseKind::Hash, 0.1).unwrap()),
+            ],
+            output: noise,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+
+        let validated = validate_effect_program(program).unwrap();
+
+        assert_eq!(validated.lowering.steps.len(), 3);
+        assert_eq!(
+            validated
+                .lowering
+                .steps
+                .iter()
+                .map(|step| step.node_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            validated
+                .lowering
+                .steps
+                .iter()
+                .map(|step| step.input_slots.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![], vec![0], vec![1]]
+        );
+        assert_eq!(validated.lowering.output_slot, 2);
+        assert!(!validated.lowering.uses_backdrop);
+    }
+
+    #[test]
+    fn changed_program_topology_gets_fresh_lowering_metadata() {
+        let original = validate_effect_program(test_backdrop_blur_program()).unwrap();
+        let source = original.program.nodes[0].id;
+        let mut changed_program = original.program.clone();
+        changed_program.id = EffectProgramId::new(3).unwrap();
+        changed_program.nodes.truncate(1);
+        changed_program.output = source;
+
+        let changed = validate_effect_program(changed_program).unwrap();
+
+        assert_eq!(original.lowering.steps.len(), 2);
+        assert_eq!(changed.lowering.steps.len(), 1);
+        assert_ne!(original.lowering, changed.lowering);
+        assert_eq!(original.lowering.steps.len(), 2);
+        assert_eq!(original.lowering.output_slot, 1);
     }
 }

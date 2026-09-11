@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Write as _, num::NonZeroU16};
+use std::{fmt::Write as _, num::NonZeroU16};
 
 use crate::compositor::{
     EffectAnchor, EffectAnchorScope, ResolvedEffectInstance, ResolvedEffectScene, VisualGroupId,
@@ -9,7 +9,8 @@ use super::{
     BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
     EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
     EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectSource, EffectValidationError,
-    EffectWorkingSpace, ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
+    EffectWorkingSpace, MAX_EFFECT_PROGRAM_NODES, ValidatedEffectProgram, plan_effect_damage,
+    validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -47,8 +48,15 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CHECKPOINT_INTERSECTION_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn reset_peak_live_work_counters() {
     PEAK_LIVE_WORK_COUNTERS.with(|counters| counters.set(PeakLiveWorkCounters::default()));
+    CHECKPOINT_INTERSECTION_CHECKS.with(|checks| checks.set(0));
 }
 
 #[cfg(test)]
@@ -111,21 +119,13 @@ fn note_node_visit() {
 }
 
 #[cfg(test)]
-fn note_program_lookup_map_build() {
-    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.program_lookup_map_builds += 1;
-        counters.set(value);
-    });
+fn note_checkpoint_intersection_check() {
+    CHECKPOINT_INTERSECTION_CHECKS.with(|checks| checks.set(checks.get() + 1));
 }
 
 #[cfg(test)]
-fn note_output_map_build() {
-    PEAK_LIVE_WORK_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.output_map_builds += 1;
-        counters.set(value);
-    });
+fn checkpoint_intersection_checks() -> usize {
+    CHECKPOINT_INTERSECTION_CHECKS.with(std::cell::Cell::get)
 }
 
 pub fn builtin_background_blur_program_id() -> EffectProgramId {
@@ -766,24 +766,20 @@ pub fn compile_frame_execution_plan(
             output_bounds,
         );
         final_damage = final_damage.union(&effect_damage.output_damage);
-        let dependencies = checkpoints
-            .iter()
-            .filter(|(_, region, _)| region.intersects(&effect_damage.capture_region))
-            .map(|(pass, _, _)| *pass)
-            .collect::<Vec<_>>();
-        let dependency_instances = if program
-            .program
-            .nodes
-            .iter()
-            .any(|node| matches!(node.kind, EffectNodeKind::Source(EffectSource::Backdrop)))
-        {
-            checkpoints
-                .iter()
-                .filter(|(_, region, _)| region.intersects(&effect_damage.capture_region))
-                .map(|(_, _, instance_id)| *instance_id)
-                .collect::<Vec<_>>()
+        let (dependencies, dependency_instances) = if program.lowering.uses_backdrop {
+            let mut dependencies = Vec::new();
+            let mut dependency_instances = Vec::new();
+            for (pass, region, instance_id) in &checkpoints {
+                #[cfg(test)]
+                note_checkpoint_intersection_check();
+                if region.intersects(&effect_damage.capture_region) {
+                    dependencies.push(*pass);
+                    dependency_instances.push(*instance_id);
+                }
+            }
+            (dependencies, dependency_instances)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let checkpoint = compile_instance(
             &mut builder,
@@ -1001,6 +997,34 @@ struct InstanceCompilePlan<'a> {
     checkpoint_dependencies: &'a [GraphPassId],
 }
 
+fn resolve_output(
+    outputs: &[Option<GraphTextureId>; MAX_EFFECT_PROGRAM_NODES],
+    slot: usize,
+    node: EffectNodeId,
+) -> Result<GraphTextureId, RenderGraphCompileError> {
+    outputs
+        .get(slot)
+        .copied()
+        .flatten()
+        .ok_or(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingInputNode(node),
+        ))
+}
+
+fn store_output(
+    outputs: &mut [Option<GraphTextureId>; MAX_EFFECT_PROGRAM_NODES],
+    slot: usize,
+    texture: GraphTextureId,
+) -> Result<(), RenderGraphCompileError> {
+    let output = outputs
+        .get_mut(slot)
+        .ok_or(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingOutputNode,
+        ))?;
+    *output = Some(texture);
+    Ok(())
+}
+
 fn compile_instance(
     builder: &mut GraphBuilder,
     output_texture: GraphTextureId,
@@ -1016,28 +1040,15 @@ fn compile_instance(
         output_bounds,
         checkpoint_dependencies,
     } = plan;
-    let nodes = program
-        .program
-        .nodes
-        .iter()
-        .map(|node| (node.id, node))
-        .collect::<HashMap<_, _>>();
-    #[cfg(test)]
-    note_program_lookup_map_build();
     let visual_group = instance.visual_group;
-    let mut outputs = HashMap::<EffectNodeId, GraphTextureId>::new();
-    #[cfg(test)]
-    note_output_map_build();
+    let mut outputs = [None; MAX_EFFECT_PROGRAM_NODES];
 
-    for node_id in &program.topological_order {
+    for (slot, step) in program.lowering.steps.iter().enumerate() {
         #[cfg(test)]
         note_node_visit();
-        let node = nodes
-            .get(node_id)
-            .copied()
-            .ok_or(RenderGraphCompileError::InvalidGraph(
-                EffectValidationError::MissingOutputNode,
-            ))?;
+        let node = program.program.nodes.get(step.node_index).ok_or(
+            RenderGraphCompileError::InvalidGraph(EffectValidationError::MissingOutputNode),
+        )?;
         match &node.kind {
             EffectNodeKind::Source(source) => {
                 if let EffectSource::StaticTexture(id) = source {
@@ -1098,10 +1109,15 @@ fn compile_instance(
                     }
                     capture_pass.visual_group = visual_group;
                 }
-                outputs.insert(node.id, texture);
+                store_output(&mut outputs, slot, texture)?;
             }
             EffectNodeKind::DualKawaseBlur(spec) => {
-                let input = outputs[&node.inputs[0]];
+                let input_slot = step.input_slots.first().copied().ok_or(
+                    RenderGraphCompileError::InvalidGraph(EffectValidationError::MissingInputNode(
+                        node.id,
+                    )),
+                )?;
+                let input = resolve_output(&outputs, input_slot, node.id)?;
                 let input_plan = builder.texture(input);
                 let processing_width = scaled_dimension(input_plan.width, spec.scale);
                 let processing_height = scaled_dimension(input_plan.height, spec.scale);
@@ -1152,7 +1168,7 @@ fn compile_instance(
                     )?;
                     current = texture;
                 }
-                outputs.insert(node.id, current);
+                store_output(&mut outputs, slot, current)?;
             }
             EffectNodeKind::ColorMatrix(_)
             | EffectNodeKind::Tint(_)
@@ -1160,15 +1176,20 @@ fn compile_instance(
             | EffectNodeKind::CustomFragment(_)
             | EffectNodeKind::Blend(_)
             | EffectNodeKind::Mask(_) => {
-                let inputs = node
-                    .inputs
+                let inputs = step
+                    .input_slots
                     .iter()
-                    .map(|input| outputs.get(input).copied())
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(RenderGraphCompileError::InvalidGraph(
-                        EffectValidationError::MissingInputNode(node.id),
-                    ))?;
-                let primary_plan = builder.texture(inputs[0]);
+                    .copied()
+                    .map(|input_slot| resolve_output(&outputs, input_slot, node.id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let primary_input =
+                    inputs
+                        .first()
+                        .copied()
+                        .ok_or(RenderGraphCompileError::InvalidGraph(
+                            EffectValidationError::MissingInputNode(node.id),
+                        ))?;
+                let primary_plan = builder.texture(primary_input);
                 let multi_input = inputs.len() > 1;
                 let mut normalized_inputs = Vec::with_capacity(inputs.len());
                 for input in inputs {
@@ -1190,11 +1211,9 @@ fn compile_instance(
                         primary_plan.height,
                         program.program.working_space,
                     )?;
-                    let stage_footprint = super::footprint::node_footprint(&node.kind)
-                        .map_err(RenderGraphCompileError::InvalidGraph)?;
                     let normalized_damage = output_damage.expand_clamped_xy(
-                        stage_footprint.sample_radius_x,
-                        stage_footprint.sample_radius_y,
+                        step.stage_footprint.sample_radius_x,
+                        step.stage_footprint.sample_radius_y,
                         primary_plan.domain,
                     );
                     builder.add_pass(
@@ -1217,7 +1236,14 @@ fn compile_instance(
                     normalized_inputs.push(normalized);
                 }
                 let inputs = normalized_inputs;
-                let input_plan = builder.texture(inputs[0]);
+                let primary_input =
+                    inputs
+                        .first()
+                        .copied()
+                        .ok_or(RenderGraphCompileError::InvalidGraph(
+                            EffectValidationError::MissingInputNode(node.id),
+                        ))?;
+                let input_plan = builder.texture(primary_input);
                 let output = builder.add_texture_with_layout(
                     GraphTextureSource::Intermediate,
                     input_plan.domain,
@@ -1259,14 +1285,18 @@ fn compile_instance(
                     .last_mut()
                     .expect("stage pass was appended")
                     .visual_group = visual_group;
-                outputs.insert(node.id, output);
+                store_output(&mut outputs, slot, output)?;
             }
         }
     }
 
-    let final_texture = outputs.get(&program.program.output).copied().ok_or(
-        RenderGraphCompileError::InvalidGraph(EffectValidationError::MissingOutputNode),
-    )?;
+    let final_texture = outputs
+        .get(program.lowering.output_slot)
+        .copied()
+        .flatten()
+        .ok_or(RenderGraphCompileError::InvalidGraph(
+            EffectValidationError::MissingOutputNode,
+        ))?;
     let kind = match instance.anchor {
         EffectAnchor::OutputPostProcess => RenderPassKind::OutputPostProcess,
         EffectAnchor::BeforeSurface(_)
@@ -1378,6 +1408,44 @@ mod tests {
         second.region = EffectRegion::from_rect(EffectRect::new(1200, 80, 320, 180).unwrap());
         second.target_bounds = second.region.bounding_rect().unwrap();
         (ResolvedEffectScene::new(1, vec![first, second]), registry)
+    }
+
+    fn test_instance(
+        program: EffectProgramId,
+        id: u64,
+        region: EffectRegion,
+    ) -> ResolvedEffectInstance {
+        ResolvedEffectInstance {
+            id: EffectInstanceId::new(id).expect("test instance id is non-zero"),
+            program,
+            anchor: EffectAnchor::OutputPostProcess,
+            target_bounds: region.bounding_rect().expect("test effect bounds"),
+            region,
+            parameter_block: EffectParameterBlock::default(),
+            signature: id,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            scene_order: EffectSceneOrder::for_anchor(EffectAnchor::OutputPostProcess),
+        }
+    }
+
+    fn target_content_registry() -> EffectRegistry {
+        let source = EffectNodeId::new(1).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(14).unwrap(),
+            nodes: vec![EffectNode::source(source, EffectSource::TargetContent)],
+            output: source,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        registry
     }
 
     fn fused_local_stage_scene(instance_count: usize) -> (ResolvedEffectScene, EffectRegistry) {
@@ -1989,6 +2057,117 @@ mod tests {
     }
 
     #[test]
+    fn target_content_only_effects_skip_backdrop_checkpoint_scans() {
+        let registry = target_content_registry();
+        let program = EffectProgramId::new(14).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![
+                test_instance(program, 1, region.clone()),
+                test_instance(program, 2, region),
+            ],
+        );
+        reset_peak_live_work_counters();
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("target-content effects must compile to an effect graph");
+        };
+
+        assert_eq!(checkpoint_intersection_checks(), 0);
+        assert!(
+            graph
+                .instances
+                .iter()
+                .all(|instance| instance.dependencies.is_empty())
+        );
+        assert!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SurfaceCapture)
+                .all(|pass| pass.checkpoint_dependencies.is_empty())
+        );
+    }
+
+    #[test]
+    fn backdrop_dependency_collection_scans_each_checkpoint_once() {
+        let (scene, registry) = blur_scene();
+        let base = scene.instances[0].clone();
+        let instances = (1..=3)
+            .map(|id| {
+                let mut instance = base.clone();
+                instance.id = EffectInstanceId::new(id).unwrap();
+                instance.signature = id;
+                instance
+            })
+            .collect();
+        let scene = ResolvedEffectScene::new(1, instances);
+        reset_peak_live_work_counters();
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("backdrop effects must compile to an effect graph");
+        };
+
+        assert_eq!(checkpoint_intersection_checks(), 3);
+        assert!(graph.instances[0].dependencies.is_empty());
+        assert_eq!(
+            graph.instances[1].dependencies,
+            vec![EffectInstanceId::new(1).unwrap()]
+        );
+        assert_eq!(
+            graph.instances[2].dependencies,
+            vec![
+                EffectInstanceId::new(1).unwrap(),
+                EffectInstanceId::new(2).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn non_intersecting_backdrop_checkpoints_remain_excluded() {
+        let (scene, registry) = separated_blur_scene();
+        reset_peak_live_work_counters();
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap()),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("separated backdrop effects must compile to an effect graph");
+        };
+
+        assert_eq!(checkpoint_intersection_checks(), 1);
+        assert!(
+            graph
+                .instances
+                .iter()
+                .all(|instance| instance.dependencies.is_empty())
+        );
+        assert!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .all(|pass| pass.checkpoint_dependencies.is_empty())
+        );
+    }
+
+    #[test]
     fn higher_public_child_effect_depends_on_lower_effect_and_its_content() {
         let (base_scene, registry) = blur_scene();
         let program = base_scene.instances[0].program;
@@ -2088,6 +2267,183 @@ mod tests {
         assert!(explanation.contains("capture_scene"));
         assert!(explanation.contains("kawase_down"));
         assert!(!explanation.contains("#version"));
+    }
+
+    #[test]
+    fn sparse_node_ids_compile_with_dense_lowering_storage() {
+        let source = EffectNodeId::new(1).unwrap();
+        let tint = EffectNodeId::new(30_000).unwrap();
+        let noise = EffectNodeId::new(u16::MAX).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(15).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::TargetContent),
+                EffectNode::tint(tint, source, TintSpec::WHITE),
+                EffectNode::noise(noise, tint, NoiseSpec::new(NoiseKind::Hash, 0.1).unwrap()),
+            ],
+            output: noise,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        assert_eq!(program.lowering.steps.len(), 3);
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(15).unwrap(),
+                1,
+                region.clone(),
+            )],
+        );
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("sparse node ids must compile to an effect graph");
+        };
+
+        assert_eq!(graph.stats.effect_instances, 1);
+        assert_eq!(graph.stats.passes, 3);
+        assert_eq!(graph.stats.textures, 4);
+    }
+
+    #[test]
+    fn declaration_order_does_not_change_compiled_graph_semantics() {
+        let backdrop = EffectNodeId::new(1).unwrap();
+        let target = EffectNodeId::new(2).unwrap();
+        let blend = EffectNodeId::new(3).unwrap();
+        let make_program = |nodes| {
+            validate_effect_program(EffectProgram {
+                id: EffectProgramId::new(16).unwrap(),
+                nodes,
+                output: blend,
+                working_space: EffectWorkingSpace::LinearSrgb,
+                alpha_mode: EffectAlphaMode::Preserve,
+                outsets: EffectOutsets::ZERO,
+                frame_demand: EffectFrameDemand::OnDamage,
+                failure_policy: EffectFailurePolicy::Passthrough,
+            })
+            .unwrap()
+        };
+        let first = make_program(vec![
+            EffectNode::source(backdrop, EffectSource::Backdrop),
+            EffectNode::source(target, EffectSource::TargetContent),
+            EffectNode::blend(
+                blend,
+                vec![backdrop, target],
+                BlendSpec::new(BlendMode::SourceOver, 1.0).unwrap(),
+            ),
+        ]);
+        let second = make_program(vec![
+            EffectNode::blend(
+                blend,
+                vec![backdrop, target],
+                BlendSpec::new(BlendMode::SourceOver, 1.0).unwrap(),
+            ),
+            EffectNode::source(target, EffectSource::TargetContent),
+            EffectNode::source(backdrop, EffectSource::Backdrop),
+        ]);
+        assert_eq!(first.topological_order, second.topological_order);
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(16).unwrap(),
+                1,
+                region.clone(),
+            )],
+        );
+        let compile = |program| {
+            let mut registry = EffectRegistry::empty();
+            registry.insert(program).unwrap();
+            let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+                &scene,
+                &region,
+                EffectRect::new(0, 0, 100, 100).unwrap(),
+                &registry,
+            )
+            .unwrap() else {
+                panic!("equivalent programs must compile to an effect graph");
+            };
+            graph
+        };
+
+        assert_eq!(compile(first), compile(second));
+    }
+
+    #[test]
+    fn selected_output_can_precede_an_unrelated_compiled_node() {
+        let source = EffectNodeId::new(1).unwrap();
+        let output = EffectNodeId::new(2).unwrap();
+        let unrelated = EffectNodeId::new(3).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(17).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::TargetContent),
+                EffectNode::tint(output, source, TintSpec::WHITE),
+                EffectNode::source(unrelated, EffectSource::TargetContent),
+            ],
+            output,
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        assert_eq!(program.lowering.output_slot, 1);
+        assert_eq!(program.lowering.steps.len(), 3);
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(17).unwrap(),
+                1,
+                region.clone(),
+            )],
+        );
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("unrelated valid nodes must remain compiled");
+        };
+        let tint_output = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::Fragment
+                    && matches!(pass.stage, Some(EffectNodeKind::Tint(_)))
+            })
+            .and_then(|pass| pass.output)
+            .expect("selected output stage must be compiled");
+        let final_pass = graph.passes.last().expect("final composite pass");
+        assert_eq!(final_pass.inputs, vec![tint_output]);
+        assert_eq!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SurfaceCapture)
+                .count(),
+            2
+        );
+        assert_eq!(graph.stats.passes, 4);
     }
 
     #[test]
@@ -2204,6 +2560,24 @@ mod tests {
             .filter(|pass| pass.kind == RenderPassKind::NormalizeInput)
             .collect::<Vec<_>>();
         assert_eq!(normalize.len(), 2);
+        let source_outputs = graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                matches!(
+                    pass.kind,
+                    RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+                )
+            })
+            .map(|pass| pass.output.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            normalize
+                .iter()
+                .map(|pass| pass.inputs[0])
+                .collect::<Vec<_>>(),
+            source_outputs
+        );
         assert!(
             normalize
                 .iter()
@@ -2216,6 +2590,13 @@ mod tests {
             .unwrap();
         assert_eq!(blend_pass.color_conversion, EffectColorConversion::None);
         assert_eq!(blend_pass.inputs.len(), 2);
+        assert_eq!(
+            blend_pass.inputs,
+            normalize
+                .iter()
+                .map(|pass| pass.output.unwrap())
+                .collect::<Vec<_>>()
+        );
         assert!(blend_pass.inputs.iter().all(|input| {
             graph
                 .textures
@@ -2306,6 +2687,103 @@ mod tests {
                 .rects()
                 .iter()
                 .all(|rect| rect.intersect(normalized_domain).is_some())
+        );
+    }
+
+    #[test]
+    fn custom_fragment_preserves_primary_and_auxiliary_input_order() {
+        let primary = EffectNodeId::new(1).unwrap();
+        let auxiliary_a = EffectNodeId::new(2).unwrap();
+        let auxiliary_b = EffectNodeId::new(3).unwrap();
+        let custom = EffectNodeId::new(4).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(18).unwrap(),
+            nodes: vec![
+                EffectNode::source(primary, EffectSource::Backdrop),
+                EffectNode::source(auxiliary_a, EffectSource::TargetContent),
+                EffectNode::source(auxiliary_b, EffectSource::TargetContent),
+                EffectNode::custom_fragment(
+                    custom,
+                    primary,
+                    CustomFragmentSpec {
+                        shader: ShaderModuleId::new(18).unwrap(),
+                        declared_footprint: EffectFootprint::ZERO,
+                        uniforms: Vec::new(),
+                        auxiliary_inputs: vec![auxiliary_a, auxiliary_b],
+                    },
+                )
+                .unwrap(),
+            ],
+            output: custom,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        assert_eq!(
+            program.lowering.steps.last().unwrap().input_slots,
+            vec![0, 1, 2]
+        );
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(18).unwrap(),
+                1,
+                region.clone(),
+            )],
+        );
+
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("custom fragment must compile to an effect graph");
+        };
+        let source_outputs = graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                matches!(
+                    pass.kind,
+                    RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+                )
+            })
+            .map(|pass| pass.output.unwrap())
+            .collect::<Vec<_>>();
+        let normalize = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::NormalizeInput)
+            .collect::<Vec<_>>();
+        let custom_pass = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::Fragment
+                    && matches!(pass.stage, Some(EffectNodeKind::CustomFragment(_)))
+            })
+            .expect("custom fragment stage pass");
+        assert_eq!(
+            normalize
+                .iter()
+                .map(|pass| pass.inputs[0])
+                .collect::<Vec<_>>(),
+            source_outputs
+        );
+        assert_eq!(
+            custom_pass.inputs,
+            normalize
+                .iter()
+                .map(|pass| pass.output.unwrap())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2480,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn c2_effect_workloads_report_repeated_instance_metadata() {
+    fn c2_effect_workloads_remove_repeated_instance_metadata() {
         let (single_scene, registry) = blur_scene();
         reset_peak_live_work_counters();
         let single_plan = compile_frame_execution_plan(
@@ -2500,6 +2978,8 @@ mod tests {
         println!("C2 effect one={single_counters:?} stats={single_stats:?}");
         assert_eq!(single_counters.graph_compiles, 1);
         assert_eq!(single_counters.instance_compiles, 1);
+        assert_eq!(single_counters.program_lookup_map_builds, 0);
+        assert_eq!(single_counters.output_map_builds, 0);
 
         for effect_count in [8_usize, 32] {
             let many_instances = (0..effect_count)
@@ -2536,8 +3016,12 @@ mod tests {
             );
             assert_eq!(many_counters.graph_compiles, 1);
             assert_eq!(many_counters.instance_compiles, effect_count);
-            assert_eq!(many_counters.program_lookup_map_builds, effect_count);
-            assert_eq!(many_counters.output_map_builds, effect_count);
+            assert_eq!(many_counters.program_lookup_map_builds, 0);
+            assert_eq!(many_counters.output_map_builds, 0);
+            assert_eq!(
+                many_counters.node_visits,
+                effect_count * single_counters.node_visits
+            );
             assert!(many_counters.node_visits > single_counters.node_visits);
         }
     }
@@ -2576,6 +3060,10 @@ mod tests {
         let changed_counters = peak_live_work_counters();
 
         println!("C2 uniform-only original={original_counters:?} changed={changed_counters:?}");
+        assert_eq!(original_counters.program_lookup_map_builds, 0);
+        assert_eq!(original_counters.output_map_builds, 0);
+        assert_eq!(changed_counters.program_lookup_map_builds, 0);
+        assert_eq!(changed_counters.output_map_builds, 0);
         assert_eq!(
             (
                 original.stats.passes,
@@ -2627,10 +3115,10 @@ mod tests {
         assert_eq!(changed_counters.graph_compiles, 1);
         assert_eq!(original_counters.instance_compiles, 1);
         assert_eq!(changed_counters.instance_compiles, 1);
-        assert_eq!(original_counters.program_lookup_map_builds, 1);
-        assert_eq!(changed_counters.program_lookup_map_builds, 1);
-        assert_eq!(original_counters.output_map_builds, 1);
-        assert_eq!(changed_counters.output_map_builds, 1);
+        assert_eq!(original_counters.program_lookup_map_builds, 0);
+        assert_eq!(changed_counters.program_lookup_map_builds, 0);
+        assert_eq!(original_counters.output_map_builds, 0);
+        assert_eq!(changed_counters.output_map_builds, 0);
     }
 
     #[test]
