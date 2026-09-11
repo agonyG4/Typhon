@@ -1398,6 +1398,42 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
 }
 
 #[test]
+fn map_command_queued_before_same_batch_destroy_is_pruned() {
+    let generation = generation(217);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 217);
+
+    normalize(&mut xwm, create_event(handle.xid(), false)).expect("CreateNotify");
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("MapRequest");
+    normalize(
+        &mut xwm,
+        Event::DestroyNotify(xproto::DestroyNotifyEvent {
+            response_type: 17,
+            sequence: 0,
+            event: 1,
+            window: handle.xid(),
+        }),
+    )
+    .expect("DestroyNotify");
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+        )
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, XwmEvent::WindowDestroyed(window) if *window == handle))
+    );
+    assert!(matches!(
+        super::super::commands::execute(&mut xwm, XwmCommand::Map(handle)),
+        Ok(super::super::XwmCommandOutcome::DroppedTargetGone { window }) if window == handle
+    ));
+}
+
+#[test]
 fn stale_generation_commands_are_dropped_without_touching_current_xwm() {
     let current_generation = generation(213);
     let stale_generation = generation(214);

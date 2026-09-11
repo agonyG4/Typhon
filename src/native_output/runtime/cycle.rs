@@ -170,24 +170,6 @@ impl NativeRuntime {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         let now_ns = monotonic_now_ns()?;
         let slow_cycle_enabled = self.slow_cycle_trace.enabled();
-        if slow_cycle_enabled {
-            let xwayland_totals = self.xwayland.slow_cycle_totals();
-            self.slow_cycle_trace.start_cycle(
-                now_ns,
-                self.presentation_timing.mode().refresh_interval_ns(),
-                SlowCycleContext {
-                    wake_reasons: cycle.wakeup.reasons.bits(),
-                    continuation_reasons: cycle.wakeup.continuation.bits(),
-                    ready_sources: cycle.wakeup.ready_sources,
-                    blocked_ns: cycle.wakeup.blocked_ns,
-                    timer_lateness_ns: cycle.wakeup.timer_lateness_ns,
-                    x11_events_total: xwayland_totals.0,
-                    x11_property_replies_total: xwayland_totals.1,
-                    xwm_budget_exhaustions_total: xwayland_totals.2,
-                    ..SlowCycleContext::default()
-                },
-            );
-        }
         let mut render_attempted = false;
         if self.pointer_timing.enabled() {
             self.pointer_timing.record_next_reactor_wake(now_ns);
@@ -664,6 +646,8 @@ impl NativeRuntime {
             cycle.wakeup.reasons.input(),
             self.input_epoch.backlog_pending(),
         );
+        self.slow_cycle_trace
+            .note_dispatch_timings(cycle.tick_us, cycle.input_drain_us);
         self.slow_cycle_trace.note_output(
             render_attempted,
             cycle.frame_rendered,

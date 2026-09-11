@@ -275,6 +275,28 @@ fn should_continue_resuming_recovery(
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
+        let slow_cycle_start_ns = if self.slow_cycle_trace.enabled() {
+            let start_ns = monotonic_now_ns()?;
+            let xwayland_totals = self.xwayland.slow_cycle_totals();
+            self.slow_cycle_trace.start_cycle_after_wake(
+                start_ns,
+                self.presentation_timing.mode().refresh_interval_ns(),
+                SlowCycleContext {
+                    wake_reasons: wakeup.reasons.bits(),
+                    continuation_reasons: wakeup.continuation.bits(),
+                    ready_sources: wakeup.ready_sources,
+                    blocked_ns: wakeup.blocked_ns,
+                    timer_lateness_ns: wakeup.timer_lateness_ns,
+                    x11_events_total: xwayland_totals.0,
+                    x11_property_replies_total: xwayland_totals.1,
+                    xwm_budget_exhaustions_total: xwayland_totals.2,
+                    ..SlowCycleContext::default()
+                },
+            );
+            Some(start_ns)
+        } else {
+            None
+        };
         self.service_dmabuf_gpu_releases(&wakeup.dmabuf_gpu_release_tokens)?;
         self.check_kms_commit_worker_health()?;
         if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
@@ -481,6 +503,13 @@ impl NativeRuntime {
                 });
             }
         }
+        if let Some(start_ns) = slow_cycle_start_ns {
+            self.slow_cycle_trace.record_phase(
+                SlowCyclePhase::PostWakeMaintenance,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
         if !self.session.permits_output() {
             return Ok(NativeCycleState {
                 wakeup,
@@ -526,6 +555,17 @@ impl NativeRuntime {
             NativePageFlipDrain::default()
         };
         let pageflip_drain_us = elapsed_micros(pageflip_drain_start);
+        if self.slow_cycle_trace.enabled() {
+            self.slow_cycle_trace.record_phase_duration(
+                SlowCyclePhase::PageflipDrain,
+                pageflip_drain_us.saturating_mul(1_000),
+            );
+        }
+        let slow_post_wake_after_pageflip_start_ns = self
+            .slow_cycle_trace
+            .enabled()
+            .then(monotonic_now_ns)
+            .transpose()?;
         *mismatched_pageflip_events =
             mismatched_pageflip_events.saturating_add(pageflip_drain.mismatched_events);
         *stale_pageflip_events = stale_pageflip_events.saturating_add(pageflip_drain.stale_events);
@@ -1677,6 +1717,13 @@ impl NativeRuntime {
                         .retain(|ownership| ownership.job.token != pageflip_token);
                 }
             }
+        }
+        if let Some(start_ns) = slow_post_wake_after_pageflip_start_ns {
+            self.slow_cycle_trace.record_phase(
+                SlowCyclePhase::PostWakeMaintenance,
+                start_ns,
+                monotonic_now_ns()?,
+            );
         }
         Ok(NativeCycleState {
             wakeup,
