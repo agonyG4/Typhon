@@ -80,6 +80,10 @@ impl WindowState {
         self.minimized_surfaces.len()
     }
 
+    pub(super) fn minimized_surfaces(&self) -> &[RenderableSurface] {
+        &self.minimized_surfaces
+    }
+
     pub(super) fn capture_restore_geometry(&mut self, geometry: WindowGeometry) {
         if self.mode == ToplevelMode::Normal && self.restore_geometry.is_none() {
             self.restore_geometry = Some(geometry);

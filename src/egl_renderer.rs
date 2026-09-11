@@ -25,6 +25,7 @@ use oblivion_one::{
         buffer::{DmabufImageKey, DrmModifier, WeakBufferIdentity},
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
+    window_lifecycle_animation::{LampWindowSample, LifecycleSceneSample},
 };
 
 mod damage;
@@ -47,10 +48,11 @@ use effects::{
     builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
 use geometry::{
-    EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
-    MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan, SurfaceSampling, VERTEX_STRIDE,
-    add_surface_consumers_for_command_range, plan_capture_visibility, plan_surface_consumers,
-    plan_visibility, push_draw_command, push_draw_command_with_uv, surface_sampling_for_plan,
+    EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
+    EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
+    SurfaceSampling, VERTEX_STRIDE, add_surface_consumers_for_command_range,
+    plan_capture_visibility, plan_surface_consumers, plan_visibility, push_draw_command,
+    push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use program::create_texture_program;
 
@@ -67,8 +69,17 @@ pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
     *const egl::Int,
     egl::Int,
 ) -> egl::Boolean;
+
+struct SurfaceResourceInputs<'a> {
+    canonical: &'a [RenderableSurface],
+    lifecycle: &'a [RenderableSurface],
+    client_cursor: Option<&'a RenderableSurface>,
+}
+
 const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
 const EGL_BUFFER_AGE_EXT: egl::Int = 0x313d;
+const MAX_LAMP_VERTICES: usize = 65_536;
+const LAMP_TARGET_CELL_PIXELS: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmabufImportGlStage {
@@ -503,6 +514,22 @@ pub struct EglSceneDrawRequest<'a> {
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
+    pub lifecycle: &'a LifecycleSceneSample,
+    pub lifecycle_surfaces: &'a [RenderableSurface],
+    pub lifecycle_decorations: &'a [DecorationRenderInstance],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LampUniformLocations {
+    output_size: Option<glow::UniformLocation>,
+    source_rect: Option<glow::UniformLocation>,
+    full_window_rect: Option<glow::UniformLocation>,
+    anchor_rect: Option<glow::UniformLocation>,
+    progress: Option<glow::UniformLocation>,
+    opacity: Option<glow::UniformLocation>,
+    pull_constant: Option<glow::UniformLocation>,
+    framebuffer_origin_bottom_left: Option<glow::UniformLocation>,
+    texture: Option<glow::UniformLocation>,
 }
 
 pub(crate) struct GlesSceneRenderer {
@@ -519,6 +546,17 @@ pub(crate) struct GlesSceneRenderer {
     overlay_vertex_buffer: GlBuffer,
     overlay_vertex_buffer_capacity: usize,
     overlay_geometry_dirty: bool,
+    lamp_program: Option<GlProgram>,
+    lamp_uniform_locations: Option<LampUniformLocations>,
+    lamp_vertex_array: GlVertexArray,
+    lamp_vertex_buffer: GlBuffer,
+    lamp_vertex_buffer_capacity: usize,
+    lamp_geometry_dirty: bool,
+    lamp_geometry_key: Option<u64>,
+    lamp_vertices: Vec<EglLampVertex>,
+    lamp_commands: Vec<EglLampDrawCommand>,
+    lamp_samples: Vec<LampWindowSample>,
+    current_framebuffer_origin: OutputFramebufferOrigin,
     current_size: (u32, u32),
     texture_upload_rgba: Vec<u8>,
     vertices: Vec<EglTexturedVertex>,
@@ -580,7 +618,243 @@ fn push_output_background_command(
     );
 }
 
+fn surface_root_for_lamp(
+    surface: &RenderableSurface,
+    surfaces: &[RenderableSurface],
+    lifecycle: &LifecycleSceneSample,
+) -> u32 {
+    let mut current = surface.surface_id;
+    for _ in 0..=surfaces.len() {
+        if lifecycle
+            .lamps
+            .iter()
+            .any(|lamp| lamp.root_surface_id == current)
+        {
+            return current;
+        }
+        let Some(parent) = surfaces
+            .iter()
+            .find(|candidate| candidate.surface_id == current)
+            .and_then(|candidate| candidate.placement.parent_surface_id)
+        else {
+            break;
+        };
+        current = parent;
+    }
+    current
+}
+
+struct LampGridSpec {
+    layer: EglDrawLayer,
+    window_id: compositor::WindowId,
+    bounds: EglRect,
+    uv: EglUvRect,
+}
+
+fn append_lamp_grid(
+    vertices: &mut Vec<EglLampVertex>,
+    commands: &mut Vec<EglLampDrawCommand>,
+    spec: LampGridSpec,
+) {
+    let LampGridSpec {
+        layer,
+        window_id,
+        bounds,
+        uv,
+    } = spec;
+    let x = bounds.x();
+    let y = bounds.y();
+    let width = bounds.width();
+    let height = bounds.height();
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return;
+    }
+    let mut columns = ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
+    let mut rows = ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
+    let required = columns.saturating_mul(rows).saturating_mul(6);
+    if vertices.len().saturating_add(required) > MAX_LAMP_VERTICES {
+        columns = 1;
+        rows = 1;
+    }
+    let required = columns.saturating_mul(rows).saturating_mul(6);
+    if vertices.len().saturating_add(required) > MAX_LAMP_VERTICES {
+        return;
+    }
+    let vertex_start = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+    let columns_f = columns as f32;
+    let rows_f = rows as f32;
+    let push_vertex = |vertices: &mut Vec<EglLampVertex>, column: usize, row: usize| {
+        let u = column as f32 / columns_f;
+        let v = row as f32 / rows_f;
+        vertices.push(EglLampVertex {
+            position: [x + width * u, y + height * v],
+            uv: [
+                uv.left() + (uv.right() - uv.left()) * u,
+                uv.top() + (uv.bottom() - uv.top()) * v,
+            ],
+        });
+    };
+    for row in 0..rows {
+        for column in 0..columns {
+            for (vertex_column, vertex_row) in [
+                (column, row),
+                (column + 1, row),
+                (column + 1, row + 1),
+                (column, row),
+                (column + 1, row + 1),
+                (column, row + 1),
+            ] {
+                push_vertex(vertices, vertex_column, vertex_row);
+            }
+        }
+    }
+    commands.push(EglLampDrawCommand {
+        layer,
+        bounds: EglRect::new(x, y, width, height),
+        vertex_start,
+        vertex_count: u32::try_from(required).unwrap_or(u32::MAX),
+        sampling: SurfaceSampling::ScaledLinear,
+        window_id,
+    });
+}
+
+fn lamp_geometry_key(
+    lifecycle: &LifecycleSceneSample,
+    surfaces: &[RenderableSurface],
+    decorations: &[DecorationRenderInstance],
+) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix = |value: u64| {
+        signature ^= value;
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+    };
+    for lamp in &lifecycle.lamps {
+        for value in [
+            lamp.window_id.get(),
+            u64::from(lamp.root_surface_id),
+            lamp.source_rect.x().to_bits(),
+            lamp.source_rect.y().to_bits(),
+            lamp.source_rect.width().to_bits(),
+            lamp.source_rect.height().to_bits(),
+            lamp.full_window_rect.x().to_bits(),
+            lamp.full_window_rect.y().to_bits(),
+            lamp.full_window_rect.width().to_bits(),
+            lamp.full_window_rect.height().to_bits(),
+            lamp.anchor_rect.x().to_bits(),
+            lamp.anchor_rect.y().to_bits(),
+            lamp.anchor_rect.width().to_bits(),
+            lamp.anchor_rect.height().to_bits(),
+        ] {
+            mix(value);
+        }
+    }
+    for surface in surfaces {
+        mix(u64::from(surface.surface_id));
+        mix(surface.x as u32 as u64);
+        mix(surface.y as u32 as u64);
+        mix(u64::from(surface.width));
+        mix(u64::from(surface.height));
+        mix(u64::from(surface.placement.parent_surface_id.unwrap_or(0)));
+        mix(surface.placement.local_x as u32 as u64);
+        mix(surface.placement.local_y as u32 as u64);
+        mix(surface.placement.root_mode as u32 as u64);
+        let buffer_size = surface.buffer_size();
+        mix(u64::from(buffer_size.width));
+        mix(u64::from(buffer_size.height));
+        mix(u64::from(surface.buffer_scale));
+        mix(surface.buffer_transform as u32 as u64);
+    }
+    for decoration in decorations {
+        mix(u64::from(decoration.root_surface_id()));
+        mix(decoration.scene_snapshot().visual_signature());
+    }
+    signature
+}
+
+fn plan_lamp_surface_consumers(
+    commands: &[EglLampDrawCommand],
+    repairs: &[OutputRect],
+) -> SurfaceConsumerPlan {
+    let mut plan = SurfaceConsumerPlan::default();
+    for command in commands {
+        if repairs
+            .iter()
+            .any(|repair| command.bounds.intersects_output_rect(*repair))
+            && let EglDrawLayer::Surface(surface_id) = command.layer
+        {
+            plan.add_surface(surface_id);
+        }
+    }
+    plan.finish();
+    plan
+}
+
+fn lifecycle_damage_for_samples(
+    lifecycle: &LifecycleSceneSample,
+    output_width: u32,
+    output_height: u32,
+    output_scale: f64,
+) -> OutputDamage {
+    let mut rects = Vec::new();
+    for lamp in &lifecycle.lamps {
+        let left = lamp
+            .source_rect
+            .x()
+            .min(lamp.full_window_rect.x())
+            .min(lamp.anchor_rect.x());
+        let top = lamp
+            .source_rect
+            .y()
+            .min(lamp.full_window_rect.y())
+            .min(lamp.anchor_rect.y());
+        let right = (lamp.source_rect.x() + lamp.source_rect.width())
+            .max(lamp.full_window_rect.x() + lamp.full_window_rect.width())
+            .max(lamp.anchor_rect.x() + lamp.anchor_rect.width());
+        let bottom = (lamp.source_rect.y() + lamp.source_rect.height())
+            .max(lamp.full_window_rect.y() + lamp.full_window_rect.height())
+            .max(lamp.anchor_rect.y() + lamp.anchor_rect.height());
+        if [left, top, right, bottom].into_iter().all(f64::is_finite) {
+            rects.push(OutputRect::new(
+                (left * output_scale).floor() as i32,
+                (top * output_scale).floor() as i32,
+                ((right - left) * output_scale).ceil().max(1.0) as u32,
+                ((bottom - top) * output_scale).ceil().max(1.0) as u32,
+            ));
+        }
+    }
+    OutputDamage::rects(output_width, output_height, rects)
+}
+
+fn set_lamp_uniform_rect(
+    gl: &glow::Context,
+    location: Option<&glow::UniformLocation>,
+    rect: compositor::PresentationRect,
+    scale: f64,
+) {
+    if let Some(location) = location {
+        unsafe {
+            gl.uniform_4_f32(
+                Some(location),
+                (rect.x() * scale) as f32,
+                (rect.y() * scale) as f32,
+                (rect.width() * scale) as f32,
+                (rect.height() * scale) as f32,
+            );
+        }
+    }
+}
+
 impl GlesSceneRenderer {
+    pub(crate) const fn lifecycle_animation_available(&self) -> bool {
+        self.lamp_program.is_some()
+    }
+
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
         self.repaint_planner.invalidate();
         self.presented_scene_key = None;
@@ -603,10 +877,13 @@ impl GlesSceneRenderer {
         };
         let program = create_texture_program(&gl)?;
         let capture_program = program::create_capture_program(&gl)?;
+        let lamp_program = program::create_lamp_program(&gl).ok();
         let scene_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let scene_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         let overlay_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let overlay_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
+        let lamp_vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
+        let lamp_vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
         unsafe {
             for (vertex_array, vertex_buffer) in [
                 (scene_vertex_array, scene_vertex_buffer),
@@ -624,6 +901,17 @@ impl GlesSceneRenderer {
                 gl.enable_vertex_attrib_array(1);
                 gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, VERTEX_STRIDE, 8);
             }
+            gl.bind_vertex_array(Some(lamp_vertex_array));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(lamp_vertex_buffer));
+            gl.buffer_data_size(
+                glow::ARRAY_BUFFER,
+                MIN_VERTEX_BUFFER_BYTES as i32,
+                glow::STATIC_DRAW,
+            );
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, VERTEX_STRIDE, 0);
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, VERTEX_STRIDE, 8);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
             gl.use_program(Some(program));
@@ -633,6 +921,12 @@ impl GlesSceneRenderer {
             gl.use_program(Some(capture_program));
             if let Some(location) = gl.get_uniform_location(capture_program, "u_texture") {
                 gl.uniform_1_i32(Some(&location), 0);
+            }
+            if let Some(lamp_program) = lamp_program {
+                gl.use_program(Some(lamp_program));
+                if let Some(location) = gl.get_uniform_location(lamp_program, "u_texture") {
+                    gl.uniform_1_i32(Some(&location), 0);
+                }
             }
             gl.use_program(Some(program));
             gl.enable(glow::BLEND);
@@ -646,6 +940,20 @@ impl GlesSceneRenderer {
             gl.viewport(0, 0, width as i32, height as i32);
         }
 
+        let lamp_uniform_locations = lamp_program.map(|program| unsafe {
+            LampUniformLocations {
+                output_size: gl.get_uniform_location(program, "u_output_size"),
+                source_rect: gl.get_uniform_location(program, "u_source_rect"),
+                full_window_rect: gl.get_uniform_location(program, "u_full_window_rect"),
+                anchor_rect: gl.get_uniform_location(program, "u_anchor_rect"),
+                progress: gl.get_uniform_location(program, "u_progress"),
+                opacity: gl.get_uniform_location(program, "u_opacity"),
+                pull_constant: gl.get_uniform_location(program, "u_pull_constant"),
+                framebuffer_origin_bottom_left: gl
+                    .get_uniform_location(program, "u_framebuffer_origin_bottom_left"),
+                texture: gl.get_uniform_location(program, "u_texture"),
+            }
+        });
         let mut effect_shaders = ShaderProgramCache::new(builtin_shader_program_count())
             .expect("built-in shader cache capacity is non-zero");
         effect_shaders.prewarm_builtins(&gl)?;
@@ -663,6 +971,17 @@ impl GlesSceneRenderer {
             overlay_vertex_buffer,
             overlay_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
             overlay_geometry_dirty: true,
+            lamp_program,
+            lamp_uniform_locations,
+            lamp_vertex_array,
+            lamp_vertex_buffer,
+            lamp_vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            lamp_geometry_dirty: true,
+            lamp_geometry_key: None,
+            lamp_vertices: Vec::new(),
+            lamp_commands: Vec::new(),
+            lamp_samples: Vec::new(),
+            current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             cursor_image: cursor_image.clone(),
             current_size: (width, height),
             texture_upload_rgba: Vec::new(),
@@ -929,9 +1248,15 @@ impl GlesSceneRenderer {
             client_cursor,
             current_damage,
             surface_resource_sync_states,
+            lifecycle,
+            lifecycle_surfaces,
+            lifecycle_decorations,
         } = request;
         let width = width.max(1);
         let height = height.max(1);
+        self.current_framebuffer_origin = framebuffer_origin;
+        self.lamp_samples.clear();
+        self.lamp_samples.extend_from_slice(&lifecycle.lamps);
         let output_scale_key = compositor::output_scale_key(output_scale);
         let mut scaled_visual_state =
             compositor::scale_desktop_visual_state(visual_state, output_scale);
@@ -955,6 +1280,7 @@ impl GlesSceneRenderer {
             .count();
         self.ensure_frame_resources()?;
         self.ensure_decoration_resources(egl, egl_display, decoration_instances)?;
+        self.ensure_decoration_resources(egl, egl_display, lifecycle_decorations)?;
         if scaled_visual_state.cursor.is_some() {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
@@ -962,6 +1288,7 @@ impl GlesSceneRenderer {
             egl,
             egl_display,
             surfaces,
+            lifecycle_surfaces,
             client_cursor.map(|cursor| cursor.surface),
         )?;
         // The software client cursor remains eager: it is a small, separately
@@ -973,8 +1300,11 @@ impl GlesSceneRenderer {
             self.realize_surface_resources_for_consumers(
                 egl,
                 egl_display,
-                surfaces,
-                Some(cursor),
+                SurfaceResourceInputs {
+                    canonical: surfaces,
+                    lifecycle: lifecycle_surfaces,
+                    client_cursor: Some(cursor),
+                },
                 &cursor_consumers,
                 &surface_resource_sync_states,
             )?;
@@ -1037,6 +1367,11 @@ impl GlesSceneRenderer {
             scaled_visual_state,
             client_cursor_damage,
         );
+        let output_damage = output_damage.union(
+            lifecycle_damage_for_samples(lifecycle, width, height, output_scale),
+            width,
+            height,
+        );
         let (output_damage, contradictory_empty_damage) = resolve_scene_damage_authority(
             scene_changed,
             damage_authority_available,
@@ -1075,6 +1410,12 @@ impl GlesSceneRenderer {
             client_cursor,
             output_scale,
             framebuffer_origin,
+        );
+        self.rebuild_lamp_commands_if_needed(
+            lifecycle,
+            lifecycle_surfaces,
+            lifecycle_decorations,
+            output_scale,
         );
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let output_bounds = EffectRect::new(0, 0, width, height)
@@ -1148,6 +1489,10 @@ impl GlesSceneRenderer {
         }
         let repair_rects = repaint_plan_output_rects(&plan, width, height);
         let mut consumer_plan = plan_surface_consumers(&self.commands, &repair_rects);
+        consumer_plan.extend(&plan_lamp_surface_consumers(
+            &self.lamp_commands,
+            &repair_rects,
+        ));
         add_surface_consumers_for_command_range(
             &mut consumer_plan,
             &self.cursor_commands,
@@ -1188,8 +1533,11 @@ impl GlesSceneRenderer {
         self.realize_surface_resources_for_consumers(
             egl,
             egl_display,
-            surfaces,
-            client_cursor.map(|cursor| cursor.surface),
+            SurfaceResourceInputs {
+                canonical: surfaces,
+                lifecycle: lifecycle_surfaces,
+                client_cursor: client_cursor.map(|cursor| cursor.surface),
+            },
             &consumer_plan,
             &surface_resource_sync_states,
         )?;
@@ -1467,6 +1815,7 @@ impl GlesSceneRenderer {
         egl: &EglInstance,
         egl_display: egl::Display,
         surfaces: &[RenderableSurface],
+        lifecycle_surfaces: &[RenderableSurface],
         client_cursor: Option<&RenderableSurface>,
     ) -> RendererResult<()> {
         self.evict_dead_cached_dmabufs(egl, egl_display);
@@ -1474,11 +1823,17 @@ impl GlesSceneRenderer {
         self.active_surface_ids
             .extend(surfaces.iter().map(|surface| surface.surface_id));
         self.active_surface_ids
+            .extend(lifecycle_surfaces.iter().map(|surface| surface.surface_id));
+        self.active_surface_ids
             .extend(client_cursor.map(|surface| surface.surface_id));
         self.active_surface_ids.sort_unstable();
         self.active_surface_ids.dedup();
 
-        for surface in surfaces.iter().chain(client_cursor) {
+        for surface in surfaces
+            .iter()
+            .chain(lifecycle_surfaces)
+            .chain(client_cursor)
+        {
             let Some((action, resource)) =
                 reconcile_surface_resource_backing(&mut self.surface_resources, surface)
             else {
@@ -1527,12 +1882,16 @@ impl GlesSceneRenderer {
         &mut self,
         egl: &EglInstance,
         egl_display: egl::Display,
-        surfaces: &[RenderableSurface],
-        client_cursor: Option<&RenderableSurface>,
+        inputs: SurfaceResourceInputs<'_>,
         consumers: &SurfaceConsumerPlan,
         sync_states: &[SurfaceResourceSyncState],
     ) -> RendererResult<()> {
-        for surface in surfaces.iter().chain(client_cursor) {
+        for surface in inputs
+            .canonical
+            .iter()
+            .chain(inputs.lifecycle)
+            .chain(inputs.client_cursor)
+        {
             if consumers
                 .surface_ids()
                 .binary_search(&surface.surface_id)
@@ -2183,6 +2542,7 @@ impl GlesSceneRenderer {
                     self.gl.clear(glow::COLOR_BUFFER_BIT);
                 }
                 self.draw_command_batch(true, None)?;
+                self.draw_lamp_overlay(None)?;
                 self.draw_command_batch(false, None)?;
             }
             RenderExecution::Scissored {
@@ -2205,6 +2565,7 @@ impl GlesSceneRenderer {
                     );
                     draw_result = self
                         .draw_command_batch(true, output_rect)
+                        .and_then(|()| self.draw_lamp_overlay(output_rect))
                         .and_then(|()| self.draw_command_batch(false, output_rect));
                     if draw_result.is_err() {
                         break;
@@ -2225,6 +2586,271 @@ impl GlesSceneRenderer {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
         Ok(())
+    }
+
+    fn rebuild_lamp_commands_if_needed(
+        &mut self,
+        lifecycle: &LifecycleSceneSample,
+        lifecycle_surfaces: &[RenderableSurface],
+        lifecycle_decorations: &[DecorationRenderInstance],
+        output_scale: f64,
+    ) {
+        let geometry_key = lamp_geometry_key(lifecycle, lifecycle_surfaces, lifecycle_decorations);
+        if self.lamp_geometry_key == Some(geometry_key) {
+            return;
+        }
+        self.lamp_geometry_key = Some(geometry_key);
+        self.lamp_geometry_dirty = true;
+        self.lamp_vertices.clear();
+        self.lamp_commands.clear();
+        if lifecycle.lamps.is_empty() {
+            return;
+        }
+        let assignments =
+            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
+        for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments) {
+            let Some(lamp) = lifecycle.lamps.iter().find(|lamp| {
+                lamp.root_surface_id
+                    == surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
+            }) else {
+                continue;
+            };
+            for render_plan in compositor::surface_render_plans_with_aperture(
+                surface,
+                assignment.target,
+                assignment.visual_clip.as_ref(),
+            ) {
+                let target = render_plan.content_target;
+                if target.width() == 0 || target.height() == 0 {
+                    continue;
+                }
+                append_lamp_grid(
+                    &mut self.lamp_vertices,
+                    &mut self.lamp_commands,
+                    LampGridSpec {
+                        layer: EglDrawLayer::Surface(surface.surface_id),
+                        window_id: lamp.window_id,
+                        bounds: EglRect::new(
+                            target.x() as f32,
+                            target.y() as f32,
+                            target.width() as f32,
+                            target.height() as f32,
+                        ),
+                        uv: EglUvRect::new(
+                            render_plan.content_uv.left,
+                            render_plan.content_uv.top,
+                            render_plan.content_uv.right,
+                            render_plan.content_uv.bottom,
+                        ),
+                    },
+                );
+            }
+        }
+        for decoration in lifecycle_decorations {
+            let Some(lamp) = lifecycle
+                .lamps
+                .iter()
+                .find(|lamp| lamp.root_surface_id == decoration.root_surface_id())
+            else {
+                continue;
+            };
+            let scale = output_scale.max(1.0) as f32;
+            let (origin_x, origin_y) = decoration.origin();
+            for primitive in decoration.primitives() {
+                let (rect, layer) = match primitive {
+                    DecorationRenderPrimitive::SolidRect { rect, color } => {
+                        (*rect, EglDrawLayer::SolidRgba(rgba_to_pixel(*color)))
+                    }
+                    DecorationRenderPrimitive::Image { rect, asset } => {
+                        (*rect, EglDrawLayer::DecorationAsset(asset.asset_id()))
+                    }
+                    DecorationRenderPrimitive::Text { rect, asset, .. } => {
+                        (*rect, EglDrawLayer::DecorationAsset(asset.asset_id()))
+                    }
+                };
+                append_lamp_grid(
+                    &mut self.lamp_vertices,
+                    &mut self.lamp_commands,
+                    LampGridSpec {
+                        layer,
+                        window_id: lamp.window_id,
+                        bounds: EglRect::new(
+                            origin_x.saturating_add(rect.x) as f32 * scale,
+                            origin_y.saturating_add(rect.y) as f32 * scale,
+                            rect.width as f32 * scale,
+                            rect.height as f32 * scale,
+                        ),
+                        uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                    },
+                );
+            }
+        }
+    }
+
+    fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
+        let (Some(program), Some(uniforms)) = (self.lamp_program, self.lamp_uniform_locations)
+        else {
+            return Ok(());
+        };
+        if self.lamp_vertices.is_empty() || self.lamp_commands.is_empty() {
+            return Ok(());
+        }
+        let required_size = self.lamp_vertices.len() * std::mem::size_of::<EglLampVertex>();
+        ensure_vertex_buffer_capacity(
+            &self.gl,
+            self.lamp_vertex_buffer,
+            &mut self.lamp_vertex_buffer_capacity,
+            required_size,
+        );
+        if self.lamp_geometry_dirty {
+            unsafe {
+                self.gl
+                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.lamp_vertex_buffer));
+                self.gl.buffer_sub_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    0,
+                    bytemuck::cast_slice(self.lamp_vertices.as_slice()),
+                );
+            }
+            self.lamp_geometry_dirty = false;
+        }
+        let samples = self
+            .lamp_commands
+            .iter()
+            .filter_map(|command| {
+                self.lamp_geometry_sample(command.window_id)
+                    .map(|sample| (*command, sample))
+            })
+            .collect::<Vec<_>>();
+        unsafe {
+            self.gl.use_program(Some(program));
+            self.gl.bind_vertex_array(Some(self.lamp_vertex_array));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+            if let Some(location) = &uniforms.texture {
+                self.gl.uniform_1_i32(Some(location), 0);
+            }
+            if let Some(location) = &uniforms.output_size {
+                self.gl.uniform_2_f32(
+                    Some(location),
+                    self.current_size.0 as f32,
+                    self.current_size.1 as f32,
+                );
+            }
+            if let Some(location) = &uniforms.pull_constant {
+                self.gl.uniform_1_f32(
+                    Some(location),
+                    oblivion_one::window_lifecycle_animation::ASTREA_LAMP_PULL as f32,
+                );
+            }
+            if let Some(location) = &uniforms.framebuffer_origin_bottom_left {
+                self.gl.uniform_1_i32(
+                    Some(location),
+                    i32::from(
+                        self.current_framebuffer_origin == OutputFramebufferOrigin::BottomLeft,
+                    ),
+                );
+            }
+        }
+        let output_scale = self.effect_output_scale.max(1.0) as f64;
+        let mut sampling = None;
+        for (command, sample) in samples {
+            if scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
+                continue;
+            }
+            let Some(texture) = self.texture_for_layer(command.layer) else {
+                continue;
+            };
+            unsafe {
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                if sampling != Some(command.sampling) {
+                    let filter = match command.sampling {
+                        SurfaceSampling::ExactNearest => glow::NEAREST,
+                        SurfaceSampling::ScaledLinear => glow::LINEAR,
+                    } as i32;
+                    self.gl
+                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                    self.gl
+                        .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                    sampling = Some(command.sampling);
+                }
+                set_lamp_uniform_rect(
+                    &self.gl,
+                    uniforms.source_rect.as_ref(),
+                    sample.source_rect,
+                    output_scale,
+                );
+                set_lamp_uniform_rect(
+                    &self.gl,
+                    uniforms.full_window_rect.as_ref(),
+                    sample.full_window_rect,
+                    output_scale,
+                );
+                set_lamp_uniform_rect(
+                    &self.gl,
+                    uniforms.anchor_rect.as_ref(),
+                    sample.anchor_rect,
+                    output_scale,
+                );
+                if let Some(location) = &uniforms.progress {
+                    self.gl
+                        .uniform_1_f32(Some(location), sample.progress as f32);
+                }
+                if let Some(location) = &uniforms.opacity {
+                    self.gl.uniform_1_f32(Some(location), sample.opacity as f32);
+                }
+                self.gl.draw_arrays(
+                    glow::TRIANGLES,
+                    command.vertex_start as i32,
+                    command.vertex_count as i32,
+                );
+            }
+        }
+        unsafe {
+            self.gl.use_program(Some(self.program));
+            self.gl.bind_vertex_array(Some(self.scene_vertex_array));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draw_lifecycle_overlays(
+        &mut self,
+        rects: &[OutputRect],
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        for rect in rects {
+            let y = match framebuffer_origin {
+                OutputFramebufferOrigin::BottomLeft => self
+                    .current_size
+                    .1
+                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
+                    as i32,
+                OutputFramebufferOrigin::TopLeftScanout => rect.y,
+            };
+            unsafe {
+                self.gl.enable(glow::SCISSOR_TEST);
+                self.gl
+                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
+            }
+            self.draw_lamp_overlay(Some(*rect))?;
+        }
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+        }
+        Ok(())
+    }
+
+    fn lamp_geometry_sample(&self, window_id: compositor::WindowId) -> Option<LampWindowSample> {
+        self.lamp_samples
+            .iter()
+            .find(|sample| sample.window_id == window_id)
+            .copied()
     }
 
     pub(crate) fn begin_effect_repaint(
@@ -2704,6 +3330,11 @@ impl GlesSceneRenderer {
         }
 
         unsafe {
+            if let Some(lamp_program) = self.lamp_program.take() {
+                self.gl.delete_program(lamp_program);
+            }
+            self.gl.delete_buffer(self.lamp_vertex_buffer);
+            self.gl.delete_vertex_array(self.lamp_vertex_array);
             self.gl.delete_buffer(self.scene_vertex_buffer);
             self.gl.delete_vertex_array(self.scene_vertex_array);
             self.gl.delete_buffer(self.overlay_vertex_buffer);
@@ -4271,13 +4902,71 @@ mod tests {
         RenderableSurfaceDamage, SurfaceCommitCounter, SurfaceCommitSequence, SurfaceOpaqueRegion,
         SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
     };
+    use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
         DmabufImageKey, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
+    use oblivion_one::window_lifecycle_animation::{
+        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
+    };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    fn lamp_test_sample(progress: f64) -> LifecycleSceneSample {
+        let rect = PresentationRect::new(100.0, 80.0, 800.0, 600.0).expect("valid rectangle");
+        let anchor = PresentationRect::new(1200.0, 900.0, 64.0, 64.0).expect("valid anchor");
+        LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(1),
+            lamps: vec![LampWindowSample {
+                window_id: oblivion_one::compositor::WindowId::from_raw(1)
+                    .expect("valid window id"),
+                root_surface_id: 1,
+                transition_id: LifecycleTransitionId::new(1),
+                source_rect: rect,
+                full_window_rect: rect,
+                anchor_rect: anchor,
+                progress,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn lamp_mesh_identity_ignores_progress() {
+        assert_eq!(
+            lamp_geometry_key(&lamp_test_sample(0.1), &[], &[]),
+            lamp_geometry_key(&lamp_test_sample(0.9), &[], &[])
+        );
+    }
+
+    #[test]
+    fn lamp_mesh_vertex_budget_is_bounded_for_concurrent_windows() {
+        let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("valid window id");
+        let mut vertices = Vec::new();
+        let mut commands = Vec::new();
+        for _ in 0..32 {
+            append_lamp_grid(
+                &mut vertices,
+                &mut commands,
+                LampGridSpec {
+                    layer: EglDrawLayer::Surface(1),
+                    window_id,
+                    bounds: EglRect::new(0.0, 0.0, 10_000.0, 10_000.0),
+                    uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                },
+            );
+        }
+        assert!(vertices.len() <= MAX_LAMP_VERTICES);
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.vertex_count <= MAX_LAMP_VERTICES as u32)
+        );
+    }
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct DmabufRingQualification {

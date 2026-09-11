@@ -828,6 +828,7 @@ impl CompositorState {
         state
             .presentation_animator
             .set_enabled(state.animation_control.enabled());
+        state.set_lifecycle_animation_enabled(state.animation_control.enabled());
         state.rebuild_active_scene_view();
         state
     }

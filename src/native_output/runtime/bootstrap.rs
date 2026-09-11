@@ -571,6 +571,10 @@ impl NativeRuntime {
             initial_presented_scene.frame_id,
             &initial_presented_scene.presentation,
         );
+        server.publish_presented_lifecycle(
+            initial_presented_scene.frame_id,
+            &initial_presented_scene.lifecycle,
+        );
         let scene_history = NativeSceneHistory::new(initial_presented_scene);
         let last_client_cursor_damage = None;
         let last_software_cursor_damage = None;
@@ -994,6 +998,7 @@ impl NativeRuntime {
                 build_native_kms_startup_plan(kms_policy, scanout.kind(), discovery)?;
             (startup_plan, scanout)
         };
+        server.set_lifecycle_animation_renderer_available(scanout.lifecycle_animation_available());
         let atomic_discovery = match &startup_plan {
             NativeKmsStartupPlan::Atomic { discovery } => Some(discovery.as_ref()),
             NativeKmsStartupPlan::Legacy { .. } => None,
@@ -1257,6 +1262,9 @@ impl NativeRuntime {
                 target.height,
                 drm_file_generation,
             )?;
+            server.set_lifecycle_animation_renderer_available(
+                scanout.lifecycle_animation_available(),
+            );
             scanout.paint_server_frame(
                 &mut frame_renderer,
                 &initial_resolved_scene,

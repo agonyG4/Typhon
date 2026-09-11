@@ -358,6 +358,9 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<(f64, f64, (i32, i32))> {
+        if self.lifecycle_surface_is_suppressed(root_surface_id) {
+            return None;
+        }
         let Some(index) = self.active_scene_surface_index(root_surface_id) else {
             return Some((x, y, (0, 0)));
         };
@@ -419,6 +422,9 @@ impl CompositorState {
                 continue;
             };
             if root_surface.surface_id != group.root_surface_id() {
+                continue;
+            }
+            if self.lifecycle_surface_is_suppressed(group.root_surface_id()) {
                 continue;
             }
             let Some(root_origin) = origins.get(root_index).copied() else {
@@ -508,6 +514,9 @@ impl CompositorState {
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
                 let root_surface_id = self.visual_stack_root_for_surface(surface_id);
+                if self.lifecycle_surface_is_suppressed(root_surface_id) {
+                    return None;
+                }
                 if !self.pointer_scene_owner_is_frontmost(
                     root_surface_id,
                     Some(surface_id),
@@ -545,6 +554,9 @@ impl CompositorState {
                 root_surface_id,
                 hit,
             } => {
+                if self.lifecycle_surface_is_suppressed(*root_surface_id) {
+                    return None;
+                }
                 if !self.pointer_scene_owner_is_frontmost(*root_surface_id, None, Some(*hit), x, y)
                 {
                     return None;

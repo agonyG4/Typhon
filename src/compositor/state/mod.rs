@@ -14,6 +14,7 @@ mod helpers;
 mod hit_testing;
 mod input_dispatch;
 mod input_resources;
+mod lifecycle_animation;
 mod output_membership;
 mod output_state;
 mod override_redirect_stack;

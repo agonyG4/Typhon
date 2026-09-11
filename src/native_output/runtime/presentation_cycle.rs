@@ -1131,6 +1131,7 @@ impl NativeRuntime {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
                         let presentation_snapshot = resolved_scene.presentation_snapshot.clone();
+                        let lifecycle_snapshot = resolved_scene.lifecycle_snapshot.clone();
                         let (
                             frame_target,
                             submit_window,
@@ -1381,6 +1382,7 @@ impl NativeRuntime {
                                     resolved_render_generation,
                                     resolved_snapshot,
                                     presentation_snapshot,
+                                    lifecycle_snapshot,
                                     resolved_scene_signature,
                                     render_damage_signature,
                                     repair_damage_signature,

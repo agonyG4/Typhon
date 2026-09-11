@@ -59,6 +59,7 @@ pub(super) fn replace_atomic_ready_scene(
     frame_id: u64,
     render_generation: u64,
     presentation: oblivion_one::compositor::PresentationFrameSnapshot,
+    lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     cursor: (
         Option<NativeClientCursorDamageState>,
         Option<NativeDamageRect>,
@@ -71,6 +72,7 @@ pub(super) fn replace_atomic_ready_scene(
         scene: resolved_snapshot,
         cursor_damage,
         presentation,
+        lifecycle,
     });
 }
 
@@ -86,6 +88,7 @@ pub(super) fn record_atomic_rendered_scene(
     resolved_render_generation: u64,
     resolved_snapshot: NativeSceneSnapshot,
     presentation: oblivion_one::compositor::PresentationFrameSnapshot,
+    lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     resolved_scene_signature: u64,
     render_damage_signature: u64,
     repair_damage_signature: u64,
@@ -103,6 +106,7 @@ pub(super) fn record_atomic_rendered_scene(
         frame_id,
         resolved_render_generation,
         presentation,
+        lifecycle,
         cursor,
     );
     record_composited_scene_identity(
@@ -353,6 +357,7 @@ pub(super) fn promote_pageflip_and_publish(
     }
     if let Some(snapshot) = scene_history.presented_snapshot() {
         server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
+        server.publish_presented_lifecycle(snapshot.frame_id, &snapshot.lifecycle);
     }
     true
 }
@@ -366,6 +371,7 @@ pub(super) fn promote_immediate_and_publish(
     }
     if let Some(snapshot) = scene_history.presented_snapshot() {
         server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
+        server.publish_presented_lifecycle(snapshot.frame_id, &snapshot.lifecycle);
     }
     true
 }

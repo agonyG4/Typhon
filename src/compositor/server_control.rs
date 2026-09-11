@@ -24,6 +24,7 @@ impl crate::compositor::CompositorState {
         let enabled = configuration.enabled;
         let snapshot = self.animation_control.set_configuration(configuration)?;
         self.presentation_animator.set_enabled(enabled);
+        self.set_lifecycle_animation_enabled(enabled);
         Ok(snapshot)
     }
 }

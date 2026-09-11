@@ -585,6 +585,7 @@ fn execute_graph_passes(
         renderer.commands.len(),
         framebuffer_origin,
     )?;
+    renderer.draw_lifecycle_overlays(&repaint_rects, framebuffer_origin)?;
     renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
     renderer.establish_ordinary_scene_state();
     stats.instances = selection.executed_instances.len();

@@ -23,6 +23,22 @@ impl EglRect {
         }
     }
 
+    pub(super) const fn x(self) -> f32 {
+        self.x
+    }
+
+    pub(super) const fn y(self) -> f32 {
+        self.y
+    }
+
+    pub(super) const fn width(self) -> f32 {
+        self.width
+    }
+
+    pub(super) const fn height(self) -> f32 {
+        self.height
+    }
+
     pub(super) fn intersects_output_rect(self, rect: super::OutputRect) -> bool {
         let left = f64::from(self.x);
         let top = f64::from(self.y);
@@ -388,6 +404,22 @@ impl EglUvRect {
             bottom,
         }
     }
+
+    pub(super) const fn left(self) -> f32 {
+        self.left
+    }
+
+    pub(super) const fn top(self) -> f32 {
+        self.top
+    }
+
+    pub(super) const fn right(self) -> f32 {
+        self.right
+    }
+
+    pub(super) const fn bottom(self) -> f32 {
+        self.bottom
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +457,26 @@ pub(super) struct EglTexturedVertex {
 
 unsafe impl bytemuck::Zeroable for EglTexturedVertex {}
 unsafe impl bytemuck::Pod for EglTexturedVertex {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EglLampVertex {
+    pub(super) position: [f32; 2],
+    pub(super) uv: [f32; 2],
+}
+
+unsafe impl bytemuck::Zeroable for EglLampVertex {}
+unsafe impl bytemuck::Pod for EglLampVertex {}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EglLampDrawCommand {
+    pub(super) layer: EglDrawLayer,
+    pub(super) bounds: EglRect,
+    pub(super) vertex_start: u32,
+    pub(super) vertex_count: u32,
+    pub(super) sampling: SurfaceSampling,
+    pub(super) window_id: oblivion_one::compositor::WindowId,
+}
 
 pub(super) fn push_draw_command(
     vertices: &mut Vec<EglTexturedVertex>,

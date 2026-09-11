@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_speed_and_planned_manual_override_are_rejected() {
+    fn invalid_speed_is_rejected_and_lamp_manual_override_is_accepted() {
         let mut document = AnimationConfiguration::default().to_document();
         document.speed = 3.0;
         assert_eq!(
@@ -208,10 +208,7 @@ mod tests {
         document
             .overrides
             .insert("window.minimize".into(), "minimize.lamp".into());
-        assert!(matches!(
-            AnimationConfiguration::from_document(document),
-            Err(AnimationConfigurationError::PlannedEffect { .. })
-        ));
+        assert!(AnimationConfiguration::from_document(document).is_ok());
     }
 
     #[test]

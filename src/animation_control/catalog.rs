@@ -115,7 +115,10 @@ impl AnimationEffect {
     }
 
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::None | Self::GeometryKde | Self::GeometryMacos)
+        matches!(
+            self,
+            Self::None | Self::GeometryKde | Self::GeometryMacos | Self::MinimizeLamp
+        )
     }
 
     pub const fn availability(self) -> &'static str {
@@ -227,14 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn astrea_reserves_planned_lamp_but_effectively_resolves_to_none() {
-        let slot = AnimationSlot::WindowMinimize;
-        let requested = AnimationPreset::Astrea.requested_effect(slot);
-        assert_eq!(requested, AnimationEffect::MinimizeLamp);
-        assert_eq!(
-            effect_for_request(slot, requested, true),
-            AnimationEffect::None
-        );
+    fn astrea_resolves_lamp_for_minimize_and_restore() {
+        for slot in [AnimationSlot::WindowMinimize, AnimationSlot::WindowRestore] {
+            let requested = AnimationPreset::Astrea.requested_effect(slot);
+            assert_eq!(requested, AnimationEffect::MinimizeLamp);
+            assert_eq!(
+                effect_for_request(slot, requested, true),
+                AnimationEffect::MinimizeLamp
+            );
+        }
     }
 
     #[test]
@@ -262,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn planned_and_incompatible_effects_are_not_available_for_manual_use() {
-        assert!(!AnimationEffect::MinimizeLamp.is_available());
+    fn available_and_incompatible_effects_are_validated_separately() {
+        assert!(AnimationEffect::MinimizeLamp.is_available());
         assert!(!AnimationEffect::GeometryKde.compatible_with(AnimationSlot::WindowOpen));
     }
 }

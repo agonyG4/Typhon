@@ -224,6 +224,7 @@ impl CompositorState {
         &mut self,
         id: WindowId,
     ) -> Option<DesktopWindow> {
+        self.lifecycle_teardown_window(id);
         let _ = self.remove_tiled_window_from_layout(id);
         let window = self.desktop_windows.remove(&id)?;
         for child in self.desktop_windows.values_mut() {

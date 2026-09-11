@@ -399,13 +399,20 @@ impl super::CompositorState {
         presentation: &PresentationSceneSample,
     ) -> ResolvedEffectScene {
         let scene = self.resolved_effect_scene();
-        if presentation.transforms.is_empty() {
-            return scene;
-        }
-
         let instances = scene
             .instances
             .into_iter()
+            .filter(|instance| {
+                let root_surface_id = match instance.anchor {
+                    EffectAnchor::BeforeSurface(surface_id)
+                    | EffectAnchor::ReplaceSurface(surface_id)
+                    | EffectAnchor::AfterSurface(surface_id) => {
+                        Some(self.root_surface_id_for_surface(surface_id))
+                    }
+                    EffectAnchor::OutputPostProcess => None,
+                };
+                root_surface_id.is_none_or(|root| !self.lifecycle_surface_is_suppressed(root))
+            })
             .map(|mut instance| {
                 let surface_id = match instance.anchor {
                     EffectAnchor::BeforeSurface(surface_id)

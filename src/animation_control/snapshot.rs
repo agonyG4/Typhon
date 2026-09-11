@@ -111,7 +111,7 @@ mod tests {
     use crate::animation_control::catalog::effect_for_request;
 
     #[test]
-    fn snapshot_explicitly_reports_astrea_lamp_as_requested_but_none_effective() {
+    fn snapshot_reports_astrea_lamp_as_requested_and_effective() {
         let configuration = AnimationConfiguration::default();
         let mut requested = BTreeMap::new();
         let mut effective = BTreeMap::new();
@@ -135,7 +135,9 @@ mod tests {
             catalog: AnimationCatalogSnapshot::default(),
         };
         assert_eq!(snapshot.requested["window.minimize"], "minimize.lamp");
-        assert_eq!(snapshot.effective["window.minimize"], "none");
+        assert_eq!(snapshot.effective["window.minimize"], "minimize.lamp");
+        assert_eq!(snapshot.requested["window.restore"], "minimize.lamp");
+        assert_eq!(snapshot.effective["window.restore"], "minimize.lamp");
         assert!(serde_json::to_vec(&snapshot).unwrap().len() < 16 * 1024);
     }
 }

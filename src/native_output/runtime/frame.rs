@@ -6,6 +6,7 @@ use oblivion_one::compositor::{
     AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
     PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample, ResolvedEffectScene,
 };
+use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,6 +78,10 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) presentation: PresentationSceneSample,
     pub(crate) presentation_snapshot: PresentationFrameSnapshot,
+    pub(crate) lifecycle: LifecycleSceneSample,
+    pub(crate) lifecycle_surfaces: Vec<RenderableSurface>,
+    pub(crate) lifecycle_decorations: Vec<DecorationRenderInstance>,
+    pub(crate) lifecycle_snapshot: LifecycleFrameSnapshot,
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
@@ -88,6 +93,21 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     pub(crate) fn from_server_at(server: &'a OwnCompositorServer, at: AnimationTime) -> Self {
         let (canonical_surfaces, visibility) =
             server.native_frame_renderable_surfaces_with_metrics();
+        let lifecycle = server.lifecycle_scene_sample_at(at);
+        let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
+        let lifecycle_decorations =
+            server.native_decoration_render_instances_for_scale(&lifecycle_surfaces, 1.0);
+        let canonical_surfaces = if server.lifecycle_render_suppressed_roots().is_empty() {
+            canonical_surfaces
+        } else {
+            Cow::Owned(
+                canonical_surfaces
+                    .iter()
+                    .filter(|surface| !server.lifecycle_surface_is_suppressed(surface.surface_id))
+                    .cloned()
+                    .collect(),
+            )
+        };
         let targets = server.native_frame_presentation_targets(canonical_surfaces.as_ref());
         let presentation = server.presentation_scene_sample_for_targets_at(at, &targets);
         let decorations = server
@@ -106,6 +126,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             &presentation,
             server.presented_window_geometries_for_targets(&presentation, &targets),
         );
+        let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids();
         let render_generation = server.scene_render_generation();
@@ -141,6 +162,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             effects,
             presentation,
             presentation_snapshot,
+            lifecycle,
+            lifecycle_surfaces,
+            lifecycle_decorations,
+            lifecycle_snapshot,
         }
     }
 
@@ -157,6 +182,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             effects: self.effects,
             presentation: self.presentation,
             presentation_snapshot: self.presentation_snapshot,
+            lifecycle: self.lifecycle,
+            lifecycle_surfaces: self.lifecycle_surfaces,
+            lifecycle_decorations: self.lifecycle_decorations,
+            lifecycle_snapshot: self.lifecycle_snapshot,
         }
     }
 
@@ -684,6 +713,7 @@ mod tests {
     use oblivion_one::render_backend::buffer::{
         BufferIdAllocator, BufferSize, CommittedSurfaceBuffer,
     };
+    use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
     use std::borrow::Cow;
     use std::process;
     use wayland_server::protocol::wl_output;
@@ -821,6 +851,13 @@ mod tests {
                 effects: ResolvedEffectScene::default(),
                 presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(0)),
                 presentation_snapshot: PresentationFrameSnapshot::empty(),
+                lifecycle: LifecycleSceneSample {
+                    sampled_at: AnimationTime::from_nanos(0),
+                    lamps: Vec::new(),
+                },
+                lifecycle_surfaces: Vec::new(),
+                lifecycle_decorations: Vec::new(),
+                lifecycle_snapshot: LifecycleFrameSnapshot::default(),
             };
             assert_eq!(resolved.snapshot_ref().popup_surface_ids, popup_surface_ids);
         }
@@ -1341,6 +1378,14 @@ impl NativeFrameRenderer {
                         .map(|cursor| cursor.surface.surface_id),
                 ),
         );
+        let lifecycle_surface_resource_sync_states = server.surface_resource_sync_states(
+            resolved_scene
+                .lifecycle_surfaces
+                .iter()
+                .map(|surface| surface.surface_id),
+        );
+        let mut surface_resource_sync_states = surface_resource_sync_states;
+        surface_resource_sync_states.extend(lifecycle_surface_resource_sync_states);
         EglSceneDrawRequest {
             width,
             height,
@@ -1359,6 +1404,9 @@ impl NativeFrameRenderer {
             current_damage,
             effects: &resolved_scene.effects,
             surface_resource_sync_states,
+            lifecycle: &resolved_scene.lifecycle,
+            lifecycle_surfaces: &resolved_scene.lifecycle_surfaces,
+            lifecycle_decorations: &resolved_scene.lifecycle_decorations,
         }
     }
 }

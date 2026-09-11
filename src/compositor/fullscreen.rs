@@ -54,6 +54,7 @@ pub enum DirectScanoutSceneRejection {
     PlacementMismatch,
     ResizePreviewActive,
     AnimationTransform,
+    LifecycleAnimation,
     PendingOrUnpublishedWork,
 }
 
@@ -80,6 +81,7 @@ impl DirectScanoutSceneRejection {
             Self::PlacementMismatch => "placement_mismatch",
             Self::ResizePreviewActive => "resize_preview_active",
             Self::AnimationTransform => "animation_transform",
+            Self::LifecycleAnimation => "lifecycle_animation",
             Self::PendingOrUnpublishedWork => "pending_or_unpublished_work",
         }
     }
@@ -555,6 +557,10 @@ mod tests {
         assert_eq!(
             DirectScanoutSceneRejection::AnimationTransform.as_str(),
             "animation_transform"
+        );
+        assert_eq!(
+            DirectScanoutSceneRejection::LifecycleAnimation.as_str(),
+            "lifecycle_animation"
         );
     }
 }

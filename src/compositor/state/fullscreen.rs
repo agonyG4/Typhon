@@ -448,6 +448,9 @@ impl CompositorState {
         {
             blockers.push(DirectScanoutSceneRejection::AnimationTransform);
         }
+        if self.lifecycle_animation_has_pending_visible() {
+            blockers.push(DirectScanoutSceneRejection::LifecycleAnimation);
+        }
 
         let geometry = self.current_visual_root_window_geometry(owner.owner_root_surface_id);
         if !geometry.is_some_and(|geometry| {

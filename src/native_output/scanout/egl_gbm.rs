@@ -333,6 +333,10 @@ impl NativeGbmFramebufferCache {
 }
 
 impl NativeEglGbmScanout {
+    pub(crate) fn lifecycle_animation_available(&self) -> bool {
+        self.scene.lifecycle_animation_available()
+    }
+
     pub(crate) fn reload_trusted_effect_registry(
         &mut self,
         registry: &oblivion_one::effects::TrustedEffectRegistry,

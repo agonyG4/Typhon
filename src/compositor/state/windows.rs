@@ -1200,6 +1200,8 @@ impl CompositorState {
         else {
             return false;
         };
+        let lifecycle_source = self.lifecycle_minimize_source_rect(root_surface_id);
+        let lifecycle_full_window = self.lifecycle_window_rect(root_surface_id);
         let scene_effect = self.window_is_visible_in_active_scene(window_id);
         let tiled_location = self
             .window(window_id)
@@ -1252,6 +1254,12 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
         }
+        self.begin_lifecycle_minimize(
+            window_id,
+            root_surface_id,
+            lifecycle_source,
+            lifecycle_full_window,
+        );
         self.refresh_active_scene_surface_order();
         self.mark_astrea_toplevel_dirty(window_id);
         if self.focused_root_surface_id() == Some(root_surface_id) {
@@ -1299,9 +1307,12 @@ impl CompositorState {
     }
 
     fn restore_minimized_desktop_window_contents(&mut self, window_id: WindowId) -> bool {
-        let x11_surface_id = self
+        let Some((root_surface_id, x11_surface_id)) = self
             .window(window_id)
-            .and_then(|window| window.x11_surface_id);
+            .map(|window| (window.root_surface_id, window.x11_surface_id))
+        else {
+            return false;
+        };
         let Some(minimized_surfaces) = self
             .window_mut(window_id)
             .and_then(|window| window.state.restore_minimized())
@@ -1311,6 +1322,12 @@ impl CompositorState {
 
         for surface in minimized_surfaces {
             self.append_renderable_surface(surface);
+        }
+        if self
+            .window(window_id)
+            .is_some_and(|window| window.state.mode() == ToplevelMode::Fullscreen)
+        {
+            self.set_fullscreen_presentation_owner(root_surface_id);
         }
         self.refresh_active_scene_surface_order();
         if let Some(surface_id) = x11_surface_id {
@@ -1339,6 +1356,7 @@ impl CompositorState {
         if layout_batch {
             let _ = self.finish_layout_reflow_batch();
         }
+        self.begin_lifecycle_restore(window_id, root_surface_id);
         true
     }
 

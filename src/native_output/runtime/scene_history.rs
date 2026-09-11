@@ -1,5 +1,6 @@
 use super::*;
 use oblivion_one::compositor::PresentationFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeFrameSceneSnapshot {
@@ -8,6 +9,7 @@ pub(crate) struct NativeFrameSceneSnapshot {
     pub(crate) scene: NativeSceneSnapshot,
     pub(crate) cursor_damage: NativeCursorDamageBounds,
     pub(crate) presentation: PresentationFrameSnapshot,
+    pub(crate) lifecycle: LifecycleFrameSnapshot,
 }
 
 impl NativeFrameSceneSnapshot {
@@ -22,6 +24,7 @@ impl NativeFrameSceneSnapshot {
             scene: resolved.snapshot_owned(),
             cursor_damage,
             presentation: resolved.presentation_snapshot.clone(),
+            lifecycle: resolved.lifecycle_snapshot.clone(),
         }
     }
 }
@@ -163,8 +166,18 @@ impl NativeSceneHistory {
                     software: current.cursor_damage.software,
                 },
             )
+            .union_surface_rects(
+                lifecycle_damage_rects(&previous.lifecycle, output_width, output_height)
+                    .into_iter()
+                    .chain(lifecycle_damage_rects(
+                        &current.lifecycle,
+                        output_width,
+                        output_height,
+                    )),
+            )
             .as_renderer_damage(output_width, output_height),
-            None => OutputDamage::Full,
+            None => NativeOutputDamage::full_output(output_width, output_height)
+                .as_renderer_damage(output_width, output_height),
         };
         Some(PreparedNativePresentationTransition {
             token,
@@ -229,9 +242,51 @@ impl NativeSceneHistory {
     }
 }
 
+fn lifecycle_damage_rects(
+    snapshot: &LifecycleFrameSnapshot,
+    output_width: u32,
+    output_height: u32,
+) -> Vec<NativeDamageRect> {
+    snapshot
+        .lamps
+        .iter()
+        .filter_map(|lamp| {
+            let left = lamp
+                .source_rect
+                .x()
+                .min(lamp.full_window_rect.x())
+                .min(lamp.anchor_rect.x());
+            let top = lamp
+                .source_rect
+                .y()
+                .min(lamp.full_window_rect.y())
+                .min(lamp.anchor_rect.y());
+            let right = (lamp.source_rect.x() + lamp.source_rect.width())
+                .max(lamp.full_window_rect.x() + lamp.full_window_rect.width())
+                .max(lamp.anchor_rect.x() + lamp.anchor_rect.width());
+            let bottom = (lamp.source_rect.y() + lamp.source_rect.height())
+                .max(lamp.full_window_rect.y() + lamp.full_window_rect.height())
+                .max(lamp.anchor_rect.y() + lamp.anchor_rect.height());
+            if ![left, top, right, bottom].into_iter().all(f64::is_finite) {
+                return None;
+            }
+            NativeDamageRect {
+                x: left.floor() as i32,
+                y: top.floor() as i32,
+                width: (right - left).ceil().max(1.0) as u32,
+                height: (bottom - top).ceil().max(1.0) as u32,
+            }
+            .clipped_to_output(output_width, output_height)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oblivion_one::window_lifecycle_animation::{
+        LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
+    };
 
     fn snapshot(frame_id: u64) -> NativeFrameSceneSnapshot {
         NativeFrameSceneSnapshot {
@@ -240,6 +295,7 @@ mod tests {
             scene: NativeSceneSnapshot::default(),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         }
     }
 
@@ -261,7 +317,65 @@ mod tests {
             scene: NativeSceneSnapshot::default(),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation,
+            lifecycle: LifecycleFrameSnapshot::default(),
         }
+    }
+
+    fn lifecycle_snapshot(progress: f64) -> LifecycleFrameSnapshot {
+        let source = oblivion_one::compositor::PresentationRect::new(80.0, 60.0, 640.0, 480.0)
+            .expect("valid source rectangle");
+        let anchor = oblivion_one::compositor::PresentationRect::new(1200.0, 800.0, 48.0, 48.0)
+            .expect("valid anchor rectangle");
+        LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
+            sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
+            lamps: vec![LampWindowSample {
+                window_id: oblivion_one::compositor::WindowId::from_raw(7)
+                    .expect("valid window id"),
+                root_surface_id: 7,
+                transition_id: LifecycleTransitionId::new(1),
+                source_rect: source,
+                full_window_rect: source,
+                anchor_rect: anchor,
+                progress,
+                opacity: if progress >= 1.0 { 0.0 } else { 1.0 },
+                mathematically_settled: progress >= 1.0,
+                direction: LifecycleDirection::Minimize,
+            }],
+        })
+    }
+
+    #[test]
+    fn lifecycle_damage_and_metadata_follow_physical_scene_promotion() {
+        let mut initial = snapshot(1);
+        initial.lifecycle = lifecycle_snapshot(0.5);
+        let mut next = snapshot(2);
+        next.lifecycle = lifecycle_snapshot(1.0);
+        let mut history = NativeSceneHistory::new(initial);
+        history.replace_ready(next.clone());
+        assert!(history.queue_submission(20));
+
+        let transition = history
+            .prepare_pageflip_transition(20, 1920, 1080)
+            .expect("lifecycle scene transition must be prepared");
+        assert!(!matches!(transition.damage, OutputDamage::Empty));
+        assert_eq!(
+            history
+                .presented_snapshot()
+                .expect("initial scene is presented")
+                .lifecycle
+                .lamps[0]
+                .progress,
+            0.5
+        );
+        assert!(history.promote_pageflip(20));
+        assert!(
+            history
+                .presented_snapshot()
+                .expect("promoted scene is presented")
+                .lifecycle
+                .lamps[0]
+                .mathematically_settled
+        );
     }
 
     #[test]

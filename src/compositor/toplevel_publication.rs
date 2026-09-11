@@ -484,6 +484,15 @@ impl AstreaToplevelPublisher {
         }
     }
 
+    pub(in crate::compositor) fn minimize_anchor(
+        &self,
+        window_id: WindowId,
+    ) -> Option<MinimizeAnchorRect> {
+        self.minimize_anchors
+            .get(&window_id)
+            .map(|anchor| anchor.rect)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn minimize_anchor_for_test(

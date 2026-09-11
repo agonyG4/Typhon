@@ -624,6 +624,11 @@ pub struct CompositorState {
     #[allow(dead_code)]
     presentation_animation_policy: PresentationAnimationPolicy,
     pub(in crate::compositor) animation_control: crate::animation_control::AnimationControlState,
+    window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
+    lifecycle_animation_renderer_available: Option<bool>,
+    lifecycle_render_suppressed_roots: HashSet<u32>,
+    presented_lifecycle: crate::window_lifecycle_animation::LifecycleFrameSnapshot,
+    presented_lifecycle_frame_id: u64,
     presented_presentation: PresentationFrameSnapshot,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
     presented_presentation_frame_id: u64,

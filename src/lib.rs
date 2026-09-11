@@ -30,6 +30,7 @@ pub mod session;
 pub mod shell;
 pub mod syncobj;
 pub mod wayland_drm;
+pub mod window_lifecycle_animation;
 pub mod wm;
 pub mod xwayland;
 

@@ -1006,6 +1006,52 @@ impl OwnCompositorServer {
         self.state.native_frame_presentation_targets(surfaces)
     }
 
+    pub fn lifecycle_scene_sample_at(
+        &self,
+        at: AnimationTime,
+    ) -> crate::window_lifecycle_animation::LifecycleSceneSample {
+        self.state.lifecycle_scene_sample_at(at)
+    }
+
+    pub fn lifecycle_renderable_surfaces(
+        &self,
+        sample: &crate::window_lifecycle_animation::LifecycleSceneSample,
+    ) -> Vec<RenderableSurface> {
+        self.state.lifecycle_renderable_surfaces(sample)
+    }
+
+    pub fn lifecycle_render_suppressed_roots(&self) -> &std::collections::HashSet<u32> {
+        self.state.lifecycle_render_suppressed_roots()
+    }
+
+    pub fn lifecycle_surface_is_suppressed(&self, surface_id: u32) -> bool {
+        self.state.lifecycle_surface_is_suppressed(surface_id)
+    }
+
+    pub fn lifecycle_frame_snapshot_at(
+        &self,
+        at: AnimationTime,
+    ) -> crate::window_lifecycle_animation::LifecycleFrameSnapshot {
+        self.state.lifecycle_frame_snapshot_at(at)
+    }
+
+    pub fn publish_presented_lifecycle(
+        &mut self,
+        frame_id: u64,
+        snapshot: &crate::window_lifecycle_animation::LifecycleFrameSnapshot,
+    ) {
+        self.state.publish_presented_lifecycle(frame_id, snapshot);
+    }
+
+    pub fn presented_lifecycle_frame_id(&self) -> u64 {
+        self.state.presented_lifecycle_frame_id()
+    }
+
+    pub fn set_lifecycle_animation_renderer_available(&mut self, available: bool) {
+        self.state
+            .set_lifecycle_animation_renderer_available(available);
+    }
+
     #[doc(hidden)]
     pub fn install_native_frame_test_scene(
         &mut self,
@@ -1038,7 +1084,9 @@ impl OwnCompositorServer {
             &presentation,
             self.presented_window_geometries_for_targets(&presentation, &targets),
         );
+        let lifecycle = self.lifecycle_frame_snapshot_at(at);
         self.publish_presented_presentation(frame_id, &snapshot);
+        self.publish_presented_lifecycle(frame_id, &lifecycle);
     }
 
     pub fn presentation_scene_sample_at(&self, at: AnimationTime) -> PresentationSceneSample {
