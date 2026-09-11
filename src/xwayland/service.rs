@@ -259,6 +259,14 @@ impl XwaylandService {
         }
     }
 
+    pub fn slow_cycle_totals(&self) -> (u64, u64, u64) {
+        (
+            self.metrics.xwm_events_received,
+            self.metrics.property_refresh_completed,
+            self.metrics.xwm_drain_budget_exhaustions,
+        )
+    }
+
     pub fn readiness_snapshot(&self) -> Option<XwaylandReadinessSnapshot> {
         match &self.state {
             ServiceState::Starting(resources) => Some(self.snapshot_for_starting(resources)),

@@ -272,6 +272,10 @@ impl NativeRuntime {
         let execution_started = std::time::Instant::now();
         let commands = coalesce_client_list_sync(normalization.commands);
         let command_count = commands.len();
+        if self.slow_cycle_trace.enabled() {
+            self.slow_cycle_trace
+                .note_xwayland_scene(events_processed, command_count);
+        }
         for command in commands {
             let _ = self
                 .xwayland

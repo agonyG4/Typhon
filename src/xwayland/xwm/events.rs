@@ -61,6 +61,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::MapRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
+            xwm.reconcile_window_kind(handle, DesktopWindowKind::Managed)?;
             if xwm.windows.get(handle).is_some_and(|record| {
                 record.map_requested
                     && !matches!(
@@ -74,16 +75,10 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.windows
                 .mark_map_requested(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            xwm.authorize_map_if_requested(handle)?;
             xwm.begin_map_to_association_wait(handle)?;
             xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
-            if xwm
-                .windows
-                .get(handle)
-                .is_some_and(|record| record.kind == DesktopWindowKind::OverrideRedirect)
-            {
-                xwm.mark_override_redirect_stack_dirty();
-            }
             trace_window_state(xwm, "map_request_processed", handle, TraceFields::new());
         }
         Event::MapNotify(event) => {

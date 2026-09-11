@@ -57,6 +57,7 @@ mod session;
 mod session_io;
 mod shutdown;
 mod shutdown_cycle;
+mod slow_cycle;
 mod wake_plan;
 mod work_domains;
 mod xwayland;
@@ -149,6 +150,7 @@ pub(crate) use session_io::{
 pub(crate) use shutdown::{
     NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,
 };
+use slow_cycle::{NativeSlowCycleTrace, SlowCycleContext, SlowCyclePhase};
 pub(super) use xwayland_reactor::{
     sync_xwayland_reactor_sources, sync_xwayland_reactor_sources_with_generation,
 };
@@ -581,6 +583,7 @@ pub(crate) struct NativeRuntime {
     presentation_trace_path: Option<std::path::PathBuf>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,
+    slow_cycle_trace: NativeSlowCycleTrace,
 }
 
 pub(super) fn reload_trusted_effects_from_disk(
@@ -719,6 +722,7 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        self.slow_cycle_trace.dump();
         let _ = self
             .dmabuf_gpu_release_registry
             .cancel_all(&mut self.event_loop, &mut self.server);

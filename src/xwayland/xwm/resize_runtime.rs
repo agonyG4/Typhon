@@ -583,24 +583,13 @@ impl Xwm {
         &mut self,
         handle: X11WindowHandle,
     ) -> Result<bool, XwmError> {
-        let Some((properties_ready, kind, map_authorized)) = self
+        let Some(properties_ready) = self
             .windows
             .get(handle)
-            .map(|record| (record.properties_ready, record.kind, record.map_authorized))
+            .map(|record| record.properties_ready)
         else {
             return Ok(false);
         };
-        if properties_ready
-            && kind == DesktopWindowKind::Managed
-            && !map_authorized
-            && self
-                .windows
-                .mark_map_authorized(handle)
-                .map_err(XwmError::InvalidCommand)?
-        {
-            self.outgoing_events
-                .push_back(XwmEvent::WindowMapRequested(handle));
-        }
         if !properties_ready {
             return Ok(false);
         }
@@ -617,6 +606,32 @@ impl Xwm {
             );
             self.outgoing_events
                 .push_back(XwmEvent::WindowReady(snapshot));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn authorize_map_if_requested(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<bool, XwmError> {
+        let Some((map_requested, kind, map_authorized)) = self
+            .windows
+            .get(handle)
+            .map(|record| (record.map_requested, record.kind, record.map_authorized))
+        else {
+            return Ok(false);
+        };
+        if map_requested
+            && kind == DesktopWindowKind::Managed
+            && !map_authorized
+            && self
+                .windows
+                .mark_map_authorized(handle)
+                .map_err(XwmError::InvalidCommand)?
+        {
+            self.outgoing_events
+                .push_back(XwmEvent::WindowMapRequested(handle));
             return Ok(true);
         }
         Ok(false)

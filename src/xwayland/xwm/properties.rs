@@ -646,6 +646,25 @@ fn complete_property(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn complete_stale_reply_for_test(
+    xwm: &mut Xwm,
+    handle: X11WindowHandle,
+    kind: PropertyKind,
+    epoch: u64,
+) -> Result<(), XwmError> {
+    complete_property(
+        xwm,
+        PendingProperty {
+            sequence: 0,
+            handle,
+            kind,
+            epoch,
+        },
+        fallback_for(kind),
+    )
+}
+
 fn initialize_sync_counter_from_properties(
     xwm: &mut Xwm,
     handle: X11WindowHandle,

@@ -169,6 +169,26 @@ impl NativeRuntime {
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         let now_ns = monotonic_now_ns()?;
+        let slow_cycle_enabled = self.slow_cycle_trace.enabled();
+        if slow_cycle_enabled {
+            let xwayland_totals = self.xwayland.slow_cycle_totals();
+            self.slow_cycle_trace.start_cycle(
+                now_ns,
+                self.presentation_timing.mode().refresh_interval_ns(),
+                SlowCycleContext {
+                    wake_reasons: cycle.wakeup.reasons.bits(),
+                    continuation_reasons: cycle.wakeup.continuation.bits(),
+                    ready_sources: cycle.wakeup.ready_sources,
+                    blocked_ns: cycle.wakeup.blocked_ns,
+                    timer_lateness_ns: cycle.wakeup.timer_lateness_ns,
+                    x11_events_total: xwayland_totals.0,
+                    x11_property_replies_total: xwayland_totals.1,
+                    xwm_budget_exhaustions_total: xwayland_totals.2,
+                    ..SlowCycleContext::default()
+                },
+            );
+        }
+        let mut render_attempted = false;
         if self.pointer_timing.enabled() {
             self.pointer_timing.record_next_reactor_wake(now_ns);
             self.pointer_timing.record_reactor_wake_return(now_ns);
@@ -176,6 +196,10 @@ impl NativeRuntime {
         self.service_due_dmabuf_release_retry(now_ns)?;
         let runtime_state = self.native_runtime_state(&cycle, now_ns);
         let work_domains = NativeWorkDomains::classify(&cycle.wakeup, &runtime_state);
+        if slow_cycle_enabled {
+            self.slow_cycle_trace
+                .note_work_domains(work_domains.diagnostic_bits());
+        }
         let operation_plan = work_domains.operation_plan();
         let wayland_client_work = work_domains.wayland_protocol;
         let xwayland_work = work_domains.xwayland;
@@ -202,6 +226,7 @@ impl NativeRuntime {
             self.reap_supervised_children(&cycle)?;
         }
         if work_domains.xwayland {
+            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let xwm_drain_started = Instant::now();
             self.dispatch_xwayland_events(&cycle.wakeup)?;
             self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
@@ -211,6 +236,13 @@ impl NativeRuntime {
                 self.revoke_xwayland_private_client();
             }
             self.sync_xwayland_reactor_sources()?;
+            if let Some(start_ns) = slow_phase_started_at_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::XwaylandReactor,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         }
         if cycle.wakeup.reasons.timer()
             || cycle
@@ -218,6 +250,7 @@ impl NativeRuntime {
                 .continuation
                 .contains(NativeContinuationReason::ControlTimeout)
         {
+            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             self.control_server.expire_idle_clients(
                 &mut self.event_loop,
                 monotonic_now_ns()?,
@@ -229,6 +262,13 @@ impl NativeRuntime {
                 self.revoke_xwayland_private_client();
             }
             self.sync_xwayland_reactor_sources()?;
+            if let Some(start_ns) = slow_phase_started_at_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::TimerDeadline,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         }
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
@@ -250,6 +290,7 @@ impl NativeRuntime {
             })?;
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
+                self.finish_slow_cycle(&cycle, render_attempted)?;
                 return Ok(());
             }
             if work_domains.control {
@@ -260,12 +301,18 @@ impl NativeRuntime {
             }
             self.service_keyboard_persistence_completions(&cycle.wakeup)?;
             self.arm_suspended_deadline()?;
+            self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
         if !self.shutdown.is_running() {
             self.quiesce_control_server()?;
+            self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
+        let slow_wayland_phase_started_at_ns = (slow_cycle_enabled
+            && (work_domains.wayland_dispatch || work_domains.input))
+            .then(monotonic_now_ns)
+            .transpose()?;
         let wayland_dispatch_started = Instant::now();
         let dispatch_outcome =
             if operation_plan.dispatch_wayland_read_side || operation_plan.service_input {
@@ -281,6 +328,7 @@ impl NativeRuntime {
             self.request_native_vt_switch(vt)?;
             if !self.session.permits_output() {
                 self.quiesce_control_server()?;
+                self.finish_slow_cycle(&cycle, render_attempted)?;
                 return Ok(());
             }
         }
@@ -341,6 +389,17 @@ impl NativeRuntime {
         } else if work_domains.input {
             self.note_timing_scope("input_dispatch", wayland_dispatch_started.elapsed());
         }
+        if let Some(start_ns) = slow_wayland_phase_started_at_ns {
+            self.slow_cycle_trace.record_phase(
+                SlowCyclePhase::WaylandInput,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
+        let slow_cursor_phase_started_at_ns = (slow_cycle_enabled
+            && (work_domains.control || work_domains.cursor))
+            .then(monotonic_now_ns)
+            .transpose()?;
         let cursor_control_started_at_ns = (self.pointer_timing.enabled()
             && (work_domains.control || work_domains.cursor))
             .then(monotonic_now_ns)
@@ -366,6 +425,13 @@ impl NativeRuntime {
                 monotonic_now_ns()?,
             );
         }
+        if let Some(start_ns) = slow_cursor_phase_started_at_ns {
+            self.slow_cycle_trace.record_phase(
+                SlowCyclePhase::CursorControl,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
         let xwayland_scene_work = wayland_client_work || xwayland_work;
         if xwayland_scene_work {
             let _ = self.service_input_at_routing_guard_checkpoint(
@@ -375,6 +441,7 @@ impl NativeRuntime {
             )?;
         }
         if xwayland_scene_work {
+            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -392,6 +459,13 @@ impl NativeRuntime {
                     monotonic_now_ns()?,
                 );
             }
+            if let Some(start_ns) = slow_phase_started_at_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::XwaylandScene,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         }
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
@@ -400,6 +474,7 @@ impl NativeRuntime {
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
             }
+            self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
         if work_domains.wayland_dispatch || work_domains.control || xwayland_scene_work {
@@ -429,6 +504,7 @@ impl NativeRuntime {
             )?;
         }
         let prepare_outcome = if prepare_operation_plan.service_acquire_and_prepare {
+            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -452,6 +528,13 @@ impl NativeRuntime {
                     monotonic_now_ns()?,
                 );
             }
+            if let Some(start_ns) = slow_phase_started_at_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::AcquirePrepare,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
             outcome
         } else {
             self.resource_efficiency_mut().record_acquire_prepare_skip();
@@ -469,6 +552,7 @@ impl NativeRuntime {
             self.plan_pending_commit_timing(monotonic_now_ns()?);
         }
         if !self.shutdown.is_running() || !self.session.permits_output() {
+            self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
         let presentation_operation_plan = NativeWorkDomains::classify(
@@ -489,6 +573,8 @@ impl NativeRuntime {
             )?;
         }
         if presentation_work {
+            render_attempted = true;
+            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -522,6 +608,13 @@ impl NativeRuntime {
                     monotonic_now_ns()?,
                 );
             }
+            if let Some(start_ns) = slow_phase_started_at_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::RenderPresentKms,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
         } else {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
@@ -542,6 +635,44 @@ impl NativeRuntime {
         if self.pointer_timing.enabled() {
             self.pointer_timing.record_cycle_return(monotonic_now_ns()?);
         }
+        self.finish_slow_cycle(&cycle, render_attempted)?;
+        Ok(())
+    }
+
+    fn finish_slow_cycle(
+        &mut self,
+        cycle: &NativeCycleState,
+        render_attempted: bool,
+    ) -> NativeResult<()> {
+        if !self.slow_cycle_trace.enabled() {
+            return Ok(());
+        }
+        let (kms_queue_depth, kms_worker_active) = self
+            .kms_commit_worker
+            .as_ref()
+            .map(|worker| (worker.queue_depth(), worker.submission_active()))
+            .unwrap_or_default();
+        let xwayland_totals = self.xwayland.slow_cycle_totals();
+        self.slow_cycle_trace.note_xwayland_totals(
+            xwayland_totals.0,
+            xwayland_totals.1,
+            xwayland_totals.2,
+        );
+        self.slow_cycle_trace.note_input(
+            cycle.raw_input_events,
+            cycle.coalesced_input_events,
+            cycle.wakeup.reasons.input(),
+            self.input_epoch.backlog_pending(),
+        );
+        self.slow_cycle_trace.note_output(
+            render_attempted,
+            cycle.frame_rendered,
+            cycle.frame_submitted,
+            cycle.pageflip_pending_at_tick || self.scanout.page_flip_pending(),
+            kms_queue_depth,
+            kms_worker_active,
+        );
+        self.slow_cycle_trace.finish_cycle(monotonic_now_ns()?);
         Ok(())
     }
 

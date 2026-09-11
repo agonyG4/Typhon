@@ -12,6 +12,7 @@ use x11rb::{
 };
 
 use super::super::X11WindowSnapshot;
+use super::super::properties::{self, PropertyKind};
 use super::super::{ResizeSyncState, X11WindowType, X11WindowTypes, XwmCommand, XwmEvent};
 use super::tests::{
     complete_property_refresh, generation, map_event, prepare_managed_window, ready_events,
@@ -147,6 +148,30 @@ fn sync_snapshot(handle: super::X11WindowHandle, counter: u64) -> X11WindowSnaps
         supports_sync_request: true,
         sync_counter: Some(counter),
     }
+}
+
+fn create_event(window: u32, override_redirect: bool) -> Event {
+    Event::CreateNotify(xproto::CreateNotifyEvent {
+        response_type: 16,
+        sequence: 0,
+        parent: 1,
+        window,
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
+        border_width: 0,
+        override_redirect,
+    })
+}
+
+fn map_request_event(window: u32) -> Event {
+    Event::MapRequest(xproto::MapRequestEvent {
+        response_type: 20,
+        sequence: 0,
+        parent: 1,
+        window,
+    })
 }
 
 fn prepare_mapped_override_redirect_window(
@@ -1939,10 +1964,14 @@ fn iconic_client_map_request_starts_a_new_map_epoch() {
     complete_property_refresh(&mut xwm, &mut peer);
 
     let events = ready_events(&mut xwm);
-    assert!(
-        events.iter().any(
-            |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
-        )
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+            )
+            .count(),
+        1
     );
 
     normalize(
@@ -1956,6 +1985,141 @@ fn iconic_client_map_request_starts_a_new_map_epoch() {
     )
     .expect("duplicate client MapRequest");
     assert!(ready_events(&mut xwm).is_empty());
+}
+
+#[test]
+fn create_override_redirect_then_map_request_authorizes_managed_mapping() {
+    let generation = generation(33);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 133);
+
+    normalize(&mut xwm, create_event(handle.xid(), true)).expect("CreateNotify");
+    assert_eq!(
+        xwm.windows.get(handle).expect("created window").kind,
+        DesktopWindowKind::OverrideRedirect
+    );
+
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("MapRequest");
+    let map_events = ready_events(&mut xwm);
+    assert_eq!(
+        map_events
+            .iter()
+            .filter(
+                |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+            )
+            .count(),
+        1,
+        "MapRequest must authorize mapping before properties complete"
+    );
+    let record = xwm.windows.get(handle).expect("managed map record");
+    assert_eq!(record.kind, DesktopWindowKind::Managed);
+    assert!(record.map_requested);
+    assert!(record.map_authorized);
+    assert!(!record.properties_ready);
+
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("duplicate MapRequest");
+    assert!(ready_events(&mut xwm).is_empty());
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Map(handle))
+        .expect("map authorization command");
+    complete_property_refresh(&mut xwm, &mut peer);
+    xwm.note_x11_surface_serial(handle, 0x1234, 0)
+        .expect("X11 surface serial");
+    xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+        generation,
+        serial: NonZeroU64::new(0x1234).expect("association serial"),
+        surface_id: 42,
+    })
+    .expect("Wayland association");
+    xwm.mark_window_buffer_ready(handle)
+        .expect("buffer readiness");
+    normalize(&mut xwm, map_event(handle.xid(), false)).expect("MapNotify");
+
+    let ready = ready_events(&mut xwm);
+    assert_eq!(
+        ready
+            .iter()
+            .filter(|event| matches!(event, XwmEvent::WindowReady(snapshot) if snapshot.handle == handle))
+            .count(),
+        1,
+        "managed readiness must be published exactly once"
+    );
+}
+
+#[test]
+fn properties_ready_before_map_request_do_not_authorize_mapping() {
+    let generation = generation(34);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 134);
+
+    normalize(&mut xwm, create_event(handle.xid(), false)).expect("CreateNotify");
+    complete_property_refresh(&mut xwm, &mut peer);
+    assert!(
+        ready_events(&mut xwm).iter().all(
+            |event| !matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+        )
+    );
+    let record = xwm.windows.get(handle).expect("observed window");
+    assert!(!record.map_requested);
+    assert!(!record.map_authorized);
+
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("MapRequest");
+    let events = ready_events(&mut xwm);
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn genuine_override_redirect_map_notify_is_adopted_without_map_command() {
+    let generation = generation(35);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 135);
+
+    normalize(&mut xwm, create_event(handle.xid(), true)).expect("CreateNotify");
+    normalize(&mut xwm, map_event(handle.xid(), true)).expect("external OR MapNotify");
+    complete_property_refresh(&mut xwm, &mut peer);
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        events.iter().all(
+            |event| !matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+        )
+    );
+    let record = xwm.windows.get(handle).expect("OR window record");
+    assert_eq!(record.kind, DesktopWindowKind::OverrideRedirect);
+    assert!(record.mapped_notified);
+    assert!(!record.map_operation_pending);
+}
+
+#[test]
+fn stale_property_reply_cannot_revert_managed_map_request() {
+    let generation = generation(36);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 136);
+
+    normalize(&mut xwm, create_event(handle.xid(), true)).expect("CreateNotify");
+    let old_epoch = xwm
+        .windows
+        .get(handle)
+        .expect("created window")
+        .property_epoch;
+    normalize(&mut xwm, map_request_event(handle.xid())).expect("MapRequest");
+
+    properties::complete_stale_reply_for_test(&mut xwm, handle, PropertyKind::NetWmName, old_epoch)
+        .expect("stale property reply");
+
+    let record = xwm.windows.get(handle).expect("managed map record");
+    assert_eq!(record.kind, DesktopWindowKind::Managed);
+    assert!(record.map_requested);
+    assert!(record.map_authorized);
+    assert_eq!(xwm.property_metrics().stale, 1);
 }
 
 #[test]

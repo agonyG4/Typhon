@@ -743,6 +743,7 @@ impl NativeRuntime {
                 .map(std::path::PathBuf::from),
             timing_scopes: std::collections::BTreeMap::new(),
             render_telemetry: NativeRenderTelemetry::default(),
+            slow_cycle_trace: NativeSlowCycleTrace::from_env(),
         };
         if xwayland_environment_materialized {
             runtime

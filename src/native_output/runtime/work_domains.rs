@@ -64,6 +64,56 @@ impl NativeCycleOperationPlan {
 }
 
 impl NativeWorkDomains {
+    pub(super) const fn diagnostic_bits(self) -> u32 {
+        let mut bits = 0;
+        if self.input {
+            bits |= 1 << 0;
+        }
+        if self.wayland_protocol {
+            bits |= 1 << 1;
+        }
+        if self.astrea_publication {
+            bits |= 1 << 2;
+        }
+        if self.commit_timing_planning {
+            bits |= 1 << 3;
+        }
+        if self.wayland_dispatch {
+            bits |= 1 << 4;
+        }
+        if self.scene {
+            bits |= 1 << 5;
+        }
+        if self.cursor {
+            bits |= 1 << 6;
+        }
+        if self.presentation {
+            bits |= 1 << 7;
+        }
+        if self.explicit_sync {
+            bits |= 1 << 8;
+        }
+        if self.surface_pacing {
+            bits |= 1 << 9;
+        }
+        if self.xwayland {
+            bits |= 1 << 10;
+        }
+        if self.control {
+            bits |= 1 << 11;
+        }
+        if self.children {
+            bits |= 1 << 12;
+        }
+        if self.session {
+            bits |= 1 << 13;
+        }
+        if self.shutdown {
+            bits |= 1 << 14;
+        }
+        bits
+    }
+
     pub(super) const fn should_service_surface_pacing(self) -> bool {
         self.surface_pacing && !self.wayland_dispatch
     }
