@@ -149,6 +149,7 @@ impl OutputSlotOwnership {
 
 /// Fatal output ownership failures. Recoverable session ownership lives in `suspended`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum OutputQuarantineReason {
     PostDrawRenderFailure,
     RenderFenceExportFailure,
