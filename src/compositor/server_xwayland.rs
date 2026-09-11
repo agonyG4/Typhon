@@ -241,7 +241,7 @@ impl OwnCompositorServer {
         }
     }
 
-    pub(super) fn restack_xwayland_windows(&self) -> XwmCommand {
+    pub(crate) fn restack_xwayland_windows(&self) -> XwmCommand {
         let (client_list, stacking) = self.state.x11_client_lists();
         XwmCommand::RestackExact {
             order: self.state.x11_stack_handles(),

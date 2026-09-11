@@ -269,7 +269,13 @@ impl CompositorState {
             .pending_locked_pointer_reveal
             .as_ref()
             .is_some_and(|pending| {
-                pending.backend_restore_settled && pending.client_warp_position.is_some()
+                pending.backend_restore_settled
+                    && pending.client_warp_position.is_some()
+                    && pending
+                        .backend_settled_dispatch_epoch
+                        .is_some_and(|settled_epoch| {
+                            settled_epoch.saturating_add(1) < self.dispatch_epoch
+                        })
             });
         if should_finalize {
             self.finalize_pending_locked_pointer_reveal(reason);
@@ -365,19 +371,29 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal_after_dispatch(&mut self) {
-        let should_fallback = self
+        let should_finalize = self
             .pending_locked_pointer_reveal
             .as_ref()
             .is_some_and(|pending| {
-                pending
-                    .backend_settled_dispatch_epoch
-                    .is_some_and(|settled_epoch| {
-                        pending.client_warp_position.is_none()
-                            && settled_epoch.saturating_add(2) < self.dispatch_epoch
-                    })
+                let Some(settled_epoch) = pending.backend_settled_dispatch_epoch else {
+                    return false;
+                };
+                if pending.client_warp_position.is_some() {
+                    settled_epoch.saturating_add(1) < self.dispatch_epoch
+                } else {
+                    settled_epoch.saturating_add(2) < self.dispatch_epoch
+                }
             });
-        if should_fallback {
-            self.settle_pending_locked_pointer_reveal_fallback();
+        if should_finalize {
+            if self
+                .pending_locked_pointer_reveal
+                .as_ref()
+                .is_some_and(|pending| pending.client_warp_position.is_none())
+            {
+                self.settle_pending_locked_pointer_reveal_fallback();
+            } else {
+                self.finalize_pending_locked_pointer_reveal("dispatch_grace_elapsed");
+            }
         }
     }
 

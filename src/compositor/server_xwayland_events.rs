@@ -87,6 +87,11 @@ impl OwnCompositorServer {
                 if !self.state.defer_client_list_sync() {
                     commands.push(self.sync_xwayland_client_lists());
                 }
+                if snapshot_for_trace.transient_for.is_some()
+                    && self.state.x11_stack_handles().len() >= 2
+                {
+                    commands.push(self.restack_xwayland_windows());
+                }
                 commands
             }
             Err(error) => {
