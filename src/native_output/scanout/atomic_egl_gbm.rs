@@ -1603,6 +1603,18 @@ impl AtomicRenderedFrameParts {
             dmabuf_cache_entries: self.stats.dmabuf_cache_entries,
             dmabuf_cache_peak_entries: self.stats.dmabuf_cache_peak_entries,
             dmabuf_cache_evictions: self.stats.dmabuf_cache_evictions,
+            dmabuf_current_resource_reuses: self.stats.dmabuf_current_resource_reuses,
+            dmabuf_cache_hits: self.stats.dmabuf_cache_hits,
+            dmabuf_cache_misses: self.stats.dmabuf_cache_misses,
+            dmabuf_cache_insertions: self.stats.dmabuf_cache_insertions,
+            dmabuf_cache_evictions_dead: self.stats.dmabuf_cache_evictions_dead,
+            dmabuf_cache_evictions_surface_bound: self.stats.dmabuf_cache_evictions_surface_bound,
+            dmabuf_cache_evictions_surface_destroyed: self
+                .stats
+                .dmabuf_cache_evictions_surface_destroyed,
+            dmabuf_cache_max_entries_for_one_surface: self
+                .stats
+                .dmabuf_cache_max_entries_for_one_surface,
             surface_resource_candidates: self.stats.surface_resource_candidates,
             surface_resource_consumers: self.stats.surface_resource_consumers,
             surface_resource_deferred: self.stats.surface_resource_deferred,

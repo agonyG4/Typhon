@@ -50,6 +50,7 @@ pub(crate) struct EffectGraphMetrics {
     pub passes: usize,
     pub textures: usize,
     pub peak_live_textures: usize,
+    pub peak_live_bytes: u64,
     pub capture_pixels: u64,
     pub output_pixels: u64,
 }
@@ -77,6 +78,7 @@ pub(crate) fn graph_metrics(
         passes: graph.stats.passes,
         textures: graph.stats.textures,
         peak_live_textures: graph.stats.peak_live_intermediates,
+        peak_live_bytes: super::resources::estimate_graph_peak_bytes(graph).unwrap_or_default(),
         capture_pixels,
         output_pixels,
     }

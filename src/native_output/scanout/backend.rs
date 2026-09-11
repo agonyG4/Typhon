@@ -81,6 +81,14 @@ pub(crate) struct NativePaintStats {
     pub(crate) dmabuf_cache_entries: usize,
     pub(crate) dmabuf_cache_peak_entries: usize,
     pub(crate) dmabuf_cache_evictions: usize,
+    pub(crate) dmabuf_current_resource_reuses: usize,
+    pub(crate) dmabuf_cache_hits: usize,
+    pub(crate) dmabuf_cache_misses: usize,
+    pub(crate) dmabuf_cache_insertions: usize,
+    pub(crate) dmabuf_cache_evictions_dead: usize,
+    pub(crate) dmabuf_cache_evictions_surface_bound: usize,
+    pub(crate) dmabuf_cache_evictions_surface_destroyed: usize,
+    pub(crate) dmabuf_cache_max_entries_for_one_surface: usize,
     pub(crate) surface_resource_candidates: usize,
     pub(crate) surface_resource_consumers: usize,
     pub(crate) surface_resource_deferred: usize,
@@ -139,6 +147,29 @@ impl NativePaintStats {
             NativePerfField::usize("dmabuf_cache_peak_entries", self.dmabuf_cache_peak_entries),
             NativePerfField::usize("dmabuf_cache_evictions", self.dmabuf_cache_evictions),
             NativePerfField::usize(
+                "dmabuf_current_resource_reuses",
+                self.dmabuf_current_resource_reuses,
+            ),
+            NativePerfField::usize("dmabuf_cache_hits", self.dmabuf_cache_hits),
+            NativePerfField::usize("dmabuf_cache_misses", self.dmabuf_cache_misses),
+            NativePerfField::usize("dmabuf_cache_insertions", self.dmabuf_cache_insertions),
+            NativePerfField::usize(
+                "dmabuf_cache_evictions_dead",
+                self.dmabuf_cache_evictions_dead,
+            ),
+            NativePerfField::usize(
+                "dmabuf_cache_evictions_surface_bound",
+                self.dmabuf_cache_evictions_surface_bound,
+            ),
+            NativePerfField::usize(
+                "dmabuf_cache_evictions_surface_destroyed",
+                self.dmabuf_cache_evictions_surface_destroyed,
+            ),
+            NativePerfField::usize(
+                "dmabuf_cache_max_entries_for_one_surface",
+                self.dmabuf_cache_max_entries_for_one_surface,
+            ),
+            NativePerfField::usize(
                 "surface_resource_candidates",
                 self.surface_resource_candidates,
             ),
@@ -155,6 +186,22 @@ impl NativePaintStats {
             NativePerfField::u64("copy_us", self.copy_us),
             NativePerfField::u64("write_us", self.write_us),
         ];
+        if self.backend == NativeScanoutKind::AtomicEglGbmExplicit {
+            fields.extend([
+                NativePerfField::u64(
+                    "output_slot_linear_payload_bytes",
+                    output_slot_linear_payload_bytes(self.width, self.height),
+                ),
+                NativePerfField::u64(
+                    "output_pool_linear_payload_bytes",
+                    output_pool_linear_payload_bytes(self.width, self.height),
+                ),
+                NativePerfField::u64(
+                    "incremental_third_slot_linear_payload_bytes",
+                    incremental_third_slot_linear_payload_bytes(self.width, self.height),
+                ),
+            ]);
+        }
         if let Some(scanout_format) = self.scanout_format {
             fields.push(NativePerfField::str(
                 "scanout_format",
@@ -257,6 +304,10 @@ impl NativePaintStats {
                     "render_graph_peak_live_textures",
                     repaint.render_graph_peak_live_textures,
                 ),
+                NativePerfField::u64(
+                    "effect_graph_peak_live_bytes",
+                    repaint.effect_graph_peak_live_bytes,
+                ),
                 NativePerfField::u64("effect_capture_pixels", repaint.effect_capture_pixels),
                 NativePerfField::u64(
                     "effect_capture_pixels_executed",
@@ -278,7 +329,43 @@ impl NativePaintStats {
                     "effect_resource_evictions",
                     repaint.effect_resource_evictions,
                 ),
+                NativePerfField::usize(
+                    "effect_resource_allocations_total",
+                    repaint.effect_resource_allocations_total,
+                ),
+                NativePerfField::usize(
+                    "effect_resource_reuses_total",
+                    repaint.effect_resource_reuses_total,
+                ),
+                NativePerfField::usize(
+                    "effect_resource_evictions_total",
+                    repaint.effect_resource_evictions_total,
+                ),
                 NativePerfField::u64("effect_gpu_cache_bytes", repaint.effect_gpu_cache_bytes),
+                NativePerfField::u64(
+                    "effect_gpu_cache_peak_bytes",
+                    repaint.effect_gpu_cache_peak_bytes,
+                ),
+                NativePerfField::u64("effect_gpu_budget_bytes", repaint.effect_gpu_budget_bytes),
+                NativePerfField::usize("effect_gpu_cached_keys", repaint.effect_gpu_cached_keys),
+                NativePerfField::usize(
+                    "effect_gpu_cached_textures",
+                    repaint.effect_gpu_cached_textures,
+                ),
+                NativePerfField::usize(
+                    "effect_gpu_checked_out_textures",
+                    repaint.effect_gpu_checked_out_textures,
+                ),
+                NativePerfField::usize("shader_cache_capacity", repaint.shader_cache_capacity),
+                NativePerfField::usize("shader_cache_entries", repaint.shader_cache_entries),
+                NativePerfField::usize(
+                    "shader_cache_peak_entries",
+                    repaint.shader_cache_peak_entries,
+                ),
+                NativePerfField::usize(
+                    "shader_cache_evictions_total",
+                    repaint.shader_cache_evictions_total,
+                ),
             ]);
             if let Some(age) = repaint.buffer_age {
                 fields.push(NativePerfField::u64("egl_buffer_age", u64::from(age)));

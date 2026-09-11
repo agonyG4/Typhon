@@ -63,6 +63,7 @@ impl ShaderProgramKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShaderCacheError {
     InvalidCapacity,
+    CapacityOverflow,
     CacheFull,
     MissingProgram,
 }
@@ -99,11 +100,91 @@ struct CachedShaderProgram {
     uniform_locations: HashMap<String, Option<glow::UniformLocation>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShaderProgramCacheMetrics {
+    pub(crate) capacity: usize,
+    pub(crate) resident_entries: usize,
+    pub(crate) peak_entries: usize,
+    pub(crate) eviction_count: usize,
+}
+
 pub struct ShaderProgramCache {
     entries: HashMap<ShaderProgramKey, CachedShaderProgram>,
     capacity: usize,
+    peak_entries: usize,
     clock: u64,
     evicted: Vec<ShaderProgramKey>,
+}
+
+fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 9] {
+    [
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
+                .expect("builtin shader ids are non-zero"),
+            1,
+            blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            blur::DUAL_KAWASE_UPSAMPLE_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COPY)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            super::executor::COPY_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COPY)
+                .expect("builtin shader ids are non-zero"),
+            1,
+            super::executor::NORMALIZE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            super::executor::COMPOSITE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_MASK)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            super::executor::MASK_STAGE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_BLEND)
+                .expect("builtin shader ids are non-zero"),
+            0,
+            super::executor::BLEND_STAGE_FRAGMENT_SHADER,
+        ),
+    ]
+}
+
+pub(crate) fn builtin_shader_program_count() -> usize {
+    builtin_shader_programs().len()
+}
+
+pub(crate) fn shader_cache_capacity_for_custom_shaders(
+    custom_shader_count: usize,
+) -> Result<usize, ShaderCacheError> {
+    builtin_shader_program_count()
+        .checked_add(custom_shader_count)
+        .ok_or(ShaderCacheError::CapacityOverflow)
 }
 
 impl ShaderProgramCache {
@@ -114,6 +195,7 @@ impl ShaderProgramCache {
         Ok(Self {
             entries: HashMap::new(),
             capacity,
+            peak_entries: 0,
             clock: 0,
             evicted: Vec::new(),
         })
@@ -144,6 +226,7 @@ impl ShaderProgramCache {
                 uniform_locations: HashMap::new(),
             },
         );
+        self.peak_entries = self.peak_entries.max(self.entries.len());
         Ok(())
     }
 
@@ -163,6 +246,15 @@ impl ShaderProgramCache {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn metrics(&self) -> ShaderProgramCacheMetrics {
+        ShaderProgramCacheMetrics {
+            capacity: self.capacity,
+            resident_entries: self.entries.len(),
+            peak_entries: self.peak_entries,
+            eviction_count: self.evicted.len(),
+        }
     }
 
     pub(crate) fn get_or_compile(
@@ -208,6 +300,7 @@ impl ShaderProgramCache {
                 uniform_locations: HashMap::new(),
             },
         );
+        self.peak_entries = self.peak_entries.max(self.entries.len());
         Ok(program)
     }
 
@@ -277,59 +370,8 @@ impl ShaderProgramCache {
 
     pub(crate) fn prewarm_builtins(&mut self, gl: &glow::Context) -> RendererResult<()> {
         let vertex = blur::DUAL_KAWASE_VERTEX_SHADER;
-        for (module, variant, fragment) in [
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
-                0,
-                blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE,
-                1,
-                blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE,
-                0,
-                blur::DUAL_KAWASE_UPSAMPLE_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_COPY,
-                0,
-                super::executor::COPY_FRAGMENT_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_COPY,
-                1,
-                super::executor::NORMALIZE_FRAGMENT_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE,
-                0,
-                super::executor::COMPOSITE_FRAGMENT_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
-                0,
-                super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_MASK,
-                0,
-                super::executor::MASK_STAGE_FRAGMENT_SHADER,
-            ),
-            (
-                INTERNAL_EFFECT_SHADER_MODULE_BLEND,
-                0,
-                super::executor::BLEND_STAGE_FRAGMENT_SHADER,
-            ),
-        ] {
-            let key = ShaderProgramKey::new(
-                oblivion_one::effects::ShaderModuleId::new(module)
-                    .expect("builtin shader ids are non-zero"),
-                variant,
-                EffectWorkingSpace::LinearSrgb,
-            );
+        for (module, variant, fragment) in builtin_shader_programs() {
+            let key = ShaderProgramKey::new(module, variant, EffectWorkingSpace::LinearSrgb);
             self.prewarm(gl, key, vertex, fragment)?;
         }
         Ok(())
@@ -589,6 +631,76 @@ mod tests {
         cache.touch(key(2, 0)).unwrap();
         cache.remember_source(key(3, 0), "three").unwrap();
         assert_eq!(cache.evicted_keys(), vec![key(1, 0)]);
+    }
+
+    #[test]
+    fn undersized_generation_cache_evicts_a_required_key() {
+        let required_keys = [key(1, 0), key(2, 0), key(3, 0)];
+        let mut cache = ShaderProgramCache::new(2).unwrap();
+        for (index, required_key) in required_keys.into_iter().enumerate() {
+            cache
+                .remember_source(required_key, ["one", "two", "three"][index])
+                .unwrap();
+        }
+        assert_eq!(cache.evicted_keys(), vec![key(1, 0)]);
+        assert_eq!(cache.metrics().eviction_count, 1);
+    }
+
+    #[test]
+    fn builtin_shader_count_and_generation_capacity_share_one_resident_set() {
+        assert_eq!(
+            builtin_shader_program_count(),
+            builtin_shader_programs().len()
+        );
+        assert_eq!(builtin_shader_program_count(), 9);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 9);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 10);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 129);
+        assert_eq!(
+            shader_cache_capacity_for_custom_shaders(usize::MAX),
+            Err(ShaderCacheError::CapacityOverflow)
+        );
+    }
+
+    #[test]
+    fn custom_shader_set_beyond_old_effective_limit_remains_resident() {
+        let custom_count = 120;
+        let capacity = shader_cache_capacity_for_custom_shaders(custom_count).unwrap();
+        let mut cache = ShaderProgramCache::new(capacity).unwrap();
+        for (index, (module, variant, _)) in builtin_shader_programs().into_iter().enumerate() {
+            cache
+                .remember_source(
+                    ShaderProgramKey::new(module, variant, EffectWorkingSpace::LinearSrgb),
+                    &format!("builtin-{index}"),
+                )
+                .unwrap();
+        }
+        for index in 0..custom_count {
+            cache
+                .remember_source(key(2_000 + index as u64, 0), "custom")
+                .unwrap();
+        }
+        let metrics = cache.metrics();
+        assert_eq!(metrics.capacity, capacity);
+        assert_eq!(metrics.resident_entries, capacity);
+        assert_eq!(metrics.peak_entries, capacity);
+        assert_eq!(metrics.eviction_count, 0);
+    }
+
+    #[test]
+    fn steady_state_lookup_does_not_evict_resident_entries() {
+        let keys = [key(1, 0), key(2, 0), key(3, 0)];
+        let mut cache = ShaderProgramCache::new(keys.len()).unwrap();
+        for (index, key) in keys.into_iter().enumerate() {
+            cache
+                .remember_source(key, ["one", "two", "three"][index])
+                .unwrap();
+        }
+        let before = cache.metrics();
+        for key in keys {
+            assert!(cache.lookup(key).is_err());
+        }
+        assert_eq!(cache.metrics(), before);
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub enum EffectResourceError {
     InvalidDimensions,
     SizeOverflow,
     TextureIdOverflow,
+    InvalidGraphLifetime,
     BudgetExceeded {
         requested_bytes: u64,
         current_bytes: u64,
@@ -619,41 +620,73 @@ pub(crate) fn release_dead_graph_textures(
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) fn estimate_graph_peak_bytes(
     graph: &CompiledFrameGraph,
 ) -> Result<u64, EffectResourceError> {
-    let mut pool = EffectResourcePool::new();
-    let mut live = HashMap::new();
-    for pass in &graph.passes {
-        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
-            let Some(plan) = graph
-                .textures
-                .iter()
-                .find(|texture| texture.id == texture_id)
-            else {
-                return Err(EffectResourceError::UnknownTexture(u64::from(
-                    texture_id.get(),
-                )));
-            };
-            if plan.source == GraphTextureSource::Output || live.contains_key(&texture_id) {
-                continue;
-            }
-            live.insert(texture_id, pool.checkout(texture_key(plan))?);
-        }
-        let dead = graph
-            .textures
-            .iter()
-            .filter(|texture| texture.last_use == Some(pass.id))
-            .map(|texture| texture.id)
-            .collect::<Vec<_>>();
-        for texture_id in dead {
-            if let Some(texture) = live.remove(&texture_id) {
-                pool.return_texture(texture)?;
-            }
-        }
+    if graph.passes.is_empty() {
+        return Ok(0);
     }
-    Ok(pool.peak_bytes())
+
+    let max_pass_id = graph
+        .passes
+        .iter()
+        .map(|pass| usize::from(pass.id.get()))
+        .max()
+        .unwrap_or(0);
+    let mut position_by_id = vec![None; max_pass_id.saturating_add(1)];
+    for (position, pass) in graph.passes.iter().enumerate() {
+        let id = usize::from(pass.id.get());
+        let Some(mapped_position) = position_by_id.get_mut(id) else {
+            return Err(EffectResourceError::InvalidGraphLifetime);
+        };
+        if mapped_position.is_some() {
+            return Err(EffectResourceError::InvalidGraphLifetime);
+        }
+        *mapped_position = Some(position);
+    }
+
+    let mut delta = vec![0_i128; graph.passes.len().saturating_add(1)];
+    for texture in &graph.textures {
+        if texture.source == GraphTextureSource::Output {
+            continue;
+        }
+        let (Some(first), Some(last)) = (texture.first_use, texture.last_use) else {
+            continue;
+        };
+        let first = position_by_id
+            .get(usize::from(first.get()))
+            .copied()
+            .flatten()
+            .ok_or(EffectResourceError::InvalidGraphLifetime)?;
+        let last = position_by_id
+            .get(usize::from(last.get()))
+            .copied()
+            .flatten()
+            .ok_or(EffectResourceError::InvalidGraphLifetime)?;
+        if first > last {
+            return Err(EffectResourceError::InvalidGraphLifetime);
+        }
+        let bytes = i128::from(texture_key(texture).estimated_bytes()?);
+        delta[first] = delta[first]
+            .checked_add(bytes)
+            .ok_or(EffectResourceError::SizeOverflow)?;
+        delta[last + 1] = delta[last + 1]
+            .checked_sub(bytes)
+            .ok_or(EffectResourceError::SizeOverflow)?;
+    }
+
+    let mut live = 0_i128;
+    let mut peak = 0_i128;
+    for change in delta.into_iter().take(graph.passes.len()) {
+        live = live
+            .checked_add(change)
+            .ok_or(EffectResourceError::SizeOverflow)?;
+        if live < 0 {
+            return Err(EffectResourceError::InvalidGraphLifetime);
+        }
+        peak = peak.max(live);
+    }
+    u64::try_from(peak).map_err(|_| EffectResourceError::SizeOverflow)
 }
 
 #[cfg(test)]
@@ -825,6 +858,142 @@ mod tests {
         pool.return_texture(second).unwrap();
     }
 
+    fn fullscreen_blur_graph(width: u32, height: u32) -> CompiledFrameGraph {
+        let effect = EffectInstanceId::new(1).unwrap();
+        let anchor = oblivion_one::compositor::EffectAnchor::OutputPostProcess;
+        let ids = (1..=6)
+            .map(GraphTextureId::new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let pass_ids = (1..=6)
+            .map(oblivion_one::effects::GraphPassId::new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let mut textures = vec![GraphTexturePlan {
+            id: ids[0],
+            source: GraphTextureSource::CapturedScene,
+            width,
+            height,
+            domain: oblivion_one::effects::EffectRect::new(0, 0, width, height).unwrap(),
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: Some(pass_ids[0]),
+            last_use: Some(pass_ids[1]),
+        }];
+        for (index, (texture_width, texture_height, first, last)) in [
+            (width / 2, height / 2, 1, 2),
+            (width / 4, height / 4, 2, 3),
+            (width / 2, height / 2, 3, 4),
+            (width, height, 4, 5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            textures.push(GraphTexturePlan {
+                id: ids[index + 1],
+                source: GraphTextureSource::Intermediate,
+                width: texture_width,
+                height: texture_height,
+                domain: oblivion_one::effects::EffectRect::new(0, 0, width, height).unwrap(),
+                working_space: EffectWorkingSpace::LinearSrgb,
+                origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                first_use: Some(pass_ids[first]),
+                last_use: Some(pass_ids[last]),
+            });
+        }
+        textures.push(GraphTexturePlan {
+            id: ids[5],
+            source: GraphTextureSource::Output,
+            width,
+            height,
+            domain: oblivion_one::effects::EffectRect::new(0, 0, width, height).unwrap(),
+            working_space: EffectWorkingSpace::OutputEncodedSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: Some(pass_ids[5]),
+            last_use: Some(pass_ids[5]),
+        });
+        let input_output = [
+            (vec![], ids[0]),
+            (vec![ids[0]], ids[1]),
+            (vec![ids[1]], ids[2]),
+            (vec![ids[2]], ids[3]),
+            (vec![ids[3]], ids[4]),
+            (vec![ids[4]], ids[5]),
+        ];
+        let passes = input_output
+            .into_iter()
+            .zip(pass_ids)
+            .map(|((inputs, output), id)| CompiledRenderPass {
+                id,
+                kind: RenderPassKind::Composite,
+                inputs,
+                output: Some(output),
+                damage: EffectRegion::empty(),
+                instance: effect,
+                anchor,
+                blur_radius: None,
+                stage: None,
+                fused_stages: Vec::new(),
+                parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+                alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+                encode_output: false,
+                color_conversion: oblivion_one::effects::EffectColorConversion::None,
+                checkpoint_dependencies: Vec::new(),
+                visual_group: None,
+                anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            })
+            .collect();
+        CompiledFrameGraph {
+            passes,
+            textures,
+            instances: Vec::new(),
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn fullscreen_blur_peak_bytes_scale_with_output_size() {
+        let peak_1080p = estimate_graph_peak_bytes(&fullscreen_blur_graph(1920, 1080)).unwrap();
+        let peak_1440p = estimate_graph_peak_bytes(&fullscreen_blur_graph(2560, 1440)).unwrap();
+        let peak_4k = estimate_graph_peak_bytes(&fullscreen_blur_graph(3840, 2160)).unwrap();
+
+        assert_eq!(peak_1080p, 20_736_000);
+        assert_eq!(peak_1440p, 36_864_000);
+        assert_eq!(peak_4k, 82_944_000);
+        assert_eq!(peak_1440p, peak_1080p * 16 / 9);
+        assert_eq!(peak_4k, peak_1080p * 4);
+        assert_eq!(
+            DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES - peak_1080p,
+            46_372_864
+        );
+        assert!(peak_4k > DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn pool_reuse_reduces_allocations_without_changing_graph_demand() {
+        let graph = fullscreen_blur_graph(1920, 1080);
+        let demand = estimate_graph_peak_bytes(&graph).unwrap();
+        assert_eq!(
+            graph
+                .textures
+                .iter()
+                .filter(|texture| texture.width == 960 && texture.height == 540)
+                .count(),
+            2
+        );
+        let mut pool = EffectResourcePool::new();
+        let reusable = key(960, 540);
+        let first = pool.checkout(reusable).unwrap();
+        pool.return_texture(first).unwrap();
+        let second = pool.checkout(reusable).unwrap();
+        pool.return_texture(second).unwrap();
+
+        assert_eq!(pool.metrics().allocation_count, 1);
+        assert_eq!(pool.metrics().reuse_count, 1);
+        assert_eq!(demand, 20_736_000);
+    }
+
     #[test]
     fn fullscreen_1080p_blur_liveness_stays_inside_the_default_budget() {
         let effect = EffectInstanceId::new(1).unwrap();
@@ -926,12 +1095,25 @@ mod tests {
     fn resource_metrics_distinguish_allocations_from_reuses() {
         let mut pool = EffectResourcePool::new();
         let texture = pool.checkout(key(16, 16)).unwrap();
-        assert_eq!(pool.metrics().allocation_count, 1);
-        assert_eq!(pool.metrics().reuse_count, 0);
+        let live_metrics = pool.metrics();
+        assert_eq!(live_metrics.allocation_count, 1);
+        assert_eq!(live_metrics.reuse_count, 0);
+        assert_eq!(live_metrics.current_bytes, 16 * 16 * 4);
+        assert_eq!(live_metrics.peak_bytes, live_metrics.current_bytes);
+        assert_eq!(
+            live_metrics.budget_bytes,
+            DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES
+        );
+        assert_eq!(live_metrics.cached_key_count, 1);
+        assert_eq!(live_metrics.cached_texture_count, 1);
+        assert_eq!(live_metrics.checked_out_texture_count, 1);
         pool.return_texture(texture).unwrap();
         let reused = pool.checkout(key(16, 16)).unwrap();
-        assert_eq!(pool.metrics().allocation_count, 1);
-        assert_eq!(pool.metrics().reuse_count, 1);
+        let reused_metrics = pool.metrics();
+        assert_eq!(reused_metrics.allocation_count, 1);
+        assert_eq!(reused_metrics.reuse_count, 1);
+        assert_eq!(reused_metrics.current_bytes, live_metrics.current_bytes);
+        assert_eq!(reused_metrics.peak_bytes, live_metrics.peak_bytes);
         pool.return_texture(reused).unwrap();
     }
 

@@ -44,7 +44,7 @@ use damage::{
 };
 use effects::{
     EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
-    graph_metrics,
+    builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, EglVisibilityDecision,
@@ -343,6 +343,14 @@ pub(crate) struct GlesSceneFrameStats {
     pub dmabuf_cache_entries: usize,
     pub dmabuf_cache_peak_entries: usize,
     pub dmabuf_cache_evictions: usize,
+    pub dmabuf_current_resource_reuses: usize,
+    pub dmabuf_cache_hits: usize,
+    pub dmabuf_cache_misses: usize,
+    pub dmabuf_cache_insertions: usize,
+    pub dmabuf_cache_evictions_dead: usize,
+    pub dmabuf_cache_evictions_surface_bound: usize,
+    pub dmabuf_cache_evictions_surface_destroyed: usize,
+    pub dmabuf_cache_max_entries_for_one_surface: usize,
     pub shm_full_resyncs: usize,
     pub repaint_mode: RepaintMode,
     pub buffer_age: Option<u32>,
@@ -383,6 +391,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub render_graph_passes: usize,
     pub effect_passes_executed: usize,
     pub render_graph_peak_live_textures: usize,
+    pub effect_graph_peak_live_bytes: u64,
     pub effect_capture_pixels: u64,
     pub effect_capture_pixels_executed: u64,
     pub effect_output_pixels: u64,
@@ -393,6 +402,18 @@ pub(crate) struct GlesSceneFrameStats {
     pub effect_resource_reuses: usize,
     pub effect_resource_evictions: usize,
     pub effect_gpu_cache_bytes: u64,
+    pub effect_gpu_cache_peak_bytes: u64,
+    pub effect_gpu_budget_bytes: u64,
+    pub effect_gpu_cached_keys: usize,
+    pub effect_gpu_cached_textures: usize,
+    pub effect_gpu_checked_out_textures: usize,
+    pub effect_resource_allocations_total: usize,
+    pub effect_resource_reuses_total: usize,
+    pub effect_resource_evictions_total: usize,
+    pub shader_cache_capacity: usize,
+    pub shader_cache_entries: usize,
+    pub shader_cache_peak_entries: usize,
+    pub shader_cache_evictions_total: usize,
     pub effect_failure_reason: Option<EffectFailureReason>,
 }
 
@@ -512,6 +533,7 @@ pub(crate) struct GlesSceneRenderer {
     surface_resources: HashMap<u32, EglSurfaceResource>,
     dmabuf_resource_cache: HashMap<DmabufImageKey, CachedDmabufResource<EglImageResource>>,
     dmabuf_cache_peak_entries: usize,
+    dmabuf_cache_max_entries_for_one_surface: usize,
     active_surface_ids: Vec<u32>,
     failed_surface_generations: HashMap<u32, u64>,
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
@@ -624,8 +646,8 @@ impl GlesSceneRenderer {
             gl.viewport(0, 0, width as i32, height as i32);
         }
 
-        let mut effect_shaders =
-            ShaderProgramCache::new(128).expect("stable default shader cache capacity is non-zero");
+        let mut effect_shaders = ShaderProgramCache::new(builtin_shader_program_count())
+            .expect("built-in shader cache capacity is non-zero");
         effect_shaders.prewarm_builtins(&gl)?;
 
         Ok(Self {
@@ -656,6 +678,7 @@ impl GlesSceneRenderer {
             surface_resources: HashMap::new(),
             dmabuf_resource_cache: HashMap::new(),
             dmabuf_cache_peak_entries: 0,
+            dmabuf_cache_max_entries_for_one_surface: 0,
             active_surface_ids: Vec::new(),
             failed_surface_generations: HashMap::new(),
             frame_resources: HashMap::new(),
@@ -753,8 +776,10 @@ impl GlesSceneRenderer {
         &mut self,
         generation: EffectRegistryGeneration,
     ) -> Result<(), RegistryReloadError> {
+        let capacity = shader_cache_capacity_for_custom_shaders(generation.shaders.len())
+            .expect("validated shader generation size fits cache capacity");
         let mut next_shaders =
-            ShaderProgramCache::new(128).expect("stable default shader cache capacity is non-zero");
+            ShaderProgramCache::new(capacity).expect("shader cache capacity is non-zero");
         let compile_result = (|| {
             next_shaders.prewarm_builtins(&self.gl).map_err(|error| {
                 RegistryReloadError::ShaderCompile {
@@ -1269,6 +1294,7 @@ impl GlesSceneRenderer {
         self.frame_stats.effect_instances_visible = metrics.instances;
         self.frame_stats.render_graph_passes = metrics.passes;
         self.frame_stats.render_graph_peak_live_textures = metrics.peak_live_textures;
+        self.frame_stats.effect_graph_peak_live_bytes = metrics.peak_live_bytes;
         self.frame_stats.effect_capture_pixels = metrics.capture_pixels;
         self.frame_stats.effect_output_pixels = metrics.output_pixels;
     }
@@ -1278,7 +1304,20 @@ impl GlesSceneRenderer {
         self.frame_stats.effect_resource_allocations = metrics.allocation_count;
         self.frame_stats.effect_resource_reuses = metrics.reuse_count;
         self.frame_stats.effect_resource_evictions = metrics.eviction_count;
+        self.frame_stats.effect_resource_allocations_total = metrics.allocation_count;
+        self.frame_stats.effect_resource_reuses_total = metrics.reuse_count;
+        self.frame_stats.effect_resource_evictions_total = metrics.eviction_count;
         self.frame_stats.effect_gpu_cache_bytes = metrics.current_bytes;
+        self.frame_stats.effect_gpu_cache_peak_bytes = metrics.peak_bytes;
+        self.frame_stats.effect_gpu_budget_bytes = metrics.budget_bytes;
+        self.frame_stats.effect_gpu_cached_keys = metrics.cached_key_count;
+        self.frame_stats.effect_gpu_cached_textures = metrics.cached_texture_count;
+        self.frame_stats.effect_gpu_checked_out_textures = metrics.checked_out_texture_count;
+        let shader_metrics = self.effect_shaders.metrics();
+        self.frame_stats.shader_cache_capacity = shader_metrics.capacity;
+        self.frame_stats.shader_cache_entries = shader_metrics.resident_entries;
+        self.frame_stats.shader_cache_peak_entries = shader_metrics.peak_entries;
+        self.frame_stats.shader_cache_evictions_total = shader_metrics.eviction_count;
     }
 
     fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {
@@ -1479,6 +1518,8 @@ impl GlesSceneRenderer {
 
         self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
         self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        self.frame_stats.dmabuf_cache_max_entries_for_one_surface =
+            self.dmabuf_cache_max_entries_for_one_surface;
         Ok(())
     }
 
@@ -1513,6 +1554,8 @@ impl GlesSceneRenderer {
         }
         self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
         self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
+        self.frame_stats.dmabuf_cache_max_entries_for_one_surface =
+            self.dmabuf_cache_max_entries_for_one_surface;
         Ok(())
     }
 
@@ -1541,6 +1584,10 @@ impl GlesSceneRenderer {
                 if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
                     resource.image.generation = surface.generation;
                 }
+                self.frame_stats.dmabuf_current_resource_reuses = self
+                    .frame_stats
+                    .dmabuf_current_resource_reuses
+                    .saturating_add(1);
                 self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
                 return Ok(());
             }
@@ -1665,6 +1712,8 @@ impl GlesSceneRenderer {
                 }
             }
             cached.image.generation = surface.generation;
+            self.frame_stats.dmabuf_cache_hits =
+                self.frame_stats.dmabuf_cache_hits.saturating_add(1);
             self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
             if let Some(old) = self.surface_resources.insert(
                 surface.surface_id,
@@ -1687,6 +1736,8 @@ impl GlesSceneRenderer {
                 surface.dmabuf_handle(),
             );
         }
+        self.frame_stats.dmabuf_cache_misses =
+            self.frame_stats.dmabuf_cache_misses.saturating_add(1);
 
         let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
             let result = create_surface_resource(
@@ -1768,6 +1819,10 @@ impl GlesSceneRenderer {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
             self.frame_stats.dmabuf_cache_evictions =
                 self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+            self.frame_stats.dmabuf_cache_evictions_dead = self
+                .frame_stats
+                .dmabuf_cache_evictions_dead
+                .saturating_add(1);
             return;
         }
 
@@ -1782,6 +1837,16 @@ impl GlesSceneRenderer {
         ) {
             destroy_image_resource(&self.gl, egl, egl_display, replaced.image);
         }
+        self.frame_stats.dmabuf_cache_insertions =
+            self.frame_stats.dmabuf_cache_insertions.saturating_add(1);
+        let surface_entries = self
+            .dmabuf_resource_cache
+            .values()
+            .filter(|cached| cached.surface_id == surface_id)
+            .count();
+        self.dmabuf_cache_max_entries_for_one_surface = self
+            .dmabuf_cache_max_entries_for_one_surface
+            .max(surface_entries);
         self.dmabuf_cache_peak_entries = self
             .dmabuf_cache_peak_entries
             .max(self.dmabuf_resource_cache.len());
@@ -1817,6 +1882,10 @@ impl GlesSceneRenderer {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
             self.frame_stats.dmabuf_cache_evictions =
                 self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+            self.frame_stats.dmabuf_cache_evictions_surface_bound = self
+                .frame_stats
+                .dmabuf_cache_evictions_surface_bound
+                .saturating_add(1);
         }
     }
 
@@ -1841,6 +1910,10 @@ impl GlesSceneRenderer {
                 destroy_image_resource(&self.gl, egl, egl_display, resource.image);
                 self.frame_stats.dmabuf_cache_evictions =
                     self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+                self.frame_stats.dmabuf_cache_evictions_surface_destroyed = self
+                    .frame_stats
+                    .dmabuf_cache_evictions_surface_destroyed
+                    .saturating_add(1);
             }
         }
     }
@@ -1857,6 +1930,10 @@ impl GlesSceneRenderer {
                 destroy_image_resource(&self.gl, egl, egl_display, cached.image);
                 self.frame_stats.dmabuf_cache_evictions =
                     self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+                self.frame_stats.dmabuf_cache_evictions_dead = self
+                    .frame_stats
+                    .dmabuf_cache_evictions_dead
+                    .saturating_add(1);
             }
         }
     }
@@ -4201,6 +4278,59 @@ mod tests {
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct DmabufRingQualification {
+        imports: usize,
+        current_resource_reuses: usize,
+        cache_hits: usize,
+        cache_misses: usize,
+        surface_bound_evictions: usize,
+        peak_entries: usize,
+    }
+
+    fn qualify_dmabuf_ring(ring_len: usize, cycles: usize) -> DmabufRingQualification {
+        let mut current = None;
+        let mut cache = std::collections::BTreeSet::new();
+        let mut result = DmabufRingQualification::default();
+        for buffer in (0..ring_len).cycle().take(ring_len.saturating_mul(cycles)) {
+            if current == Some(buffer) {
+                result.current_resource_reuses += 1;
+                continue;
+            }
+            if cache.remove(&buffer) {
+                result.cache_hits += 1;
+            } else {
+                result.cache_misses += 1;
+                result.imports += 1;
+            }
+            if let Some(previous) = current {
+                if cache.len() >= MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE {
+                    let oldest = *cache.iter().next().expect("full cache is non-empty");
+                    cache.remove(&oldest);
+                    result.surface_bound_evictions += 1;
+                }
+                cache.insert(previous);
+            }
+            current = Some(buffer);
+            result.peak_entries = result.peak_entries.max(cache.len());
+        }
+        result
+    }
+
+    #[test]
+    fn dmabuf_ring_qualification_exposes_capacity_behavior_without_egl() {
+        for ring_len in 2..=5 {
+            let result = qualify_dmabuf_ring(ring_len, 2);
+            assert_eq!(result.imports, ring_len);
+            assert_eq!(result.cache_misses, ring_len);
+            assert_eq!(result.cache_hits, ring_len);
+            assert_eq!(result.current_resource_reuses, 0);
+            assert_eq!(result.surface_bound_evictions, 0);
+            assert_eq!(result.peak_entries, ring_len - 1);
+        }
+        assert!(qualify_dmabuf_ring(6, 2).surface_bound_evictions > 0);
+    }
 
     #[test]
     fn dmabuf_image_target_invalid_operation_is_buffer_local() {

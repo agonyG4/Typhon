@@ -14,4 +14,6 @@ pub(crate) use executor::{
 };
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
 pub(crate) use resources::EffectGlResourceCache;
-pub(crate) use shader_cache::ShaderProgramCache;
+pub(crate) use shader_cache::{
+    ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
+};

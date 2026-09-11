@@ -36,6 +36,21 @@ use oblivion_one::native::buffering::PresentationOpportunityFrontier;
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 const SUSPENDED_OUTPUT_SLOT_CAPACITY: usize = EXPLICIT_OUTPUT_SLOT_CAPACITY - 1;
 
+pub(crate) const fn output_slot_linear_payload_bytes(width: u32, height: u32) -> u64 {
+    (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4)
+}
+
+pub(crate) const fn output_pool_linear_payload_bytes(width: u32, height: u32) -> u64 {
+    output_slot_linear_payload_bytes(width, height)
+        .saturating_mul(EXPLICIT_OUTPUT_SLOT_CAPACITY as u64)
+}
+
+pub(crate) const fn incremental_third_slot_linear_payload_bytes(width: u32, height: u32) -> u64 {
+    output_slot_linear_payload_bytes(width, height)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OutputSlotId(u8);
 
@@ -2133,6 +2148,26 @@ mod tests {
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn output_slot_linear_payload_scales_with_resolution_and_capacity() {
+        for (width, height, one_slot, two_slots, three_slots) in [
+            (1920, 1080, 8_294_400, 16_588_800, 24_883_200),
+            (2560, 1440, 14_745_600, 29_491_200, 44_236_800),
+            (3840, 2160, 33_177_600, 66_355_200, 99_532_800),
+        ] {
+            assert_eq!(output_slot_linear_payload_bytes(width, height), one_slot);
+            assert_eq!(output_pool_linear_payload_bytes(width, height), three_slots);
+            assert_eq!(
+                output_pool_linear_payload_bytes(width, height) - one_slot,
+                two_slots
+            );
+            assert_eq!(
+                incremental_third_slot_linear_payload_bytes(width, height),
+                one_slot
+            );
+        }
+    }
 
     fn test_render_fence() -> NativeRenderFence {
         let mut pipe = [-1; 2];

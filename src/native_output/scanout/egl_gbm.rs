@@ -923,6 +923,16 @@ pub(crate) fn native_egl_gbm_paint_stats(
         dmabuf_cache_entries: scene_stats.dmabuf_cache_entries,
         dmabuf_cache_peak_entries: scene_stats.dmabuf_cache_peak_entries,
         dmabuf_cache_evictions: scene_stats.dmabuf_cache_evictions,
+        dmabuf_current_resource_reuses: scene_stats.dmabuf_current_resource_reuses,
+        dmabuf_cache_hits: scene_stats.dmabuf_cache_hits,
+        dmabuf_cache_misses: scene_stats.dmabuf_cache_misses,
+        dmabuf_cache_insertions: scene_stats.dmabuf_cache_insertions,
+        dmabuf_cache_evictions_dead: scene_stats.dmabuf_cache_evictions_dead,
+        dmabuf_cache_evictions_surface_bound: scene_stats.dmabuf_cache_evictions_surface_bound,
+        dmabuf_cache_evictions_surface_destroyed: scene_stats
+            .dmabuf_cache_evictions_surface_destroyed,
+        dmabuf_cache_max_entries_for_one_surface: scene_stats
+            .dmabuf_cache_max_entries_for_one_surface,
         surface_resource_candidates: scene_stats.surface_resource_candidates,
         surface_resource_consumers: scene_stats.surface_resource_consumers,
         surface_resource_deferred: scene_stats.surface_resource_deferred,
