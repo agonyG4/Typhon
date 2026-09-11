@@ -1129,7 +1129,7 @@ impl NativeRuntime {
             input_plan.primary.as_str()
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
-        let initial_resolved_scene = ResolvedNativeFrameScene::from_server(&server);
+        let initial_resolved_scene = ResolvedNativeFrameScene::from_server(&server).into_owned();
         let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
             effective_atomic_cursor_state(cursor, cursor_render_mode, input_state.cursor_visible())
                 .kms_state()
