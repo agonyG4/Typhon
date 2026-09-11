@@ -308,7 +308,6 @@ impl EglGlesDmabufImportAttributes {
                 return Err(EglGlesImportError::InvalidPlaneSet);
             }
 
-            let modifier = descriptor.modifier.0;
             attributes.extend_from_slice(&[
                 EGL_DMA_BUF_PLANE_FD_EXT[plane_index],
                 plane.fd().as_raw_fd() as usize,
@@ -316,11 +315,16 @@ impl EglGlesDmabufImportAttributes {
                 descriptor.offset as usize,
                 EGL_DMA_BUF_PLANE_PITCH_EXT[plane_index],
                 descriptor.stride as usize,
-                EGL_DMA_BUF_PLANE_MODIFIER_LO_EXT[plane_index],
-                modifier as u32 as usize,
-                EGL_DMA_BUF_PLANE_MODIFIER_HI_EXT[plane_index],
-                (modifier >> 32) as usize,
             ]);
+            if descriptor.modifier != DrmModifier::INVALID {
+                let modifier = descriptor.modifier.0;
+                attributes.extend_from_slice(&[
+                    EGL_DMA_BUF_PLANE_MODIFIER_LO_EXT[plane_index],
+                    modifier as u32 as usize,
+                    EGL_DMA_BUF_PLANE_MODIFIER_HI_EXT[plane_index],
+                    (modifier >> 32) as usize,
+                ]);
+            }
         }
 
         attributes.push(EGL_NONE);
@@ -450,6 +454,76 @@ mod tests {
     }
 
     #[test]
+    fn egl_gles_dmabuf_import_attributes_omit_implicit_modifier_metadata() {
+        let handle = dmabuf_handle(DrmFormat::Argb8888, DrmModifier::INVALID);
+
+        let attributes = EglGlesDmabufImportAttributes::from_handle(&handle)
+            .expect("implicit single-plane ARGB dmabuf should produce EGL import attributes");
+
+        assert_eq!(
+            attributes.as_slice(),
+            &[
+                EGL_WIDTH,
+                2,
+                EGL_HEIGHT,
+                2,
+                EGL_LINUX_DRM_FOURCC_EXT,
+                DrmFormat::ARGB8888_FOURCC as usize,
+                EGL_DMA_BUF_PLANE0_FD_EXT,
+                handle.planes()[0].fd().as_raw_fd() as usize,
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                0,
+                EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                8,
+                EGL_NONE,
+            ]
+        );
+    }
+
+    #[test]
+    fn egl_gles_dmabuf_import_attributes_keep_linear_modifier_metadata() {
+        let handle = dmabuf_handle(DrmFormat::Argb8888, DrmModifier::LINEAR);
+
+        let attributes = EglGlesDmabufImportAttributes::from_handle(&handle)
+            .expect("explicit linear dmabuf should produce EGL import attributes");
+
+        assert!(attributes.as_slice().windows(2).any(|pair| {
+            pair[0] == EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT
+                && pair[1] == DrmModifier::LINEAR.0 as usize
+        }));
+        assert!(
+            attributes
+                .as_slice()
+                .windows(2)
+                .any(|pair| pair[0] == EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT && pair[1] == 0)
+        );
+    }
+
+    #[test]
+    fn egl_gles_dmabuf_import_attributes_omit_implicit_metadata_for_all_planes() {
+        let handle = dmabuf_handle_with_modifiers(
+            DrmFormat::Argb8888,
+            &[DrmModifier::INVALID, DrmModifier::INVALID],
+        );
+
+        let attributes = EglGlesDmabufImportAttributes::from_handle(&handle)
+            .expect("implicit multi-plane dmabuf should produce EGL import attributes");
+
+        assert!(
+            attributes
+                .as_slice()
+                .iter()
+                .all(|attribute| !EGL_DMA_BUF_PLANE_MODIFIER_LO_EXT.contains(attribute))
+        );
+        assert!(
+            attributes
+                .as_slice()
+                .iter()
+                .all(|attribute| !EGL_DMA_BUF_PLANE_MODIFIER_HI_EXT.contains(attribute))
+        );
+    }
+
+    #[test]
     fn egl_gles_dmabuf_import_attributes_reject_empty_plane_sets() {
         let empty = DmabufBufferHandle::new(
             BufferSize::new(2, 2).unwrap(),
@@ -496,18 +570,31 @@ mod tests {
     }
 
     fn dmabuf_handle(format: DrmFormat, modifier: DrmModifier) -> DmabufBufferHandle {
+        dmabuf_handle_with_modifiers(format, &[modifier])
+    }
+
+    fn dmabuf_handle_with_modifiers(
+        format: DrmFormat,
+        modifiers: &[DrmModifier],
+    ) -> DmabufBufferHandle {
         DmabufBufferHandle::new(
             BufferSize::new(2, 2).unwrap(),
             format,
-            vec![DmabufPlane::new(
-                File::open("/dev/null").unwrap().into(),
-                DmabufPlaneDescriptor {
-                    plane_index: 0,
-                    offset: 0,
-                    stride: 8,
-                    modifier,
-                },
-            )],
+            modifiers
+                .iter()
+                .enumerate()
+                .map(|(plane_index, modifier)| {
+                    DmabufPlane::new(
+                        File::open("/dev/null").unwrap().into(),
+                        DmabufPlaneDescriptor {
+                            plane_index: plane_index as u32,
+                            offset: 0,
+                            stride: 8,
+                            modifier: *modifier,
+                        },
+                    )
+                })
+                .collect(),
         )
         .unwrap()
     }

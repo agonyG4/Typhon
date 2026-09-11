@@ -22,8 +22,8 @@ use oblivion_one::{
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
-        buffer::{DmabufImageKey, WeakBufferIdentity},
-        egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes},
+        buffer::{DmabufImageKey, DrmModifier, WeakBufferIdentity},
+        egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
 };
 
@@ -69,6 +69,254 @@ pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
 ) -> egl::Boolean;
 const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
 const EGL_BUFFER_AGE_EXT: egl::Int = 0x313d;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufImportGlStage {
+    TextureCreation,
+    Bind,
+    TextureConfiguration,
+    ImageTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufImportFailureClass {
+    BufferIncompatible,
+    RendererFatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufImportPath {
+    Initial,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufImportCacheState {
+    NotChecked,
+    Miss,
+    Hit,
+}
+
+#[derive(Debug)]
+enum DmabufTextureImportError {
+    InvalidAttributes(EglGlesImportError),
+    EglImageCreation(egl::Error),
+    TextureCreation(String),
+    Gl {
+        stage: DmabufImportGlStage,
+        error: u32,
+    },
+}
+
+impl DmabufTextureImportError {
+    fn classification(&self) -> DmabufImportFailureClass {
+        match self {
+            Self::InvalidAttributes(_) => DmabufImportFailureClass::BufferIncompatible,
+            Self::EglImageCreation(
+                egl::Error::BadAttribute
+                | egl::Error::BadMatch
+                | egl::Error::BadNativePixmap
+                | egl::Error::BadParameter,
+            ) => DmabufImportFailureClass::BufferIncompatible,
+            Self::Gl {
+                stage: DmabufImportGlStage::ImageTarget,
+                error: glow::INVALID_OPERATION,
+            } => DmabufImportFailureClass::BufferIncompatible,
+            _ => DmabufImportFailureClass::RendererFatal,
+        }
+    }
+
+    fn stage_name(&self) -> &'static str {
+        match self {
+            Self::InvalidAttributes(_) => "attributes",
+            Self::EglImageCreation(_) => "egl_create_image",
+            Self::TextureCreation(_) => "texture_creation",
+            Self::Gl { stage, .. } => match stage {
+                DmabufImportGlStage::TextureCreation => "texture_creation",
+                DmabufImportGlStage::Bind => "bind",
+                DmabufImportGlStage::TextureConfiguration => "texture_configuration",
+                DmabufImportGlStage::ImageTarget => "image_target",
+            },
+        }
+    }
+
+    fn error_code(&self) -> Option<u32> {
+        match self {
+            Self::EglImageCreation(error) => Some(error.native() as u32),
+            Self::Gl { error, .. } => Some(*error),
+            Self::InvalidAttributes(_) | Self::TextureCreation(_) => None,
+        }
+    }
+
+    fn egl_image_created(&self) -> bool {
+        matches!(self, Self::TextureCreation(_) | Self::Gl { .. })
+    }
+}
+
+impl std::fmt::Display for DmabufTextureImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAttributes(error) => {
+                write!(formatter, "invalid DMA-BUF import attributes: {error:?}")
+            }
+            Self::EglImageCreation(error) => write!(formatter, "eglCreateImage failed: {error}"),
+            Self::TextureCreation(error) => write!(formatter, "texture creation failed: {error}"),
+            Self::Gl { stage, error } => {
+                write!(formatter, "GL {:?} failed with error 0x{error:04x}", stage)
+            }
+        }
+    }
+}
+
+impl Error for DmabufTextureImportError {}
+
+fn drain_gl_errors(gl: &glow::Context) -> Option<u32> {
+    first_drained_gl_error(|| unsafe { gl.get_error() })
+}
+
+fn first_drained_gl_error(mut next_error: impl FnMut() -> u32) -> Option<u32> {
+    let mut first_error = None;
+    loop {
+        let error = next_error();
+        if error == glow::NO_ERROR {
+            return first_error;
+        }
+        first_error.get_or_insert(error);
+    }
+}
+
+fn check_dmabuf_gl_stage(
+    gl: &glow::Context,
+    stage: DmabufImportGlStage,
+) -> Result<(), DmabufTextureImportError> {
+    drain_gl_errors(gl).map_or(Ok(()), |error| {
+        Err(DmabufTextureImportError::Gl { stage, error })
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DmabufImportDiagnosticContext {
+    surface_id: u32,
+    generation: u64,
+    buffer_id: u64,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    modifier: u64,
+    planes: usize,
+    path: DmabufImportPath,
+    cache: DmabufImportCacheState,
+}
+
+impl DmabufImportDiagnosticContext {
+    fn from_surface(
+        surface: &RenderableSurface,
+        path: DmabufImportPath,
+        cache: DmabufImportCacheState,
+    ) -> Option<Self> {
+        let handle = surface.dmabuf_handle()?;
+        let modifier = handle
+            .planes()
+            .first()
+            .map(|plane| plane.descriptor().modifier.0)?;
+        let size = handle.size();
+        Some(Self {
+            surface_id: surface.surface_id,
+            generation: surface.generation,
+            buffer_id: surface.buffer_id().get(),
+            width: size.width,
+            height: size.height,
+            fourcc: handle.format().as_fourcc(),
+            modifier,
+            planes: handle.planes().len(),
+            path,
+            cache,
+        })
+    }
+}
+
+fn log_dmabuf_import_context(
+    context: DmabufImportDiagnosticContext,
+    event: &'static str,
+    stage: &'static str,
+    egl_image_created: bool,
+    error_code: Option<u32>,
+    classification: &'static str,
+) {
+    let error_code = error_code.map_or_else(|| "none".to_owned(), |code| format!("0x{code:04x}"));
+    eprintln!(
+        "oblivion-one compositor: dmabuf {event}: surface={} generation={} buffer_id={} size={}x{} fourcc=0x{:08x} modifier=0x{:016x} implicit={} planes={} path={:?} cache={:?} egl_image={} stage={} gl_or_egl_error={} classification={classification}",
+        context.surface_id,
+        context.generation,
+        context.buffer_id,
+        context.width,
+        context.height,
+        context.fourcc,
+        context.modifier,
+        context.modifier == DrmModifier::INVALID.0,
+        context.planes,
+        context.path,
+        context.cache,
+        egl_image_created,
+        stage,
+        error_code,
+    );
+}
+
+fn settle_dmabuf_import_result<T>(
+    result: RendererResult<T>,
+    context: DmabufImportDiagnosticContext,
+    frame_stats: &mut GlesSceneFrameStats,
+    failed_surface_generations: &mut HashMap<u32, u64>,
+) -> RendererResult<Option<T>> {
+    match result {
+        Ok(resource) => {
+            failed_surface_generations.remove(&context.surface_id);
+            if native_egl_debug_enabled() {
+                log_dmabuf_import_context(
+                    context,
+                    "import_accepted",
+                    "complete",
+                    true,
+                    None,
+                    "success",
+                );
+            }
+            Ok(Some(resource))
+        }
+        Err(error) => {
+            let Some(import_error) = error.downcast_ref::<DmabufTextureImportError>() else {
+                return Err(error);
+            };
+            let classification = import_error.classification();
+            let should_log = failed_surface_generations
+                .get(&context.surface_id)
+                .is_none_or(|generation| *generation != context.generation);
+            if should_log || classification == DmabufImportFailureClass::RendererFatal {
+                log_dmabuf_import_context(
+                    context,
+                    "import_rejected",
+                    import_error.stage_name(),
+                    import_error.egl_image_created(),
+                    import_error.error_code(),
+                    match classification {
+                        DmabufImportFailureClass::BufferIncompatible => "buffer_incompatible",
+                        DmabufImportFailureClass::RendererFatal => "renderer_fatal",
+                    },
+                );
+            }
+            if classification == DmabufImportFailureClass::RendererFatal {
+                return Err(error);
+            }
+            frame_stats.dmabuf_import_failures =
+                frame_stats.dmabuf_import_failures.saturating_add(1);
+            if should_log {
+                failed_surface_generations.insert(context.surface_id, context.generation);
+            }
+            Ok(None)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeEglConfigCandidate {
@@ -1337,7 +1585,7 @@ impl GlesSceneRenderer {
             self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
         }
 
-        match create_surface_resource(
+        let result = create_surface_resource(
             &self.gl,
             egl,
             egl_display,
@@ -1346,36 +1594,36 @@ impl GlesSceneRenderer {
             (surface.cpu_pixels().is_some() && sync_state.authoritative)
                 .then_some(sync_state.current_commit),
             &mut self.texture_upload_rgba,
+        );
+        if let Some(context) = DmabufImportDiagnosticContext::from_surface(
+            surface,
+            DmabufImportPath::Initial,
+            DmabufImportCacheState::NotChecked,
         ) {
-            Ok(resource) => {
-                if surface.cpu_pixels().is_some() {
+            if let Some(resource) = settle_dmabuf_import_result(
+                result,
+                context,
+                &mut self.frame_stats,
+                &mut self.failed_surface_generations,
+            )? {
+                self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+                self.surface_resources.insert(surface.surface_id, resource);
+            }
+        } else {
+            match result {
+                Ok(resource) => {
                     self.frame_stats.shm_upload_bytes = self
                         .frame_stats
                         .shm_upload_bytes
                         .saturating_add(surface_upload_byte_len(surface));
-                } else if surface.dmabuf_handle().is_some() {
-                    self.frame_stats.dmabuf_imports =
-                        self.frame_stats.dmabuf_imports.saturating_add(1);
+                    self.failed_surface_generations.remove(&surface.surface_id);
+                    self.surface_resources.insert(surface.surface_id, resource);
                 }
-                self.failed_surface_generations.remove(&surface.surface_id);
-                self.surface_resources.insert(surface.surface_id, resource);
-            }
-            Err(error) => {
-                if surface.dmabuf_handle().is_some() {
-                    self.frame_stats.dmabuf_import_failures =
-                        self.frame_stats.dmabuf_import_failures.saturating_add(1);
-                }
-                let should_log = self
-                    .failed_surface_generations
-                    .get(&surface.surface_id)
-                    .is_none_or(|generation| *generation != surface.generation);
-                if should_log {
+                Err(error) => {
                     eprintln!(
-                        "oblivion-one compositor: failed to import surface {} on EGL/GLES: {error}",
+                        "oblivion-one compositor: failed to realize surface {} on EGL/GLES: {error}",
                         surface.surface_id
                     );
-                    self.failed_surface_generations
-                        .insert(surface.surface_id, surface.generation);
                 }
             }
         }
@@ -1401,6 +1649,20 @@ impl GlesSceneRenderer {
                     cached.image.texture,
                     cached.image.egl_image.map(|image| image.as_ptr()),
                 );
+                if let Some(context) = DmabufImportDiagnosticContext::from_surface(
+                    surface,
+                    DmabufImportPath::Replacement,
+                    DmabufImportCacheState::Hit,
+                ) {
+                    log_dmabuf_import_context(
+                        context,
+                        "resource_selected",
+                        "cache",
+                        cached.image.egl_image.is_some(),
+                        None,
+                        "success",
+                    );
+                }
             }
             cached.image.generation = surface.generation;
             self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
@@ -1427,7 +1689,7 @@ impl GlesSceneRenderer {
         }
 
         let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
-            let resource = create_surface_resource(
+            let result = create_surface_resource(
                 &self.gl,
                 egl,
                 egl_display,
@@ -1435,14 +1697,27 @@ impl GlesSceneRenderer {
                 surface,
                 None,
                 &mut self.texture_upload_rgba,
-            )?;
-            self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
-            self.surface_resources.insert(surface.surface_id, resource);
+            );
+            let context = DmabufImportDiagnosticContext::from_surface(
+                surface,
+                DmabufImportPath::Initial,
+                DmabufImportCacheState::Miss,
+            )
+            .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
+            if let Some(resource) = settle_dmabuf_import_result(
+                result,
+                context,
+                &mut self.frame_stats,
+                &mut self.failed_surface_generations,
+            )? {
+                self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+                self.surface_resources.insert(surface.surface_id, resource);
+            }
             return Ok(());
         };
         self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
 
-        let resource = create_surface_resource(
+        let result = create_surface_resource(
             &self.gl,
             egl,
             egl_display,
@@ -1450,9 +1725,22 @@ impl GlesSceneRenderer {
             surface,
             None,
             &mut self.texture_upload_rgba,
-        )?;
-        self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
-        self.surface_resources.insert(surface.surface_id, resource);
+        );
+        let context = DmabufImportDiagnosticContext::from_surface(
+            surface,
+            DmabufImportPath::Replacement,
+            DmabufImportCacheState::Miss,
+        )
+        .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
+        if let Some(resource) = settle_dmabuf_import_result(
+            result,
+            context,
+            &mut self.frame_stats,
+            &mut self.failed_surface_generations,
+        )? {
+            self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+            self.surface_resources.insert(surface.surface_id, resource);
+        }
         Ok(())
     }
 
@@ -3275,37 +3563,59 @@ fn create_dmabuf_resource(
     handle: &oblivion_one::render_backend::buffer::DmabufBufferHandle,
     generation: u64,
 ) -> RendererResult<EglImageResource> {
+    let preexisting_gl_error = drain_gl_errors(gl);
+    if native_egl_debug_enabled()
+        && let Some(error) = preexisting_gl_error
+    {
+        eprintln!(
+            "oblivion-one compositor: dmabuf import cleared preexisting GL error 0x{error:04x}"
+        );
+    }
     let Some(egl_image_target_texture_2d) = egl_image_target_texture_2d else {
         return Err(io::Error::other("GL_OES_EGL_image is unavailable").into());
     };
-    let attributes = EglGlesDmabufImportAttributes::from_handle(handle).map_err(|error| {
-        io::Error::other(format!("invalid dmabuf import attributes: {error:?}"))
-    })?;
+    let attributes = EglGlesDmabufImportAttributes::from_handle(handle)
+        .map_err(DmabufTextureImportError::InvalidAttributes)?;
     let no_context = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
     let null_client_buffer = unsafe { egl::ClientBuffer::from_ptr(ptr::null_mut()) };
-    let image = egl.create_image(
-        egl_display,
-        no_context,
-        EGL_LINUX_DMA_BUF_EXT,
-        null_client_buffer,
-        attributes.as_slice(),
-    )?;
+    let image = egl
+        .create_image(
+            egl_display,
+            no_context,
+            EGL_LINUX_DMA_BUF_EXT,
+            null_client_buffer,
+            attributes.as_slice(),
+        )
+        .map_err(DmabufTextureImportError::EglImageCreation)?;
     let image_guard = EglImageGuard::new(image, |image| {
         let _ = egl.destroy_image(egl_display, image);
     });
-    let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
+    let texture = unsafe {
+        gl.create_texture()
+            .map_err(|error| DmabufTextureImportError::TextureCreation(error.to_owned()))?
+    };
+    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureCreation) {
+        unsafe { gl.delete_texture(texture) };
+        return Err(error.into());
+    }
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        configure_texture(gl);
+    }
+    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::Bind) {
+        unsafe { gl.delete_texture(texture) };
+        return Err(error.into());
+    }
+    configure_texture(gl);
+    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureConfiguration) {
+        unsafe { gl.delete_texture(texture) };
+        return Err(error.into());
+    }
+    unsafe {
         egl_image_target_texture_2d(glow::TEXTURE_2D, image_guard.image().as_ptr());
-        let error = gl.get_error();
-        if error != glow::NO_ERROR {
-            gl.delete_texture(texture);
-            return Err(io::Error::other(format!(
-                "glEGLImageTargetTexture2DOES failed with GL error 0x{error:x}"
-            ))
-            .into());
-        }
+    }
+    if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::ImageTarget) {
+        unsafe { gl.delete_texture(texture) };
+        return Err(error.into());
     }
 
     let size = handle.size();
@@ -3891,6 +4201,211 @@ mod tests {
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    #[test]
+    fn dmabuf_image_target_invalid_operation_is_buffer_local() {
+        let error = DmabufTextureImportError::Gl {
+            stage: DmabufImportGlStage::ImageTarget,
+            error: glow::INVALID_OPERATION,
+        };
+
+        assert_eq!(
+            error.classification(),
+            DmabufImportFailureClass::BufferIncompatible
+        );
+    }
+
+    #[test]
+    fn dmabuf_texture_configuration_invalid_operation_is_renderer_fatal() {
+        let error = DmabufTextureImportError::Gl {
+            stage: DmabufImportGlStage::TextureConfiguration,
+            error: glow::INVALID_OPERATION,
+        };
+
+        assert_eq!(
+            error.classification(),
+            DmabufImportFailureClass::RendererFatal
+        );
+    }
+
+    #[test]
+    fn dmabuf_import_error_drain_returns_first_error_and_clears_all_stale_errors() {
+        let mut errors = [glow::INVALID_OPERATION, glow::INVALID_ENUM, glow::NO_ERROR].into_iter();
+
+        assert_eq!(
+            first_drained_gl_error(|| errors.next().expect("test error stream is finite")),
+            Some(glow::INVALID_OPERATION)
+        );
+        assert!(errors.next().is_none());
+    }
+
+    #[test]
+    fn dmabuf_replacement_incompatibility_is_surface_local() {
+        let mut frame_stats = GlesSceneFrameStats::default();
+        let mut failed_surface_generations = HashMap::new();
+        let result = settle_dmabuf_import_result::<u8>(
+            Err(Box::new(DmabufTextureImportError::EglImageCreation(
+                egl::Error::BadMatch,
+            ))),
+            DmabufImportDiagnosticContext {
+                surface_id: 7,
+                generation: 9,
+                buffer_id: 11,
+                width: 2,
+                height: 2,
+                fourcc: XR24,
+                modifier: 0,
+                planes: 1,
+                path: DmabufImportPath::Replacement,
+                cache: DmabufImportCacheState::Miss,
+            },
+            &mut frame_stats,
+            &mut failed_surface_generations,
+        );
+
+        assert!(
+            result
+                .expect("buffer-local import rejection is absorbed")
+                .is_none()
+        );
+        assert_eq!(frame_stats.dmabuf_import_failures, 1);
+        assert_eq!(failed_surface_generations.get(&7), Some(&9));
+    }
+
+    #[test]
+    fn dmabuf_renderer_fatal_failure_still_escapes_surface_local_boundary() {
+        let mut frame_stats = GlesSceneFrameStats::default();
+        let mut failed_surface_generations = HashMap::new();
+        let result = settle_dmabuf_import_result::<u8>(
+            Err(Box::new(DmabufTextureImportError::Gl {
+                stage: DmabufImportGlStage::Bind,
+                error: glow::INVALID_OPERATION,
+            })),
+            DmabufImportDiagnosticContext {
+                surface_id: 7,
+                generation: 9,
+                buffer_id: 11,
+                width: 2,
+                height: 2,
+                fourcc: XR24,
+                modifier: 0,
+                planes: 1,
+                path: DmabufImportPath::Replacement,
+                cache: DmabufImportCacheState::Miss,
+            },
+            &mut frame_stats,
+            &mut failed_surface_generations,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(frame_stats.dmabuf_import_failures, 0);
+        assert!(failed_surface_generations.is_empty());
+    }
+
+    #[test]
+    fn unclassified_dmabuf_import_error_still_escapes_surface_local_boundary() {
+        let mut frame_stats = GlesSceneFrameStats::default();
+        let mut failed_surface_generations = HashMap::new();
+        let result = settle_dmabuf_import_result::<u8>(
+            Err(io::Error::other("unclassified renderer failure").into()),
+            DmabufImportDiagnosticContext {
+                surface_id: 7,
+                generation: 9,
+                buffer_id: 11,
+                width: 2,
+                height: 2,
+                fourcc: XR24,
+                modifier: 0,
+                planes: 1,
+                path: DmabufImportPath::Initial,
+                cache: DmabufImportCacheState::NotChecked,
+            },
+            &mut frame_stats,
+            &mut failed_surface_generations,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(frame_stats.dmabuf_import_failures, 0);
+        assert!(failed_surface_generations.is_empty());
+    }
+
+    #[test]
+    fn dmabuf_rejected_replacement_does_not_install_or_cache_failed_generation() {
+        let mut frame_stats = GlesSceneFrameStats::default();
+        let mut failed_surface_generations = HashMap::new();
+        let mut cached_resources = HashMap::from([("A", 1_u8)]);
+        let context = DmabufImportDiagnosticContext {
+            surface_id: 7,
+            generation: 9,
+            buffer_id: 12,
+            width: 2,
+            height: 2,
+            fourcc: XR24,
+            modifier: 0,
+            planes: 1,
+            path: DmabufImportPath::Replacement,
+            cache: DmabufImportCacheState::Miss,
+        };
+
+        let result = settle_dmabuf_import_result::<u8>(
+            Err(Box::new(DmabufTextureImportError::EglImageCreation(
+                egl::Error::BadMatch,
+            ))),
+            context,
+            &mut frame_stats,
+            &mut failed_surface_generations,
+        )
+        .expect("buffer-local replacement rejection is nonfatal");
+        if let Some(resource) = result {
+            cached_resources.insert("B", resource);
+        }
+
+        assert!(!cached_resources.contains_key("B"));
+        assert_eq!(cached_resources.get("A"), Some(&1));
+        assert_eq!(frame_stats.dmabuf_import_failures, 1);
+    }
+
+    #[test]
+    fn dmabuf_rejected_generation_can_be_followed_by_a_valid_import() {
+        let mut frame_stats = GlesSceneFrameStats::default();
+        let mut failed_surface_generations = HashMap::new();
+        let context = DmabufImportDiagnosticContext {
+            surface_id: 7,
+            generation: 9,
+            buffer_id: 13,
+            width: 2,
+            height: 2,
+            fourcc: XR24,
+            modifier: 0,
+            planes: 1,
+            path: DmabufImportPath::Replacement,
+            cache: DmabufImportCacheState::Miss,
+        };
+
+        assert!(
+            settle_dmabuf_import_result::<u8>(
+                Err(Box::new(DmabufTextureImportError::EglImageCreation(
+                    egl::Error::BadMatch,
+                ))),
+                context,
+                &mut frame_stats,
+                &mut failed_surface_generations,
+            )
+            .expect("buffer-local replacement rejection is nonfatal")
+            .is_none()
+        );
+        let valid = settle_dmabuf_import_result(
+            Ok(3_u8),
+            context,
+            &mut frame_stats,
+            &mut failed_surface_generations,
+        )
+        .expect("a later valid generation remains usable");
+
+        assert_eq!(valid, Some(3));
+        assert_eq!(frame_stats.dmabuf_import_failures, 1);
+        assert!(failed_surface_generations.is_empty());
+    }
 
     fn test_shm_surface(damage: RenderableSurfaceDamage) -> RenderableSurface {
         let identity = BufferIdAllocator::default()

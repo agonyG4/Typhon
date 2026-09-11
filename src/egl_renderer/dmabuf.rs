@@ -77,6 +77,24 @@ pub(crate) fn query_egl_dmabuf_feedback(
         .flat_map(|(_, modifiers)| modifiers)
         .any(|modifier| is_nvidia_block_linear_modifier(modifier.modifier));
 
+    let mut tranche_formats = renderer_tranche_formats(queried_formats, has_nvidia_modifiers);
+
+    if tranche_formats.is_empty() {
+        return EglGlesDmabufFeedback::default();
+    }
+
+    tranche_formats.sort_by_key(preferred_dmabuf_format_key);
+    let mut table_formats = tranche_formats.clone();
+    if has_nvidia_modifiers {
+        table_formats.extend(nvidia_unindexed_dmabuf_table_tail());
+    }
+    EglGlesDmabufFeedback::from_table_and_tranche_formats(table_formats, tranche_formats)
+}
+
+fn renderer_tranche_formats(
+    queried_formats: impl IntoIterator<Item = (DrmFormat, Vec<EglQueriedModifier>)>,
+    has_nvidia_modifiers: bool,
+) -> Vec<EglGlesDmabufFormat> {
     let mut tranche_formats = Vec::new();
     for (drm_format, modifiers) in queried_formats {
         let mut has_tranche_modifier = false;
@@ -93,17 +111,7 @@ pub(crate) fn query_egl_dmabuf_feedback(
             tranche_formats.push(EglGlesDmabufFormat::new(drm_format, DrmModifier::INVALID));
         }
     }
-
-    if tranche_formats.is_empty() {
-        EglGlesDmabufFeedback::default()
-    } else {
-        tranche_formats.sort_by_key(preferred_dmabuf_format_key);
-        let mut table_formats = tranche_formats.clone();
-        if has_nvidia_modifiers {
-            table_formats.extend(nvidia_unindexed_dmabuf_table_tail());
-        }
-        EglGlesDmabufFeedback::from_table_and_tranche_formats(table_formats, tranche_formats)
-    }
+    tranche_formats
 }
 
 pub(crate) fn query_egl_renderable_dmabuf_formats(
@@ -305,4 +313,43 @@ fn query_egl_device_path(
         .to_string_lossy()
         .into_owned();
     (!path.is_empty()).then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_non_external_modifier_is_eligible_for_renderer_tranche() {
+        let modifier = DrmModifier(0x0300_0000_0060_6010);
+        let formats = renderer_tranche_formats(
+            vec![(
+                DrmFormat::Xrgb8888,
+                vec![EglQueriedModifier {
+                    modifier,
+                    external_only: false,
+                }],
+            )],
+            false,
+        );
+
+        assert!(formats.contains(&EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, modifier)));
+    }
+
+    #[test]
+    fn explicit_external_only_modifier_is_excluded_from_renderer_tranche() {
+        let modifier = DrmModifier(0x0300_0000_0060_6010);
+        let formats = renderer_tranche_formats(
+            vec![(
+                DrmFormat::Xrgb8888,
+                vec![EglQueriedModifier {
+                    modifier,
+                    external_only: true,
+                }],
+            )],
+            false,
+        );
+
+        assert!(formats.is_empty());
+    }
 }
