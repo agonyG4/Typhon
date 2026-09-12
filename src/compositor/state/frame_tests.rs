@@ -100,6 +100,92 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn blocked_same_root_head_is_not_superseded_by_ready_successor() {
+        let mut state = CompositorState::default();
+        let first_id = SurfaceTreeTransactionId::new(5);
+        let second_id = SurfaceTreeTransactionId::new(6);
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                id: first_id,
+                root_surface_id: 9,
+                nodes: vec![(9, empty_cached_subsurface_commit())],
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(7),
+                    commit_id: AcquireCommitId::for_tests(8),
+                    surface_id: 9,
+                    buffer_id: 10,
+                    acquire: ExplicitSyncPoint::for_tests_with_signal_script(11, 12, [false]),
+                    state: PendingAcquireState::EventfdBacked,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                id: second_id,
+                root_surface_id: 9,
+                nodes: vec![(9, empty_cached_subsurface_commit())],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        state.commit_ready_surface_tree_transactions();
+
+        assert_eq!(
+            state
+                .pending_surface_tree_transactions
+                .iter()
+                .map(|transaction| transaction.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+    }
+
+    #[test]
+    fn blocked_root_does_not_block_an_independent_ready_root() {
+        let mut state = CompositorState::default();
+        let blocked_id = SurfaceTreeTransactionId::new(7);
+        let ready_id = SurfaceTreeTransactionId::new(8);
+        state.pending_surface_tree_transactions.extend([
+            PendingSurfaceTreeTransaction {
+                id: blocked_id,
+                root_surface_id: 10,
+                nodes: vec![(10, empty_cached_subsurface_commit())],
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(9),
+                    commit_id: AcquireCommitId::for_tests(10),
+                    surface_id: 10,
+                    buffer_id: 11,
+                    acquire: ExplicitSyncPoint::for_tests_with_signal_script(12, 13, [false]),
+                    state: PendingAcquireState::EventfdBacked,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+            PendingSurfaceTreeTransaction {
+                id: ready_id,
+                root_surface_id: 11,
+                nodes: vec![(11, empty_cached_subsurface_commit())],
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        ]);
+
+        state.commit_ready_surface_tree_transactions();
+
+        assert_eq!(
+            state
+                .pending_surface_tree_transactions
+                .iter()
+                .map(|transaction| transaction.id)
+                .collect::<Vec<_>>(),
+            vec![blocked_id]
+        );
+    }
+
+    #[test]
     fn stale_fifo_generation_cannot_clear_the_current_barrier() {
         let mut state = CompositorState::default();
         let current = ActiveFifoBarrier {

@@ -233,6 +233,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_id: u32,
         reply: Sender<XdgRoleSnapshot>,
     },
+    CapturePendingSurfaceTreeTransactions(Sender<Vec<(u64, Vec<(u32, u64)>)>>),
     CapturePendingFrameCallbacks(Sender<bool>),
     CaptureOnlyPendingSurfaceFrameCallbacks(Sender<bool>),
     CapturePendingFrameWork(Sender<bool>),
@@ -1134,6 +1135,26 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .compliance_metrics
                                 .xdg_reassociation_blocked_stale_unpublished_work,
                         });
+                    }
+                    ServerCommand::CapturePendingSurfaceTreeTransactions(reply) => {
+                        let transactions = server
+                            .state
+                            .pending_surface_tree_transactions
+                            .iter()
+                            .map(|transaction| {
+                                (
+                                    transaction.id.get(),
+                                    transaction
+                                        .nodes
+                                        .iter()
+                                        .map(|(surface_id, commit)| {
+                                            (*surface_id, commit.commit_id.get())
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect();
+                        let _ = reply.send(transactions);
                     }
                     ServerCommand::CapturePendingFrameCallbacks(reply) => {
                         let _ = reply.send(server.has_pending_frame_callbacks());
@@ -2163,6 +2184,19 @@ pub(in crate::compositor::tests) fn capture_xdg_role_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report XDG role snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_pending_surface_tree_transactions(
+    commands: &Sender<ServerCommand>,
+) -> Vec<(u64, Vec<(u32, u64)>)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePendingSurfaceTreeTransactions(reply))
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pending surface-tree transactions")
 }
 
 pub(in crate::compositor::tests) fn capture_pending_frame_callbacks(

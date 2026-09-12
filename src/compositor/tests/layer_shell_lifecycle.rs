@@ -959,6 +959,145 @@ fn superseded_unready_explicit_sync_commit_discards_presentation_feedback() {
 }
 
 #[test]
+fn synchronized_child_replacement_preserves_the_latched_surface_tree() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (parent, _layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "latched-tree-replacement",
+        64,
+        32,
+    );
+    let child_a = compositor.create_surface(&qh, ());
+    let child_b = compositor.create_surface(&qh, ());
+    let _subsurface_a = subcompositor.get_subsurface(&child_a, &parent, &qh, ());
+    let _subsurface_b = subcompositor.get_subsurface(&child_b, &parent, &qh, ());
+    let sync_surface_a = syncobj.get_surface(&child_a, &qh, ());
+    let acquire_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let acquire = syncobj.import_timeline(acquire_fd.as_fd(), &qh, ());
+    let release_fd = release_timeline.export_timeline_fd().unwrap();
+    let release = syncobj.import_timeline(release_fd.as_fd(), &qh, ());
+    let buffer_a1 = create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff11_1111, 2, 2).unwrap();
+    let buffer_a2 = create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_2222, 3, 3).unwrap();
+    let _buffer_b1 = attach_test_buffered_surface(&child_b, &shm, &qh, 4, 4).unwrap();
+
+    sync_surface_a.set_acquire_point(&acquire, 0, 1);
+    sync_surface_a.set_release_point(&release, 0, 2);
+    child_a.attach(Some(&buffer_a1), 0, 0);
+    child_a.damage_buffer(0, 0, 2, 2);
+    child_a.commit();
+    child_b.commit();
+    let callback = parent.frame(&qh, ());
+    state.tracked_frame_callback_id = Some(callback.id().protocol_id());
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let latched_tree = capture_pending_surface_tree_transactions(&commands);
+    assert_eq!(latched_tree.len(), 1);
+    assert_eq!(latched_tree[0].1.len(), 3);
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    sync_surface_a.set_acquire_point(&acquire, 0, 3);
+    sync_surface_a.set_release_point(&release, 0, 4);
+    child_a.attach(Some(&buffer_a2), 0, 0);
+    child_a.damage_buffer(0, 0, 3, 3);
+    child_a.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        capture_pending_surface_tree_transactions(&commands),
+        latched_tree
+    );
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    acquire_timeline.signal_point(1).unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let first_publication = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(
+        state
+            .frame_completion_event_log
+            .iter()
+            .filter(|event| **event == "frame_callback")
+            .count(),
+        1
+    );
+    assert!(
+        first_publication
+            .iter()
+            .any(|surface| surface.width == 2 && surface.height == 2)
+    );
+    assert!(
+        first_publication
+            .iter()
+            .any(|surface| surface.width == 4 && surface.height == 4)
+    );
+    assert!(
+        !first_publication
+            .iter()
+            .any(|surface| surface.width == 3 && surface.height == 3)
+    );
+
+    acquire_timeline.signal_point(3).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let second_publication = capture_renderable_surface_snapshot(&commands);
+    assert!(
+        second_publication
+            .iter()
+            .any(|surface| surface.width == 3 && surface.height == 3)
+    );
+    assert!(
+        second_publication
+            .iter()
+            .any(|surface| surface.width == 4 && surface.height == 4)
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn synchronized_subsurface_explicit_sync_survives_bufferless_commit() {
     let Some(acquire_timeline) =
         test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())

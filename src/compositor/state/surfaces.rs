@@ -470,68 +470,6 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained_explicit;
-
-        let mut retained_trees = Vec::new();
-        let mut pacing_deadline_changed = false;
-        for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
-            let supersedes = transaction.nodes.iter().any(|(node_surface_id, commit)| {
-                *node_surface_id == surface_id
-                    && commit.commit_sequence < new_sequence
-                    && commit.attachment.is_some()
-            });
-            if supersedes {
-                if transaction.is_pacing_protected() {
-                    retained_trees.push(transaction);
-                    continue;
-                }
-                if self.transaction_is_ready(&transaction) {
-                    retained_trees.push(transaction);
-                    continue;
-                }
-                pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
-                let root_surface_id = transaction.root_surface_id;
-                let replacement = SurfaceCommitId::from_sequence(new_sequence);
-                let acquire_state = if self.transaction_is_ready(&transaction) {
-                    PendingAcquireState::Ready
-                } else {
-                    PendingAcquireState::RegistrationPending
-                };
-                for (_, commit) in &transaction.nodes {
-                    if commit.attachment.is_some() {
-                        self.note_explicit_commit_superseded(
-                            commit.commit_id,
-                            acquire_state,
-                            commit.frame_callbacks.len(),
-                            replacement,
-                            "newer_surface_tree_attachment_arrived",
-                        );
-                    }
-                }
-                let released = self.release_pending_surface_tree_transaction(
-                    transaction,
-                    AcquireWatchCancelReason::Superseded,
-                );
-                callbacks.extend(released.callbacks);
-                if let Some(resize_commit) = released.resize_commit {
-                    self.release_detached_resize_capture(root_surface_id, resize_commit);
-                }
-                self.resize_flow_metrics
-                    .surface_pending_attachments_superseded = self
-                    .resize_flow_metrics
-                    .surface_pending_attachments_superseded
-                    .saturating_add(1);
-                self.resize_flow_metrics.surface_cross_queue_supersessions = self
-                    .resize_flow_metrics
-                    .surface_cross_queue_supersessions
-                    .saturating_add(1);
-            } else {
-                retained_trees.push(transaction);
-            }
-        }
-        self.pending_surface_tree_transactions = retained_trees;
-        if pacing_deadline_changed {
-            self.invalidate_surface_pacing_deadline_cache();
-        }
         callbacks
     }
     pub(in crate::compositor) fn capture_surface_damage_presentation(

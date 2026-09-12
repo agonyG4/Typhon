@@ -1287,6 +1287,64 @@ mod tests {
     }
 
     #[test]
+    fn queue_capacity_rejects_a_blocked_transaction_without_evicting_an_admitted_tree() {
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test client");
+        let client = display_handle
+            .insert_client(server_end, std::sync::Arc::new(()))
+            .expect("insert test client");
+        let mut state = CompositorState::default();
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = crate::compositor::compositor_surface_id(&surface);
+        for index in 0..8 {
+            state
+                .pending_surface_tree_transactions
+                .push(PendingSurfaceTreeTransaction {
+                    id: SurfaceTreeTransactionId::new(index as u64 + 1),
+                    root_surface_id: surface_id,
+                    nodes: vec![(surface_id, empty_cached_subsurface_commit())],
+                    dependencies: vec![SurfaceTreeAcquireDependency {
+                        surface_commit_id: SurfaceCommitId::for_tests(index as u64 + 20),
+                        commit_id: AcquireCommitId::for_tests(index as u64 + 30),
+                        surface_id,
+                        buffer_id: index + 40,
+                        acquire: ExplicitSyncPoint::for_tests_with_signal_script(
+                            index + 50,
+                            u64::from(index + 60),
+                            [false],
+                        ),
+                        state: PendingAcquireState::EventfdBacked,
+                    }],
+                    commit_timing_readiness: None,
+                    received_at: Instant::now(),
+                });
+        }
+        let admitted_ids = state
+            .pending_surface_tree_transactions
+            .iter()
+            .map(|transaction| transaction.id)
+            .collect::<Vec<_>>();
+
+        state.queue_waiting_surface_tree(
+            surface_id,
+            vec![(surface_id, empty_cached_subsurface_commit())],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            state
+                .pending_surface_tree_transactions
+                .iter()
+                .map(|transaction| transaction.id)
+                .collect::<Vec<_>>(),
+            admitted_ids
+        );
+        assert_eq!(state.take_client_resource_exhaustions().len(), 1);
+    }
+
+    #[test]
     fn fallback_is_refresh_aware_but_finite() {
         assert_eq!(fifo_forward_progress_deadline(10, 60_000_000), 75_000_010);
         assert_eq!(fifo_forward_progress_deadline(10, 6_060_606), 34_000_010);

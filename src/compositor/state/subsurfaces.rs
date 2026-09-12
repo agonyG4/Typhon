@@ -139,14 +139,6 @@ impl CompositorState {
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
             return;
         }
-        if commit.attachment.is_some() {
-            let mut superseded_callbacks = self.supersede_older_pending_attachments_for_surface(
-                surface_id,
-                commit.commit_sequence,
-            );
-            superseded_callbacks.extend(commit.frame_callbacks);
-            commit.frame_callbacks = superseded_callbacks;
-        }
         if self.xdg_surface_is_constructed(surface_id) {
             match commit.attachment.as_ref() {
                 Some(PendingSurfaceAttachment::Buffer(_))
@@ -183,6 +175,14 @@ impl CompositorState {
         if self.is_effectively_synchronized_subsurface(surface_id) {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
+        }
+        if commit.attachment.is_some() {
+            let mut superseded_callbacks = self.supersede_older_pending_attachments_for_surface(
+                surface_id,
+                commit.commit_sequence,
+            );
+            superseded_callbacks.extend(commit.frame_callbacks);
+            commit.frame_callbacks = superseded_callbacks;
         }
         match commit.attachment.as_mut() {
             Some(PendingSurfaceAttachment::Buffer(pending)) => {
@@ -725,7 +725,7 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
         transaction_id: SurfaceTreeTransactionId,
-        mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
         commit_timing_readiness: Option<CommitTimingReadiness>,
         received_at: Instant,
@@ -758,6 +758,14 @@ impl CompositorState {
                 .saturating_add(1);
             self.commit_ready_surface_tree_transactions();
             matching.clear();
+            matching.extend(
+                self.pending_surface_tree_transactions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, transaction)| {
+                        (transaction.root_surface_id == root_surface_id).then_some(index)
+                    }),
+            );
         }
         if matching.len() >= Self::MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT {
             self.subsurface_transaction_metrics
@@ -765,11 +773,14 @@ impl CompositorState {
                 .subsurface_transaction_metrics
                 .explicit_sync_queue_overflow
                 .saturating_add(1);
-            let remove_index = matching.iter().copied().find(|index| {
-                !self.transaction_is_ready(&self.pending_surface_tree_transactions[*index])
-                    && !self.pending_surface_tree_transactions[*index].is_pacing_protected()
-            });
-            let Some(remove_index) = remove_index else {
+            self.commit_ready_surface_tree_transactions();
+            let still_at_capacity = self
+                .pending_surface_tree_transactions
+                .iter()
+                .filter(|transaction| transaction.root_surface_id == root_surface_id)
+                .count()
+                >= Self::MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT;
+            if still_at_capacity {
                 if self.request_client_resource_exhaustion(root_surface_id) {
                     self.surface_pacing_metrics
                         .queue_admission_resource_exhaustion = self
@@ -779,26 +790,7 @@ impl CompositorState {
                 }
                 self.release_unpublished_surface_tree_nodes(nodes);
                 return;
-            };
-            let superseded = self.pending_surface_tree_transactions.remove(remove_index);
-            if superseded.commit_timing_readiness.is_some() {
-                self.invalidate_surface_pacing_deadline_cache();
             }
-            let released = self.release_pending_surface_tree_transaction(
-                superseded,
-                AcquireWatchCancelReason::Superseded,
-            );
-            if let Some((_, root)) = nodes.first_mut() {
-                root.frame_callbacks.extend(released.callbacks);
-            }
-            if let Some(resize_commit) = released.resize_commit {
-                self.install_tree_resize_commit(root_surface_id, &mut nodes, resize_commit);
-            }
-            self.subsurface_transaction_metrics
-                .tree_transactions_superseded = self
-                .subsurface_transaction_metrics
-                .tree_transactions_superseded
-                .saturating_add(1);
         }
         if self.external_acquire_readiness {
             for dependency in &dependencies {
@@ -1071,33 +1063,6 @@ impl CompositorState {
             if let Some(resize) = resize {
                 self.release_resize_capture(*surface_id, resize.commit_sequence);
             }
-        }
-    }
-
-    pub(in crate::compositor) fn install_tree_resize_commit(
-        &self,
-        root_surface_id: u32,
-        nodes: &mut [(u32, CachedSubsurfaceCommit)],
-        resize_commit: ResizeCommitSnapshot,
-    ) {
-        let Some((_, root)) = nodes
-            .iter_mut()
-            .find(|(surface_id, _)| *surface_id == root_surface_id)
-        else {
-            return;
-        };
-        if let Some(PendingSurfaceAttachment::Buffer(buffer)) = root.attachment.as_mut() {
-            let resize_commit = self.snapshot_resize_commit_for_buffer(
-                root_surface_id,
-                resize_commit,
-                buffer,
-                root.window_geometry,
-            );
-            buffer.resize_commit = Some(Box::new(resize_commit));
-            buffer.resize_capture_finalized = true;
-        } else {
-            root.resize_commit = Some(resize_commit);
-            root.resize_capture_finalized = true;
         }
     }
 
