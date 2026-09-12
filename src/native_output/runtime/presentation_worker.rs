@@ -153,6 +153,7 @@ pub(super) fn resolve_scene_and_damage<'a>(
 pub(super) fn replace_ready_scene_and_signature(
     scene_history: &mut NativeSceneHistory,
     resolved_scene: &ResolvedNativeFrameScene<'_>,
+    lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     frame_index: u64,
     cursor: (
         Option<NativeClientCursorDamageState>,
@@ -162,6 +163,7 @@ pub(super) fn replace_ready_scene_and_signature(
     replace_ready_scene(
         scene_history,
         resolved_scene,
+        lifecycle,
         frame_index,
         cursor.0,
         cursor.1,
@@ -336,15 +338,18 @@ pub(super) fn native_output_damage_for_presented_scene(
 pub(super) fn replace_ready_scene(
     scene_history: &mut NativeSceneHistory,
     resolved_scene: &ResolvedNativeFrameScene<'_>,
+    lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     frame_index: u64,
     current_client_cursor_damage: Option<NativeClientCursorDamageState>,
     current_software_cursor_damage: Option<NativeDamageRect>,
 ) {
-    scene_history.replace_ready(NativeFrameSceneSnapshot::from_resolved_frame_scene(
+    let mut snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         frame_index,
         resolved_scene,
         scene_history.cursor_damage((current_client_cursor_damage, current_software_cursor_damage)),
-    ));
+    );
+    snapshot.lifecycle = lifecycle;
+    scene_history.replace_ready(snapshot);
 }
 
 pub(super) fn promote_pageflip_and_publish(
@@ -357,7 +362,17 @@ pub(super) fn promote_pageflip_and_publish(
     }
     if let Some(snapshot) = scene_history.presented_snapshot() {
         server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
-        server.publish_presented_lifecycle(snapshot.frame_id, &snapshot.lifecycle);
+        let canonical_root_surface_ids = snapshot
+            .scene
+            .surfaces
+            .iter()
+            .map(|surface| surface.visual_root_surface_id)
+            .collect::<Vec<_>>();
+        server.publish_presented_lifecycle_for_scene(
+            snapshot.frame_id,
+            &snapshot.lifecycle,
+            &canonical_root_surface_ids,
+        );
     }
     true
 }
@@ -371,7 +386,17 @@ pub(super) fn promote_immediate_and_publish(
     }
     if let Some(snapshot) = scene_history.presented_snapshot() {
         server.publish_presented_presentation(snapshot.frame_id, &snapshot.presentation);
-        server.publish_presented_lifecycle(snapshot.frame_id, &snapshot.lifecycle);
+        let canonical_root_surface_ids = snapshot
+            .scene
+            .surfaces
+            .iter()
+            .map(|surface| surface.visual_root_surface_id)
+            .collect::<Vec<_>>();
+        server.publish_presented_lifecycle_for_scene(
+            snapshot.frame_id,
+            &snapshot.lifecycle,
+            &canonical_root_surface_ids,
+        );
     }
     true
 }

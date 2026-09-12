@@ -1133,6 +1133,21 @@ impl OwnCompositorServer {
         self.state.publish_presented_lifecycle(frame_id, snapshot);
     }
 
+    #[allow(dead_code)]
+    pub fn publish_presented_lifecycle_for_scene(
+        &mut self,
+        frame_id: u64,
+        snapshot: &crate::window_lifecycle_animation::LifecycleFrameSnapshot,
+        canonical_root_surface_ids: &[u32],
+    ) {
+        self.state.publish_presented_lifecycle_with_replacements(
+            frame_id,
+            snapshot,
+            canonical_root_surface_ids,
+            true,
+        );
+    }
+
     pub fn presented_lifecycle_frame_id(&self) -> u64 {
         self.state.presented_lifecycle_frame_id()
     }
@@ -1189,7 +1204,21 @@ impl OwnCompositorServer {
             &presentation,
             self.presented_window_geometries_for_targets(&presentation, &targets),
         );
-        let lifecycle = self.lifecycle_frame_snapshot_at(at);
+        let lifecycle_sample = self.lifecycle_scene_sample_at(at);
+        let evidence = crate::window_lifecycle_animation::LifecycleRenderEvidence::from_consumed(
+            lifecycle_sample.lamps.iter().map(|lamp| {
+                crate::window_lifecycle_animation::LifecycleRenderEvidenceEntry {
+                    window_id: lamp.window_id,
+                    root_surface_id: lamp.root_surface_id,
+                    transition_id: lamp.transition_id,
+                }
+            }),
+        );
+        let lifecycle =
+            crate::window_lifecycle_animation::LifecycleFrameSnapshot::qualified_from_sample(
+                &lifecycle_sample,
+                &evidence,
+            );
         self.publish_presented_presentation(frame_id, &snapshot);
         self.publish_presented_lifecycle(frame_id, &lifecycle);
     }
@@ -1304,6 +1333,15 @@ impl OwnCompositorServer {
     ) -> Vec<DecorationRenderInstance> {
         self.state
             .native_decoration_render_instances_for_scale(surfaces, output_scale)
+    }
+
+    pub fn lifecycle_decoration_render_instances(
+        &self,
+        sample: &crate::window_lifecycle_animation::LifecycleSceneSample,
+        surfaces: &[RenderableSurface],
+    ) -> Vec<DecorationRenderInstance> {
+        self.state
+            .lifecycle_decoration_render_instances(sample, surfaces)
     }
 
     pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
@@ -1612,7 +1650,7 @@ impl OwnCompositorServer {
         self.state.has_pending_acquire_watch_changes()
     }
 
-    pub fn has_unowned_frame_work(&self) -> bool {
+    pub fn has_unowned_frame_work(&mut self) -> bool {
         self.state.has_unowned_frame_work()
     }
 

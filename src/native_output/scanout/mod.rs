@@ -420,7 +420,11 @@ impl NativeScanoutBackend {
                     cursor_mode,
                     damage,
                 )
-                .map(NativePaintOutcome::Rendered),
+                .map(|stats| NativePaintOutcome::Rendered {
+                    stats,
+                    lifecycle:
+                        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::default(),
+                }),
             Self::Dumb(framebuffer) => framebuffer
                 .paint_server_frame(
                     renderer,
@@ -430,7 +434,11 @@ impl NativeScanoutBackend {
                     cursor_mode,
                     damage,
                 )
-                .map(NativePaintOutcome::Rendered),
+                .map(|stats| NativePaintOutcome::Rendered {
+                    stats,
+                    lifecycle:
+                        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::default(),
+                }),
         }
     }
 

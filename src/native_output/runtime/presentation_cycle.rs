@@ -1161,7 +1161,6 @@ impl NativeRuntime {
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
                         let presentation_snapshot = resolved_scene.presentation_snapshot.clone();
-                        let lifecycle_snapshot = resolved_scene.lifecycle_snapshot.clone();
                         let (
                             frame_target,
                             submit_window,
@@ -1403,7 +1402,7 @@ impl NativeRuntime {
                                 });
                             }
                             #[rustfmt::skip]
-                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
+                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, lifecycle_snapshot, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
                                 if slow_cycle_enabled {
                                     slow_cycle_trace.note_compositor_render_us(render_us);
                                 }
@@ -1682,6 +1681,10 @@ impl NativeRuntime {
                             }
                         };
                         let paint_stats = paint_outcome.stats();
+                        let lifecycle_snapshot = match &paint_outcome {
+                            NativePaintOutcome::Rendered { lifecycle, .. } => lifecycle.clone(),
+                            NativePaintOutcome::Skipped(_) => Default::default(),
+                        };
                         render_telemetry.record_native_paint(paint_stats);
                         frame_pacing.log(
                             "render_complete",
@@ -1731,7 +1734,7 @@ impl NativeRuntime {
                             }
                         } else {
                             frame_rendered = true;
-                            #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
+                            #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, lifecycle_snapshot, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
                             drop(resolved_scene);
                             let protocol_batch_id = server
                                 .prepared_frame_batch_id()

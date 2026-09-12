@@ -59,6 +59,16 @@ pub struct AnimationCatalogSnapshot {
 
 impl Default for AnimationCatalogSnapshot {
     fn default() -> Self {
+        Self::for_runtime_capabilities(
+            super::super::animation_control::AnimationRuntimeCapabilities::default(),
+        )
+    }
+}
+
+impl AnimationCatalogSnapshot {
+    pub fn for_runtime_capabilities(
+        runtime_capabilities: super::super::animation_control::AnimationRuntimeCapabilities,
+    ) -> Self {
         Self {
             presets: AnimationPreset::ALL
                 .into_iter()
@@ -81,7 +91,9 @@ impl Default for AnimationCatalogSnapshot {
                 .into_iter()
                 .map(|effect| AnimationEffectCapability {
                     id: effect.id().to_string(),
-                    availability: effect.availability().to_string(),
+                    availability: effect
+                        .availability_for_runtime(runtime_capabilities)
+                        .to_string(),
                     compatible_slots: AnimationSlot::ALL
                         .into_iter()
                         .filter(|slot| effect.compatible_with(*slot))
@@ -108,7 +120,7 @@ pub struct AnimationControlSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animation_control::catalog::effect_for_request;
+    use crate::animation_control::{AnimationRuntimeCapabilities, catalog::effect_for_request};
 
     #[test]
     fn snapshot_reports_astrea_lamp_as_requested_and_effective() {
@@ -120,9 +132,16 @@ mod tests {
             requested.insert(slot.id().to_string(), effect.id().to_string());
             effective.insert(
                 slot.id().to_string(),
-                effect_for_request(slot, effect, configuration.enabled)
-                    .id()
-                    .to_string(),
+                effect_for_request(
+                    slot,
+                    effect,
+                    configuration.enabled,
+                    AnimationRuntimeCapabilities {
+                        lamp_renderer: true,
+                    },
+                )
+                .id()
+                .to_string(),
             );
         }
         let snapshot = AnimationControlSnapshot {
@@ -132,7 +151,11 @@ mod tests {
             config: (&configuration).into(),
             requested,
             effective,
-            catalog: AnimationCatalogSnapshot::default(),
+            catalog: AnimationCatalogSnapshot::for_runtime_capabilities(
+                AnimationRuntimeCapabilities {
+                    lamp_renderer: true,
+                },
+            ),
         };
         assert_eq!(snapshot.requested["window.minimize"], "minimize.lamp");
         assert_eq!(snapshot.effective["window.minimize"], "minimize.lamp");

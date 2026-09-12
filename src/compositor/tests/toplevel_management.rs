@@ -806,6 +806,7 @@ fn authorized_v3_client_sets_and_clears_global_minimize_anchor() {
 fn lifecycle_effect_path_preserves_resolved_background_appearance() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_lifecycle_animation_renderer_available(true);
     server.authorize_astrea_shell_pid(std::process::id());
     let (commands, server_thread) = spawn_controllable_test_server(server);
     let socket_path = runtime_socket_path(&socket_name);
@@ -869,6 +870,10 @@ fn lifecycle_effect_path_preserves_resolved_background_appearance() {
         lifecycle_path.lifecycle_resolved_effect_instance_count, 1,
         "Lamp must receive the resolved effect source instead of raw surfaces only"
     );
+    assert_eq!(lifecycle_path.canonical_surface_count, 0);
+    assert_eq!(lifecycle_path.retained_surface_count, 1);
+    assert_eq!(lifecycle_path.lifecycle_transition_count, 1);
+    assert!(!lifecycle_path.restore_suppression_active);
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub const ASTREA_LAMP_BASE_DURATION_MS: u64 = 280;
 pub const ASTREA_LAMP_PULL: f64 = 2.5;
+const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LifecycleTransitionId(NonZeroU64);
@@ -138,6 +139,18 @@ impl LifecycleFrameSnapshot {
         }
     }
 
+    pub fn qualified_from_sample(
+        sample: &LifecycleSceneSample,
+        evidence: &LifecycleRenderEvidence,
+    ) -> Self {
+        let mut snapshot = Self::from_sample(sample);
+        snapshot.lamps.retain(|lamp| {
+            evidence.contains(lamp.window_id, lamp.root_surface_id, lamp.transition_id)
+        });
+        snapshot.refresh_signature();
+        snapshot
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.lamps.is_empty()
     }
@@ -151,6 +164,93 @@ impl LifecycleFrameSnapshot {
     pub fn refresh_signature(&mut self) {
         self.signature = lifecycle_snapshot_signature(&self.lamps);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifecycleRenderEvidenceEntry {
+    pub window_id: WindowId,
+    pub root_surface_id: u32,
+    pub transition_id: LifecycleTransitionId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LifecycleRenderEvidence {
+    pub consumed: Vec<LifecycleRenderEvidenceEntry>,
+}
+
+impl LifecycleRenderEvidence {
+    pub fn from_consumed(entries: impl IntoIterator<Item = LifecycleRenderEvidenceEntry>) -> Self {
+        let mut evidence = Self::default();
+        for entry in entries {
+            evidence.record(entry);
+        }
+        evidence
+    }
+
+    pub fn record(&mut self, entry: LifecycleRenderEvidenceEntry) {
+        if !self.consumed.contains(&entry)
+            && self.consumed.len() < MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES
+        {
+            self.consumed.push(entry);
+        }
+    }
+
+    pub fn contains(
+        &self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        transition_id: LifecycleTransitionId,
+    ) -> bool {
+        self.consumed.iter().any(|entry| {
+            entry.window_id == window_id
+                && entry.root_surface_id == root_surface_id
+                && entry.transition_id == transition_id
+        })
+    }
+}
+
+/// Returns the finite conservative region that can be affected by a Lamp
+/// representation. All three lifecycle rectangles participate because the
+/// warp can cover any of them over the transition.
+pub fn lamp_footprint(
+    source_rect: PresentationRect,
+    full_window_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+) -> Option<PresentationRect> {
+    if !valid_lamp_rects(source_rect, full_window_rect, anchor_rect) {
+        return None;
+    }
+    let left = source_rect
+        .x()
+        .min(full_window_rect.x())
+        .min(anchor_rect.x());
+    let top = source_rect
+        .y()
+        .min(full_window_rect.y())
+        .min(anchor_rect.y());
+    let right = (source_rect.x() + source_rect.width())
+        .max(full_window_rect.x() + full_window_rect.width())
+        .max(anchor_rect.x() + anchor_rect.width());
+    let bottom = (source_rect.y() + source_rect.height())
+        .max(full_window_rect.y() + full_window_rect.height())
+        .max(anchor_rect.y() + anchor_rect.height());
+    PresentationRect::new(left, top, right - left, bottom - top)
+}
+
+pub fn lamp_footprint_intersects_output(
+    source_rect: PresentationRect,
+    full_window_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    let Some(footprint) = lamp_footprint(source_rect, full_window_rect, anchor_rect) else {
+        return false;
+    };
+    footprint.x() < f64::from(output_width)
+        && footprint.y() < f64::from(output_height)
+        && footprint.x() + footprint.width() > 0.0
+        && footprint.y() + footprint.height() > 0.0
 }
 
 fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
@@ -354,6 +454,23 @@ impl WindowLifecycleAnimator {
         if !mathematically_settled {
             return false;
         }
+        let Some(transition) = self.transitions.get(&window_id) else {
+            return false;
+        };
+        if transition.transition_id != transition_id {
+            return false;
+        }
+        self.transitions.remove(&window_id);
+        true
+    }
+
+    /// Retire a transition proven unable to change this output. This is a
+    /// logical no-visual-change settlement, not physical presentation ACK.
+    pub fn settle_no_visual_change(
+        &mut self,
+        window_id: WindowId,
+        transition_id: LifecycleTransitionId,
+    ) -> bool {
         let Some(transition) = self.transitions.get(&window_id) else {
             return false;
         };
@@ -726,6 +843,99 @@ mod tests {
         assert_eq!(animator.active_count(), 1);
         assert!(animator.acknowledge(window, transition, true));
         assert_eq!(animator.active_count(), 0);
+    }
+
+    #[test]
+    fn render_evidence_qualifies_only_consumed_transition_identities() {
+        let first_window = WindowId::from_raw(15).expect("valid window id");
+        let second_window = WindowId::from_raw(16).expect("valid window id");
+        let source = rect(0.0, 0.0, 100.0, 100.0);
+        let second_source = rect(1000.0, 1000.0, 100.0, 100.0);
+        let anchor = rect(200.0, 200.0, 10.0, 10.0);
+        let second_anchor = rect(1200.0, 1200.0, 10.0, 10.0);
+        let mut animator = WindowLifecycleAnimator::new(true);
+        let first = animator
+            .start_or_reverse(
+                request(
+                    first_window,
+                    15,
+                    source,
+                    anchor,
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("first transition starts");
+        let second = animator
+            .start_or_reverse(
+                request(
+                    second_window,
+                    16,
+                    second_source,
+                    second_anchor,
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("second transition starts");
+        assert!(lamp_footprint_intersects_output(
+            source, source, anchor, 800, 600
+        ));
+        assert!(!lamp_footprint_intersects_output(
+            second_source,
+            second_source,
+            second_anchor,
+            800,
+            600,
+        ));
+        let sample = animator.sample_scene(AnimationTime::from_nanos(100_000_000));
+        let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+            window_id: first_window,
+            root_surface_id: 15,
+            transition_id: first,
+        }]);
+        let qualified = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
+        assert_eq!(qualified.lamps.len(), 1);
+        assert_eq!(qualified.lamps[0].window_id, first_window);
+        assert_eq!(qualified.lamps[0].transition_id, first);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn lamp_footprint_intersection_is_conservative_and_output_aware() {
+        let source = rect(300.0, 300.0, 20.0, 20.0);
+        let full = rect(310.0, 310.0, 30.0, 30.0);
+        let anchor = rect(330.0, 330.0, 10.0, 10.0);
+        assert!(!lamp_footprint_intersects_output(
+            source, full, anchor, 100, 100
+        ));
+        assert!(lamp_footprint_intersects_output(
+            source, full, anchor, 400, 400
+        ));
+    }
+
+    #[test]
+    fn no_visual_change_settlement_is_separate_from_physical_ack() {
+        let window = WindowId::from_raw(17).expect("valid window id");
+        let mut animator = WindowLifecycleAnimator::new(true);
+        let transition = animator
+            .start_or_reverse(
+                request(
+                    window,
+                    17,
+                    rect(300.0, 300.0, 100.0, 100.0),
+                    rect(500.0, 500.0, 10.0, 10.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("transition starts");
+        assert!(animator.settle_no_visual_change(window, transition));
+        assert_eq!(animator.active_count(), 0);
+        assert!(!animator.acknowledge(window, transition, true));
     }
 
     #[test]

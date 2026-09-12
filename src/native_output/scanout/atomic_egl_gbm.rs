@@ -705,7 +705,11 @@ impl AtomicEglGbmScanout {
             )
             .map_err(native_egl_io_error)?;
         match outcome {
-            EglFrameOutcome::Rendered { commit, stats } => {
+            EglFrameOutcome::Rendered {
+                commit,
+                stats,
+                lifecycle_evidence,
+            } => {
                 let fence = self.create_render_fence()?;
                 Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
                     AtomicRenderedFrameParts {
@@ -713,6 +717,7 @@ impl AtomicEglGbmScanout {
                         scene_commit: commit,
                         render_fence: fence,
                         stats,
+                        lifecycle_evidence,
                         render_us: elapsed_micros(started),
                     },
                 )))
@@ -1100,6 +1105,11 @@ impl AtomicEglGbmScanout {
             }
         };
         let render_us = parts.render_us;
+        let lifecycle_snapshot =
+            oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::qualified_from_sample(
+                &resolved_scene.lifecycle,
+                &parts.lifecycle_evidence,
+            );
         server.trace_surface_pipeline_surfaces(
             SurfacePipelineEvent::SceneSampled,
             resolved_scene.surfaces.iter().map(|surface| {
@@ -1206,6 +1216,7 @@ impl AtomicEglGbmScanout {
                     protocol_batch_id,
                     render_us,
                     repaint_stats,
+                    lifecycle_snapshot,
                     resolved_snapshot,
                     resolved_scene_signature,
                     render_damage_signature,
@@ -1572,6 +1583,7 @@ pub(crate) enum AtomicFrameRenderOutcome {
         framebuffer_slot: u8,
         deferred_o1_binding_advanced_intervals: Option<u64>,
         deferred_o1_binding_failure: Option<DeferredO1BindingFailure>,
+        lifecycle_snapshot: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     },
     Skipped {
         reason: FrameSkipReason,
@@ -1588,6 +1600,8 @@ pub(crate) struct AtomicRenderedFrameParts {
     pub(crate) scene_commit: EglSceneFrameCommit,
     pub(crate) render_fence: NativeRenderFence,
     pub(crate) stats: GlesSceneFrameStats,
+    pub(crate) lifecycle_evidence:
+        oblivion_one::window_lifecycle_animation::LifecycleRenderEvidence,
     pub(crate) render_us: u64,
 }
 

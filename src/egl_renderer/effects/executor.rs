@@ -547,6 +547,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
@@ -763,6 +764,7 @@ fn composition_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_pass(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
@@ -1434,6 +1436,7 @@ fn set_identity_color_matrix(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_capture(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,

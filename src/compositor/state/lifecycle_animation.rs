@@ -1,5 +1,5 @@
 use super::*;
-use crate::animation_control::{AnimationEffect, AnimationSlot};
+use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleFrameSnapshot, LifecycleSceneSample, LifecycleTransitionRequest,
@@ -67,19 +67,238 @@ impl CompositorState {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::window_lifecycle_animation::{
+        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
+        LifecycleTransitionId, LifecycleTransitionRequest,
+    };
+
+    fn lifecycle_request(
+        window_id: WindowId,
+        root_surface_id: u32,
+        source_rect: PresentationRect,
+        anchor_rect: PresentationRect,
+        direction: LifecycleDirection,
+    ) -> LifecycleTransitionRequest {
+        LifecycleTransitionRequest {
+            window_id,
+            root_surface_id,
+            source_rect,
+            full_window_rect: source_rect,
+            anchor_rect,
+            direction,
+            resolved_effect_scene: ResolvedEffectScene::default(),
+        }
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
+        PresentationRect::new(x, y, width, height).expect("valid test rectangle")
+    }
+
+    #[test]
+    fn unconsumed_endpoint_pageflip_does_not_retire_lifecycle_transition() {
+        let window_id = WindowId::from_raw(301).expect("valid window ID");
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let source = rect(20.0, 20.0, 200.0, 150.0);
+        let anchor = rect(500.0, 500.0, 40.0, 40.0);
+        let transition_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(window_id, 301, source, anchor, LifecycleDirection::Minimize),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        let endpoint = state
+            .window_lifecycle_animator
+            .sample_scene(AnimationTime::from_nanos(280_000_000));
+
+        state.publish_presented_lifecycle(1, &LifecycleFrameSnapshot::default());
+        assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+
+        let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+            window_id,
+            root_surface_id: 301,
+            transition_id,
+        }]);
+        let qualified = LifecycleFrameSnapshot::qualified_from_sample(&endpoint, &evidence);
+        state.publish_presented_lifecycle(2, &qualified);
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    }
+
+    #[test]
+    fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler() {
+        let window_id = WindowId::from_raw(302).expect("valid window ID");
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let transition_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    302,
+                    rect(300.0, 300.0, 100.0, 100.0),
+                    rect(500.0, 500.0, 20.0, 20.0),
+                    LifecycleDirection::Restore,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        state.lifecycle_render_suppressed_roots.insert(302);
+        assert!(!state.lifecycle_animation_has_pending_visible());
+        assert!(state.settle_lifecycle_no_visual_change());
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+        assert!(!state.lifecycle_render_suppressed_roots.contains(&302));
+        assert!(!state.lifecycle_animation_has_pending_visible());
+        assert!(
+            !state
+                .window_lifecycle_animator
+                .acknowledge(window_id, transition_id, true)
+        );
+    }
+
+    #[test]
+    fn old_visible_physical_lamp_prevents_no_visual_settlement() {
+        let window_id = WindowId::from_raw(303).expect("valid window ID");
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    303,
+                    rect(300.0, 300.0, 100.0, 100.0),
+                    rect(500.0, 500.0, 20.0, 20.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        let old = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id: 303,
+                transition_id: LifecycleTransitionId::new(99),
+                source_rect: rect(0.0, 0.0, 80.0, 80.0),
+                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
+                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+            visual_sources: Vec::new(),
+        };
+        state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&old);
+        assert!(!state.settle_lifecycle_no_visual_change());
+        assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+        assert!(state.lifecycle_animation_has_pending_visible());
+    }
+
+    #[test]
+    fn canonical_presentation_replaces_old_physical_lamp_after_logical_cancel() {
+        let window_id = WindowId::from_raw(304).expect("valid window ID");
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let old = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id: 304,
+                transition_id: LifecycleTransitionId::new(100),
+                source_rect: rect(0.0, 0.0, 80.0, 80.0),
+                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
+                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+            visual_sources: Vec::new(),
+        };
+        state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&old);
+        state.publish_presented_lifecycle_with_replacements(2, &Default::default(), &[304], true);
+        assert!(state.presented_lifecycle.lamps.is_empty());
+    }
+
+    #[test]
+    fn rendered_replacement_clears_absent_physical_lamp_without_acknowledging_active_transition() {
+        let window_id = WindowId::from_raw(305).expect("valid window ID");
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    305,
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        let physical = state
+            .window_lifecycle_animator
+            .sample_scene(AnimationTime::from_nanos(100_000_000));
+        state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&physical);
+        state.publish_presented_lifecycle_with_replacements(2, &Default::default(), &[], true);
+        assert!(state.presented_lifecycle.lamps.is_empty());
+        assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+        assert_eq!(
+            state
+                .window_lifecycle_animator
+                .sample_scene(AnimationTime::from_nanos(100_000_000))
+                .lamps
+                .len(),
+            1
+        );
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn lifecycle_effect(
         &self,
         direction: LifecycleDirection,
     ) -> AnimationEffect {
-        if self.lifecycle_animation_renderer_available == Some(false) {
-            return AnimationEffect::None;
-        }
         let slot = match direction {
             LifecycleDirection::Minimize => AnimationSlot::WindowMinimize,
             LifecycleDirection::Restore => AnimationSlot::WindowRestore,
         };
-        self.animation_control.effective_effect(slot)
+        self.animation_control
+            .effective_effect(slot, self.animation_runtime_capabilities())
+    }
+
+    pub(in crate::compositor) fn animation_runtime_capabilities(
+        &self,
+    ) -> AnimationRuntimeCapabilities {
+        AnimationRuntimeCapabilities {
+            lamp_renderer: self.lifecycle_animation_renderer_available == Some(true),
+        }
     }
 
     pub(in crate::compositor) fn lifecycle_minimize_source_rect(
@@ -121,11 +340,13 @@ impl CompositorState {
         source_rect: Option<PresentationRect>,
         full_window_rect: Option<PresentationRect>,
         resolved_effect_scene: ResolvedEffectScene,
+        lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
         if self.lifecycle_effect(LifecycleDirection::Minimize) != AnimationEffect::MinimizeLamp {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         }
         let Some(source_rect) =
@@ -134,6 +355,7 @@ impl CompositorState {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
         let Some(full_window_rect) =
@@ -142,18 +364,34 @@ impl CompositorState {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
         let Some(anchor_rect) = self.lifecycle_anchor_rect(window_id) else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
+        if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+            source_rect,
+            full_window_rect,
+            anchor_rect,
+            self.output_size.width,
+            self.output_size.height,
+        ) {
+            self.window_lifecycle_animator.cancel(window_id);
+            self.lifecycle_render_suppressed_roots
+                .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
+            return;
+        }
         let Some(now) = AnimationTime::monotonic_now() else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
         let speed = self.animation_control.configuration().speed;
@@ -163,6 +401,11 @@ impl CompositorState {
         self.presentation_animator.cancel(root_surface_id);
         self.lifecycle_render_suppressed_roots
             .remove(&root_surface_id);
+        for decoration in lifecycle_decorations {
+            self.lifecycle_decorations
+                .entry(decoration.root_surface_id())
+                .or_insert(decoration);
+        }
         let _ = self.window_lifecycle_animator.start_or_reverse(
             LifecycleTransitionRequest {
                 window_id,
@@ -188,24 +431,41 @@ impl CompositorState {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         }
         let Some(full_window_rect) = self.lifecycle_window_rect(root_surface_id) else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
         let Some(anchor_rect) = self.lifecycle_anchor_rect(window_id) else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
+        if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+            full_window_rect,
+            full_window_rect,
+            anchor_rect,
+            self.output_size.width,
+            self.output_size.height,
+        ) {
+            self.window_lifecycle_animator.cancel(window_id);
+            self.lifecycle_render_suppressed_roots
+                .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
+            return;
+        }
         let Some(now) = AnimationTime::monotonic_now() else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
         let speed = self.animation_control.configuration().speed;
@@ -271,6 +531,35 @@ impl CompositorState {
         surfaces
     }
 
+    pub(in crate::compositor) fn lifecycle_decoration_render_instances(
+        &self,
+        sample: &LifecycleSceneSample,
+        surfaces: &[RenderableSurface],
+    ) -> Vec<DecorationRenderInstance> {
+        let roots = sample
+            .lamps
+            .iter()
+            .map(|lamp| lamp.root_surface_id)
+            .collect::<HashSet<_>>();
+        let mut frozen = Vec::new();
+        let mut frozen_roots = HashSet::new();
+        for root_surface_id in roots.iter().copied() {
+            if let Some(decoration) = self.lifecycle_decorations.get(&root_surface_id) {
+                frozen.push(decoration.clone());
+                frozen_roots.insert(root_surface_id);
+            }
+        }
+        frozen.extend(
+            self.native_decoration_render_instances_for_scale(surfaces, 1.0)
+                .into_iter()
+                .filter(|decoration| {
+                    roots.contains(&decoration.root_surface_id())
+                        && !frozen_roots.contains(&decoration.root_surface_id())
+                }),
+        );
+        frozen
+    }
+
     pub(in crate::compositor) fn lifecycle_surface_is_suppressed(&self, surface_id: u32) -> bool {
         self.lifecycle_render_suppressed_roots
             .contains(&self.root_surface_id_for_surface(surface_id))
@@ -283,9 +572,76 @@ impl CompositorState {
         LifecycleFrameSnapshot::from_sample(&self.lifecycle_scene_sample_at(at))
     }
 
+    fn lifecycle_lamp_intersects_output(
+        &self,
+        lamp: &crate::window_lifecycle_animation::LampWindowSample,
+    ) -> bool {
+        crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+            lamp.source_rect,
+            lamp.full_window_rect,
+            lamp.anchor_rect,
+            self.output_size.width,
+            self.output_size.height,
+        )
+    }
+
+    pub(in crate::compositor) fn settle_lifecycle_no_visual_change(&mut self) -> bool {
+        let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        let candidates = self
+            .window_lifecycle_animator
+            .sample_scene(now)
+            .lamps
+            .into_iter()
+            .filter(|lamp| !self.lifecycle_lamp_intersects_output(lamp))
+            .filter(|lamp| {
+                !self.presented_lifecycle.lamps.iter().any(|presented| {
+                    presented.window_id == lamp.window_id
+                        && !presented.mathematically_settled
+                        && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+                            presented.source_rect,
+                            presented.full_window_rect,
+                            presented.anchor_rect,
+                            self.output_size.width,
+                            self.output_size.height,
+                        )
+                })
+            })
+            .map(|lamp| (lamp.window_id, lamp.root_surface_id, lamp.transition_id))
+            .collect::<Vec<_>>();
+        let mut settled = false;
+        for (window_id, root_surface_id, transition_id) in candidates {
+            if self
+                .window_lifecycle_animator
+                .settle_no_visual_change(window_id, transition_id)
+            {
+                self.lifecycle_render_suppressed_roots
+                    .remove(&root_surface_id);
+                self.lifecycle_decorations.remove(&root_surface_id);
+                settled = true;
+            }
+        }
+        settled
+    }
+
     pub(in crate::compositor) fn lifecycle_animation_has_pending_visible(&self) -> bool {
-        self.window_lifecycle_animator.has_pending_visible()
-            || self.presented_lifecycle.contains_visible_non_identity()
+        let active_intersects = self
+            .window_lifecycle_animator
+            .sample_scene(AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)))
+            .lamps
+            .iter()
+            .any(|lamp| self.lifecycle_lamp_intersects_output(lamp));
+        let presented_intersects = self.presented_lifecycle.lamps.iter().any(|lamp| {
+            !lamp.mathematically_settled
+                && lamp.opacity > f64::EPSILON
+                && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+                    lamp.source_rect,
+                    lamp.full_window_rect,
+                    lamp.anchor_rect,
+                    self.output_size.width,
+                    self.output_size.height,
+                )
+        });
+        active_intersects || presented_intersects
     }
 
     pub(in crate::compositor) fn lifecycle_render_suppressed_roots(&self) -> &HashSet<u32> {
@@ -297,17 +653,52 @@ impl CompositorState {
         frame_id: u64,
         snapshot: &LifecycleFrameSnapshot,
     ) {
+        self.publish_presented_lifecycle_with_replacements(frame_id, snapshot, &[], false);
+    }
+
+    pub(in crate::compositor) fn publish_presented_lifecycle_with_replacements(
+        &mut self,
+        frame_id: u64,
+        snapshot: &LifecycleFrameSnapshot,
+        canonical_root_surface_ids: &[u32],
+        rendered_scene_replacement: bool,
+    ) {
         self.presented_lifecycle_frame_id = frame_id;
-        self.presented_lifecycle = snapshot.clone();
+        let mut qualified = snapshot.clone();
+        for old in &self.presented_lifecycle.lamps {
+            let replaced = snapshot
+                .lamps
+                .iter()
+                .any(|lamp| lamp.root_surface_id == old.root_surface_id);
+            let canonical_replaced = canonical_root_surface_ids.contains(&old.root_surface_id);
+            let rendered_replaced = rendered_scene_replacement && !replaced;
+            let still_visible = !old.mathematically_settled
+                && old.opacity > f64::EPSILON
+                && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
+                    old.source_rect,
+                    old.full_window_rect,
+                    old.anchor_rect,
+                    self.output_size.width,
+                    self.output_size.height,
+                );
+            if !replaced && !canonical_replaced && !rendered_replaced && still_visible {
+                qualified.lamps.push(*old);
+            }
+        }
+        qualified.refresh_signature();
+        self.presented_lifecycle = qualified;
         for lamp in &snapshot.lamps {
-            if self.window_lifecycle_animator.acknowledge(
+            let acknowledged = self.window_lifecycle_animator.acknowledge(
                 lamp.window_id,
                 lamp.transition_id,
                 lamp.mathematically_settled,
-            ) && matches!(lamp.direction, LifecycleDirection::Restore)
-            {
+            );
+            if acknowledged && matches!(lamp.direction, LifecycleDirection::Restore) {
                 self.lifecycle_render_suppressed_roots
                     .remove(&lamp.root_surface_id);
+            }
+            if acknowledged {
+                self.lifecycle_decorations.remove(&lamp.root_surface_id);
             }
         }
         self.advance_pointer_hit_generation();
@@ -326,6 +717,7 @@ impl CompositorState {
         if !available {
             self.window_lifecycle_animator.cancel_all();
             self.lifecycle_render_suppressed_roots.clear();
+            self.lifecycle_decorations.clear();
         }
     }
 
@@ -336,6 +728,9 @@ impl CompositorState {
                 .remove(&root_surface_id);
         }
         self.window_lifecycle_animator.cancel(window_id);
+        if let Some(root_surface_id) = root_surface_id {
+            self.lifecycle_decorations.remove(&root_surface_id);
+        }
     }
 
     pub(in crate::compositor) fn lifecycle_teardown_window(&mut self, window_id: WindowId) {

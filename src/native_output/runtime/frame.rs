@@ -96,7 +96,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle = server.lifecycle_scene_sample_at(at);
         let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
         let lifecycle_decorations =
-            server.native_decoration_render_instances_for_scale(&lifecycle_surfaces, 1.0);
+            server.lifecycle_decoration_render_instances(&lifecycle, &lifecycle_surfaces);
         let canonical_surfaces = if server.lifecycle_render_suppressed_roots().is_empty() {
             canonical_surfaces
         } else {

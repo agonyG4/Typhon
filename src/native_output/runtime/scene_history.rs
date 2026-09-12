@@ -1,6 +1,6 @@
 use super::*;
 use oblivion_one::compositor::PresentationFrameSnapshot;
-use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, lamp_footprint};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeFrameSceneSnapshot {
@@ -258,25 +258,12 @@ fn lifecycle_damage_rects(
         .lamps
         .iter()
         .filter_map(|lamp| {
-            let left = lamp
-                .source_rect
-                .x()
-                .min(lamp.full_window_rect.x())
-                .min(lamp.anchor_rect.x());
-            let top = lamp
-                .source_rect
-                .y()
-                .min(lamp.full_window_rect.y())
-                .min(lamp.anchor_rect.y());
-            let right = (lamp.source_rect.x() + lamp.source_rect.width())
-                .max(lamp.full_window_rect.x() + lamp.full_window_rect.width())
-                .max(lamp.anchor_rect.x() + lamp.anchor_rect.width());
-            let bottom = (lamp.source_rect.y() + lamp.source_rect.height())
-                .max(lamp.full_window_rect.y() + lamp.full_window_rect.height())
-                .max(lamp.anchor_rect.y() + lamp.anchor_rect.height());
-            if ![left, top, right, bottom].into_iter().all(f64::is_finite) {
-                return None;
-            }
+            let footprint =
+                lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect)?;
+            let left = footprint.x();
+            let top = footprint.y();
+            let right = footprint.x() + footprint.width();
+            let bottom = footprint.y() + footprint.height();
             NativeDamageRect {
                 x: left.floor() as i32,
                 y: top.floor() as i32,

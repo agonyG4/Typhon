@@ -566,6 +566,7 @@ impl NativeEglGbmScanout {
         let draw_us = elapsed_micros(draw_start);
         let EglFrameOutcome::Rendered {
             commit: scene_commit,
+            lifecycle_evidence,
             ..
         } = outcome
         else {
@@ -618,16 +619,22 @@ impl NativeEglGbmScanout {
         let fb_id = self.framebuffer_cache.fb_id_for(fd, &bo)?;
         self.buffers
             .set_ready(NativePresentedGbmBuffer { _bo: bo, fb_id });
-        Ok(NativePaintOutcome::Rendered(native_egl_gbm_paint_stats(
-            self.format as u32,
-            self.width,
-            self.height,
-            draw_us,
-            swap_us,
-            elapsed_micros(total_start),
-            scene_stats,
-            swap_with_damage_used,
-        )))
+        Ok(NativePaintOutcome::Rendered {
+            stats: native_egl_gbm_paint_stats(
+                self.format as u32,
+                self.width,
+                self.height,
+                draw_us,
+                swap_us,
+                elapsed_micros(total_start),
+                scene_stats,
+                swap_with_damage_used,
+            ),
+            lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::qualified_from_sample(
+                &resolved_scene.lifecycle,
+                &lifecycle_evidence,
+            ),
+        })
     }
 
     pub(crate) fn fb_id(&self) -> u32 {

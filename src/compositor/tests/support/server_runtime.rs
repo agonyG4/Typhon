@@ -377,6 +377,10 @@ pub(in crate::compositor::tests) struct LifecycleEffectPathSnapshot {
     pub raw_lamp_surface_ids: Vec<u32>,
     pub presentation_effect_instance_count: usize,
     pub lifecycle_resolved_effect_instance_count: usize,
+    pub canonical_surface_count: usize,
+    pub retained_surface_count: usize,
+    pub lifecycle_transition_count: usize,
+    pub restore_suppression_active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,6 +633,27 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .iter()
                             .map(|surface| surface.surface_id)
                             .collect::<Vec<_>>();
+                        let (canonical_surface_count, retained_surface_count) = lifecycle
+                            .lamps
+                            .first()
+                            .and_then(|lamp| server.state.window(lamp.window_id))
+                            .map(|window| {
+                                (
+                                    server
+                                        .state
+                                        .renderable_surfaces
+                                        .iter()
+                                        .filter(|surface| {
+                                            server
+                                                .state
+                                                .root_surface_id_for_surface(surface.surface_id)
+                                                == window.root_surface_id
+                                        })
+                                        .count(),
+                                    window.state.minimized_surfaces().len(),
+                                )
+                            })
+                            .unwrap_or_default();
                         let _ = reply.send(LifecycleEffectPathSnapshot {
                             raw_lamp_surface_ids: lifecycle_surface_ids.clone(),
                             lifecycle_surface_ids,
@@ -640,6 +665,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .first()
                                 .and_then(|lamp| lifecycle.visual_source_for_window(lamp.window_id))
                                 .map_or(0, |source| source.effect_scene.instances.len()),
+                            canonical_surface_count,
+                            retained_surface_count,
+                            lifecycle_transition_count: server
+                                .state
+                                .window_lifecycle_animator
+                                .active_count(),
+                            restore_suppression_active: !server
+                                .state
+                                .lifecycle_render_suppressed_roots()
+                                .is_empty(),
                         });
                     }
                     ServerCommand::ReplaceBlurPolicyConfig { config, reply } => {

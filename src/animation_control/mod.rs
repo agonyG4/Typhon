@@ -15,6 +15,16 @@ pub use snapshot::{
     AnimationCatalogSnapshot, AnimationConfigurationSnapshot, AnimationControlSnapshot,
 };
 
+/// Runtime capabilities confirmed by the compositor renderer boundary.
+///
+/// This intentionally contains no renderer objects or GL state. A missing
+/// confirmation is represented by `false`, so an animation cannot start on an
+/// optimistic capability assumption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnimationRuntimeCapabilities {
+    pub lamp_renderer: bool,
+}
+
 use crate::presentation_animation::{AnimationCurve, SpringSpec};
 use crate::presentation_animation_policy::{
     PresentationAnimationKind, PresentationAnimationPolicy, PresentationAnimationStyle,
@@ -99,7 +109,11 @@ impl AnimationControlState {
         self.configuration.enabled
     }
 
-    pub fn effective_effect(&self, slot: AnimationSlot) -> AnimationEffect {
+    pub fn effective_effect(
+        &self,
+        slot: AnimationSlot,
+        runtime_capabilities: AnimationRuntimeCapabilities,
+    ) -> AnimationEffect {
         let mut requested = self.configuration.requested_effect(slot).0;
         if !self.configuration.overrides.contains_key(&slot)
             && let (Some(style), Some(_)) = (self.legacy_style, slot.geometry_kind())
@@ -109,12 +123,17 @@ impl AnimationControlState {
                 PresentationAnimationStyle::Kde => AnimationEffect::GeometryKde,
             };
         }
-        effect_for_request(slot, requested, self.configuration.enabled)
+        effect_for_request(
+            slot,
+            requested,
+            self.configuration.enabled,
+            runtime_capabilities,
+        )
     }
 
     pub fn curve_for(&self, kind: PresentationAnimationKind) -> Option<AnimationCurve> {
         let slot = AnimationSlot::from_geometry_kind(kind);
-        match self.effective_effect(slot) {
+        match self.effective_effect(slot, AnimationRuntimeCapabilities::default()) {
             AnimationEffect::GeometryKde => Some(scale_curve(
                 PresentationAnimationPolicy::kde().curve_for(kind),
                 self.configuration.speed,
@@ -127,7 +146,10 @@ impl AnimationControlState {
         }
     }
 
-    pub fn snapshot(&self) -> AnimationControlSnapshot {
+    pub fn snapshot(
+        &self,
+        runtime_capabilities: AnimationRuntimeCapabilities,
+    ) -> AnimationControlSnapshot {
         let mut requested = BTreeMap::new();
         let mut effective = BTreeMap::new();
         for slot in AnimationSlot::ALL {
@@ -137,7 +159,9 @@ impl AnimationControlState {
             );
             effective.insert(
                 slot.id().to_string(),
-                self.effective_effect(slot).id().to_string(),
+                self.effective_effect(slot, runtime_capabilities)
+                    .id()
+                    .to_string(),
             );
         }
         AnimationControlSnapshot {
@@ -147,16 +171,20 @@ impl AnimationControlState {
             config: (&self.configuration).into(),
             effective,
             requested,
-            catalog: AnimationCatalogSnapshot::default(),
+            catalog: AnimationCatalogSnapshot::for_runtime_capabilities(runtime_capabilities),
         }
     }
 
     pub fn set_configuration(
         &mut self,
         candidate: AnimationConfiguration,
+        runtime_capabilities: AnimationRuntimeCapabilities,
     ) -> Result<AnimationControlSnapshot, AnimationPersistenceError> {
         candidate
             .validate()
+            .map_err(|_| AnimationPersistenceError::Invalid)?;
+        candidate
+            .validate_runtime_mutation(&self.configuration, runtime_capabilities)
             .map_err(|_| AnimationPersistenceError::Invalid)?;
         self.store.write(&candidate)?;
         self.configuration = candidate;
@@ -164,7 +192,7 @@ impl AnimationControlState {
         self.startup_override = false;
         self.legacy_style = None;
         self.generation = self.generation.saturating_add(1);
-        Ok(self.snapshot())
+        Ok(self.snapshot(runtime_capabilities))
     }
 }
 
@@ -252,16 +280,92 @@ mod tests {
         let store =
             AnimationConfigurationStore::unavailable(AnimationPersistenceError::WriteFailed);
         let mut state = AnimationControlState::from_store(store);
-        let before = state.snapshot();
+        let before = state.snapshot(AnimationRuntimeCapabilities::default());
         let candidate = AnimationConfiguration {
             preset: AnimationPreset::Macos,
             ..AnimationConfiguration::default()
         };
         assert_eq!(
-            state.set_configuration(candidate),
+            state.set_configuration(candidate, AnimationRuntimeCapabilities::default()),
             Err(AnimationPersistenceError::WriteFailed)
         );
-        assert_eq!(state.snapshot(), before);
+        assert_eq!(
+            state.snapshot(AnimationRuntimeCapabilities::default()),
+            before
+        );
+    }
+
+    #[test]
+    fn snapshots_project_runtime_lamp_truth_without_rewriting_requested_intent() {
+        let directory = temp_directory();
+        let state = AnimationControlState::from_store(
+            AnimationConfigurationStore::new(directory.clone()).unwrap(),
+        );
+        let available = state.snapshot(AnimationRuntimeCapabilities {
+            lamp_renderer: true,
+        });
+        assert_eq!(available.requested["window.minimize"], "minimize.lamp");
+        assert_eq!(available.effective["window.minimize"], "minimize.lamp");
+        assert_eq!(
+            available
+                .catalog
+                .effects
+                .iter()
+                .find(|effect| effect.id == "minimize.lamp")
+                .unwrap()
+                .availability,
+            "available"
+        );
+
+        let unavailable = state.snapshot(AnimationRuntimeCapabilities::default());
+        assert_eq!(unavailable.requested["window.minimize"], "minimize.lamp");
+        assert_eq!(unavailable.effective["window.minimize"], "none");
+        assert_eq!(
+            unavailable
+                .catalog
+                .effects
+                .iter()
+                .find(|effect| effect.id == "minimize.lamp")
+                .unwrap()
+                .availability,
+            "unavailable"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn existing_lamp_override_survives_capability_loss_for_unrelated_mutations() {
+        let directory = temp_directory();
+        let mut state = AnimationControlState::from_store(
+            AnimationConfigurationStore::new(directory.clone()).unwrap(),
+        );
+        let mut lamp = AnimationConfiguration::default();
+        lamp.overrides
+            .insert(AnimationSlot::WindowMinimize, AnimationEffect::MinimizeLamp);
+        state
+            .set_configuration(
+                lamp.clone(),
+                AnimationRuntimeCapabilities {
+                    lamp_renderer: true,
+                },
+            )
+            .unwrap();
+        let mut speed = lamp.clone();
+        speed.speed = 1.25;
+        let snapshot = state
+            .set_configuration(speed, AnimationRuntimeCapabilities::default())
+            .unwrap();
+        assert_eq!(snapshot.requested["window.minimize"], "minimize.lamp");
+        assert_eq!(snapshot.effective["window.minimize"], "none");
+
+        let mut removed = lamp;
+        removed.overrides.clear();
+        assert!(
+            state
+                .set_configuration(removed, AnimationRuntimeCapabilities::default())
+                .is_ok()
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

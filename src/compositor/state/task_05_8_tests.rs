@@ -38,7 +38,12 @@ mod task_05_8_tests {
         );
         state
             .animation_control
-            .set_configuration(configuration)
+            .set_configuration(
+                configuration,
+                crate::animation_control::AnimationRuntimeCapabilities {
+                    lamp_renderer: true,
+                },
+            )
             .expect("animation test configuration");
         let _ = fs::remove_dir_all(directory);
         state.presentation_animator.set_enabled(true);

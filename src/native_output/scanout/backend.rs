@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativePresentResult {
@@ -103,22 +104,25 @@ pub(crate) struct NativePaintStats {
     pub(crate) swap_with_damage_used: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum NativePaintOutcome {
     Skipped(NativePaintStats),
-    Rendered(NativePaintStats),
+    Rendered {
+        stats: NativePaintStats,
+        lifecycle: LifecycleFrameSnapshot,
+    },
 }
 
 impl NativePaintOutcome {
-    pub(crate) const fn stats(self) -> NativePaintStats {
+    pub(crate) const fn stats(&self) -> NativePaintStats {
         match self {
-            Self::Skipped(stats) | Self::Rendered(stats) => stats,
+            Self::Skipped(stats) | Self::Rendered { stats, .. } => *stats,
         }
     }
 
     pub(crate) fn require_rendered(self, context: &str) -> io::Result<NativePaintStats> {
         match self {
-            Self::Rendered(stats) => Ok(stats),
+            Self::Rendered { stats, .. } => Ok(stats),
             Self::Skipped(_) => Err(io::Error::other(format!(
                 "{context} unexpectedly produced no rendered frame"
             ))),

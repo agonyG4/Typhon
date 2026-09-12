@@ -1174,9 +1174,7 @@ impl NativeRuntime {
                 .map(|source_key| {
                     (
                         source_key.surface_id,
-                        oblivion_one::compositor::SurfaceCommitSequence(
-                            source_key.commit_sequence,
-                        ),
+                        oblivion_one::compositor::SurfaceCommitSequence(source_key.commit_sequence),
                     )
                 });
             let exact_cursor_commit = software_cursor_commit.or(hardware_cursor_commit);
@@ -1213,72 +1211,81 @@ impl NativeRuntime {
                     .into());
                 }
             };
-            let stats = parts.paint_stats(
-                explicit.format_modifier.fourcc,
-                target.width,
-                target.height,
-            );
+            let stats =
+                parts.paint_stats(explicit.format_modifier.fourcc, target.width, target.height);
+            let lifecycle =
+                oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::qualified_from_sample(
+                    &initial_resolved_scene.lifecycle,
+                    &parts.lifecycle_evidence,
+                );
             initial_atomic_parts = Some(parts);
-            NativePaintOutcome::Rendered(stats)
+            NativePaintOutcome::Rendered { stats, lifecycle }
         } else {
             match scanout.paint_server_frame(
-        &mut frame_renderer,
-        &initial_resolved_scene,
-        &server,
-        &input_state,
-        cursor_render_mode,
-        &initial_damage,
-    ) {
-        Ok(paint) => paint,
-        Err(error)
-            if scanout.kind() == NativeScanoutKind::NativeEglGbmOpaqueCompatibility
-                && scanout_preference
-                    != NativeScanoutPreference::NativeEglGbmOpaqueCompatibility
-                && app_gpu_preference != CompositorAppGpuPreference::Accelerated =>
-        {
-            let fallback_plan = scanout_plan.after_failed(scanout.kind());
-            if fallback_plan.primary == NativeScanoutKind::Unavailable {
-                return Err(error.into());
-            }
-            eprintln!(
-                "native scanout: initial native EGL/GBM paint failed: {error}; trying {} fallback",
-                fallback_plan.primary.as_str()
-            );
-            perf.log("native.backend_fallback", || {
-                vec![
-                    NativePerfField::str(
-                        "failed",
-                        NativeScanoutKind::NativeEglGbmOpaqueCompatibility.as_str(),
-                    ),
-                    NativePerfField::str("fallback", fallback_plan.primary.as_str()),
-                    NativePerfField::str("error", error.to_string()),
-                ]
-            });
-            drop(scanout);
-            scanout = NativeScanoutBackend::open(
-                fallback_plan,
-                kms.file(),
-                target.width,
-                target.height,
-                drm_file_generation,
-            )?;
-            server.set_lifecycle_animation_renderer_available(
-                scanout.lifecycle_animation_available(),
-            );
-            scanout.paint_server_frame(
                 &mut frame_renderer,
                 &initial_resolved_scene,
                 &server,
                 &input_state,
                 cursor_render_mode,
                 &initial_damage,
-            )?
-        }
+            ) {
+                Ok(paint) => paint,
+                Err(error)
+                    if scanout.kind() == NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+                        && scanout_preference
+                            != NativeScanoutPreference::NativeEglGbmOpaqueCompatibility
+                        && app_gpu_preference != CompositorAppGpuPreference::Accelerated =>
+                {
+                    let fallback_plan = scanout_plan.after_failed(scanout.kind());
+                    if fallback_plan.primary == NativeScanoutKind::Unavailable {
+                        return Err(error.into());
+                    }
+                    eprintln!(
+                        "native scanout: initial native EGL/GBM paint failed: {error}; trying {} fallback",
+                        fallback_plan.primary.as_str()
+                    );
+                    perf.log("native.backend_fallback", || {
+                        vec![
+                            NativePerfField::str(
+                                "failed",
+                                NativeScanoutKind::NativeEglGbmOpaqueCompatibility.as_str(),
+                            ),
+                            NativePerfField::str("fallback", fallback_plan.primary.as_str()),
+                            NativePerfField::str("error", error.to_string()),
+                        ]
+                    });
+                    drop(scanout);
+                    scanout = NativeScanoutBackend::open(
+                        fallback_plan,
+                        kms.file(),
+                        target.width,
+                        target.height,
+                        drm_file_generation,
+                    )?;
+                    server.set_lifecycle_animation_renderer_available(
+                        scanout.lifecycle_animation_available(),
+                    );
+                    scanout.paint_server_frame(
+                        &mut frame_renderer,
+                        &initial_resolved_scene,
+                        &server,
+                        &input_state,
+                        cursor_render_mode,
+                        &initial_damage,
+                    )?
+                }
                 Err(error) => return Err(error.into()),
             }
-        }
-    .require_rendered("initial native scanout")?;
-        #[rustfmt::skip] let initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(0, &initial_resolved_scene, NativeCursorDamageBounds::default());
+        };
+        let initial_lifecycle_snapshot = match &initial_paint {
+            NativePaintOutcome::Rendered { lifecycle, .. } => lifecycle.clone(),
+            NativePaintOutcome::Skipped(_) => {
+                return Err(io::Error::other("native initial scanout unexpectedly skipped").into());
+            }
+        };
+        let initial_paint_stats = initial_paint.require_rendered("initial native scanout")?;
+        #[rustfmt::skip] let mut initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(0, &initial_resolved_scene, NativeCursorDamageBounds::default());
+        initial_presented_scene.lifecycle = initial_lifecycle_snapshot;
         drop(initial_resolved_scene);
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =
@@ -1345,7 +1352,7 @@ impl NativeRuntime {
             ]
         });
         perf.log("native.frame", || {
-            let mut fields = initial_paint.fields();
+            let mut fields = initial_paint_stats.fields();
             fields.extend(initial_damage.fields());
             fields.extend([
                 NativePerfField::str("phase", "initial"),

@@ -1,5 +1,7 @@
 use super::hit_testing::PointerSceneHit;
 use super::*;
+use crate::animation_control::AnimationEffect;
+use crate::window_lifecycle_animation::LifecycleDirection;
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
 impl CompositorState {
@@ -1258,6 +1260,17 @@ impl CompositorState {
             self.begin_layout_reflow_batch();
         }
 
+        // Capture only the compositor-owned SSD plan while the minimized
+        // window still has its pre-focus-change visual state. Client and
+        // subsurface content remains live in the retained surface list.
+        let lifecycle_decorations = if self.lifecycle_effect(LifecycleDirection::Minimize)
+            == AnimationEffect::MinimizeLamp
+        {
+            self.native_decoration_render_instances_for_scale(&minimized_surfaces, 1.0)
+        } else {
+            Vec::new()
+        };
+
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
         }
@@ -1267,6 +1280,7 @@ impl CompositorState {
             lifecycle_source,
             lifecycle_full_window,
             lifecycle_effect_scene,
+            lifecycle_decorations,
         );
         self.refresh_active_scene_surface_order();
         self.mark_astrea_toplevel_dirty(window_id);

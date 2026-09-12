@@ -20,6 +20,7 @@ use oblivion_one::{
         self, DecorationRenderInstance, DecorationRenderPrimitive, DecorationSceneSnapshot,
         DesktopVisualState, RenderableSurface, SurfaceCommitCounter, SurfaceDamageRect,
         SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfaceResourceSyncState, VisualGroupId,
+        clipped_decoration_text_geometry,
     },
     cursor_theme::CompositorCursorImage,
     render_backend::{
@@ -27,7 +28,8 @@ use oblivion_one::{
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
     window_lifecycle_animation::{
-        LampWindowSample, LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind,
+        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
+        LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
     },
 };
 
@@ -437,6 +439,7 @@ pub(crate) enum FrameSkipReason {
     NoLogicalDamage,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EglFrameOutcome {
     Skipped {
@@ -446,6 +449,7 @@ pub(crate) enum EglFrameOutcome {
     Rendered {
         commit: EglSceneFrameCommit,
         stats: GlesSceneFrameStats,
+        lifecycle_evidence: LifecycleRenderEvidence,
     },
 }
 
@@ -570,6 +574,7 @@ pub(crate) struct GlesSceneRenderer {
     lifecycle_visual_resources: HashMap<compositor::WindowId, LifecycleResolvedVisualResource>,
     lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
     lamp_samples: Vec<LampWindowSample>,
+    lifecycle_render_evidence: LifecycleRenderEvidence,
     current_framebuffer_origin: OutputFramebufferOrigin,
     current_size: (u32, u32),
     texture_upload_rgba: Vec<u8>,
@@ -831,23 +836,13 @@ fn lifecycle_damage_for_samples(
 ) -> OutputDamage {
     let mut rects = Vec::new();
     for lamp in &lifecycle.lamps {
-        let left = lamp
-            .source_rect
-            .x()
-            .min(lamp.full_window_rect.x())
-            .min(lamp.anchor_rect.x());
-        let top = lamp
-            .source_rect
-            .y()
-            .min(lamp.full_window_rect.y())
-            .min(lamp.anchor_rect.y());
-        let right = (lamp.source_rect.x() + lamp.source_rect.width())
-            .max(lamp.full_window_rect.x() + lamp.full_window_rect.width())
-            .max(lamp.anchor_rect.x() + lamp.anchor_rect.width());
-        let bottom = (lamp.source_rect.y() + lamp.source_rect.height())
-            .max(lamp.full_window_rect.y() + lamp.full_window_rect.height())
-            .max(lamp.anchor_rect.y() + lamp.anchor_rect.height());
-        if [left, top, right, bottom].into_iter().all(f64::is_finite) {
+        if let Some(footprint) =
+            lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect)
+        {
+            let left = footprint.x();
+            let top = footprint.y();
+            let right = footprint.x() + footprint.width();
+            let bottom = footprint.y() + footprint.height();
             rects.push(OutputRect::new(
                 (left * output_scale).floor() as i32,
                 (top * output_scale).floor() as i32,
@@ -1013,6 +1008,7 @@ impl GlesSceneRenderer {
             lifecycle_visual_resources: HashMap::new(),
             lifecycle_visual_sources: HashMap::new(),
             lamp_samples: Vec::new(),
+            lifecycle_render_evidence: LifecycleRenderEvidence::default(),
             current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             cursor_image: cursor_image.clone(),
             current_size: (width, height),
@@ -1289,6 +1285,7 @@ impl GlesSceneRenderer {
         self.current_framebuffer_origin = framebuffer_origin;
         self.lamp_samples.clear();
         self.lamp_samples.extend_from_slice(&lifecycle.lamps);
+        self.lifecycle_render_evidence.consumed.clear();
         self.lifecycle_visual_sources.clear();
         self.lifecycle_visual_sources.extend(
             lifecycle
@@ -1648,6 +1645,7 @@ impl GlesSceneRenderer {
                 scene_key: candidate_scene_key,
             },
             stats: self.frame_stats,
+            lifecycle_evidence: self.lifecycle_render_evidence.clone(),
         })
     }
 
@@ -2713,15 +2711,28 @@ impl GlesSceneRenderer {
             let scale = output_scale.max(1.0) as f32;
             let (origin_x, origin_y) = decoration.origin();
             for primitive in decoration.primitives() {
-                let (rect, layer) = match primitive {
-                    DecorationRenderPrimitive::SolidRect { rect, color } => {
-                        (*rect, EglDrawLayer::SolidRgba(rgba_to_pixel(*color)))
-                    }
-                    DecorationRenderPrimitive::Image { rect, asset } => {
-                        (*rect, EglDrawLayer::DecorationAsset(asset.asset_id()))
-                    }
-                    DecorationRenderPrimitive::Text { rect, asset, .. } => {
-                        (*rect, EglDrawLayer::DecorationAsset(asset.asset_id()))
+                let (rect, uv, layer) = match primitive {
+                    DecorationRenderPrimitive::SolidRect { rect, color } => (
+                        *rect,
+                        EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                        EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
+                    ),
+                    DecorationRenderPrimitive::Image { rect, asset } => (
+                        *rect,
+                        EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                        EglDrawLayer::DecorationAsset(asset.asset_id()),
+                    ),
+                    DecorationRenderPrimitive::Text {
+                        rect, clip, asset, ..
+                    } => {
+                        let Some(crop) = clipped_decoration_text_geometry(*rect, *clip) else {
+                            continue;
+                        };
+                        (
+                            crop.rect,
+                            EglUvRect::new(crop.uv[0], crop.uv[1], crop.uv[2], crop.uv[3]),
+                            EglDrawLayer::DecorationAsset(asset.asset_id()),
+                        )
                     }
                 };
                 append_lamp_grid(
@@ -2736,7 +2747,7 @@ impl GlesSceneRenderer {
                             rect.width as f32 * scale,
                             rect.height as f32 * scale,
                         ),
-                        uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                        uv,
                     },
                 );
             }
@@ -3151,6 +3162,12 @@ impl GlesSceneRenderer {
                     command.vertex_count as i32,
                 );
             }
+            self.lifecycle_render_evidence
+                .record(LifecycleRenderEvidenceEntry {
+                    window_id: sample.window_id,
+                    root_surface_id: sample.root_surface_id,
+                    transition_id: sample.transition_id,
+                });
         }
         unsafe {
             self.gl.use_program(Some(self.program));
@@ -3813,34 +3830,20 @@ fn push_egl_decoration_text(
 ) {
     let scale = output_scale.max(1.0) as f32;
     let (origin_x, origin_y) = instance.origin();
-    let left = rect.x.max(clip.x);
-    let top = rect.y.max(clip.y);
-    let right = rect
-        .x
-        .saturating_add(rect.width as i32)
-        .min(clip.x.saturating_add(clip.width as i32));
-    let bottom = rect
-        .y
-        .saturating_add(rect.height as i32)
-        .min(clip.y.saturating_add(clip.height as i32));
-    if left >= right || top >= bottom || rect.width == 0 || rect.height == 0 {
+    let Some(crop) = clipped_decoration_text_geometry(rect, clip) else {
         return;
-    }
-    let uv = EglUvRect::new(
-        (left - rect.x) as f32 / rect.width as f32,
-        (top - rect.y) as f32 / rect.height as f32,
-        (right - rect.x) as f32 / rect.width as f32,
-        (bottom - rect.y) as f32 / rect.height as f32,
-    );
+    };
+    let crop_rect = crop.rect;
+    let uv = EglUvRect::new(crop.uv[0], crop.uv[1], crop.uv[2], crop.uv[3]);
     push_draw_command_with_uv(
         vertices,
         commands,
         EglDrawLayer::DecorationAsset(asset.asset_id()),
         EglRect::new(
-            (origin_x.saturating_add(left) as f32) * scale,
-            (origin_y.saturating_add(top) as f32) * scale,
-            (right - left) as f32 * scale,
-            (bottom - top) as f32 * scale,
+            (origin_x.saturating_add(crop_rect.x) as f32) * scale,
+            (origin_y.saturating_add(crop_rect.y) as f32) * scale,
+            crop_rect.width as f32 * scale,
+            crop_rect.height as f32 * scale,
         ),
         uv,
         SurfaceSampling::ScaledLinear,
@@ -3890,6 +3893,17 @@ where
         required,
         required_assets,
     }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn decoration_resource_keys_for_primitive_sets<'a, I>(
+    primitive_sets: I,
+) -> HashSet<DecorationResourceKey>
+where
+    I: IntoIterator<Item = &'a [DecorationRenderPrimitive]>,
+{
+    decoration_resource_requirements(primitive_sets).required
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

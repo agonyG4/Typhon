@@ -180,7 +180,8 @@ impl CompositorState {
         !self.pending_acquire_watch_changes.is_empty()
     }
 
-    pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
+    pub(in crate::compositor) fn has_unowned_frame_work(&mut self) -> bool {
+        self.settle_lifecycle_no_visual_change();
         self.has_pending_frame_prepare_work()
             || self.has_pending_interactive_visual_work()
             || self.presentation_animation_has_pending_visible()

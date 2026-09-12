@@ -1,6 +1,9 @@
 //! Validated user intent for the animation control plane.
 
-use super::catalog::{AnimationEffect, AnimationPreset, AnimationSlot};
+use super::{
+    AnimationRuntimeCapabilities,
+    catalog::{AnimationEffect, AnimationPreset, AnimationSlot},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -54,6 +57,22 @@ impl AnimationConfiguration {
             Some(effect) => (*effect, true),
             None => (self.preset.requested_effect(slot), false),
         }
+    }
+
+    pub fn validate_runtime_mutation(
+        &self,
+        current: &Self,
+        runtime_capabilities: AnimationRuntimeCapabilities,
+    ) -> Result<(), AnimationConfigurationError> {
+        for (&slot, &effect) in &self.overrides {
+            if current.overrides.get(&slot) == Some(&effect) {
+                continue;
+            }
+            if !effect.is_executable(runtime_capabilities) {
+                return Err(AnimationConfigurationError::UnavailableEffect { slot, effect });
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_overrides(&mut self) {
@@ -132,6 +151,10 @@ pub enum AnimationConfigurationError {
         slot: AnimationSlot,
         effect: AnimationEffect,
     },
+    UnavailableEffect {
+        slot: AnimationSlot,
+        effect: AnimationEffect,
+    },
     IncompatibleEffect {
         slot: AnimationSlot,
         effect: AnimationEffect,
@@ -151,6 +174,12 @@ impl std::fmt::Display for AnimationConfigurationError {
             Self::PlannedEffect { slot, effect } => write!(
                 formatter,
                 "effect {} for slot {} is planned",
+                effect.id(),
+                slot.id()
+            ),
+            Self::UnavailableEffect { slot, effect } => write!(
+                formatter,
+                "effect {} for slot {} is unavailable in this runtime",
                 effect.id(),
                 slot.id()
             ),
@@ -209,6 +238,47 @@ mod tests {
             .overrides
             .insert("window.minimize".into(), "minimize.lamp".into());
         assert!(AnimationConfiguration::from_document(document).is_ok());
+    }
+
+    #[test]
+    fn runtime_unavailable_lamp_override_is_rejected_only_when_newly_introduced() {
+        let mut current = AnimationConfiguration::default();
+        current
+            .overrides
+            .insert(AnimationSlot::WindowMinimize, AnimationEffect::MinimizeLamp);
+        let mut candidate = current.clone();
+        candidate.speed = 1.25;
+        assert!(
+            candidate
+                .validate_runtime_mutation(
+                    &current,
+                    super::super::AnimationRuntimeCapabilities::default()
+                )
+                .is_ok()
+        );
+
+        let mut new_candidate = AnimationConfiguration::default();
+        new_candidate
+            .overrides
+            .insert(AnimationSlot::WindowMinimize, AnimationEffect::MinimizeLamp);
+        assert!(matches!(
+            new_candidate.validate_runtime_mutation(
+                &AnimationConfiguration::default(),
+                super::super::AnimationRuntimeCapabilities::default(),
+            ),
+            Err(AnimationConfigurationError::UnavailableEffect { .. })
+        ));
+
+        let mut removed = current;
+        removed.overrides.clear();
+        assert!(
+            removed
+                .validate_runtime_mutation(
+                    &candidate,
+                    super::super::AnimationRuntimeCapabilities::default()
+                )
+                .is_ok()
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub(super) fn reset_after_same_buffer(
 }
 
 pub(super) fn refreshed_published_state(
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     last_rendered_scene_generation: u64,
 ) -> (u64, u64, bool, bool) {
     let scene_generation = server.scene_render_generation();

@@ -288,6 +288,7 @@ pub use crate::presentation_animation_policy::{
     PresentationAnimationKind, PresentationAnimationPolicy, PresentationAnimationStyle,
     presentation_animation_style_from_env,
 };
+pub use decoration::render_plan::clipped_decoration_text_geometry;
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -648,6 +649,7 @@ pub struct CompositorState {
     window_lifecycle_animator: crate::window_lifecycle_animation::WindowLifecycleAnimator,
     lifecycle_animation_renderer_available: Option<bool>,
     lifecycle_render_suppressed_roots: HashSet<u32>,
+    lifecycle_decorations: HashMap<u32, crate::compositor::DecorationRenderInstance>,
     presented_lifecycle: crate::window_lifecycle_animation::LifecycleFrameSnapshot,
     presented_lifecycle_frame_id: u64,
     presented_presentation: PresentationFrameSnapshot,

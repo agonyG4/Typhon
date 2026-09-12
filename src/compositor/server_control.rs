@@ -11,7 +11,8 @@ impl crate::compositor::CompositorState {
     pub(crate) fn animation_control_snapshot(
         &self,
     ) -> crate::animation_control::AnimationControlSnapshot {
-        self.animation_control.snapshot()
+        self.animation_control
+            .snapshot(self.animation_runtime_capabilities())
     }
 
     pub(crate) fn set_animation_configuration(
@@ -22,7 +23,9 @@ impl crate::compositor::CompositorState {
         crate::animation_control::AnimationPersistenceError,
     > {
         let enabled = configuration.enabled;
-        let snapshot = self.animation_control.set_configuration(configuration)?;
+        let snapshot = self
+            .animation_control
+            .set_configuration(configuration, self.animation_runtime_capabilities())?;
         self.presentation_animator.set_enabled(enabled);
         self.set_lifecycle_animation_enabled(enabled);
         Ok(snapshot)

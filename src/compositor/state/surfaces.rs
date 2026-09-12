@@ -993,6 +993,7 @@ impl CompositorState {
         self.send_output_mode_to_bound_outputs();
         self.reconfigure_layer_surfaces_for_output_change();
         let _ = self.reflow_usable_output_geometry();
+        self.settle_lifecycle_no_visual_change();
         true
     }
 

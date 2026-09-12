@@ -129,6 +129,27 @@ impl AnimationEffect {
         }
     }
 
+    pub const fn availability_for_runtime(
+        self,
+        runtime_capabilities: super::AnimationRuntimeCapabilities,
+    ) -> &'static str {
+        if !self.is_available() {
+            return "planned";
+        }
+        if matches!(self, Self::MinimizeLamp) && !runtime_capabilities.lamp_renderer {
+            return "unavailable";
+        }
+        "available"
+    }
+
+    pub const fn is_executable(
+        self,
+        runtime_capabilities: super::AnimationRuntimeCapabilities,
+    ) -> bool {
+        self.is_available()
+            && (!matches!(self, Self::MinimizeLamp) || runtime_capabilities.lamp_renderer)
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|effect| effect.id() == value)
     }
@@ -206,8 +227,9 @@ pub const fn effect_for_request(
     slot: AnimationSlot,
     requested: AnimationEffect,
     enabled: bool,
+    runtime_capabilities: super::AnimationRuntimeCapabilities,
 ) -> AnimationEffect {
-    if enabled && requested.is_available() && requested.compatible_with(slot) {
+    if enabled && requested.is_executable(runtime_capabilities) && requested.compatible_with(slot) {
         requested
     } else {
         AnimationEffect::None
@@ -231,14 +253,37 @@ mod tests {
 
     #[test]
     fn astrea_resolves_lamp_for_minimize_and_restore() {
+        let capabilities = super::super::AnimationRuntimeCapabilities {
+            lamp_renderer: true,
+        };
         for slot in [AnimationSlot::WindowMinimize, AnimationSlot::WindowRestore] {
             let requested = AnimationPreset::Astrea.requested_effect(slot);
             assert_eq!(requested, AnimationEffect::MinimizeLamp);
             assert_eq!(
-                effect_for_request(slot, requested, true),
+                effect_for_request(slot, requested, true, capabilities),
                 AnimationEffect::MinimizeLamp
             );
         }
+    }
+
+    #[test]
+    fn lamp_runtime_capability_controls_effective_resolution_without_changing_intent() {
+        let requested = AnimationEffect::MinimizeLamp;
+        let unavailable = super::super::AnimationRuntimeCapabilities::default();
+        assert_eq!(
+            effect_for_request(AnimationSlot::WindowMinimize, requested, true, unavailable),
+            AnimationEffect::None
+        );
+        assert_eq!(
+            requested.availability_for_runtime(unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            requested.availability_for_runtime(super::super::AnimationRuntimeCapabilities {
+                lamp_renderer: true,
+            }),
+            "available"
+        );
     }
 
     #[test]

@@ -32,6 +32,43 @@ pub enum DecorationRenderPrimitive {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecorationTextCrop {
+    pub rect: DecorationRect,
+    pub uv: [f32; 4],
+}
+
+/// Crop a title asset to its safe-area clip while preserving the source UV.
+/// Both ordinary EGL decoration rendering and Lamp mesh construction use this
+/// helper so their text geometry cannot diverge.
+pub fn clipped_decoration_text_geometry(
+    rect: DecorationRect,
+    clip: DecorationRect,
+) -> Option<DecorationTextCrop> {
+    let left = rect.x.max(clip.x);
+    let top = rect.y.max(clip.y);
+    let right = rect
+        .x
+        .saturating_add(rect.width as i32)
+        .min(clip.x.saturating_add(clip.width as i32));
+    let bottom = rect
+        .y
+        .saturating_add(rect.height as i32)
+        .min(clip.y.saturating_add(clip.height as i32));
+    if left >= right || top >= bottom || rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    Some(DecorationTextCrop {
+        rect: DecorationRect::new(left, top, (right - left) as u32, (bottom - top) as u32),
+        uv: [
+            (left - rect.x) as f32 / rect.width as f32,
+            (top - rect.y) as f32 / rect.height as f32,
+            (right - rect.x) as f32 / rect.width as f32,
+            (bottom - rect.y) as f32 / rect.height as f32,
+        ],
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecorationRenderPlan {
     pub layout: DecorationLayout,
@@ -105,6 +142,33 @@ fn hash_layout(hash: &mut u64, layout: &DecorationLayout) {
         layout.extents.left,
     ] {
         hash_u32(hash, extent);
+    }
+}
+
+#[cfg(test)]
+mod text_crop_tests {
+    use super::{DecorationRect, clipped_decoration_text_geometry};
+
+    #[test]
+    fn text_crop_preserves_left_and_right_uvs() {
+        let crop = clipped_decoration_text_geometry(
+            DecorationRect::new(0, 0, 100, 20),
+            DecorationRect::new(20, 0, 60, 20),
+        )
+        .expect("overlapping text clip");
+        assert_eq!(crop.rect, DecorationRect::new(20, 0, 60, 20));
+        assert_eq!(crop.uv, [0.2, 0.0, 0.8, 1.0]);
+    }
+
+    #[test]
+    fn text_crop_returns_none_when_fully_outside() {
+        assert!(
+            clipped_decoration_text_geometry(
+                DecorationRect::new(0, 0, 10, 10),
+                DecorationRect::new(20, 20, 10, 10),
+            )
+            .is_none()
+        );
     }
 }
 
