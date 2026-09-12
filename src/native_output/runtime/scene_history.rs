@@ -341,6 +341,7 @@ mod tests {
                 mathematically_settled: progress >= 1.0,
                 direction: LifecycleDirection::Minimize,
             }],
+            visual_sources: Vec::new(),
         })
     }
 

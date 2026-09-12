@@ -1202,6 +1202,13 @@ impl CompositorState {
         };
         let lifecycle_source = self.lifecycle_minimize_source_rect(root_surface_id);
         let lifecycle_full_window = self.lifecycle_window_rect(root_surface_id);
+        let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
+        let lifecycle_effect_scene = match (lifecycle_source, lifecycle_full_window) {
+            (Some(source), Some(full_window)) => {
+                Self::map_effect_scene_to_presentation(&lifecycle_effect_scene, full_window, source)
+            }
+            _ => lifecycle_effect_scene,
+        };
         let scene_effect = self.window_is_visible_in_active_scene(window_id);
         let tiled_location = self
             .window(window_id)
@@ -1259,6 +1266,7 @@ impl CompositorState {
             root_surface_id,
             lifecycle_source,
             lifecycle_full_window,
+            lifecycle_effect_scene,
         );
         self.refresh_active_scene_surface_order();
         self.mark_astrea_toplevel_dirty(window_id);
@@ -1356,7 +1364,8 @@ impl CompositorState {
         if layout_batch {
             let _ = self.finish_layout_reflow_batch();
         }
-        self.begin_lifecycle_restore(window_id, root_surface_id);
+        let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
+        self.begin_lifecycle_restore(window_id, root_surface_id, lifecycle_effect_scene);
         true
     }
 

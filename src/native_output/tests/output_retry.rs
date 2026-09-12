@@ -1,6 +1,7 @@
 use super::output::test_renderable_surface;
 use super::*;
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
 fn contains(rect: NativeDamageRect, x: i32, y: i32) -> bool {
     x >= rect.x
@@ -25,6 +26,7 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         frame_id: 2,
@@ -32,6 +34,7 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(200));
     assert!(history.discard_submission(200));

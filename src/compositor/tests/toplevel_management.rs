@@ -3,8 +3,9 @@ use super::support::frame_buffer_client::create_test_buffered_toplevel;
 use super::support::locked_relative::{runtime_socket_path, unique_socket_name};
 use super::support::registry_state::RegistryTestState;
 use super::support::server_runtime::{
-    ServerCommand, capture_minimize_anchor, create_test_shm_file, spawn_controllable_test_server,
-    spawn_test_server, stop_controllable_test_server, stop_test_server,
+    ServerCommand, capture_lifecycle_effect_path, capture_minimize_anchor,
+    capture_resolved_effect_scene, create_test_shm_file, spawn_controllable_test_server,
+    spawn_test_server, stop_controllable_test_server, stop_test_server, wait_for_server_commands,
 };
 use super::support::window_ops::create_buffered_toplevel_then_window_commands;
 use crate::astrea_shell_auth::client::astrea_shell_auth_manager_v1 as client_astrea_shell_auth_manager_v1;
@@ -24,6 +25,7 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::{wl_compositor as client_wl_compositor, wl_shm as client_wl_shm};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, globals::registry_queue_init};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1 as client_ext_background_effect_manager_v1;
 use wayland_protocols::xdg::shell::client::xdg_wm_base as client_xdg_wm_base;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 
@@ -796,6 +798,77 @@ fn authorized_v3_client_sets_and_clears_global_minimize_anchor() {
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(capture_minimize_anchor(&commands, window_id), None);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn lifecycle_effect_path_preserves_resolved_background_appearance() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let background_manager: client_ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 80, 60).unwrap();
+    let effect = background_manager.get_background_effect(&surface, &qh, ());
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 80, 60);
+    effect.set_blur_region(Some(&region));
+    region.destroy();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    wait_for_server_commands(&commands);
+
+    assert_eq!(capture_resolved_effect_scene(&commands).instances.len(), 1);
+
+    let anchor_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (anchor_globals, mut anchor_queue) =
+        registry_queue_init::<ToplevelClientState>(&anchor_connection).unwrap();
+    let anchor_qh = anchor_queue.handle();
+    let mut anchor_state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &anchor_connection,
+        &anchor_globals,
+        &anchor_qh,
+        &mut anchor_queue,
+        &mut anchor_state,
+    );
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        anchor_globals.bind(&anchor_qh, 3..=3, ()).unwrap();
+    anchor_connection.flush().unwrap();
+    anchor_queue.roundtrip(&mut anchor_state).unwrap();
+    assert_eq!(anchor_state.handles.len(), 1);
+    anchor_state.handles[0].set_minimize_anchor(1200, 800, 48, 48);
+    anchor_connection.flush().unwrap();
+    anchor_queue.roundtrip(&mut anchor_state).unwrap();
+
+    commands.send(ServerCommand::MinimizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+
+    let lifecycle_path = capture_lifecycle_effect_path(&commands);
+    assert_eq!(lifecycle_path.lifecycle_surface_ids, vec![1]);
+    assert_eq!(lifecycle_path.raw_lamp_surface_ids, vec![1]);
+    assert_eq!(
+        lifecycle_path.presentation_effect_instance_count, 0,
+        "the canonical presentation effect scene must stay suppressed while Lamp owns the root"
+    );
+    assert_eq!(
+        lifecycle_path.lifecycle_resolved_effect_instance_count, 1,
+        "Lamp must receive the resolved effect source instead of raw surfaces only"
+    );
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }

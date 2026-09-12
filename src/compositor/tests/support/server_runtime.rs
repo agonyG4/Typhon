@@ -157,6 +157,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
+    CaptureLifecycleEffectPath(Sender<LifecycleEffectPathSnapshot>),
     ReplaceBlurPolicyConfig {
         config: crate::blur_policy::BlurPolicyConfig,
         reply: Sender<bool>,
@@ -368,6 +369,14 @@ pub(in crate::compositor::tests) enum ServerCommand {
     PresentFrame,
     MarkRenderDamagePresented,
     Stop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct LifecycleEffectPathSnapshot {
+    pub lifecycle_surface_ids: Vec<u32>,
+    pub raw_lamp_surface_ids: Vec<u32>,
+    pub presentation_effect_instance_count: usize,
+    pub lifecycle_resolved_effect_instance_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +612,35 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
+                    }
+                    ServerCommand::CaptureLifecycleEffectPath(reply) => {
+                        let at =
+                            AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+                        let canonical_surfaces = server.native_frame_renderable_surfaces();
+                        let targets =
+                            server.native_frame_presentation_targets(canonical_surfaces.as_ref());
+                        let presentation =
+                            server.presentation_scene_sample_for_targets_at(at, &targets);
+                        let presentation_effects =
+                            server.resolved_effect_scene_for_presentation(&presentation);
+                        let lifecycle = server.lifecycle_scene_sample_at(at);
+                        let lifecycle_surfaces = server.lifecycle_renderable_surfaces(&lifecycle);
+                        let lifecycle_surface_ids = lifecycle_surfaces
+                            .iter()
+                            .map(|surface| surface.surface_id)
+                            .collect::<Vec<_>>();
+                        let _ = reply.send(LifecycleEffectPathSnapshot {
+                            raw_lamp_surface_ids: lifecycle_surface_ids.clone(),
+                            lifecycle_surface_ids,
+                            presentation_effect_instance_count: presentation_effects
+                                .instances
+                                .len(),
+                            lifecycle_resolved_effect_instance_count: lifecycle
+                                .lamps
+                                .first()
+                                .and_then(|lamp| lifecycle.visual_source_for_window(lamp.window_id))
+                                .map_or(0, |source| source.effect_scene.instances.len()),
+                        });
                     }
                     ServerCommand::ReplaceBlurPolicyConfig { config, reply } => {
                         let changed = server.state.blur_assignment.replace_config(config).is_ok();
@@ -1925,6 +1963,18 @@ pub(in crate::compositor::tests) fn capture_resolved_effect_scene(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report resolved effect scene")
+}
+
+pub(in crate::compositor::tests) fn capture_lifecycle_effect_path(
+    commands: &Sender<ServerCommand>,
+) -> LifecycleEffectPathSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLifecycleEffectPath(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report lifecycle effect path")
 }
 
 pub(in crate::compositor::tests) fn replace_blur_policy_config(

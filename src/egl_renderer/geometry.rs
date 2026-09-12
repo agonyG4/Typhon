@@ -428,6 +428,7 @@ pub(super) enum EglDrawLayer {
     SolidRgba(u32),
     DecorationAsset(u64),
     Surface(u32),
+    LifecycleResolvedVisual(oblivion_one::compositor::WindowId),
     Cursor,
 }
 
@@ -451,8 +452,8 @@ pub(super) struct EglDrawCommand {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EglTexturedVertex {
-    position: [f32; 2],
-    uv: [f32; 2],
+    pub(super) position: [f32; 2],
+    pub(super) uv: [f32; 2],
 }
 
 unsafe impl bytemuck::Zeroable for EglTexturedVertex {}

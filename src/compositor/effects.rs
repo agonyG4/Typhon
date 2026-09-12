@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::presentation_animation::{
-    PresentationGroupTransform, PresentationRect, PresentationSceneSample,
-};
+use crate::presentation_animation::{PresentationRect, PresentationSceneSample};
 
 use crate::effects::{
     EffectFrameDemand, EffectInstanceId, EffectParameterBlock, EffectParameterDefinition,
@@ -862,7 +860,10 @@ fn effect_semantic_sort_key(instance: &ResolvedEffectInstance) -> (EffectSceneOr
     (instance.scene_order, instance.id.get())
 }
 
-fn map_effect_rect(transform: PresentationGroupTransform, rect: EffectRect) -> Option<EffectRect> {
+pub(in crate::compositor) fn map_effect_rect(
+    transform: crate::presentation_animation::PresentationGroupTransform,
+    rect: EffectRect,
+) -> Option<EffectRect> {
     let canonical = PresentationRect::new(
         f64::from(rect.x),
         f64::from(rect.y),
@@ -886,8 +887,8 @@ fn map_effect_rect(transform: PresentationGroupTransform, rect: EffectRect) -> O
     EffectRect::new(left, top, width, height)
 }
 
-fn map_effect_region(
-    transform: PresentationGroupTransform,
+pub(in crate::compositor) fn map_effect_region(
+    transform: crate::presentation_animation::PresentationGroupTransform,
     region: &EffectRegion,
     fallback_bounds: EffectRect,
 ) -> EffectRegion {
@@ -1116,6 +1117,7 @@ mod tests {
     use crate::effects::{
         EffectInstanceId, EffectParameterBlock, EffectProgramId, EffectRect, EffectRegion,
     };
+    use crate::presentation_animation::PresentationGroupTransform;
 
     fn test_effect_instance(
         id: EffectInstanceId,

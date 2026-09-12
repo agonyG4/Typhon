@@ -7,6 +7,8 @@ use oblivion_one::compositor::{
     AnimationTime, FullscreenRenderPlanMetrics, PresentationSceneSample, ResolvedEffectScene,
 };
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::LifecycleSceneSample;
 use std::borrow::Cow;
 
 #[test]
@@ -62,6 +64,14 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             sampled_windows: 0,
         },
         presentation_snapshot: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            lamps: Vec::new(),
+            visual_sources: Vec::new(),
+        },
+        lifecycle_surfaces: Vec::new(),
+        lifecycle_decorations: Vec::new(),
+        lifecycle_snapshot: LifecycleFrameSnapshot::default(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
         1,
@@ -116,6 +126,14 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         effects: ResolvedEffectScene::default(),
         presentation: PresentationSceneSample::empty(AnimationTime::from_nanos(7)),
         presentation_snapshot: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(7),
+            lamps: Vec::new(),
+            visual_sources: Vec::new(),
+        },
+        lifecycle_surfaces: Vec::new(),
+        lifecycle_decorations: Vec::new(),
+        lifecycle_snapshot: LifecycleFrameSnapshot::default(),
     };
     let frozen = resolved_scene.into_owned();
     assert_eq!(
@@ -271,6 +289,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
             scene: normal.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         });
         for frame_id in 1..=20_u64 {
             let scene = fullscreen_scene(frame_id);
@@ -280,6 +299,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
                 scene,
                 cursor_damage: NativeCursorDamageBounds::default(),
                 presentation: PresentationFrameSnapshot::empty(),
+                lifecycle: LifecycleFrameSnapshot::default(),
             });
             let token = 700 + frame_id;
             assert!(history.queue_submission(token));

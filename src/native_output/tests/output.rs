@@ -3,6 +3,7 @@ use super::*;
 use crate::egl_renderer::{BufferAge, EglPartialRepaintCapabilities, PartialRepaintPlanner, RepaintMode};
 use oblivion_one::effects::{EffectRect, EffectRegion};
 use oblivion_one::presentation_animation::PresentationFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
 #[test]
 fn c2_native_snapshot_workloads_report_surface_and_visual_group_reconstruction() {
@@ -838,6 +839,7 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         scene: presented_a_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         frame_id: 2,
@@ -845,6 +847,7 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         scene: rendered_b_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(2));
     assert_eq!(history.presented_scene().surfaces[0].surface_id, 88);
@@ -996,6 +999,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         frame_id: 2,
@@ -1003,6 +1007,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(220));
     assert!(history.discard_submission(220));
@@ -1012,6 +1017,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
 
     let damage = native_output_damage_for_scene_snapshots(
@@ -1101,6 +1107,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         scene: presented_scene,
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
         frame_id: 2,
@@ -1108,6 +1115,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     assert!(history.queue_submission(230));
     assert!(history.discard_submission(230));
@@ -1117,6 +1125,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         scene: retry_scene.clone(),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
 
     let damage = native_output_damage_for_scene_snapshots(
@@ -1245,6 +1254,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             scene: scene(2200, 100),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         });
         let mut planner = PartialRepaintPlanner::new(
             (WIDTH, HEIGHT),
@@ -1287,6 +1297,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
                 scene: current_scene,
                 cursor_damage: NativeCursorDamageBounds::default(),
                 presentation: PresentationFrameSnapshot::empty(),
+                lifecycle: LifecycleFrameSnapshot::default(),
             });
             let token = 960 + frame_id;
             assert!(history.queue_submission(token));
@@ -1301,6 +1312,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             scene: retry_scene.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         });
         let rejected_token = 1000 + age as u64;
         assert!(history.queue_submission(rejected_token));
@@ -1311,6 +1323,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             scene: retry_scene.clone(),
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         });
 
         let current_damage = native_output_damage_for_scene_snapshots(
@@ -1439,6 +1452,7 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
         scene: scene(&first_surface, widths[0]),
         cursor_damage: NativeCursorDamageBounds::default(),
         presentation: PresentationFrameSnapshot::empty(),
+        lifecycle: LifecycleFrameSnapshot::default(),
     });
     let mut partial = vec![0xff12_151c; (WIDTH * HEIGHT) as usize];
     paint_oversized_ssd_scene(
@@ -1499,6 +1513,7 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
             scene: current_scene,
             cursor_damage: NativeCursorDamageBounds::default(),
             presentation: PresentationFrameSnapshot::empty(),
+            lifecycle: LifecycleFrameSnapshot::default(),
         });
         let token = 100 + step as u64;
         assert!(history.queue_submission(token));

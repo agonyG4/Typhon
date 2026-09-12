@@ -854,6 +854,7 @@ mod tests {
                 lifecycle: LifecycleSceneSample {
                     sampled_at: AnimationTime::from_nanos(0),
                     lamps: Vec::new(),
+                    visual_sources: Vec::new(),
                 },
                 lifecycle_surfaces: Vec::new(),
                 lifecycle_decorations: Vec::new(),

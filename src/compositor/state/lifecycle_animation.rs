@@ -1,8 +1,71 @@
 use super::*;
 use crate::animation_control::{AnimationEffect, AnimationSlot};
+use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleFrameSnapshot, LifecycleSceneSample, LifecycleTransitionRequest,
 };
+use std::num::NonZeroU64;
+
+impl CompositorState {
+    /// Freeze only the compositor-owned effect instances belonging to one
+    /// lifecycle visual group before logical minimize removes that group from
+    /// the canonical scene. Output-wide effects intentionally do not become a
+    /// lifecycle source; they remain owned by the normal output composition.
+    pub(in crate::compositor) fn resolved_effect_scene_for_lifecycle_root(
+        &self,
+        root_surface_id: u32,
+    ) -> ResolvedEffectScene {
+        let scene = self.resolved_effect_scene();
+        let instances = scene
+            .instances
+            .into_iter()
+            .filter(|instance| match instance.anchor {
+                EffectAnchor::BeforeSurface(surface_id)
+                | EffectAnchor::ReplaceSurface(surface_id)
+                | EffectAnchor::AfterSurface(surface_id) => {
+                    self.root_surface_id_for_surface(surface_id) == root_surface_id
+                }
+                EffectAnchor::OutputPostProcess => false,
+            })
+            .collect();
+        ResolvedEffectScene::new(scene.generation, instances)
+    }
+
+    pub(in crate::compositor) fn map_effect_scene_to_presentation(
+        scene: &ResolvedEffectScene,
+        canonical_rect: PresentationRect,
+        presented_rect: PresentationRect,
+    ) -> ResolvedEffectScene {
+        let transform = PresentationGroupTransform::new(
+            0,
+            TransitionId::new(NonZeroU64::MIN),
+            canonical_rect,
+            presented_rect,
+            false,
+        );
+        let instances = scene
+            .instances
+            .iter()
+            .cloned()
+            .map(|mut instance| {
+                instance.region = super::super::effects::map_effect_region(
+                    transform,
+                    &instance.region,
+                    instance.target_bounds,
+                );
+                if let Some(target_bounds) =
+                    super::super::effects::map_effect_rect(transform, instance.target_bounds)
+                {
+                    instance.target_bounds = target_bounds;
+                }
+                instance.signature =
+                    instance.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ transform.signature();
+                instance
+            })
+            .collect();
+        ResolvedEffectScene::new(scene.generation, instances)
+    }
+}
 
 impl CompositorState {
     pub(in crate::compositor) fn lifecycle_effect(
@@ -57,6 +120,7 @@ impl CompositorState {
         root_surface_id: u32,
         source_rect: Option<PresentationRect>,
         full_window_rect: Option<PresentationRect>,
+        resolved_effect_scene: ResolvedEffectScene,
     ) {
         if self.lifecycle_effect(LifecycleDirection::Minimize) != AnimationEffect::MinimizeLamp {
             self.window_lifecycle_animator.cancel(window_id);
@@ -107,6 +171,7 @@ impl CompositorState {
                 full_window_rect,
                 anchor_rect,
                 direction: LifecycleDirection::Minimize,
+                resolved_effect_scene,
             },
             now,
             speed,
@@ -117,6 +182,7 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
         root_surface_id: u32,
+        resolved_effect_scene: ResolvedEffectScene,
     ) {
         if self.lifecycle_effect(LifecycleDirection::Restore) != AnimationEffect::MinimizeLamp {
             self.window_lifecycle_animator.cancel(window_id);
@@ -153,6 +219,7 @@ impl CompositorState {
                     full_window_rect,
                     anchor_rect,
                     direction: LifecycleDirection::Restore,
+                    resolved_effect_scene,
                 },
                 now,
                 speed,

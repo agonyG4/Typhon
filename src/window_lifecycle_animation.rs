@@ -1,7 +1,9 @@
+use crate::compositor::ResolvedEffectScene;
 use crate::core::WindowId;
 use crate::presentation_animation::{AnimationTime, PresentationRect};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 pub const ASTREA_LAMP_BASE_DURATION_MS: u64 = 280;
 pub const ASTREA_LAMP_PULL: f64 = 2.5;
@@ -34,7 +36,22 @@ impl LifecycleDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleVisualSourceKind {
+    NoOwnedEffects,
+    ResolvedOwnedEffects,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LifecycleVisualSource {
+    pub window_id: WindowId,
+    pub root_surface_id: u32,
+    pub transition_id: LifecycleTransitionId,
+    pub kind: LifecycleVisualSourceKind,
+    pub effect_scene: Arc<ResolvedEffectScene>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleTransitionRequest {
     pub window_id: WindowId,
     pub root_surface_id: u32,
@@ -42,6 +59,7 @@ pub struct LifecycleTransitionRequest {
     pub full_window_rect: PresentationRect,
     pub anchor_rect: PresentationRect,
     pub direction: LifecycleDirection,
+    pub resolved_effect_scene: ResolvedEffectScene,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +80,15 @@ pub struct LampWindowSample {
 pub struct LifecycleSceneSample {
     pub sampled_at: AnimationTime,
     pub lamps: Vec<LampWindowSample>,
+    pub visual_sources: Vec<LifecycleVisualSource>,
+}
+
+impl LifecycleSceneSample {
+    pub fn visual_source_for_window(&self, window_id: WindowId) -> Option<&LifecycleVisualSource> {
+        self.visual_sources
+            .iter()
+            .find(|source| source.window_id == window_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,7 +187,7 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
     signature
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LifecycleTransition {
     window_id: WindowId,
     root_surface_id: u32,
@@ -173,6 +200,7 @@ struct LifecycleTransition {
     target_progress: f64,
     started_at: AnimationTime,
     duration_nanos: u64,
+    resolved_effect_scene: Arc<ResolvedEffectScene>,
 }
 
 #[derive(Debug)]
@@ -204,7 +232,7 @@ impl WindowLifecycleAnimator {
     pub fn set_enabled(&mut self, enabled: bool, now: AnimationTime) {
         if self.enabled && !enabled {
             for transition in self.transitions.values_mut() {
-                let current = transition_progress(*transition, now);
+                let current = transition_progress(transition, now);
                 transition.start_progress = current;
                 transition.target_progress = transition.direction.target_progress();
                 transition.started_at = now;
@@ -227,26 +255,34 @@ impl WindowLifecycleAnimator {
             full_window_rect,
             anchor_rect,
             direction,
+            resolved_effect_scene,
         } = request;
         if !valid_lamp_rects(source_rect, full_window_rect, anchor_rect) {
             return None;
         }
 
-        let existing = self.transitions.get(&window_id).copied();
+        let existing = self.transitions.get(&window_id).cloned();
         let start_progress = existing
+            .as_ref()
             .map(|transition| transition_progress(transition, now))
             .unwrap_or_else(|| match direction {
                 LifecycleDirection::Minimize => 0.0,
                 LifecycleDirection::Restore => 1.0,
             });
         let (source_rect, full_window_rect, anchor_rect) =
-            existing.map_or((source_rect, full_window_rect, anchor_rect), |transition| {
-                (
-                    transition.source_rect,
-                    transition.full_window_rect,
-                    transition.anchor_rect,
-                )
-            });
+            existing
+                .as_ref()
+                .map_or((source_rect, full_window_rect, anchor_rect), |transition| {
+                    (
+                        transition.source_rect,
+                        transition.full_window_rect,
+                        transition.anchor_rect,
+                    )
+                });
+        let resolved_effect_scene = existing
+            .as_ref()
+            .map(|transition| Arc::clone(&transition.resolved_effect_scene))
+            .unwrap_or_else(|| Arc::new(resolved_effect_scene));
         let transition_id = self.allocate_transition_id();
         let base_duration_nanos = effective_duration_nanos(speed);
         let remaining = (direction.target_progress() - start_progress).abs();
@@ -265,6 +301,7 @@ impl WindowLifecycleAnimator {
                 target_progress: direction.target_progress(),
                 started_at: now,
                 duration_nanos,
+                resolved_effect_scene,
             },
         );
         Some(transition_id)
@@ -281,7 +318,7 @@ impl WindowLifecycleAnimator {
     pub fn sample(&self, window_id: WindowId, now: AnimationTime) -> Option<LampWindowSample> {
         self.transitions
             .get(&window_id)
-            .copied()
+            .cloned()
             .map(|transition| sample_transition(transition, now))
     }
 
@@ -291,8 +328,19 @@ impl WindowLifecycleAnimator {
             lamps: self
                 .transitions
                 .values()
-                .copied()
+                .cloned()
                 .map(|transition| sample_transition(transition, now))
+                .collect(),
+            visual_sources: self
+                .transitions
+                .values()
+                .map(|transition| LifecycleVisualSource {
+                    window_id: transition.window_id,
+                    root_surface_id: transition.root_surface_id,
+                    transition_id: transition.transition_id,
+                    kind: lifecycle_visual_source_kind(&transition.resolved_effect_scene),
+                    effect_scene: Arc::clone(&transition.resolved_effect_scene),
+                })
                 .collect(),
         }
     }
@@ -332,7 +380,7 @@ impl WindowLifecycleAnimator {
 }
 
 fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> LampWindowSample {
-    let progress = transition_progress(transition, now);
+    let progress = transition_progress(&transition, now);
     LampWindowSample {
         window_id: transition.window_id,
         root_surface_id: transition.root_surface_id,
@@ -347,7 +395,7 @@ fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> Lam
     }
 }
 
-fn transition_progress(transition: LifecycleTransition, now: AnimationTime) -> f64 {
+fn transition_progress(transition: &LifecycleTransition, now: AnimationTime) -> f64 {
     if transition.duration_nanos == 0 {
         return transition.target_progress;
     }
@@ -358,6 +406,14 @@ fn transition_progress(transition: LifecycleTransition, now: AnimationTime) -> f
     (transition.start_progress
         + (transition.target_progress - transition.start_progress) * timeline)
         .clamp(0.0, 1.0)
+}
+
+fn lifecycle_visual_source_kind(scene: &ResolvedEffectScene) -> LifecycleVisualSourceKind {
+    if scene.is_empty() {
+        LifecycleVisualSourceKind::NoOwnedEffects
+    } else {
+        LifecycleVisualSourceKind::ResolvedOwnedEffects
+    }
 }
 
 fn effective_duration_nanos(speed: f64) -> u64 {
@@ -523,6 +579,7 @@ mod tests {
             full_window_rect: source_rect,
             anchor_rect,
             direction,
+            resolved_effect_scene: ResolvedEffectScene::default(),
         }
     }
     use crate::presentation_animation::PresentationRect;

@@ -11,8 +11,9 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::effects::{
     EffectGenerationPublisher, EffectManifest, EffectRect, EffectRegion, EffectRegistry,
-    EffectRegistryGeneration, FrameExecutionPlan, RegistryReloadError, TrustedEffectRegistry,
-    compile_frame_execution_plan, reload_with_publisher,
+    EffectRegistryGeneration, EffectWorkingSpace, FrameExecutionPlan, RegistryReloadError,
+    TrustedEffectRegistry, compile_frame_execution_plan, plan_effect_execution_demand,
+    reload_with_publisher,
 };
 use oblivion_one::{
     compositor::{
@@ -25,7 +26,9 @@ use oblivion_one::{
         buffer::{DmabufImageKey, DrmModifier, WeakBufferIdentity},
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
-    window_lifecycle_animation::{LampWindowSample, LifecycleSceneSample},
+    window_lifecycle_animation::{
+        LampWindowSample, LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind,
+    },
 };
 
 mod damage;
@@ -47,6 +50,7 @@ use effects::{
     EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
     builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
+use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
     EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
@@ -519,6 +523,12 @@ pub struct EglSceneDrawRequest<'a> {
     pub lifecycle_decorations: &'a [DecorationRenderInstance],
 }
 
+struct LifecycleResolvedVisualResource {
+    texture: PooledEffectTexture,
+    source_signature: u64,
+    source_rect: compositor::PresentationRect,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
@@ -555,6 +565,10 @@ pub(crate) struct GlesSceneRenderer {
     lamp_geometry_key: Option<u64>,
     lamp_vertices: Vec<EglLampVertex>,
     lamp_commands: Vec<EglLampDrawCommand>,
+    lifecycle_source_vertices: HashMap<compositor::WindowId, Vec<EglTexturedVertex>>,
+    lifecycle_source_commands: HashMap<compositor::WindowId, Vec<EglDrawCommand>>,
+    lifecycle_visual_resources: HashMap<compositor::WindowId, LifecycleResolvedVisualResource>,
+    lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
     lamp_samples: Vec<LampWindowSample>,
     current_framebuffer_origin: OutputFramebufferOrigin,
     current_size: (u32, u32),
@@ -728,12 +742,19 @@ fn lamp_geometry_key(
     lifecycle: &LifecycleSceneSample,
     surfaces: &[RenderableSurface],
     decorations: &[DecorationRenderInstance],
+    output_scale: f64,
+    framebuffer_origin: OutputFramebufferOrigin,
 ) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |value: u64| {
         signature ^= value;
         signature = signature.wrapping_mul(0x1000_0000_01b3);
     };
+    mix(output_scale.to_bits());
+    mix(match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => 1,
+        OutputFramebufferOrigin::TopLeftScanout => 2,
+    });
     for lamp in &lifecycle.lamps {
         for value in [
             lamp.window_id.get(),
@@ -752,6 +773,13 @@ fn lamp_geometry_key(
             lamp.anchor_rect.height().to_bits(),
         ] {
             mix(value);
+        }
+        if let Some(source) = lifecycle.visual_source_for_window(lamp.window_id) {
+            mix(match source.kind {
+                LifecycleVisualSourceKind::NoOwnedEffects => 1,
+                LifecycleVisualSourceKind::ResolvedOwnedEffects => 2,
+            });
+            mix(source.effect_scene.signature);
         }
     }
     for surface in surfaces {
@@ -980,6 +1008,10 @@ impl GlesSceneRenderer {
             lamp_geometry_key: None,
             lamp_vertices: Vec::new(),
             lamp_commands: Vec::new(),
+            lifecycle_source_vertices: HashMap::new(),
+            lifecycle_source_commands: HashMap::new(),
+            lifecycle_visual_resources: HashMap::new(),
+            lifecycle_visual_sources: HashMap::new(),
             lamp_samples: Vec::new(),
             current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             cursor_image: cursor_image.clone(),
@@ -1257,6 +1289,14 @@ impl GlesSceneRenderer {
         self.current_framebuffer_origin = framebuffer_origin;
         self.lamp_samples.clear();
         self.lamp_samples.extend_from_slice(&lifecycle.lamps);
+        self.lifecycle_visual_sources.clear();
+        self.lifecycle_visual_sources.extend(
+            lifecycle
+                .visual_sources
+                .iter()
+                .cloned()
+                .map(|source| (source.window_id, source)),
+        );
         let output_scale_key = compositor::output_scale_key(output_scale);
         let mut scaled_visual_state =
             compositor::scale_desktop_visual_state(visual_state, output_scale);
@@ -1273,6 +1313,7 @@ impl GlesSceneRenderer {
         self.effect_time_seconds = effect_time;
         self.effect_output_scale = output_scale.max(0.0) as f32;
         self.ensure_output_size(width, height)?;
+        self.release_stale_lifecycle_visual_resources();
         self.frame_stats.effect_instances_visible = effects
             .instances
             .iter()
@@ -1493,6 +1534,9 @@ impl GlesSceneRenderer {
             &self.lamp_commands,
             &repair_rects,
         ));
+        for commands in self.lifecycle_source_commands.values() {
+            consumer_plan.extend(&plan_surface_consumers(commands, &repair_rects));
+        }
         add_surface_consumers_for_command_range(
             &mut consumer_plan,
             &self.cursor_commands,
@@ -1673,6 +1717,7 @@ impl GlesSceneRenderer {
             return Ok(());
         }
 
+        self.release_all_lifecycle_visual_resources();
         self.current_size = (width, height);
         self.repaint_planner.resize((width, height));
         self.scene_cache_key = None;
@@ -2542,6 +2587,7 @@ impl GlesSceneRenderer {
                     self.gl.clear(glow::COLOR_BUFFER_BIT);
                 }
                 self.draw_command_batch(true, None)?;
+                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
                 self.draw_lamp_overlay(None)?;
                 self.draw_command_batch(false, None)?;
             }
@@ -2565,6 +2611,9 @@ impl GlesSceneRenderer {
                     );
                     draw_result = self
                         .draw_command_batch(true, output_rect)
+                        .and_then(|()| {
+                            self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)
+                        })
                         .and_then(|()| self.draw_lamp_overlay(output_rect))
                         .and_then(|()| self.draw_command_batch(false, output_rect));
                     if draw_result.is_err() {
@@ -2595,7 +2644,13 @@ impl GlesSceneRenderer {
         lifecycle_decorations: &[DecorationRenderInstance],
         output_scale: f64,
     ) {
-        let geometry_key = lamp_geometry_key(lifecycle, lifecycle_surfaces, lifecycle_decorations);
+        let geometry_key = lamp_geometry_key(
+            lifecycle,
+            lifecycle_surfaces,
+            lifecycle_decorations,
+            output_scale,
+            self.current_framebuffer_origin,
+        );
         if self.lamp_geometry_key == Some(geometry_key) {
             return;
         }
@@ -2603,6 +2658,8 @@ impl GlesSceneRenderer {
         self.lamp_geometry_dirty = true;
         self.lamp_vertices.clear();
         self.lamp_commands.clear();
+        self.lifecycle_source_vertices.clear();
+        self.lifecycle_source_commands.clear();
         if lifecycle.lamps.is_empty() {
             return;
         }
@@ -2685,6 +2742,285 @@ impl GlesSceneRenderer {
                 );
             }
         }
+
+        for source in &lifecycle.visual_sources {
+            if source.kind != LifecycleVisualSourceKind::ResolvedOwnedEffects {
+                continue;
+            }
+            let Some(lamp) = lifecycle
+                .lamps
+                .iter()
+                .find(|lamp| lamp.window_id == source.window_id)
+            else {
+                continue;
+            };
+            let mut vertices = Vec::new();
+            let mut commands = Vec::new();
+            let visual_group = source
+                .effect_scene
+                .instances
+                .first()
+                .and_then(|instance| instance.visual_group)
+                .or_else(|| VisualGroupId::new(1));
+            for (surface, assignment) in
+                lifecycle_surfaces
+                    .iter()
+                    .zip(compositor::surface_render_space_assignments(
+                        lifecycle_surfaces,
+                        output_scale,
+                    ))
+            {
+                if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
+                    != lamp.root_surface_id
+                {
+                    continue;
+                }
+                push_egl_surface_commands(
+                    &mut vertices,
+                    &mut commands,
+                    self.current_size.0,
+                    self.current_size.1,
+                    surface,
+                    assignment,
+                    self.current_framebuffer_origin,
+                    visual_group,
+                );
+            }
+            for decoration in lifecycle_decorations
+                .iter()
+                .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
+            {
+                push_egl_decoration_instance(
+                    &mut vertices,
+                    &mut commands,
+                    self.current_size.0,
+                    self.current_size.1,
+                    decoration,
+                    output_scale,
+                    self.current_framebuffer_origin,
+                    visual_group,
+                );
+            }
+            reproject_lifecycle_source_commands(
+                &mut vertices,
+                &mut commands,
+                lamp.full_window_rect,
+                lamp.source_rect,
+                output_scale,
+                self.current_size,
+                self.current_framebuffer_origin,
+            );
+            self.lifecycle_source_vertices
+                .insert(source.window_id, vertices);
+            self.lifecycle_source_commands
+                .insert(source.window_id, commands);
+            append_lamp_grid(
+                &mut self.lamp_vertices,
+                &mut self.lamp_commands,
+                LampGridSpec {
+                    layer: EglDrawLayer::LifecycleResolvedVisual(source.window_id),
+                    window_id: source.window_id,
+                    bounds: EglRect::new(
+                        (lamp.full_window_rect.x() * output_scale) as f32,
+                        (lamp.full_window_rect.y() * output_scale) as f32,
+                        (lamp.full_window_rect.width() * output_scale) as f32,
+                        (lamp.full_window_rect.height() * output_scale) as f32,
+                    ),
+                    uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
+                },
+            );
+        }
+    }
+
+    /// Materialize one frozen, bounded compositor-resolved source for each
+    /// effected lifecycle group. The source is captured after the ordinary
+    /// scene/effect pass and reused for the complete short transition, so the
+    /// effect graph never evaluates backdrop pixels against a moving Lamp
+    /// mesh. A failed capture deliberately leaves the raw lifecycle path
+    /// available and never owns suppression or lifecycle state by itself.
+    fn prepare_lifecycle_visual_sources(
+        &mut self,
+        _plan: &RepaintPlan,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        self.release_stale_lifecycle_visual_resources();
+        let output_scale = self.effect_output_scale.max(1.0) as f64;
+        let sources = self
+            .lifecycle_visual_sources
+            .values()
+            .filter(|source| source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for source in sources {
+            let Some(lamp) = self
+                .lamp_samples
+                .iter()
+                .find(|sample| sample.window_id == source.window_id)
+                .copied()
+            else {
+                continue;
+            };
+            let source_rect = scaled_presentation_rect(lamp.source_rect, output_scale);
+            let Some((width, height)) = lifecycle_visual_texture_size(source_rect) else {
+                continue;
+            };
+            let source_signature = lifecycle_visual_source_signature(&source, lamp, output_scale);
+            let ready = self
+                .lifecycle_visual_resources
+                .get(&source.window_id)
+                .is_some_and(|resource| {
+                    resource.source_signature == source_signature
+                        && resource.source_rect == lamp.source_rect
+                        && self.effect_resources.texture(&resource.texture).is_some()
+                });
+            if ready {
+                continue;
+            }
+
+            if let Some(previous) = self.lifecycle_visual_resources.remove(&source.window_id) {
+                let _ = self.effect_resources.release(previous.texture);
+            }
+            let texture_key = EffectTextureKey::new(
+                width,
+                height,
+                EffectTextureFormat::Rgba8,
+                EffectTextureFilter::Linear,
+                EffectWorkingSpace::OutputEncodedSrgb,
+            );
+            let Ok(texture) = self.effect_resources.acquire(&self.gl, texture_key) else {
+                continue;
+            };
+            if self
+                .capture_lifecycle_visual_source(&source, lamp, texture.clone(), framebuffer_origin)
+                .is_err()
+            {
+                let _ = self.effect_resources.release(texture);
+                continue;
+            }
+            self.lifecycle_visual_resources.insert(
+                source.window_id,
+                LifecycleResolvedVisualResource {
+                    texture,
+                    source_signature,
+                    source_rect: lamp.source_rect,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn capture_lifecycle_visual_source(
+        &mut self,
+        source: &LifecycleVisualSource,
+        lamp: LampWindowSample,
+        target: PooledEffectTexture,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        clear_effect_texture(self, &target)?;
+        let backup = self.effect_resources.acquire(&self.gl, target.key)?;
+        let result = (|| {
+            copy_output_region_to_texture(self, &backup, lamp.source_rect, framebuffer_origin)?;
+
+            let source_vertices = self
+                .lifecycle_source_vertices
+                .get(&source.window_id)
+                .cloned()
+                .unwrap_or_default();
+            let source_commands = self
+                .lifecycle_source_commands
+                .get(&source.window_id)
+                .cloned()
+                .unwrap_or_default();
+            if source_vertices.is_empty() || source_commands.is_empty() {
+                return Err(
+                    io::Error::other("lifecycle visual source has no draw commands").into(),
+                );
+            }
+
+            let saved_vertices = std::mem::replace(&mut self.vertices, source_vertices);
+            let saved_commands = std::mem::replace(&mut self.commands, source_commands);
+            self.scene_geometry_dirty = true;
+            let draw_result = (|| {
+                let source_damage = lifecycle_visual_effect_damage(lamp.source_rect);
+                let output_bounds =
+                    EffectRect::new(0, 0, self.current_size.0.max(1), self.current_size.1.max(1))
+                        .expect("non-zero renderer dimensions must form valid effect bounds");
+                let graph = match compile_frame_execution_plan(
+                    &source.effect_scene,
+                    &source_damage,
+                    output_bounds,
+                    &self.effect_registry,
+                )? {
+                    FrameExecutionPlan::EffectGraph(graph) => graph,
+                    FrameExecutionPlan::LegacyScene => {
+                        return Err(io::Error::other(
+                            "effect lifecycle source unexpectedly compiled as legacy scene",
+                        )
+                        .into());
+                    }
+                };
+                let demand = plan_effect_execution_demand(&graph, &source_damage, true);
+                let selection = effects::select_effect_execution(&graph, &demand);
+                effects::execute_effect_graph_for_lifecycle(
+                    self,
+                    &graph,
+                    framebuffer_origin,
+                    &[lifecycle_visual_output_rect(
+                        lamp.source_rect,
+                        output_bounds,
+                    )],
+                    &demand,
+                    &selection,
+                )?;
+                copy_output_region_to_texture(self, &target, lamp.source_rect, framebuffer_origin)?;
+                Ok(())
+            })();
+            self.vertices = saved_vertices;
+            self.commands = saved_commands;
+            // The temporary source draw replaced the scene VBO contents.
+            // Force the normal scene cache to upload its unchanged geometry
+            // before the next ordinary scene draw.
+            self.scene_geometry_dirty = true;
+            draw_result
+        })();
+
+        let restore_result =
+            restore_output_region_from_texture(self, &backup, lamp.source_rect, framebuffer_origin);
+        let release_result = self.effect_resources.release(backup);
+        match (result, restore_result, release_result) {
+            (Err(error), _, _) => Err(error),
+            (Ok(()), Err(error), _) => Err(error),
+            (Ok(()), Ok(()), Err(error)) => Err(error.into()),
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn release_stale_lifecycle_visual_resources(&mut self) {
+        let stale = self
+            .lifecycle_visual_resources
+            .keys()
+            .copied()
+            .filter(|window_id| {
+                !self
+                    .lifecycle_visual_sources
+                    .get(window_id)
+                    .is_some_and(|source| {
+                        source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects
+                    })
+            })
+            .collect::<Vec<_>>();
+        for window_id in stale {
+            if let Some(resource) = self.lifecycle_visual_resources.remove(&window_id) {
+                let _ = self.effect_resources.release(resource.texture);
+            }
+        }
+    }
+
+    fn release_all_lifecycle_visual_resources(&mut self) {
+        for (_, resource) in self.lifecycle_visual_resources.drain() {
+            let _ = self.effect_resources.release(resource.texture);
+        }
     }
 
     fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
@@ -2718,6 +3054,11 @@ impl GlesSceneRenderer {
             .lamp_commands
             .iter()
             .filter_map(|command| {
+                if self.lifecycle_visual_source_is_ready(command.window_id)
+                    && !matches!(command.layer, EglDrawLayer::LifecycleResolvedVisual(_))
+                {
+                    return None;
+                }
                 self.lamp_geometry_sample(command.window_id)
                     .map(|sample| (*command, sample))
             })
@@ -2823,7 +3164,9 @@ impl GlesSceneRenderer {
         &mut self,
         rects: &[OutputRect],
         framebuffer_origin: OutputFramebufferOrigin,
+        plan: &RepaintPlan,
     ) -> RendererResult<()> {
+        self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
         for rect in rects {
             let y = match framebuffer_origin {
                 OutputFramebufferOrigin::BottomLeft => self
@@ -3297,11 +3640,21 @@ impl GlesSceneRenderer {
                 .surface_resources
                 .get(&surface_id)
                 .map(|resource| resource.image.texture),
+            EglDrawLayer::LifecycleResolvedVisual(window_id) => self
+                .lifecycle_visual_resources
+                .get(&window_id)
+                .and_then(|resource| self.effect_resources.texture(&resource.texture)),
             EglDrawLayer::Cursor => self
                 .cursor_resource
                 .as_ref()
                 .map(|resource| resource.texture),
         }
+    }
+
+    fn lifecycle_visual_source_is_ready(&self, window_id: compositor::WindowId) -> bool {
+        self.lifecycle_visual_resources
+            .get(&window_id)
+            .is_some_and(|resource| self.effect_resources.texture(&resource.texture).is_some())
     }
 
     pub(crate) fn destroy(&mut self, egl: &EglInstance, egl_display: egl::Display) {
@@ -3320,6 +3673,7 @@ impl GlesSceneRenderer {
         for (_, resource) in self.dmabuf_resource_cache.drain() {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
         }
+        self.release_all_lifecycle_visual_resources();
         self.effect_shaders.clear(&self.gl);
         self.effect_resources.destroy(&self.gl);
         if let Some((vertex_array, vertex_buffer)) = self.effect_quad.take() {
@@ -3989,6 +4343,397 @@ fn push_egl_surface_commands(
     for command in &mut commands[command_start..] {
         command.visual_group = visual_group;
     }
+}
+
+fn reproject_lifecycle_source_commands(
+    vertices: &mut [EglTexturedVertex],
+    commands: &mut [EglDrawCommand],
+    full_window_rect: compositor::PresentationRect,
+    source_rect: compositor::PresentationRect,
+    output_scale: f64,
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
+    let full = scaled_presentation_rect(full_window_rect, output_scale);
+    let source = scaled_presentation_rect(source_rect, output_scale);
+    let map_point = |point: [f64; 2]| {
+        [
+            source.x() + (point[0] - full.x()) * source.width() / full.width(),
+            source.y() + (point[1] - full.y()) * source.height() / full.height(),
+        ]
+    };
+    for vertex in vertices {
+        let output_point = ndc_to_output_point(vertex.position, output_size, framebuffer_origin);
+        let mapped = map_point(output_point);
+        vertex.position = output_point_to_ndc(mapped, output_size, framebuffer_origin);
+    }
+    for command in commands {
+        let left = f64::from(command.bounds.x());
+        let top = f64::from(command.bounds.y());
+        let right = left + f64::from(command.bounds.width());
+        let bottom = top + f64::from(command.bounds.height());
+        let mapped_top_left = map_point([left, top]);
+        let mapped_bottom_right = map_point([right, bottom]);
+        command.bounds = EglRect::new(
+            mapped_top_left[0] as f32,
+            mapped_top_left[1] as f32,
+            (mapped_bottom_right[0] - mapped_top_left[0]) as f32,
+            (mapped_bottom_right[1] - mapped_top_left[1]) as f32,
+        );
+        // A lifecycle source is a non-linear visual-group input. It must not
+        // contribute a rectangular opaque region to ordinary occlusion.
+        command.opaque_regions.clear();
+    }
+}
+
+fn scaled_presentation_rect(
+    rect: compositor::PresentationRect,
+    output_scale: f64,
+) -> compositor::PresentationRect {
+    compositor::PresentationRect::new(
+        rect.x() * output_scale,
+        rect.y() * output_scale,
+        rect.width() * output_scale,
+        rect.height() * output_scale,
+    )
+    .unwrap_or(rect)
+}
+
+fn ndc_to_output_point(
+    position: [f32; 2],
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> [f64; 2] {
+    let x = (f64::from(position[0]) + 1.0) * f64::from(output_size.0) * 0.5;
+    let y = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => {
+            (1.0 - f64::from(position[1])) * f64::from(output_size.1) * 0.5
+        }
+        OutputFramebufferOrigin::TopLeftScanout => {
+            (f64::from(position[1]) + 1.0) * f64::from(output_size.1) * 0.5
+        }
+    };
+    [x, y]
+}
+
+fn output_point_to_ndc(
+    point: [f64; 2],
+    output_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> [f32; 2] {
+    let x = point[0] / f64::from(output_size.0.max(1)) * 2.0 - 1.0;
+    let y = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => {
+            1.0 - point[1] / f64::from(output_size.1.max(1)) * 2.0
+        }
+        OutputFramebufferOrigin::TopLeftScanout => {
+            point[1] / f64::from(output_size.1.max(1)) * 2.0 - 1.0
+        }
+    };
+    [x as f32, y as f32]
+}
+
+fn lifecycle_visual_source_signature(
+    source: &LifecycleVisualSource,
+    lamp: LampWindowSample,
+    output_scale: f64,
+) -> u64 {
+    let mut signature = source.effect_scene.signature;
+    for value in [
+        lamp.source_rect.x().to_bits(),
+        lamp.source_rect.y().to_bits(),
+        lamp.source_rect.width().to_bits(),
+        lamp.source_rect.height().to_bits(),
+        lamp.full_window_rect.x().to_bits(),
+        lamp.full_window_rect.y().to_bits(),
+        lamp.full_window_rect.width().to_bits(),
+        lamp.full_window_rect.height().to_bits(),
+        output_scale.to_bits(),
+    ] {
+        signature ^= value;
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+    }
+    signature
+}
+
+fn lifecycle_visual_texture_size(rect: compositor::PresentationRect) -> Option<(u32, u32)> {
+    let width = rect.width().ceil();
+    let height = rect.height().ceil();
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let width = width.min(f64::from(u32::MAX)) as u32;
+    let height = height.min(f64::from(u32::MAX)) as u32;
+    (width != 0 && height != 0).then_some((width, height))
+}
+
+fn lifecycle_visual_effect_damage(rect: compositor::PresentationRect) -> EffectRegion {
+    presentation_rect_to_effect_rect(rect)
+        .map(EffectRegion::from_rect)
+        .unwrap_or_default()
+}
+
+fn presentation_rect_to_effect_rect(rect: compositor::PresentationRect) -> Option<EffectRect> {
+    let x = rect.x().floor();
+    let y = rect.y().floor();
+    let right = (rect.x() + rect.width()).ceil();
+    let bottom = (rect.y() + rect.height()).ceil();
+    if !x.is_finite()
+        || !y.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || x < f64::from(i32::MIN)
+        || y < f64::from(i32::MIN)
+        || right > f64::from(i32::MAX)
+        || bottom > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    EffectRect::new(
+        x as i32,
+        y as i32,
+        (right - x).max(1.0).min(f64::from(u32::MAX)) as u32,
+        (bottom - y).max(1.0).min(f64::from(u32::MAX)) as u32,
+    )
+}
+
+fn lifecycle_visual_output_rect(
+    rect: compositor::PresentationRect,
+    output_bounds: EffectRect,
+) -> OutputRect {
+    let Some(rect) =
+        presentation_rect_to_effect_rect(rect).and_then(|rect| rect.intersect(output_bounds))
+    else {
+        return OutputRect::new(0, 0, 0, 0);
+    };
+    OutputRect::new(rect.x, rect.y, rect.width, rect.height)
+}
+
+fn lifecycle_output_copy_region(
+    renderer: &GlesSceneRenderer,
+    rect: compositor::PresentationRect,
+    target_width: u32,
+    target_height: u32,
+) -> Option<(OutputRect, i32, i32)> {
+    let scale = renderer.effect_output_scale.max(1.0) as f64;
+    let left = (rect.x() * scale).floor();
+    let top = (rect.y() * scale).floor();
+    let right = ((rect.x() + rect.width()) * scale).ceil();
+    let bottom = ((rect.y() + rect.height()) * scale).ceil();
+    if !left.is_finite()
+        || !top.is_finite()
+        || !right.is_finite()
+        || !bottom.is_finite()
+        || right <= left
+        || bottom <= top
+        || left < f64::from(i32::MIN)
+        || top < f64::from(i32::MIN)
+        || right > f64::from(i32::MAX)
+        || bottom > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    let left = left as i32;
+    let top = top as i32;
+    let right = right as i32;
+    let bottom = bottom as i32;
+    let visible_left = i64::from(left)
+        .max(0)
+        .min(i64::from(renderer.current_size.0));
+    let visible_top = i64::from(top)
+        .max(0)
+        .min(i64::from(renderer.current_size.1));
+    let visible_right = i64::from(right)
+        .max(0)
+        .min(i64::from(renderer.current_size.0));
+    let visible_bottom = i64::from(bottom)
+        .max(0)
+        .min(i64::from(renderer.current_size.1));
+    if visible_right <= visible_left || visible_bottom <= visible_top {
+        return None;
+    }
+    let visible = OutputRect::new(
+        visible_left as i32,
+        visible_top as i32,
+        (visible_right - visible_left) as u32,
+        (visible_bottom - visible_top) as u32,
+    );
+    let destination_x = visible.x.saturating_sub(left);
+    let destination_top = visible.y.saturating_sub(top);
+    let destination_bottom = destination_top.saturating_add(visible.height as i32);
+    let destination_y =
+        i32::try_from(i64::from(target_height).saturating_sub(i64::from(destination_bottom)))
+            .ok()?;
+    if destination_x < 0
+        || destination_y < 0
+        || destination_x.saturating_add(visible.width as i32) > target_width as i32
+        || destination_y.saturating_add(visible.height as i32) > target_height as i32
+    {
+        return None;
+    }
+    Some((visible, destination_x, destination_y))
+}
+
+fn copy_output_region_to_texture(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    rect: compositor::PresentationRect,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    let Some((visible, destination_x, destination_y)) =
+        lifecycle_output_copy_region(renderer, rect, target.key.width, target.key.height)
+    else {
+        return Ok(());
+    };
+    let source_y = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => renderer
+            .current_size
+            .1
+            .saturating_sub(visible.y.max(0) as u32 + visible.height)
+            as i32,
+        OutputFramebufferOrigin::TopLeftScanout => visible.y,
+    };
+    let texture = renderer
+        .effect_resources
+        .texture(target)
+        .ok_or_else(|| io::Error::other("lifecycle source texture was not realized"))?;
+    renderer.bind_active_output_framebuffer();
+    unsafe {
+        renderer.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        renderer.gl.copy_tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            destination_x,
+            destination_y,
+            visible.x,
+            source_y,
+            visible.width as i32,
+            visible.height as i32,
+        );
+        renderer.gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+    renderer.establish_ordinary_scene_state();
+    Ok(())
+}
+
+fn clear_effect_texture(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+) -> RendererResult<()> {
+    renderer
+        .effect_resources
+        .bind_render_target(&renderer.gl, target)?;
+    unsafe {
+        renderer
+            .gl
+            .viewport(0, 0, target.key.width as i32, target.key.height as i32);
+        renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        renderer.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    renderer.effect_resources.unbind_render_target(&renderer.gl);
+    renderer.establish_ordinary_scene_state();
+    Ok(())
+}
+
+fn restore_output_region_from_texture(
+    renderer: &mut GlesSceneRenderer,
+    source: &PooledEffectTexture,
+    rect: compositor::PresentationRect,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    let Some((visible, destination_x, destination_y)) =
+        lifecycle_output_copy_region(renderer, rect, source.key.width, source.key.height)
+    else {
+        return Ok(());
+    };
+    let destination_bottom = destination_y.saturating_add(visible.height as i32);
+    let uv_left = destination_x as f32 / source.key.width as f32;
+    let uv_right =
+        destination_x.saturating_add(visible.width as i32) as f32 / source.key.width as f32;
+    let uv_top = 1.0 - destination_y as f32 / source.key.height as f32;
+    let uv_bottom = 1.0 - destination_bottom as f32 / source.key.height as f32;
+    let output_width = renderer.current_size.0.max(1) as f32;
+    let output_height = renderer.current_size.1.max(1) as f32;
+    let left = visible.x as f32 / output_width * 2.0 - 1.0;
+    let right = (visible.x + visible.width as i32) as f32 / output_width * 2.0 - 1.0;
+    let (top, bottom) = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => (
+            1.0 - visible.y as f32 / output_height * 2.0,
+            1.0 - (visible.y + visible.height as i32) as f32 / output_height * 2.0,
+        ),
+        OutputFramebufferOrigin::TopLeftScanout => (
+            visible.y as f32 / output_height * 2.0 - 1.0,
+            (visible.y + visible.height as i32) as f32 / output_height * 2.0 - 1.0,
+        ),
+    };
+    let vertices = [
+        EglTexturedVertex {
+            position: [left, top],
+            uv: [uv_left, uv_top],
+        },
+        EglTexturedVertex {
+            position: [left, bottom],
+            uv: [uv_left, uv_bottom],
+        },
+        EglTexturedVertex {
+            position: [right, bottom],
+            uv: [uv_right, uv_bottom],
+        },
+        EglTexturedVertex {
+            position: [left, top],
+            uv: [uv_left, uv_top],
+        },
+        EglTexturedVertex {
+            position: [right, bottom],
+            uv: [uv_right, uv_bottom],
+        },
+        EglTexturedVertex {
+            position: [right, top],
+            uv: [uv_right, uv_top],
+        },
+    ];
+    let texture = renderer
+        .effect_resources
+        .texture(source)
+        .ok_or_else(|| io::Error::other("lifecycle backup texture was not realized"))?;
+    renderer.bind_active_output_framebuffer();
+    unsafe {
+        renderer
+            .gl
+            .bind_buffer(glow::ARRAY_BUFFER, Some(renderer.scene_vertex_buffer));
+        renderer.gl.buffer_sub_data_u8_slice(
+            glow::ARRAY_BUFFER,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
+        renderer
+            .gl
+            .bind_vertex_array(Some(renderer.scene_vertex_array));
+        renderer.gl.use_program(Some(renderer.program));
+        renderer.gl.active_texture(glow::TEXTURE0);
+        renderer.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        renderer.gl.enable(glow::BLEND);
+        renderer.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        renderer.gl.enable(glow::SCISSOR_TEST);
+        let y = match framebuffer_origin {
+            OutputFramebufferOrigin::BottomLeft => renderer
+                .current_size
+                .1
+                .saturating_sub(visible.y.max(0) as u32 + visible.height)
+                as i32,
+            OutputFramebufferOrigin::TopLeftScanout => visible.y,
+        };
+        renderer
+            .gl
+            .scissor(visible.x, y, visible.width as i32, visible.height as i32);
+        renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        renderer.gl.bind_texture(glow::TEXTURE_2D, None);
+        renderer.gl.disable(glow::SCISSOR_TEST);
+    }
+    renderer.scene_geometry_dirty = true;
+    renderer.establish_ordinary_scene_state();
+    Ok(())
 }
 
 fn push_egl_render_plan(
@@ -4932,14 +5677,27 @@ mod tests {
                 direction: LifecycleDirection::Minimize,
                 mathematically_settled: false,
             }],
+            visual_sources: Vec::new(),
         }
     }
 
     #[test]
     fn lamp_mesh_identity_ignores_progress() {
         assert_eq!(
-            lamp_geometry_key(&lamp_test_sample(0.1), &[], &[]),
-            lamp_geometry_key(&lamp_test_sample(0.9), &[], &[])
+            lamp_geometry_key(
+                &lamp_test_sample(0.1),
+                &[],
+                &[],
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            ),
+            lamp_geometry_key(
+                &lamp_test_sample(0.9),
+                &[],
+                &[],
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            )
         );
     }
 

@@ -495,9 +495,45 @@ pub(crate) fn execute_effect_graph(
         graph,
         &mut textures,
         framebuffer_origin,
-        repaint_plan,
+        Some(repaint_plan),
+        None,
         demand,
         selection,
+        false,
+        true,
+    );
+    if result.is_err() {
+        renderer.establish_ordinary_scene_state();
+        unsafe { renderer.gl.bind_texture(glow::TEXTURE_2D, None) };
+    }
+    let release_result = renderer.effect_resources.release_graph(textures);
+    match (result, release_result) {
+        (Ok(stats), Ok(())) => Ok(stats),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+pub(crate) fn execute_effect_graph_for_lifecycle(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_rects: &[OutputRect],
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+) -> RendererResult<EffectExecutionStats> {
+    let mut textures = std::collections::HashMap::new();
+    let result = execute_graph_passes(
+        renderer,
+        graph,
+        &mut textures,
+        framebuffer_origin,
+        None,
+        Some(repaint_rects),
+        demand,
+        selection,
+        true,
+        false,
     );
     if result.is_err() {
         renderer.establish_ordinary_scene_state();
@@ -516,12 +552,22 @@ fn execute_graph_passes(
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
     framebuffer_origin: OutputFramebufferOrigin,
-    repaint_plan: &super::super::damage::RepaintPlan,
+    repaint_plan: Option<&super::super::damage::RepaintPlan>,
+    explicit_repaint_rects: Option<&[OutputRect]>,
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
+    lifecycle_backdrop: bool,
+    draw_overlays: bool,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
-    let repaint_rects = renderer.begin_effect_repaint(repaint_plan, framebuffer_origin)?;
+    let repaint_rects = if let Some(rects) = explicit_repaint_rects {
+        rects.to_vec()
+    } else {
+        renderer.begin_effect_repaint(
+            repaint_plan.expect("ordinary effect execution needs a repaint plan"),
+            framebuffer_origin,
+        )?
+    };
     let mut scene_cursor = 0;
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id) {
@@ -574,6 +620,7 @@ fn execute_graph_passes(
             pass,
             framebuffer_origin,
             &effective_pass_damage(graph, demand, pass),
+            lifecycle_backdrop,
             &mut stats,
         )?;
         release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
@@ -585,8 +632,14 @@ fn execute_graph_passes(
         renderer.commands.len(),
         framebuffer_origin,
     )?;
-    renderer.draw_lifecycle_overlays(&repaint_rects, framebuffer_origin)?;
-    renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
+    if draw_overlays {
+        renderer.draw_lifecycle_overlays(
+            &repaint_rects,
+            framebuffer_origin,
+            repaint_plan.expect("ordinary effect execution needs a repaint plan"),
+        )?;
+        renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
+    }
     renderer.establish_ordinary_scene_state();
     stats.instances = selection.executed_instances.len();
     Ok(stats)
@@ -717,6 +770,7 @@ fn execute_pass(
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
+    lifecycle_backdrop: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     match pass.kind {
@@ -728,6 +782,7 @@ fn execute_pass(
                 pass,
                 framebuffer_origin,
                 execution_damage,
+                lifecycle_backdrop,
                 stats,
             )?;
             stats.scene_captures = stats.scene_captures.saturating_add(1);
@@ -1386,6 +1441,7 @@ fn execute_capture(
     pass: &CompiledRenderPass,
     framebuffer_origin: OutputFramebufferOrigin,
     execution_damage: &EffectRegion,
+    lifecycle_backdrop: bool,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<()> {
     let output = pass
@@ -1398,6 +1454,40 @@ fn execute_capture(
     stats.capture_pixels = stats
         .capture_pixels
         .saturating_add(u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height)));
+    if lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture {
+        let target_texture = renderer
+            .effect_resources
+            .texture(target)
+            .ok_or_else(|| io::Error::other("lifecycle backdrop texture was not realized"))?;
+        let source_x = target_plan.domain.x.max(0);
+        let source_y = match framebuffer_origin {
+            OutputFramebufferOrigin::BottomLeft => target_plan.domain.y.max(0),
+            OutputFramebufferOrigin::TopLeftScanout => renderer
+                .current_size
+                .1
+                .saturating_sub(target_plan.domain.bottom().max(0) as u32)
+                as i32,
+        };
+        renderer.bind_active_output_framebuffer();
+        unsafe {
+            renderer
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(target_texture));
+            renderer.gl.copy_tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                source_x,
+                source_y,
+                target_plan.width as i32,
+                target_plan.height as i32,
+            );
+            renderer.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        restore_output_viewport(renderer);
+        return Ok(());
+    }
     if !pass.checkpoint_dependencies.is_empty() {
         let target_texture = renderer
             .effect_resources
