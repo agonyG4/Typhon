@@ -564,25 +564,39 @@ impl NativeEglGbmScanout {
             .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)
             .map_err(native_egl_io_error)?;
         let draw_us = elapsed_micros(draw_start);
-        let EglFrameOutcome::Rendered {
-            commit: scene_commit,
-            lifecycle_evidence,
-            ..
-        } = outcome
-        else {
-            let EglFrameOutcome::Skipped { stats, .. } = outcome else {
-                unreachable!();
-            };
-            return Ok(NativePaintOutcome::Skipped(native_egl_gbm_paint_stats(
-                self.format as u32,
-                self.width,
-                self.height,
-                draw_us,
-                0,
-                elapsed_micros(total_start),
-                stats,
-                false,
-            )));
+        let (scene_commit, lifecycle_evidence) = match outcome {
+            EglFrameOutcome::Rendered {
+                commit: scene_commit,
+                lifecycle_evidence,
+                ..
+            } => (scene_commit, lifecycle_evidence),
+            EglFrameOutcome::Skipped { stats, .. } => {
+                return Ok(NativePaintOutcome::Skipped(native_egl_gbm_paint_stats(
+                    self.format as u32,
+                    self.width,
+                    self.height,
+                    draw_us,
+                    0,
+                    elapsed_micros(total_start),
+                    stats,
+                    false,
+                )));
+            }
+            EglFrameOutcome::LifecycleFallback { stats, fallbacks } => {
+                return Ok(NativePaintOutcome::LifecycleFallback {
+                    stats: native_egl_gbm_paint_stats(
+                        self.format as u32,
+                        self.width,
+                        self.height,
+                        draw_us,
+                        0,
+                        elapsed_micros(total_start),
+                        stats,
+                        false,
+                    ),
+                    fallbacks,
+                });
+            }
         };
         let output_damage = scene_commit.repaint_plan();
         let swap_with_damage_used = self.swap_buffers_with_damage.is_some()

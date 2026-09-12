@@ -1157,6 +1157,13 @@ impl OwnCompositorServer {
             .set_lifecycle_animation_renderer_available(available);
     }
 
+    pub fn apply_lifecycle_render_fallback(
+        &mut self,
+        fallback: crate::window_lifecycle_animation::LifecycleRenderFallbackEntry,
+    ) -> bool {
+        self.state.apply_lifecycle_render_fallback(fallback)
+    }
+
     #[doc(hidden)]
     pub fn install_native_frame_test_scene(
         &mut self,

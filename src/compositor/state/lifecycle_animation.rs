@@ -2,7 +2,8 @@ use super::*;
 use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleFrameSnapshot, LifecycleSceneSample, LifecycleTransitionRequest,
+    LifecycleDirection, LifecycleFrameSnapshot, LifecycleRenderFallbackEntry, LifecycleSceneSample,
+    LifecycleTransitionRequest,
 };
 use std::num::NonZeroU64;
 
@@ -73,7 +74,8 @@ mod tests {
     use super::*;
     use crate::window_lifecycle_animation::{
         LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
-        LifecycleTransitionId, LifecycleTransitionRequest,
+        LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleTransitionId,
+        LifecycleTransitionRequest,
     };
 
     fn lifecycle_request(
@@ -276,6 +278,162 @@ mod tests {
                 .lamps
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn runtime_slot_change_snaps_minimize_and_restore_but_retains_physical_ownership() {
+        let directory = std::env::temp_dir().join(format!(
+            "typhon-lifecycle-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("create animation configuration directory");
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        state.animation_control = crate::animation_control::AnimationControlState::from_store(
+            crate::animation_control::AnimationConfigurationStore::new(directory.clone())
+                .expect("create animation configuration store"),
+        );
+        let window_id = WindowId::from_raw(306).expect("valid window ID");
+        let minimize_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    306,
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(200.0, 200.0, 20.0, 20.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize starts");
+        let mut candidate = state.animation_control.configuration().clone();
+        candidate
+            .overrides
+            .insert(AnimationSlot::WindowMinimize, AnimationEffect::None);
+        state
+            .set_animation_configuration(candidate)
+            .expect("runtime policy mutation persists");
+        let minimize = state
+            .window_lifecycle_animator
+            .sample(window_id, AnimationTime::from_nanos(0))
+            .expect("snapped minimize remains owned");
+        assert_eq!(minimize.transition_id, minimize_id);
+        assert_eq!(minimize.progress, 1.0);
+        assert!(minimize.mathematically_settled);
+        let minimize_sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+        let minimize_frame = LifecycleFrameSnapshot::qualified_from_sample(
+            &minimize_sample,
+            &LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+                window_id,
+                root_surface_id: 306,
+                transition_id: minimize_id,
+            }]),
+        );
+        state.publish_presented_lifecycle(1, &minimize_frame);
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+
+        let restore_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    306,
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(200.0, 200.0, 20.0, 20.0),
+                    LifecycleDirection::Restore,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("restore starts");
+        state.lifecycle_render_suppressed_roots.insert(306);
+        let mut candidate = state.animation_control.configuration().clone();
+        candidate
+            .overrides
+            .insert(AnimationSlot::WindowRestore, AnimationEffect::None);
+        state
+            .set_animation_configuration(candidate)
+            .expect("restore policy mutation persists");
+        let restore = state
+            .window_lifecycle_animator
+            .sample(window_id, AnimationTime::from_nanos(0))
+            .expect("snapped restore remains owned");
+        assert_eq!(restore.transition_id, restore_id);
+        assert_eq!(restore.progress, 0.0);
+        assert!(state.lifecycle_render_suppressed_roots.contains(&306));
+        let restore_sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+        let restore_frame = LifecycleFrameSnapshot::qualified_from_sample(
+            &restore_sample,
+            &LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+                window_id,
+                root_surface_id: 306,
+                transition_id: restore_id,
+            }]),
+        );
+        state.publish_presented_lifecycle(2, &restore_frame);
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+        assert!(!state.lifecycle_render_suppressed_roots.contains(&306));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stale_lifecycle_render_fallback_cannot_cancel_a_reversal() {
+        let window_id = WindowId::from_raw(307).expect("valid window ID");
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let request = |direction| {
+            lifecycle_request(
+                window_id,
+                307,
+                rect(0.0, 0.0, 80.0, 80.0),
+                rect(200.0, 200.0, 20.0, 20.0),
+                direction,
+            )
+        };
+        let old_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                request(LifecycleDirection::Minimize),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize starts");
+        let new_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                request(LifecycleDirection::Restore),
+                AnimationTime::from_nanos(100_000_000),
+                1.0,
+            )
+            .expect("restore reverses");
+        assert_ne!(old_id, new_id);
+
+        assert!(
+            !state.apply_lifecycle_render_fallback(LifecycleRenderFallbackEntry {
+                window_id,
+                root_surface_id: 307,
+                transition_id: old_id,
+                reason: LifecycleRenderFallbackReason::LampProgramUnavailable,
+            })
+        );
+        assert_eq!(
+            state
+                .window_lifecycle_animator
+                .sample(window_id, AnimationTime::from_nanos(100_000_000))
+                .expect("new transition survives")
+                .transition_id,
+            new_id
         );
     }
 }
@@ -707,6 +865,48 @@ impl CompositorState {
     pub(in crate::compositor) fn set_lifecycle_animation_enabled(&mut self, enabled: bool) {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         self.window_lifecycle_animator.set_enabled(enabled, now);
+    }
+
+    pub(in crate::compositor) fn reconcile_lifecycle_animation_policy(&mut self) {
+        let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        let active = self.window_lifecycle_animator.sample_scene(now).lamps;
+        for lamp in active {
+            if self.lifecycle_effect(lamp.direction) != AnimationEffect::MinimizeLamp {
+                self.window_lifecycle_animator.snap_to_endpoint(
+                    lamp.window_id,
+                    lamp.transition_id,
+                    now,
+                );
+            }
+        }
+    }
+
+    pub(in crate::compositor) fn apply_lifecycle_render_fallback(
+        &mut self,
+        fallback: LifecycleRenderFallbackEntry,
+    ) -> bool {
+        let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        let Some(current) = self
+            .window_lifecycle_animator
+            .sample(fallback.window_id, now)
+        else {
+            return false;
+        };
+        if current.root_surface_id != fallback.root_surface_id
+            || current.transition_id != fallback.transition_id
+        {
+            return false;
+        }
+        if !self
+            .window_lifecycle_animator
+            .retire_render_fallback(fallback.window_id, fallback.transition_id)
+        {
+            return false;
+        }
+        self.lifecycle_render_suppressed_roots
+            .remove(&fallback.root_surface_id);
+        self.lifecycle_decorations.remove(&fallback.root_surface_id);
+        true
     }
 
     pub(in crate::compositor) fn set_lifecycle_animation_renderer_available(

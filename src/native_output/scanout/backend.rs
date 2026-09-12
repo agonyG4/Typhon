@@ -1,5 +1,5 @@
 use super::*;
-use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleRenderFallbacks};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativePresentResult {
@@ -111,12 +111,18 @@ pub(crate) enum NativePaintOutcome {
         stats: NativePaintStats,
         lifecycle: LifecycleFrameSnapshot,
     },
+    LifecycleFallback {
+        stats: NativePaintStats,
+        fallbacks: LifecycleRenderFallbacks,
+    },
 }
 
 impl NativePaintOutcome {
     pub(crate) const fn stats(&self) -> NativePaintStats {
         match self {
-            Self::Skipped(stats) | Self::Rendered { stats, .. } => *stats,
+            Self::Skipped(stats)
+            | Self::Rendered { stats, .. }
+            | Self::LifecycleFallback { stats, .. } => *stats,
         }
     }
 
@@ -125,6 +131,9 @@ impl NativePaintOutcome {
             Self::Rendered { stats, .. } => Ok(stats),
             Self::Skipped(_) => Err(io::Error::other(format!(
                 "{context} unexpectedly produced no rendered frame"
+            ))),
+            Self::LifecycleFallback { .. } => Err(io::Error::other(format!(
+                "{context} requested a recoverable lifecycle fallback"
             ))),
         }
     }

@@ -23,12 +23,12 @@ impl crate::compositor::CompositorState {
         crate::animation_control::AnimationPersistenceError,
     > {
         let enabled = configuration.enabled;
-        let snapshot = self
-            .animation_control
+        self.animation_control
             .set_configuration(configuration, self.animation_runtime_capabilities())?;
         self.presentation_animator.set_enabled(enabled);
         self.set_lifecycle_animation_enabled(enabled);
-        Ok(snapshot)
+        self.reconcile_lifecycle_animation_policy();
+        Ok(self.animation_control_snapshot())
     }
 }
 

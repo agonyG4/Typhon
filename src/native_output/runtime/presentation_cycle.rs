@@ -1291,9 +1291,10 @@ impl NativeRuntime {
                             let render_call_ns = monotonic_now_ns()?.saturating_sub(start_ns);
                             let renderer_ns = match &render_outcome {
                                 AtomicFrameRenderOutcome::Skipped { render_us, .. }
-                                | AtomicFrameRenderOutcome::Rendered { render_us, .. } => {
-                                    render_us.saturating_mul(1_000)
-                                }
+                                | AtomicFrameRenderOutcome::Rendered { render_us, .. }
+                                | AtomicFrameRenderOutcome::LifecycleFallback {
+                                    render_us, ..
+                                } => render_us.saturating_mul(1_000),
                             };
                             slow_cycle_trace.record_phase_duration(
                                 SlowCyclePhase::OutputTransactionPreparation,
@@ -1398,6 +1399,30 @@ impl NativeRuntime {
                                             pending_frame_work,
                                         ),
                                         NativePerfField::str("output_damage", "empty"),
+                                    ]
+                                });
+                            }
+                            AtomicFrameRenderOutcome::LifecycleFallback {
+                                fallbacks,
+                                render_us,
+                            } => {
+                                let fallback_count = fallbacks.failed.len();
+                                for fallback in fallbacks.failed {
+                                    server.apply_lifecycle_render_fallback(fallback);
+                                }
+                                frame_pacing.note_predictive_o1_other_safe_abandonment();
+                                frame_scheduler.note_immediate_completion();
+                                frame_completed = true;
+                                *queued_redraw_requested = true;
+                                *last_acquire_ready_at_ns = None;
+                                perf.log("native.atomic_lifecycle_fallback", || {
+                                    vec![
+                                        NativePerfField::usize("fallbacks", fallback_count),
+                                        NativePerfField::u64("render_us", render_us),
+                                        NativePerfField::bool(
+                                            "physical_lifecycle_ledger_changed",
+                                            false,
+                                        ),
                                     ]
                                 });
                             }
@@ -1683,7 +1708,8 @@ impl NativeRuntime {
                         let paint_stats = paint_outcome.stats();
                         let lifecycle_snapshot = match &paint_outcome {
                             NativePaintOutcome::Rendered { lifecycle, .. } => lifecycle.clone(),
-                            NativePaintOutcome::Skipped(_) => Default::default(),
+                            NativePaintOutcome::Skipped(_)
+                            | NativePaintOutcome::LifecycleFallback { .. } => Default::default(),
                         };
                         render_telemetry.record_native_paint(paint_stats);
                         frame_pacing.log(
@@ -1698,7 +1724,32 @@ impl NativeRuntime {
                                 PacingField::u64("render_total_us", paint_stats.total_us),
                             ],
                         );
-                        if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
+                        if matches!(paint_outcome, NativePaintOutcome::LifecycleFallback { .. }) {
+                            let NativePaintOutcome::LifecycleFallback { fallbacks, .. } =
+                                paint_outcome
+                            else {
+                                unreachable!();
+                            };
+                            let fallback_count = fallbacks.failed.len();
+                            server.restore_prepared_frame_batch_after_render_failure();
+                            for fallback in fallbacks.failed {
+                                server.apply_lifecycle_render_fallback(fallback);
+                            }
+                            frame_scheduler.note_immediate_completion();
+                            frame_completed = true;
+                            *queued_redraw_requested = true;
+                            *last_acquire_ready_at_ns = None;
+                            drop(resolved_scene);
+                            perf.log("native.lifecycle_fallback", || {
+                                vec![
+                                    NativePerfField::usize("fallbacks", fallback_count),
+                                    NativePerfField::bool(
+                                        "physical_lifecycle_ledger_changed",
+                                        false,
+                                    ),
+                                ]
+                            });
+                        } else if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
                             drop(resolved_scene);
                             if complete_compatibility_no_visual_change(
                                 paint_outcome,

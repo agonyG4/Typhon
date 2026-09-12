@@ -29,6 +29,7 @@ use oblivion_one::{
     },
     window_lifecycle_animation::{
         LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
+        LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleRenderFallbacks,
         LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
     },
 };
@@ -452,6 +453,10 @@ pub(crate) enum EglFrameOutcome {
         stats: GlesSceneFrameStats,
         lifecycle_evidence: LifecycleRenderEvidence,
     },
+    LifecycleFallback {
+        stats: GlesSceneFrameStats,
+        fallbacks: LifecycleRenderFallbacks,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -576,6 +581,7 @@ pub(crate) struct GlesSceneRenderer {
     lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
     lamp_samples: Vec<LampWindowSample>,
     lifecycle_render_evidence: LifecycleRenderEvidence,
+    lifecycle_render_fallbacks: LifecycleRenderFallbacks,
     current_framebuffer_origin: OutputFramebufferOrigin,
     current_size: (u32, u32),
     texture_upload_rgba: Vec<u8>,
@@ -671,11 +677,58 @@ struct LampGridSpec {
     uv: EglUvRect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacySceneScissoredPhase {
+    BaseRepair(usize),
+    PrepareLifecycleSources,
+    RestoreRepairScissor(usize),
+    Lamp(usize),
+    ExternalOverlays(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegacySceneScissoredPhasePlan {
+    repair_count: usize,
+    index: usize,
+}
+
+impl Iterator for LegacySceneScissoredPhasePlan {
+    type Item = LegacySceneScissoredPhase;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let phase = if self.index < self.repair_count {
+            LegacySceneScissoredPhase::BaseRepair(self.index)
+        } else if self.index == self.repair_count {
+            LegacySceneScissoredPhase::PrepareLifecycleSources
+        } else {
+            let offset = self.index - self.repair_count - 1;
+            let repair = offset / 3;
+            if repair >= self.repair_count {
+                return None;
+            }
+            match offset % 3 {
+                0 => LegacySceneScissoredPhase::RestoreRepairScissor(repair),
+                1 => LegacySceneScissoredPhase::Lamp(repair),
+                _ => LegacySceneScissoredPhase::ExternalOverlays(repair),
+            }
+        };
+        self.index = self.index.saturating_add(1);
+        Some(phase)
+    }
+}
+
+fn legacy_scene_scissored_phase_plan(repair_count: usize) -> LegacySceneScissoredPhasePlan {
+    LegacySceneScissoredPhasePlan {
+        repair_count,
+        index: 0,
+    }
+}
+
 fn append_lamp_grid(
     vertices: &mut Vec<EglLampVertex>,
     commands: &mut Vec<EglLampDrawCommand>,
     spec: LampGridSpec,
-) {
+) -> bool {
     let LampGridSpec {
         layer,
         window_id,
@@ -693,7 +746,7 @@ fn append_lamp_grid(
         || width <= 0.0
         || height <= 0.0
     {
-        return;
+        return false;
     }
     let mut columns = ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
     let mut rows = ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
@@ -704,7 +757,7 @@ fn append_lamp_grid(
     }
     let required = columns.saturating_mul(rows).saturating_mul(6);
     if vertices.len().saturating_add(required) > MAX_LAMP_VERTICES {
-        return;
+        return false;
     }
     let vertex_start = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
     let columns_f = columns as f32;
@@ -742,6 +795,7 @@ fn append_lamp_grid(
         sampling: SurfaceSampling::ScaledLinear,
         window_id,
     });
+    true
 }
 
 fn lamp_geometry_key(
@@ -765,6 +819,7 @@ fn lamp_geometry_key(
         for value in [
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
+            lamp.transition_id.get(),
             lamp.source_rect.x().to_bits(),
             lamp.source_rect.y().to_bits(),
             lamp.source_rect.width().to_bits(),
@@ -1010,6 +1065,7 @@ impl GlesSceneRenderer {
             lifecycle_visual_sources: HashMap::new(),
             lamp_samples: Vec::new(),
             lifecycle_render_evidence: LifecycleRenderEvidence::default(),
+            lifecycle_render_fallbacks: LifecycleRenderFallbacks::default(),
             current_framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             cursor_image: cursor_image.clone(),
             current_size: (width, height),
@@ -1287,6 +1343,7 @@ impl GlesSceneRenderer {
         self.lamp_samples.clear();
         self.lamp_samples.extend_from_slice(&lifecycle.lamps);
         self.lifecycle_render_evidence.consumed.clear();
+        self.lifecycle_render_fallbacks.failed.clear();
         self.lifecycle_visual_sources.clear();
         self.lifecycle_visual_sources.extend(
             lifecycle
@@ -1636,6 +1693,14 @@ impl GlesSceneRenderer {
         if let Err(error) = draw_result {
             self.repaint_planner.invalidate();
             return Err(error);
+        }
+        self.record_lifecycle_fallbacks_without_evidence();
+        if !self.lifecycle_render_fallbacks.is_empty() {
+            self.repaint_planner.invalidate();
+            return Ok(EglFrameOutcome::LifecycleFallback {
+                stats: self.frame_stats,
+                fallbacks: self.lifecycle_render_fallbacks.clone(),
+            });
         }
         self.record_effect_resource_metrics();
         self.record_repaint_stats(&plan);
@@ -2598,25 +2663,53 @@ impl GlesSceneRenderer {
                     self.gl.enable(glow::SCISSOR_TEST);
                 }
                 let mut draw_result = Ok(());
-                for [x, y, width, height] in &scissors {
-                    unsafe {
-                        self.gl.scissor(*x, *y, *width, *height);
-                        self.gl.clear(glow::COLOR_BUFFER_BIT);
-                    }
-                    let output_rect = gl_scissor_to_output_rect(
-                        [*x, *y, *width, *height],
-                        self.current_size.1,
-                        framebuffer_origin,
-                    );
-                    draw_result = self
-                        .draw_command_batch(true, output_rect)
-                        .and_then(|()| {
-                            self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)
-                        })
-                        .and_then(|()| self.draw_lamp_overlay(output_rect))
-                        .and_then(|()| self.draw_command_batch(false, output_rect));
+                for phase in legacy_scene_scissored_phase_plan(scissors.len()) {
                     if draw_result.is_err() {
                         break;
+                    }
+                    match phase {
+                        LegacySceneScissoredPhase::BaseRepair(index) => {
+                            let [x, y, width, height] = scissors[index];
+                            unsafe {
+                                self.gl.scissor(x, y, width, height);
+                                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                            }
+                            let output_rect = gl_scissor_to_output_rect(
+                                [x, y, width, height],
+                                self.current_size.1,
+                                framebuffer_origin,
+                            );
+                            draw_result = self.draw_command_batch(true, output_rect);
+                        }
+                        LegacySceneScissoredPhase::PrepareLifecycleSources => {
+                            draw_result =
+                                self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
+                        }
+                        LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
+                            let [x, y, width, height] = scissors[index];
+                            unsafe {
+                                self.gl.enable(glow::SCISSOR_TEST);
+                                self.gl.scissor(x, y, width, height);
+                            }
+                        }
+                        LegacySceneScissoredPhase::Lamp(index) => {
+                            let [x, y, width, height] = scissors[index];
+                            let output_rect = gl_scissor_to_output_rect(
+                                [x, y, width, height],
+                                self.current_size.1,
+                                framebuffer_origin,
+                            );
+                            draw_result = self.draw_lamp_overlay(output_rect);
+                        }
+                        LegacySceneScissoredPhase::ExternalOverlays(index) => {
+                            let [x, y, width, height] = scissors[index];
+                            let output_rect = gl_scissor_to_output_rect(
+                                [x, y, width, height],
+                                self.current_size.1,
+                                framebuffer_origin,
+                            );
+                            draw_result = self.draw_command_batch(false, output_rect);
+                        }
                     }
                 }
                 if disable_scissor_after {
@@ -2662,185 +2755,205 @@ impl GlesSceneRenderer {
         if lifecycle.lamps.is_empty() {
             return;
         }
+        let mut transition_starts = HashMap::new();
+        let mut rejected_transitions = HashSet::new();
         let assignments =
             compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
-        for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments) {
-            let Some(lamp) = lifecycle.lamps.iter().find(|lamp| {
-                lamp.root_surface_id
-                    == surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
-            }) else {
-                continue;
-            };
-            for render_plan in compositor::surface_render_plans_with_aperture(
-                surface,
-                assignment.target,
-                assignment.visual_clip.as_ref(),
-            ) {
-                let target = render_plan.content_target;
-                if target.width() == 0 || target.height() == 0 {
-                    continue;
-                }
-                append_lamp_grid(
-                    &mut self.lamp_vertices,
-                    &mut self.lamp_commands,
-                    LampGridSpec {
-                        layer: EglDrawLayer::Surface(surface.surface_id),
-                        window_id: lamp.window_id,
-                        bounds: EglRect::new(
-                            target.x() as f32,
-                            target.y() as f32,
-                            target.width() as f32,
-                            target.height() as f32,
-                        ),
-                        uv: EglUvRect::new(
-                            render_plan.content_uv.left,
-                            render_plan.content_uv.top,
-                            render_plan.content_uv.right,
-                            render_plan.content_uv.bottom,
-                        ),
-                    },
-                );
-            }
-        }
-        for decoration in lifecycle_decorations {
-            let Some(lamp) = lifecycle
-                .lamps
-                .iter()
-                .find(|lamp| lamp.root_surface_id == decoration.root_surface_id())
-            else {
-                continue;
-            };
-            let scale = output_scale.max(1.0) as f32;
-            let (origin_x, origin_y) = decoration.origin();
-            for primitive in decoration.primitives() {
-                let (rect, uv, layer) = match primitive {
-                    DecorationRenderPrimitive::SolidRect { rect, color } => (
-                        *rect,
-                        EglUvRect::new(0.0, 0.0, 1.0, 1.0),
-                        EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
-                    ),
-                    DecorationRenderPrimitive::Image { rect, asset } => (
-                        *rect,
-                        EglUvRect::new(0.0, 0.0, 1.0, 1.0),
-                        EglDrawLayer::DecorationAsset(asset.asset_id()),
-                    ),
-                    DecorationRenderPrimitive::Text {
-                        rect, clip, asset, ..
-                    } => {
-                        let Some(crop) = clipped_decoration_text_geometry(*rect, *clip) else {
-                            continue;
-                        };
-                        (
-                            crop.rect,
-                            EglUvRect::new(crop.uv[0], crop.uv[1], crop.uv[2], crop.uv[3]),
-                            EglDrawLayer::DecorationAsset(asset.asset_id()),
-                        )
+        for lamp in lifecycle.lamps.iter().copied() {
+            let resolved_source = lifecycle
+                .visual_source_for_window(lamp.window_id)
+                .filter(|source| source.kind == LifecycleVisualSourceKind::ResolvedOwnedEffects);
+            if let Some(source) = resolved_source {
+                let mut vertices = Vec::new();
+                let mut commands = Vec::new();
+                let visual_group = source
+                    .effect_scene
+                    .instances
+                    .first()
+                    .and_then(|instance| instance.visual_group)
+                    .or_else(|| VisualGroupId::new(1));
+                for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
+                    if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
+                        != lamp.root_surface_id
+                    {
+                        continue;
                     }
-                };
-                append_lamp_grid(
-                    &mut self.lamp_vertices,
-                    &mut self.lamp_commands,
-                    LampGridSpec {
-                        layer,
-                        window_id: lamp.window_id,
-                        bounds: EglRect::new(
-                            origin_x.saturating_add(rect.x) as f32 * scale,
-                            origin_y.saturating_add(rect.y) as f32 * scale,
-                            rect.width as f32 * scale,
-                            rect.height as f32 * scale,
-                        ),
-                        uv,
-                    },
-                );
-            }
-        }
-
-        for source in &lifecycle.visual_sources {
-            if source.kind != LifecycleVisualSourceKind::ResolvedOwnedEffects {
-                continue;
-            }
-            let Some(lamp) = lifecycle
-                .lamps
-                .iter()
-                .find(|lamp| lamp.window_id == source.window_id)
-            else {
-                continue;
-            };
-            let mut vertices = Vec::new();
-            let mut commands = Vec::new();
-            let visual_group = source
-                .effect_scene
-                .instances
-                .first()
-                .and_then(|instance| instance.visual_group)
-                .or_else(|| VisualGroupId::new(1));
-            for (surface, assignment) in
-                lifecycle_surfaces
+                    push_egl_surface_commands(
+                        &mut vertices,
+                        &mut commands,
+                        self.current_size.0,
+                        self.current_size.1,
+                        surface,
+                        assignment.clone(),
+                        self.current_framebuffer_origin,
+                        visual_group,
+                    );
+                }
+                for decoration in lifecycle_decorations
                     .iter()
-                    .zip(compositor::surface_render_space_assignments(
-                        lifecycle_surfaces,
+                    .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
+                {
+                    push_egl_decoration_instance(
+                        &mut vertices,
+                        &mut commands,
+                        self.current_size.0,
+                        self.current_size.1,
+                        decoration,
                         output_scale,
-                    ))
-            {
+                        self.current_framebuffer_origin,
+                        visual_group,
+                    );
+                }
+                reproject_lifecycle_source_commands(
+                    &mut vertices,
+                    &mut commands,
+                    lamp.full_window_rect,
+                    lamp.source_rect,
+                    output_scale,
+                    self.current_size,
+                    self.current_framebuffer_origin,
+                );
+                self.lifecycle_source_vertices
+                    .insert(source.window_id, vertices);
+                self.lifecycle_source_commands
+                    .insert(source.window_id, commands);
+                self.append_lamp_grid_for_transition(
+                    lamp,
+                    LampGridSpec {
+                        layer: EglDrawLayer::LifecycleResolvedVisual(source.window_id),
+                        window_id: source.window_id,
+                        bounds: EglRect::new(
+                            (lamp.full_window_rect.x() * output_scale) as f32,
+                            (lamp.full_window_rect.y() * output_scale) as f32,
+                            (lamp.full_window_rect.width() * output_scale) as f32,
+                            (lamp.full_window_rect.height() * output_scale) as f32,
+                        ),
+                        uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
+                    },
+                    &mut transition_starts,
+                    &mut rejected_transitions,
+                );
+                continue;
+            }
+
+            for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
                 if surface_root_for_lamp(surface, lifecycle_surfaces, lifecycle)
                     != lamp.root_surface_id
                 {
                     continue;
                 }
-                push_egl_surface_commands(
-                    &mut vertices,
-                    &mut commands,
-                    self.current_size.0,
-                    self.current_size.1,
+                for render_plan in compositor::surface_render_plans_with_aperture(
                     surface,
-                    assignment,
-                    self.current_framebuffer_origin,
-                    visual_group,
-                );
+                    assignment.target,
+                    assignment.visual_clip.as_ref(),
+                ) {
+                    let target = render_plan.content_target;
+                    if target.width() == 0 || target.height() == 0 {
+                        continue;
+                    }
+                    self.append_lamp_grid_for_transition(
+                        lamp,
+                        LampGridSpec {
+                            layer: EglDrawLayer::Surface(surface.surface_id),
+                            window_id: lamp.window_id,
+                            bounds: EglRect::new(
+                                target.x() as f32,
+                                target.y() as f32,
+                                target.width() as f32,
+                                target.height() as f32,
+                            ),
+                            uv: EglUvRect::new(
+                                render_plan.content_uv.left,
+                                render_plan.content_uv.top,
+                                render_plan.content_uv.right,
+                                render_plan.content_uv.bottom,
+                            ),
+                        },
+                        &mut transition_starts,
+                        &mut rejected_transitions,
+                    );
+                }
             }
+            let scale = output_scale.max(1.0) as f32;
             for decoration in lifecycle_decorations
                 .iter()
                 .filter(|decoration| decoration.root_surface_id() == lamp.root_surface_id)
             {
-                push_egl_decoration_instance(
-                    &mut vertices,
-                    &mut commands,
-                    self.current_size.0,
-                    self.current_size.1,
-                    decoration,
-                    output_scale,
-                    self.current_framebuffer_origin,
-                    visual_group,
+                let (origin_x, origin_y) = decoration.origin();
+                for primitive in decoration.primitives() {
+                    let (rect, uv, layer) = match primitive {
+                        DecorationRenderPrimitive::SolidRect { rect, color } => (
+                            *rect,
+                            EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                            EglDrawLayer::SolidRgba(rgba_to_pixel(*color)),
+                        ),
+                        DecorationRenderPrimitive::Image { rect, asset } => (
+                            *rect,
+                            EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+                            EglDrawLayer::DecorationAsset(asset.asset_id()),
+                        ),
+                        DecorationRenderPrimitive::Text {
+                            rect, clip, asset, ..
+                        } => {
+                            let Some(crop) = clipped_decoration_text_geometry(*rect, *clip) else {
+                                continue;
+                            };
+                            (
+                                crop.rect,
+                                EglUvRect::new(crop.uv[0], crop.uv[1], crop.uv[2], crop.uv[3]),
+                                EglDrawLayer::DecorationAsset(asset.asset_id()),
+                            )
+                        }
+                    };
+                    self.append_lamp_grid_for_transition(
+                        lamp,
+                        LampGridSpec {
+                            layer,
+                            window_id: lamp.window_id,
+                            bounds: EglRect::new(
+                                origin_x.saturating_add(rect.x) as f32 * scale,
+                                origin_y.saturating_add(rect.y) as f32 * scale,
+                                rect.width as f32 * scale,
+                                rect.height as f32 * scale,
+                            ),
+                            uv,
+                        },
+                        &mut transition_starts,
+                        &mut rejected_transitions,
+                    );
+                }
+            }
+        }
+        for lamp in &lifecycle.lamps {
+            if !transition_starts.contains_key(&lamp.window_id)
+                && !rejected_transitions.contains(&lamp.window_id)
+            {
+                self.record_lifecycle_render_fallback(
+                    *lamp,
+                    LifecycleRenderFallbackReason::MeshBudget,
                 );
             }
-            reproject_lifecycle_source_commands(
-                &mut vertices,
-                &mut commands,
-                lamp.full_window_rect,
-                lamp.source_rect,
-                output_scale,
-                self.current_size,
-                self.current_framebuffer_origin,
-            );
-            self.lifecycle_source_vertices
-                .insert(source.window_id, vertices);
-            self.lifecycle_source_commands
-                .insert(source.window_id, commands);
-            append_lamp_grid(
-                &mut self.lamp_vertices,
-                &mut self.lamp_commands,
-                LampGridSpec {
-                    layer: EglDrawLayer::LifecycleResolvedVisual(source.window_id),
-                    window_id: source.window_id,
-                    bounds: EglRect::new(
-                        (lamp.full_window_rect.x() * output_scale) as f32,
-                        (lamp.full_window_rect.y() * output_scale) as f32,
-                        (lamp.full_window_rect.width() * output_scale) as f32,
-                        (lamp.full_window_rect.height() * output_scale) as f32,
-                    ),
-                    uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
-                },
-            );
+        }
+    }
+
+    fn append_lamp_grid_for_transition(
+        &mut self,
+        lamp: LampWindowSample,
+        spec: LampGridSpec,
+        transition_starts: &mut HashMap<compositor::WindowId, (usize, usize)>,
+        rejected_transitions: &mut HashSet<compositor::WindowId>,
+    ) {
+        if rejected_transitions.contains(&lamp.window_id) {
+            return;
+        }
+        let start = *transition_starts
+            .entry(lamp.window_id)
+            .or_insert((self.lamp_vertices.len(), self.lamp_commands.len()));
+        if !append_lamp_grid(&mut self.lamp_vertices, &mut self.lamp_commands, spec) {
+            self.lamp_vertices.truncate(start.0);
+            self.lamp_commands.truncate(start.1);
+            rejected_transitions.insert(lamp.window_id);
+            self.record_lifecycle_render_fallback(lamp, LifecycleRenderFallbackReason::MeshBudget);
         }
     }
 
@@ -2848,8 +2961,8 @@ impl GlesSceneRenderer {
     /// effected lifecycle group. The source is captured after the ordinary
     /// scene/effect pass and reused for the complete short transition, so the
     /// effect graph never evaluates backdrop pixels against a moving Lamp
-    /// mesh. A failed capture deliberately leaves the raw lifecycle path
-    /// available and never owns suppression or lifecycle state by itself.
+    /// mesh. A failed capture reports an exact lifecycle fallback instead of
+    /// exposing a raw warped representation of an effect-owned source.
     fn prepare_lifecycle_visual_sources(
         &mut self,
         _plan: &RepaintPlan,
@@ -2875,6 +2988,10 @@ impl GlesSceneRenderer {
             };
             let source_rect = scaled_presentation_rect(lamp.source_rect, output_scale);
             let Some((width, height)) = lifecycle_visual_texture_size(source_rect) else {
+                self.record_lifecycle_render_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::ResolvedSourceAllocation,
+                );
                 continue;
             };
             let source_signature = lifecycle_visual_source_signature(&source, lamp, output_scale);
@@ -2901,6 +3018,10 @@ impl GlesSceneRenderer {
                 EffectWorkingSpace::OutputEncodedSrgb,
             );
             let Ok(texture) = self.effect_resources.acquire(&self.gl, texture_key) else {
+                self.record_lifecycle_render_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::ResolvedSourceAllocation,
+                );
                 continue;
             };
             if self
@@ -2908,6 +3029,10 @@ impl GlesSceneRenderer {
                 .is_err()
             {
                 let _ = self.effect_resources.release(texture);
+                self.record_lifecycle_render_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::ResolvedSourceCapture,
+                );
                 continue;
             }
             self.lifecycle_visual_resources.insert(
@@ -2920,6 +3045,20 @@ impl GlesSceneRenderer {
             );
         }
         Ok(())
+    }
+
+    fn record_lifecycle_render_fallback(
+        &mut self,
+        lamp: LampWindowSample,
+        reason: LifecycleRenderFallbackReason,
+    ) {
+        self.lifecycle_render_fallbacks
+            .record(LifecycleRenderFallbackEntry {
+                window_id: lamp.window_id,
+                root_surface_id: lamp.root_surface_id,
+                transition_id: lamp.transition_id,
+                reason,
+            });
     }
 
     fn capture_lifecycle_visual_source(
@@ -3038,6 +3177,9 @@ impl GlesSceneRenderer {
     fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
         let (Some(program), Some(uniforms)) = (self.lamp_program, self.lamp_uniform_locations)
         else {
+            self.record_visible_lifecycle_fallbacks(
+                LifecycleRenderFallbackReason::LampProgramUnavailable,
+            );
             return Ok(());
         };
         if self.lamp_vertices.is_empty() || self.lamp_commands.is_empty() {
@@ -3116,7 +3258,7 @@ impl GlesSceneRenderer {
         let missing_required_decoration_resources = samples
             .iter()
             .filter(|(command, _)| {
-                !scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect))
+                scissor.is_none_or(|rect| command.bounds.intersects_output_rect(rect))
                     && Self::is_required_decoration_layer(command.layer)
                     && self.texture_for_layer(command.layer).is_none()
             })
@@ -3126,6 +3268,10 @@ impl GlesSceneRenderer {
                 continue;
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
+                self.record_lifecycle_render_fallback(
+                    sample,
+                    LifecycleRenderFallbackReason::LifecycleResourceUnavailable,
+                );
                 continue;
             };
             unsafe {
@@ -3188,6 +3334,56 @@ impl GlesSceneRenderer {
             self.gl.bind_vertex_array(Some(self.scene_vertex_array));
         }
         Ok(())
+    }
+
+    fn record_visible_lifecycle_fallbacks(&mut self, reason: LifecycleRenderFallbackReason) {
+        let visible = self
+            .lamp_samples
+            .iter()
+            .copied()
+            .filter(|lamp| self.lamp_intersects_current_output(lamp))
+            .collect::<Vec<_>>();
+        for lamp in visible {
+            self.record_lifecycle_render_fallback(lamp, reason);
+        }
+    }
+
+    fn record_lifecycle_fallbacks_without_evidence(&mut self) {
+        let missing = self
+            .lamp_samples
+            .iter()
+            .copied()
+            .filter(|lamp| {
+                !self.lifecycle_render_evidence.contains(
+                    lamp.window_id,
+                    lamp.root_surface_id,
+                    lamp.transition_id,
+                )
+            })
+            .filter(|lamp| self.lamp_intersects_current_output(lamp))
+            .collect::<Vec<_>>();
+        for lamp in missing {
+            self.record_lifecycle_render_fallback(
+                lamp,
+                LifecycleRenderFallbackReason::NoConsumedRepresentation,
+            );
+        }
+    }
+
+    fn lamp_intersects_current_output(&self, lamp: &LampWindowSample) -> bool {
+        let scale = self.effect_output_scale.max(1.0) as f64;
+        lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect).is_some_and(
+            |footprint| {
+                let x = footprint.x() * scale;
+                let y = footprint.y() * scale;
+                let width = footprint.width() * scale;
+                let height = footprint.height() * scale;
+                x < f64::from(self.current_size.0)
+                    && y < f64::from(self.current_size.1)
+                    && x + width > 0.0
+                    && y + height > 0.0
+            },
+        )
     }
 
     pub(crate) fn draw_lifecycle_overlays(
@@ -5732,6 +5928,7 @@ mod tests {
     };
     use oblivion_one::window_lifecycle_animation::{
         LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
+        LifecycleVisualSource, LifecycleVisualSourceKind,
     };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
@@ -5911,7 +6108,7 @@ mod tests {
             &[(603, window_id)],
             None,
         );
-        let resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
             &server,
             AnimationTime::from_nanos(0),
         );
@@ -5942,6 +6139,9 @@ mod tests {
             EglFrameOutcome::Rendered { stats, .. } | EglFrameOutcome::Skipped { stats, .. } => {
                 stats
             }
+            EglFrameOutcome::LifecycleFallback { .. } => {
+                panic!("decoration-only regression frame unexpectedly requested lifecycle fallback")
+            }
         };
 
         assert_eq!(renderer.decoration_resources.len(), required.required.len());
@@ -5964,6 +6164,47 @@ mod tests {
                 .missing_required_decoration_resources
                 > 0
         );
+
+        resolved.lifecycle = lamp_test_sample(0.5);
+        renderer.lamp_program = None;
+        renderer.lamp_uniform_locations = None;
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let fallback = renderer
+            .draw_scene(&egl, display, egl_surface, request)
+            .expect("unavailable Lamp requests a recoverable lifecycle fallback");
+        let EglFrameOutcome::LifecycleFallback { fallbacks, .. } = fallback else {
+            panic!("unavailable Lamp must not produce a rendered frame");
+        };
+        assert_eq!(fallbacks.failed.len(), 1);
+        assert_eq!(fallbacks.failed[0].window_id.get(), 1);
+        assert!(renderer.lifecycle_render_evidence.consumed.is_empty());
+
+        let mut resolved_effect_lifecycle = lamp_test_sample(0.5);
+        resolved_effect_lifecycle.visual_sources = vec![LifecycleVisualSource {
+            window_id: oblivion_one::compositor::WindowId::from_raw(1)
+                .expect("valid lifecycle window ID"),
+            root_surface_id: 1,
+            transition_id: LifecycleTransitionId::new(1),
+            kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
+            effect_scene: std::sync::Arc::new(
+                oblivion_one::compositor::ResolvedEffectScene::default(),
+            ),
+        }];
+        renderer.lamp_geometry_key = None;
+        renderer.rebuild_lamp_commands_if_needed(&resolved_effect_lifecycle, &[], &[], 1.0);
+        assert_eq!(renderer.lamp_commands.len(), 1);
+        assert!(matches!(
+            renderer.lamp_commands[0].layer,
+            EglDrawLayer::LifecycleResolvedVisual(_)
+        ));
     }
 
     #[test]
@@ -6081,6 +6322,47 @@ mod tests {
             commands
                 .iter()
                 .all(|command| command.vertex_count <= MAX_LAMP_VERTICES as u32)
+        );
+    }
+
+    #[test]
+    fn lamp_grid_admission_is_atomic_when_the_minimum_grid_does_not_fit() {
+        let window_id = oblivion_one::compositor::WindowId::from_raw(2).expect("valid window id");
+        let vertex = EglLampVertex {
+            position: [0.0, 0.0],
+            uv: [0.0, 0.0],
+        };
+        let mut vertices = vec![vertex; MAX_LAMP_VERTICES - 5];
+        let mut commands = Vec::new();
+        assert!(!append_lamp_grid(
+            &mut vertices,
+            &mut commands,
+            LampGridSpec {
+                layer: EglDrawLayer::Surface(2),
+                window_id,
+                bounds: EglRect::new(10_000.0, 10_000.0, 10_000.0, 10_000.0),
+                uv: EglUvRect::new(0.0, 0.0, 1.0, 1.0),
+            },
+        ));
+        assert_eq!(vertices.len(), MAX_LAMP_VERTICES - 5);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn legacy_scissored_lifecycle_phases_prepare_once_after_all_repairs() {
+        assert_eq!(
+            legacy_scene_scissored_phase_plan(2).collect::<Vec<_>>(),
+            vec![
+                LegacySceneScissoredPhase::BaseRepair(0),
+                LegacySceneScissoredPhase::BaseRepair(1),
+                LegacySceneScissoredPhase::PrepareLifecycleSources,
+                LegacySceneScissoredPhase::RestoreRepairScissor(0),
+                LegacySceneScissoredPhase::Lamp(0),
+                LegacySceneScissoredPhase::ExternalOverlays(0),
+                LegacySceneScissoredPhase::RestoreRepairScissor(1),
+                LegacySceneScissoredPhase::Lamp(1),
+                LegacySceneScissoredPhase::ExternalOverlays(1),
+            ]
         );
     }
 

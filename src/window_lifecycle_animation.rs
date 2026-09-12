@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub const ASTREA_LAMP_BASE_DURATION_MS: u64 = 280;
 pub const ASTREA_LAMP_PULL: f64 = 2.5;
 const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
+const MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LifecycleTransitionId(NonZeroU64);
@@ -206,6 +207,46 @@ impl LifecycleRenderEvidence {
                 && entry.root_surface_id == root_surface_id
                 && entry.transition_id == transition_id
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleRenderFallbackReason {
+    ResolvedSourceAllocation,
+    ResolvedSourceCapture,
+    LampProgramUnavailable,
+    LifecycleResourceUnavailable,
+    MeshBudget,
+    NoConsumedRepresentation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifecycleRenderFallbackEntry {
+    pub window_id: WindowId,
+    pub root_surface_id: u32,
+    pub transition_id: LifecycleTransitionId,
+    pub reason: LifecycleRenderFallbackReason,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LifecycleRenderFallbacks {
+    pub failed: Vec<LifecycleRenderFallbackEntry>,
+}
+
+impl LifecycleRenderFallbacks {
+    pub fn record(&mut self, entry: LifecycleRenderFallbackEntry) {
+        if !self.failed.iter().any(|existing| {
+            existing.window_id == entry.window_id
+                && existing.root_surface_id == entry.root_surface_id
+                && existing.transition_id == entry.transition_id
+        }) && self.failed.len() < MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES
+        {
+            self.failed.push(entry);
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.failed.is_empty()
     }
 }
 
@@ -454,6 +495,45 @@ impl WindowLifecycleAnimator {
         if !mathematically_settled {
             return false;
         }
+        let Some(transition) = self.transitions.get(&window_id) else {
+            return false;
+        };
+        if transition.transition_id != transition_id {
+            return false;
+        }
+        self.transitions.remove(&window_id);
+        true
+    }
+
+    /// Snap one exact transition to its semantic endpoint while retaining
+    /// lifecycle ownership until the endpoint is physically presented.
+    pub fn snap_to_endpoint(
+        &mut self,
+        window_id: WindowId,
+        transition_id: LifecycleTransitionId,
+        now: AnimationTime,
+    ) -> bool {
+        let Some(transition) = self.transitions.get_mut(&window_id) else {
+            return false;
+        };
+        if transition.transition_id != transition_id {
+            return false;
+        }
+        transition.start_progress = transition.direction.target_progress();
+        transition.target_progress = transition.direction.target_progress();
+        transition.started_at = now;
+        transition.duration_nanos = 0;
+        true
+    }
+
+    /// Retire one exact transition after the renderer has requested a
+    /// recoverable lifecycle fallback. This is not a physical presentation
+    /// acknowledgement and therefore does not affect any physical ledger.
+    pub fn retire_render_fallback(
+        &mut self,
+        window_id: WindowId,
+        transition_id: LifecycleTransitionId,
+    ) -> bool {
         let Some(transition) = self.transitions.get(&window_id) else {
             return false;
         };
@@ -843,6 +923,37 @@ mod tests {
         assert_eq!(animator.active_count(), 1);
         assert!(animator.acknowledge(window, transition, true));
         assert_eq!(animator.active_count(), 0);
+    }
+
+    #[test]
+    fn policy_endpoint_snap_preserves_exact_transition_ownership() {
+        let window = WindowId::from_raw(10).expect("valid window id");
+        let source = rect(20.0, 20.0, 400.0, 300.0);
+        let anchor = rect(900.0, 700.0, 48.0, 48.0);
+        let mut animator = WindowLifecycleAnimator::new(true);
+        let transition = animator
+            .start_or_reverse(
+                request(window, 10, source, anchor, LifecycleDirection::Minimize),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize starts");
+
+        assert!(animator.snap_to_endpoint(
+            window,
+            transition,
+            AnimationTime::from_nanos(100_000_000),
+        ));
+        let endpoint = animator
+            .sample(window, AnimationTime::from_nanos(100_000_000))
+            .expect("snapped transition remains active");
+        assert_eq!(endpoint.transition_id, transition);
+        assert_eq!(endpoint.progress, 1.0);
+        assert_eq!(endpoint.source_rect, source);
+        assert_eq!(endpoint.anchor_rect, anchor);
+        assert!(endpoint.mathematically_settled);
+        assert_eq!(animator.active_count(), 1);
+        assert!(animator.acknowledge(window, transition, true));
     }
 
     #[test]

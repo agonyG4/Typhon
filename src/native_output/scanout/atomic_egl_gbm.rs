@@ -37,6 +37,7 @@ use crate::native_output::runtime::{
     direct_terminal_callback_owner_leaks, settle_failed_output_transaction,
     settle_no_visual_change_output_transaction,
 };
+use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
@@ -733,6 +734,12 @@ impl AtomicEglGbmScanout {
                     render_us: elapsed_micros(started),
                 })
             }
+            EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+                Ok(AtomicSlotRenderOutcome::LifecycleFallback {
+                    fallbacks,
+                    render_us: elapsed_micros(started),
+                })
+            }
         }
     }
 
@@ -1067,6 +1074,34 @@ impl AtomicEglGbmScanout {
                     reason,
                     render_us,
                     dmabuf_gpu_release: dmabuf_gpu_release_lease_id.zip(release_fence),
+                });
+            }
+            Ok(AtomicSlotRenderOutcome::LifecycleFallback {
+                fallbacks,
+                render_us,
+            }) => {
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::RenderExecution,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("lifecycle fallback transaction has no frame batch")
+                        })?;
+                        server
+                            .discard_frame_batch(batch_id, FrameBatchDiscardReason::RenderFailure);
+                        let _ = self.swapchain_mut()?.quarantine_rendering(
+                            None,
+                            OutputQuarantineReason::PostDrawRenderFailure,
+                        );
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                return Ok(AtomicFrameRenderOutcome::LifecycleFallback {
+                    fallbacks,
+                    render_us,
                 });
             }
             Err(error) => {
@@ -1562,6 +1597,10 @@ pub(crate) enum AtomicSlotRenderOutcome {
         reason: FrameSkipReason,
         render_us: u64,
     },
+    LifecycleFallback {
+        fallbacks: LifecycleRenderFallbacks,
+        render_us: u64,
+    },
 }
 
 #[expect(
@@ -1592,6 +1631,10 @@ pub(crate) enum AtomicFrameRenderOutcome {
             oblivion_one::compositor::DmabufGpuReleaseLeaseId,
             NativeRenderFence,
         )>,
+    },
+    LifecycleFallback {
+        fallbacks: LifecycleRenderFallbacks,
+        render_us: u64,
     },
 }
 

@@ -1210,6 +1210,12 @@ impl NativeRuntime {
                     ))
                     .into());
                 }
+                AtomicSlotRenderOutcome::LifecycleFallback { fallbacks, .. } => {
+                    return Err(io::Error::other(format!(
+                        "native initial modeset lifecycle fallback: {fallbacks:?}"
+                    ))
+                    .into());
+                }
             };
             let stats =
                 parts.paint_stats(explicit.format_modifier.fourcc, target.width, target.height);
@@ -1281,6 +1287,12 @@ impl NativeRuntime {
             NativePaintOutcome::Rendered { lifecycle, .. } => lifecycle.clone(),
             NativePaintOutcome::Skipped(_) => {
                 return Err(io::Error::other("native initial scanout unexpectedly skipped").into());
+            }
+            NativePaintOutcome::LifecycleFallback { fallbacks, .. } => {
+                return Err(io::Error::other(format!(
+                    "native initial scanout lifecycle fallback: {fallbacks:?}"
+                ))
+                .into());
             }
         };
         let initial_paint_stats = initial_paint.require_rendered("initial native scanout")?;
