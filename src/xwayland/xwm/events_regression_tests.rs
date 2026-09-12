@@ -7,8 +7,9 @@ use std::{
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
 use crate::xwayland::XwaylandAssociationEvent;
 use x11rb::{
-    protocol::{Event, sync, xproto},
-    x11_utils::ExtensionInformation,
+    connection::Connection,
+    protocol::{Event, shape, sync, xproto},
+    x11_utils::{ExtensionInformation, Serialize},
 };
 
 use super::super::X11WindowSnapshot;
@@ -18,7 +19,7 @@ use super::tests::{
     complete_property_refresh, generation, map_event, prepare_managed_window, ready_events,
     ready_surface_id, test_fixture, unmap_event,
 };
-use super::{X11Geometry, X11WindowLifecycle, normalize};
+use super::{X11Geometry, X11WindowLifecycle, drain, normalize};
 
 fn alarm_notify_event(alarm: u32, counter_value: u64) -> Event {
     Event::SyncAlarmNotify(sync::AlarmNotifyEvent {
@@ -37,6 +38,48 @@ fn alarm_notify_event(alarm: u32, counter_value: u64) -> Event {
         timestamp: 0,
         state: sync::ALARMSTATE::ACTIVE,
     })
+}
+
+fn raw_alarm_notify(
+    alarm: u32,
+    counter_value: u64,
+    first_event: u8,
+    state: sync::ALARMSTATE,
+) -> [u8; 32] {
+    sync::AlarmNotifyEvent {
+        response_type: first_event.saturating_add(sync::ALARM_NOTIFY_EVENT),
+        kind: 0,
+        sequence: 17,
+        alarm,
+        counter_value: sync::Int64 {
+            hi: (counter_value >> 32) as i32,
+            lo: counter_value as u32,
+        },
+        alarm_value: sync::Int64 {
+            hi: (counter_value >> 32) as i32,
+            lo: counter_value as u32,
+        },
+        timestamp: 123,
+        state,
+    }
+    .serialize()
+}
+
+fn install_extension(
+    xwm: &mut super::super::Xwm,
+    name: &'static str,
+    major_opcode: u8,
+    first_event: u8,
+    first_error: u8,
+) {
+    xwm.connection.set_extensions(HashMap::from([(
+        name,
+        ExtensionInformation {
+            major_opcode,
+            first_event,
+            first_error,
+        },
+    )]));
 }
 
 fn read_fixture_requests(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
@@ -1564,6 +1607,217 @@ fn xsync_request_precedes_configure() {
         vec![18, 25, 12],
         "allow-off, sync request, and ConfigureWindow must be ordered"
     );
+}
+
+#[test]
+fn raw_sync_alarm_notify_decodes_through_connection_poll() {
+    let generation = generation(235);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let first_event = 80;
+    install_extension(&mut xwm, sync::X11_EXTENSION_NAME, 128, first_event, 100);
+    let raw = raw_alarm_notify(0xfeed, 7, first_event, sync::ALARMSTATE::INACTIVE);
+    peer.write_all(&raw).expect("raw AlarmNotify");
+
+    let event = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll raw AlarmNotify")
+        .expect("one raw AlarmNotify");
+    match event {
+        Event::SyncAlarmNotify(event) => {
+            assert_eq!(event.response_type, first_event + sync::ALARM_NOTIFY_EVENT);
+            assert_eq!(event.sequence, 17);
+            assert_eq!(event.alarm, 0xfeed);
+            assert_eq!(event.counter_value.lo, 7);
+            assert_eq!(event.timestamp, 123);
+            assert_eq!(event.state, sync::ALARMSTATE::INACTIVE);
+        }
+        other => panic!("raw Sync event decoded as {other:?}"),
+    }
+}
+
+#[test]
+fn raw_sync_alarm_notify_reaches_resize_state_machine_through_drain() {
+    let generation = generation(236);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 236, true, false, false);
+    let first_event = 80;
+    xwm.capabilities.sync = true;
+    install_extension(&mut xwm, sync::X11_EXTENSION_NAME, 128, first_event, 100);
+    xwm.windows
+        .get_mut(handle)
+        .expect("managed window")
+        .snapshot = Some(sync_snapshot(handle, 41));
+
+    super::super::commands::begin_resize_sync(
+        &mut xwm,
+        handle,
+        X11Geometry {
+            width: 901,
+            height: 701,
+            ..X11Geometry::default()
+        },
+        7,
+        100,
+        false,
+    )
+    .expect("begin synchronized resize");
+    let alarm = *xwm.sync_alarms.get(&handle).expect("owned alarm");
+    peer.write_all(&raw_alarm_notify(
+        alarm,
+        7,
+        first_event,
+        sync::ALARMSTATE::INACTIVE,
+    ))
+    .expect("raw AlarmNotify");
+
+    let drain_result = drain(&mut xwm, 8).expect("drain raw AlarmNotify");
+    assert_eq!(drain_result.processed, 1);
+    assert_eq!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::AckObserved {
+            counter_value: 7,
+            deadline_ns: 100,
+        }
+    );
+    assert!(xwm.sync_alarm_bindings.contains_key(&alarm));
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [XwmEvent::ResizeSyncAckObserved { window, counter_value }]
+            if *window == handle && *counter_value == 7
+    ));
+}
+
+#[test]
+fn raw_unregistered_extension_event_remains_unknown() {
+    let generation = generation(237);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    install_extension(&mut xwm, sync::X11_EXTENSION_NAME, 128, 80, 100);
+    let raw = [79_u8; 32];
+    peer.write_all(&raw).expect("unknown extension event");
+
+    let event = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll unknown extension event")
+        .expect("one unknown extension event");
+    assert!(matches!(event, Event::Unknown(bytes) if bytes == raw));
+}
+
+#[test]
+fn raw_core_event_decodes_with_empty_extension_registry() {
+    let generation = generation(238);
+    let (xwm, mut peer) = test_fixture(generation);
+    let event = xproto::MapNotifyEvent {
+        response_type: xproto::MAP_NOTIFY_EVENT,
+        sequence: 23,
+        event: 1,
+        window: 2,
+        override_redirect: false,
+    };
+    let raw: [u8; 32] = event.into();
+    peer.write_all(&raw).expect("core MapNotify");
+
+    let decoded = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll core event")
+        .expect("one core event");
+    assert!(
+        matches!(decoded, Event::MapNotify(event) if event.window == 2 && event.sequence == 23)
+    );
+}
+
+#[test]
+fn raw_shape_event_decodes_from_registered_extension() {
+    let generation = generation(239);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let first_event = 90;
+    install_extension(&mut xwm, shape::X11_EXTENSION_NAME, 129, first_event, 110);
+    let event = shape::NotifyEvent {
+        response_type: first_event + shape::NOTIFY_EVENT,
+        shape_kind: shape::SK::BOUNDING,
+        sequence: 29,
+        affected_window: 77,
+        extents_x: 3,
+        extents_y: 4,
+        extents_width: 640,
+        extents_height: 480,
+        server_time: 321,
+        shaped: true,
+    };
+    peer.write_all(&event.serialize()).expect("raw ShapeNotify");
+
+    let decoded = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll ShapeNotify")
+        .expect("one ShapeNotify");
+    assert!(matches!(
+        decoded,
+        Event::ShapeNotify(event)
+            if event.response_type == first_event
+                && event.affected_window == 77
+                && event.extents_width == 640
+                && event.shaped
+    ));
+}
+
+#[test]
+fn raw_core_error_decodes_with_empty_extension_registry() {
+    let generation = generation(240);
+    let (xwm, mut peer) = test_fixture(generation);
+    let mut raw = [0_u8; 32];
+    raw[1] = xproto::WINDOW_ERROR;
+    raw[2..4].copy_from_slice(&31_u16.to_ne_bytes());
+    raw[4..8].copy_from_slice(&0xfeed_u32.to_ne_bytes());
+    raw[8..10].copy_from_slice(&7_u16.to_ne_bytes());
+    raw[10] = xproto::CONFIGURE_WINDOW_REQUEST;
+    peer.write_all(&raw).expect("core X11 error");
+
+    let decoded = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll core error")
+        .expect("one core error");
+    match decoded {
+        Event::Error(error) => {
+            assert_eq!(error.error_code, xproto::WINDOW_ERROR);
+            assert_eq!(error.sequence, 31);
+            assert_eq!(error.extension_name, None);
+        }
+        other => panic!("core error decoded as {other:?}"),
+    }
+}
+
+#[test]
+fn registered_extension_error_uses_registry_first_error() {
+    let generation = generation(241);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let first_error = 100;
+    install_extension(&mut xwm, sync::X11_EXTENSION_NAME, 128, 80, first_error);
+    let mut raw = [0_u8; 32];
+    raw[1] = first_error + sync::ALARM_ERROR;
+    raw[2..4].copy_from_slice(&37_u16.to_ne_bytes());
+    raw[8..10].copy_from_slice(&u16::from(sync::DESTROY_ALARM_REQUEST).to_ne_bytes());
+    raw[10] = 128;
+    peer.write_all(&raw).expect("Sync extension error");
+
+    let decoded = xwm
+        .connection
+        .poll_for_event()
+        .expect("poll Sync error")
+        .expect("one Sync error");
+    match decoded {
+        Event::Error(error) => {
+            assert_eq!(error.error_code, first_error + sync::ALARM_ERROR);
+            assert_eq!(
+                error.extension_name.as_deref(),
+                Some(sync::X11_EXTENSION_NAME)
+            );
+        }
+        other => panic!("Sync error decoded as {other:?}"),
+    }
 }
 
 #[test]

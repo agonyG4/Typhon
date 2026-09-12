@@ -16,11 +16,58 @@ use x11rb::{
     protocol::{Event, xproto::Setup},
     rust_connection::{DefaultStream, PollMode, RustConnection, Stream},
     utils::RawFdContainer,
-    x11_utils::{ExtensionInformation, TryParse, TryParseFd, X11Error},
+    x11_utils::{ExtInfoProvider, ExtensionInformation, TryParse, TryParseFd, X11Error},
 };
 use x11rb_protocol::{RawEventAndSeqNumber, SequenceNumber};
 
 pub(crate) const MAX_XWM_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// The single discovered-extension metadata authority for XWM requests and
+/// response decoding.  x11rb's `RustConnection` keeps its own private manager,
+/// so the incremental startup results must be supplied directly here.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExtensionRegistry {
+    by_name: HashMap<&'static str, ExtensionInformation>,
+}
+
+impl ExtensionRegistry {
+    fn from_map(by_name: HashMap<&'static str, ExtensionInformation>) -> Self {
+        Self { by_name }
+    }
+
+    fn replace(&mut self, by_name: HashMap<&'static str, ExtensionInformation>) {
+        self.by_name = by_name;
+    }
+
+    fn get(&self, extension_name: &'static str) -> Option<ExtensionInformation> {
+        self.by_name.get(extension_name).copied()
+    }
+}
+
+impl ExtInfoProvider for ExtensionRegistry {
+    fn get_from_major_opcode(&self, major_opcode: u8) -> Option<(&str, ExtensionInformation)> {
+        self.by_name
+            .iter()
+            .find(|(_, info)| info.major_opcode == major_opcode)
+            .map(|(name, info)| (*name, *info))
+    }
+
+    fn get_from_event_code(&self, event_code: u8) -> Option<(&str, ExtensionInformation)> {
+        self.by_name
+            .iter()
+            .filter(|(_, info)| info.first_event <= event_code)
+            .max_by_key(|(_, info)| info.first_event)
+            .map(|(name, info)| (*name, *info))
+    }
+
+    fn get_from_error_code(&self, error_code: u8) -> Option<(&str, ExtensionInformation)> {
+        self.by_name
+            .iter()
+            .filter(|(_, info)| info.first_error <= error_code)
+            .max_by_key(|(_, info)| info.first_error)
+            .map(|(name, info)| (*name, *info))
+    }
+}
 
 /// The stream used by the reactor-owned XWM connection.
 ///
@@ -222,7 +269,7 @@ impl<S: Stream + AsRawFd> Stream for ReactorStream<S> {
 #[derive(Debug)]
 pub(crate) struct X11Connection {
     inner: RustConnection<ReactorStream>,
-    extensions: HashMap<&'static str, ExtensionInformation>,
+    extensions: ExtensionRegistry,
     deferred_events: Mutex<VecDeque<RawEventAndSeqNumber<Vec<u8>>>>,
 }
 
@@ -233,7 +280,7 @@ impl X11Connection {
     ) -> Self {
         Self {
             inner,
-            extensions,
+            extensions: ExtensionRegistry::from_map(extensions),
             deferred_events: Mutex::new(VecDeque::new()),
         }
     }
@@ -250,7 +297,7 @@ impl X11Connection {
         &mut self,
         extensions: HashMap<&'static str, ExtensionInformation>,
     ) {
-        self.extensions = extensions;
+        self.extensions.replace(extensions);
     }
 
     pub(crate) fn defer_raw_event(&self, event: RawEventAndSeqNumber<Vec<u8>>) {
@@ -326,7 +373,7 @@ impl RequestConnection for X11Connection {
         &self,
         extension_name: &'static str,
     ) -> Result<Option<ExtensionInformation>, ConnectionError> {
-        Ok(self.extensions.get(extension_name).copied())
+        Ok(self.extensions.get(extension_name))
     }
 
     fn wait_for_reply_or_raw_error(
@@ -366,11 +413,11 @@ impl RequestConnection for X11Connection {
     }
 
     fn parse_error(&self, error: &[u8]) -> Result<X11Error, ParseError> {
-        self.inner.parse_error(error)
+        X11Error::try_parse(error, &self.extensions)
     }
 
     fn parse_event(&self, event: &[u8]) -> Result<Event, ParseError> {
-        self.inner.parse_event(event)
+        Event::parse(event, &self.extensions)
     }
 }
 
@@ -414,6 +461,8 @@ mod tests {
         io::{Read, Write},
         os::unix::net::UnixStream,
     };
+
+    use x11rb::x11_utils::ExtInfoProvider;
 
     use super::*;
 
@@ -461,6 +510,85 @@ mod tests {
             },
             queued_output: Mutex::new(VecDeque::new()),
         }
+    }
+
+    #[test]
+    fn extension_registry_uses_x11rb_lookup_semantics() {
+        let composite = ExtensionInformation {
+            major_opcode: 128,
+            first_event: 40,
+            first_error: 80,
+        };
+        let shape = ExtensionInformation {
+            major_opcode: 129,
+            first_event: 50,
+            first_error: 90,
+        };
+        let sync = ExtensionInformation {
+            major_opcode: 130,
+            first_event: 60,
+            first_error: 100,
+        };
+        let registry = ExtensionRegistry::from_map(HashMap::from([
+            ("Composite", composite),
+            ("SHAPE", shape),
+            ("SYNC", sync),
+        ]));
+
+        assert_eq!(registry.get("SYNC"), Some(sync));
+        assert_eq!(registry.get("unknown"), None);
+        assert_eq!(registry.get_from_major_opcode(129), Some(("SHAPE", shape)));
+        assert_eq!(registry.get_from_major_opcode(127), None);
+        assert_eq!(registry.get_from_event_code(55), Some(("SHAPE", shape)));
+        assert_eq!(registry.get_from_event_code(65), Some(("SYNC", sync)));
+        assert_eq!(registry.get_from_event_code(39), None);
+        assert_eq!(registry.get_from_error_code(95), Some(("SHAPE", shape)));
+        assert_eq!(registry.get_from_error_code(105), Some(("SYNC", sync)));
+        assert_eq!(registry.get_from_error_code(79), None);
+    }
+
+    #[test]
+    fn extension_registry_replacement_discards_stale_information() {
+        let old = ExtensionInformation {
+            major_opcode: 128,
+            first_event: 40,
+            first_error: 80,
+        };
+        let new = ExtensionInformation {
+            major_opcode: 129,
+            first_event: 50,
+            first_error: 90,
+        };
+        let registry = ExtensionRegistry::from_map(HashMap::from([("OLD", old)]));
+        assert_eq!(registry.get("OLD"), Some(old));
+
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("reactor stream");
+        let setup = Setup {
+            roots: vec![x11rb::protocol::xproto::Screen {
+                root: 1,
+                root_visual: 1,
+                root_depth: 24,
+                width_in_pixels: 1,
+                height_in_pixels: 1,
+                ..x11rb::protocol::xproto::Screen::default()
+            }],
+            resource_id_base: 0x100000,
+            resource_id_mask: 0x0fffff,
+            maximum_request_length: u16::MAX,
+            ..Setup::default()
+        };
+        let inner = RustConnection::for_connected_stream(stream, setup).expect("connection");
+        let mut connection = X11Connection::new(inner, HashMap::from([("OLD", old)]));
+        assert_eq!(connection.extensions, registry);
+        connection.set_extensions(HashMap::from([("NEW", new)]));
+        assert_eq!(connection.extension_information("OLD").unwrap(), None);
+        assert_eq!(connection.extension_information("NEW").unwrap(), Some(new));
+        assert_eq!(connection.extensions.get_from_major_opcode(128), None);
+        assert_eq!(
+            connection.extensions.get_from_major_opcode(129),
+            Some(("NEW", new))
+        );
     }
 
     #[test]
