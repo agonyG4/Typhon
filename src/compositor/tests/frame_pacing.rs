@@ -182,7 +182,61 @@ fn fifo_request_after_surface_destroy_is_the_exact_surface_error() {
         error.code,
         client_wp_fifo_v1::Error::SurfaceDestroyed as u32
     );
-    let _ = stop_test_server(running, server_thread);
+    let server = stop_test_server(running, server_thread);
+    let record = server
+        .state
+        .protocol_error_trace
+        .records()
+        .next()
+        .expect("FIFO surface-destroyed error should be attributed");
+    assert_eq!(record.interface, ProtocolErrorInterface::Fifo);
+    assert_eq!(record.category, ProtocolErrorCategory::SurfaceDestroyed);
+    assert_eq!(
+        record.error_code,
+        Some(client_wp_fifo_v1::Error::SurfaceDestroyed as u32)
+    );
+    assert_eq!(record.surface_id, Some(1));
+}
+
+#[test]
+fn commit_timer_request_after_surface_destroy_is_attributed() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let (connection, _globals, queue, compositor, _fifo_manager, timing_manager) =
+        qualified_connection(&socket_path).unwrap();
+    let qh = queue.handle();
+    let surface = compositor.create_surface(&qh, ());
+    let timer = timing_manager.get_timer(&surface, &qh, ());
+    connection.roundtrip().unwrap();
+    surface.destroy();
+    connection.roundtrip().unwrap();
+    timer.set_timestamp(0, 0, 0);
+    let result = connection.roundtrip();
+    assert!(result.is_err());
+    let error = connection
+        .protocol_error()
+        .expect("commit-timing request after surface destruction must fail");
+    assert_eq!(error.object_interface, "wp_commit_timer_v1");
+    assert_eq!(
+        error.code,
+        client_wp_commit_timer_v1::Error::SurfaceDestroyed as u32
+    );
+
+    let server = stop_test_server(running, server_thread);
+    let record = server
+        .state
+        .protocol_error_trace
+        .records()
+        .next()
+        .expect("commit-timing surface-destroyed error should be attributed");
+    assert_eq!(record.interface, ProtocolErrorInterface::CommitTiming);
+    assert_eq!(record.category, ProtocolErrorCategory::SurfaceDestroyed);
+    assert_eq!(
+        record.error_code,
+        Some(client_wp_commit_timer_v1::Error::SurfaceDestroyed as u32)
+    );
 }
 
 #[test]

@@ -46,7 +46,10 @@ impl Dispatch<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()> f
                     );
                     return;
                 };
-                let sync_state = Arc::new(SyncobjSurfaceState::new(surface.downgrade()));
+                let sync_state = Arc::new(SyncobjSurfaceState::new(
+                    compositor_surface_id(&surface),
+                    surface.downgrade(),
+                ));
                 if !surface_data.attach_explicit_sync(sync_state.clone()) {
                     state.post_protocol_error(
                         client,
@@ -110,7 +113,7 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
 {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
         request: wp_linux_drm_syncobj_surface_v1::Request,
         data: &Arc<SyncobjSurfaceState>,
@@ -127,7 +130,13 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
-                    state.note_protocol_error_metric();
+                    state.note_protocol_error_for_resource(
+                        client,
+                        resource,
+                        SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
+                        Some(data.surface_id()),
+                        ProtocolErrorCategory::SurfaceDestroyed,
+                    );
                     data.post_error(
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
                         "associated wl_surface was destroyed",
@@ -148,7 +157,13 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
-                    state.note_protocol_error_metric();
+                    state.note_protocol_error_for_resource(
+                        client,
+                        resource,
+                        SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
+                        Some(data.surface_id()),
+                        ProtocolErrorCategory::SurfaceDestroyed,
+                    );
                     data.post_error(
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
                         "associated wl_surface was destroyed",

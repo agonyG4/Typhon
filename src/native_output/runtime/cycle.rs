@@ -556,7 +556,6 @@ impl NativeRuntime {
         }
         if presentation_work {
             render_attempted = true;
-            let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             let phase_started_at_ns = self
                 .pointer_timing
                 .enabled()
@@ -586,13 +585,6 @@ impl NativeRuntime {
             if let Some(start_ns) = phase_started_at_ns {
                 self.pointer_timing.record_phase(
                     NativePointerTimingPhase::RenderPresentKms,
-                    start_ns,
-                    monotonic_now_ns()?,
-                );
-            }
-            if let Some(start_ns) = slow_phase_started_at_ns {
-                self.slow_cycle_trace.record_phase(
-                    SlowCyclePhase::RenderPresentKms,
                     start_ns,
                     monotonic_now_ns()?,
                 );

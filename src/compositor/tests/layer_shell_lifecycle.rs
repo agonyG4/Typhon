@@ -542,8 +542,23 @@ fn layer_surface_explicit_sync_waits_then_publishes_and_destroy_pending_is_safe(
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(capture_renderable_surface_count(&commands), 0);
 
+    sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 7);
+    assert!(queue.roundtrip(&mut state).is_err());
+
     commands.send(ServerCommand::Stop).unwrap();
-    let _server = server_thread.join().unwrap();
+    let server = server_thread.join().unwrap();
+    let record = server
+        .state
+        .protocol_error_trace
+        .records()
+        .next()
+        .expect("syncobj surface-destroyed error should be attributed");
+    assert_eq!(record.interface, ProtocolErrorInterface::Syncobj);
+    assert_eq!(record.category, ProtocolErrorCategory::SurfaceDestroyed);
+    assert_eq!(
+        record.error_code,
+        Some(crate::compositor::SYNCOBJ_SURFACE_ERROR_NO_SURFACE)
+    );
 }
 
 #[test]

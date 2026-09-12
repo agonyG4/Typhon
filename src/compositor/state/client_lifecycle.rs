@@ -27,6 +27,51 @@ impl CompositorState {
 
     pub(in crate::compositor) fn note_protocol_error_metric(&mut self) {
         self.compliance_metrics.note_protocol_error();
+        // Some generated or internal protocol paths do not retain the client/resource
+        // that caused the error. Keep the counter and recorder coupled, while marking
+        // those records explicitly unavailable instead of silently dropping them.
+        self.protocol_error_trace.record(ProtocolErrorRecord {
+            timestamp_ns: protocol_error_timestamp_ns(),
+            client_id: None,
+            peer_pid: None,
+            interface: ProtocolErrorInterface::Other,
+            resource_id: None,
+            error_code: None,
+            surface_id: None,
+            xwayland_generation: None,
+            category: ProtocolErrorCategory::Unavailable,
+        });
+    }
+
+    pub(in crate::compositor) fn note_protocol_error_for_resource<I: Resource>(
+        &mut self,
+        client: &Client,
+        resource: &I,
+        code: impl Into<u32>,
+        surface_id: Option<u32>,
+        category: ProtocolErrorCategory,
+    ) {
+        self.compliance_metrics.note_protocol_error();
+        let interface = ProtocolErrorInterface::for_resource::<I>();
+        let xwayland_generation = matches!(interface, ProtocolErrorInterface::XwaylandShell)
+            .then(|| {
+                self.xwayland
+                    .client_identity
+                    .as_ref()
+                    .map(|identity| identity.generation.get())
+            })
+            .flatten();
+        self.protocol_error_trace.record(ProtocolErrorRecord {
+            timestamp_ns: protocol_error_timestamp_ns(),
+            client_id: Some(client.id()),
+            peer_pid: None,
+            interface,
+            resource_id: Some(resource.id().protocol_id()),
+            error_code: Some(code.into()),
+            surface_id,
+            xwayland_generation,
+            category,
+        });
     }
 
     pub(in crate::compositor) fn post_protocol_error<I: Resource>(
@@ -61,7 +106,15 @@ impl CompositorState {
         cleanup_now: bool,
     ) {
         let client_id = client.id();
-        self.note_protocol_error_metric();
+        let code = code.into();
+        let message = message.into();
+        self.note_protocol_error_for_resource(
+            client,
+            resource,
+            code,
+            None,
+            ProtocolErrorCategory::Wire,
+        );
         resource.post_error(code, message);
         if cleanup_now {
             self.teardown_client_resources(&client_id);

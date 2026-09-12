@@ -76,9 +76,9 @@ use super::{
     PointerConstraintTransitionSnapshot, PresentationClock, PresentationProtocolCapabilities,
     ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePresentationMetadata,
-    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePipelineEvent,
+    SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason,
+    WindowId, WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
     XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
@@ -164,6 +164,92 @@ impl OwnCompositorServer {
         self.state.compliance_metrics
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn trace_surface_pipeline_event(
+        &mut self,
+        kind: SurfacePipelineEvent,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        buffer_id: Option<u64>,
+        frame_batch_id: Option<u64>,
+        surface_tree_transaction_id: Option<u64>,
+        output_transaction_id: Option<u64>,
+        output_frame_id: Option<u64>,
+        pageflip_token: Option<u64>,
+    ) {
+        self.state.trace_surface_pipeline_event(
+            kind,
+            surface_id,
+            commit_sequence,
+            buffer_id,
+            frame_batch_id,
+            surface_tree_transaction_id,
+            output_transaction_id,
+            output_frame_id,
+            pageflip_token,
+        );
+    }
+
+    pub fn trace_surface_pipeline_surfaces(
+        &mut self,
+        kind: SurfacePipelineEvent,
+        surfaces: impl IntoIterator<Item = (u32, SurfaceCommitSequence, Option<u64>)>,
+        frame_batch_id: Option<u64>,
+        output_transaction_id: Option<u64>,
+        output_frame_id: Option<u64>,
+    ) {
+        if !self.state.surface_pipeline_trace_enabled() {
+            return;
+        }
+        for (surface_id, commit_sequence, buffer_id) in surfaces {
+            self.trace_surface_pipeline_event(
+                kind,
+                surface_id,
+                commit_sequence,
+                buffer_id,
+                frame_batch_id,
+                None,
+                output_transaction_id,
+                output_frame_id,
+                None,
+            );
+        }
+    }
+
+    pub fn trace_surface_pipeline_active_surfaces(
+        &mut self,
+        kind: SurfacePipelineEvent,
+        frame_batch_id: Option<u64>,
+        output_transaction_id: Option<u64>,
+        output_frame_id: Option<u64>,
+        pageflip_token: Option<u64>,
+    ) {
+        if !self.state.surface_pipeline_trace_enabled() {
+            return;
+        }
+        for index in 0..self.state.active_scene_surfaces().len() {
+            let (surface_id, commit_sequence, buffer_id) = {
+                let surface = &self.state.active_scene_surfaces()[index];
+                (
+                    surface.surface_id,
+                    surface.commit_sequence,
+                    Some(surface.buffer_id().get()),
+                )
+            };
+            self.trace_surface_pipeline_event(
+                kind,
+                surface_id,
+                commit_sequence,
+                buffer_id,
+                frame_batch_id,
+                None,
+                output_transaction_id,
+                output_frame_id,
+                pageflip_token,
+            );
+        }
+    }
+
     #[doc(hidden)]
     pub fn surface_locality_metrics(&self) -> SurfaceLocalityMetrics {
         self.state.locality_metrics.get()
@@ -187,6 +273,10 @@ impl OwnCompositorServer {
         if let Some(summary) = self.state.take_commit_debug_summary_line() {
             println!("{summary}");
         }
+        if self.state.compliance_metrics.protocol_errors_total > 0 {
+            self.state.protocol_error_trace.dump();
+        }
+        self.state.surface_pipeline_trace.dump();
     }
 
     pub fn disarm_shutdown_releases(&mut self) {
@@ -1889,6 +1979,13 @@ impl OwnCompositorServer {
     ) {
         self.state
             .complete_presented_frame_batch(frame_id, batch_id, presentation);
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::PresentationFeedbackCompleted,
+            Some(batch_id.get()),
+            None,
+            Some(frame_id),
+            None,
+        );
         let _ = self.display.flush_clients();
     }
 
@@ -1905,6 +2002,13 @@ impl OwnCompositorServer {
             batch_id,
             direct_surface_id,
             presentation,
+        );
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::PresentationFeedbackCompleted,
+            Some(batch_id.get()),
+            None,
+            None,
+            Some(frame_id),
         );
         let _ = self.display.flush_clients();
     }

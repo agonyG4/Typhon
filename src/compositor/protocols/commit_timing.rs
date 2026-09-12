@@ -64,7 +64,7 @@ impl Dispatch<wp_commit_timing_manager_v1::WpCommitTimingManagerV1, ()> for Comp
 impl Dispatch<wp_commit_timer_v1::WpCommitTimerV1, CommitTimerResourceData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_commit_timer_v1::WpCommitTimerV1,
         request: wp_commit_timer_v1::Request,
         data: &CommitTimerResourceData,
@@ -81,7 +81,13 @@ impl Dispatch<wp_commit_timer_v1::WpCommitTimerV1, CommitTimerResourceData> for 
                 tv_nsec,
             } => {
                 if !data.surface.is_alive() {
-                    state.note_protocol_error_metric();
+                    state.note_protocol_error_for_resource(
+                        client,
+                        resource,
+                        wp_commit_timer_v1::Error::SurfaceDestroyed,
+                        Some(data.surface_id),
+                        ProtocolErrorCategory::SurfaceDestroyed,
+                    );
                     resource.post_error(
                         wp_commit_timer_v1::Error::SurfaceDestroyed,
                         "associated wl_surface was destroyed",

@@ -503,14 +503,14 @@ impl NativeRuntime {
                 });
             }
         }
-        if let Some(start_ns) = slow_cycle_start_ns {
-            self.slow_cycle_trace.record_phase(
-                SlowCyclePhase::PostWakeMaintenance,
-                start_ns,
-                monotonic_now_ns()?,
-            );
-        }
         if !self.session.permits_output() {
+            if let Some(start_ns) = slow_cycle_start_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::PostWakeMaintenance,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
             return Ok(NativeCycleState {
                 wakeup,
                 work_class: NativeWorkClass::NoOutputWork,
@@ -534,6 +534,13 @@ impl NativeRuntime {
             });
         }
         let pageflip_drain_start = Instant::now();
+        if let Some(start_ns) = slow_cycle_start_ns {
+            self.slow_cycle_trace.record_phase(
+                SlowCyclePhase::PostWakeMaintenance,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
         let should_drain_pageflips = wakeup.reasons.drm()
             || (wakeup.reasons.timer()
                 && (frame_scheduler.page_flip_pending()
@@ -1163,6 +1170,13 @@ impl NativeRuntime {
                     );
                     dmabuf_gpu_release_registry
                         .note_composited_pageflip(transaction_id, presented_at_ns);
+                    server.trace_surface_pipeline_active_surfaces(
+                        oblivion_one::compositor::SurfacePipelineEvent::OutputFramePresented,
+                        Some(protocol_batch_id.get()),
+                        Some(transaction_id.get()),
+                        Some(frame.frame_id),
+                        Some(pageflip_token.get()),
+                    );
                     if !promote_pageflip_and_publish(scene_history, pageflip_token.get(), server) {
                         return Err(io::Error::other(
                             "composited pageflip scene promotion did not match transition",

@@ -100,7 +100,17 @@ impl
             }
             ext_background_effect_surface_v1::Request::SetBlurRegion { region } => {
                 if !data.surface.is_alive() {
-                    state.note_protocol_error_metric();
+                    if let Some(client) = resource.client() {
+                        state.note_protocol_error_for_resource(
+                            &client,
+                            resource,
+                            ext_background_effect_surface_v1::Error::SurfaceDestroyed,
+                            Some(data.surface_id),
+                            ProtocolErrorCategory::SurfaceDestroyed,
+                        );
+                    } else {
+                        state.note_protocol_error_metric();
+                    }
                     resource.post_error(
                         ext_background_effect_surface_v1::Error::SurfaceDestroyed,
                         "associated wl_surface was destroyed",

@@ -466,7 +466,17 @@ impl CompositorState {
         if !role.initial_configure_sent || requires_initial_ack {
             let resource = role.resource.clone();
             let debug_details = layer_surface_debug_details(surface_id, role, pending_surface_size);
-            self.note_protocol_error_metric();
+            if let Some(client) = resource.client() {
+                self.note_protocol_error_for_resource(
+                    &client,
+                    &resource,
+                    zwlr_layer_surface_v1::Error::InvalidSurfaceState,
+                    Some(surface_id),
+                    ProtocolErrorCategory::InvalidState,
+                );
+            } else {
+                self.note_protocol_error_metric();
+            }
             resource.post_error(
                 zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                 "layer surface buffer committed before configure was acknowledged".to_string(),
@@ -710,7 +720,17 @@ impl CompositorState {
         let pending = self.layer_surfaces[&surface_id].pending;
         if let Err(message) = validate_layer_surface_size(pending) {
             let resource = self.layer_surfaces[&surface_id].resource.clone();
-            self.note_protocol_error_metric();
+            if let Some(client) = resource.client() {
+                self.note_protocol_error_for_resource(
+                    &client,
+                    &resource,
+                    zwlr_layer_surface_v1::Error::InvalidSize,
+                    Some(surface_id),
+                    ProtocolErrorCategory::InvalidState,
+                );
+            } else {
+                self.note_protocol_error_metric();
+            }
             resource.post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
             return None;
         }

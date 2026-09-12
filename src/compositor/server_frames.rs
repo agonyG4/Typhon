@@ -356,6 +356,13 @@ impl OwnCompositorServer {
     ) {
         self.state
             .complete_frame_callbacks_after_admission(batch_id, admission);
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::FrameCallbacksAdmitted,
+            Some(batch_id.get()),
+            None,
+            None,
+            None,
+        );
         let _ = self.display.flush_clients();
     }
 
@@ -366,6 +373,13 @@ impl OwnCompositorServer {
 
     pub fn note_frame_callbacks_deferred_ready(&mut self, batch_id: CompositorFrameBatchId) {
         self.state.note_frame_callbacks_deferred_ready(batch_id);
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::FrameCallbacksDeferred,
+            Some(batch_id.get()),
+            None,
+            None,
+            None,
+        );
     }
 
     #[doc(hidden)]
@@ -375,6 +389,13 @@ impl OwnCompositorServer {
     ) {
         self.state
             .complete_direct_frame_callbacks_after_admission(batch_id);
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::FrameCallbacksAdmitted,
+            Some(batch_id.get()),
+            None,
+            None,
+            None,
+        );
         let _ = self.display.flush_clients();
     }
 

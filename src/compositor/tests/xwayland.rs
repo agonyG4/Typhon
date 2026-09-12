@@ -19,7 +19,62 @@ use wayland_client::protocol::{
     wl_surface as client_wl_surface,
 };
 use wayland_client::{Connection, EventQueue, globals::registry_queue_init};
-use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
+use wayland_protocols::xwayland::shell::v1::client::{
+    xwayland_shell_v1 as client_xwayland_shell_v1,
+    xwayland_surface_v1 as client_xwayland_surface_v1,
+};
+
+#[test]
+fn xwayland_shell_protocol_error_is_attributed() {
+    let socket_name = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero generation"));
+    let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .expect("insert private XWayland client");
+    let (running, server_thread) = super::spawn_test_server(server);
+    let connection = Connection::from_socket(client_stream).expect("create Wayland client");
+    let (globals, queue) = registry_queue_init::<super::RegistryTestState>(&connection)
+        .expect("read compositor globals");
+    let qh = queue.handle();
+    let shell: client_xwayland_shell_v1::XwaylandShellV1 =
+        globals.bind(&qh, 1..=1, ()).expect("bind XWayland shell");
+    let compositor: client_wl_compositor::WlCompositor =
+        globals.bind(&qh, 1..=6, ()).expect("bind compositor");
+    let surface = compositor.create_surface(&qh, ());
+    let xwayland_surface = shell.get_xwayland_surface(&surface, &qh, ());
+    xwayland_surface.set_serial(0, 0);
+    connection.flush().expect("flush invalid association");
+    assert!(connection.roundtrip().is_err());
+    let error = connection
+        .protocol_error()
+        .expect("invalid XWayland serial must be a protocol error");
+    assert_eq!(error.object_interface, "xwayland_surface_v1");
+    assert_eq!(
+        error.code,
+        client_xwayland_surface_v1::Error::InvalidSerial as u32
+    );
+
+    let server = super::stop_test_server(running, server_thread);
+    let record = server
+        .state
+        .protocol_error_trace
+        .records()
+        .next()
+        .expect("XWayland protocol error should be attributed");
+    assert_eq!(
+        record.interface,
+        super::ProtocolErrorInterface::XwaylandShell
+    );
+    assert_eq!(record.category, super::ProtocolErrorCategory::Wire);
+    assert_eq!(
+        record.error_code,
+        Some(client_xwayland_surface_v1::Error::InvalidSerial as u32)
+    );
+    assert_eq!(record.xwayland_generation, Some(1));
+}
 
 #[path = "xwayland_admission.rs"]
 mod xwayland_admission;

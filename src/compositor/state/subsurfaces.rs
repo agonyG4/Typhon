@@ -19,6 +19,7 @@ impl CompositorState {
         if explicit_sync.has_points() {
             explicit_sync.state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                 "explicit sync points were set without an attached buffer",
             );
@@ -544,6 +545,7 @@ impl CompositorState {
                 if acquire.is_some() || release.is_some() {
                     state.post_error_with_metrics(
                         &mut self.compliance_metrics,
+                        &mut self.protocol_error_trace,
                         SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                         "explicit sync points were set without an attached buffer",
                     );
@@ -554,6 +556,7 @@ impl CompositorState {
             if !pending.data.is_dmabuf() {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
+                    &mut self.protocol_error_trace,
                     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                     "explicit sync is only supported for linux-dmabuf buffers",
                 );
@@ -562,6 +565,7 @@ impl CompositorState {
             let Some(acquire) = acquire else {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
+                    &mut self.protocol_error_trace,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "dmabuf commit is missing an acquire timeline point",
                 );
@@ -570,6 +574,7 @@ impl CompositorState {
             let Some(release) = release else {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
+                    &mut self.protocol_error_trace,
                     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                     "dmabuf commit is missing a release timeline point",
                 );
@@ -578,6 +583,7 @@ impl CompositorState {
             if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
+                    &mut self.protocol_error_trace,
                     SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                     "acquire timeline point must be lower than release point on the same timeline",
                 );
@@ -591,6 +597,7 @@ impl CompositorState {
             let Some(commit_id) = self.acquire_commit_ids.allocate() else {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
+                    &mut self.protocol_error_trace,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "explicit sync commit identity space exhausted",
                 );
@@ -621,6 +628,17 @@ impl CompositorState {
                 acquire,
                 state: PendingAcquireState::RegistrationPending,
             });
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::AcquirePending,
+                *surface_id,
+                commit.commit_sequence,
+                Some(pending.resource.id().protocol_id().into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             self.note_explicit_commit_acquire_wait(commit.commit_id, commit.frame_callbacks.len());
         }
         Some(dependencies)
@@ -723,6 +741,27 @@ impl CompositorState {
             );
         }
         let transaction_id = self.allocate_surface_tree_transaction_id();
+        for (surface_id, commit) in &nodes {
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::TransactionQueued,
+                *surface_id,
+                commit.commit_sequence,
+                commit
+                    .attachment
+                    .as_ref()
+                    .and_then(|attachment| match attachment {
+                        PendingSurfaceAttachment::Buffer(buffer) => {
+                            Some(buffer.data.buffer_id().get())
+                        }
+                        PendingSurfaceAttachment::RemoveContent => None,
+                    }),
+                None,
+                Some(transaction_id.get()),
+                None,
+                None,
+                None,
+            );
+        }
         self.pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
                 id: transaction_id,
@@ -878,6 +917,27 @@ impl CompositorState {
         mut transaction: PendingSurfaceTreeTransaction,
         reason: AcquireWatchCancelReason,
     ) -> ReleasedSurfaceTreeState {
+        for (surface_id, commit) in &transaction.nodes {
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::TransactionAbandoned,
+                *surface_id,
+                commit.commit_sequence,
+                commit
+                    .attachment
+                    .as_ref()
+                    .and_then(|attachment| match attachment {
+                        PendingSurfaceAttachment::Buffer(buffer) => {
+                            Some(buffer.data.buffer_id().get())
+                        }
+                        PendingSurfaceAttachment::RemoveContent => None,
+                    }),
+                None,
+                Some(transaction.id.get()),
+                None,
+                None,
+                None,
+            );
+        }
         if self.external_acquire_readiness {
             for dependency in &transaction.dependencies {
                 self.pending_acquire_watch_changes

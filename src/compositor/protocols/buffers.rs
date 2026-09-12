@@ -244,6 +244,7 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
                         &state.dmabuf_feedback,
                         state.gpu_protocol_capabilities.wl_drm_formats(),
                         &mut state.compliance_metrics,
+                        &mut state.protocol_error_trace,
                         identity,
                     )
                 }) {
@@ -277,10 +278,11 @@ fn wl_drm_prime_buffer_data(
     feedback: &EglGlesDmabufFeedback,
     allowed_formats: &[u32],
     metrics: &mut CoreComplianceMetrics,
+    trace: &mut ProtocolErrorTrace,
     identity: BufferIdentity,
 ) -> Option<DmabufBufferData> {
     if request.width <= 0 || request.height <= 0 || request.offset0 < 0 || request.stride0 <= 0 {
-        metrics.note_protocol_error();
+        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidName);
         drm.post_error(
             wl_drm::Error::InvalidName,
             "wl_drm prime buffer dimensions are invalid".to_string(),
@@ -290,7 +292,7 @@ fn wl_drm_prime_buffer_data(
 
     let drm_format = DrmFormat::from_fourcc(request.format);
     if !matches!(drm_format, DrmFormat::Argb8888 | DrmFormat::Xrgb8888) {
-        metrics.note_protocol_error();
+        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidFormat);
         drm.post_error(
             wl_drm::Error::InvalidFormat,
             "unsupported wl_drm prime buffer format".to_string(),
@@ -300,7 +302,7 @@ fn wl_drm_prime_buffer_data(
     if !feedback.supports(drm_format, DrmModifier::LINEAR)
         || !allowed_formats.contains(&request.format)
     {
-        metrics.note_protocol_error();
+        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidFormat);
         drm.post_error(
             wl_drm::Error::InvalidFormat,
             "wl_drm prime buffers require a linear advertised format".to_string(),
@@ -311,7 +313,7 @@ fn wl_drm_prime_buffer_data(
     let minimum_stride = (request.width as u32).saturating_mul(4);
     let stride = request.stride0 as u32;
     if stride < minimum_stride || request.offset0 % 4 != 0 {
-        metrics.note_protocol_error();
+        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidName);
         drm.post_error(
             wl_drm::Error::InvalidName,
             "wl_drm prime buffer plane metadata is out of bounds".to_string(),
@@ -335,6 +337,16 @@ fn wl_drm_prime_buffer_data(
     )
     .ok()?;
     Some(DmabufBufferData { identity, handle })
+}
+
+fn note_wl_drm_protocol_error(
+    metrics: &mut CoreComplianceMetrics,
+    trace: &mut ProtocolErrorTrace,
+    resource: &wl_drm::WlDrm,
+    code: wl_drm::Error,
+) {
+    metrics.note_protocol_error();
+    trace.record_for_resource(resource, code.into(), ProtocolErrorCategory::Wire);
 }
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
@@ -430,6 +442,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                         modifier: ((modifier_hi as u64) << 32) | u64::from(modifier_lo),
                     },
                     &mut state.compliance_metrics,
+                    &mut state.protocol_error_trace,
                 );
             }
             zwp_linux_buffer_params_v1::Request::Create {
@@ -450,6 +463,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     &state.dmabuf_feedback,
                     state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
+                    &mut state.protocol_error_trace,
                     identity,
                 ) else {
                     resource.failed();
@@ -482,6 +496,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     &state.dmabuf_feedback,
                     state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
+                    &mut state.protocol_error_trace,
                     identity,
                 ) {
                     _data_init.init(buffer_id, buffer_data);

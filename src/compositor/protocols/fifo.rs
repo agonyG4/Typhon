@@ -64,7 +64,7 @@ impl Dispatch<wp_fifo_manager_v1::WpFifoManagerV1, ()> for CompositorState {
 impl Dispatch<wp_fifo_v1::WpFifoV1, FifoResourceData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_fifo_v1::WpFifoV1,
         request: wp_fifo_v1::Request,
         data: &FifoResourceData,
@@ -75,7 +75,13 @@ impl Dispatch<wp_fifo_v1::WpFifoV1, FifoResourceData> for CompositorState {
             wp_fifo_v1::Request::Destroy => state.remove_fifo_resource(resource, data.surface_id),
             wp_fifo_v1::Request::SetBarrier => {
                 if !data.surface.is_alive() {
-                    state.note_protocol_error_metric();
+                    state.note_protocol_error_for_resource(
+                        client,
+                        resource,
+                        wp_fifo_v1::Error::SurfaceDestroyed,
+                        Some(data.surface_id),
+                        ProtocolErrorCategory::SurfaceDestroyed,
+                    );
                     resource.post_error(
                         wp_fifo_v1::Error::SurfaceDestroyed,
                         "associated wl_surface was destroyed",
@@ -86,7 +92,13 @@ impl Dispatch<wp_fifo_v1::WpFifoV1, FifoResourceData> for CompositorState {
             }
             wp_fifo_v1::Request::WaitBarrier => {
                 if !data.surface.is_alive() {
-                    state.note_protocol_error_metric();
+                    state.note_protocol_error_for_resource(
+                        client,
+                        resource,
+                        wp_fifo_v1::Error::SurfaceDestroyed,
+                        Some(data.surface_id),
+                        ProtocolErrorCategory::SurfaceDestroyed,
+                    );
                     resource.post_error(
                         wp_fifo_v1::Error::SurfaceDestroyed,
                         "associated wl_surface was destroyed",

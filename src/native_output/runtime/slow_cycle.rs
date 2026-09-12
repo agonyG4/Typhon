@@ -21,10 +21,15 @@ pub(super) enum SlowCyclePhase {
     CursorControl = 5,
     XwaylandScene = 6,
     AcquirePrepare = 7,
-    RenderPresentKms = 8,
+    PresentationCursorPlanning = 8,
+    SceneResolveAndDamage = 9,
+    OutputTransactionPreparation = 10,
+    RendererAndFence = 11,
+    PostRenderBookkeeping = 12,
+    ReadyFrameKmsHandoff = 13,
 }
 
-const SLOW_CYCLE_PHASE_COUNT: usize = 9;
+const SLOW_CYCLE_PHASE_COUNT: usize = 14;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SlowCycleContext {
@@ -50,6 +55,7 @@ pub(super) struct SlowCycleRecord {
     /// Existing `NativeCycleState::input_drain_us`: backend begin/drain time;
     /// semantic input routing and coalescing are outside this measurement.
     pub(super) input_backend_drain_us: u64,
+    pub(super) compositor_render_us: u64,
     pub(super) unattributed_ns: u64,
     phase_ns: [u64; SLOW_CYCLE_PHASE_COUNT],
     pub(super) wake_reasons: u32,
@@ -84,6 +90,7 @@ impl Default for SlowCycleRecord {
             class: SlowCycleClass::Slow,
             wayland_dispatch_us: 0,
             input_backend_drain_us: 0,
+            compositor_render_us: 0,
             unattributed_ns: 0,
             phase_ns: [0; SLOW_CYCLE_PHASE_COUNT],
             wake_reasons: 0,
@@ -237,6 +244,13 @@ impl NativeSlowCycleTrace {
         active.record.input_backend_drain_us = input_backend_drain_us;
     }
 
+    pub(super) fn note_compositor_render_us(&mut self, render_us: u64) {
+        let Some(active) = self.state.as_mut().and_then(|state| state.active.as_mut()) else {
+            return;
+        };
+        active.record.compositor_render_us = render_us;
+    }
+
     #[cfg(test)]
     pub(super) fn note_xwayland(
         &mut self,
@@ -320,11 +334,25 @@ impl NativeSlowCycleTrace {
         if active.record.total_ns <= active.record.refresh_interval_ns {
             return;
         }
-        let measured_phase_ns = active
-            .record
-            .phase_ns
-            .into_iter()
-            .fold(0_u64, u64::saturating_add);
+        let measured_phase_ns = [
+            SlowCyclePhase::PostWakeMaintenance,
+            SlowCyclePhase::PageflipDrain,
+            SlowCyclePhase::XwaylandReactor,
+            SlowCyclePhase::TimerDeadline,
+            SlowCyclePhase::WaylandInput,
+            SlowCyclePhase::CursorControl,
+            SlowCyclePhase::XwaylandScene,
+            SlowCyclePhase::AcquirePrepare,
+            SlowCyclePhase::PresentationCursorPlanning,
+            SlowCyclePhase::SceneResolveAndDamage,
+            SlowCyclePhase::OutputTransactionPreparation,
+            SlowCyclePhase::RendererAndFence,
+            SlowCyclePhase::PostRenderBookkeeping,
+            SlowCyclePhase::ReadyFrameKmsHandoff,
+        ]
+        .into_iter()
+        .map(|phase| active.record.phase_ns[phase as usize])
+        .fold(0_u64, u64::saturating_add);
         active.record.unattributed_ns = active.record.total_ns.saturating_sub(measured_phase_ns);
         let severe_threshold = active.record.refresh_interval_ns.saturating_mul(2);
         active.record.class = if active.record.total_ns > severe_threshold {
@@ -352,13 +380,14 @@ impl NativeSlowCycleTrace {
         };
         for record in &state.records {
             eprintln!(
-                "typhon_slow_cycle class={:?} start_ns={} total_ns={} refresh_ns={} wayland_dispatch_us={} input_backend_drain_us={} unattributed_ns={} phases_ns={:?} wake=0x{:x} continuation=0x{:x} domains=0x{:x} ready_sources={} blocked_ns={} timer_lateness_ns={:?} x11_events={} x11_property_replies={} xwm_budget_exhausted={} xwm_events_translated={} xwm_commands_executed={} input_raw={} input_coalesced={} input_ready={} input_backlog_pending={} render_attempted={} frame_rendered={} frame_submitted={} pageflip_pending={} kms_queue_depth={} kms_worker_active={}",
+                "typhon_slow_cycle class={:?} start_ns={} total_ns={} refresh_ns={} wayland_dispatch_us={} input_backend_drain_us={} compositor_render_us={} unattributed_ns={} phases_ns={:?} wake=0x{:x} continuation=0x{:x} domains=0x{:x} ready_sources={} blocked_ns={} timer_lateness_ns={:?} x11_events={} x11_property_replies={} xwm_budget_exhausted={} xwm_events_translated={} xwm_commands_executed={} input_raw={} input_coalesced={} input_ready={} input_backlog_pending={} render_attempted={} frame_rendered={} frame_submitted={} pageflip_pending={} kms_queue_depth={} kms_worker_active={}",
                 record.class,
                 record.cycle_start_ns,
                 record.total_ns,
                 record.refresh_interval_ns,
                 record.wayland_dispatch_us,
                 record.input_backend_drain_us,
+                record.compositor_render_us,
                 record.unattributed_ns,
                 record.phase_ns,
                 record.wake_reasons,
@@ -450,7 +479,7 @@ mod tests {
         let mut trace = NativeSlowCycleTrace::new(true);
         trace.start_cycle_after_wake(100, 1_000, context());
         trace.record_phase(SlowCyclePhase::XwaylandReactor, 100, 350);
-        trace.record_phase(SlowCyclePhase::RenderPresentKms, 350, 1_250);
+        trace.record_phase(SlowCyclePhase::RendererAndFence, 350, 1_250);
         trace.note_xwayland(7, 5, true);
         trace.note_xwayland_scene(7, 3);
         trace.note_input(11, 4, true, true);
@@ -461,7 +490,7 @@ mod tests {
         assert_eq!(record.total_ns, 1_400);
         assert_eq!(record.refresh_interval_ns, 1_000);
         assert_eq!(record.phase(SlowCyclePhase::XwaylandReactor), 250);
-        assert_eq!(record.phase(SlowCyclePhase::RenderPresentKms), 900);
+        assert_eq!(record.phase(SlowCyclePhase::RendererAndFence), 900);
         assert_eq!(record.wake_reasons, 0x11);
         assert_eq!(record.continuation_reasons, 0x22);
         assert_eq!(record.work_domains, 0x44);
@@ -583,6 +612,35 @@ mod tests {
         let record = trace.retained_records().next().unwrap();
         assert_eq!(record.wayland_dispatch_us, 20_000);
         assert_eq!(record.input_backend_drain_us, 400);
+    }
+
+    #[test]
+    fn existing_renderer_duration_is_copied_into_the_slow_record() {
+        let mut trace = NativeSlowCycleTrace::new(true);
+        trace.start_cycle_after_wake(0, 1_000, SlowCycleContext::default());
+        trace.note_compositor_render_us(36_000);
+        trace.record_phase_duration(SlowCyclePhase::RendererAndFence, 36_000_000);
+        trace.finish_cycle(38_000_000);
+
+        let record = trace.retained_records().next().unwrap();
+        assert_eq!(record.compositor_render_us, 36_000);
+        assert_eq!(record.phase(SlowCyclePhase::RendererAndFence), 36_000_000);
+    }
+
+    #[test]
+    fn render_subphases_are_non_overlapping_for_residual_accounting() {
+        let mut trace = NativeSlowCycleTrace::new(true);
+        trace.start_cycle_after_wake(0, 1_000, SlowCycleContext::default());
+        trace.record_phase_duration(SlowCyclePhase::PresentationCursorPlanning, 100);
+        trace.record_phase_duration(SlowCyclePhase::SceneResolveAndDamage, 200);
+        trace.record_phase_duration(SlowCyclePhase::OutputTransactionPreparation, 300);
+        trace.record_phase_duration(SlowCyclePhase::RendererAndFence, 400);
+        trace.record_phase_duration(SlowCyclePhase::PostRenderBookkeeping, 100);
+        trace.record_phase_duration(SlowCyclePhase::ReadyFrameKmsHandoff, 200);
+        trace.finish_cycle(2_000);
+
+        let record = trace.retained_records().next().unwrap();
+        assert_eq!(record.unattributed_ns, 700);
     }
 
     #[test]

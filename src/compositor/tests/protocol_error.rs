@@ -204,6 +204,19 @@ fn invalid_scale_is_a_wire_error_and_does_not_disconnect_another_client() {
     );
     assert_eq!(server.state.surface_client_ids.len(), 1);
     assert_eq!(server.state.compliance_metrics.protocol_errors_total, 1);
+    let record = server
+        .state
+        .protocol_error_trace
+        .records()
+        .next()
+        .expect("wl_surface protocol error should be attributed");
+    assert_eq!(record.interface, ProtocolErrorInterface::CoreSurface);
+    assert_eq!(record.category, ProtocolErrorCategory::Wire);
+    assert_eq!(
+        record.error_code,
+        Some(client_wl_surface::Error::InvalidScale as u32)
+    );
+    assert_eq!(record.resource_id, Some(surface_a_id));
 }
 
 #[test]

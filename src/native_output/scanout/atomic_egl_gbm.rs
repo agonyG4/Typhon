@@ -13,6 +13,7 @@ use khronos_egl as egl;
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
     DrmContentType, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
+    SurfacePipelineEvent,
 };
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
@@ -904,6 +905,19 @@ impl AtomicEglGbmScanout {
             self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
             return Err(io::Error::other(error));
         }
+        server.trace_surface_pipeline_surfaces(
+            SurfacePipelineEvent::SceneResolved,
+            resolved_scene.surfaces.iter().map(|surface| {
+                (
+                    surface.surface_id,
+                    surface.commit_sequence,
+                    Some(surface.buffer_id().get()),
+                )
+            }),
+            Some(protocol_batch_id.get()),
+            Some(transaction_id.get()),
+            Some(frame_id),
+        );
         // This is the estimator's production render boundary. Everything before it may
         // include protocol bookkeeping or diagnostics; everything after it is explicit
         // scene encoding, fence export, and GPU work owned by this output frame.
@@ -1086,6 +1100,32 @@ impl AtomicEglGbmScanout {
             }
         };
         let render_us = parts.render_us;
+        server.trace_surface_pipeline_surfaces(
+            SurfacePipelineEvent::SceneSampled,
+            resolved_scene.surfaces.iter().map(|surface| {
+                (
+                    surface.surface_id,
+                    surface.commit_sequence,
+                    Some(surface.buffer_id().get()),
+                )
+            }),
+            Some(protocol_batch_id.get()),
+            Some(transaction_id.get()),
+            Some(frame_id),
+        );
+        server.trace_surface_pipeline_surfaces(
+            SurfacePipelineEvent::OutputFrameRendered,
+            resolved_scene.surfaces.iter().map(|surface| {
+                (
+                    surface.surface_id,
+                    surface.commit_sequence,
+                    Some(surface.buffer_id().get()),
+                )
+            }),
+            Some(protocol_batch_id.get()),
+            Some(transaction_id.get()),
+            Some(frame_id),
+        );
         let repaint_stats = parts.stats;
         let render_damage_signature = parts
             .scene_commit

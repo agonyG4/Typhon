@@ -16,8 +16,9 @@ use wayland_server::{
 use crate::syncobj::DrmSyncobjTimeline;
 
 use super::{
-    CoreComplianceMetrics, PendingSurfaceBuffer, RenderableSurfaceDamage, SurfaceCommitId,
-    SurfaceCommitSequence,
+    CoreComplianceMetrics, PendingSurfaceBuffer, ProtocolErrorCategory, ProtocolErrorInterface,
+    ProtocolErrorRecord, ProtocolErrorTrace, RenderableSurfaceDamage, SurfaceCommitId,
+    SurfaceCommitSequence, protocol_error_timestamp_ns,
 };
 
 pub(super) const SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS: u32 = 0;
@@ -251,6 +252,7 @@ pub(super) struct SyncobjTimelineData {
 
 #[derive(Debug)]
 pub(super) struct SyncobjSurfaceState {
+    surface_id: u32,
     surface: Weak<wl_surface::WlSurface>,
     resource: Mutex<Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>>,
     pending_acquire: Mutex<Option<ExplicitSyncPoint>>,
@@ -258,8 +260,9 @@ pub(super) struct SyncobjSurfaceState {
 }
 
 impl SyncobjSurfaceState {
-    pub(super) fn new(surface: Weak<wl_surface::WlSurface>) -> Self {
+    pub(super) fn new(surface_id: u32, surface: Weak<wl_surface::WlSurface>) -> Self {
         Self {
+            surface_id,
             surface,
             resource: Mutex::new(None),
             pending_acquire: Mutex::new(None),
@@ -286,6 +289,10 @@ impl SyncobjSurfaceState {
 
     pub(super) fn surface_is_alive(&self) -> bool {
         self.surface.is_alive()
+    }
+
+    pub(super) const fn surface_id(&self) -> u32 {
+        self.surface_id
     }
 
     pub(super) fn clear_resource(&self) {
@@ -315,10 +322,33 @@ impl SyncobjSurfaceState {
     pub(super) fn post_error_with_metrics(
         &self,
         metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
         code: u32,
         message: &str,
     ) {
         metrics.note_protocol_error();
+        let (client_id, resource_id) = self
+            .resource
+            .lock()
+            .ok()
+            .and_then(|resource| resource.as_ref().cloned())
+            .map_or((None, None), |resource| {
+                (
+                    resource.client().map(|client| client.id()),
+                    Some(resource.id().protocol_id()),
+                )
+            });
+        trace.record(ProtocolErrorRecord {
+            timestamp_ns: protocol_error_timestamp_ns(),
+            client_id,
+            peer_pid: None,
+            interface: ProtocolErrorInterface::Syncobj,
+            resource_id,
+            error_code: Some(code),
+            surface_id: Some(self.surface_id),
+            xwayland_generation: None,
+            category: ProtocolErrorCategory::InvalidState,
+        });
         self.post_error(code, message);
     }
 

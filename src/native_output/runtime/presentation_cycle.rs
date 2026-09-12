@@ -143,6 +143,7 @@ impl NativeRuntime {
             frame_pacing,
             presentation_trace,
             cursor_reveal_trace,
+            slow_cycle_trace,
             last_acquire_ready_at_ns,
             resize_perf: _,
             pointer_constraint_backend: _,
@@ -168,6 +169,9 @@ impl NativeRuntime {
         #[rustfmt::skip] let (render_generation, _scene_generation, scene_changed, pending_frame_work) = refreshed_published_state(server, *last_rendered_scene_generation);
         let effect_demand = server.effect_frame_demand_snapshot();
         let pacing_now_ns = monotonic_now_ns()?;
+        let slow_cycle_enabled = slow_cycle_trace.enabled();
+        let cursor_planning_started_at_ns =
+            slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
         #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
         let (client_cursor, client_cursor_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
@@ -297,6 +301,13 @@ impl NativeRuntime {
             effect_dirty_region: effect_demand.dirty_region.clone(),
             page_flip_pending: false,
         });
+        if let Some(start_ns) = cursor_planning_started_at_ns {
+            slow_cycle_trace.record_phase(
+                SlowCyclePhase::PresentationCursorPlanning,
+                start_ns,
+                monotonic_now_ns()?,
+            );
+        }
         if repaint_decision.repaint {
             frame_pacing.queue_visual(pacing_now_ns, render_generation);
             frame_scheduler.queue_visual_work();
@@ -711,7 +722,9 @@ impl NativeRuntime {
                     }
                 }
             });
-            match super::presentation_ready::submit_ready_frame(
+            let ready_handoff_started_at_ns =
+                slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
+            let ready_submission = super::presentation_ready::submit_ready_frame(
                 scheduler_decision,
                 worker_mode,
                 kms_commit_worker.as_ref(),
@@ -748,7 +761,15 @@ impl NativeRuntime {
                 perf,
                 #[cfg(test)]
                 native_io_recorder,
-            )? {
+            )?;
+            if let Some(start_ns) = ready_handoff_started_at_ns {
+                slow_cycle_trace.record_phase(
+                    SlowCyclePhase::ReadyFrameKmsHandoff,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
+            match ready_submission {
                 super::presentation_ready::ReadySubmissionResult::Submitted => {}
                 super::presentation_ready::ReadySubmissionResult::Unavailable => {
                     presentation_deadline.clear_scheduled_target();
@@ -1037,6 +1058,8 @@ impl NativeRuntime {
                     pending_frame_work,
                     effective_redraw_requested,
                 );
+                let scene_resolve_started_at_ns =
+                    slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
                 let (resolved_scene, output_damage) = resolve_scene_and_damage(
                     presented_planes
                         .primary
@@ -1058,6 +1081,13 @@ impl NativeRuntime {
                     target.width,
                     target.height,
                 );
+                if let Some(start_ns) = scene_resolve_started_at_ns {
+                    slow_cycle_trace.record_phase(
+                        SlowCyclePhase::SceneResolveAndDamage,
+                        start_ns,
+                        monotonic_now_ns()?,
+                    );
+                }
                 let no_primary_work = output_damage.is_empty()
                     && !effective_redraw_requested
                     && !effect_demand.continuous_visible
@@ -1223,6 +1253,8 @@ impl NativeRuntime {
                             > 0)
                         .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
                         .transpose()?;
+                        let render_call_started_at_ns =
+                            slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -1256,6 +1288,23 @@ impl NativeRuntime {
                         ).inspect_err(|_| {
                             frame_pacing.note_predictive_o1_failed();
                         })?;
+                        if let Some(start_ns) = render_call_started_at_ns {
+                            let render_call_ns = monotonic_now_ns()?.saturating_sub(start_ns);
+                            let renderer_ns = match &render_outcome {
+                                AtomicFrameRenderOutcome::Skipped { render_us, .. }
+                                | AtomicFrameRenderOutcome::Rendered { render_us, .. } => {
+                                    render_us.saturating_mul(1_000)
+                                }
+                            };
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::OutputTransactionPreparation,
+                                render_call_ns.saturating_sub(renderer_ns),
+                            );
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::RendererAndFence,
+                                renderer_ns,
+                            );
+                        }
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped {
                                 reason,
@@ -1355,6 +1404,9 @@ impl NativeRuntime {
                             }
                             #[rustfmt::skip]
                             AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
+                                if slow_cycle_enabled {
+                                    slow_cycle_trace.note_compositor_render_us(render_us);
+                                }
                                 frame_pacing.note_render_ready();
                                 if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
                                     frame_pacing.note_predictive_binding_after_render_completion(

@@ -72,6 +72,13 @@ impl NativeSceneHistory {
         self.presented.as_ref().map(|snapshot| snapshot.frame_id)
     }
 
+    pub(crate) fn submitted_frame_id(&self, token: u64) -> Option<u64> {
+        self.submitted
+            .iter()
+            .find(|(submitted_token, _)| *submitted_token == token)
+            .map(|(_, snapshot)| snapshot.frame_id)
+    }
+
     pub(crate) fn presented_snapshot(&self) -> Option<&NativeFrameSceneSnapshot> {
         self.presented.as_ref()
     }

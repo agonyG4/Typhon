@@ -93,7 +93,9 @@ mod plan;
 mod popup;
 mod presentation;
 mod presentation_modes;
+mod protocol_error_trace;
 mod protocols;
+mod surface_pipeline_trace;
 pub(crate) use protocols::cursor_shape::ProtocolCursorShape;
 mod render;
 mod runtime_files;
@@ -301,6 +303,10 @@ pub use presentation::{
     FramePresentation, PresentationClock, PresentationKind, PresentationTimestamp,
 };
 pub use presentation_modes::*;
+use protocol_error_trace::{
+    ProtocolErrorCategory, ProtocolErrorInterface, ProtocolErrorRecord, ProtocolErrorTrace,
+    protocol_error_timestamp_ns,
+};
 pub use render::{
     BufferAge, DecorationRenderInstance, DecorationSceneSnapshot, DesktopComposeRequest,
     DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
@@ -344,6 +350,8 @@ pub use surface::{
     SurfaceOpaqueRect, SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend,
     SurfaceResourceSyncState,
 };
+pub use surface_pipeline_trace::SurfacePipelineEvent;
+use surface_pipeline_trace::SurfacePipelineTrace;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCallbackTime(u32);
 impl FrameCallbackTime {
@@ -883,6 +891,8 @@ pub struct CompositorState {
     typhon_socket_name: Option<String>,
     pending_process_launches: VecDeque<PendingProcessLaunch>,
     compliance_metrics: CoreComplianceMetrics,
+    protocol_error_trace: ProtocolErrorTrace,
+    surface_pipeline_trace: SurfacePipelineTrace,
 }
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

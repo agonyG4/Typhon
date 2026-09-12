@@ -234,14 +234,17 @@ impl CompositorState {
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
         has_attachment_change: bool,
+        captured_buffer_id: Option<u64>,
     ) {
         if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
             let current = self.current_surface_buffers.get(&surface_id);
             let buffer_size =
                 current.and_then(|buffer| buffer.width().ok().zip(buffer.height().ok()));
-            let buffer_id = (!has_attachment_change)
-                .then(|| current.map(|buffer| buffer.buffer_id().get()))
-                .flatten();
+            let buffer_id = captured_buffer_id.or_else(|| {
+                (!has_attachment_change)
+                    .then(|| current.map(|buffer| buffer.buffer_id().get()))
+                    .flatten()
+            });
             let association_serial = self
                 .xwayland
                 .associations
@@ -268,6 +271,17 @@ impl CompositorState {
                     .map_or(commit_sequence, |latest| latest.max(commit_sequence)),
             );
         }
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::CommitCaptured,
+            surface_id,
+            commit_sequence,
+            captured_buffer_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     }
     pub(in crate::compositor) fn surface_publication_decision(
         &self,
@@ -1221,6 +1235,32 @@ impl CompositorState {
         surface_id: u32,
         reason: SurfaceTeardownReason,
     ) {
+        let commit_sequence = self
+            .active_surface_presentation_commits
+            .get(&surface_id)
+            .map(|active| active.commit_sequence)
+            .or_else(|| {
+                self.surface_publications
+                    .get(&surface_id)
+                    .and_then(|publication| publication.latest_published)
+            })
+            .unwrap_or_else(SurfaceCommitSequence::initial);
+        let buffer_id = self
+            .current_surface_buffers
+            .get(&surface_id)
+            .map(CurrentSurfaceBuffer::buffer_id)
+            .map(|buffer_id| buffer_id.get());
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::SurfaceDetached,
+            surface_id,
+            commit_sequence,
+            buffer_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if root_surface_id == surface_id {
             self.cancel_presentation_for_root(root_surface_id);
@@ -1436,8 +1476,8 @@ mod ordered_publication_tests {
     #[test]
     fn ordered_ready_commit_ignores_newer_received_attachment() {
         let mut state = CompositorState::default();
-        state.record_surface_commit_received(7, SurfaceCommitSequence(10), true);
-        state.record_surface_commit_received(7, SurfaceCommitSequence(11), true);
+        state.record_surface_commit_received(7, SurfaceCommitSequence(10), true, None);
+        state.record_surface_commit_received(7, SurfaceCommitSequence(11), true, None);
 
         assert_eq!(
             state.surface_publication_decision(
@@ -1740,7 +1780,7 @@ mod ordered_publication_tests {
 
         assert_ne!(metadata_epoch, content_epoch);
 
-        state.record_surface_commit_received(7, SurfaceCommitSequence(12), false);
+        state.record_surface_commit_received(7, SurfaceCommitSequence(12), false, None);
 
         assert_eq!(state.surface_content_epoch(7), metadata_epoch);
     }

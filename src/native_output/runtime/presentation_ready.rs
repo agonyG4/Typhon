@@ -176,6 +176,13 @@ pub(super) fn submit_ready_frame(
             // backend has accepted that token; pageflip-time transition
             // preparation is keyed by this same token.
             scene_history.queue_submission_or_error(token)?;
+            server.trace_surface_pipeline_active_surfaces(
+                oblivion_one::compositor::SurfacePipelineEvent::OutputFrameSubmitted,
+                callback_batch_id.map(|batch_id| batch_id.get()),
+                Some(transaction_id.get()),
+                scene_history.submitted_frame_id(token),
+                Some(token),
+            );
             explicit.mark_composited_submission();
             (
                 NativePresentResult::AsyncSubmitted {

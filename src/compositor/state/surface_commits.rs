@@ -685,6 +685,7 @@ impl CompositorState {
         if !pending.data.is_dmabuf() {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                 "explicit sync is only supported for linux-dmabuf buffers",
             );
@@ -695,6 +696,7 @@ impl CompositorState {
         let Some(acquire) = acquire else {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "dmabuf commit is missing an acquire timeline point",
             );
@@ -704,6 +706,7 @@ impl CompositorState {
         let Some(release) = release else {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                 "dmabuf commit is missing a release timeline point",
             );
@@ -714,6 +717,7 @@ impl CompositorState {
         if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                 "acquire timeline point must be lower than release point on the same timeline",
             );
@@ -734,6 +738,7 @@ impl CompositorState {
                 let Some(commit_id) = self.acquire_commit_ids.allocate() else {
                     sync_state.post_error_with_metrics(
                         &mut self.compliance_metrics,
+                        &mut self.protocol_error_trace,
                         SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                         "explicit sync commit identity space exhausted",
                     );
@@ -792,6 +797,7 @@ impl CompositorState {
         let Some(commit_id) = self.acquire_commit_ids.allocate() else {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
+                &mut self.protocol_error_trace,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "explicit sync commit identity space exhausted",
             );

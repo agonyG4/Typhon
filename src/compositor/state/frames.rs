@@ -445,6 +445,13 @@ impl CompositorState {
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
+        self.trace_surface_pipeline_active_surfaces(
+            SurfacePipelineEvent::FrameBatchBuilt,
+            Some(batch_id.get()),
+            None,
+            None,
+            None,
+        );
         self.rebuild_scene_work_index();
         batch_id
     }
@@ -992,6 +999,11 @@ impl CompositorState {
                     .buffer_release_metrics
                     .buffer_releases_completed
                     .saturating_add(1);
+                self.trace_surface_pipeline_buffer_release(
+                    buffer_id.get(),
+                    Some(batch_id.get()),
+                    Some(frame_id),
+                );
                 client_pacing_log(
                     "buffer_release_completed",
                     &[

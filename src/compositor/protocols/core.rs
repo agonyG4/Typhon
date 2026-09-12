@@ -128,6 +128,12 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     surface_id,
                     commit_sequence,
                     has_attachment_change,
+                    attachment.as_ref().and_then(|attachment| match attachment {
+                        PendingSurfaceAttachment::Buffer(buffer) => {
+                            Some(buffer.data.buffer_id().get())
+                        }
+                        PendingSurfaceAttachment::RemoveContent => None,
+                    }),
                 );
                 let buffer_size = match attachment.as_ref() {
                     Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer

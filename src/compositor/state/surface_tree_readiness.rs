@@ -29,6 +29,17 @@ impl CompositorState {
                     } else if self.active_fifo_barriers.contains_key(surface_id) {
                         self.surface_pacing_metrics.waits_blocked =
                             self.surface_pacing_metrics.waits_blocked.saturating_add(1);
+                        self.trace_surface_pipeline_event(
+                            SurfacePipelineEvent::FifoWaitBlocked,
+                            *surface_id,
+                            commit.commit_sequence,
+                            None,
+                            None,
+                            Some(transaction.id.get()),
+                            None,
+                            None,
+                            None,
+                        );
                     }
                 }
                 if commit
@@ -40,6 +51,17 @@ impl CompositorState {
                         .surface_pacing_metrics
                         .transactions_blocked_by_timing
                         .saturating_add(1);
+                    self.trace_surface_pipeline_event(
+                        SurfacePipelineEvent::CommitTimingBlocked,
+                        *surface_id,
+                        commit.commit_sequence,
+                        None,
+                        None,
+                        Some(transaction.id.get()),
+                        None,
+                        None,
+                        None,
+                    );
                 }
             }
         }
@@ -175,6 +197,55 @@ impl CompositorState {
                 .subsurface_transaction_metrics
                 .waiting_transactions_published
                 .saturating_add(1);
+            for (surface_id, commit) in &transaction.nodes {
+                if commit.pacing.fifo_wait_barrier
+                    && !commit.pacing.fifo_wait_ignored_for_synchronized_subsurface
+                {
+                    self.trace_surface_pipeline_event(
+                        SurfacePipelineEvent::FifoWaitReleased,
+                        *surface_id,
+                        commit.commit_sequence,
+                        None,
+                        None,
+                        Some(transaction.id.get()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                if commit.pacing.commit_timing.is_some() {
+                    self.trace_surface_pipeline_event(
+                        SurfacePipelineEvent::CommitTimingReleased,
+                        *surface_id,
+                        commit.commit_sequence,
+                        None,
+                        None,
+                        Some(transaction.id.get()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                self.trace_surface_pipeline_event(
+                    SurfacePipelineEvent::TransactionPromoted,
+                    *surface_id,
+                    commit.commit_sequence,
+                    commit
+                        .attachment
+                        .as_ref()
+                        .and_then(|attachment| match attachment {
+                            PendingSurfaceAttachment::Buffer(buffer) => {
+                                Some(buffer.data.buffer_id().get())
+                            }
+                            PendingSurfaceAttachment::RemoveContent => None,
+                        }),
+                    None,
+                    Some(transaction.id.get()),
+                    None,
+                    None,
+                    None,
+                );
+            }
             self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
         }
         self.pending_surface_tree_transactions = transactions;

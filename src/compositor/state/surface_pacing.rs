@@ -299,6 +299,17 @@ impl CompositorState {
                     .entry(surface_id)
                     .or_default()
                     .push((surface_generation, commit_sequence, readiness));
+                self.trace_surface_pipeline_event(
+                    SurfacePipelineEvent::CommitTimingCaptured,
+                    surface_id,
+                    commit_sequence,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
             }
             return;
         }
@@ -323,11 +334,33 @@ impl CompositorState {
             .surface_pacing_metrics
             .barriers_activated
             .saturating_add(1);
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::FifoBarrierSet,
+            surface_id,
+            commit_sequence,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         if let Some(readiness) = pacing.commit_timing_readiness {
             self.active_commit_timing_targets
                 .entry(surface_id)
                 .or_default()
                 .push((surface_generation, commit_sequence, readiness));
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::CommitTimingCaptured,
+                surface_id,
+                commit_sequence,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
     }
 

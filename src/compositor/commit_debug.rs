@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use wayland_server::{Resource, backend::ObjectId, protocol::wl_callback};
 
-use super::PendingAcquireState;
+use super::{PendingAcquireState, SurfaceCommitSequence, SurfacePipelineEvent};
 
 macro_rules! commit_debug_println {
     ($($arg:tt)*) => {
@@ -101,6 +101,7 @@ struct LiveCommit {
     surface: u32,
     root: u32,
     sequence: u64,
+    buffer_id: Option<u64>,
     acquire_state: PendingAcquireState,
     visual_generation: Option<u64>,
 }
@@ -159,6 +160,7 @@ impl super::CompositorState {
                 surface,
                 root,
                 sequence,
+                buffer_id,
                 acquire_state: PendingAcquireState::RegistrationPending,
                 visual_generation: None,
             },
@@ -222,6 +224,17 @@ impl super::CompositorState {
                 .saturating_add(1);
         }
         let live = live.clone();
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::AcquireReady,
+            live.surface,
+            SurfaceCommitSequence(live.sequence),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         self.commit_log(
             "acquire_ready",
             id,
@@ -272,6 +285,17 @@ impl super::CompositorState {
             }
         }
         if let (Some(live), Some(disposition)) = (live, disposition) {
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::CommitSuperseded,
+                live.surface,
+                SurfaceCommitSequence(live.sequence),
+                live.buffer_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             self.commit_log(
                 match disposition {
                     SurfaceCommitDisposition::SupersededWhileReady => "superseded_ready",
@@ -327,6 +351,17 @@ impl super::CompositorState {
             }
         }
         if let Some(live) = live {
+            self.trace_surface_pipeline_event(
+                SurfacePipelineEvent::CommitSuperseded,
+                live.surface,
+                SurfaceCommitSequence(live.sequence),
+                live.buffer_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             self.commit_log(
                 "merged",
                 id,
@@ -425,6 +460,17 @@ impl super::CompositorState {
         let Some(live) = self.commit_debug.live.remove(&id) else {
             return;
         };
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::CommitDiscarded,
+            live.surface,
+            SurfaceCommitSequence(live.sequence),
+            live.buffer_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         self.commit_debug
             .metrics
             .note_publication_rejected(live.acquire_state, decision);
@@ -463,6 +509,17 @@ impl super::CompositorState {
         let Some(live) = self.commit_debug.live.remove(&id) else {
             return;
         };
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::CommitDiscarded,
+            live.surface,
+            SurfaceCommitSequence(live.sequence),
+            live.buffer_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         self.commit_log(
             "destroyed",
             id,
@@ -484,6 +541,17 @@ impl super::CompositorState {
         let Some(live) = self.commit_debug.live.remove(&id) else {
             return;
         };
+        self.trace_surface_pipeline_event(
+            SurfacePipelineEvent::CommitDiscarded,
+            live.surface,
+            SurfaceCommitSequence(live.sequence),
+            live.buffer_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         self.commit_log(
             "destroyed",
             id,
@@ -690,13 +758,49 @@ mod tests {
 
     #[test]
     fn surface_destruction_retires_live_commit_id_without_reuse() {
-        let mut state = super::super::CompositorState::default();
+        let mut state = super::super::CompositorState {
+            surface_pipeline_trace: super::super::surface_pipeline_trace::SurfacePipelineTrace::new(
+                true, 8,
+            ),
+            ..Default::default()
+        };
         let id = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
         state.note_explicit_commit_captured(id, 7, 11, None, &[]);
         state.note_explicit_commit_destroyed(id, "surface_destroyed");
         let next = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13));
         assert!(next.get() > id.get());
         assert!(!state.commit_debug.live.contains_key(&id));
+        let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, SurfacePipelineEvent::CommitDiscarded);
+        assert_eq!(records[0].surface_id, 7);
+        assert_eq!(
+            records[0].commit_sequence,
+            super::super::SurfaceCommitSequence(11)
+        );
+    }
+
+    #[test]
+    fn superseded_commit_is_retained_in_surface_lineage() {
+        let mut state = super::super::CompositorState {
+            surface_pipeline_trace: super::super::surface_pipeline_trace::SurfacePipelineTrace::new(
+                true, 8,
+            ),
+            ..Default::default()
+        };
+        let id = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
+        state.note_explicit_commit_captured(id, 7, 11, Some(19), &[]);
+        state.note_explicit_commit_superseded(
+            id,
+            PendingAcquireState::RegistrationPending,
+            0,
+            SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13)),
+            "test",
+        );
+        let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, SurfacePipelineEvent::CommitSuperseded);
+        assert_eq!(records[0].buffer_id, Some(19));
     }
 
     #[test]

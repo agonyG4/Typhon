@@ -18,8 +18,8 @@ use crate::render_backend::egl_gles::{EglGlesDmabufFeedback, EglGlesDmabufFormat
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    CompositorState, CoreComplianceMetrics, gpu_protocol_capabilities::GpuFormat,
-    unique_runtime_file_path,
+    CompositorState, CoreComplianceMetrics, ProtocolErrorCategory, ProtocolErrorTrace,
+    gpu_protocol_capabilities::GpuFormat, unique_runtime_file_path,
 };
 
 const WL_DRM_CAPABILITIES_SINCE: u32 = 2;
@@ -300,9 +300,15 @@ impl DmabufParamsData {
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         plane: PendingDmabufPlane,
         metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
     ) {
         if self.is_used() {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::AlreadyUsed,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::AlreadyUsed,
                 "linux-dmabuf params already used".to_string(),
@@ -310,7 +316,12 @@ impl DmabufParamsData {
             return;
         }
         if plane.plane_idx > 3 {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::PlaneIdx,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::PlaneIdx,
                 "dmabuf plane index is outside the supported EGL import range".to_string(),
@@ -318,7 +329,12 @@ impl DmabufParamsData {
             return;
         }
         if plane.stride == 0 {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::OutOfBounds,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::OutOfBounds,
                 "invalid dmabuf plane offset or stride".to_string(),
@@ -330,7 +346,12 @@ impl DmabufParamsData {
             .iter()
             .any(|existing| existing.plane_idx == plane.plane_idx)
         {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::PlaneSet,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::PlaneSet,
                 "dmabuf plane index was already provided".to_string(),
@@ -350,12 +371,18 @@ impl DmabufParamsData {
         feedback: &EglGlesDmabufFeedback,
         allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
     ) -> bool {
-        if !self.mark_used(params, metrics) {
+        if !self.mark_used(params, metrics, trace) {
             return false;
         }
         if width <= 0 || height <= 0 {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::InvalidDimensions,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::InvalidDimensions,
                 "dmabuf width and height must be positive".to_string(),
@@ -364,7 +391,12 @@ impl DmabufParamsData {
         }
         let planes = self.planes.lock().unwrap();
         let Some(plane) = planes.first() else {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::Incomplete,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::Incomplete,
                 "dmabuf create requires at least one plane".to_string(),
@@ -378,7 +410,12 @@ impl DmabufParamsData {
                 allowed_formats,
             )
         {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::InvalidFormat,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::InvalidFormat,
                 "dmabuf format + modifier pair is not advertised by compositor feedback"
@@ -388,7 +425,12 @@ impl DmabufParamsData {
         }
         let _fd = plane.fd.as_fd();
         if plane.offset % 4 != 0 {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::OutOfBounds,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::OutOfBounds,
                 "dmabuf plane offset is not aligned".to_string(),
@@ -409,6 +451,7 @@ impl DmabufParamsData {
         feedback: &EglGlesDmabufFeedback,
         allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
         identity: BufferIdentity,
     ) -> Option<DmabufBufferData> {
         if !self.validate_for_create(
@@ -419,6 +462,7 @@ impl DmabufParamsData {
             feedback,
             allowed_formats,
             metrics,
+            trace,
         ) {
             return None;
         }
@@ -442,7 +486,12 @@ impl DmabufParamsData {
         match DmabufBufferHandle::new(size, drm_format, planes) {
             Ok(handle) => Some(DmabufBufferData { identity, handle }),
             Err(_) => {
-                metrics.note_protocol_error();
+                note_dmabuf_protocol_error(
+                    metrics,
+                    trace,
+                    params,
+                    zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
+                );
                 params.post_error(
                     zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
                     "invalid dmabuf buffer metadata".to_string(),
@@ -463,10 +512,16 @@ impl DmabufParamsData {
         &self,
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
     ) -> bool {
         let mut used = self.used.lock().unwrap();
         if *used {
-            metrics.note_protocol_error();
+            note_dmabuf_protocol_error(
+                metrics,
+                trace,
+                params,
+                zwp_linux_buffer_params_v1::Error::AlreadyUsed,
+            );
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::AlreadyUsed,
                 "linux-dmabuf params already used".to_string(),
@@ -480,6 +535,16 @@ impl DmabufParamsData {
     fn is_used(&self) -> bool {
         *self.used.lock().unwrap()
     }
+}
+
+fn note_dmabuf_protocol_error(
+    metrics: &mut CoreComplianceMetrics,
+    trace: &mut ProtocolErrorTrace,
+    resource: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+    code: zwp_linux_buffer_params_v1::Error,
+) {
+    metrics.note_protocol_error();
+    trace.record_for_resource(resource, code.into(), ProtocolErrorCategory::Wire);
 }
 
 #[derive(Debug, Clone)]
