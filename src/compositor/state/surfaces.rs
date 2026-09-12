@@ -1314,6 +1314,7 @@ impl CompositorState {
         }
         self.deactivate_pointer_constraints_for_surface(surface_id, false);
         let cached = self.subsurface_transactions.remove_subtree(surface_id);
+        self.update_synchronized_cache_metrics();
         self.release_cached_subsurface_commits(cached);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);

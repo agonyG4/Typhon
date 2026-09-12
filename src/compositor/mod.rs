@@ -340,9 +340,9 @@ pub use state::{
 };
 use state_data::*;
 use subsurface::{
-    CachedSubsurfaceCommit, CapturedPointerConstraintSurfaceState,
-    PointerConstraintLifecycleCommit, PointerConstraintRegionCommit, SubsurfaceSyncMode,
-    SubsurfaceTransactionState,
+    CacheAdmissionFailure, CacheCommitOutcome, CachedSubsurfaceCommit,
+    CapturedPointerConstraintSurfaceState, PointerConstraintLifecycleCommit,
+    PointerConstraintRegionCommit, SubsurfaceSyncMode, SubsurfaceTransactionState,
 };
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
@@ -465,7 +465,12 @@ pub struct ResizeFlowMetrics {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubsurfaceTransactionMetrics {
     pub synchronized_child_commits_cached: u64,
+    pub cached_commits_appended: u64,
     pub cached_commits_merged: u64,
+    pub cached_commits_rejected: u64,
+    pub cache_per_surface_limit_hits: u64,
+    pub cache_per_client_limit_hits: u64,
+    pub cache_global_limit_hits: u64,
     pub tree_transactions_prepared: u64,
     pub tree_transactions_published: u64,
     pub tree_transactions_waiting_on_acquire: u64,
@@ -490,6 +495,14 @@ pub struct SubsurfaceTransactionMetrics {
     pub maximum_waiting_slots_per_root: usize,
     pub maximum_explicit_sync_queue_depth: usize,
     pub maximum_cached_nodes: usize,
+    pub current_cached_entries: usize,
+    pub maximum_cached_entries: usize,
+    pub maximum_cached_entries_per_surface: usize,
+    pub maximum_cached_entries_per_client: usize,
+    pub current_cached_obligations: usize,
+    pub maximum_cached_obligations: usize,
+    pub maximum_cached_obligations_per_surface: usize,
+    pub maximum_cached_obligations_per_client: usize,
     pub maximum_tree_depth: usize,
     pub maximum_transaction_wait_ms: u64,
     pub synchronized_child_immediate_publish_attempts: u64,
@@ -716,6 +729,7 @@ pub struct CompositorState {
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
     pending_client_resource_exhaustions: Vec<u32>,
+    pending_client_resource_exhaustion_clients: HashSet<ClientId>,
     pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,

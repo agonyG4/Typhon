@@ -27,7 +27,7 @@ impl OwnCompositorServer {
                         code: 2,
                         object_id: 1,
                         object_interface: "wl_display".to_string(),
-                        message: "surface tree pacing transaction queue exhausted".to_string(),
+                        message: "surface Content Update/cache resources exhausted".to_string(),
                     },
                 );
             }

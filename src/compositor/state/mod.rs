@@ -38,6 +38,7 @@ mod surface_pacing;
 mod surface_transactions;
 mod surface_tree_readiness;
 mod surfaces;
+mod synchronized_cache;
 mod tiled_layout;
 mod tiled_resize;
 mod window_actions;

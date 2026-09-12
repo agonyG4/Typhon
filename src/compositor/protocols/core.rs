@@ -452,7 +452,7 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
                     state.post_protocol_error(client, resource, code, error.message());
                     return;
                 }
-                if !state.register_subsurface_relationship(surface_id, parent_id) {
+                if !state.register_subsurface_relationship(surface_id, parent_id, client.id()) {
                     state.rollback_surface_role_reservation(
                         surface_id,
                         SurfaceRole::Subsurface { parent_id },

@@ -1,0 +1,424 @@
+use super::*;
+use std::{os::unix::net::UnixStream, sync::Arc};
+
+use wayland_server::{Display, protocol::wl_callback};
+
+fn test_client(
+    display_handle: &mut wayland_server::DisplayHandle,
+) -> (wayland_server::Client, UnixStream) {
+    let (server_end, peer) = UnixStream::pair().expect("cache test client");
+    let client = display_handle
+        .insert_client(server_end, Arc::new(()))
+        .expect("insert cache test client");
+    (client, peer)
+}
+
+#[test]
+fn new_role_defaults_to_synchronized() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert_eq!(
+        state.requested_mode(2),
+        Some(SubsurfaceSyncMode::Synchronized)
+    );
+    assert!(state.is_effectively_synchronized(2));
+}
+
+#[test]
+fn set_sync_and_set_desync_record_requested_mode() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
+    assert_eq!(
+        state.requested_mode(2),
+        Some(SubsurfaceSyncMode::Desynchronized)
+    );
+    assert!(state.set_mode(2, SubsurfaceSyncMode::Synchronized));
+    assert_eq!(
+        state.requested_mode(2),
+        Some(SubsurfaceSyncMode::Synchronized)
+    );
+}
+
+#[test]
+fn desynchronized_descendant_under_synchronized_ancestor_remains_effectively_sync() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.register(3, 2));
+    assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
+    assert!(state.is_effectively_synchronized(3));
+    assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
+    assert!(!state.is_effectively_synchronized(3));
+}
+
+#[test]
+fn role_registration_rejects_reuse_and_cycles() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(!state.register(2, 3));
+    assert!(!state.register(1, 2));
+}
+
+#[test]
+fn role_destruction_removes_only_that_role_while_surface_teardown_removes_subtree() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.register(3, 2));
+    assert!(state.remove_role(2).is_empty());
+    assert_eq!(state.parent(2), None);
+    assert_eq!(state.parent(3), Some(2));
+
+    assert!(state.register(4, 1));
+    assert!(state.register(5, 4));
+    assert!(state.remove_subtree(4).is_empty());
+    assert_eq!(state.parent(4), None);
+    assert_eq!(state.parent(5), None);
+}
+
+#[test]
+fn pacing_boundaries_are_never_merged_or_reordered() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+
+    let mut first = crate::compositor::state::empty_cached_subsurface_commit();
+    first.pacing = CapturedSurfacePacing {
+        fifo_set_barrier: true,
+        ..CapturedSurfacePacing::default()
+    };
+    let mut second = crate::compositor::state::empty_cached_subsurface_commit();
+    second.pacing = CapturedSurfacePacing {
+        fifo_wait_barrier: true,
+        ..CapturedSurfacePacing::default()
+    };
+
+    assert!(matches!(
+        state.cache_commit(2, first),
+        CacheCommitOutcome::Inserted
+    ));
+    assert!(matches!(
+        state.cache_commit(2, second),
+        CacheCommitOutcome::Inserted
+    ));
+    assert_eq!(state.roles[&2].cached_commits.len(), 2);
+    assert!(state.roles[&2].cached_commits[0].pacing.fifo_set_barrier);
+    assert!(state.roles[&2].cached_commits[1].pacing.fifo_wait_barrier);
+}
+
+#[test]
+fn synchronized_cache_does_not_grow_past_the_surface_limit() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+
+    for sequence in 0..8 {
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        commit.commit_id = SurfaceCommitId::for_tests(sequence + 1);
+        commit.commit_sequence = SurfaceCommitSequence(sequence + 1);
+        commit.pacing.fifo_set_barrier = true;
+        assert!(matches!(
+            state.cache_commit(2, commit),
+            CacheCommitOutcome::Inserted
+        ));
+    }
+    let mut rejected = crate::compositor::state::empty_cached_subsurface_commit();
+    rejected.commit_id = SurfaceCommitId::for_tests(9);
+    rejected.commit_sequence = SurfaceCommitSequence(9);
+    rejected.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(2, rejected),
+        CacheCommitOutcome::Rejected {
+            reason: CacheAdmissionFailure::PerSurfaceEntryLimit,
+            ..
+        }
+    ));
+
+    assert_eq!(state.roles[&2].cached_commits.len(), 8);
+    assert_eq!(state.cached_entry_count(), 8);
+    assert_eq!(state.maximum_cached_entries(), 8);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn ordinary_commits_after_a_boundary_merge_into_the_tail() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+
+    let mut boundary = crate::compositor::state::empty_cached_subsurface_commit();
+    boundary.commit_id = SurfaceCommitId::for_tests(1);
+    boundary.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(2, boundary),
+        CacheCommitOutcome::Inserted
+    ));
+
+    let mut tail_merges = 0;
+    for sequence in 2..=4 {
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        commit.commit_id = SurfaceCommitId::for_tests(sequence);
+        commit.commit_sequence = SurfaceCommitSequence(sequence);
+        if matches!(
+            state.cache_commit(2, commit),
+            CacheCommitOutcome::Merged { .. }
+        ) {
+            tail_merges += 1;
+        }
+    }
+
+    assert_eq!(tail_merges, 2);
+    assert_eq!(state.roles[&2].cached_commits.len(), 2);
+    assert_eq!(
+        state.roles[&2].cached_commits[0].commit_id,
+        SurfaceCommitId::for_tests(1)
+    );
+    assert_eq!(
+        state.roles[&2].cached_commits[1].commit_id,
+        SurfaceCommitId::for_tests(4)
+    );
+}
+
+#[test]
+fn boundary_stress_remains_bounded_without_retaining_rejected_commits() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+
+    for sequence in 1..=100_000 {
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        commit.commit_id = SurfaceCommitId::for_tests(sequence);
+        commit.commit_sequence = SurfaceCommitSequence(sequence);
+        commit.pacing.fifo_set_barrier = true;
+        state.cache_commit(2, commit);
+    }
+
+    assert_eq!(state.roles[&2].cached_commits.len(), 8);
+    assert_eq!(state.cached_entry_count(), 8);
+    assert_eq!(state.maximum_cached_entries(), 8);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn ordinary_and_boundary_commits_remain_ordered_at_the_tail() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+
+    let mut ordinary = crate::compositor::state::empty_cached_subsurface_commit();
+    ordinary.commit_id = SurfaceCommitId::for_tests(1);
+    assert!(matches!(
+        state.cache_commit(2, ordinary),
+        CacheCommitOutcome::Inserted
+    ));
+
+    let mut boundary = crate::compositor::state::empty_cached_subsurface_commit();
+    boundary.commit_id = SurfaceCommitId::for_tests(2);
+    boundary.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(2, boundary),
+        CacheCommitOutcome::Inserted
+    ));
+
+    let mut after_boundary = crate::compositor::state::empty_cached_subsurface_commit();
+    after_boundary.commit_id = SurfaceCommitId::for_tests(3);
+    assert!(matches!(
+        state.cache_commit(2, after_boundary),
+        CacheCommitOutcome::Inserted
+    ));
+
+    assert_eq!(state.roles[&2].cached_commits.len(), 3);
+    assert_eq!(
+        state.roles[&2]
+            .cached_commits
+            .iter()
+            .map(|commit| commit.commit_id)
+            .collect::<Vec<_>>(),
+        vec![
+            SurfaceCommitId::for_tests(1),
+            SurfaceCommitId::for_tests(2),
+            SurfaceCommitId::for_tests(3),
+        ]
+    );
+}
+
+#[test]
+fn latch_desync_and_teardown_settle_cache_accounting() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.register(3, 2));
+
+    assert!(matches!(
+        state.cache_commit(
+            2,
+            crate::compositor::state::empty_cached_subsurface_commit()
+        ),
+        CacheCommitOutcome::Inserted
+    ));
+    assert_eq!(state.cached_entry_count(), 1);
+    assert_eq!(state.take_latched_commits(1).len(), 1);
+    assert_eq!(state.cached_entry_count(), 0);
+    assert_eq!(state.cached_node_count(), 0);
+    assert!(state.debug_accounting_is_consistent());
+
+    assert!(matches!(
+        state.cache_commit(
+            3,
+            crate::compositor::state::empty_cached_subsurface_commit()
+        ),
+        CacheCommitOutcome::Inserted
+    ));
+    assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
+    assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
+    assert_eq!(state.take_desynchronized_subtree_commits(2).len(), 1);
+    assert_eq!(state.cached_entry_count(), 0);
+    assert!(state.debug_accounting_is_consistent());
+
+    assert!(matches!(
+        state.cache_commit(
+            3,
+            crate::compositor::state::empty_cached_subsurface_commit()
+        ),
+        CacheCommitOutcome::Inserted
+    ));
+    assert_eq!(state.remove_subtree(2).len(), 1);
+    assert_eq!(state.cached_entry_count(), 0);
+    assert_eq!(state.cached_obligation_count(), 0);
+    assert_eq!(state.cached_node_count(), 0);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn global_entry_limit_rejects_without_eviction() {
+    let mut state = SubsurfaceTransactionState::default();
+    for surface_id in 2..=513 {
+        assert!(state.register(surface_id, 1));
+        for sequence in 0..MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE {
+            let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+            commit.commit_id =
+                SurfaceCommitId::for_tests(u64::from(surface_id) * 16 + sequence as u64);
+            commit.commit_sequence =
+                SurfaceCommitSequence(u64::from(surface_id) * 16 + sequence as u64);
+            commit.pacing.fifo_set_barrier = true;
+            assert!(matches!(
+                state.cache_commit(surface_id, commit),
+                CacheCommitOutcome::Inserted
+            ));
+        }
+    }
+    assert!(state.register(514, 1));
+
+    let mut rejected = crate::compositor::state::empty_cached_subsurface_commit();
+    rejected.commit_id = SurfaceCommitId::for_tests(9000);
+    rejected.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(514, rejected),
+        CacheCommitOutcome::Rejected {
+            reason: CacheAdmissionFailure::TotalEntryLimit,
+            ..
+        }
+    ));
+    assert_eq!(
+        state.cached_entry_count(),
+        MAX_SYNCHRONIZED_CACHED_COMMITS_TOTAL
+    );
+    assert_eq!(state.roles[&2].cached_commits.len(), 8);
+    assert_eq!(state.roles[&513].cached_commits.len(), 8);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn per_client_entry_limit_cannot_be_bypassed_by_many_surfaces() {
+    let display = Display::<crate::compositor::CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (client_a, _peer_a) = test_client(&mut display_handle);
+    let (client_b, _peer_b) = test_client(&mut display_handle);
+    let mut state = SubsurfaceTransactionState::default();
+
+    for surface_id in 2..=33 {
+        assert!(state.register_with_client(surface_id, 1, Some(client_a.id())));
+        for sequence in 0..MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE {
+            let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+            commit.commit_id =
+                SurfaceCommitId::for_tests(u64::from(surface_id) * 16 + sequence as u64);
+            commit.pacing.fifo_set_barrier = true;
+            assert!(matches!(
+                state.cache_commit(surface_id, commit),
+                CacheCommitOutcome::Inserted
+            ));
+        }
+    }
+    assert_eq!(state.maximum_cached_entries_per_client(), 256);
+
+    assert!(state.register_with_client(34, 1, Some(client_a.id())));
+    let mut rejected = crate::compositor::state::empty_cached_subsurface_commit();
+    rejected.commit_id = SurfaceCommitId::for_tests(9000);
+    rejected.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(34, rejected),
+        CacheCommitOutcome::Rejected {
+            reason: CacheAdmissionFailure::PerClientEntryLimit,
+            ..
+        }
+    ));
+    assert_eq!(state.cached_entry_count(), 256);
+    assert_eq!(state.roles[&34].cached_commits.len(), 0);
+
+    assert!(state.register_with_client(35, 1, Some(client_b.id())));
+    let mut other_client_commit = crate::compositor::state::empty_cached_subsurface_commit();
+    other_client_commit.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.cache_commit(35, other_client_commit),
+        CacheCommitOutcome::Inserted
+    ));
+    assert_eq!(state.cached_entry_count(), 257);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn merge_path_is_bounded_by_retained_callback_obligations() {
+    let display = Display::<crate::compositor::CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (client, _peer) = test_client(&mut display_handle);
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register_with_client(2, 1, Some(client.id())));
+
+    for _ in 0..MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE {
+        let callback = client
+            .create_resource::<wl_callback::WlCallback, (), crate::compositor::CompositorState>(
+                &display_handle,
+                1,
+                (),
+            )
+            .expect("callback resource");
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        commit.frame_callbacks.push(callback);
+        assert!(matches!(
+            state.cache_commit(2, commit),
+            CacheCommitOutcome::Inserted | CacheCommitOutcome::Merged { .. }
+        ));
+    }
+
+    assert_eq!(state.roles[&2].cached_commits.len(), 1);
+    assert_eq!(
+        state.cached_obligation_count(),
+        MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE
+    );
+
+    let callback = client
+        .create_resource::<wl_callback::WlCallback, (), crate::compositor::CompositorState>(
+            &display_handle,
+            1,
+            (),
+        )
+        .expect("rejected callback resource");
+    let mut rejected = crate::compositor::state::empty_cached_subsurface_commit();
+    rejected.frame_callbacks.push(callback);
+    assert!(matches!(
+        state.cache_commit(2, rejected),
+        CacheCommitOutcome::Rejected {
+            reason: CacheAdmissionFailure::PerSurfaceObligationLimit,
+            ..
+        }
+    ));
+    assert_eq!(state.roles[&2].cached_commits.len(), 1);
+    assert_eq!(
+        state.cached_obligation_count(),
+        MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE
+    );
+    assert!(state.debug_accounting_is_consistent());
+}

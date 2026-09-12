@@ -33,8 +33,13 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         parent_id: u32,
+        client_id: ClientId,
     ) -> bool {
-        if !self.subsurface_transactions.register(surface_id, parent_id) {
+        if !self.subsurface_transactions.register_with_client(
+            surface_id,
+            parent_id,
+            Some(client_id),
+        ) {
             return false;
         }
         self.committed_subsurface_stacks
@@ -70,6 +75,7 @@ impl CompositorState {
             let mut commits = self
                 .subsurface_transactions
                 .take_desynchronized_subtree_commits(surface_id);
+            self.update_synchronized_cache_metrics();
             if !commits.is_empty() {
                 if !commits
                     .iter()
@@ -193,6 +199,7 @@ impl CompositorState {
         let descendants = self
             .subsurface_transactions
             .take_latched_commits(surface_id);
+        self.update_synchronized_cache_metrics();
         let mut nodes = Vec::with_capacity(descendants.len().saturating_add(1));
         nodes.push((surface_id, commit));
         nodes.extend(descendants);
@@ -682,12 +689,13 @@ impl CompositorState {
                     && !self.pending_surface_tree_transactions[*index].is_pacing_protected()
             });
             let Some(remove_index) = remove_index else {
-                self.request_client_resource_exhaustion(root_surface_id);
-                self.surface_pacing_metrics
-                    .queue_admission_resource_exhaustion = self
-                    .surface_pacing_metrics
-                    .queue_admission_resource_exhaustion
-                    .saturating_add(1);
+                if self.request_client_resource_exhaustion(root_surface_id) {
+                    self.surface_pacing_metrics
+                        .queue_admission_resource_exhaustion = self
+                        .surface_pacing_metrics
+                        .queue_admission_resource_exhaustion
+                        .saturating_add(1);
+                }
                 self.release_unpublished_surface_tree_nodes(nodes);
                 return;
             };
@@ -1034,63 +1042,6 @@ impl CompositorState {
         callbacks
     }
 
-    pub(in crate::compositor) fn cache_synchronized_subsurface_commit(
-        &mut self,
-        surface_id: u32,
-        mut commit: CachedSubsurfaceCommit,
-    ) {
-        let buffer_id = commit
-            .attachment
-            .as_ref()
-            .and_then(|attachment| match attachment {
-                PendingSurfaceAttachment::Buffer(buffer) => Some(buffer.data.buffer_id().get()),
-                PendingSurfaceAttachment::RemoveContent => None,
-            });
-        if let (
-            Some(PendingSurfaceAttachment::Buffer(buffer)),
-            Some(CapturedExplicitSyncState {
-                release: Some(release),
-                ..
-            }),
-        ) = (commit.attachment.as_mut(), commit.explicit_sync.as_ref())
-        {
-            buffer.explicit_release = Some(release.clone());
-        }
-        let merged = self.subsurface_transactions.has_cached_commit(surface_id);
-        if let Some(release) = self
-            .subsurface_transactions
-            .cache_commit(surface_id, commit)
-        {
-            self.release_pending_surface_buffer(release);
-        }
-        self.subsurface_transaction_metrics
-            .synchronized_child_commits_cached = self
-            .subsurface_transaction_metrics
-            .synchronized_child_commits_cached
-            .saturating_add(1);
-        if merged {
-            self.subsurface_transaction_metrics.cached_commits_merged = self
-                .subsurface_transaction_metrics
-                .cached_commits_merged
-                .saturating_add(1);
-        }
-        self.subsurface_transaction_metrics.maximum_cached_nodes = self
-            .subsurface_transaction_metrics
-            .maximum_cached_nodes
-            .max(self.subsurface_transactions.cached_node_count());
-        self.subsurface_transaction_metrics.maximum_tree_depth = self
-            .subsurface_transaction_metrics
-            .maximum_tree_depth
-            .max(self.subsurface_transactions.maximum_depth());
-        if compositor_debug_surface_logging_enabled() {
-            eprintln!(
-                "oblivion-one compositor: subsurface_tx surface={surface_id} parent={:?} requested_mode={:?} effective_mode=sync decision=cached buffer_id={buffer_id:?}",
-                self.subsurface_transactions.parent(surface_id),
-                self.subsurface_transactions.requested_mode(surface_id),
-            );
-        }
-    }
-
     pub(in crate::compositor) fn apply_pending_subsurface_parent_state(
         &mut self,
         parent_id: u32,
@@ -1264,6 +1215,7 @@ impl CompositorState {
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
         let parent_id = self.subsurface_transactions.parent(surface_id);
         let cached = self.subsurface_transactions.remove_role(surface_id);
+        self.update_synchronized_cache_metrics();
         self.release_cached_subsurface_commits(cached);
         self.unmap_surface_content(surface_id);
         self.deactivate_role_instance(surface_id);

@@ -8,21 +8,44 @@ pub(in crate::compositor) struct ClientTeardownSummary {
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn request_client_resource_exhaustion(&mut self, surface_id: u32) {
-        if !self
+    pub(in crate::compositor) fn request_client_resource_exhaustion(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        let client_id = self.surface_client_ids.get(&surface_id).cloned();
+        let already_pending = self
             .pending_client_resource_exhaustions
             .contains(&surface_id)
-        {
-            self.pending_client_resource_exhaustions.push(surface_id);
+            || client_id.as_ref().is_some_and(|client_id| {
+                self.pending_client_resource_exhaustion_clients
+                    .contains(client_id)
+            });
+        if already_pending {
+            return false;
+        }
+        self.pending_client_resource_exhaustions.push(surface_id);
+        if let Some(client_id) = client_id {
+            self.pending_client_resource_exhaustion_clients
+                .insert(client_id);
         }
         self.surface_pacing_metrics.queue_resource_exhaustions = self
             .surface_pacing_metrics
             .queue_resource_exhaustions
             .saturating_add(1);
+        true
     }
 
     pub(in crate::compositor) fn take_client_resource_exhaustions(&mut self) -> Vec<u32> {
+        self.pending_client_resource_exhaustion_clients.clear();
         std::mem::take(&mut self.pending_client_resource_exhaustions)
+    }
+
+    pub(in crate::compositor) fn client_resource_exhaustion_pending(
+        &self,
+        client_id: &ClientId,
+    ) -> bool {
+        self.pending_client_resource_exhaustion_clients
+            .contains(client_id)
     }
 
     pub(in crate::compositor) fn note_protocol_error_metric(&mut self) {

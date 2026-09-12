@@ -6,6 +6,7 @@ impl CompositorState {
         releases: &mut ShutdownDmabufReleaseSet,
     ) {
         let mut cached = self.subsurface_transactions.drain_cached_commits();
+        self.update_synchronized_cache_metrics();
         for transaction in self.pending_surface_tree_transactions.drain(..) {
             cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
         }

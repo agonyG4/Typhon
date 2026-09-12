@@ -3,6 +3,7 @@ use std::{
     time::Instant,
 };
 
+use wayland_server::backend::ClientId;
 use wayland_server::protocol::wl_callback;
 use wayland_server::protocol::wl_output;
 
@@ -16,6 +17,18 @@ use super::{
         PendingViewportChange,
     },
 };
+
+pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE: usize = 8;
+pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_PER_CLIENT: usize = 256;
+pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_TOTAL: usize = 4096;
+// An obligation is one retained frame callback, presentation feedback, buffer
+// ownership slot (plus one slot per validated DMA-BUF plane), or explicit-sync
+// acquire/release point. This is a cardinality guard, not a byte or GPU-memory
+// estimate. A merged entry is checked against the same limits because callbacks
+// can accumulate even while the VecDeque length stays constant.
+pub(super) const MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE: usize = 1024;
+pub(super) const MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_CLIENT: usize = 8192;
+pub(super) const MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_TOTAL: usize = 65536;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum SubsurfaceSyncMode {
@@ -163,6 +176,40 @@ pub(super) struct CachedSubsurfaceCommit {
 }
 
 impl CachedSubsurfaceCommit {
+    pub(super) fn cached_obligation_count(&self) -> usize {
+        self.frame_callbacks
+            .len()
+            .checked_add(self.presentation_feedbacks.len())
+            .and_then(|count| {
+                count.checked_add(cached_attachment_obligation_count(self.attachment.as_ref()))
+            })
+            .and_then(|count| {
+                count.checked_add(cached_explicit_sync_obligation_count(
+                    self.explicit_sync.as_ref(),
+                ))
+            })
+            .expect("synchronized cache obligation count overflow")
+    }
+
+    fn merged_cached_obligation_count(&self, newer: &Self) -> usize {
+        let attachment = newer.attachment.as_ref().or(self.attachment.as_ref());
+        let explicit_sync = if newer.attachment.is_some() || newer.explicit_sync.is_some() {
+            newer.explicit_sync.as_ref()
+        } else {
+            self.explicit_sync.as_ref()
+        };
+        newer
+            .frame_callbacks
+            .len()
+            .checked_add(self.frame_callbacks.len())
+            .and_then(|count| count.checked_add(newer.presentation_feedbacks.len()))
+            .and_then(|count| count.checked_add(cached_attachment_obligation_count(attachment)))
+            .and_then(|count| {
+                count.checked_add(cached_explicit_sync_obligation_count(explicit_sync))
+            })
+            .expect("synchronized cache obligation count overflow")
+    }
+
     pub(super) fn merge(&mut self, newer: Self) -> Option<PendingSurfaceBuffer> {
         let Self {
             commit_id,
@@ -250,6 +297,53 @@ impl CachedSubsurfaceCommit {
     }
 }
 
+fn cached_attachment_obligation_count(attachment: Option<&PendingSurfaceAttachment>) -> usize {
+    match attachment {
+        Some(PendingSurfaceAttachment::Buffer(buffer)) => 1usize
+            .checked_add(
+                buffer
+                    .data
+                    .dmabuf_handle()
+                    .map_or(0, |handle| handle.planes().len()),
+            )
+            .expect("synchronized cache attachment obligation count overflow"),
+        Some(PendingSurfaceAttachment::RemoveContent) | None => 0,
+    }
+}
+
+fn cached_explicit_sync_obligation_count(
+    explicit_sync: Option<&CapturedExplicitSyncState>,
+) -> usize {
+    explicit_sync.map_or(0, |state| {
+        usize::from(state.acquire.is_some()) + usize::from(state.release.is_some())
+    })
+}
+
+#[derive(Debug)]
+pub(super) enum CacheCommitOutcome {
+    Inserted,
+    Merged {
+        superseded_buffer: Option<Box<PendingSurfaceBuffer>>,
+    },
+    Rejected {
+        commit: Box<CachedSubsurfaceCommit>,
+        reason: CacheAdmissionFailure,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheAdmissionFailure {
+    MissingRole,
+    ClientAlreadyExhausted,
+    PerSurfaceEntryLimit,
+    PerClientEntryLimit,
+    TotalEntryLimit,
+    PerSurfaceObligationLimit,
+    PerClientObligationLimit,
+    TotalObligationLimit,
+    AccountingInvariant,
+}
+
 fn merge_damage(
     older: Option<RenderableSurfaceDamage>,
     newer: Option<RenderableSurfaceDamage>,
@@ -273,6 +367,30 @@ fn merge_damage(
         | (Some(damage), Some(RenderableSurfaceDamage::Empty)) => Some(damage),
         (Some(damage), None) | (None, Some(damage)) => Some(damage),
         (None, None) => None,
+    }
+}
+
+fn replace_cached_count(current: usize, old: usize, new: usize) -> usize {
+    current
+        .checked_sub(old)
+        .and_then(|count| count.checked_add(new))
+        .expect("synchronized cache accounting drift")
+}
+
+fn checked_replace_cached_count(current: usize, old: usize, new: usize) -> Option<usize> {
+    current.checked_sub(old)?.checked_add(new)
+}
+
+fn replace_cached_map_count<K>(counts: &mut HashMap<K, usize>, key: K, old: usize, new: usize)
+where
+    K: Eq + std::hash::Hash,
+{
+    let current = counts.get(&key).copied().unwrap_or_default();
+    let updated = replace_cached_count(current, old, new);
+    if updated == 0 {
+        counts.remove(&key);
+    } else {
+        counts.insert(key, updated);
     }
 }
 
@@ -547,6 +665,7 @@ mod window_geometry_tests {
 #[derive(Debug)]
 struct SubsurfaceRoleState {
     parent_id: u32,
+    client_id: Option<ClientId>,
     requested_mode: SubsurfaceSyncMode,
     cached_commits: VecDeque<CachedSubsurfaceCommit>,
     pending_position: Option<(i32, i32)>,
@@ -555,10 +674,33 @@ struct SubsurfaceRoleState {
 #[derive(Debug, Default)]
 pub(super) struct SubsurfaceTransactionState {
     roles: HashMap<u32, SubsurfaceRoleState>,
+    cached_entries_per_surface: HashMap<u32, usize>,
+    cached_obligations_per_surface: HashMap<u32, usize>,
+    cached_entries_per_client: HashMap<ClientId, usize>,
+    cached_obligations_per_client: HashMap<ClientId, usize>,
+    cached_entries_total: usize,
+    cached_obligations_total: usize,
+    cached_nodes: usize,
+    maximum_cached_entries: usize,
+    maximum_cached_entries_per_surface: usize,
+    maximum_cached_entries_per_client: usize,
+    maximum_cached_obligations: usize,
+    maximum_cached_obligations_per_surface: usize,
+    maximum_cached_obligations_per_client: usize,
 }
 
 impl SubsurfaceTransactionState {
+    #[cfg(test)]
     pub(super) fn register(&mut self, surface_id: u32, parent_id: u32) -> bool {
+        self.register_with_client(surface_id, parent_id, None)
+    }
+
+    pub(super) fn register_with_client(
+        &mut self,
+        surface_id: u32,
+        parent_id: u32,
+        client_id: Option<ClientId>,
+    ) -> bool {
         if surface_id == parent_id || self.roles.contains_key(&surface_id) {
             return false;
         }
@@ -573,6 +715,7 @@ impl SubsurfaceTransactionState {
             surface_id,
             SubsurfaceRoleState {
                 parent_id,
+                client_id,
                 requested_mode: SubsurfaceSyncMode::Synchronized,
                 cached_commits: VecDeque::new(),
                 pending_position: None,
@@ -582,10 +725,25 @@ impl SubsurfaceTransactionState {
     }
 
     pub(super) fn remove_role(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
-        self.roles
-            .remove(&surface_id)
-            .map(|role| role.cached_commits.into_iter().collect())
-            .unwrap_or_default()
+        let Some(role) = self.roles.remove(&surface_id) else {
+            return Vec::new();
+        };
+        let client_id = role.client_id.clone();
+        let cached_commits = role.cached_commits.into_iter().collect::<Vec<_>>();
+        let cached_obligations = cached_commits
+            .iter()
+            .map(CachedSubsurfaceCommit::cached_obligation_count)
+            .sum();
+        self.replace_cached_accounting(
+            surface_id,
+            client_id.as_ref(),
+            cached_commits.len(),
+            0,
+            cached_obligations,
+            0,
+        );
+        debug_assert!(self.debug_accounting_is_consistent());
+        cached_commits
     }
 
     pub(super) fn remove_subtree(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
@@ -598,17 +756,35 @@ impl SubsurfaceTransactionState {
                     .filter_map(|(child_id, role)| (role.parent_id == id).then_some(*child_id)),
             );
             if let Some(role) = self.roles.remove(&id) {
-                removed.extend(role.cached_commits);
+                let client_id = role.client_id.clone();
+                let cached_commits = role.cached_commits.into_iter().collect::<Vec<_>>();
+                let cached_obligations = cached_commits
+                    .iter()
+                    .map(CachedSubsurfaceCommit::cached_obligation_count)
+                    .sum();
+                self.replace_cached_accounting(
+                    id,
+                    client_id.as_ref(),
+                    cached_commits.len(),
+                    0,
+                    cached_obligations,
+                    0,
+                );
+                removed.extend(cached_commits);
             }
         }
+        debug_assert!(self.debug_accounting_is_consistent());
         removed
     }
 
     pub(super) fn drain_cached_commits(&mut self) -> Vec<CachedSubsurfaceCommit> {
-        self.roles
-            .values_mut()
-            .flat_map(|role| role.cached_commits.drain(..))
-            .collect()
+        let surface_ids = self.roles.keys().copied().collect::<Vec<_>>();
+        let mut commits = Vec::new();
+        for surface_id in surface_ids {
+            commits.extend(self.take_cached_commits_for_surface(surface_id));
+        }
+        debug_assert!(self.debug_accounting_is_consistent());
+        commits
     }
 
     pub(super) fn parent(&self, surface_id: u32) -> Option<u32> {
@@ -625,6 +801,12 @@ impl SubsurfaceTransactionState {
         };
         role.requested_mode = mode;
         true
+    }
+
+    pub(super) fn client_id(&self, surface_id: u32) -> Option<&ClientId> {
+        self.roles
+            .get(&surface_id)
+            .and_then(|role| role.client_id.as_ref())
     }
 
     pub(super) fn is_effectively_synchronized(&self, surface_id: u32) -> bool {
@@ -648,33 +830,159 @@ impl SubsurfaceTransactionState {
         &mut self,
         surface_id: u32,
         commit: CachedSubsurfaceCommit,
-    ) -> Option<PendingSurfaceBuffer> {
-        let role = self.roles.get_mut(&surface_id)?;
-        if role.cached_commits.is_empty() {
-            role.cached_commits.push_back(commit);
-            return None;
-        }
-        if role.cached_commits.len() == 1
-            && !role
-                .cached_commits
-                .front()
-                .is_some_and(|cached| cached.pacing.is_boundary())
-            && !commit.pacing.is_boundary()
-        {
+    ) -> CacheCommitOutcome {
+        debug_assert!(self.debug_accounting_is_consistent());
+        let Some(role) = self.roles.get(&surface_id) else {
+            return CacheCommitOutcome::Rejected {
+                commit: Box::new(commit),
+                reason: CacheAdmissionFailure::MissingRole,
+            };
+        };
+        let old_entries = role.cached_commits.len();
+        let old_obligations = self
+            .cached_obligations_per_surface
+            .get(&surface_id)
+            .copied()
+            .unwrap_or_default();
+        let can_merge = role
+            .cached_commits
+            .back()
+            .is_some_and(|tail| !tail.pacing.is_boundary() && !commit.pacing.is_boundary());
+        let new_entries = if can_merge {
+            old_entries
+        } else {
+            let Some(new_entries) = old_entries.checked_add(1) else {
+                return CacheCommitOutcome::Rejected {
+                    commit: Box::new(commit),
+                    reason: CacheAdmissionFailure::AccountingInvariant,
+                };
+            };
+            new_entries
+        };
+        let new_obligations = if can_merge {
             role.cached_commits
-                .front_mut()
-                .expect("cached commit exists")
-                .merge(commit)
+                .back()
+                .expect("merge target exists")
+                .merged_cached_obligation_count(&commit)
+        } else {
+            let Some(new_obligations) =
+                old_obligations.checked_add(commit.cached_obligation_count())
+            else {
+                return CacheCommitOutcome::Rejected {
+                    commit: Box::new(commit),
+                    reason: CacheAdmissionFailure::AccountingInvariant,
+                };
+            };
+            new_obligations
+        };
+        let Some(new_total_entries) =
+            checked_replace_cached_count(self.cached_entries_total, old_entries, new_entries)
+        else {
+            return CacheCommitOutcome::Rejected {
+                commit: Box::new(commit),
+                reason: CacheAdmissionFailure::AccountingInvariant,
+            };
+        };
+        let Some(new_total_obligations) = checked_replace_cached_count(
+            self.cached_obligations_total,
+            old_obligations,
+            new_obligations,
+        ) else {
+            return CacheCommitOutcome::Rejected {
+                commit: Box::new(commit),
+                reason: CacheAdmissionFailure::AccountingInvariant,
+            };
+        };
+        let client_id = role.client_id.clone();
+        let (new_client_entries, new_client_obligations) =
+            if let Some(client_id) = client_id.as_ref() {
+                let client_cached_entries = self
+                    .cached_entries_per_client
+                    .get(client_id)
+                    .copied()
+                    .unwrap_or_default();
+                let client_cached_obligations = self
+                    .cached_obligations_per_client
+                    .get(client_id)
+                    .copied()
+                    .unwrap_or_default();
+                let Some(new_client_entries) =
+                    checked_replace_cached_count(client_cached_entries, old_entries, new_entries)
+                else {
+                    return CacheCommitOutcome::Rejected {
+                        commit: Box::new(commit),
+                        reason: CacheAdmissionFailure::AccountingInvariant,
+                    };
+                };
+                let Some(new_client_obligations) = checked_replace_cached_count(
+                    client_cached_obligations,
+                    old_obligations,
+                    new_obligations,
+                ) else {
+                    return CacheCommitOutcome::Rejected {
+                        commit: Box::new(commit),
+                        reason: CacheAdmissionFailure::AccountingInvariant,
+                    };
+                };
+                (new_client_entries, new_client_obligations)
+            } else {
+                (0, 0)
+            };
+
+        let rejection = if new_entries > MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE {
+            Some(CacheAdmissionFailure::PerSurfaceEntryLimit)
+        } else if new_obligations > MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_SURFACE {
+            Some(CacheAdmissionFailure::PerSurfaceObligationLimit)
+        } else if client_id.is_some()
+            && new_client_entries > MAX_SYNCHRONIZED_CACHED_COMMITS_PER_CLIENT
+        {
+            Some(CacheAdmissionFailure::PerClientEntryLimit)
+        } else if client_id.is_some()
+            && new_client_obligations > MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_PER_CLIENT
+        {
+            Some(CacheAdmissionFailure::PerClientObligationLimit)
+        } else if new_total_entries > MAX_SYNCHRONIZED_CACHED_COMMITS_TOTAL {
+            Some(CacheAdmissionFailure::TotalEntryLimit)
+        } else if new_total_obligations > MAX_SYNCHRONIZED_CACHED_OBLIGATIONS_TOTAL {
+            Some(CacheAdmissionFailure::TotalObligationLimit)
+        } else {
+            None
+        };
+        let Some(role) = self.roles.get_mut(&surface_id) else {
+            return CacheCommitOutcome::Rejected {
+                commit: Box::new(commit),
+                reason: CacheAdmissionFailure::MissingRole,
+            };
+        };
+        if let Some(reason) = rejection {
+            return CacheCommitOutcome::Rejected {
+                commit: Box::new(commit),
+                reason,
+            };
+        }
+        let outcome = if can_merge {
+            CacheCommitOutcome::Merged {
+                superseded_buffer: role
+                    .cached_commits
+                    .back_mut()
+                    .expect("merge target exists")
+                    .merge(commit)
+                    .map(Box::new),
+            }
         } else {
             role.cached_commits.push_back(commit);
-            None
-        }
-    }
-
-    pub(super) fn has_cached_commit(&self, surface_id: u32) -> bool {
-        self.roles
-            .get(&surface_id)
-            .is_some_and(|role| !role.cached_commits.is_empty())
+            CacheCommitOutcome::Inserted
+        };
+        self.replace_cached_accounting(
+            surface_id,
+            client_id.as_ref(),
+            old_entries,
+            new_entries,
+            old_obligations,
+            new_obligations,
+        );
+        debug_assert!(self.debug_accounting_is_consistent());
+        outcome
     }
 
     pub(super) fn cached_pointer_constraint_hint(
@@ -700,10 +1008,39 @@ impl SubsurfaceTransactionState {
     }
 
     pub(super) fn cached_node_count(&self) -> usize {
-        self.roles
-            .values()
-            .filter(|role| !role.cached_commits.is_empty())
-            .count()
+        self.cached_nodes
+    }
+
+    pub(super) fn cached_entry_count(&self) -> usize {
+        self.cached_entries_total
+    }
+
+    pub(super) fn cached_obligation_count(&self) -> usize {
+        self.cached_obligations_total
+    }
+
+    pub(super) fn maximum_cached_entries(&self) -> usize {
+        self.maximum_cached_entries
+    }
+
+    pub(super) fn maximum_cached_entries_per_surface(&self) -> usize {
+        self.maximum_cached_entries_per_surface
+    }
+
+    pub(super) fn maximum_cached_entries_per_client(&self) -> usize {
+        self.maximum_cached_entries_per_client
+    }
+
+    pub(super) fn maximum_cached_obligations(&self) -> usize {
+        self.maximum_cached_obligations
+    }
+
+    pub(super) fn maximum_cached_obligations_per_surface(&self) -> usize {
+        self.maximum_cached_obligations_per_surface
+    }
+
+    pub(super) fn maximum_cached_obligations_per_client(&self) -> usize {
+        self.maximum_cached_obligations_per_client
     }
 
     pub(super) fn maximum_depth(&self) -> usize {
@@ -759,14 +1096,13 @@ impl SubsurfaceTransactionState {
         self.collect_effectively_synchronized_descendants(parent_id, &mut surface_ids);
         let mut commits = Vec::new();
         for surface_id in surface_ids {
-            if let Some(role) = self.roles.get_mut(&surface_id) {
-                commits.extend(
-                    role.cached_commits
-                        .drain(..)
-                        .map(|commit| (surface_id, commit)),
-                );
-            }
+            commits.extend(
+                self.take_cached_commits_for_surface(surface_id)
+                    .into_iter()
+                    .map(|commit| (surface_id, commit)),
+            );
         }
+        debug_assert!(self.debug_accounting_is_consistent());
         commits
     }
 
@@ -782,15 +1118,165 @@ impl SubsurfaceTransactionState {
             .collect::<Vec<_>>();
         let mut commits = Vec::new();
         for surface_id in eligible {
-            if let Some(role) = self.roles.get_mut(&surface_id) {
-                commits.extend(
-                    role.cached_commits
-                        .drain(..)
-                        .map(|commit| (surface_id, commit)),
-                );
+            commits.extend(
+                self.take_cached_commits_for_surface(surface_id)
+                    .into_iter()
+                    .map(|commit| (surface_id, commit)),
+            );
+        }
+        debug_assert!(self.debug_accounting_is_consistent());
+        commits
+    }
+
+    fn take_cached_commits_for_surface(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
+        let (client_id, old_entries, old_obligations, commits) = {
+            let Some(role) = self.roles.get_mut(&surface_id) else {
+                return Vec::new();
+            };
+            let client_id = role.client_id.clone();
+            let old_entries = role.cached_commits.len();
+            let old_obligations = self
+                .cached_obligations_per_surface
+                .get(&surface_id)
+                .copied()
+                .unwrap_or_default();
+            let commits = role.cached_commits.drain(..).collect::<Vec<_>>();
+            (client_id, old_entries, old_obligations, commits)
+        };
+        self.replace_cached_accounting(
+            surface_id,
+            client_id.as_ref(),
+            old_entries,
+            0,
+            old_obligations,
+            0,
+        );
+        commits
+    }
+
+    fn replace_cached_accounting(
+        &mut self,
+        surface_id: u32,
+        client_id: Option<&ClientId>,
+        old_entries: usize,
+        new_entries: usize,
+        old_obligations: usize,
+        new_obligations: usize,
+    ) {
+        self.cached_entries_total =
+            replace_cached_count(self.cached_entries_total, old_entries, new_entries);
+        self.cached_obligations_total = replace_cached_count(
+            self.cached_obligations_total,
+            old_obligations,
+            new_obligations,
+        );
+        replace_cached_map_count(
+            &mut self.cached_entries_per_surface,
+            surface_id,
+            old_entries,
+            new_entries,
+        );
+        replace_cached_map_count(
+            &mut self.cached_obligations_per_surface,
+            surface_id,
+            old_obligations,
+            new_obligations,
+        );
+        if let Some(client_id) = client_id {
+            replace_cached_map_count(
+                &mut self.cached_entries_per_client,
+                client_id.clone(),
+                old_entries,
+                new_entries,
+            );
+            replace_cached_map_count(
+                &mut self.cached_obligations_per_client,
+                client_id.clone(),
+                old_obligations,
+                new_obligations,
+            );
+        }
+        match (old_entries == 0, new_entries == 0) {
+            (true, false) => {
+                self.cached_nodes = self
+                    .cached_nodes
+                    .checked_add(1)
+                    .expect("synchronized cache node count overflow");
+            }
+            (false, true) => {
+                self.cached_nodes = self
+                    .cached_nodes
+                    .checked_sub(1)
+                    .expect("synchronized cache node count underflow");
+            }
+            _ => {}
+        }
+        self.maximum_cached_entries = self.maximum_cached_entries.max(new_entries);
+        self.maximum_cached_entries_per_surface =
+            self.maximum_cached_entries_per_surface.max(new_entries);
+        self.maximum_cached_obligations = self.maximum_cached_obligations.max(new_obligations);
+        self.maximum_cached_obligations_per_surface = self
+            .maximum_cached_obligations_per_surface
+            .max(new_obligations);
+        if let Some(client_id) = client_id {
+            let entries = self
+                .cached_entries_per_client
+                .get(client_id)
+                .copied()
+                .unwrap_or_default();
+            let obligations = self
+                .cached_obligations_per_client
+                .get(client_id)
+                .copied()
+                .unwrap_or_default();
+            self.maximum_cached_entries_per_client =
+                self.maximum_cached_entries_per_client.max(entries);
+            self.maximum_cached_obligations_per_client =
+                self.maximum_cached_obligations_per_client.max(obligations);
+        }
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn debug_accounting_is_consistent(&self) -> bool {
+        let mut entries_total = 0usize;
+        let mut obligations_total = 0usize;
+        let mut nodes = 0usize;
+        let mut entries_per_surface = HashMap::new();
+        let mut obligations_per_surface = HashMap::new();
+        let mut entries_per_client = HashMap::new();
+        let mut obligations_per_client = HashMap::new();
+        for (surface_id, role) in &self.roles {
+            let entries = role.cached_commits.len();
+            let obligations = role
+                .cached_commits
+                .iter()
+                .map(CachedSubsurfaceCommit::cached_obligation_count)
+                .sum::<usize>();
+            entries_total += entries;
+            obligations_total += obligations;
+            if entries != 0 {
+                nodes += 1;
+                entries_per_surface.insert(*surface_id, entries);
+            }
+            if obligations != 0 {
+                obligations_per_surface.insert(*surface_id, obligations);
+            }
+            if let Some(client_id) = role.client_id.as_ref() {
+                if entries != 0 {
+                    *entries_per_client.entry(client_id.clone()).or_insert(0) += entries;
+                }
+                if obligations != 0 {
+                    *obligations_per_client.entry(client_id.clone()).or_insert(0) += obligations;
+                }
             }
         }
-        commits
+        entries_total == self.cached_entries_total
+            && obligations_total == self.cached_obligations_total
+            && nodes == self.cached_nodes
+            && entries_per_surface == self.cached_entries_per_surface
+            && obligations_per_surface == self.cached_obligations_per_surface
+            && entries_per_client == self.cached_entries_per_client
+            && obligations_per_client == self.cached_obligations_per_client
     }
 
     fn collect_effectively_synchronized_descendants(&self, parent_id: u32, output: &mut Vec<u32>) {
@@ -902,10 +1388,20 @@ mod tests {
             ..CapturedSurfacePacing::default()
         };
 
-        assert!(state.cache_commit(2, first).is_none());
-        assert!(state.cache_commit(2, second).is_none());
+        assert!(matches!(
+            state.cache_commit(2, first),
+            CacheCommitOutcome::Inserted
+        ));
+        assert!(matches!(
+            state.cache_commit(2, second),
+            CacheCommitOutcome::Inserted
+        ));
         assert_eq!(state.roles[&2].cached_commits.len(), 2);
         assert!(state.roles[&2].cached_commits[0].pacing.fifo_set_barrier);
         assert!(state.roles[&2].cached_commits[1].pacing.fifo_wait_barrier);
     }
 }
+
+#[cfg(test)]
+#[path = "subsurface_cache_tests.rs"]
+mod cache_limit_tests;

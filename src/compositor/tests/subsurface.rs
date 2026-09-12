@@ -126,6 +126,11 @@ fn default_synchronized_child_is_invisible_until_parent_commit() {
     assert_eq!(after_parent_generation, before_child_generation + 1);
     let metrics = server.subsurface_transaction_metrics();
     assert_eq!(metrics.synchronized_child_commits_cached, 1);
+    assert_eq!(metrics.cached_commits_appended, 1);
+    assert_eq!(metrics.cached_commits_merged, 0);
+    assert_eq!(metrics.cached_commits_rejected, 0);
+    assert_eq!(metrics.current_cached_entries, 0);
+    assert_eq!(metrics.maximum_cached_entries, 1);
     assert_eq!(metrics.tree_transactions_published, 2);
     assert_eq!(metrics.maximum_cached_nodes, 1);
     assert_eq!(metrics.synchronized_child_immediate_publish_attempts, 0);
@@ -182,7 +187,11 @@ fn multiple_synchronized_child_commits_publish_only_the_latest_buffer() {
     assert_ne!(after_child.buffer_id, before_child.buffer_id);
     assert_eq!(superseded_buffer_releases, 1);
     let metrics = server.subsurface_transaction_metrics();
+    assert_eq!(metrics.cached_commits_appended, 2);
     assert_eq!(metrics.cached_commits_merged, 1);
+    assert_eq!(metrics.cached_commits_rejected, 0);
+    assert_eq!(metrics.current_cached_entries, 0);
+    assert_eq!(metrics.maximum_cached_entries, 1);
     assert_eq!(metrics.maximum_cached_nodes, 1);
 }
 
@@ -195,7 +204,7 @@ fn set_desync_publishes_cached_state_when_no_ancestor_remains_synchronized() {
 
     let (before_desync, after_desync) =
         capture_cached_child_before_and_after_set_desync(&socket_path, &commands).unwrap();
-    let _server = stop_controllable_test_server(commands, server_thread);
+    let server = stop_controllable_test_server(commands, server_thread);
     let child_size = |surfaces: &[RenderableSurfaceSnapshot]| {
         surfaces
             .iter()
@@ -205,6 +214,12 @@ fn set_desync_publishes_cached_state_when_no_ancestor_remains_synchronized() {
 
     assert_eq!(child_size(&before_desync), Some((5, 5)));
     assert_eq!(child_size(&after_desync), Some((9, 7)));
+    assert_eq!(
+        server
+            .subsurface_transaction_metrics()
+            .current_cached_entries,
+        0
+    );
 }
 
 #[test]
