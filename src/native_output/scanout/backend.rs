@@ -243,6 +243,10 @@ impl NativePaintStats {
                 NativePerfField::usize("commands_considered", repaint.commands_considered),
                 NativePerfField::usize("commands_executed", repaint.commands_executed),
                 NativePerfField::usize(
+                    "missing_required_decoration_resources",
+                    repaint.missing_required_decoration_resources,
+                ),
+                NativePerfField::usize(
                     "commands_rejected_outside_damage",
                     repaint.commands_rejected_outside_damage,
                 ),

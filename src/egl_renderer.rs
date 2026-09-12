@@ -382,6 +382,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub draw_command_replays: usize,
     pub commands_considered: usize,
     pub commands_executed: usize,
+    pub missing_required_decoration_resources: usize,
     pub commands_rejected_outside_damage: usize,
     pub commands_rejected_outside_remaining: usize,
     pub commands_rejected_occluded: usize,
@@ -1795,12 +1796,13 @@ impl GlesSceneRenderer {
     where
         I: IntoIterator<Item = &'a DecorationRenderInstance>,
     {
-        let instances = instances.into_iter().collect::<Vec<_>>();
         let DecorationResourceRequirements {
             required,
             required_assets,
         } = decoration_resource_requirements(
-            instances.iter().map(|instance| instance.primitives()),
+            instances
+                .into_iter()
+                .map(DecorationRenderInstance::primitives),
         );
 
         let stale = self
@@ -3111,6 +3113,14 @@ impl GlesSceneRenderer {
         }
         let output_scale = self.effect_output_scale.max(1.0) as f64;
         let mut sampling = None;
+        let missing_required_decoration_resources = samples
+            .iter()
+            .filter(|(command, _)| {
+                !scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect))
+                    && Self::is_required_decoration_layer(command.layer)
+                    && self.texture_for_layer(command.layer).is_none()
+            })
+            .count();
         for (command, sample) in samples {
             if scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
                 continue;
@@ -3169,6 +3179,10 @@ impl GlesSceneRenderer {
                     transition_id: sample.transition_id,
                 });
         }
+        self.frame_stats.missing_required_decoration_resources = self
+            .frame_stats
+            .missing_required_decoration_resources
+            .saturating_add(missing_required_decoration_resources);
         unsafe {
             self.gl.use_program(Some(self.program));
             self.gl.bind_vertex_array(Some(self.scene_vertex_array));
@@ -3427,6 +3441,7 @@ impl GlesSceneRenderer {
         let mut commands_considered = 0;
         let mut commands_executed = 0;
         let mut commands_rejected_outside_damage = 0;
+        let mut missing_required_decoration_resources: usize = 0;
         let mut texture_binds = 0;
         let mut draw_calls = 0;
         for (command_index, command) in commands.iter().enumerate() {
@@ -3449,6 +3464,10 @@ impl GlesSceneRenderer {
                 }
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
+                if Self::is_required_decoration_layer(command.layer) {
+                    missing_required_decoration_resources =
+                        missing_required_decoration_resources.saturating_add(1);
+                }
                 continue;
             };
             unsafe {
@@ -3482,6 +3501,10 @@ impl GlesSceneRenderer {
             .frame_stats
             .commands_executed
             .saturating_add(commands_executed);
+        self.frame_stats.missing_required_decoration_resources = self
+            .frame_stats
+            .missing_required_decoration_resources
+            .saturating_add(missing_required_decoration_resources);
         self.frame_stats.commands_rejected_outside_damage = self
             .frame_stats
             .commands_rejected_outside_damage
@@ -3636,6 +3659,13 @@ impl GlesSceneRenderer {
             .frame_stats
             .peak_region_piece_count
             .max(stats.peak_region_pieces);
+    }
+
+    const fn is_required_decoration_layer(layer: EglDrawLayer) -> bool {
+        matches!(
+            layer,
+            EglDrawLayer::SolidRgba(_) | EglDrawLayer::DecorationAsset(_)
+        )
     }
 
     fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<GlTexture> {
@@ -5766,6 +5796,173 @@ mod tests {
                 .contains(&DecorationResourceKey::Solid(rgba_to_pixel([
                     17, 34, 51, 255,
                 ])))
+        );
+    }
+
+    #[test]
+    fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_together() {
+        const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
+        let egl = unsafe { EglInstance::load_required() }
+            .expect("EGL loader is required for decoration reconciliation regression");
+        let display = unsafe {
+            egl.get_platform_display(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                std::ptr::null_mut(),
+                &[egl::ATTRIB_NONE],
+            )
+            .or_else(|_| {
+                egl.get_display(egl::DEFAULT_DISPLAY)
+                    .ok_or(egl::Error::BadDisplay)
+            })
+        }
+        .expect("EGL display is available");
+        egl.initialize(display).expect("EGL initializes");
+        egl.bind_api(egl::OPENGL_ES_API)
+            .expect("EGL binds the GLES API");
+        let config_attributes = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES3_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let count = egl
+            .matching_config_count(display, &config_attributes)
+            .expect("EGL returns GLES3 pbuffer configs");
+        assert!(count > 0, "EGL exposes a GLES3 pbuffer config");
+        let mut configs = Vec::with_capacity(count);
+        egl.choose_config(display, &config_attributes, &mut configs)
+            .expect("EGL chooses a GLES3 pbuffer config");
+        let config = configs[0];
+        let context = create_gles_context(&egl, display, config).expect("GLES3 context creates");
+        let egl_surface = egl
+            .create_pbuffer_surface(
+                display,
+                config,
+                &[egl::WIDTH, 320, egl::HEIGHT, 200, egl::NONE],
+            )
+            .expect("EGL pbuffer surface creates");
+        egl.make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+            .expect("EGL makes the GLES3 context current");
+
+        let cursor_image = Arc::new(
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff], 1, 1, 0, 0)
+                .expect("test cursor image is valid"),
+        );
+        let mut renderer = GlesSceneRenderer::new_current(
+            &egl,
+            320,
+            200,
+            None,
+            EglPartialRepaintCapabilities {
+                buffer_age: false,
+                partial_render_repair: false,
+                swap_buffers_with_damage: false,
+            },
+            cursor_image,
+        )
+        .expect("test GLES renderer creates");
+
+        let socket_name = format!(
+            "typhon-decoration-resource-reconciliation-{}",
+            std::process::id()
+        );
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("bind compositor for decoration reconciliation regression");
+        let surface = RenderableSurface {
+            surface_id: 603,
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 200,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                BufferIdAllocator::default()
+                    .allocate()
+                    .expect("test buffer identity"),
+                BufferSize::new(320, 200).expect("test surface size"),
+                vec![0xff12_3456; 320 * 200],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::full(),
+            opaque_region: SurfaceOpaqueRegion::None,
+        };
+        let window_id = oblivion_one::compositor::WindowId::from_raw(3).expect("test window id");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![surface],
+            &[(603, window_id)],
+            None,
+        );
+        let resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+            &server,
+            AnimationTime::from_nanos(0),
+        );
+        assert_eq!(resolved.decorations.len(), 1);
+        assert!(resolved.lifecycle_decorations.is_empty());
+        let required = decoration_resource_requirements(
+            resolved
+                .decorations
+                .iter()
+                .map(DecorationRenderInstance::primitives),
+        );
+
+        let input_state = crate::native_output::NativeInputState::new(320, 200);
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let outcome = renderer
+            .draw_scene(&egl, display, egl_surface, request)
+            .expect("frame with canonical decoration and empty lifecycle renders");
+        let stats = match outcome {
+            EglFrameOutcome::Rendered { stats, .. } | EglFrameOutcome::Skipped { stats, .. } => {
+                stats
+            }
+        };
+
+        assert_eq!(renderer.decoration_resources.len(), required.required.len());
+        assert!(
+            required
+                .required
+                .iter()
+                .all(|key| renderer.decoration_resources.contains_key(key))
+        );
+        assert_eq!(stats.missing_required_decoration_resources, 0);
+
+        renderer.decoration_resources.clear();
+        renderer.frame_stats = GlesSceneFrameStats::default();
+        renderer
+            .draw_command_batch(true, None)
+            .expect("scene draw tolerates a missing decoration resource");
+        assert!(
+            renderer
+                .last_frame_stats()
+                .missing_required_decoration_resources
+                > 0
         );
     }
 
