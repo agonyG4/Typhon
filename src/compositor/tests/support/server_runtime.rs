@@ -6,6 +6,9 @@ use super::{
 };
 use crate::compositor::layer_shell::KeyboardInteractivity;
 use crate::wm::{LayoutMembership, WorkspaceId, WorkspaceLocation};
+
+type PendingSurfaceTreeTransactionsSnapshot = Vec<(u64, Vec<(u32, u64)>)>;
+
 pub(in crate::compositor::tests) fn create_test_shm_file(
     pixels: &[u32],
 ) -> Result<File, Box<dyn std::error::Error>> {
@@ -233,7 +236,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         surface_id: u32,
         reply: Sender<XdgRoleSnapshot>,
     },
-    CapturePendingSurfaceTreeTransactions(Sender<Vec<(u64, Vec<(u32, u64)>)>>),
+    CapturePendingSurfaceTreeTransactions(Sender<PendingSurfaceTreeTransactionsSnapshot>),
     CapturePendingFrameCallbacks(Sender<bool>),
     CaptureOnlyPendingSurfaceFrameCallbacks(Sender<bool>),
     CapturePendingFrameWork(Sender<bool>),
@@ -2188,7 +2191,7 @@ pub(in crate::compositor::tests) fn capture_xdg_role_snapshot(
 
 pub(in crate::compositor::tests) fn capture_pending_surface_tree_transactions(
     commands: &Sender<ServerCommand>,
-) -> Vec<(u64, Vec<(u32, u64)>)> {
+) -> PendingSurfaceTreeTransactionsSnapshot {
     let (reply, receiver) = mpsc::channel();
     commands
         .send(ServerCommand::CapturePendingSurfaceTreeTransactions(reply))
