@@ -29,8 +29,9 @@ pub(crate) const MAX_XWM_OUTPUT_BYTES: usize = 1024 * 1024;
 /// adds a bounded transport queue so x11rb's request machinery cannot spin on
 /// a full socket or block the compositor thread.
 #[derive(Debug)]
-pub(crate) struct ReactorStream {
-    inner: DefaultStream,
+pub(crate) struct ReactorStream<S = DefaultStream> {
+    inner: S,
+    // Serializes every socket write with acceptance into the single output FIFO.
     queued_output: Mutex<VecDeque<u8>>,
 }
 
@@ -49,7 +50,9 @@ impl ReactorStream {
             queued_output: Mutex::new(VecDeque::new()),
         })
     }
+}
 
+impl<S: Stream> ReactorStream<S> {
     pub(crate) fn wants_writable(&self) -> bool {
         !self
             .queued_output
@@ -63,7 +66,14 @@ impl ReactorStream {
             .queued_output
             .lock()
             .expect("XWM output mutex poisoned");
-        while let Some(byte) = queued.front().copied() {
+        self.flush_queued(&mut queued)
+    }
+
+    // Caller holds the output lock through draining, direct writes, and suffix acceptance.
+    fn flush_queued(&self, queued: &mut VecDeque<u8>) -> io::Result<bool> {
+        // The queue is at most 1 MiB and cannot grow under this guard. Each
+        // iteration removes positive progress or stops immediately on EAGAIN.
+        while !queued.is_empty() {
             let mut scratch = [0u8; 16 * 1024];
             let count = scratch.len().min(queued.len());
             for (slot, value) in scratch[..count].iter_mut().zip(queued.iter().take(count)) {
@@ -84,19 +94,20 @@ impl ReactorStream {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
             }
-            if queued.front().copied() == Some(byte) && count != 0 {
-                // The write path must make progress when it reported bytes.
-                break;
-            }
         }
         Ok(!queued.is_empty())
     }
 
+    #[cfg(test)]
     fn queue(&self, bytes: &[u8]) -> io::Result<()> {
         let mut queued = self
             .queued_output
             .lock()
             .expect("XWM output mutex poisoned");
+        Self::append_queued(&mut queued, bytes)
+    }
+
+    fn append_queued(queued: &mut VecDeque<u8>, bytes: &[u8]) -> io::Result<()> {
         if queued.len().saturating_add(bytes.len()) > MAX_XWM_OUTPUT_BYTES {
             return Err(io::Error::other("XWM output queue exceeded its hard bound"));
         }
@@ -105,13 +116,13 @@ impl ReactorStream {
     }
 }
 
-impl AsRawFd for ReactorStream {
+impl<S: AsRawFd> AsRawFd for ReactorStream<S> {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-impl Stream for ReactorStream {
+impl<S: Stream + AsRawFd> Stream for ReactorStream<S> {
     fn poll(&self, mode: PollMode) -> io::Result<()> {
         let _ = self.flush_pending()?;
 
@@ -166,15 +177,26 @@ impl Stream for ReactorStream {
                 "XWM transport does not support ancillary descriptors",
             ));
         }
-        let _ = self.flush_pending()?;
+        let mut queued = self
+            .queued_output
+            .lock()
+            .expect("XWM output mutex poisoned");
+        if self.flush_queued(&mut queued)? {
+            Self::append_queued(&mut queued, buffer)?;
+            return Ok(buffer.len());
+        }
         match self.inner.write(buffer, fds) {
             Ok(written) if written == buffer.len() => Ok(written),
             Ok(written) => {
-                self.queue(&buffer[written..])?;
+                if let Err(error) = Self::append_queued(&mut queued, &buffer[written..]) {
+                    // Stream follows Write: an error cannot conceal accepted bytes.
+                    // Leave the unaccepted suffix with x11rb for its next write.
+                    return if written > 0 { Ok(written) } else { Err(error) };
+                }
                 Ok(buffer.len())
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                self.queue(buffer)?;
+                Self::append_queued(&mut queued, buffer)?;
                 Ok(buffer.len())
             }
             Err(error) => Err(error),
@@ -388,9 +410,168 @@ impl Connection for X11Connection {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, os::unix::net::UnixStream};
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+    };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ScriptedStream {
+        // Zero means EAGAIN; positive entries cap the next successful write.
+        steps: Mutex<VecDeque<usize>>,
+        received: Mutex<Vec<u8>>,
+    }
+
+    impl AsRawFd for ScriptedStream {
+        fn as_raw_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    impl Stream for ScriptedStream {
+        fn poll(&self, _: PollMode) -> io::Result<()> {
+            panic!("reactor must not call the blocking inner poll")
+        }
+
+        fn read(&self, _: &mut [u8], _: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+            unreachable!("output-only fixture")
+        }
+
+        fn write(&self, bytes: &[u8], _: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+            let limit = self.steps.lock().unwrap().pop_front().unwrap_or(usize::MAX);
+            if limit == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let written = bytes.len().min(limit);
+            self.received
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+    }
+
+    fn scripted_stream(steps: VecDeque<usize>) -> ReactorStream<ScriptedStream> {
+        ReactorStream {
+            inner: ScriptedStream {
+                steps: Mutex::new(steps),
+                received: Mutex::new(Vec::new()),
+            },
+            queued_output: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    #[test]
+    fn short_writes_and_eagain_preserve_every_accepted_byte() {
+        for offset in 0..16 {
+            let stream = scripted_stream((0..128).map(|i| (i + offset) % 7).collect());
+            let mut accepted = Vec::new();
+            for request in 0..32 {
+                let bytes = vec![b'A' + request; 1024 + usize::from(request) * 17];
+                assert_eq!(stream.write(&bytes, &mut Vec::new()).unwrap(), bytes.len());
+                accepted.extend(bytes);
+                let received = stream.inner.received.lock().unwrap();
+                assert_eq!(*received, accepted[..received.len()]);
+                assert_eq!(stream.wants_writable(), received.len() < accepted.len());
+            }
+            for _ in 0..128 {
+                if !stream.flush_pending().unwrap() {
+                    break;
+                }
+            }
+            assert_eq!(*stream.inner.received.lock().unwrap(), accepted);
+            assert!(!stream.wants_writable());
+        }
+    }
+
+    #[test]
+    fn exact_capacity_accepts_no_extra_bytes_and_keeps_writable_interest() {
+        let stream = scripted_stream(VecDeque::from([0, 0, 0]));
+        let bytes = vec![b'A'; MAX_XWM_OUTPUT_BYTES];
+        assert_eq!(stream.write(&bytes, &mut Vec::new()).unwrap(), bytes.len());
+        assert!(stream.wants_writable());
+        assert!(stream.write(b"B", &mut Vec::new()).is_err());
+        assert_eq!(
+            stream.queued_output.lock().unwrap().len(),
+            MAX_XWM_OUTPUT_BYTES
+        );
+        assert!(
+            stream.flush_pending().unwrap(),
+            "EAGAIN retains writable interest"
+        );
+        assert!(stream.inner.received.lock().unwrap().is_empty());
+        assert!(!stream.flush_pending().unwrap());
+        assert_eq!(*stream.inner.received.lock().unwrap(), bytes);
+        assert!(!stream.wants_writable());
+    }
+
+    #[test]
+    fn older_queued_bytes_cannot_be_overtaken() {
+        let (socket, mut peer) = UnixStream::pair().expect("socket pair");
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let stream = ReactorStream::from_unix_stream(socket).expect("reactor stream");
+        stream.queue(&vec![b'A'; 48 * 1024]).expect("older output");
+        assert_eq!(stream.write(b"B", &mut Vec::new()).unwrap(), 1);
+        for _ in 0..8 {
+            if !stream.flush_pending().unwrap() {
+                break;
+            }
+        }
+        let mut received = vec![0; 48 * 1024 + 1];
+        peer.read_exact(&mut received).expect("all accepted bytes");
+        assert_eq!(
+            received.iter().position(|byte| *byte == b'B'),
+            Some(48 * 1024)
+        );
+        assert!(received[..48 * 1024].iter().all(|byte| *byte == b'A'));
+        assert!(!stream.wants_writable());
+    }
+
+    #[test]
+    fn repeated_queued_bytes_are_positive_progress() {
+        let (socket, mut peer) = UnixStream::pair().expect("socket pair");
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let stream = ReactorStream::from_unix_stream(socket).expect("reactor stream");
+        let bytes = vec![b'A'; 48 * 1024];
+        stream.queue(&bytes).expect("older output");
+        assert!(!stream.flush_pending().expect("drain every positive write"));
+        let mut received = vec![0; bytes.len()];
+        peer.read_exact(&mut received).expect("all repeated bytes");
+        assert_eq!(received, bytes);
+        assert!(!stream.wants_writable());
+    }
+
+    #[test]
+    fn oversized_short_write_reports_the_prefix_already_sent() {
+        let (socket, mut peer) = UnixStream::pair().expect("socket pair");
+        let capacity: libc::c_int = 4096;
+        // Limit the socket below the request size to force a positive short write.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&capacity as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let stream = ReactorStream::from_unix_stream(socket).expect("reactor stream");
+        let bytes = vec![b'A'; 2 * MAX_XWM_OUTPUT_BYTES];
+        let accepted = stream
+            .write(&bytes, &mut Vec::new())
+            .expect("a sent prefix must be reported, even if its suffix cannot fit");
+        assert!(accepted > 0 && accepted < bytes.len());
+        let mut received = vec![0; accepted];
+        peer.read_exact(&mut received).expect("accepted prefix");
+        assert_eq!(received, bytes[..accepted]);
+        assert!(!stream.wants_writable());
+    }
 
     #[test]
     fn reactor_stream_is_nonblocking_before_any_x11_request() {
