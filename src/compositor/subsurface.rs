@@ -1211,10 +1211,12 @@ impl SubsurfaceTransactionState {
             }
             _ => {}
         }
-        self.maximum_cached_entries = self.maximum_cached_entries.max(new_entries);
+        self.maximum_cached_entries = self.maximum_cached_entries.max(self.cached_entries_total);
         self.maximum_cached_entries_per_surface =
             self.maximum_cached_entries_per_surface.max(new_entries);
-        self.maximum_cached_obligations = self.maximum_cached_obligations.max(new_obligations);
+        self.maximum_cached_obligations = self
+            .maximum_cached_obligations
+            .max(self.cached_obligations_total);
         self.maximum_cached_obligations_per_surface = self
             .maximum_cached_obligations_per_surface
             .max(new_obligations);

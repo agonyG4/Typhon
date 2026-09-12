@@ -730,7 +730,7 @@ pub struct CompositorState {
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
-    pending_client_resource_exhaustions: Vec<u32>,
+    pending_client_resource_exhaustions: Vec<PendingClientResourceExhaustion>,
     pending_client_resource_exhaustion_clients: HashSet<ClientId>,
     pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,

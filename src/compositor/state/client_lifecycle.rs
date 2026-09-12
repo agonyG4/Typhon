@@ -7,27 +7,48 @@ pub(in crate::compositor) struct ClientTeardownSummary {
     pub(in crate::compositor) repaint_scheduled: bool,
 }
 
+#[derive(Debug)]
+pub(in crate::compositor) struct PendingClientResourceExhaustion {
+    pub(in crate::compositor) client: Client,
+    pub(in crate::compositor) _evidence_surface_id: u32,
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn request_client_resource_exhaustion(
         &mut self,
         surface_id: u32,
     ) -> bool {
-        let client_id = self.surface_client_ids.get(&surface_id).cloned();
-        let already_pending = self
-            .pending_client_resource_exhaustions
-            .contains(&surface_id)
-            || client_id.as_ref().is_some_and(|client_id| {
-                self.pending_client_resource_exhaustion_clients
-                    .contains(client_id)
-            });
-        if already_pending {
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            debug_assert!(
+                false,
+                "resource exhaustion requested without a live surface resource"
+            );
+            return false;
+        };
+        let Some(client) = surface.client() else {
+            debug_assert!(
+                false,
+                "resource exhaustion surface has no owning client resource"
+            );
+            return false;
+        };
+        let client_id = client.id();
+        debug_assert_eq!(
+            self.surface_client_ids.get(&surface_id),
+            Some(&client_id),
+            "surface ownership maps disagree while scheduling resource exhaustion"
+        );
+        if !self
+            .pending_client_resource_exhaustion_clients
+            .insert(client_id)
+        {
             return false;
         }
-        self.pending_client_resource_exhaustions.push(surface_id);
-        if let Some(client_id) = client_id {
-            self.pending_client_resource_exhaustion_clients
-                .insert(client_id);
-        }
+        self.pending_client_resource_exhaustions
+            .push(PendingClientResourceExhaustion {
+                client,
+                _evidence_surface_id: surface_id,
+            });
         self.surface_pacing_metrics.queue_resource_exhaustions = self
             .surface_pacing_metrics
             .queue_resource_exhaustions
@@ -35,7 +56,9 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn take_client_resource_exhaustions(&mut self) -> Vec<u32> {
+    pub(in crate::compositor) fn take_client_resource_exhaustions(
+        &mut self,
+    ) -> Vec<PendingClientResourceExhaustion> {
         self.pending_client_resource_exhaustion_clients.clear();
         std::mem::take(&mut self.pending_client_resource_exhaustions)
     }

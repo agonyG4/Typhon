@@ -1,6 +1,6 @@
 use super::*;
 use crate::native::presentation_deadline::MonotonicTimestampNs;
-use wayland_server::{Resource, backend::protocol::ProtocolError};
+use wayland_server::backend::protocol::ProtocolError;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedDirectFrameBatch {
@@ -16,21 +16,17 @@ impl OwnCompositorServer {
     }
 
     pub(super) fn kill_pending_resource_exhaustion_clients(&mut self) {
-        for surface_id in self.state.take_client_resource_exhaustions() {
-            let handle = self.display.handle();
-            if let Some(surface) = self.state.surface_resource_by_id(surface_id)
-                && let Ok(client) = handle.get_client(surface.id())
-            {
-                client.kill(
-                    &handle,
-                    ProtocolError {
-                        code: 2,
-                        object_id: 1,
-                        object_interface: "wl_display".to_string(),
-                        message: "surface Content Update/cache resources exhausted".to_string(),
-                    },
-                );
-            }
+        let handle = self.display.handle();
+        for pending in self.state.take_client_resource_exhaustions() {
+            pending.client.kill(
+                &handle,
+                ProtocolError {
+                    code: 2,
+                    object_id: 1,
+                    object_interface: "wl_display".to_string(),
+                    message: "surface Content Update/cache resources exhausted".to_string(),
+                },
+            );
         }
     }
 
@@ -541,6 +537,177 @@ impl OwnCompositorServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        os::unix::net::UnixStream,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use wayland_server::{
+        Client,
+        backend::{ClientData, DisconnectReason},
+    };
+
+    #[derive(Debug)]
+    struct TestClientData {
+        disconnected: Arc<AtomicBool>,
+    }
+
+    impl ClientData for TestClientData {
+        fn disconnected(
+            &self,
+            _client_id: wayland_server::backend::ClientId,
+            _reason: DisconnectReason,
+        ) {
+            self.disconnected.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_client_surface(
+        server: &mut OwnCompositorServer,
+    ) -> (
+        Client,
+        wayland_server::protocol::wl_surface::WlSurface,
+        Arc<AtomicBool>,
+        UnixStream,
+    ) {
+        let (server_end, peer) = UnixStream::pair().expect("resource exhaustion test client");
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut handle = server.display.handle();
+        let client = handle
+            .insert_client(
+                server_end,
+                Arc::new(TestClientData {
+                    disconnected: disconnected.clone(),
+                }),
+            )
+            .expect("insert resource exhaustion test client");
+        let surface = server
+            .state
+            .test_create_unmapped_surface_resource_at_version(&client, &handle, 1);
+        (client, surface, disconnected, peer)
+    }
+
+    #[test]
+    fn pending_exhaustion_kills_client_after_fault_surface_destroyed() {
+        let mut server = OwnCompositorServer::bind(format!(
+            "typhon-resource-exhaustion-surface-destroy-{}",
+            std::process::id()
+        ))
+        .expect("resource exhaustion test server");
+        let (client, surface, disconnected, _peer) = test_client_surface(&mut server);
+        let surface_id = compositor_surface_id(&surface);
+
+        assert!(server.state.request_client_resource_exhaustion(surface_id));
+        server
+            .state
+            .teardown_surface_resource(surface_id, SurfaceTeardownReason::ExplicitDestroy);
+        assert!(server.state.surface_resource_by_id(surface_id).is_none());
+        assert!(
+            server
+                .state
+                .client_resource_exhaustion_pending(&client.id())
+        );
+        assert_eq!(server.state.pending_client_resource_exhaustions.len(), 1);
+        assert_eq!(
+            server.state.pending_client_resource_exhaustions[0]
+                .client
+                .id(),
+            client.id()
+        );
+        assert_eq!(
+            server.state.pending_client_resource_exhaustions[0]._evidence_surface_id,
+            surface_id
+        );
+
+        server.kill_pending_resource_exhaustion_clients();
+
+        assert!(disconnected.load(Ordering::SeqCst));
+        assert!(
+            !server
+                .state
+                .client_resource_exhaustion_pending(&client.id())
+        );
+    }
+
+    #[test]
+    fn resource_exhaustion_kills_only_the_client_that_triggered_it() {
+        let mut server = OwnCompositorServer::bind(format!(
+            "typhon-resource-exhaustion-isolation-{}",
+            std::process::id()
+        ))
+        .expect("resource exhaustion test server");
+        let (_client_a, surface_a, disconnected_a, _peer_a) = test_client_surface(&mut server);
+        let (_client_b, surface_b, disconnected_b, _peer_b) = test_client_surface(&mut server);
+        let surface_a_id = compositor_surface_id(&surface_a);
+
+        assert!(
+            server
+                .state
+                .request_client_resource_exhaustion(surface_a_id)
+        );
+        server
+            .state
+            .teardown_surface_resource(surface_a_id, SurfaceTeardownReason::ExplicitDestroy);
+        server.kill_pending_resource_exhaustion_clients();
+
+        assert!(disconnected_a.load(Ordering::SeqCst));
+        assert!(!disconnected_b.load(Ordering::SeqCst));
+        assert!(server.display.handle().get_client(surface_b.id()).is_ok());
+    }
+
+    #[test]
+    fn one_client_has_one_pending_resource_exhaustion_record() {
+        let mut server = OwnCompositorServer::bind(format!(
+            "typhon-resource-exhaustion-dedup-{}",
+            std::process::id()
+        ))
+        .expect("resource exhaustion test server");
+        let (client, surface_a, _disconnected, _peer_a) = test_client_surface(&mut server);
+        let handle = server.display.handle();
+        let surface_b = server
+            .state
+            .test_create_unmapped_surface_resource_at_version(&client, &handle, 1);
+        let surface_a_id = compositor_surface_id(&surface_a);
+        let surface_b_id = compositor_surface_id(&surface_b);
+
+        assert!(
+            server
+                .state
+                .request_client_resource_exhaustion(surface_a_id)
+        );
+        assert!(
+            !server
+                .state
+                .request_client_resource_exhaustion(surface_b_id)
+        );
+        assert!(
+            server
+                .state
+                .client_resource_exhaustion_pending(&client.id())
+        );
+        assert_eq!(server.state.pending_client_resource_exhaustions.len(), 1);
+        assert_eq!(
+            server.state.pending_client_resource_exhaustions[0]
+                .client
+                .id(),
+            client.id()
+        );
+        assert_eq!(
+            server
+                .state
+                .surface_pacing_metrics
+                .queue_resource_exhaustions,
+            1
+        );
+        assert_eq!(server.state.take_client_resource_exhaustions().len(), 1);
+        assert!(
+            !server
+                .state
+                .client_resource_exhaustion_pending(&client.id())
+        );
+    }
 
     #[test]
     fn surface_pacing_service_flushes_at_its_write_side_boundary() {

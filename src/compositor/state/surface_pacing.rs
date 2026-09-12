@@ -1240,7 +1240,16 @@ mod tests {
     }
     #[test]
     fn non_evictable_queue_rejects_an_ordinary_incoming_transaction() {
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test client");
+        let client = display_handle
+            .insert_client(server_end, std::sync::Arc::new(()))
+            .expect("insert test client");
         let mut state = CompositorState::default();
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = crate::compositor::compositor_surface_id(&surface);
         let requested = CommitTimingConstraint::from_protocol(
             client_pacing_now_ns() / 1_000_000_000 + 3_600,
             0,
@@ -1253,8 +1262,8 @@ mod tests {
                 .pending_surface_tree_transactions
                 .push(PendingSurfaceTreeTransaction {
                     id: SurfaceTreeTransactionId::new(index as u64 + 1),
-                    root_surface_id: 9,
-                    nodes: vec![(9, commit)],
+                    root_surface_id: surface_id,
+                    nodes: vec![(surface_id, commit)],
                     dependencies: Vec::new(),
                     commit_timing_readiness: None,
                     received_at: Instant::now(),
@@ -1262,13 +1271,13 @@ mod tests {
         }
 
         state.queue_waiting_surface_tree(
-            9,
-            vec![(9, empty_cached_subsurface_commit())],
+            surface_id,
+            vec![(surface_id, empty_cached_subsurface_commit())],
             Vec::new(),
         );
 
         assert_eq!(state.pending_surface_tree_transactions.len(), 8);
-        assert_eq!(state.take_client_resource_exhaustions(), vec![9]);
+        assert_eq!(state.take_client_resource_exhaustions().len(), 1);
         assert_eq!(
             state
                 .surface_pacing_metrics

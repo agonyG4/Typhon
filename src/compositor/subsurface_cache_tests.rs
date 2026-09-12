@@ -316,8 +316,85 @@ fn global_entry_limit_rejects_without_eviction() {
         state.cached_entry_count(),
         MAX_SYNCHRONIZED_CACHED_COMMITS_TOTAL
     );
+    assert_eq!(
+        state.maximum_cached_entries(),
+        MAX_SYNCHRONIZED_CACHED_COMMITS_TOTAL
+    );
     assert_eq!(state.roles[&2].cached_commits.len(), 8);
     assert_eq!(state.roles[&513].cached_commits.len(), 8);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn aggregate_entry_high_watermark_tracks_all_cached_surfaces() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.register(3, 1));
+
+    for surface_id in [2, 3] {
+        let entry_count = if surface_id == 2 { 8 } else { 5 };
+        for sequence in 0..entry_count {
+            let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+            commit.commit_id = SurfaceCommitId::for_tests(
+                u64::from(surface_id) * 16 + u64::try_from(sequence).unwrap(),
+            );
+            commit.pacing.fifo_set_barrier = true;
+            assert!(matches!(
+                state.cache_commit(surface_id, commit),
+                CacheCommitOutcome::Inserted
+            ));
+        }
+    }
+
+    assert_eq!(state.cached_entry_count(), 13);
+    assert_eq!(state.maximum_cached_entries(), 13);
+    assert_eq!(state.maximum_cached_entries_per_surface(), 8);
+
+    assert_eq!(state.remove_role(2).len(), 8);
+    assert_eq!(state.cached_entry_count(), 5);
+    assert_eq!(state.maximum_cached_entries(), 13);
+    assert_eq!(state.maximum_cached_entries_per_surface(), 8);
+    assert!(state.debug_accounting_is_consistent());
+}
+
+#[test]
+fn aggregate_obligation_high_watermark_tracks_all_cached_surfaces() {
+    let display = Display::<crate::compositor::CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (client, _peer) = test_client(&mut display_handle);
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register_with_client(2, 1, Some(client.id())));
+    assert!(state.register_with_client(3, 1, Some(client.id())));
+
+    for (surface_id, callback_count) in [(2, 600), (3, 500)] {
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        for _ in 0..callback_count {
+            commit.frame_callbacks.push(
+                client
+                    .create_resource::<
+                        wl_callback::WlCallback,
+                        (),
+                        crate::compositor::CompositorState,
+                    >(&display_handle, 1, ())
+                    .expect("callback resource"),
+            );
+        }
+        assert!(matches!(
+            state.cache_commit(surface_id, commit),
+            CacheCommitOutcome::Inserted
+        ));
+    }
+
+    assert_eq!(state.cached_obligation_count(), 1_100);
+    assert_eq!(state.maximum_cached_obligations(), 1_100);
+    assert_eq!(state.maximum_cached_obligations_per_surface(), 600);
+    assert_eq!(state.maximum_cached_obligations_per_client(), 1_100);
+
+    assert_eq!(state.remove_role(2).len(), 1);
+    assert_eq!(state.cached_obligation_count(), 500);
+    assert_eq!(state.maximum_cached_obligations(), 1_100);
+    assert_eq!(state.maximum_cached_obligations_per_surface(), 600);
+    assert_eq!(state.maximum_cached_obligations_per_client(), 1_100);
     assert!(state.debug_accounting_is_consistent());
 }
 
