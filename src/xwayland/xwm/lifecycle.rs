@@ -25,7 +25,13 @@ impl Drop for Xwm {
             connection::Connection as _, protocol::xproto::ConnectionExt as XprotoConnectionExt,
         };
 
-        for alarm in self.sync_alarms.values().copied() {
+        let alarms = self
+            .sync_alarms
+            .values()
+            .copied()
+            .chain(self.sync_alarm_bindings.keys().copied())
+            .collect::<std::collections::HashSet<_>>();
+        for alarm in alarms {
             let _ = self.connection.sync_destroy_alarm(alarm);
         }
         let _ = self.connection.destroy_window(self.supporting_wm_check);

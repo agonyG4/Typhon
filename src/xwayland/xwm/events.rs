@@ -11,7 +11,11 @@ use crate::compositor::DesktopWindowKind;
 use crate::xwayland::trace::{self, TraceCategory, TraceFields};
 use x11rb::{
     connection::Connection,
-    protocol::{Event, sync::Int64, xproto},
+    protocol::{
+        Event,
+        sync::{self, Int64},
+        xproto,
+    },
 };
 pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> {
     let mut processed = 0;
@@ -168,6 +172,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 );
                 return Ok(());
             }
+            xwm.clear_resize_sync(handle);
             if let Some(association) = association {
                 xwm.clear_surface_buffer_ready(association.surface_id);
                 xwm.association.remove_x11_window(handle);
@@ -337,6 +342,16 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::SyncCounterNotify(event) => {
             if xwm.capabilities.sync {
                 xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
+            }
+        }
+        Event::SyncAlarmNotify(event) => {
+            if xwm.capabilities.sync
+                && matches!(
+                    event.state,
+                    sync::ALARMSTATE::ACTIVE | sync::ALARMSTATE::INACTIVE
+                )
+            {
+                xwm.note_sync_alarm_notify(event.alarm, int64_to_u64(event.counter_value));
             }
         }
         Event::FocusIn(event) => {
@@ -651,6 +666,7 @@ pub(crate) mod tests {
             resize_sync: super::super::resize_sync::ResizeSyncTracker::default(),
             focus: super::super::focus::FocusTracker::default(),
             sync_alarms: Default::default(),
+            sync_alarm_bindings: Default::default(),
             sync_handles_by_counter: Default::default(),
             sync_counter_initializations: Default::default(),
             timed_out_resize_counters: Default::default(),

@@ -935,7 +935,24 @@ pub(crate) fn begin_resize_sync(
         let _ = xwm.connection.sync_destroy_alarm(alarm);
         return Err(XwmError::ResizeSync(error));
     }
+    let Some(transaction_id) = xwm.resize_sync.transaction_id(window) else {
+        xwm.resize_sync.clear(window);
+        let _ = xwm.connection.sync_destroy_alarm(alarm);
+        return Err(XwmError::InvalidCommand(
+            "resize sync transaction disappeared",
+        ));
+    };
     xwm.sync_alarms.insert(window, alarm);
+    xwm.sync_alarm_bindings.insert(
+        alarm,
+        super::ResizeSyncAlarmBinding {
+            alarm,
+            handle: window,
+            generation: window.generation(),
+            transaction_id,
+            counter_value: requested_counter_value,
+        },
+    );
     xwm.sync_handles_by_counter.insert(sync_counter, window);
 
     let mut configure_cookie_sequence = None;

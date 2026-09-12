@@ -91,6 +91,15 @@ pub(super) fn trace_raw_event(event: &Event) {
                 .field("sync_counter", event.counter)
                 .field("sync_counter_value", format!("{:?}", event.counter_value))
         }),
+        Event::SyncAlarmNotify(event) => trace::emit("SyncAlarmNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("sync_alarm", event.alarm)
+                .field("sync_counter_value", format!("{:?}", event.counter_value))
+                .field("sync_alarm_value", format!("{:?}", event.alarm_value))
+                .field("sync_alarm_state", format!("{:?}", event.state))
+        }),
         _ => {}
     }
 }

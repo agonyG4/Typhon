@@ -61,7 +61,7 @@ pub use decoration::{X11DecorationHints, X11FrameExtents, X11MotifDecorationHint
 pub use event_types::{X11AdmissionCancellationReason, XwmDrain, XwmEvent};
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
-pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
+pub(crate) use resize_sync::{ResizeSyncAlarmBinding, ResizeSyncCommit, ResizeSyncTracker};
 pub(crate) use root_stack::OverrideRedirectStackMetrics;
 use root_stack::OverrideRedirectStackState;
 pub use window::X11WindowLifecycle;
@@ -358,6 +358,7 @@ pub struct Xwm {
     pub(crate) resize_sync: ResizeSyncTracker,
     pub(crate) focus: focus::FocusTracker,
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
+    pub(crate) sync_alarm_bindings: HashMap<u32, ResizeSyncAlarmBinding>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) sync_counter_initializations: HashMap<X11WindowHandle, u32>,
     pub(crate) timed_out_resize_counters: HashMap<X11WindowHandle, u64>,

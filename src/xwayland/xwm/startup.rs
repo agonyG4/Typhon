@@ -1345,6 +1345,7 @@ impl XwmStartup {
             resize_sync: super::resize_sync::ResizeSyncTracker::default(),
             focus: super::focus::FocusTracker::default(),
             sync_alarms: Default::default(),
+            sync_alarm_bindings: Default::default(),
             sync_handles_by_counter: Default::default(),
             sync_counter_initializations: Default::default(),
             timed_out_resize_counters: Default::default(),

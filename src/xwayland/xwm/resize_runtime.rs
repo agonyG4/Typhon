@@ -3,6 +3,31 @@ use crate::xwayland::trace::{self, TraceFields};
 use x11rb::connection::Connection;
 
 impl Xwm {
+    pub(crate) fn note_sync_alarm_notify(&mut self, alarm: u32, value: u64) {
+        let Some(binding) = self.sync_alarm_bindings.get(&alarm).copied() else {
+            return;
+        };
+        let handle = binding.handle;
+        let alarm_matches_binding = binding.alarm == alarm;
+        let owned_by_window = self.sync_alarms.get(&handle) == Some(&alarm);
+        let generation_matches =
+            binding.generation == self.generation && handle.generation() == self.generation;
+        let transaction_matches =
+            self.resize_sync.transaction_id(handle) == Some(binding.transaction_id);
+        let late_timeout_matches = self.resize_sync.transaction_id(handle).is_none()
+            && self.resize_sync.sync_disabled(handle)
+            && self.timed_out_resize_counters.get(&handle) == Some(&binding.counter_value);
+        if !alarm_matches_binding
+            || !owned_by_window
+            || !generation_matches
+            || (!transaction_matches && !late_timeout_matches)
+            || value != binding.counter_value
+        {
+            return;
+        }
+        self.note_resize_sync_ack(handle, value);
+    }
+
     pub(crate) fn handle_focus_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         let Some(pending) = self.focus.pending_focus().copied() else {
             return Ok(());
@@ -184,7 +209,13 @@ impl Xwm {
             .keys()
             .filter(|handle| handle.generation() == generation)
             .copied()
-            .collect::<Vec<_>>();
+            .chain(
+                self.sync_alarm_bindings
+                    .values()
+                    .filter(|binding| binding.generation == generation)
+                    .map(|binding| binding.handle),
+            )
+            .collect::<HashSet<_>>();
         self.resize_sync.clear_generation(generation);
         self.timed_out_resize_counters
             .retain(|handle, _| handle.generation() != generation);
@@ -199,6 +230,8 @@ impl Xwm {
         for handle in handles {
             self.clear_resize_sync_alarm(handle);
         }
+        self.sync_alarm_bindings
+            .retain(|_, binding| binding.generation != generation);
     }
 
     pub(crate) fn note_expected_configure_with_context(
@@ -482,13 +515,26 @@ impl Xwm {
     }
 
     pub(crate) fn clear_resize_sync_alarm(&mut self, handle: X11WindowHandle) {
-        let Some(alarm) = self.sync_alarms.remove(&handle) else {
-            return;
-        };
+        let alarms = self
+            .sync_alarms
+            .remove(&handle)
+            .into_iter()
+            .chain(
+                self.sync_alarm_bindings
+                    .iter()
+                    .filter(|(_, binding)| binding.handle == handle)
+                    .map(|(alarm, _)| *alarm),
+            )
+            .collect::<HashSet<_>>();
+        for alarm in alarms {
+            self.sync_alarm_bindings.remove(&alarm);
+            use x11rb::protocol::sync::ConnectionExt as _;
+            let _ = self.connection.sync_destroy_alarm(alarm);
+        }
+        self.sync_alarm_bindings
+            .retain(|_, binding| binding.handle != handle);
         self.sync_handles_by_counter
             .retain(|_, mapped_handle| *mapped_handle != handle);
-        use x11rb::protocol::sync::ConnectionExt as _;
-        let _ = self.connection.sync_destroy_alarm(alarm);
     }
 
     pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) -> bool {

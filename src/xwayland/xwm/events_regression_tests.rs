@@ -20,6 +20,25 @@ use super::tests::{
 };
 use super::{X11Geometry, X11WindowLifecycle, normalize};
 
+fn alarm_notify_event(alarm: u32, counter_value: u64) -> Event {
+    Event::SyncAlarmNotify(sync::AlarmNotifyEvent {
+        response_type: 1,
+        kind: 0,
+        sequence: 0,
+        alarm,
+        counter_value: sync::Int64 {
+            hi: (counter_value >> 32) as i32,
+            lo: counter_value as u32,
+        },
+        alarm_value: sync::Int64 {
+            hi: (counter_value >> 32) as i32,
+            lo: counter_value as u32,
+        },
+        timestamp: 0,
+        state: sync::ALARMSTATE::ACTIVE,
+    })
+}
+
 fn read_fixture_requests(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
     peer.set_nonblocking(true)
         .expect("nonblocking fixture peer");
@@ -1545,6 +1564,220 @@ fn xsync_request_precedes_configure() {
         vec![18, 25, 12],
         "allow-off, sync request, and ConfigureWindow must be ordered"
     );
+}
+
+#[test]
+fn matching_sync_alarm_notify_acknowledges_active_resize() {
+    let generation = generation(231);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 231, true, false, false);
+    xwm.capabilities.sync = true;
+    xwm.connection.set_extensions(HashMap::from([(
+        sync::X11_EXTENSION_NAME,
+        ExtensionInformation {
+            major_opcode: 128,
+            first_event: 0,
+            first_error: 0,
+        },
+    )]));
+    xwm.windows
+        .get_mut(handle)
+        .expect("managed window")
+        .snapshot = Some(sync_snapshot(handle, 41));
+
+    super::super::commands::begin_resize_sync(
+        &mut xwm,
+        handle,
+        X11Geometry {
+            width: 901,
+            height: 701,
+            ..X11Geometry::default()
+        },
+        7,
+        100,
+        false,
+    )
+    .expect("begin synchronized resize");
+    let alarm = *xwm.sync_alarms.get(&handle).expect("owned alarm");
+    let destroyed_alarm = Event::SyncAlarmNotify(sync::AlarmNotifyEvent {
+        state: sync::ALARMSTATE::DESTROYED,
+        ..match alarm_notify_event(alarm, 7) {
+            Event::SyncAlarmNotify(event) => event,
+            _ => unreachable!("alarm helper produces AlarmNotify"),
+        }
+    });
+    normalize(&mut xwm, destroyed_alarm).expect("destroyed AlarmNotify");
+    assert!(matches!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::ConfigureSent { .. }
+    ));
+    let inactive_alarm = Event::SyncAlarmNotify(sync::AlarmNotifyEvent {
+        state: sync::ALARMSTATE::INACTIVE,
+        ..match alarm_notify_event(alarm, 7) {
+            Event::SyncAlarmNotify(event) => event,
+            _ => unreachable!("alarm helper produces AlarmNotify"),
+        }
+    });
+    normalize(&mut xwm, inactive_alarm).expect("triggered inactive AlarmNotify");
+
+    assert_eq!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::AckObserved {
+            counter_value: 7,
+            deadline_ns: 100,
+        }
+    );
+    assert!(matches!(
+        xwm.take_events().collect::<Vec<_>>().as_slice(),
+        [XwmEvent::ResizeSyncAckObserved { window, counter_value }]
+            if *window == handle && *counter_value == 7
+    ));
+}
+
+#[test]
+fn unknown_and_replaced_sync_alarms_cannot_acknowledge_resize() {
+    let generation = generation(232);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 232, true, false, false);
+    xwm.capabilities.sync = true;
+    xwm.connection.set_extensions(HashMap::from([(
+        sync::X11_EXTENSION_NAME,
+        ExtensionInformation {
+            major_opcode: 128,
+            first_event: 0,
+            first_error: 0,
+        },
+    )]));
+    xwm.windows
+        .get_mut(handle)
+        .expect("managed window")
+        .snapshot = Some(sync_snapshot(handle, 41));
+
+    let geometry = X11Geometry {
+        width: 900,
+        height: 700,
+        ..X11Geometry::default()
+    };
+    super::super::commands::begin_resize_sync(&mut xwm, handle, geometry, 7, 100, false)
+        .expect("begin first resize");
+    let old_alarm = *xwm.sync_alarms.get(&handle).expect("first alarm");
+    normalize(&mut xwm, alarm_notify_event(old_alarm.wrapping_add(1), 7))
+        .expect("unknown AlarmNotify");
+    assert!(matches!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::ConfigureSent { .. }
+    ));
+
+    xwm.clear_resize_sync(handle);
+    super::super::commands::begin_resize_sync(
+        &mut xwm,
+        handle,
+        X11Geometry {
+            width: 901,
+            ..geometry
+        },
+        7,
+        100,
+        false,
+    )
+    .expect("begin replacement resize");
+    let new_alarm = *xwm.sync_alarms.get(&handle).expect("replacement alarm");
+    assert_ne!(old_alarm, new_alarm);
+    normalize(&mut xwm, alarm_notify_event(old_alarm, 7)).expect("stale AlarmNotify");
+    assert!(matches!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::ConfigureSent { .. }
+    ));
+    normalize(&mut xwm, alarm_notify_event(new_alarm, 7)).expect("current AlarmNotify");
+    assert!(matches!(
+        xwm.resize_sync.state(handle),
+        ResizeSyncState::AckObserved { .. }
+    ));
+}
+
+#[test]
+fn generation_cleanup_removes_sync_alarm_ownership() {
+    let generation = generation(233);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 233, true, false, false);
+    xwm.capabilities.sync = true;
+    xwm.connection.set_extensions(HashMap::from([(
+        sync::X11_EXTENSION_NAME,
+        ExtensionInformation {
+            major_opcode: 128,
+            first_event: 0,
+            first_error: 0,
+        },
+    )]));
+    xwm.windows
+        .get_mut(handle)
+        .expect("managed window")
+        .snapshot = Some(sync_snapshot(handle, 41));
+    super::super::commands::begin_resize_sync(
+        &mut xwm,
+        handle,
+        X11Geometry {
+            width: 901,
+            height: 701,
+            ..X11Geometry::default()
+        },
+        7,
+        100,
+        false,
+    )
+    .expect("begin synchronized resize");
+    let alarm = *xwm.sync_alarms.get(&handle).expect("owned alarm");
+
+    xwm.clear_generation(generation);
+    assert!(xwm.sync_alarms.is_empty());
+    assert!(xwm.sync_alarm_bindings.is_empty());
+    normalize(&mut xwm, alarm_notify_event(alarm, 7)).expect("stale generation AlarmNotify");
+    assert!(xwm.take_events().next().is_none());
+}
+
+#[test]
+fn matching_late_sync_alarm_recovers_after_timeout_but_wrong_counter_does_not() {
+    let generation = generation(234);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 234, true, false, false);
+    xwm.capabilities.sync = true;
+    xwm.connection.set_extensions(HashMap::from([(
+        sync::X11_EXTENSION_NAME,
+        ExtensionInformation {
+            major_opcode: 128,
+            first_event: 0,
+            first_error: 0,
+        },
+    )]));
+    xwm.windows
+        .get_mut(handle)
+        .expect("managed window")
+        .snapshot = Some(sync_snapshot(handle, 41));
+    super::super::commands::begin_resize_sync(
+        &mut xwm,
+        handle,
+        X11Geometry {
+            width: 901,
+            height: 701,
+            ..X11Geometry::default()
+        },
+        19,
+        100,
+        false,
+    )
+    .expect("begin synchronized resize");
+    let alarm = *xwm.sync_alarms.get(&handle).expect("owned alarm");
+    xwm.handle_resize_sync_deadline(100).expect("timeout");
+    assert!(xwm.resize_sync.sync_disabled(handle));
+    normalize(&mut xwm, alarm_notify_event(alarm, 20)).expect("wrong late AlarmNotify");
+    assert!(xwm.resize_sync.sync_disabled(handle));
+    assert!(xwm.sync_alarm_bindings.contains_key(&alarm));
+
+    normalize(&mut xwm, alarm_notify_event(alarm, 19)).expect("matching late AlarmNotify");
+    assert!(!xwm.resize_sync.sync_disabled(handle));
+    assert!(!xwm.timed_out_resize_counters.contains_key(&handle));
+    assert!(!xwm.sync_alarms.contains_key(&handle));
+    assert!(!xwm.sync_alarm_bindings.contains_key(&alarm));
 }
 
 #[test]

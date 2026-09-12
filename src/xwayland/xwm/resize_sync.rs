@@ -61,6 +61,15 @@ pub(crate) struct ResizeSyncDesired {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResizeSyncAlarmBinding {
+    pub(crate) alarm: u32,
+    pub(crate) handle: X11WindowHandle,
+    pub(crate) generation: XwaylandGeneration,
+    pub(crate) transaction_id: u64,
+    pub(crate) counter_value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResizeSyncTransaction {
     id: u64,
     geometry: X11Geometry,
