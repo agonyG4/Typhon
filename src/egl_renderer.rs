@@ -1320,8 +1320,13 @@ impl GlesSceneRenderer {
             .filter(|instance| !instance.region.is_empty())
             .count();
         self.ensure_frame_resources()?;
-        self.ensure_decoration_resources(egl, egl_display, decoration_instances)?;
-        self.ensure_decoration_resources(egl, egl_display, lifecycle_decorations)?;
+        self.ensure_decoration_resources(
+            egl,
+            egl_display,
+            decoration_instances
+                .iter()
+                .chain(lifecycle_decorations.iter()),
+        )?;
         if scaled_visual_state.cursor.is_some() {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
@@ -1783,28 +1788,22 @@ impl GlesSceneRenderer {
         Ok(())
     }
 
-    fn ensure_decoration_resources(
+    fn ensure_decoration_resources<'a, I>(
         &mut self,
         egl: &EglInstance,
         egl_display: egl::Display,
-        instances: &[DecorationRenderInstance],
-    ) -> RendererResult<()> {
-        let mut required = HashSet::new();
-        let mut required_assets = HashMap::new();
-        for instance in instances {
-            for primitive in instance.primitives() {
-                match primitive {
-                    DecorationRenderPrimitive::SolidRect { color, .. }
-                    | DecorationRenderPrimitive::Text { color, .. } => {
-                        required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
-                    }
-                    DecorationRenderPrimitive::Image { asset, .. } => {
-                        required.insert(DecorationResourceKey::Asset(asset.asset_id()));
-                        required_assets.insert(asset.asset_id(), asset);
-                    }
-                }
-            }
-        }
+        instances: I,
+    ) -> RendererResult<()>
+    where
+        I: IntoIterator<Item = &'a DecorationRenderInstance>,
+    {
+        let instances = instances.into_iter().collect::<Vec<_>>();
+        let DecorationResourceRequirements {
+            required,
+            required_assets,
+        } = decoration_resource_requirements(
+            instances.iter().map(|instance| instance.primitives()),
+        );
 
         let stale = self
             .decoration_resources
@@ -3858,6 +3857,41 @@ fn rgba_to_pixel(color: [u8; 4]) -> u32 {
         | u32::from(color[2])
 }
 
+struct DecorationResourceRequirements<'a> {
+    required: HashSet<DecorationResourceKey>,
+    required_assets: HashMap<u64, &'a oblivion_one::compositor::DecorationRasterAsset>,
+}
+
+fn decoration_resource_requirements<'a, I>(primitive_sets: I) -> DecorationResourceRequirements<'a>
+where
+    I: IntoIterator<Item = &'a [DecorationRenderPrimitive]>,
+{
+    let mut required = HashSet::new();
+    let mut required_assets = HashMap::new();
+    for primitives in primitive_sets {
+        for primitive in primitives {
+            match primitive {
+                DecorationRenderPrimitive::SolidRect { color, .. } => {
+                    required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
+                }
+                DecorationRenderPrimitive::Image { asset, .. } => {
+                    required.insert(DecorationResourceKey::Asset(asset.asset_id()));
+                    required_assets.insert(asset.asset_id(), asset);
+                }
+                DecorationRenderPrimitive::Text { color, asset, .. } => {
+                    required.insert(DecorationResourceKey::Solid(rgba_to_pixel(*color)));
+                    required.insert(DecorationResourceKey::Asset(asset.asset_id()));
+                    required_assets.insert(asset.asset_id(), asset);
+                }
+            }
+        }
+    }
+    DecorationResourceRequirements {
+        required,
+        required_assets,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DecorationResourceKey {
     Solid(u32),
@@ -5679,6 +5713,119 @@ mod tests {
             }],
             visual_sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn decoration_resource_requirements_include_canonical_and_lifecycle_instances() {
+        let canonical = vec![DecorationRenderPrimitive::SolidRect {
+            rect: oblivion_one::compositor::DecorationRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 26,
+            },
+            color: [51, 51, 51, 255],
+        }];
+        let lifecycle = vec![DecorationRenderPrimitive::SolidRect {
+            rect: oblivion_one::compositor::DecorationRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 26,
+            },
+            color: [17, 34, 51, 255],
+        }];
+
+        let requirements =
+            decoration_resource_requirements([canonical.as_slice(), lifecycle.as_slice()]);
+
+        assert!(
+            requirements
+                .required
+                .contains(&DecorationResourceKey::Solid(rgba_to_pixel([
+                    51, 51, 51, 255,
+                ])))
+        );
+        assert!(
+            requirements
+                .required
+                .contains(&DecorationResourceKey::Solid(rgba_to_pixel([
+                    17, 34, 51, 255,
+                ])))
+        );
+    }
+
+    #[test]
+    fn egl_decoration_commands_emit_titlebar_and_button_primitives() {
+        let socket_name = format!("typhon-floating-ssd-egl-{}", std::process::id());
+        let mut server =
+            oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+                .expect("bind compositor for EGL decoration command regression");
+        let width = 320;
+        let height = 200;
+        let surface = RenderableSurface {
+            surface_id: 603,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                BufferIdAllocator::default()
+                    .allocate()
+                    .expect("test buffer identity"),
+                BufferSize::new(width, height).expect("test surface size"),
+                vec![0xff12_3456; (width * height) as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::full(),
+            opaque_region: SurfaceOpaqueRegion::None,
+        };
+        let window_id = oblivion_one::compositor::WindowId::from_raw(3).expect("test window id");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![surface.clone()],
+            &[(603, window_id)],
+            None,
+        );
+        let decorations = server.native_decoration_render_instances(&[surface]);
+        assert_eq!(decorations.len(), 1);
+        let decoration = &decorations[0];
+        let (_, _, _, height) = decoration.scene_snapshot().bounds();
+        assert!(height > 200, "Floating SSD must add visible chrome height");
+        let mut vertices = Vec::new();
+        let mut commands = Vec::new();
+
+        push_egl_decoration_instance(
+            &mut vertices,
+            &mut commands,
+            1280,
+            800,
+            decoration,
+            1.0,
+            OutputFramebufferOrigin::BottomLeft,
+            Some(VisualGroupId::new(1).expect("visual group id")),
+        );
+
+        assert_eq!(commands.len(), decoration.primitives().len());
+        assert!(
+            commands
+                .iter()
+                .any(|command| { matches!(command.layer, EglDrawLayer::SolidRgba(_)) })
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| { matches!(command.layer, EglDrawLayer::DecorationAsset(_)) })
+        );
     }
 
     #[test]

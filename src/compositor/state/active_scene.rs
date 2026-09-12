@@ -175,6 +175,21 @@ impl CompositorState {
     }
 
     #[doc(hidden)]
+    pub fn install_native_frame_test_scene_with_server_decorations(
+        &mut self,
+        surfaces: Vec<RenderableSurface>,
+        windows: &[(u32, WindowId)],
+        fullscreen_owner: Option<u32>,
+    ) {
+        self.install_native_frame_test_scene(surfaces, windows, fullscreen_owner);
+        for &(root_surface_id, _) in windows {
+            self.xdg_decoration_states
+                .insert(root_surface_id, WindowDecorationState::new());
+        }
+        self.rebuild_active_scene_view();
+    }
+
+    #[doc(hidden)]
     pub fn start_test_presentation_transition(
         &mut self,
         root_surface_id: u32,

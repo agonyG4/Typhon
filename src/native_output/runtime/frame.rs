@@ -692,9 +692,9 @@ pub(crate) fn update_cursor_output_arbitration(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCursorOutputArbitration, NativeSceneSnapshot, ResolvedNativeFrameScene,
-        finalize_snapshot, reset_snapshot_work_counters, snapshot_work_counters,
-        visibility_signature,
+        NativeCursorOutputArbitration, NativeCursorRenderMode, NativeFrameRenderer,
+        NativeInputState, NativeSceneSnapshot, ResolvedNativeFrameScene, finalize_snapshot,
+        reset_snapshot_work_counters, snapshot_work_counters, visibility_signature,
     };
     use oblivion_one::compositor::{
         AnimationTime, FullscreenRenderPlanMetrics, PresentationRect, RenderableSurface,
@@ -794,6 +794,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             [602]
         );
+    }
+
+    #[test]
+    fn resolved_native_frame_scene_and_egl_request_retain_floating_ssd() {
+        let socket_name = format!("typhon-floating-ssd-frame-{}", process::id());
+        let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("bind compositor for Floating SSD frame regression");
+        server.install_native_frame_test_scene_with_server_decorations(
+            vec![test_surface(
+                603,
+                320,
+                200,
+                SurfacePlacement::root_at(40, 50),
+            )],
+            &[(603, WindowId::from_raw(3).expect("test window id"))],
+            None,
+        );
+
+        let resolved =
+            ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(0));
+
+        assert_eq!(resolved.surface_ids().collect::<Vec<_>>(), [603]);
+        assert_eq!(resolved.decorations.len(), 1);
+        let decoration = &resolved.decorations[0];
+        assert_eq!(decoration.root_surface_id(), 603);
+        let (_, _, width, height) = decoration.scene_snapshot().bounds();
+        assert_eq!(width, 320);
+        assert!(height > 200, "Floating SSD must add visible chrome height");
+        assert!(resolved.lifecycle_decorations.is_empty());
+
+        let mut renderer = NativeFrameRenderer::default();
+        let input_state = NativeInputState::new(1280, 800);
+        let request = renderer.egl_scene_draw_request(
+            1280,
+            800,
+            &resolved,
+            &server,
+            &input_state,
+            NativeCursorRenderMode::Hardware,
+            None,
+        );
+        assert_eq!(request.decoration_instances.len(), 1);
+        assert_eq!(request.decoration_instances[0].root_surface_id(), 603);
     }
 
     #[test]

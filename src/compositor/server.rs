@@ -1154,6 +1154,21 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn install_native_frame_test_scene_with_server_decorations(
+        &mut self,
+        surfaces: Vec<RenderableSurface>,
+        windows: &[(u32, WindowId)],
+        fullscreen_owner: Option<u32>,
+    ) {
+        self.state
+            .install_native_frame_test_scene_with_server_decorations(
+                surfaces,
+                windows,
+                fullscreen_owner,
+            );
+    }
+
+    #[doc(hidden)]
     pub fn start_test_presentation_transition(
         &mut self,
         root_surface_id: u32,

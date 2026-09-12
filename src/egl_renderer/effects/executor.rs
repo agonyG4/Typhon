@@ -2160,6 +2160,74 @@ mod coordinate_tests {
             vec![0, 1]
         );
     }
+
+    #[test]
+    fn before_surface_visual_group_execution_keeps_root_and_decoration_commands() {
+        let group = oblivion_one::compositor::VisualGroupId::new(8).unwrap();
+        let command = |layer| EglDrawCommand {
+            layer,
+            visual_group: Some(group),
+            bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::SolidRgba(0xff00_0000)),
+            command(EglDrawLayer::Surface(42)),
+            command(EglDrawLayer::SolidRgba(0xff33_3333)),
+        ];
+        let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+
+        assert_eq!(
+            composition_range(
+                &commands,
+                anchor,
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            composition_range(
+                &commands,
+                oblivion_one::compositor::EffectAnchor::ReplaceSurface(42),
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (0, 3)
+        );
+        assert_eq!(
+            composition_range(
+                &commands,
+                oblivion_one::compositor::EffectAnchor::AfterSurface(42),
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            (3, 3)
+        );
+        assert_eq!(
+            capture::indices_for_capture(
+                &commands
+                    .iter()
+                    .map(|command| match command.layer {
+                        EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+                        _ => capture::CaptureLayer::Other,
+                    })
+                    .collect::<Vec<_>>(),
+                &commands
+                    .iter()
+                    .map(|command| command.visual_group)
+                    .collect::<Vec<_>>(),
+                anchor,
+                true,
+                Some(group),
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            ),
+            vec![0, 1, 2]
+        );
+    }
 }
 
 #[cfg(test)]
