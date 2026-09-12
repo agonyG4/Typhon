@@ -253,7 +253,6 @@ impl CompositorState {
             nodes.iter().any(|(_, commit)| commit.attachment.is_some());
         let incoming_is_pacing_protected =
             nodes.iter().any(|(_, commit)| commit.pacing.is_boundary());
-        let incoming_is_ready = self.surface_tree_parts_ready(&nodes, &dependencies);
         let matching = self
             .pending_surface_tree_transactions
             .iter()
@@ -263,11 +262,12 @@ impl CompositorState {
             })
             .collect::<Vec<_>>();
         let Some(&target_index) = matching.last() else {
-            if incoming_has_unready_acquire || (incoming_is_pacing_protected && !incoming_is_ready)
-            {
-                self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
+            let transaction =
+                self.build_surface_tree_transaction(root_surface_id, nodes, dependencies);
+            if self.transaction_is_ready(&transaction) {
+                self.publish_surface_tree_nodes(root_surface_id, transaction.nodes);
             } else {
-                self.publish_surface_tree_nodes(root_surface_id, nodes);
+                self.queue_waiting_surface_tree_transaction(transaction);
             }
             return;
         };
@@ -651,12 +651,61 @@ impl CompositorState {
         Some(dependencies)
     }
 
-    pub(in crate::compositor) fn queue_waiting_surface_tree(
+    fn build_surface_tree_transaction(
         &mut self,
         root_surface_id: u32,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        dependencies: Vec<SurfaceTreeAcquireDependency>,
+    ) -> PendingSurfaceTreeTransaction {
+        PendingSurfaceTreeTransaction {
+            id: self.allocate_surface_tree_transaction_id(),
+            root_surface_id,
+            nodes,
+            dependencies,
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        }
+    }
+
+    fn queue_waiting_surface_tree_transaction(
+        &mut self,
+        transaction: PendingSurfaceTreeTransaction,
+    ) {
+        let PendingSurfaceTreeTransaction {
+            id: transaction_id,
+            root_surface_id,
+            nodes,
+            dependencies,
+            commit_timing_readiness,
+            received_at,
+        } = transaction;
+        self.queue_waiting_surface_tree_parts(
+            root_surface_id,
+            transaction_id,
+            nodes,
+            dependencies,
+            commit_timing_readiness,
+            received_at,
+        );
+    }
+
+    fn queue_waiting_surface_tree_parts(
+        &mut self,
+        root_surface_id: u32,
+        transaction_id: SurfaceTreeTransactionId,
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        commit_timing_readiness: Option<CommitTimingReadiness>,
+        received_at: Instant,
     ) {
+        let mut transaction = PendingSurfaceTreeTransaction {
+            id: transaction_id,
+            root_surface_id,
+            nodes: Vec::new(),
+            dependencies: Vec::new(),
+            commit_timing_readiness,
+            received_at,
+        };
         let mut matching = self
             .pending_surface_tree_transactions
             .iter()
@@ -748,7 +797,6 @@ impl CompositorState {
                 self.active_toplevel_resizes.contains_key(&root_surface_id),
             );
         }
-        let transaction_id = self.allocate_surface_tree_transaction_id();
         for (surface_id, commit) in &nodes {
             self.trace_surface_pipeline_event(
                 SurfacePipelineEvent::TransactionQueued,
@@ -770,15 +818,9 @@ impl CompositorState {
                 None,
             );
         }
-        self.pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
-                id: transaction_id,
-                root_surface_id,
-                nodes,
-                dependencies,
-                commit_timing_readiness: None,
-                received_at: Instant::now(),
-            });
+        transaction.nodes = nodes;
+        transaction.dependencies = dependencies;
+        self.pending_surface_tree_transactions.push(transaction);
         self.rebuild_scene_work_index();
         debug_assert!(
             self.pending_surface_tree_transactions
@@ -798,6 +840,16 @@ impl CompositorState {
             .resize_flow_metrics
             .max_pending_explicit_sync_commits
             .max(pending_acquires);
+    }
+
+    pub(in crate::compositor) fn queue_waiting_surface_tree(
+        &mut self,
+        root_surface_id: u32,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        dependencies: Vec<SurfaceTreeAcquireDependency>,
+    ) {
+        let transaction = self.build_surface_tree_transaction(root_surface_id, nodes, dependencies);
+        self.queue_waiting_surface_tree_transaction(transaction);
     }
 
     pub(in crate::compositor) fn publish_surface_tree_nodes(

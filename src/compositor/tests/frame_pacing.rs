@@ -288,3 +288,33 @@ fn timestamp_is_one_shot_surface_state() {
 
     let _ = stop_test_server(running, server_thread);
 }
+
+#[test]
+fn first_future_timed_surface_commit_is_queued_before_publication() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, _globals, queue, compositor, _fifo_manager, timing_manager) =
+        qualified_connection(&socket_path).unwrap();
+    let qh = queue.handle();
+    let surface = compositor.create_surface(&qh, ());
+    let timer = timing_manager.get_timer(&surface, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic).unwrap();
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    surface.commit();
+    connection.roundtrip().unwrap();
+
+    let mut server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(
+        server.state.pending_surface_tree_transactions[0]
+            .commit_timing_request()
+            .expect("first timed commit should retain its timing request")
+            .seconds(),
+        u64::from(seconds_lo.saturating_add(1))
+    );
+    assert_eq!(server.commit_timing_planning_candidates().len(), 1);
+}
