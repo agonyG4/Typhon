@@ -161,6 +161,50 @@ fn subsurface_position_changes_only_on_parent_commit() {
 }
 
 #[test]
+fn delayed_parent_commit_uses_position_captured_at_commit_boundary() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (after_delayed_parent, after_next_parent) =
+        capture_delayed_parent_position_snapshot(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let child_position = |surfaces: &[RenderableSurfaceSnapshot]| {
+        surfaces
+            .iter()
+            .find(|surface| surface.parent_surface_id.is_some())
+            .map(|surface| (surface.local_x, surface.local_y))
+    };
+
+    assert_eq!(child_position(&after_delayed_parent), Some((10, 10)));
+    assert_eq!(child_position(&after_next_parent), Some((20, 20)));
+}
+
+#[test]
+fn delayed_parent_restack_uses_latest_latched_stack_as_next_baseline() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (after_first, after_second) =
+        capture_delayed_parent_restack_snapshots(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let order = |surfaces: &[RenderableSurfaceSnapshot]| {
+        surfaces
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(order(&after_first), vec![(20, 15), (7, 7), (6, 6)]);
+    assert_eq!(order(&after_second), vec![(20, 15), (6, 6), (7, 7)]);
+}
+
+#[test]
 fn multiple_synchronized_child_commits_publish_only_the_latest_buffer() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

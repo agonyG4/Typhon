@@ -191,6 +191,7 @@ impl CompositorState {
             pacing,
             presentation,
             pointer_constraint_state,
+            commit_context,
         } = commit;
         self.apply_captured_surface_pacing(surface_id, commit_sequence, pacing);
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
@@ -241,6 +242,7 @@ impl CompositorState {
         });
         let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
+        self.apply_captured_subsurface_parent_state(surface_id, commit_context.subsurface_parent);
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
                 pending.opaque_region = opaque_region;
@@ -260,9 +262,17 @@ impl CompositorState {
                     std::mem::take(&mut presentation_feedbacks),
                     explicit_sync,
                     window_geometry,
+                    commit_context.layer_surface,
                 );
             }
             Some(PendingSurfaceAttachment::RemoveContent) => {
+                if let Some(captured) = commit_context.layer_surface
+                    && !self.apply_layer_surface_commit(surface_id, captured)
+                {
+                    self.complete_frame_callbacks(frame_callbacks);
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
+                    return;
+                }
                 if self.is_cursor_surface(surface_id) {
                     self.commit_cursor_surface_removal_request(surface_id);
                     self.note_explicit_commit_published(commit_id);
@@ -302,6 +312,7 @@ impl CompositorState {
                         resize_capture_finalized,
                         window_geometry,
                     },
+                    commit_context.layer_surface,
                 );
                 self.note_explicit_commit_published(commit_id);
                 if renderable_index.is_some() {

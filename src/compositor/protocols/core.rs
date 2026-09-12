@@ -246,6 +246,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     pacing,
                     presentation,
                     pointer_constraint_state,
+                    commit_context: CapturedSurfaceCommitContext::default(),
                 };
                 state.commit_surface_tree_request(surface_id, commit);
             }

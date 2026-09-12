@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::*;
+use crate::compositor::layer_shell::CapturedLayerSurfaceCommitState;
 
 impl CompositorState {
     pub(in crate::compositor) fn commit_surface_buffer(
@@ -640,13 +641,25 @@ impl CompositorState {
         presentation_feedbacks: Vec<PendingPresentationFeedback>,
         explicit_sync: Option<CapturedExplicitSyncState>,
         window_geometry: Option<XdgWindowGeometry>,
+        layer_surface: Option<CapturedLayerSurfaceCommitState>,
     ) {
         pending.commit_sequence = commit_sequence;
         if !self.is_cursor_surface(surface_id) {
             let pending_surface_size = pending.surface_size.or_else(|| {
                 BufferSize::new(pending.data.width().ok()?, pending.data.height().ok()?)
             });
-            if !self.layer_surface_can_publish_buffer(surface_id, pending_surface_size) {
+            if let Some(layer_surface) = layer_surface {
+                if !self.layer_surface_can_publish_buffer(
+                    surface_id,
+                    pending_surface_size,
+                    layer_surface,
+                ) {
+                    self.release_pending_surface_buffer(pending);
+                    self.complete_frame_callbacks(frame_callbacks);
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
+                    return;
+                }
+            } else if self.layer_surfaces.contains_key(&surface_id) {
                 self.release_pending_surface_buffer(pending);
                 self.complete_frame_callbacks(frame_callbacks);
                 self.discard_presentation_feedbacks(presentation_feedbacks);
@@ -895,6 +908,7 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         state: BufferlessSurfaceCommitState,
+        layer_surface: Option<CapturedLayerSurfaceCommitState>,
     ) -> bool {
         let BufferlessSurfaceCommitState {
             commit_sequence,
@@ -918,7 +932,9 @@ impl CompositorState {
             return true;
         }
 
-        if !self.apply_layer_surface_commit(surface_id) {
+        if let Some(layer_surface) = layer_surface
+            && !self.apply_layer_surface_commit(surface_id, layer_surface)
+        {
             return false;
         }
         let mut resize_commit = if resize_capture_finalized {

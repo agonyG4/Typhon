@@ -1452,6 +1452,140 @@ fn newer_configure_does_not_clear_unconsumed_acked_snapshot() {
 }
 
 #[test]
+fn delayed_layer_commit_uses_role_state_captured_before_later_mutation() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (globals, _) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let timing_manager: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (surface, layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "delayed-layer-snapshot",
+        1280,
+        32,
+    );
+    let surface_id = surface.id().protocol_id();
+    assert!(capture_layer_surface_commit_state(&commands, surface_id).is_some());
+
+    layer_surface.set_exclusive_zone(12);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    let timer = timing_manager.get_timer(&surface, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic).unwrap();
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    layer_surface.set_exclusive_zone(34);
+    layer_surface
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_layer_surface_commit_state(&commands, surface_id),
+        Some((12, 1))
+    );
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_layer_surface_commit_state(&commands, surface_id),
+        Some((34, 2))
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
+fn configure_ack_after_delayed_commit_remains_for_the_next_commit() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (globals, _) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let timing_manager: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    let (surface, layer_surface) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "delayed-layer-ack",
+        1280,
+        32,
+    );
+    let surface_id = surface.id().protocol_id();
+    state.suppress_layer_surface_ack = true;
+    layer_surface.set_exclusive_zone(12);
+    let timer = timing_manager.get_timer(&surface, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic).unwrap();
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 900,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let serial_b = *state
+        .layer_surface_configure_serials
+        .last()
+        .expect("output resize should issue a second configure");
+    layer_surface.ack_configure(serial_b);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        capture_layer_surface_pending_ack(&commands, surface_id),
+        Some(serial_b)
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_layer_surface_pending_ack(&commands, surface_id),
+        None
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn mapped_layer_surface_can_commit_old_buffer_while_new_configure_is_pending() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);

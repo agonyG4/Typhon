@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, registry_state::*, subsurface_client::*, window_ops::*,
 };
+use crate::compositor::layer_shell::KeyboardInteractivity;
 use crate::wm::{LayoutMembership, WorkspaceId, WorkspaceLocation};
 pub(in crate::compositor::tests) fn create_test_shm_file(
     pixels: &[u32],
@@ -170,6 +171,14 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureLayerSurfaceCommitState {
+        surface_id: u32,
+        reply: Sender<Option<(i32, u8)>>,
+    },
+    CaptureLayerSurfacePendingAck {
+        surface_id: u32,
+        reply: Sender<Option<u32>>,
+    },
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureRootWindowGeometry {
@@ -744,6 +753,34 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 )
                                 .collect(),
                         );
+                    }
+                    ServerCommand::CaptureLayerSurfaceCommitState { surface_id, reply } => {
+                        let state = server
+                            .state
+                            .layer_surfaces
+                            .values()
+                            .find(|role| role.surface.id().protocol_id() == surface_id)
+                            .map(|role| {
+                                (
+                                    role.committed.exclusive_zone,
+                                    match role.committed.keyboard_interactivity {
+                                        KeyboardInteractivity::None => 0,
+                                        KeyboardInteractivity::Exclusive => 1,
+                                        KeyboardInteractivity::OnDemand => 2,
+                                    },
+                                )
+                            });
+                        let _ = reply.send(state);
+                    }
+                    ServerCommand::CaptureLayerSurfacePendingAck { surface_id, reply } => {
+                        let pending_ack = server
+                            .state
+                            .layer_surfaces
+                            .values()
+                            .find(|role| role.surface.id().protocol_id() == surface_id)
+                            .and_then(|role| role.pending_ack_for_next_surface_commit)
+                            .map(|configure| configure.serial);
+                        let _ = reply.send(pending_ack);
                     }
                     ServerCommand::CaptureCommittedWindowGeometry(reply) => {
                         let geometry =
@@ -1660,6 +1697,34 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_layer_surface_commit_state(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<(i32, u8)> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLayerSurfaceCommitState { surface_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should return layer surface state")
+}
+
+pub(in crate::compositor::tests) fn capture_layer_surface_pending_ack(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLayerSurfacePendingAck { surface_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should return layer surface pending acknowledgement")
 }
 
 pub(in crate::compositor::tests) fn capture_native_frame_surface_ids(

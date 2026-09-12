@@ -156,6 +156,13 @@ pub(super) struct PendingLayerConfigure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CapturedLayerSurfaceCommitState {
+    pub(super) state: LayerSurfaceCommitState,
+    pub(super) acknowledged_configure: Option<PendingLayerConfigure>,
+    pub(super) initial_configure_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LayerConfigureOrigin {
     Initial,
     ClientSurfaceCommit { initiator_surface_id: u32 },
@@ -404,12 +411,50 @@ impl CompositorState {
         layer_shell_debug_log(|| format!("create surface={surface_id}"));
     }
 
-    pub(in crate::compositor) fn apply_layer_surface_commit(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn capture_layer_surface_commit_state(
+        &mut self,
+        surface_id: u32,
+    ) -> Result<Option<CapturedLayerSurfaceCommitState>, ()> {
+        let Some(role) = self.layer_surfaces.get(&surface_id) else {
+            return Ok(None);
+        };
+        if let Err(message) = validate_layer_surface_size(role.pending) {
+            let resource = role.resource.clone();
+            if let Some(client) = resource.client() {
+                self.note_protocol_error_for_resource(
+                    &client,
+                    &resource,
+                    zwlr_layer_surface_v1::Error::InvalidSize,
+                    Some(surface_id),
+                    ProtocolErrorCategory::InvalidState,
+                );
+            } else {
+                self.note_protocol_error_metric();
+            }
+            resource.post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
+            return Err(());
+        }
+        let role = self
+            .layer_surfaces
+            .get_mut(&surface_id)
+            .expect("layer surface disappeared during commit capture");
+        Ok(Some(CapturedLayerSurfaceCommitState {
+            state: role.pending,
+            acknowledged_configure: role.pending_ack_for_next_surface_commit.take(),
+            initial_configure_acknowledged: role.initial_configure_acknowledged,
+        }))
+    }
+
+    pub(in crate::compositor) fn apply_layer_surface_commit(
+        &mut self,
+        surface_id: u32,
+        captured: CapturedLayerSurfaceCommitState,
+    ) -> bool {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
         let previous_usable = self.reserved_usable_geometry();
-        let committed_change = match self.commit_pending_layer_surface_state(surface_id) {
+        let committed_change = match self.apply_captured_layer_surface_state(surface_id, captured) {
             Some(committed_change) => committed_change,
             None => {
                 return false;
@@ -429,7 +474,6 @@ impl CompositorState {
         {
             self.configure_layer_surface(surface_id);
         }
-        self.consume_pending_ack_for_surface_commit(surface_id);
         true
     }
 
@@ -437,13 +481,14 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         pending_surface_size: Option<BufferSize>,
+        captured: CapturedLayerSurfaceCommitState,
     ) -> bool {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
         let previous_usable = self.reserved_usable_geometry();
         if self
-            .commit_pending_layer_surface_state(surface_id)
+            .apply_captured_layer_surface_state(surface_id, captured)
             .is_none()
         {
             return false;
@@ -462,7 +507,7 @@ impl CompositorState {
         let Some(role) = self.layer_surfaces.get(&surface_id) else {
             return false;
         };
-        let requires_initial_ack = !role.mapped && !role.initial_configure_acknowledged;
+        let requires_initial_ack = !role.mapped && !captured.initial_configure_acknowledged;
         if !role.initial_configure_sent || requires_initial_ack {
             let resource = role.resource.clone();
             let debug_details = layer_surface_debug_details(surface_id, role, pending_surface_size);
@@ -486,7 +531,6 @@ impl CompositorState {
             });
             return false;
         }
-        self.consume_pending_ack_for_surface_commit(surface_id);
         true
     }
 
@@ -642,12 +686,6 @@ impl CompositorState {
         true
     }
 
-    fn consume_pending_ack_for_surface_commit(&mut self, surface_id: u32) {
-        if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
-            role.pending_ack_for_next_surface_commit = None;
-        }
-    }
-
     pub(in crate::compositor) fn set_layer_surface_pending_layer(
         &mut self,
         surface_id: u32,
@@ -709,7 +747,11 @@ impl CompositorState {
         }
     }
 
-    fn commit_pending_layer_surface_state(&mut self, surface_id: u32) -> Option<bool> {
+    fn apply_captured_layer_surface_state(
+        &mut self,
+        surface_id: u32,
+        captured: CapturedLayerSurfaceCommitState,
+    ) -> Option<bool> {
         let Some(previous) = self
             .layer_surfaces
             .get(&surface_id)
@@ -717,8 +759,7 @@ impl CompositorState {
         else {
             return Some(false);
         };
-        let pending = self.layer_surfaces[&surface_id].pending;
-        if let Err(message) = validate_layer_surface_size(pending) {
+        if let Err(message) = validate_layer_surface_size(captured.state) {
             let resource = self.layer_surfaces[&surface_id].resource.clone();
             if let Some(client) = resource.client() {
                 self.note_protocol_error_for_resource(
@@ -735,7 +776,7 @@ impl CompositorState {
             return None;
         }
         let mut rerun_focus = false;
-        let mapped_changed = previous != pending;
+        let mapped_changed = previous != captured.state;
         if mapped_changed {
             self.layer_surface_order = self.layer_surface_order.saturating_add(1);
         }
@@ -743,11 +784,11 @@ impl CompositorState {
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
             return Some(false);
         };
-        role.committed = pending;
+        role.committed = captured.state;
         if role.mapped && mapped_changed {
             role.order = order;
-            rerun_focus = previous.layer != pending.layer
-                || previous.keyboard_interactivity != pending.keyboard_interactivity;
+            rerun_focus = previous.layer != captured.state.layer
+                || previous.keyboard_interactivity != captured.state.keyboard_interactivity;
         }
         let committed_change = role.mapped && mapped_changed;
         if rerun_focus {

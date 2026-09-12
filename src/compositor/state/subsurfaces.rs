@@ -1,6 +1,7 @@
 #![allow(clippy::question_mark)]
 
 use super::*;
+use crate::compositor::subsurface::{CapturedSubsurfaceParentState, CapturedSurfaceCommitContext};
 
 impl CompositorState {
     const MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT: usize = 8;
@@ -50,6 +51,10 @@ impl CompositorState {
             .entry(parent_id)
             .or_insert_with(|| vec![parent_id])
             .push(surface_id);
+        self.latched_subsurface_stacks.insert(
+            parent_id,
+            self.committed_subsurface_stacks[&parent_id].clone(),
+        );
         self.pending_subsurface_stacks.remove(&parent_id);
         self.reorder_renderable_surfaces_by_committed_stack();
         true
@@ -98,11 +103,38 @@ impl CompositorState {
             .set_pending_position(surface_id, x, y);
     }
 
+    fn capture_surface_commit_context(
+        &mut self,
+        surface_id: u32,
+    ) -> Result<CapturedSurfaceCommitContext, ()> {
+        let layer_surface = self.capture_layer_surface_commit_state(surface_id)?;
+        let positions = self
+            .subsurface_transactions
+            .take_pending_positions_for_parent(surface_id);
+        let stack = self.pending_subsurface_stacks.remove(&surface_id);
+        if let Some(stack) = &stack {
+            self.latched_subsurface_stacks
+                .insert(surface_id, stack.clone());
+        }
+        Ok(CapturedSurfaceCommitContext {
+            subsurface_parent: CapturedSubsurfaceParentState { positions, stack },
+            layer_surface,
+        })
+    }
+
     pub(in crate::compositor) fn commit_surface_tree_request(
         &mut self,
         surface_id: u32,
         mut commit: CachedSubsurfaceCommit,
     ) {
+        let commit_context = match self.capture_surface_commit_context(surface_id) {
+            Ok(context) => context,
+            Err(()) => {
+                self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+                return;
+            }
+        };
+        commit.commit_context = commit_context;
         if !self.normalize_explicit_sync_commit(&mut commit) {
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
             return;
@@ -1094,20 +1126,20 @@ impl CompositorState {
         callbacks
     }
 
-    pub(in crate::compositor) fn apply_pending_subsurface_parent_state(
+    pub(in crate::compositor) fn apply_captured_subsurface_parent_state(
         &mut self,
         parent_id: u32,
+        captured: CapturedSubsurfaceParentState,
     ) -> bool {
-        let positions = self
-            .subsurface_transactions
-            .take_pending_positions_for_parent(parent_id);
         let mut changed = false;
-        for (surface_id, x, y) in positions {
+        for (surface_id, x, y) in captured.positions {
             let placement = SurfacePlacement::subsurface(parent_id, x, y);
             changed |= self.surface_placement(surface_id) != placement;
             self.set_surface_placement(surface_id, SurfacePlacement::subsurface(parent_id, x, y));
         }
-        changed |= self.apply_pending_subsurface_stack_for_parent(parent_id);
+        if let Some(stack) = captured.stack {
+            changed |= self.apply_captured_subsurface_stack_for_parent(parent_id, stack);
+        }
         if changed {
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::SurfaceCommit,
@@ -1141,9 +1173,7 @@ impl CompositorState {
         }
         self.begin_surface_tree_publication();
         self.apply_cached_subsurface_commit(root_id, root_commit);
-        self.apply_pending_subsurface_parent_state(root_id);
         for (surface_id, commit) in commits {
-            self.apply_pending_subsurface_parent_state(surface_id);
             self.apply_cached_subsurface_commit(surface_id, commit);
         }
         self.finish_surface_tree_publication();
@@ -1168,9 +1198,10 @@ impl CompositorState {
         self.pending_subsurface_stacks
             .entry(parent_id)
             .or_insert_with(|| {
-                self.committed_subsurface_stacks
+                self.latched_subsurface_stacks
                     .get(&parent_id)
                     .cloned()
+                    .or_else(|| self.committed_subsurface_stacks.get(&parent_id).cloned())
                     .unwrap_or_else(|| vec![parent_id])
             })
     }
@@ -1211,13 +1242,11 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn apply_pending_subsurface_stack_for_parent(
+    fn apply_captured_subsurface_stack_for_parent(
         &mut self,
         parent_id: u32,
+        mut stack: Vec<u32>,
     ) -> bool {
-        let Some(mut stack) = self.pending_subsurface_stacks.remove(&parent_id) else {
-            return false;
-        };
         stack.retain(|id| {
             *id == parent_id
                 || self
@@ -1246,6 +1275,7 @@ impl CompositorState {
         surface_id: u32,
     ) {
         self.committed_subsurface_stacks.remove(&surface_id);
+        self.latched_subsurface_stacks.remove(&surface_id);
         self.pending_subsurface_stacks.remove(&surface_id);
         for stack in self.committed_subsurface_stacks.values_mut() {
             stack.retain(|id| *id != surface_id);
@@ -1255,10 +1285,17 @@ impl CompositorState {
             stack.retain(|id| *id != surface_id);
             stack.dedup();
         }
+        for stack in self.latched_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+            stack.dedup();
+        }
         self.committed_subsurface_stacks.retain(|parent_id, stack| {
             self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
         });
         self.pending_subsurface_stacks.retain(|parent_id, stack| {
+            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
+        });
+        self.latched_subsurface_stacks.retain(|parent_id, stack| {
             self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
         });
         self.reorder_renderable_surfaces_by_committed_stack();
@@ -1276,6 +1313,9 @@ impl CompositorState {
             stack.retain(|id| *id != surface_id);
         }
         for stack in self.pending_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+        }
+        for stack in self.latched_subsurface_stacks.values_mut() {
             stack.retain(|id| *id != surface_id);
         }
         self.reorder_renderable_surfaces_by_committed_stack();

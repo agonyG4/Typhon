@@ -342,8 +342,9 @@ pub use state::{
 use state_data::*;
 use subsurface::{
     CacheAdmissionFailure, CacheCommitOutcome, CachedSubsurfaceCommit,
-    CapturedPointerConstraintSurfaceState, PointerConstraintLifecycleCommit,
-    PointerConstraintRegionCommit, SubsurfaceSyncMode, SubsurfaceTransactionState,
+    CapturedPointerConstraintSurfaceState, CapturedSurfaceCommitContext,
+    PointerConstraintLifecycleCommit, PointerConstraintRegionCommit, SubsurfaceSyncMode,
+    SubsurfaceTransactionState,
 };
 pub use surface::{
     DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
@@ -756,6 +757,7 @@ pub struct CompositorState {
     active_surface_presentation_commits: HashMap<u32, ActiveSurfacePresentationCommit>,
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
+    latched_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
     subsurface_transactions: SubsurfaceTransactionState,
     subsurface_transaction_metrics: SubsurfaceTransactionMetrics,

@@ -17,6 +17,7 @@ use super::{
         PendingViewportChange,
     },
 };
+use crate::compositor::layer_shell::CapturedLayerSurfaceCommitState;
 
 pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_PER_SURFACE: usize = 8;
 pub(super) const MAX_SYNCHRONIZED_CACHED_COMMITS_PER_CLIENT: usize = 256;
@@ -150,6 +151,53 @@ fn merge_pointer_constraint_hint(
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct CapturedSubsurfaceParentState {
+    pub(super) positions: Vec<(u32, i32, i32)>,
+    pub(super) stack: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct CapturedSurfaceCommitContext {
+    pub(super) subsurface_parent: CapturedSubsurfaceParentState,
+    pub(super) layer_surface: Option<CapturedLayerSurfaceCommitState>,
+}
+
+impl CapturedSurfaceCommitContext {
+    pub(super) fn merge(&mut self, newer: Self) {
+        for (surface_id, x, y) in newer.subsurface_parent.positions {
+            if let Some((_, current_x, current_y)) = self
+                .subsurface_parent
+                .positions
+                .iter_mut()
+                .find(|(current_surface_id, _, _)| *current_surface_id == surface_id)
+            {
+                *current_x = x;
+                *current_y = y;
+            } else {
+                self.subsurface_parent.positions.push((surface_id, x, y));
+            }
+        }
+        if newer.subsurface_parent.stack.is_some() {
+            self.subsurface_parent.stack = newer.subsurface_parent.stack;
+        }
+        self.layer_surface = match (self.layer_surface, newer.layer_surface) {
+            (Some(older), Some(mut newer)) => {
+                // Acknowledgements are chronological commit obligations. If
+                // the newer coalesced update has no replacement, keep the
+                // acknowledgement captured by the older update.
+                if newer.acknowledged_configure.is_none() {
+                    newer.acknowledged_configure = older.acknowledged_configure;
+                }
+                Some(newer)
+            }
+            (None, Some(newer)) => Some(newer),
+            (Some(older), None) => Some(older),
+            (None, None) => None,
+        };
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CachedSubsurfaceCommit {
     pub(super) commit_id: SurfaceCommitId,
@@ -173,6 +221,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) pacing: CapturedSurfacePacing,
     pub(super) presentation: CapturedSurfacePresentation,
     pub(super) pointer_constraint_state: CapturedPointerConstraintSurfaceState,
+    pub(super) commit_context: CapturedSurfaceCommitContext,
 }
 
 impl CachedSubsurfaceCommit {
@@ -233,6 +282,7 @@ impl CachedSubsurfaceCommit {
             pacing,
             presentation,
             pointer_constraint_state,
+            commit_context,
         } = newer;
         // A pacing value is a commit boundary.  The caller must not merge a
         // later paced update into an older content update.
@@ -286,6 +336,7 @@ impl CachedSubsurfaceCommit {
             .pointer_constraint_state
             .clone()
             .merge(pointer_constraint_state);
+        self.commit_context.merge(commit_context);
         if resize_capture_finalized {
             self.resize_commit = resize_commit;
             self.resize_capture_finalized = true;
@@ -395,6 +446,37 @@ where
 }
 
 #[cfg(test)]
+mod commit_context_tests {
+    use super::*;
+
+    #[test]
+    fn captured_context_merges_parent_state_chronologically() {
+        let mut older = CapturedSurfaceCommitContext {
+            subsurface_parent: CapturedSubsurfaceParentState {
+                positions: vec![(10, 10, 10), (20, 20, 20)],
+                stack: Some(vec![1, 10, 20]),
+            },
+            layer_surface: None,
+        };
+        let newer = CapturedSurfaceCommitContext {
+            subsurface_parent: CapturedSubsurfaceParentState {
+                positions: vec![(10, 30, 30)],
+                stack: Some(vec![1, 20, 10]),
+            },
+            layer_surface: None,
+        };
+
+        older.merge(newer);
+
+        assert_eq!(
+            older.subsurface_parent.positions,
+            vec![(10, 30, 30), (20, 20, 20)]
+        );
+        assert_eq!(older.subsurface_parent.stack, Some(vec![1, 20, 10]));
+    }
+}
+
+#[cfg(test)]
 mod window_geometry_tests {
     use super::*;
     use crate::compositor::state_data::{BackgroundEffectRegion, InputRegionOp, InputRegionRect};
@@ -429,6 +511,7 @@ mod window_geometry_tests {
             pacing: CapturedSurfacePacing::default(),
             presentation: CapturedSurfacePresentation::default(),
             pointer_constraint_state: CapturedPointerConstraintSurfaceState::default(),
+            commit_context: CapturedSurfaceCommitContext::default(),
         }
     }
 
