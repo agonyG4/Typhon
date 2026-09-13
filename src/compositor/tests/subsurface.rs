@@ -255,6 +255,36 @@ fn destroyed_latched_subsurface_is_not_resurrected_by_delayed_parent_commit() {
 }
 
 #[test]
+fn destroyed_and_recreated_subsurface_cannot_match_a_stale_parent_transaction() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (before_release, old_stack, after_release, new_stack) =
+        capture_destroy_recreate_subsurface_aba(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        before_release
+            .iter()
+            .all(|surface| surface.parent_surface_id.is_none()),
+        "the stale R1 CU must remain delayed before its pacing release"
+    );
+    assert_eq!(old_stack.committed, None);
+    assert_eq!(old_stack.latched.as_ref().map(Vec::len), Some(2));
+    let recreated = after_release
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("the later R2 CU should apply normally");
+    assert_eq!((recreated.width, recreated.height), (13, 9));
+    assert_eq!((recreated.local_x, recreated.local_y), (20, 20));
+    assert_eq!(new_stack.committed.as_ref().map(Vec::len), Some(2));
+    assert_eq!(new_stack.committed, new_stack.latched);
+}
+
+#[test]
 fn subsurface_position_changes_only_on_parent_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

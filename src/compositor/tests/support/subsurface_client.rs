@@ -339,6 +339,88 @@ pub(in crate::compositor::tests) fn capture_destroyed_latched_subsurface_snapsho
     Ok(capture_renderable_surface_snapshot(commands))
 }
 
+pub(in crate::compositor::tests) fn capture_destroy_recreate_subsurface_aba(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (
+        Vec<RenderableSurfaceSnapshot>,
+        SubsurfaceStackStateSnapshot,
+        Vec<RenderableSurfaceSnapshot>,
+        SubsurfaceStackStateSnapshot,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let timing: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let parent_id = capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| surface.surface_id)
+        .expect("parent should be renderable before ABA capture");
+
+    let child = compositor.create_surface(&qh, ());
+    let first_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    first_subsurface.set_position(10, 10);
+    first_subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
+
+    let first_timer = timing.get_timer(&parent, &qh, ());
+    let first_now = PresentationTimestamp::from_clock(PresentationClock::Monotonic)?;
+    let (first_seconds_hi, first_seconds_lo) = first_now.protocol_seconds();
+    first_timer.set_timestamp(
+        first_seconds_hi,
+        first_seconds_lo.saturating_add(1),
+        first_now.nanoseconds(),
+    );
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    first_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let second_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    second_subsurface.set_position(20, 20);
+    second_subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    wait_for_server_commands(commands);
+    let before_release = capture_renderable_surface_snapshot(commands);
+    let old_stack = capture_subsurface_stack_state(commands, parent_id);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    wait_for_server_commands(commands);
+    let after_release = capture_renderable_surface_snapshot(commands);
+    let new_stack = capture_subsurface_stack_state(commands, parent_id);
+    Ok((before_release, old_stack, after_release, new_stack))
+}
+
 pub(in crate::compositor::tests) fn capture_preactivation_subsurface_presentation_feedback(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
