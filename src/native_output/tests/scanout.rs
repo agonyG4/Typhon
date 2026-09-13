@@ -276,6 +276,43 @@ fn current_pending_ready_slots_never_alias() {
 }
 
 #[test]
+fn complete_unpresented_render_returns_slot_to_free_without_changing_output_ownership() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        7,
+    )
+    .unwrap();
+    let current = swapchain.current();
+    let presentation_serial = swapchain.presentation_serial();
+    let next_frame_id = swapchain.next_frame_id();
+    let current_framebuffer = FramebufferId::new(41).unwrap();
+    swapchain.set_current_framebuffer_id(current_framebuffer);
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let free_before = swapchain.free_slot_count();
+
+    swapchain.complete_unpresented_render(slot).unwrap();
+
+    assert_eq!(swapchain.rendering_slot(), None);
+    assert_eq!(swapchain.quarantine_slot_id(), None);
+    assert!(!swapchain.is_poisoned());
+    assert_eq!(swapchain.current(), current);
+    assert_eq!(swapchain.presentation_serial(), presentation_serial);
+    assert_eq!(swapchain.next_frame_id(), next_frame_id);
+    assert_eq!(
+        swapchain.current_framebuffer_id(),
+        Some(current_framebuffer)
+    );
+    assert_eq!(swapchain.pending_slot(), None);
+    assert_eq!(swapchain.ready_slot(), None);
+    assert_eq!(swapchain.worker_queued_slot(), None);
+    assert_eq!(swapchain.free_slot_count(), free_before + 1);
+    assert!(swapchain.render_target_available_for(NativeOutputPacingMode::PredictiveTriple));
+    assert_eq!(swapchain.acquire_render_slot().unwrap(), slot);
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
 fn ready_frame_keeps_its_frozen_cursor_contract() {
     let slots = OutputSlotSet::new([
         OutputSlotId::new(0).unwrap(),

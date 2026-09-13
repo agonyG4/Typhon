@@ -458,6 +458,9 @@ fn render_failure_requeues_callback_for_one_later_admission() {
         .unwrap();
     wait_for_server_commands(&commands);
     assert!(capture_pending_frame_callbacks(&commands));
+    let metrics = capture_frame_callback_metrics(&commands);
+    assert_eq!(metrics.callbacks_completed_after_abandonment, 0);
+    assert_eq!(metrics.callbacks_in_discarded_rendered_batches, 0);
 
     let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
     commands

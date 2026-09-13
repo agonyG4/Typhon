@@ -900,6 +900,7 @@ mod frame_consumption_tests {
         );
 
         state.restore_frame_batch_after_render_failure(batch);
+        assert!(state.retired_frame_batches.is_empty());
         assert_eq!(
             test_dmabuf_points(&state.pending_dmabuf_buffer_releases),
             vec![1, 2, 3]

@@ -1,14 +1,16 @@
 use super::{
     ContentEpochId, ContentEpochTracker, CursorContentKey, DirectScanoutCandidateKey,
     OutputContentKey, OutputTransactionAllocator, OutputTransactionContent, OutputTransactionId,
-    OutputTransactionState,
+    OutputTransactionState, OutputTransactionTerminal,
 };
 use crate::native_output::presentation::plane::{CursorSidecarId, PlaneWriteSet};
 use crate::native_output::presentation::qualification::{DirectReleaseMode, DirectSyncReadiness};
 use crate::native_output::presentation::trace::{
     PresentationTransactionEvent, PresentationTransactionTraceRing,
 };
-use crate::native_output::runtime::settle_no_visual_change_output_transaction;
+use crate::native_output::runtime::{
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+};
 use crate::native_output::{ExplicitOutputCounters, OutputPresentationMode};
 use oblivion_one::compositor::{
     CompositorFrameBatchId, SurfaceDamagePresentation as CompositorSurfaceDamagePresentation,
@@ -414,6 +416,51 @@ fn settled_safe_abandonment_emits_exact_physical_terminal_once() {
         terminals[0].physical_terminal(),
         super::OutputPhysicalTerminal::NoPageflip {
             reason: super::OutputNoPageflipReason::SafeAbandonment,
+        }
+    );
+    assert!(ledger.take_settled_output_terminals().is_empty());
+}
+
+#[test]
+fn failed_render_settlement_emits_one_non_presenting_terminal() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(102);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let transaction_id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+
+    settle_failed_output_transaction(
+        &mut ledger,
+        transaction_id,
+        super::OutputTransactionFailureStage::RenderExecution,
+        MonotonicTimestampNs::new(20),
+        |obligations| {
+            assert_eq!(obligations.frame_batch_id(), Some(batch_id));
+            Ok(())
+        },
+    )
+    .expect("failed render transaction settles");
+
+    let terminals = ledger.take_settled_output_terminals();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].transaction_id(), transaction_id);
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.counters().presented, 0);
+    assert_eq!(
+        ledger
+            .recent_terminal()
+            .back()
+            .expect("failed render terminal history")
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Failed {
+            stage: super::OutputTransactionFailureStage::RenderExecution,
+            at: MonotonicTimestampNs::new(20),
+        })
+    );
+    assert_eq!(
+        terminals[0].physical_terminal(),
+        super::OutputPhysicalTerminal::NoPageflip {
+            reason: super::OutputNoPageflipReason::SubmissionRejected,
         }
     );
     assert!(ledger.take_settled_output_terminals().is_empty());

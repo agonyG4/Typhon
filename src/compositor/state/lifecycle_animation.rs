@@ -214,6 +214,76 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement() {
+        let window_id = WindowId::from_raw(308).expect("valid window ID");
+        let root_surface_id = 308;
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let transition_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    root_surface_id,
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        let physical = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(100_000_000),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id,
+                transition_id,
+                source_rect: rect(0.0, 0.0, 80.0, 80.0),
+                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
+                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+            visual_sources: Vec::new(),
+        };
+        state.publish_presented_lifecycle(1, &LifecycleFrameSnapshot::from_sample(&physical));
+        let confirmed = state.presented_lifecycle.clone();
+        state
+            .lifecycle_render_suppressed_roots
+            .insert(root_surface_id);
+
+        assert!(
+            state.apply_lifecycle_render_fallback(LifecycleRenderFallbackEntry {
+                window_id,
+                root_surface_id,
+                transition_id,
+                reason: LifecycleRenderFallbackReason::LampProgramUnavailable,
+            })
+        );
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+        assert_eq!(state.presented_lifecycle, confirmed);
+        assert_eq!(state.presented_lifecycle_frame_id, 1);
+        assert!(state.lifecycle_animation_has_pending_visible());
+        assert!(state.has_unowned_frame_work());
+
+        state.publish_presented_lifecycle_with_replacements(
+            2,
+            &LifecycleFrameSnapshot::default(),
+            &[root_surface_id],
+            true,
+        );
+        assert!(state.presented_lifecycle.lamps.is_empty());
+        assert_eq!(state.presented_lifecycle_frame_id, 2);
+        assert!(!state.lifecycle_animation_has_pending_visible());
+    }
+
+    #[test]
     fn canonical_presentation_replaces_old_physical_lamp_after_logical_cancel() {
         let window_id = WindowId::from_raw(304).expect("valid window ID");
         let mut state = CompositorState {

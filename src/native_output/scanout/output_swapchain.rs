@@ -499,6 +499,23 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    /// Release a rendering slot after GPU completion has been proven for an
+    /// unpresented render. This must not be used before the renderer's work is
+    /// complete: unlike `cancel_render_before_gpu`, GLES may have sampled
+    /// client or scanout images before the render was abandoned.
+    pub(crate) fn complete_unpresented_render(&mut self, slot: OutputSlotId) -> io::Result<()> {
+        if self.rendering != Some(slot) {
+            return Err(io::Error::other(
+                "completed unpresented output slot does not match active rendering ownership",
+            ));
+        }
+        // This transition creates no KMS ownership, advances no frame or
+        // presentation serial, changes no buffer-age history, and leaves
+        // ready/pending/worker ownership and fatal quarantine untouched.
+        self.rendering = None;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn finish_render(
         &mut self,

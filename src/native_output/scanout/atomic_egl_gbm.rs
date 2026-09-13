@@ -1080,6 +1080,12 @@ impl AtomicEglGbmScanout {
                 fallbacks,
                 render_us,
             }) => {
+                // The lifecycle renderer may have sampled client dmabufs or
+                // partially written the acquired scanout framebuffer before
+                // reporting a recoverable representation fallback. Prove all
+                // work in this EGL context is complete before restoring any
+                // frame-owned client-buffer ownership or recycling the slot.
+                unsafe { self.gl.finish() };
                 settle_failed_output_transaction(
                     output_transactions,
                     transaction_id,
@@ -1089,12 +1095,8 @@ impl AtomicEglGbmScanout {
                         let batch_id = obligations.frame_batch_id().ok_or_else(|| {
                             io::Error::other("lifecycle fallback transaction has no frame batch")
                         })?;
-                        server
-                            .discard_frame_batch(batch_id, FrameBatchDiscardReason::RenderFailure);
-                        let _ = self.swapchain_mut()?.quarantine_rendering(
-                            None,
-                            OutputQuarantineReason::PostDrawRenderFailure,
-                        );
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        self.swapchain_mut()?.complete_unpresented_render(slot)?;
                         Ok(())
                     },
                 )
