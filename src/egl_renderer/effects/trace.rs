@@ -1,5 +1,8 @@
 use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, GraphTextureId, GraphTextureSource, RenderPassKind,
 };
@@ -8,6 +11,11 @@ use super::resources::PooledEffectTexture;
 
 const TRACE_ENV: &str = "TYPHON_EFFECT_EXEC_TRACE";
 const MAX_TRACE_INPUTS: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TraceConfig {
@@ -142,6 +150,17 @@ impl EffectExecutionTrace {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn enabled_for_test() -> Self {
+        Self {
+            enabled: true,
+            frame_id: None,
+            render_generation: None,
+            scene_generation: None,
+            scene_signature: None,
+        }
+    }
+
     pub(crate) const fn enabled(self) -> bool {
         self.enabled
     }
@@ -151,8 +170,54 @@ impl EffectExecutionTrace {
         F: FnOnce() -> String,
     {
         if self.enabled {
-            eprintln!("typhon effect: {}", make_line());
+            let line = make_line();
+            #[cfg(test)]
+            TEST_EVENTS.with(|events| events.borrow_mut().push(line.clone()));
+            eprintln!("typhon effect: {line}");
         }
+    }
+
+    pub(crate) fn scene_replay_boundary(
+        &self,
+        boundary: &'static str,
+        pass: &CompiledRenderPass,
+        reason: &'static str,
+        scene_cursor_start: usize,
+        scene_cursor_end: usize,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_scene_replay_{boundary} frame_id={} pass={} kind={} reason={reason} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={}",
+                optional_u64(self.frame_id),
+                pass.id.get(),
+                render_pass_kind_name(pass.kind),
+                scene_cursor_end.saturating_sub(scene_cursor_start),
+            )
+        });
+    }
+
+    pub(crate) fn final_scene_replay_boundary(
+        &self,
+        boundary: &'static str,
+        scene_cursor_start: usize,
+        scene_cursor_end: usize,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_final_scene_replay_{boundary} frame_id={} scene_cursor_start={scene_cursor_start} scene_cursor_end={scene_cursor_end} command_count={}",
+                optional_u64(self.frame_id),
+                scene_cursor_end.saturating_sub(scene_cursor_start),
+            )
+        });
+    }
+
+    pub(crate) fn overlay_boundary(&self, boundary: &'static str) {
+        self.event(|| {
+            format!(
+                "event=effect_overlay_draw_{boundary} frame_id={}",
+                optional_u64(self.frame_id),
+            )
+        });
     }
 
     pub(crate) fn frame_boundary(
@@ -251,6 +316,16 @@ impl EffectExecutionTrace {
     pub(crate) fn invariant_failure(&self, error: &dyn std::error::Error) {
         self.event(|| format!("event=effect_invariant_failure invariant={error}"));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_events() {
+    TEST_EVENTS.with(|events| events.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_events() -> Vec<String> {
+    TEST_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
 fn render_pass_kind_name(kind: RenderPassKind) -> &'static str {

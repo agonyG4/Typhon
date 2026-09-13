@@ -755,12 +755,30 @@ fn execute_graph_passes(
                 pass.anchor_scope,
             );
             if draw_end > scene_cursor {
+                if renderer.effect_trace.enabled() {
+                    renderer.effect_trace.scene_replay_boundary(
+                        "begin",
+                        pass,
+                        "checkpoint_dependency",
+                        scene_cursor,
+                        draw_end,
+                    );
+                }
                 renderer.draw_effect_scene_range(
                     &repaint_rects,
                     scene_cursor,
                     draw_end,
                     framebuffer_origin,
                 )?;
+                if renderer.effect_trace.enabled() {
+                    renderer.effect_trace.scene_replay_boundary(
+                        "end",
+                        pass,
+                        "checkpoint_dependency",
+                        scene_cursor,
+                        draw_end,
+                    );
+                }
                 scene_cursor = draw_end;
             }
         }
@@ -774,12 +792,30 @@ fn execute_graph_passes(
                 pass.visual_group,
                 pass.anchor_scope,
             );
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.scene_replay_boundary(
+                    "begin",
+                    pass,
+                    "composite_advance",
+                    scene_cursor,
+                    draw_end,
+                );
+            }
             renderer.draw_effect_scene_range(
                 &repaint_rects,
                 scene_cursor,
                 draw_end,
                 framebuffer_origin,
             )?;
+            if renderer.effect_trace.enabled() {
+                renderer.effect_trace.scene_replay_boundary(
+                    "end",
+                    pass,
+                    "composite_advance",
+                    scene_cursor,
+                    draw_end,
+                );
+            }
             scene_cursor = next_cursor.max(scene_cursor);
         }
         if renderer.effect_trace.enabled() {
@@ -893,19 +929,40 @@ fn execute_graph_passes(
         release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
         stats.passes = stats.passes.saturating_add(1);
     }
+    let final_scene_cursor_end = renderer.commands.len();
+    if renderer.effect_trace.enabled() {
+        renderer.effect_trace.final_scene_replay_boundary(
+            "begin",
+            scene_cursor,
+            final_scene_cursor_end,
+        );
+    }
     renderer.draw_effect_scene_range(
         &repaint_rects,
         scene_cursor,
-        renderer.commands.len(),
+        final_scene_cursor_end,
         framebuffer_origin,
     )?;
+    if renderer.effect_trace.enabled() {
+        renderer.effect_trace.final_scene_replay_boundary(
+            "end",
+            scene_cursor,
+            final_scene_cursor_end,
+        );
+    }
     if draw_overlays {
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.overlay_boundary("begin");
+        }
         renderer.draw_lifecycle_overlays(
             &repaint_rects,
             framebuffer_origin,
             repaint_plan.expect("ordinary effect execution needs a repaint plan"),
         )?;
         renderer.draw_effect_overlays(&repaint_rects, framebuffer_origin)?;
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.overlay_boundary("end");
+        }
     }
     renderer.establish_ordinary_scene_state();
     stats.instances = selection.executed_instances.len();

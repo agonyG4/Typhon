@@ -6614,6 +6614,268 @@ mod tests {
         assert_eq!(metrics.checked_out_texture_count, 0);
     }
 
+    fn trace_event_index(events: &[String], terms: &[&str]) -> usize {
+        events
+            .iter()
+            .position(|line| terms.iter().all(|term| line.contains(term)))
+            .unwrap_or_else(|| panic!("trace event not found: {terms:?}"))
+    }
+
+    #[test]
+    fn effect_trace_bounds_visual_group_scene_and_final_replay() {
+        let mut harness = GlesEffectTestHarness::new(256, 192);
+        let target_texture =
+            create_uploaded_resource(&harness.gl, 32, 24).expect("target scene texture creates");
+        harness.renderer.surface_resources.insert(
+            42,
+            EglSurfaceResource {
+                image: target_texture,
+                dmabuf_key: None,
+                buffer_lifetime: None,
+                shm_synced_commit: None,
+            },
+        );
+        let background_texture =
+            create_uploaded_resource(&harness.gl, 1, 1).expect("background scene texture creates");
+        harness.renderer.decoration_resources.insert(
+            DecorationResourceKey::Solid(0xff20_4060),
+            background_texture,
+        );
+        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        effects::clear_effect_trace_test_events();
+
+        let rect = EffectRect::new(32, 32, 32, 24).expect("visual group blur rectangle");
+        let visual_group = VisualGroupId::new(9).expect("visual group id");
+        install_visual_group_scene_commands(&mut harness.renderer, rect, visual_group);
+        let (mut scene, registry) = moving_blur_scene(rect);
+        let instance = scene.instances.first_mut().expect("moving blur instance");
+        instance.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+        instance.visual_group = Some(visual_group);
+        instance.anchor_scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+        instance.scene_order =
+            oblivion_one::compositor::EffectSceneOrder::for_anchor(instance.anchor);
+        let output_bounds = EffectRect::new(0, 0, 256, 192).expect("output bounds");
+        let full_damage = EffectRegion::from_rect(output_bounds);
+        let repaint_plan = RepaintPlan {
+            render_damage: OutputDamage::Full,
+            repair_damage: OutputDamage::Full,
+            buffer_age: None,
+            mode: RepaintMode::Full,
+            fallback_reason: None,
+        };
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            &full_damage,
+            output_bounds,
+            &registry,
+        )
+        .expect("visual group blur graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("visual group blur must compile to an effect graph");
+        };
+        let demand = plan_effect_execution_demand(&graph, &full_damage, true);
+        let selection = effects::select_effect_execution(&graph, &demand);
+
+        effects::execute_effect_graph(
+            &mut harness.renderer,
+            &graph,
+            OutputFramebufferOrigin::BottomLeft,
+            &repaint_plan,
+            &demand,
+            &selection,
+        )
+        .expect("visual group blur graph executes in real GLES");
+        let events = effects::take_effect_trace_test_events();
+
+        let capture_execute_end = trace_event_index(
+            &events,
+            &["event=effect_pass_execute_end", "kind=SceneCapture"],
+        );
+        let composite_resources_end = trace_event_index(
+            &events,
+            &["event=effect_pass_resources_end", "kind=Composite"],
+        );
+        let replay_begin = trace_event_index(
+            &events,
+            &[
+                "event=effect_scene_replay_begin",
+                "kind=Composite",
+                "reason=composite_advance",
+            ],
+        );
+        let replay_end = trace_event_index(
+            &events,
+            &[
+                "event=effect_scene_replay_end",
+                "kind=Composite",
+                "reason=composite_advance",
+            ],
+        );
+        let composite_validate_begin = trace_event_index(
+            &events,
+            &["event=effect_pass_validate_begin", "kind=Composite"],
+        );
+        let composite_end =
+            trace_event_index(&events, &["event=effect_pass_end", "kind=Composite"]);
+        let final_replay_begin =
+            trace_event_index(&events, &["event=effect_final_scene_replay_begin"]);
+        let final_replay_end = trace_event_index(&events, &["event=effect_final_scene_replay_end"]);
+        let overlay_begin = trace_event_index(&events, &["event=effect_overlay_draw_begin"]);
+        let overlay_end = trace_event_index(&events, &["event=effect_overlay_draw_end"]);
+        let graph_execute_end = trace_event_index(&events, &["event=effect_graph_execute_end"]);
+
+        assert!(capture_execute_end < composite_resources_end);
+        assert!(composite_resources_end < replay_begin);
+        assert!(replay_begin < replay_end);
+        assert!(replay_end < composite_validate_begin);
+        assert!(composite_validate_begin < composite_end);
+        assert!(composite_end < final_replay_begin);
+        assert!(final_replay_begin < final_replay_end);
+        assert!(final_replay_end < overlay_begin);
+        assert!(overlay_begin < overlay_end);
+        assert!(overlay_end < graph_execute_end);
+        assert!(events[replay_begin].contains("scene_cursor_start=0"));
+        assert!(events[replay_begin].contains("scene_cursor_end=1"));
+        assert!(events[replay_begin].contains("command_count=1"));
+        assert!(events[final_replay_begin].contains("scene_cursor_start=1"));
+        assert!(events[final_replay_begin].contains("scene_cursor_end=2"));
+        assert!(events[final_replay_begin].contains("command_count=1"));
+    }
+
+    #[test]
+    fn effect_trace_bounds_checkpoint_scene_advancement() {
+        let mut harness = GlesEffectTestHarness::new(256, 192);
+        harness.renderer.effect_trace = effects::EffectExecutionTrace::enabled_for_test();
+        effects::clear_effect_trace_test_events();
+        for surface_id in [10, 20] {
+            let texture = create_uploaded_resource(&harness.gl, 1, 1)
+                .expect("checkpoint scene texture creates");
+            harness.renderer.surface_resources.insert(
+                surface_id,
+                EglSurfaceResource {
+                    image: texture,
+                    dmabuf_key: None,
+                    buffer_lifetime: None,
+                    shm_synced_commit: None,
+                },
+            );
+        }
+        push_draw_command(
+            &mut harness.renderer.vertices,
+            &mut harness.renderer.commands,
+            EglDrawLayer::SolidRgba(0xff20_4060),
+            EglRect::new(0.0, 0.0, 256.0, 192.0),
+            256,
+            192,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        for (surface_id, y) in [(10, 0.0), (20, 96.0)] {
+            push_draw_command(
+                &mut harness.renderer.vertices,
+                &mut harness.renderer.commands,
+                EglDrawLayer::Surface(surface_id),
+                EglRect::new(0.0, y, 256.0, 96.0),
+                256,
+                192,
+                OutputFramebufferOrigin::BottomLeft,
+            );
+        }
+        harness.renderer.scene_geometry_dirty = true;
+
+        let rect = EffectRect::new(32, 32, 64, 48).expect("checkpoint blur rectangle");
+        let (scene, registry) = moving_blur_scene(rect);
+        let mut first = scene.instances[0].clone();
+        first.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(10);
+        first.anchor_scope = oblivion_one::compositor::EffectAnchorScope::Surface;
+        first.visual_group = None;
+        first.scene_order = oblivion_one::compositor::EffectSceneOrder::for_anchor(first.anchor);
+        let mut second = first.clone();
+        second.id = oblivion_one::effects::EffectInstanceId::new(2).expect("second instance id");
+        second.signature = second.signature.saturating_add(1);
+        second.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(20);
+        second.scene_order = oblivion_one::compositor::EffectSceneOrder::for_anchor(second.anchor);
+        let scene = ResolvedEffectScene::new(1, vec![first, second]);
+        let output_bounds = EffectRect::new(0, 0, 256, 192).expect("output bounds");
+        let full_damage = EffectRegion::from_rect(output_bounds);
+        let repaint_plan = RepaintPlan {
+            render_damage: OutputDamage::Full,
+            repair_damage: OutputDamage::Full,
+            buffer_age: None,
+            mode: RepaintMode::Full,
+            fallback_reason: None,
+        };
+        let plan = oblivion_one::effects::compile_frame_execution_plan(
+            &scene,
+            &full_damage,
+            output_bounds,
+            &registry,
+        )
+        .expect("checkpoint blur graph compiles");
+        let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+            panic!("checkpoint blur must compile to an effect graph");
+        };
+        let checkpoint_pass = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == oblivion_one::effects::RenderPassKind::SceneCapture
+                    && !pass.checkpoint_dependencies.is_empty()
+            })
+            .expect("checkpoint-dependent capture pass");
+        let checkpoint_pass_id = checkpoint_pass.id.get().to_string();
+        let demand = plan_effect_execution_demand(&graph, &full_damage, true);
+        let selection = effects::select_effect_execution(&graph, &demand);
+
+        effects::execute_effect_graph(
+            &mut harness.renderer,
+            &graph,
+            OutputFramebufferOrigin::BottomLeft,
+            &repaint_plan,
+            &demand,
+            &selection,
+        )
+        .expect("checkpoint blur graph executes in real GLES");
+        let events = effects::take_effect_trace_test_events();
+
+        let replay_begin = trace_event_index(
+            &events,
+            &[
+                "event=effect_scene_replay_begin",
+                "reason=checkpoint_dependency",
+            ],
+        );
+        let replay_end = trace_event_index(
+            &events,
+            &[
+                "event=effect_scene_replay_end",
+                "reason=checkpoint_dependency",
+            ],
+        );
+        let resources_end = trace_event_index(
+            &events,
+            &[
+                "event=effect_pass_resources_end",
+                &format!("pass={checkpoint_pass_id}"),
+            ],
+        );
+        let validate_begin = trace_event_index(
+            &events,
+            &[
+                "event=effect_pass_validate_begin",
+                &format!("pass={checkpoint_pass_id}"),
+            ],
+        );
+
+        assert!(events[replay_begin].contains(&format!("pass={checkpoint_pass_id}")));
+        assert!(events[replay_end].contains(&format!("pass={checkpoint_pass_id}")));
+        assert!(resources_end < replay_begin);
+        assert!(replay_begin < replay_end);
+        assert!(replay_end < validate_begin);
+        assert!(events[replay_begin].contains("scene_cursor_start=1"));
+        assert!(events[replay_begin].contains("scene_cursor_end=2"));
+        assert!(events[replay_begin].contains("command_count=1"));
+    }
+
     fn create_effect_test_texture(
         gl: &glow::Context,
         width: u32,
