@@ -1264,7 +1264,7 @@ fn failed_shm_materialization_releases_without_false_materialization_proof() {
 }
 
 #[test]
-fn unassigned_shm_is_retained_until_role_adoption_materializes_it() {
+fn unassigned_shm_is_retained_until_parent_activation_materializes_it() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -1275,8 +1275,8 @@ fn unassigned_shm_is_retained_until_role_adoption_materializes_it() {
     let metrics = server.shm_buffer_lifetime_metrics();
 
     assert_eq!(client_state.buffer_release_count, 1);
-    assert_eq!(server.renderable_surfaces().len(), 1);
-    assert_eq!(metrics.shm_releases_after_materialization_total, 1);
+    assert_eq!(server.renderable_surfaces().len(), 2);
+    assert_eq!(metrics.shm_releases_after_materialization_total, 2);
     assert_eq!(metrics.shm_releases_superseded_without_read_total, 0);
 }
 

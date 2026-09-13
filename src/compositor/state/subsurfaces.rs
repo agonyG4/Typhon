@@ -45,15 +45,6 @@ impl CompositorState {
             return false;
         }
         self.add_subsurface_to_pending_stack(parent_id, surface_id);
-        self.committed_subsurface_stacks
-            .entry(parent_id)
-            .or_insert_with(|| vec![parent_id])
-            .retain(|id| *id == parent_id || *id != surface_id);
-        self.committed_subsurface_stacks
-            .entry(parent_id)
-            .or_insert_with(|| vec![parent_id])
-            .push(surface_id);
-        self.reorder_renderable_surfaces_by_committed_stack();
         true
     }
 
@@ -63,6 +54,16 @@ impl CompositorState {
     ) -> bool {
         self.subsurface_transactions
             .is_effectively_synchronized(surface_id)
+    }
+
+    pub(in crate::compositor) fn subsurface_content_is_inactive(&self, surface_id: u32) -> bool {
+        let SurfaceRole::Subsurface { parent_id } = self.surface_role(surface_id) else {
+            return false;
+        };
+        !self
+            .subsurface_transactions
+            .relationship_is_active_child_of(surface_id, parent_id)
+            || !self.current_surface_buffers.contains_key(&parent_id)
     }
 
     pub(in crate::compositor) fn set_subsurface_sync_mode(
@@ -105,6 +106,9 @@ impl CompositorState {
         surface_id: u32,
     ) -> Result<CapturedSurfaceCommitContext, ()> {
         let layer_surface = self.capture_layer_surface_commit_state(surface_id)?;
+        let activations = self
+            .subsurface_transactions
+            .take_pending_relationship_activations_for_parent(surface_id);
         let positions = self
             .subsurface_transactions
             .take_pending_positions_for_parent(surface_id);
@@ -114,7 +118,11 @@ impl CompositorState {
                 .insert(surface_id, stack.clone());
         }
         Ok(CapturedSurfaceCommitContext {
-            subsurface_parent: CapturedSubsurfaceParentState { positions, stack },
+            subsurface_parent: CapturedSubsurfaceParentState {
+                activations,
+                positions,
+                stack,
+            },
             layer_surface,
         })
     }
@@ -1185,13 +1193,47 @@ impl CompositorState {
         parent_id: u32,
         captured: CapturedSubsurfaceParentState,
     ) -> bool {
+        let CapturedSubsurfaceParentState {
+            activations,
+            mut positions,
+            stack,
+        } = captured;
         let mut changed = false;
-        for (surface_id, x, y) in captured.positions {
+        for surface_id in activations {
+            if !self
+                .subsurface_transactions
+                .relationship_is_registered_child_of(surface_id, parent_id)
+                || !self
+                    .subsurface_transactions
+                    .activate_relationship(surface_id, parent_id)
+            {
+                continue;
+            }
+            let position = positions
+                .iter()
+                .position(|(position_surface_id, _, _)| *position_surface_id == surface_id)
+                .map(|index| positions.remove(index))
+                .map(|(_, x, y)| (x, y))
+                .unwrap_or((0, 0));
+            let placement = SurfacePlacement::subsurface(parent_id, position.0, position.1);
+            changed |= self.surface_placement(surface_id) != placement;
+            self.set_surface_placement(surface_id, placement);
+            if self.current_surface_buffers.contains_key(&parent_id) {
+                self.adopt_current_surface_content_for_role(surface_id);
+            }
+        }
+        for (surface_id, x, y) in positions {
+            if !self
+                .subsurface_transactions
+                .relationship_is_active_child_of(surface_id, parent_id)
+            {
+                continue;
+            }
             let placement = SurfacePlacement::subsurface(parent_id, x, y);
             changed |= self.surface_placement(surface_id) != placement;
-            self.set_surface_placement(surface_id, SurfacePlacement::subsurface(parent_id, x, y));
+            self.set_surface_placement(surface_id, placement);
         }
-        if let Some(stack) = captured.stack {
+        if let Some(stack) = stack {
             changed |= self.apply_captured_subsurface_stack_for_parent(parent_id, stack);
         }
         if changed {
@@ -1285,9 +1327,8 @@ impl CompositorState {
         }
         let valid_reference = reference_id == parent_id
             || self
-                .surface_placements
-                .get(&reference_id)
-                .is_some_and(|placement| placement.parent_surface_id == Some(parent_id));
+                .subsurface_transactions
+                .relationship_is_registered_child_of(reference_id, parent_id);
         if !valid_reference {
             return false;
         }
@@ -1317,9 +1358,8 @@ impl CompositorState {
         stack.retain(|id| {
             *id == parent_id
                 || self
-                    .surface_placements
-                    .get(id)
-                    .is_some_and(|placement| placement.parent_surface_id == Some(parent_id))
+                    .subsurface_transactions
+                    .relationship_is_active_child_of(*id, parent_id)
         });
         if !stack.contains(&parent_id) {
             stack.insert(0, parent_id);

@@ -337,6 +337,9 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Materialized(materialized),
         );
+        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+            self.adopt_current_surface_content_for_role(child_id);
+        }
         if let Some(release) = shm_release {
             self.release_materialized_shm(release, copy_to_release_us);
         }
@@ -1566,6 +1569,9 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Unmaterialized(pending),
         );
+        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+            self.adopt_current_surface_content_for_role(child_id);
+        }
         self.note_xwayland_buffer_ready(surface_id);
         self.note_xwayland_commit_observed(
             surface_id,
@@ -1585,6 +1591,47 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn retain_inactive_subsurface_buffer(
+        &mut self,
+        surface_id: u32,
+        pending: PendingSurfaceBuffer,
+        frame_callbacks: Vec<wl_callback::WlCallback>,
+        source: SurfacePublicationSource,
+    ) -> bool {
+        let commit_sequence = pending.commit_sequence;
+        let buffer_id = pending.data.buffer_id();
+        let buffer_size = pending.data.width().ok().and_then(|width| {
+            pending
+                .data
+                .height()
+                .ok()
+                .and_then(|height| BufferSize::new(width, height))
+        });
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if surface_tree_debug_enabled() {
+            eprintln!(
+                "oblivion-one compositor: surface_commit surface={surface_id} role=subsurface decision=retain_inactive buffer_id={}",
+                buffer_id.get()
+            );
+        }
+        self.retain_renderable_surfaces(|surface| surface.surface_id != surface_id);
+        self.track_committed_buffer_lifetime(surface_id, &pending);
+        self.replace_current_surface_buffer(
+            surface_id,
+            CurrentSurfaceBuffer::Unmaterialized(pending),
+        );
+        self.record_surface_publication(
+            surface_id,
+            root_surface_id,
+            commit_sequence,
+            Some(buffer_id),
+            source,
+            buffer_size,
+        );
+        self.complete_frame_callbacks(frame_callbacks);
+        false
+    }
+
     pub(in crate::compositor) fn adopt_current_surface_content_for_role(
         &mut self,
         surface_id: u32,
@@ -1593,6 +1640,11 @@ impl CompositorState {
             self.surface_role(surface_id),
             SurfaceRole::Unassigned | SurfaceRole::Cursor | SurfaceRole::Xwayland
         ) {
+            return false;
+        }
+        if let SurfaceRole::Subsurface { parent_id } = self.surface_role(surface_id)
+            && !self.current_surface_buffers.contains_key(&parent_id)
+        {
             return false;
         }
         if let Some(renderable_index) = self.renderable_surface_index(surface_id) {
@@ -1661,6 +1713,9 @@ impl CompositorState {
             generation,
             RenderGenerationCause::SurfaceCommit,
         );
+        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+            self.adopt_current_surface_content_for_role(child_id);
+        }
         if surface_tree_debug_enabled() {
             eprintln!(
                 "oblivion-one compositor: surface_adopt surface={surface_id} had_buffer=true removed_root_node=false transactions_rekeyed=0"
@@ -1694,36 +1749,46 @@ impl CompositorState {
             | SurfaceRole::XdgPopup
             | SurfaceRole::LayerSurface
             | SurfaceRole::Subsurface { .. } => {
-                let commit_sequence = pending.commit_sequence;
-                let buffer_id = pending.data.buffer_id();
-                match self.surface_publication_decision(
-                    surface_id,
-                    commit_sequence,
-                    source.publication_context(),
-                ) {
-                    SurfacePublicationDecision::Publish => {
-                        let activated = self.commit_surface_buffer(
-                            surface_id,
-                            pending,
-                            damage,
-                            window_geometry,
-                            source,
-                        );
-                        self.note_layer_surface_buffer_published(surface_id);
-                        self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
-                        activated
-                    }
-                    decision => {
-                        self.record_surface_publication_rejection(
-                            surface_id,
-                            commit_sequence,
-                            Some(buffer_id),
-                            source,
-                            decision,
-                        );
-                        self.release_pending_surface_buffer(pending);
-                        self.complete_frame_callbacks(frame_callbacks);
-                        false
+                if self.subsurface_content_is_inactive(surface_id) {
+                    self.retain_inactive_subsurface_buffer(
+                        surface_id,
+                        pending,
+                        frame_callbacks,
+                        source,
+                    );
+                    false
+                } else {
+                    let commit_sequence = pending.commit_sequence;
+                    let buffer_id = pending.data.buffer_id();
+                    match self.surface_publication_decision(
+                        surface_id,
+                        commit_sequence,
+                        source.publication_context(),
+                    ) {
+                        SurfacePublicationDecision::Publish => {
+                            let activated = self.commit_surface_buffer(
+                                surface_id,
+                                pending,
+                                damage,
+                                window_geometry,
+                                source,
+                            );
+                            self.note_layer_surface_buffer_published(surface_id);
+                            self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
+                            activated
+                        }
+                        decision => {
+                            self.record_surface_publication_rejection(
+                                surface_id,
+                                commit_sequence,
+                                Some(buffer_id),
+                                source,
+                                decision,
+                            );
+                            self.release_pending_surface_buffer(pending);
+                            self.complete_frame_callbacks(frame_callbacks);
+                            false
+                        }
                     }
                 }
             }

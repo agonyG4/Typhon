@@ -1086,6 +1086,9 @@ pub(in crate::compositor::tests) fn create_unassigned_shm_surface_then_adopt_top
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let _parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     commit_initial_xdg_handshake(&parent, &connection, &mut queue)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 2, 2)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
 
     let buffer = TestShmBuffer::new(&shm, &qh, 2, 2)?;
     let surface = compositor.create_surface(&qh, ());
@@ -1098,6 +1101,10 @@ pub(in crate::compositor::tests) fn create_unassigned_shm_surface_then_adopt_top
     assert_eq!(state.buffer_release_count, 0);
 
     let _subsurface = subcompositor.get_subsurface(&surface, &parent, &qh, ());
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.buffer_release_count, 0);
+    parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     assert_eq!(state.buffer_release_count, 1);

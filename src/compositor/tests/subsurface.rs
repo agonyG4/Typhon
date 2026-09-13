@@ -102,6 +102,12 @@ fn gecko_pre_role_surface_is_adopted_as_single_subsurface_node() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert!(snapshots.after_roleless_commit.is_empty());
+    assert!(
+        snapshots
+            .after_relationship
+            .iter()
+            .all(|surface| { surface.width != 1 || surface.height != 1 })
+    );
     let parent = snapshots
         .after_adoption
         .iter()
@@ -160,6 +166,31 @@ fn default_synchronized_child_is_invisible_until_parent_commit() {
     assert_eq!(metrics.tree_transactions_published, 2);
     assert_eq!(metrics.maximum_cached_nodes, 1);
     assert_eq!(metrics.synchronized_child_immediate_publish_attempts, 0);
+}
+
+#[test]
+fn desynchronized_child_is_retained_until_parent_relationship_activation() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let DesynchronizedSubsurfaceSnapshots {
+        before_parent,
+        after_latest_child,
+        after_parent,
+    } = capture_desynchronized_subsurface_before_parent_commit(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let child_size = |surfaces: &[RenderableSurfaceSnapshot]| {
+        surfaces
+            .iter()
+            .find(|surface| surface.parent_surface_id.is_some())
+            .map(|surface| (surface.width, surface.height))
+    };
+
+    assert_eq!(child_size(&before_parent), None);
+    assert_eq!(child_size(&after_latest_child), None);
+    assert_eq!(child_size(&after_parent), Some((9, 7)));
 }
 
 #[test]
@@ -254,13 +285,16 @@ fn delayed_parent_stack_lineage_survives_new_child_creation() {
     let first_id = first_restack[2];
     let third_id = snapshots
         .after_child_creation
-        .committed
+        .pending
         .as_ref()
         .and_then(|stack| stack.last().copied())
-        .expect("new child should be in committed stack");
+        .expect("new child should be in pending stack");
     let initial = vec![parent_id, first_id, second_id];
 
-    assert_eq!(snapshots.after_first_parent_commit.committed, Some(initial));
+    assert_eq!(
+        snapshots.after_first_parent_commit.committed,
+        Some(initial.clone())
+    );
     assert_eq!(
         snapshots.after_first_parent_commit.latched,
         Some(first_restack.clone())
@@ -269,6 +303,10 @@ fn delayed_parent_stack_lineage_survives_new_child_creation() {
     assert_eq!(
         snapshots.after_child_creation.latched,
         Some(first_restack.clone())
+    );
+    assert_eq!(
+        snapshots.after_child_creation.committed,
+        Some(initial.clone())
     );
     assert_eq!(
         snapshots.after_child_creation.pending,
@@ -329,7 +367,7 @@ fn multiple_new_subsurfaces_remain_topmost_in_creation_order() {
             .len(),
         expected.len()
     );
-    assert_eq!(after_creation.committed, Some(expected.clone()));
+    assert_eq!(after_creation.committed, Some(baseline));
     assert_eq!(after_commit.committed, Some(expected.clone()));
     assert_eq!(after_commit.latched, Some(expected));
     assert_eq!(after_commit.pending, None);
@@ -363,7 +401,7 @@ fn destroying_new_subsurface_before_parent_commit_preserves_surviving_stack() {
     assert_eq!(after_commit.committed, Some(surviving.clone()));
     assert_eq!(after_commit.latched, Some(surviving));
     assert_eq!(after_commit.pending, None);
-    assert_ne!(before_destroy.committed, after_destroy.committed);
+    assert_eq!(before_destroy.committed, after_destroy.committed);
 }
 
 #[test]

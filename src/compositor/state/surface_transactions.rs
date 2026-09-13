@@ -336,6 +336,7 @@ impl CompositorState {
         let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
         self.apply_captured_subsurface_parent_state(surface_id, commit_context.subsurface_parent);
+        let inactive_subsurface = self.subsurface_content_is_inactive(surface_id);
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
                 pending.opaque_region = opaque_region;
@@ -382,7 +383,7 @@ impl CompositorState {
                         frame_callbacks,
                         SurfacePublicationSource::SurfaceTree,
                     );
-                    if activated {
+                    if activated && !inactive_subsurface {
                         self.activate_current_surface_presentation_commit(
                             surface_id,
                             commit_sequence,
@@ -413,7 +414,7 @@ impl CompositorState {
                 } else {
                     self.complete_frame_callbacks(frame_callbacks);
                 }
-                if activated {
+                if activated && !inactive_subsurface {
                     self.activate_current_surface_presentation_commit(
                         surface_id,
                         commit_sequence,

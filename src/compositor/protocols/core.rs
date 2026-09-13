@@ -466,11 +466,6 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
                     );
                     return;
                 }
-                state.set_surface_placement(
-                    surface_id,
-                    SurfacePlacement::subsurface(parent_id, 0, 0),
-                );
-                state.adopt_current_surface_content_for_role(surface_id);
                 data_init.init(id, SubsurfaceData { surface, parent });
             }
             wl_subcompositor::Request::Destroy => {}
