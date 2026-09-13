@@ -379,7 +379,7 @@ async fn register_user_scope(unit_name: &str, pid: u32) -> zbus::Result<()> {
         ("Slice", Value::from("app.slice")),
         ("Description", Value::from("Typhon application scope")),
     ];
-    type AuxiliaryUnit<'a> = (&'a str, &'a str, Vec<(&'a str, Value<'a>)>);
+    type AuxiliaryUnit<'a> = (&'a str, Vec<(&'a str, Value<'a>)>);
     let auxiliary: Vec<AuxiliaryUnit<'_>> = Vec::new();
     proxy
         .call_method(
