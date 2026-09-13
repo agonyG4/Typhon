@@ -669,7 +669,13 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
             }
             xdg_surface::Request::AckConfigure { serial } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if !state.acknowledge_xdg_configure(surface_id, serial) {
+                let acknowledged = state.acknowledge_xdg_configure(surface_id, serial);
+                if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+                    eprintln!(
+                        "oblivion-one fullscreen: event=xdg_configure_acked root_surface_id={surface_id} serial={serial} accepted={acknowledged}"
+                    );
+                }
+                if !acknowledged {
                     state.post_protocol_error(
                         client,
                         resource,
@@ -817,14 +823,41 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
             xdg_toplevel::Request::UnsetMaximized => {
                 state.restore_normal_root_window(compositor_surface_id(&data.surface));
             }
-            xdg_toplevel::Request::SetFullscreen { .. } => {
-                state.set_root_window_mode(
-                    compositor_surface_id(&data.surface),
-                    ToplevelMode::Fullscreen,
-                );
+            xdg_toplevel::Request::SetFullscreen { output } => {
+                let surface_id = compositor_surface_id(&data.surface);
+                let old_mode = state
+                    .window_id_for_surface(surface_id)
+                    .and_then(|window_id| state.window(window_id))
+                    .map(|window| window.state.mode())
+                    .unwrap_or(ToplevelMode::Normal);
+                if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+                    let app_id = state
+                        .window_id_for_surface(surface_id)
+                        .and_then(|window_id| state.window(window_id))
+                        .and_then(|window| window.metadata.app_id.as_deref())
+                        .unwrap_or("<unknown>");
+                    eprintln!(
+                        "oblivion-one fullscreen: event=xdg_fullscreen_request surface_id={surface_id} root_surface_id={surface_id} client_id={:?} app_id={app_id:?} requested_output={}",
+                        client.id(),
+                        output.is_some(),
+                    );
+                }
+                let configured = state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen);
+                if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+                    eprintln!(
+                        "oblivion-one fullscreen: event=fullscreen_mode_requested root_surface_id={surface_id} old_mode={old_mode:?} new_mode=Fullscreen configure_sent={configured}"
+                    );
+                }
             }
             xdg_toplevel::Request::UnsetFullscreen => {
-                state.restore_normal_root_window(compositor_surface_id(&data.surface));
+                let surface_id = compositor_surface_id(&data.surface);
+                if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+                    eprintln!(
+                        "oblivion-one fullscreen: event=xdg_unset_fullscreen_request surface_id={surface_id} root_surface_id={surface_id} client_id={:?}",
+                        client.id(),
+                    );
+                }
+                state.restore_normal_root_window(surface_id);
             }
             xdg_toplevel::Request::SetMinimized => {
                 state.minimize_root_window(compositor_surface_id(&data.surface));

@@ -106,11 +106,24 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn set_fullscreen_presentation_owner(&mut self, surface_id: u32) {
+        let event = if self
+            .fullscreen_presentation
+            .is_some_and(|owner| owner.owner_root_surface_id == surface_id)
+        {
+            "fullscreen_owner_refreshed"
+        } else {
+            "fullscreen_owner_set"
+        };
         self.fullscreen_presentation = Some(FullscreenPresentationState {
             owner_root_surface_id: surface_id,
             output_width: self.output_size.width,
             output_height: self.output_size.height,
         });
+        if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+            eprintln!(
+                "oblivion-one fullscreen: event={event} root_surface_id={surface_id} reason=authoritative_mode_state"
+            );
+        }
     }
 
     pub(in crate::compositor) fn clear_fullscreen_presentation_owner(&mut self, surface_id: u32) {
@@ -119,6 +132,11 @@ impl CompositorState {
             .is_some_and(|owner| owner.owner_root_surface_id == surface_id)
         {
             self.fullscreen_presentation = None;
+            if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+                eprintln!(
+                    "oblivion-one fullscreen: event=fullscreen_owner_cleared root_surface_id={surface_id} reason=authoritative_mode_or_lifecycle_transition"
+                );
+            }
         }
     }
 

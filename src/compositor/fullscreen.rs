@@ -9,6 +9,10 @@ pub struct FullscreenPresentationState {
     pub output_height: u32,
 }
 
+pub(in crate::compositor) fn fullscreen_trace_enabled() -> bool {
+    std::env::var_os("OBLIVION_ONE_DEBUG_FULLSCREEN").is_some_and(|value| value != "0")
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectScanoutSceneCandidate {
     pub surface_id: u32,

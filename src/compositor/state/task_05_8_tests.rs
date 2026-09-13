@@ -267,6 +267,28 @@ mod task_05_8_tests {
     }
 
     #[test]
+    fn output_sized_normal_window_is_not_an_xdg_fullscreen_owner() {
+        let mut state = CompositorState::default();
+        let window_id = WindowId::from_raw(3).expect("window id");
+        let mut surface = test_surface(905, state.output_size.width, state.output_size.height);
+        surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(vec![surface], &[(905, window_id)], None);
+
+        let metrics = state.fullscreen_render_plan_metrics();
+        assert!(!metrics.fullscreen_active);
+        assert!(!metrics.solitary_tree_active);
+        assert_eq!(metrics.owner_root_surface_id, None);
+        assert_eq!(
+            state
+                .native_frame_renderable_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [905]
+        );
+    }
+
+    #[test]
     fn empty_special_selection_change_does_not_advance_scene_generation() {
         let mut state = CompositorState::new(None);
         let before_open = state.scene_render_generation;

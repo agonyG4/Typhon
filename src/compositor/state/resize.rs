@@ -500,6 +500,13 @@ impl CompositorState {
             .or_default()
             .latest_sent = serial;
         self.record_xdg_configure(surface_id, serial);
+        if crate::compositor::fullscreen::fullscreen_trace_enabled()
+            && states.contains(&xdg_toplevel::State::Fullscreen)
+        {
+            eprintln!(
+                "oblivion-one fullscreen: event=xdg_configure_sent root_surface_id={surface_id} serial={serial} width={width} height={height} fullscreen_state=true"
+            );
+        }
         Some(serial)
     }
 }
