@@ -1373,7 +1373,7 @@ impl AtomicOutputSwapchain {
             && worker
                 .frame
                 .bound_target()
-                .is_some_and(|target| !is_strictly_later_claim(target.physical_claim(), claim))
+                .is_some_and(|target| !is_strictly_later_claim(claim, target.physical_claim()))
         {
             return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
                 owner: QueuedOutputFrameIdentitySnapshot {
@@ -1385,7 +1385,7 @@ impl AtomicOutputSwapchain {
         if let Some(ready) = &self.ready
             && ready
                 .bound_target()
-                .is_some_and(|target| !is_strictly_later_claim(target.physical_claim(), claim))
+                .is_some_and(|target| !is_strictly_later_claim(claim, target.physical_claim()))
         {
             return PhysicalPrimaryClaimRevalidation::OvertakesReady {
                 owner: ready.into(),
@@ -2514,6 +2514,122 @@ mod tests {
         drop(out_writer);
         assert!(swapchain.pending_fence_signaled().unwrap());
         assert!(swapchain.retire_pending_after_recovery().is_some());
+    }
+
+    #[test]
+    fn sustained_predictive_worker_move_recycles_primary_and_cursor_owners() {
+        fn render_move_frame(
+            swapchain: &mut AtomicOutputSwapchain,
+            cursor: &mut crate::native_output::output::NativeAtomicCursor,
+            frame_number: u64,
+        ) {
+            let slot = swapchain
+                .acquire_render_slot_for_limit(2)
+                .expect("predictive triple buffering must admit one future frame");
+            let target = predictive_test_target(frame_number, frame_number.saturating_mul(10));
+            let mut frame = test_frame(swapchain, slot, target);
+            frame.render_generation = frame_number;
+            cursor.set_position(
+                i32::try_from(frame_number).expect("test pointer position fits"),
+                40,
+            );
+            let mut cursor_state = cursor.desired().clone();
+            cursor_state.visible = true;
+            cursor_state.framebuffer_id = Some(91);
+            frame.frozen_cursor_plan = FrozenPrimaryCursorPlan {
+                delivery: PresentedCursorDelivery::Hardware,
+                primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy: FrozenCursorTestPolicy::Skip,
+            };
+            frame.frozen_cursor_plane_owner = Some(FrozenCursorPlaneOwner {
+                revision: cursor.desired_revision(),
+                client_source_key: None,
+                capability_key: None,
+                pin: Some(
+                    cursor
+                        .pin_framebuffer_for(&cursor_state)
+                        .expect("cursor framebuffer must remain owned while rendering"),
+                ),
+            });
+            swapchain
+                .finish_render_owned(frame)
+                .expect("rendered move frame becomes ready");
+        }
+
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let mut cursor = crate::native_output::output::test_cursor_for_worker();
+        let iterations = 512_u64;
+        let mut latest_presented_geometry = 0;
+
+        for frame_number in 1..=iterations {
+            if frame_number == 1 {
+                render_move_frame(&mut swapchain, &mut cursor, frame_number);
+            }
+
+            let token =
+                PageFlipToken::new(frame_number.saturating_add(10_000)).expect("worker token");
+            let (submission_fence, cursor_owner) = swapchain
+                .take_ready_for_worker(token, now(frame_number.saturating_mul(10)))
+                .expect("ready primary enters worker queue");
+            drop(submission_fence);
+            let cursor_owner = cursor_owner.expect("primary carries frozen cursor owner");
+            assert_eq!(
+                cursor_owner.pin.as_ref().map(|pin| pin.framebuffer_id()),
+                Some(FramebufferId::new(91).unwrap())
+            );
+
+            if frame_number < iterations {
+                render_move_frame(&mut swapchain, &mut cursor, frame_number + 1);
+            }
+            swapchain
+                .validate_invariants_for(NativeOutputPacingMode::PredictiveTriple)
+                .expect("worker queued primary plus one ready future remains bounded");
+
+            swapchain
+                .promote_worker_queued(
+                    token,
+                    None,
+                    now(frame_number.saturating_mul(10).saturating_add(1)),
+                    now(frame_number.saturating_mul(10).saturating_add(2)),
+                )
+                .expect("worker submission promotes exact primary");
+            let completed = swapchain
+                .complete_pageflip(token, 1)
+                .expect("exact primary pageflip completes");
+            assert_eq!(completed.frame.render_generation, frame_number);
+            latest_presented_geometry = completed.frame.render_generation;
+            swapchain
+                .note_physical_primary_presentation(
+                    completed
+                        .frame
+                        .bound_target()
+                        .expect("bound target")
+                        .physical_claim(),
+                )
+                .expect("physical primary claim remains ordered");
+            drop(cursor_owner);
+            swapchain
+                .validate_invariants_for(NativeOutputPacingMode::PredictiveTriple)
+                .expect("completed primary releases its slot exactly once");
+        }
+
+        assert_eq!(latest_presented_geometry, iterations);
+        assert_eq!(swapchain.worker_queued_token(), None);
+        assert_eq!(swapchain.pending_token(), None);
+        assert_eq!(swapchain.ready_identity(), None);
+        assert_eq!(swapchain.free_slot_count(), 2);
+        assert!(swapchain.acquire_render_slot_for_limit(2).is_ok());
     }
 
     fn test_target(

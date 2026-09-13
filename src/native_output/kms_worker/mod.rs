@@ -24,6 +24,8 @@ pub(crate) use policy::{
     KmsCommitWorkerTransport, kms_worker_doctor_severity,
 };
 #[cfg(test)]
+pub(crate) use queue::AttachablePrimaryPhase;
+#[cfg(test)]
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
 pub(crate) use queue::{
     AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError,

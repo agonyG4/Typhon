@@ -212,7 +212,13 @@ impl NativeRuntime {
                 atomic_commit_arbiter.atomic_commit_pending(),
                 perf,
             );
-            trace_cursor_plane_plan(server, cursor, &plan, presented_planes.cursor);
+            trace_cursor_plane_plan(
+                server,
+                cursor,
+                &plan,
+                presented_planes.cursor,
+                atomic_commit_arbiter.atomic_commit_pending(),
+            );
             client_cursor_hardware_usable = plan_uses_hardware_cursor(&plan);
             runtime_plane_plan = Some(plan);
         } else if client_surface_content_active {

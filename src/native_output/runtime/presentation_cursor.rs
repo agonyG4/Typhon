@@ -379,6 +379,7 @@ pub(super) fn trace_cursor_plane_plan(
     cursor: &NativeAtomicCursor,
     plan: &RuntimePlanePlan,
     presented_cursor: crate::native_output::presentation::plane::PresentedCursorState,
+    atomic_commit_pending: bool,
 ) {
     if server.cursor_reveal_authority().is_none() {
         return;
@@ -386,8 +387,12 @@ pub(super) fn trace_cursor_plane_plan(
     crate::pointer_debug::cursor_presentation_log_lazy(|| {
         let reveal = server.cursor_reveal_authority();
         let desired = cursor.desired();
+        let current = cursor.current();
+        let presented_matches_current = presented_cursor.kms_equivalent_to(current);
+        let capability_key_unchanged =
+            cursor.capability_key_for(current) == cursor.capability_key_for(desired);
         format!(
-            "event=cursor_plane_plan constraint={}/{} previous_delivery={:?} next_delivery={:?} delta_class={:?} cursor_action={:?} primary_action={:?} test_policy={:?} decision_reason={:?} desired_epoch={} cursor_revision={:?} desired_visible={} desired_position=({},{}) presented_delivery={:?} presented_visible={} presented_position=({},{}) presented_revision={:?} position_only_guard={}",
+            "event=cursor_plane_plan constraint={}/{} previous_delivery={:?} next_delivery={:?} delta_class={:?} cursor_action={:?} primary_action={:?} test_policy={:?} decision_reason={:?} desired_epoch={} cursor_revision={:?} desired_visible={} desired_position=({},{}) presented_delivery={:?} presented_visible={} presented_position=({},{}) presented_revision={:?} position_only_guard={} atomic_commit_pending={} attachable_primary={} presented_matches_current={} capability_key_unchanged={}",
             reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
             reveal.map_or(0, |reveal| reveal.constraint.generation),
             presented_cursor.delivery,
@@ -407,8 +412,12 @@ pub(super) fn trace_cursor_plane_plan(
             presented_cursor.output_position.x,
             presented_cursor.output_position.y,
             presented_cursor.revision,
-            plan.delta_class != CursorDeltaClass::PositionOnly
-                || presented_cursor.kms_equivalent_to(cursor.current())
+            plan.delta_class != CursorDeltaClass::PositionOnly || presented_matches_current,
+            atomic_commit_pending,
+            plan.attachable_primary
+                .map_or(0, |primary| primary.transaction_id.get()),
+            presented_matches_current,
+            capability_key_unchanged,
         )
     });
 }
@@ -948,12 +957,20 @@ fn build_runtime_plane_plan(
         }
     };
     input.next_delivery = next_delivery;
+    // A worker-queued primary keeps the Atomic lane pending, but it is still
+    // mutable until the worker freezes it.  A cursor sidecar offered during
+    // that window is validated against the primary's immutable base and will
+    // be merged into the same bundle, so the pending bit alone must not turn
+    // an x/y-only cursor move into a visual update.  Once the primary is past
+    // the attachable phase, `validation_base_unchanged` remains authoritative.
+    let validation_base_unchanged = input.validation_base_unchanged || attachable_primary.is_some();
+    input.validation_base_unchanged = validation_base_unchanged;
     let mut delta_class = classify_cursor_delta(
         previous_delivery,
         next_delivery,
         previous_state,
         next_state,
-        input.validation_base_unchanged,
+        validation_base_unchanged,
     );
     if delta_class == CursorDeltaClass::PositionOnly && !capability_key_unchanged {
         delta_class = CursorDeltaClass::Visual;
@@ -1108,10 +1125,17 @@ pub(super) fn apply_cursor_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_output::presentation::plane::CursorRevision;
+    use crate::native_output::kms_worker::{
+        AttachablePrimaryPhase, KmsCommitBundleIdentity, KmsValidationBase,
+    };
+    use crate::native_output::presentation::plane::{CursorRevision, PresentedPlaneSnapshot};
     use crate::native_output::presentation::plane_policy::{
         CursorCapabilityKey, CursorGeometryClass, PlaneCapabilityCache,
     };
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    };
+    use std::time::Duration;
 
     fn key() -> CursorCapabilityKey {
         CursorCapabilityKey {
@@ -1136,6 +1160,52 @@ mod tests {
             destination_y: 0,
             destination_width: 64,
             destination_height: 64,
+        }
+    }
+
+    fn attachable_primary() -> AttachablePrimary {
+        let transaction_id =
+            OutputTransactionId::new(std::num::NonZeroU64::new(11).expect("test transaction ID"));
+        let token = PageFlipToken::new(12).expect("test pageflip token");
+        let target = PresentationTarget {
+            sequence: 2,
+            presentation_time: MonotonicTimestampNs::new(20),
+            submit_not_before: MonotonicTimestampNs::new(10),
+            render_start_deadline: MonotonicTimestampNs::new(9),
+            refresh_interval: Duration::from_nanos(10),
+            reason: PresentationTargetReason::PredictedPressure,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(20),
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
+        };
+        let identity = KmsCommitBundleIdentity {
+            id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                token,
+            ),
+            token,
+            output_generation: 1,
+            crtc_id: 7,
+            primary_transaction_id: Some(transaction_id),
+            cursor_transaction_id: None,
+        };
+        AttachablePrimary {
+            transaction_id,
+            bundle_identity: identity,
+            validation_base: KmsValidationBase::Presented {
+                snapshot: PresentedPlaneSnapshot::initial(PresentedCursorState::hidden()),
+                output_generation: 1,
+                crtc_id: 7,
+            },
+            output_generation: 1,
+            crtc_id: 7,
+            target,
+            phase: AttachablePrimaryPhase::Queued,
         }
     }
 
@@ -1208,5 +1278,63 @@ mod tests {
             crop_changed.decision.test_policy,
             KmsCursorTestPolicy::Required
         );
+    }
+
+    #[test]
+    fn attachable_worker_primary_keeps_position_only_cursor_motion_position_only() {
+        let mut capabilities = PlaneCapabilityCache::default();
+        let capability_key = key();
+        capabilities.mark_proven(capability_key);
+        let mut previous = AtomicCursorVisualState::hidden(64, 64);
+        previous.visible = true;
+        previous.framebuffer_id = Some(9);
+        let mut next = previous.clone();
+        next.x = 12;
+        let input = PlaneSchedulingInput {
+            revision: CursorRevision::initial().advance_motion(),
+            preference: CursorPreference::Auto,
+            visible: true,
+            geometry: CursorGeometryInput {
+                pointer_x: next.x,
+                pointer_y: next.y,
+                hotspot_x: next.hotspot_x,
+                hotspot_y: next.hotspot_y,
+                cursor_width: next.width,
+                cursor_height: next.height,
+                output_width: 1920,
+                output_height: 1080,
+            },
+            geometry_valid: true,
+            hardware: Some(CursorHardwareCapability {
+                key: capability_key,
+            }),
+            capabilities: &capabilities,
+            primary_mode: PlanePrimaryMode::Composed,
+            software_allowed: true,
+            predictive_triple_active: true,
+            cursor_kms_changed: true,
+            hardware_plane_visible: true,
+            delta_class: CursorDeltaClass::Visual,
+            previous_delivery: CursorDeliveryMode::Hardware,
+            next_delivery: CursorDeliveryMode::Hardware,
+            validation_base_unchanged: false,
+            attachable_primary: Some(OutputTransactionId::new(
+                std::num::NonZeroU64::new(11).expect("test transaction ID"),
+            )),
+        };
+
+        let plan = build_runtime_plane_plan(
+            input,
+            CursorDeliveryMode::Hardware,
+            Some(&previous),
+            Some(&next),
+            false,
+            Some(attachable_primary()),
+            true,
+        );
+
+        assert_eq!(plan.delta_class, CursorDeltaClass::PositionOnly);
+        assert_eq!(plan.decision.cursor_action, CursorPlaneAction::Independent);
+        assert_eq!(plan.decision.test_policy, KmsCursorTestPolicy::SkipProven);
     }
 }
