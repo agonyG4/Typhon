@@ -339,18 +339,18 @@ pub(in crate::compositor::tests) fn capture_destroyed_latched_subsurface_snapsho
     Ok(capture_renderable_surface_snapshot(commands))
 }
 
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DestroyRecreateSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) before_release: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) old_stack: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) after_release: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) new_stack: SubsurfaceStackStateSnapshot,
+}
+
 pub(in crate::compositor::tests) fn capture_destroy_recreate_subsurface_aba(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<
-    (
-        Vec<RenderableSurfaceSnapshot>,
-        SubsurfaceStackStateSnapshot,
-        Vec<RenderableSurfaceSnapshot>,
-        SubsurfaceStackStateSnapshot,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<DestroyRecreateSubsurfaceSnapshots, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -418,7 +418,12 @@ pub(in crate::compositor::tests) fn capture_destroy_recreate_subsurface_aba(
     wait_for_server_commands(commands);
     let after_release = capture_renderable_surface_snapshot(commands);
     let new_stack = capture_subsurface_stack_state(commands, parent_id);
-    Ok((before_release, old_stack, after_release, new_stack))
+    Ok(DestroyRecreateSubsurfaceSnapshots {
+        before_release,
+        old_stack,
+        after_release,
+        new_stack,
+    })
 }
 
 pub(in crate::compositor::tests) fn capture_preactivation_subsurface_presentation_feedback(

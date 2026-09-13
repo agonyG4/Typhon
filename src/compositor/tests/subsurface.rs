@@ -262,8 +262,12 @@ fn destroyed_and_recreated_subsurface_cannot_match_a_stale_parent_transaction() 
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let (before_release, old_stack, after_release, new_stack) =
-        capture_destroy_recreate_subsurface_aba(&socket_path, &commands).unwrap();
+    let DestroyRecreateSubsurfaceSnapshots {
+        before_release,
+        old_stack,
+        after_release,
+        new_stack,
+    } = capture_destroy_recreate_subsurface_aba(&socket_path, &commands).unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert!(
