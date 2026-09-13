@@ -194,6 +194,81 @@ fn low_entries_are_written_as_distinct_region_value_operations() {
 }
 
 #[derive(Default)]
+struct RawWriteProbe {
+    calls: Vec<Vec<u8>>,
+    outcomes: VecDeque<std::io::Result<usize>>,
+}
+
+impl RawWrite for RawWriteProbe {
+    fn write(&mut self, _fd: std::os::fd::RawFd, record: &[u8]) -> std::io::Result<usize> {
+        self.calls.push(record.to_vec());
+        self.outcomes.pop_front().unwrap_or(Ok(record.len()))
+    }
+}
+
+#[test]
+fn raw_keyed_write_sends_one_complete_capacity_record() {
+    let mut writer = RawWriteProbe::default();
+    write_region_with_raw(&mut writer, -1, "drm/0000:01:00.0/vram", 8_589_934_592)
+        .expect("raw write");
+
+    assert_eq!(
+        writer.calls,
+        vec![b"drm/0000:01:00.0/vram 8589934592\n".to_vec()]
+    );
+}
+
+#[test]
+fn raw_keyed_write_uses_one_complete_zero_record_for_revert() {
+    let mut writer = RawWriteProbe::default();
+    write_region_with_raw(&mut writer, -1, "drm/0000:01:00.0/vram", 0).expect("raw write");
+
+    assert_eq!(writer.calls, vec![b"drm/0000:01:00.0/vram 0\n".to_vec()]);
+}
+
+#[test]
+fn raw_keyed_write_rejects_positive_short_write_without_suffix_retry() {
+    let mut writer = RawWriteProbe {
+        outcomes: VecDeque::from([Ok(3)]),
+        ..RawWriteProbe::default()
+    };
+    let record = build_low_record("region", 10).expect("record");
+
+    assert!(write_single_record_with(&mut writer, -1, &record).is_err());
+    assert_eq!(writer.calls, vec![b"region 10\n".to_vec()]);
+}
+
+#[test]
+fn raw_keyed_write_retries_eintr_with_the_complete_record() {
+    let mut writer = RawWriteProbe {
+        outcomes: VecDeque::from([
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            Ok(10),
+        ]),
+        ..RawWriteProbe::default()
+    };
+    let record = build_low_record("region", 10).expect("record");
+
+    write_single_record_with(&mut writer, -1, &record).expect("retry write");
+    assert_eq!(
+        writer.calls,
+        vec![b"region 10\n".to_vec(), b"region 10\n".to_vec()]
+    );
+}
+
+#[test]
+fn malformed_keyed_record_is_rejected_before_the_raw_write() {
+    let mut writer = RawWriteProbe::default();
+    for region in ["", "region\nother", "region\0other"] {
+        assert!(
+            write_region_with_raw(&mut writer, -1, region, 10).is_err(),
+            "region should fail: {region:?}"
+        );
+    }
+    assert!(writer.calls.is_empty());
+}
+
+#[derive(Default)]
 struct FailOnWriteWriter {
     attempts: Vec<(String, String, u64)>,
     successful_writes: Vec<(String, String, u64)>,
@@ -344,6 +419,38 @@ fn stale_generation_stops_between_regions_and_reverts_touched_entries() {
             ("user.slice/app.scope".to_owned(), "region-a".to_owned(), 0),
         ]
     );
+}
+
+#[test]
+fn stale_generation_before_revert_keeps_the_current_target_protected() {
+    let first = RecordingWriter::path("/user.slice/app-a.scope", 42);
+    let second = RecordingWriter::path("/user.slice/app-b.scope", 43);
+    let resolver = StubResolver {
+        results: [(42, Ok(first.clone())), (43, Ok(second))]
+            .into_iter()
+            .collect(),
+    };
+    let mut controller = controller_fixture(resolver);
+    let target_a = ForegroundTarget {
+        window_id: crate::core::WindowId::from_raw(1).expect("window id"),
+        pid: 42,
+    };
+    let target_b = ForegroundTarget {
+        window_id: crate::core::WindowId::from_raw(2).expect("window id"),
+        pid: 43,
+    };
+
+    controller.reconcile(Some(target_a)).expect("first apply");
+    let writes_before = controller.writer().writes.clone();
+
+    assert_eq!(
+        controller
+            .reconcile_with(Some(target_b), || false)
+            .expect("stale transition"),
+        TransitionResult::Stale
+    );
+    assert_eq!(controller.current_path(), Some(first.path.as_path()));
+    assert_eq!(controller.writer().writes, writes_before);
 }
 
 fn resolver_fixture(name: &str, pid: u32, uid: u32, cgroup: &str) -> DmemPaths {
@@ -582,8 +689,8 @@ fn controller_skips_writes_for_same_cgroup_and_cleans_up_failed_new_targets() {
     );
     assert_eq!(controller.writer().writes.len(), 2);
     assert!(controller.reconcile(Some(target_failed)).is_err());
-    assert_eq!(controller.current_path(), None);
-    assert_eq!(controller.writer().writes.len(), 4);
+    assert_eq!(controller.current_path(), Some(first.path.as_path()));
+    assert_eq!(controller.writer().writes.len(), 2);
 }
 
 #[test]

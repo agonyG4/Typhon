@@ -4,8 +4,11 @@ use std::{
     ffi::CString,
     fmt::{self, Display, Formatter},
     fs::{self, File},
-    io::{self, Write},
-    os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    io,
+    os::{
+        fd::{AsRawFd, FromRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     panic::{self, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -583,11 +586,20 @@ where
             return Ok(TransitionResult::SameCgroup);
         }
 
+        let resolved = resolved?;
+
+        if !should_continue() {
+            return Ok(TransitionResult::Stale);
+        }
+
         if self.current.is_some() {
             self.revert_current()?;
         }
 
-        let resolved = resolved?;
+        if !should_continue() {
+            return Ok(TransitionResult::Stale);
+        }
+
         self.apply_target(resolved, &mut should_continue)
     }
 
@@ -724,9 +736,94 @@ impl DmemLowWriter for FilesystemDmemWriter {
         region: &str,
         value: u64,
     ) -> io::Result<()> {
-        let mut file = self.open_low(cgroup)?;
-        writeln!(file, "{region} {value}")
+        let record = build_low_record(region, value)?;
+        let file = self.open_low(cgroup)?;
+        write_single_record(file.as_raw_fd(), &record)
     }
+}
+
+trait RawWrite {
+    fn write(&mut self, fd: RawFd, record: &[u8]) -> io::Result<usize>;
+}
+
+struct LibcRawWrite;
+
+impl RawWrite for LibcRawWrite {
+    fn write(&mut self, fd: RawFd, record: &[u8]) -> io::Result<usize> {
+        let result = unsafe { libc::write(fd, record.as_ptr().cast(), record.len()) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+fn write_single_record(fd: RawFd, record: &[u8]) -> io::Result<()> {
+    let mut writer = LibcRawWrite;
+    write_single_record_with(&mut writer, fd, record)
+}
+
+fn write_single_record_with<W: RawWrite>(
+    writer: &mut W,
+    fd: RawFd,
+    record: &[u8],
+) -> io::Result<()> {
+    if record.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dmem.low record must not be empty",
+        ));
+    }
+
+    loop {
+        match writer.write(fd, record) {
+            Ok(written) if written == record.len() => return Ok(()),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "dmem.low write transferred no bytes",
+                ));
+            }
+            Ok(written) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "short dmem.low keyed write: transferred {written} of {} bytes",
+                        record.len()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn build_low_record(region: &str, value: u64) -> io::Result<Vec<u8>> {
+    if region.is_empty()
+        || region.len() > 4096
+        || region
+            .bytes()
+            .any(|byte| byte == b'\0' || byte.is_ascii_whitespace())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid dmem.low region",
+        ));
+    }
+    Ok(format!("{region} {value}\n").into_bytes())
+}
+
+#[cfg(test)]
+fn write_region_with_raw<W: RawWrite>(
+    writer: &mut W,
+    fd: RawFd,
+    region: &str,
+    value: u64,
+) -> io::Result<()> {
+    let record = build_low_record(region, value)?;
+    write_single_record_with(writer, fd, &record)
 }
 
 const RETRY_DELAYS: [Duration; 5] = [
