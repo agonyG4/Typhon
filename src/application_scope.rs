@@ -311,7 +311,7 @@ pub fn run_internal_scope_exec(args: &[String]) -> Result<Infallible, ScopeError
             &unit_name,
             pid,
             ScopeSetupTimeouts::production(),
-            |unit| current_process_is_in_scope(unit),
+            current_process_is_in_scope,
         );
         match outcome {
             ScopeSetupOutcome::Scoped => report_helper_status("S"),
@@ -379,7 +379,8 @@ async fn register_user_scope(unit_name: &str, pid: u32) -> zbus::Result<()> {
         ("Slice", Value::from("app.slice")),
         ("Description", Value::from("Typhon application scope")),
     ];
-    let auxiliary: Vec<(&str, &str, Vec<(&str, Value<'_>)>)> = Vec::new();
+    type AuxiliaryUnit<'a> = (&'a str, &'a str, Vec<(&'a str, Value<'a>)>);
+    let auxiliary: Vec<AuxiliaryUnit<'_>> = Vec::new();
     proxy
         .call_method(
             "StartTransientUnit",

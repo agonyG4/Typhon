@@ -2742,6 +2742,9 @@ pub(in crate::compositor::tests) fn capture_pending_subsurface_activation_across
 
     let (parent, _xdg_surface, _toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
