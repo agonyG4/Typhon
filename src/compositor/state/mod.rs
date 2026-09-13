@@ -141,9 +141,10 @@ pub use surface_transactions::SurfaceTreeTransactionId;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::{
     ActiveSurfacePresentationCommit, BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction,
-    ReleasedSurfaceTreeState, SurfacePublicationContext, SurfacePublicationDecision,
-    SurfacePublicationSource, SurfacePublicationState, SurfaceTreeAcquireDependency,
-    SurfaceTreeMergeStats, SurfaceTreeNodeLifetime, SurfaceTreeNodeLifetimes, TransactionOrdering,
+    PreparedSurfaceTreeTransactionPartition, ReleasedSurfaceTreeState, SurfacePublicationContext,
+    SurfacePublicationDecision, SurfacePublicationSource, SurfacePublicationState,
+    SurfaceTreeAcquireDependency, SurfaceTreeMergeStats, SurfaceTreeNodeLifetime,
+    SurfaceTreeNodeLifetimes, TransactionOrdering,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
