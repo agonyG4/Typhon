@@ -632,14 +632,12 @@ mod tests {
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(
-                    older_worker
-                )))
+                .contains_attempt(PredictiveO1AttemptId::new(older_worker))
         );
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(newer_ready)))
+                .contains_attempt(PredictiveO1AttemptId::new(newer_ready))
         );
     }
 
@@ -667,14 +665,12 @@ mod tests {
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(
-                    older_worker
-                )))
+                .contains_attempt(PredictiveO1AttemptId::new(older_worker))
         );
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(newer_ready)))
+                .contains_attempt(PredictiveO1AttemptId::new(newer_ready))
         );
     }
 
@@ -694,7 +690,7 @@ mod tests {
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(live)))
+                .contains_attempt(PredictiveO1AttemptId::new(live))
         );
 
         pacing.note_predictive_ready_other_safe_abandonment(Some(live));
@@ -703,7 +699,7 @@ mod tests {
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(live)))
+                .contains_attempt(PredictiveO1AttemptId::new(live))
         );
     }
 
@@ -1426,7 +1422,7 @@ mod tests {
         );
     }
 }
-use super::scanout::{NativeScanoutBufferSnapshot, OutputFrameIdentitySnapshot};
+use super::scanout::{NativeScanoutBufferSnapshot, OutputFrameIdentitySnapshot, OutputFrameKey};
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss, RenderPrediction,
 };
@@ -1458,17 +1454,36 @@ impl NativeOutputFrameId {
 }
 
 /// Identity allocated by pacing before the output backend has created a
-/// concrete frame. It is valid for scheduling decisions only.
+/// concrete frame. It is a namespace of its own and is never reconstructed
+/// from an ordinary scheduler frame ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PredictiveO1AttemptId(NativeOutputFrameId);
+pub(crate) struct PredictiveO1AttemptId(u64);
 
 impl PredictiveO1AttemptId {
-    const fn new(frame_id: NativeOutputFrameId) -> Self {
-        Self(frame_id)
+    #[cfg(test)]
+    const fn new(value: u64) -> Self {
+        Self(value)
     }
 
     pub(crate) const fn get(self) -> u64 {
-        self.0.get()
+        self.0
+    }
+}
+
+#[derive(Debug)]
+struct PredictiveO1AttemptIdSequence {
+    next: u64,
+}
+
+impl PredictiveO1AttemptIdSequence {
+    const fn new(next: u64) -> Self {
+        Self { next }
+    }
+
+    fn next(&mut self) -> PredictiveO1AttemptId {
+        let id = PredictiveO1AttemptId(self.next.max(1));
+        self.next = id.0.checked_add(1).unwrap_or(1);
+        id
     }
 }
 #[derive(Debug)]
@@ -1769,7 +1784,10 @@ const PREDICTIVE_O1_LIFECYCLE_CAPACITY: usize = 4;
 #[derive(Debug, Clone, Copy)]
 struct PredictiveO1LifecycleEntry {
     attempt_id: PredictiveO1AttemptId,
-    physical_identity: Option<OutputFrameIdentitySnapshot>,
+    physical_key: Option<OutputFrameKey>,
+    /// Retained for diagnostics and state validation. This is not lifecycle
+    /// identity because its target field may change during deferred O1.
+    physical_state: Option<OutputFrameIdentitySnapshot>,
     stage: PredictiveO1Stage,
     observed_stages: u8,
 }
@@ -1778,7 +1796,8 @@ impl PredictiveO1LifecycleEntry {
     const fn new(attempt_id: PredictiveO1AttemptId) -> Self {
         Self {
             attempt_id,
-            physical_identity: None,
+            physical_key: None,
+            physical_state: None,
             stage: PredictiveO1Stage::Rendering,
             observed_stages: 1u8 << (PredictiveO1Stage::Rendering as u8),
         }
@@ -1824,8 +1843,8 @@ impl PredictiveO1LifecycleLedger {
     fn contains_identity(&self, identity: PredictiveO1LifecycleIdentity) -> bool {
         self.entries.iter().flatten().any(|entry| match identity {
             PredictiveO1LifecycleIdentity::Attempt(attempt_id) => entry.attempt_id == attempt_id,
-            PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
-                entry.physical_identity == Some(physical_identity)
+            PredictiveO1LifecycleIdentity::Physical(physical_key) => {
+                entry.physical_key == Some(physical_key)
             }
         })
     }
@@ -1842,8 +1861,8 @@ impl PredictiveO1LifecycleLedger {
                 PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
                     entry.attempt_id == attempt_id
                 }
-                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
-                    entry.physical_identity == Some(physical_identity)
+                PredictiveO1LifecycleIdentity::Physical(physical_key) => {
+                    entry.physical_key == Some(physical_key)
                 }
             })
             .is_some_and(|entry| entry.observed_stages & (1u8 << (stage as u8)) != 0)
@@ -1852,13 +1871,13 @@ impl PredictiveO1LifecycleLedger {
     fn bind(
         &mut self,
         attempt_id: PredictiveO1AttemptId,
-        physical_identity: OutputFrameIdentitySnapshot,
+        physical_state: OutputFrameIdentitySnapshot,
     ) -> Result<(), &'static str> {
         if self
             .entries
             .iter()
             .flatten()
-            .any(|entry| entry.physical_identity == Some(physical_identity))
+            .any(|entry| entry.physical_key == Some(OutputFrameKey::from(&physical_state)))
         {
             return Err("Predictive O1 physical identity was bound twice");
         }
@@ -1870,10 +1889,11 @@ impl PredictiveO1LifecycleLedger {
         else {
             return Err("Predictive O1 attempt identity was not live");
         };
-        if entry.physical_identity.is_some() {
+        if entry.physical_key.is_some() {
             return Err("Predictive O1 attempt identity was bound twice");
         }
-        entry.physical_identity = Some(physical_identity);
+        entry.physical_key = Some(OutputFrameKey::from(&physical_state));
+        entry.physical_state = Some(physical_state);
         Ok(())
     }
 
@@ -1885,7 +1905,7 @@ impl PredictiveO1LifecycleLedger {
             .iter()
             .flatten()
             .find(|entry| entry.attempt_id == attempt_id)
-            .and_then(|entry| entry.physical_identity)
+            .and_then(|entry| entry.physical_state)
     }
 
     fn record_stage(
@@ -1901,8 +1921,8 @@ impl PredictiveO1LifecycleLedger {
                 PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
                     entry.attempt_id == attempt_id
                 }
-                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
-                    entry.physical_identity == Some(physical_identity)
+                PredictiveO1LifecycleIdentity::Physical(physical_key) => {
+                    entry.physical_key == Some(physical_key)
                 }
             })
         else {
@@ -1926,8 +1946,8 @@ impl PredictiveO1LifecycleLedger {
                 PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
                     entry.attempt_id == attempt_id
                 }
-                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
-                    entry.physical_identity == Some(physical_identity)
+                PredictiveO1LifecycleIdentity::Physical(physical_key) => {
+                    entry.physical_key == Some(physical_key)
                 }
             })
         }) else {
@@ -1951,7 +1971,7 @@ impl PredictiveO1LifecycleLedger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictiveO1LifecycleIdentity {
     Attempt(PredictiveO1AttemptId),
-    Physical(OutputFrameIdentitySnapshot),
+    Physical(OutputFrameKey),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1963,12 +1983,13 @@ enum PredictiveO1StageRecord {
 }
 
 const fn lifecycle_identity(
-    attempt_id: NativeOutputFrameId,
-    physical_identity: Option<OutputFrameIdentitySnapshot>,
-) -> PredictiveO1LifecycleIdentity {
-    match physical_identity {
-        Some(identity) => PredictiveO1LifecycleIdentity::Physical(identity),
-        None => PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(attempt_id)),
+    attempt_id: Option<PredictiveO1AttemptId>,
+    physical_key: Option<OutputFrameKey>,
+) -> Option<PredictiveO1LifecycleIdentity> {
+    match (attempt_id, physical_key) {
+        (_, Some(key)) => Some(PredictiveO1LifecycleIdentity::Physical(key)),
+        (Some(attempt), None) => Some(PredictiveO1LifecycleIdentity::Attempt(attempt)),
+        (None, None) => None,
     }
 }
 
@@ -2013,6 +2034,8 @@ enum PredictiveReadyTerminal {
 struct WorkerPacingReservation {
     frame_id: NativeOutputFrameId,
     physical_identity: Option<OutputFrameIdentitySnapshot>,
+    physical_key: Option<OutputFrameKey>,
+    predictive_attempt_id: Option<PredictiveO1AttemptId>,
 }
 
 #[derive(Debug)]
@@ -2054,16 +2077,23 @@ pub(crate) struct NativeFramePacing {
     summary_enabled: bool,
     trace: Option<NativeTraceSink>,
     ids: NativeOutputFrameIdSequence,
+    predictive_o1_attempt_ids: PredictiveO1AttemptIdSequence,
     pub(crate) active: Option<NativeOutputFrameId>,
+    active_predictive_attempt: Option<PredictiveO1AttemptId>,
     active_physical_identity: Option<OutputFrameIdentitySnapshot>,
+    active_physical_key: Option<OutputFrameKey>,
     active_origin: PreparedFrameOrigin,
     pub(crate) active_queued_ns: Option<u64>,
     active_queued_frame_id: Option<NativeOutputFrameId>,
     pub(crate) pending: Option<NativeOutputFrameId>,
+    pending_predictive_attempt: Option<PredictiveO1AttemptId>,
     pending_physical_identity: Option<OutputFrameIdentitySnapshot>,
+    pending_physical_key: Option<OutputFrameKey>,
     pending_token: Option<u64>,
     pub(crate) ready: Option<NativeOutputFrameId>,
+    ready_predictive_attempt: Option<PredictiveO1AttemptId>,
     ready_physical_identity: Option<OutputFrameIdentitySnapshot>,
+    ready_physical_key: Option<OutputFrameKey>,
     ready_waiting_frame_id: Option<NativeOutputFrameId>,
     worker_reservation: Option<WorkerPacingReservation>,
     pub(crate) render_ahead_attempts: u64,
@@ -2263,16 +2293,23 @@ impl NativeFramePacing {
             summary_enabled: summary_enabled || trace_enabled,
             trace: trace_enabled.then(NativeTraceSink::new),
             ids: NativeOutputFrameIdSequence::new(1),
+            predictive_o1_attempt_ids: PredictiveO1AttemptIdSequence::new(1),
             active: None,
+            active_predictive_attempt: None,
             active_physical_identity: None,
+            active_physical_key: None,
             active_origin: PreparedFrameOrigin::Normal,
             active_queued_ns: None,
             active_queued_frame_id: None,
             pending: None,
+            pending_predictive_attempt: None,
             pending_physical_identity: None,
+            pending_physical_key: None,
             pending_token: None,
             ready: None,
+            ready_predictive_attempt: None,
             ready_physical_identity: None,
+            ready_physical_key: None,
             ready_waiting_frame_id: None,
             worker_reservation: None,
             render_ahead_attempts: 0,
@@ -2448,7 +2485,9 @@ impl NativeFramePacing {
         }
         let id = self.ids.next();
         self.active = Some(id);
+        self.active_predictive_attempt = None;
         self.active_physical_identity = None;
+        self.active_physical_key = None;
         self.active_origin = PreparedFrameOrigin::Normal;
         self.active_queued_ns = Some(now_ns);
         self.active_queued_frame_id = Some(id);
@@ -2482,12 +2521,13 @@ impl NativeFramePacing {
             return Ok(());
         }
         let attempt_id = self
-            .active
-            .map(PredictiveO1AttemptId::new)
+            .active_predictive_attempt
             .ok_or("Predictive O1 physical frame has no active attempt")?;
+        let physical_key = OutputFrameKey::from(&physical_identity);
         self.predictive_o1_lifecycle
             .bind(attempt_id, physical_identity)?;
         self.active_physical_identity = Some(physical_identity);
+        self.active_physical_key = Some(physical_key);
         self.log(
             "predictive_attempt_bound",
             vec![
@@ -2507,7 +2547,7 @@ impl NativeFramePacing {
 
     pub(crate) fn active_predictive_attempt_id(&self) -> Option<PredictiveO1AttemptId> {
         (self.active_origin == PreparedFrameOrigin::PredictiveO1)
-            .then(|| self.active.map(PredictiveO1AttemptId::new))
+            .then_some(self.active_predictive_attempt)
             .flatten()
     }
 
@@ -2556,11 +2596,11 @@ impl NativeFramePacing {
             (NativeOutputPacingMode::PredictiveTriple, false) => PreparedFrameOrigin::Normal,
         };
         if origin == PreparedFrameOrigin::PredictiveO1 {
-            let frame_id = self
-                .active
+            self.active
                 .ok_or("Predictive O1 render started without an active frame")?;
-            self.predictive_o1_lifecycle
-                .insert(PredictiveO1AttemptId::new(frame_id))?;
+            let attempt_id = self.predictive_o1_attempt_ids.next();
+            self.predictive_o1_lifecycle.insert(attempt_id)?;
+            self.active_predictive_attempt = Some(attempt_id);
             self.predictive_o1_created = self.predictive_o1_created.saturating_add(1);
             self.note_predictive_unbound_created();
         }
@@ -2589,12 +2629,15 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        if let Some(frame_id) = self.active {
-            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+        if let Some(identity) =
+            lifecycle_identity(self.active_predictive_attempt, self.active_physical_key)
+        {
             self.terminalize_predictive_frame(identity, terminal);
         }
         self.active = None;
+        self.active_predictive_attempt = None;
         self.active_physical_identity = None;
+        self.active_physical_key = None;
         self.active_origin = PreparedFrameOrigin::Normal;
         self.active_queued_frame_id = None;
         self.active_queued_ns = None;
@@ -2617,10 +2660,20 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        let (id, physical_identity) = if ready_submit {
-            (self.ready.take(), self.ready_physical_identity.take())
+        let (id, physical_identity, predictive_attempt_id, physical_key) = if ready_submit {
+            (
+                self.ready.take(),
+                self.ready_physical_identity.take(),
+                self.ready_predictive_attempt.take(),
+                self.ready_physical_key.take(),
+            )
         } else {
-            (self.active.take(), self.active_physical_identity.take())
+            (
+                self.active.take(),
+                self.active_physical_identity.take(),
+                self.active_predictive_attempt.take(),
+                self.active_physical_key.take(),
+            )
         };
         if !ready_submit {
             self.clear_active_worker_timing(id);
@@ -2629,6 +2682,8 @@ impl NativeFramePacing {
         self.note_submit_frame(
             id,
             physical_identity,
+            predictive_attempt_id,
+            physical_key,
             token,
             now_ns,
             ready_submit,
@@ -2640,6 +2695,8 @@ impl NativeFramePacing {
         &mut self,
         id: Option<NativeOutputFrameId>,
         physical_identity: Option<OutputFrameIdentitySnapshot>,
+        predictive_attempt_id: Option<PredictiveO1AttemptId>,
+        physical_key: Option<OutputFrameKey>,
         token: u64,
         now_ns: u64,
         ready_submit: bool,
@@ -2647,16 +2704,11 @@ impl NativeFramePacing {
     ) {
         if ready_submit {
             self.ready_submit_count += 1;
-            if let Some(frame_id) = id
-                && self
-                    .predictive_o1_lifecycle
-                    .contains_attempt(PredictiveO1AttemptId::new(frame_id))
-            {
+            if predictive_attempt_id.is_some() {
                 self.predictive_ready_submits += 1;
-                if self.note_predictive_stage(
-                    lifecycle_identity(frame_id, physical_identity),
-                    PredictiveO1Stage::Submitted,
-                ) {
+                if let Some(identity) = lifecycle_identity(predictive_attempt_id, physical_key)
+                    && self.note_predictive_stage(identity, PredictiveO1Stage::Submitted)
+                {
                     self.predictive_ready_submitted =
                         self.predictive_ready_submitted.saturating_add(1);
                 }
@@ -2670,27 +2722,18 @@ impl NativeFramePacing {
             }
         }
         if !ready_submit
-            && let Some(frame_id) = id
-            && self
-                .predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(frame_id))
+            && let Some(identity) = lifecycle_identity(predictive_attempt_id, physical_key)
         {
-            self.note_predictive_stage(
-                lifecycle_identity(frame_id, physical_identity),
-                PredictiveO1Stage::Submitted,
-            );
+            self.note_predictive_stage(identity, PredictiveO1Stage::Submitted);
         }
         if pacing_mode == NativeOutputPacingMode::ReactiveDouble && !ready_submit {
             self.reactive_double_immediate_submits += 1;
         }
-        let predictive_attempt_id = id
-            .filter(|frame_id| {
-                self.predictive_o1_lifecycle
-                    .contains_attempt(PredictiveO1AttemptId::new(*frame_id))
-            })
-            .map(|frame_id| frame_id.get());
+        let predictive_attempt_id_value = predictive_attempt_id.map(|attempt| attempt.get());
         self.pending = id;
+        self.pending_predictive_attempt = predictive_attempt_id;
         self.pending_physical_identity = physical_identity;
+        self.pending_physical_key = physical_key;
         self.pending_token = id.map(|_| token);
         if !ready_submit && self.active_queued_frame_id == id {
             self.active_queued_ns = None;
@@ -2700,7 +2743,7 @@ impl NativeFramePacing {
             "submit",
             vec![
                 frame_id_field(id),
-                PacingField::option_u64("predictive_attempt_id", predictive_attempt_id),
+                PacingField::option_u64("predictive_attempt_id", predictive_attempt_id_value),
                 PacingField::option_u64(
                     "output_frame_id",
                     physical_identity.map(|identity| identity.frame_id),
@@ -2767,13 +2810,12 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        let Some(frame_id) = self.active else {
+        let Some(identity) =
+            lifecycle_identity(self.active_predictive_attempt, self.active_physical_key)
+        else {
             return;
         };
-        let identity = lifecycle_identity(frame_id, self.active_physical_identity);
-        if self.predictive_o1_lifecycle.contains_identity(identity)
-            && self.note_predictive_stage(identity, PredictiveO1Stage::RenderReady)
-        {
+        if self.note_predictive_stage(identity, PredictiveO1Stage::RenderReady) {
             self.predictive_render_ahead_ready =
                 self.predictive_render_ahead_ready.saturating_add(1);
             self.render_ahead_successes = self.render_ahead_successes.saturating_add(1);
@@ -2856,7 +2898,7 @@ impl NativeFramePacing {
                     "output_frame_id",
                     match identity {
                         PredictiveO1LifecycleIdentity::Attempt(_) => 0,
-                        PredictiveO1LifecycleIdentity::Physical(identity) => identity.frame_id,
+                        PredictiveO1LifecycleIdentity::Physical(key) => key.frame_id,
                     },
                 ),
                 PacingField::str(
@@ -2887,9 +2929,7 @@ impl NativeFramePacing {
             return false;
         };
         self.terminalize_predictive_frame(
-            PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(
-                NativeOutputFrameId(frame_id),
-            )),
+            PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(frame_id)),
             terminal,
         )
     }
@@ -2901,7 +2941,7 @@ impl NativeFramePacing {
     ) -> bool {
         identity.is_some_and(|identity| {
             self.terminalize_predictive_frame(
-                PredictiveO1LifecycleIdentity::Physical(identity),
+                PredictiveO1LifecycleIdentity::Physical(OutputFrameKey::from(&identity)),
                 terminal,
             )
         })
@@ -2955,8 +2995,9 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        if let Some(frame_id) = self.active {
-            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+        if let Some(identity) =
+            lifecycle_identity(self.active_predictive_attempt, self.active_physical_key)
+        {
             self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::Failed);
         }
     }
@@ -2965,8 +3006,9 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        if let Some(frame_id) = self.active {
-            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+        if let Some(identity) =
+            lifecycle_identity(self.active_predictive_attempt, self.active_physical_key)
+        {
             self.terminalize_predictive_frame(
                 identity,
                 PredictiveReadyTerminal::OtherSafeAbandonment,
@@ -3016,13 +3058,26 @@ impl NativeFramePacing {
         let Some(frame_id) = self.worker_submission_frame(ready_submit) else {
             return Ok(None);
         };
-        let physical_identity = self.physical_identity_for_frame(frame_id);
+        let (physical_identity, physical_key, predictive_attempt_id) = if ready_submit {
+            (
+                self.ready_physical_identity,
+                self.ready_physical_key,
+                self.ready_predictive_attempt,
+            )
+        } else {
+            (
+                self.active_physical_identity,
+                self.active_physical_key,
+                self.active_predictive_attempt,
+            )
+        };
         self.worker_reservation = Some(WorkerPacingReservation {
             frame_id,
             physical_identity,
+            physical_key,
+            predictive_attempt_id,
         });
-        let identity = lifecycle_identity(frame_id, physical_identity);
-        if self.predictive_o1_lifecycle.contains_identity(identity) {
+        if let Some(identity) = lifecycle_identity(predictive_attempt_id, physical_key) {
             self.note_predictive_stage(identity, PredictiveO1Stage::WorkerQueued);
         }
         Ok(Some(frame_id.get()))
@@ -3033,20 +3088,17 @@ impl NativeFramePacing {
             .and_then(|reservation| reservation.physical_identity)
     }
 
+    pub(crate) fn worker_submission_output_key(&self) -> Option<OutputFrameKey> {
+        self.worker_reservation
+            .and_then(|reservation| reservation.physical_key)
+    }
+
     fn worker_submission_frame(&self, ready_submit: bool) -> Option<NativeOutputFrameId> {
         if ready_submit {
             self.ready
         } else {
             self.active
         }
-    }
-
-    fn physical_identity_for_frame(
-        &self,
-        frame_id: NativeOutputFrameId,
-    ) -> Option<OutputFrameIdentitySnapshot> {
-        self.predictive_o1_lifecycle
-            .physical_identity_for_attempt(PredictiveO1AttemptId::new(frame_id))
     }
 
     fn clear_active_worker_timing(&mut self, frame_id: Option<NativeOutputFrameId>) {
@@ -3078,11 +3130,15 @@ impl NativeFramePacing {
             self.worker_reservation = None;
             if self.active == Some(reservation.frame_id) {
                 self.active = None;
+                self.active_predictive_attempt = None;
                 self.active_physical_identity = None;
+                self.active_physical_key = None;
             }
             if self.ready == Some(reservation.frame_id) {
                 self.ready = None;
+                self.ready_predictive_attempt = None;
                 self.ready_physical_identity = None;
+                self.ready_physical_key = None;
             }
             self.clear_active_worker_timing(Some(reservation.frame_id));
             return Ok(Some(reservation.frame_id));
@@ -3114,6 +3170,12 @@ impl NativeFramePacing {
         if self.worker_submission_output_identity() != physical_identity {
             return false;
         }
+        let reservation_identity = lifecycle_identity(
+            self.worker_reservation
+                .and_then(|reservation| reservation.predictive_attempt_id),
+            self.worker_reservation
+                .and_then(|reservation| reservation.physical_key),
+        );
         let current = match self.take_worker_submission_frame(expected) {
             Ok(current) => current,
             Err(_) => return false,
@@ -3121,11 +3183,8 @@ impl NativeFramePacing {
         if current.is_none() {
             return false;
         }
-        if let Some(frame_id) = current {
-            self.terminalize_predictive_frame(
-                lifecycle_identity(frame_id, physical_identity),
-                PredictiveReadyTerminal::Failed,
-            );
+        if let Some(identity) = reservation_identity {
+            self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::Failed);
         }
         self.clear_ready_waiting_timing(current);
         self.log(
@@ -3156,10 +3215,18 @@ impl NativeFramePacing {
         if self.worker_submission_output_identity() != physical_identity {
             return Err("worker physical output identity does not match queued state");
         }
+        let predictive_attempt_id = self
+            .worker_reservation
+            .and_then(|reservation| reservation.predictive_attempt_id);
+        let physical_key = self
+            .worker_reservation
+            .and_then(|reservation| reservation.physical_key);
         let id = self.take_worker_submission_frame(expected)?;
         self.note_submit_frame(
             id,
             physical_identity,
+            predictive_attempt_id,
+            physical_key,
             token,
             now_ns,
             ready_submit,
@@ -3172,14 +3239,18 @@ impl NativeFramePacing {
         if self.pending_token != Some(token) {
             return false;
         }
-        if let Some(frame_id) = self.pending {
+        if let Some(identity) =
+            lifecycle_identity(self.pending_predictive_attempt, self.pending_physical_key)
+        {
             self.terminalize_predictive_frame(
-                lifecycle_identity(frame_id, self.pending_physical_identity),
+                identity,
                 PredictiveReadyTerminal::OtherSafeAbandonment,
             );
         }
         self.pending = None;
+        self.pending_predictive_attempt = None;
         self.pending_physical_identity = None;
+        self.pending_physical_key = None;
         self.pending_token = None;
         self.log(
             "worker_submit_abandoned",
@@ -3204,8 +3275,9 @@ impl NativeFramePacing {
         self.predictive_binding_advanced_intervals = self
             .predictive_binding_advanced_intervals
             .saturating_add(advanced_intervals);
-        if let Some(frame_id) = self.ready {
-            let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+        if let Some(identity) =
+            lifecycle_identity(self.ready_predictive_attempt, self.ready_physical_key)
+        {
             if self.predictive_o1_lifecycle.contains_identity(identity) {
                 self.note_predictive_stage(identity, PredictiveO1Stage::Bound);
             }
@@ -3221,8 +3293,9 @@ impl NativeFramePacing {
     pub(crate) fn note_predictive_unbound_ready(&mut self) {
         if self.enabled {
             self.predictive_unbound_ready = self.predictive_unbound_ready.saturating_add(1);
-            if let Some(frame_id) = self.ready {
-                let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+            if let Some(identity) =
+                lifecycle_identity(self.ready_predictive_attempt, self.ready_physical_key)
+            {
                 if self.predictive_o1_lifecycle.contains_identity(identity) {
                     self.note_predictive_stage(identity, PredictiveO1Stage::ReadyUnbound);
                 }
@@ -3243,8 +3316,9 @@ impl NativeFramePacing {
         self.predictive_binding_advanced_intervals = self
             .predictive_binding_advanced_intervals
             .saturating_add(advanced_intervals);
-        if let Some(frame_id) = self.ready {
-            let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+        if let Some(identity) =
+            lifecycle_identity(self.ready_predictive_attempt, self.ready_physical_key)
+        {
             if self.predictive_o1_lifecycle.contains_identity(identity) {
                 self.note_predictive_stage(identity, PredictiveO1Stage::Bound);
             }
@@ -3299,24 +3373,20 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        if let Some(frame_id) = self.active {
-            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
-            if !self
+        if let Some(identity) =
+            lifecycle_identity(self.active_predictive_attempt, self.active_physical_key)
+            && !self
                 .predictive_o1_lifecycle
                 .has_observed_stage(identity, PredictiveO1Stage::RenderReady)
-            {
-                self.note_render_ready();
-            }
+        {
+            self.note_render_ready();
         }
         let ready = self.active.take();
+        let predictive_attempt = self.active_predictive_attempt.take();
         let origin = std::mem::take(&mut self.active_origin);
         let physical_identity = self.active_physical_identity.take();
-        if origin == PreparedFrameOrigin::PredictiveO1
-            && ready.is_some_and(|frame_id| {
-                self.predictive_o1_lifecycle
-                    .contains_attempt(PredictiveO1AttemptId::new(frame_id))
-            })
-        {
+        let physical_key = self.active_physical_key.take();
+        if origin == PreparedFrameOrigin::PredictiveO1 && predictive_attempt.is_some() {
             self.predictive_ready_created = self.predictive_ready_created.saturating_add(1);
             self.ready_waiting_started_ns = None;
             self.ready_waiting_frame_id = None;
@@ -3327,7 +3397,9 @@ impl NativeFramePacing {
             self.ready_waiting_frame_id = ready;
         }
         self.ready = ready;
+        self.ready_predictive_attempt = predictive_attempt;
         self.ready_physical_identity = physical_identity;
+        self.ready_physical_key = physical_key;
         self.active_queued_frame_id = None;
         self.active_queued_ns = None;
         self.log(
@@ -3336,12 +3408,7 @@ impl NativeFramePacing {
                 frame_id_field(self.ready),
                 PacingField::option_u64(
                     "predictive_attempt_id",
-                    self.ready
-                        .filter(|frame_id| {
-                            self.predictive_o1_lifecycle
-                                .contains_attempt(PredictiveO1AttemptId::new(*frame_id))
-                        })
-                        .map(|frame_id| frame_id.get()),
+                    self.ready_predictive_attempt.map(|attempt| attempt.get()),
                 ),
                 PacingField::option_u64(
                     "output_frame_id",
@@ -3360,11 +3427,12 @@ impl NativeFramePacing {
         let Some(frame_id) = self.ready.take() else {
             return false;
         };
-        let physical_identity = self.ready_physical_identity.take();
-        self.terminalize_predictive_frame(
-            lifecycle_identity(frame_id, physical_identity),
-            PredictiveReadyTerminal::OvertakenReady,
-        );
+        let _physical_identity = self.ready_physical_identity.take();
+        let predictive_attempt = self.ready_predictive_attempt.take();
+        let physical_key = self.ready_physical_key.take();
+        if let Some(identity) = lifecycle_identity(predictive_attempt, physical_key) {
+            self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::OvertakenReady);
+        }
         self.clear_ready_waiting_timing(Some(frame_id));
         self.log(
             "ready_frame_abandoned",
@@ -3409,17 +3477,14 @@ impl NativeFramePacing {
         let commit_us = now_ns.saturating_sub(submitted_at_ns) / 1_000;
         self.commit_to_present.record(commit_us);
         let id = self.pending.take();
-        let pending_physical_identity = self.pending_physical_identity.take();
+        self.pending_physical_identity.take();
+        let pending_physical_key = self.pending_physical_key.take();
+        let pending_predictive_attempt = self.pending_predictive_attempt.take();
         self.pending_token = None;
-        let predictive_pending = id.is_some_and(|frame_id| {
-            self.predictive_o1_lifecycle
-                .contains_attempt(PredictiveO1AttemptId::new(frame_id))
-        });
-        let predictive_attempt_id = id
-            .filter(|_| predictive_pending)
-            .map(|frame_id| frame_id.get());
-        if predictive_pending && let Some(frame_id) = id {
-            let identity = match (pending_physical_identity, physical_identity) {
+        let predictive_attempt_id = pending_predictive_attempt.map(|attempt| attempt.get());
+        if let Some(attempt_id) = pending_predictive_attempt {
+            let actual_key = physical_identity.as_ref().map(OutputFrameKey::from);
+            let identity = match (pending_physical_key, actual_key) {
                 (Some(expected), Some(actual)) if expected == actual => {
                     Some(PredictiveO1LifecycleIdentity::Physical(actual))
                 }
@@ -3434,7 +3499,7 @@ impl NativeFramePacing {
                     self.log(
                         "predictive_physical_identity_mismatch",
                         vec![
-                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("predictive_attempt_id", attempt_id.get()),
                             PacingField::u64("expected_output_frame_id", expected.frame_id),
                             PacingField::u64("actual_output_frame_id", actual.frame_id),
                         ],
@@ -3452,7 +3517,7 @@ impl NativeFramePacing {
                     self.log(
                         "predictive_physical_identity_missing",
                         vec![
-                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("predictive_attempt_id", attempt_id.get()),
                             PacingField::u64("expected_output_frame_id", expected.frame_id),
                         ],
                     );
@@ -3463,21 +3528,19 @@ impl NativeFramePacing {
                         .predictive_o1_invalid_stage_transitions
                         .saturating_add(1);
                     self.terminalize_predictive_frame(
-                        PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(
-                            frame_id,
-                        )),
+                        PredictiveO1LifecycleIdentity::Attempt(attempt_id),
                         PredictiveReadyTerminal::InvalidStage,
                     );
                     self.log(
                         "predictive_physical_identity_unbound",
                         vec![
-                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("predictive_attempt_id", attempt_id.get()),
                             PacingField::u64("actual_output_frame_id", actual.frame_id),
                         ],
                     );
                     None
                 }
-                (None, None) => Some(lifecycle_identity(frame_id, None)),
+                (None, None) => Some(PredictiveO1LifecycleIdentity::Attempt(attempt_id)),
             };
             if let Some(identity) = identity
                 && self.note_predictive_stage(identity, PredictiveO1Stage::Presented)

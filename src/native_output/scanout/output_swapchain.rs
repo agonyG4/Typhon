@@ -300,6 +300,50 @@ pub(crate) struct OutputFrameIdentitySnapshot {
     pub(crate) target: Option<PresentationTarget>,
 }
 
+/// Immutable identity of one physical output frame.
+///
+/// Presentation state, including the deferred O1 target, is deliberately
+/// excluded: it may change while the same physical frame remains owned by
+/// the output pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OutputFrameKey {
+    pub(crate) frame_id: u64,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) slot: OutputSlotId,
+    pub(crate) framebuffer_id: FramebufferId,
+    pub(crate) render_generation: u64,
+    pub(crate) pool_generation: u64,
+}
+
+impl From<&OutputFrameIdentitySnapshot> for OutputFrameKey {
+    fn from(snapshot: &OutputFrameIdentitySnapshot) -> Self {
+        Self {
+            frame_id: snapshot.frame_id,
+            protocol_batch_id: snapshot.protocol_batch_id,
+            transaction_id: snapshot.transaction_id,
+            slot: snapshot.slot,
+            framebuffer_id: snapshot.framebuffer_id,
+            render_generation: snapshot.render_generation,
+            pool_generation: snapshot.pool_generation,
+        }
+    }
+}
+
+impl From<&RenderedOutputFrame> for OutputFrameKey {
+    fn from(frame: &RenderedOutputFrame) -> Self {
+        Self {
+            frame_id: frame.id,
+            protocol_batch_id: frame.protocol_batch_id,
+            transaction_id: frame.transaction_id,
+            slot: frame.slot,
+            framebuffer_id: frame.framebuffer_id,
+            render_generation: frame.render_generation,
+            pool_generation: frame.pool_generation,
+        }
+    }
+}
+
 impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
     fn from(frame: &RenderedOutputFrame) -> Self {
         Self {
@@ -2853,6 +2897,54 @@ mod tests {
             swapchain
                 .commit_deferred_o1_binding(transaction_id, target, submit_window)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn deferred_o1_target_mutation_preserves_physical_frame_key() {
+        let predecessor_target = predictive_test_target(1, 6_060_606);
+        let (mut swapchain, predecessor_token) =
+            swapchain_with_submitted_target(predecessor_target);
+        let predecessor = swapchain
+            .deferred_o1_predecessor()
+            .expect("pending predecessor anchor");
+        let slot = swapchain
+            .acquire_render_slot()
+            .expect("deferred render slot");
+        swapchain
+            .finish_render_owned(test_deferred_frame(
+                &swapchain,
+                slot,
+                predictive_test_target(2, 12_121_212),
+                predecessor,
+            ))
+            .expect("deferred frame becomes ready");
+
+        let before_state = swapchain.ready_identity().expect("deferred ready state");
+        let before_key = OutputFrameKey::from(&before_state);
+        complete_physical_predecessor(
+            &mut swapchain,
+            predecessor_token,
+            PrimaryRefreshClaim {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(12_121_212),
+                clock_generation: 1,
+            },
+        );
+        let (transaction_id, target, submit_window, _) = swapchain
+            .deferred_o1_binding_candidate(1, now(12_200_000))
+            .expect("binding candidate lookup")
+            .expect("deferred frame should bind");
+        swapchain
+            .commit_deferred_o1_binding(transaction_id, target, submit_window)
+            .expect("deferred frame binds");
+
+        let after_state = swapchain.ready_identity().expect("bound ready state");
+        assert_ne!(before_state, after_state);
+        assert_eq!(before_key, OutputFrameKey::from(&after_state));
+        assert_eq!(
+            before_key,
+            OutputFrameKey::from(swapchain.ready.as_ref().expect("bound ready frame"))
         );
     }
 

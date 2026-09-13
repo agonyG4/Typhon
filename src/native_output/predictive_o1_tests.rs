@@ -1,7 +1,11 @@
 use super::*;
 use crate::native_output::OutputTransactionId;
+use crate::native_output::scanout::OutputFrameKey;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::FramebufferId;
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PrimaryRefreshClaim,
+};
 use std::num::NonZeroU64;
 
 fn physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
@@ -131,7 +135,7 @@ fn predictive_pageflip_uses_physical_identity_when_logical_ids_diverge() {
     assert_eq!(
         pacing
             .predictive_o1_lifecycle
-            .physical_identity_for_attempt(PredictiveO1AttemptId::new(successor_attempt)),
+            .physical_identity_for_attempt(PredictiveO1AttemptId::new(successor_attempt.get())),
         Some(successor)
     );
 
@@ -153,6 +157,10 @@ fn predictive_worker_submission_and_pageflip_share_one_physical_identity() {
         .expect("reserve physical predictive frame")
         .expect("predictive attempt ID");
     assert_eq!(pacing.worker_submission_output_identity(), Some(physical));
+    assert_eq!(
+        pacing.worker_submission_output_key(),
+        Some(OutputFrameKey::from(&physical))
+    );
 
     pacing
         .note_worker_submit_exact(
@@ -166,10 +174,97 @@ fn predictive_worker_submission_and_pageflip_share_one_physical_identity() {
         .expect("worker submission should consume the exact physical identity");
     pacing.note_pageflip_exact(Some(physical), 4, 3, 41, 6_060);
 
-    assert_eq!(reserved, attempt.get());
+    assert_ne!(reserved, physical.frame_id);
+    assert_ne!(attempt.get(), physical.frame_id);
     assert_eq!(pacing.predictive_o1_presented, 1);
     assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
     assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+}
+
+#[test]
+fn deferred_target_mutation_does_not_change_physical_lifecycle_identity() {
+    let mut pacing = NativeFramePacing::from_env();
+    pacing.enabled = true;
+    let physical = physical_identity(5_677);
+    let attempt = predictive_ready_frame(&mut pacing, physical, false);
+    pacing.note_submit(41, 2, true, NativeOutputPacingMode::PredictiveTriple);
+
+    let mut completed = physical;
+    let target_time = MonotonicTimestampNs::new(12_121_212);
+    completed.target = Some(PresentationTarget {
+        sequence: 2,
+        presentation_time: target_time,
+        submit_not_before: target_time,
+        render_start_deadline: target_time,
+        refresh_interval: std::time::Duration::from_nanos(6_060_606),
+        reason:
+            oblivion_one::native::presentation_deadline::PresentationTargetReason::PredictedPressure,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: PrimaryRefreshClaim {
+            sequence: 2,
+            presentation_time: target_time,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    });
+
+    assert_ne!(physical, completed);
+    assert_eq!(
+        OutputFrameKey::from(&physical),
+        OutputFrameKey::from(&completed)
+    );
+    pacing.note_pageflip_exact(Some(completed), 3, 2, 41, 6_060);
+
+    assert_eq!(attempt.get(), 1);
+    assert_eq!(pacing.predictive_o1_presented, 1);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
+}
+
+#[test]
+fn normal_predecessor_pacing_id_cannot_touch_predictive_successor() {
+    let mut pacing = NativeFramePacing::from_env();
+    pacing.enabled = true;
+    pacing.ids = NativeOutputFrameIdSequence::new(5_615);
+    pacing.predictive_o1_attempt_ids = PredictiveO1AttemptIdSequence::new(9_001);
+
+    let successor = physical_identity(5_520);
+    pacing.queue_visual(1, successor.render_generation);
+    pacing.note_render_started(NativeOutputPacingMode::PredictiveTriple, true);
+    let attempt = pacing
+        .active_predictive_attempt
+        .expect("predictive attempt");
+    pacing
+        .bind_predictive_o1(successor)
+        .expect("bind successor");
+    pacing.note_render_ready();
+    pacing.note_ready_frame(2, true);
+
+    // Model the runtime overlap: the physical predecessor is represented by
+    // a normal pacing ID which numerically matches the old attempt namespace.
+    // Its ownership tag is intentionally absent.
+    assert_eq!(pacing.ready, Some(NativeOutputFrameId(5_615)));
+    pacing.pending = Some(NativeOutputFrameId(5_615));
+    pacing.pending_physical_identity = Some(physical_identity(5_615));
+    pacing.pending_physical_key = Some(OutputFrameKey::from(
+        &pacing.pending_physical_identity.expect("predecessor state"),
+    ));
+    pacing.pending_predictive_attempt = None;
+    pacing.pending_token = Some(41);
+
+    pacing.note_pageflip_exact(Some(physical_identity(5_615)), 3, 2, 41, 6_060);
+
+    assert_ne!(attempt.get(), 5_615);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    assert_eq!(
+        pacing
+            .predictive_o1_lifecycle
+            .physical_identity_for_attempt(attempt),
+        Some(successor)
+    );
 }
 
 #[test]
@@ -190,7 +285,7 @@ fn predecessor_pageflip_cannot_terminalize_a_predictive_successor() {
         pacing
             .predictive_o1_lifecycle
             .physical_identity_for_attempt(PredictiveO1AttemptId::new(
-                pacing.ready.expect("successor remains ready")
+                pacing.ready.expect("successor remains ready").get()
             )),
         Some(successor)
     );
@@ -302,7 +397,7 @@ fn mixed_prephysical_and_physical_stress_reconciles_without_capacity_growth() {
     let mut pacing = NativeFramePacing::from_env();
     pacing.enabled = true;
 
-    for iteration in 0..1_000_u64 {
+    for iteration in 0..10_000_u64 {
         let physical = physical_identity(20_000 + iteration * 3);
         pacing.queue_visual(iteration + 1, iteration + 1);
         pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
@@ -359,7 +454,7 @@ fn long_predictive_physical_identity_stress_reconciles_without_capacity_growth()
     let mut pacing = NativeFramePacing::from_env();
     pacing.enabled = true;
 
-    for sequence in 0..1_000_u64 {
+    for sequence in 0..10_000_u64 {
         let physical = physical_identity(50_000 + sequence * 7);
         predictive_ready_frame(&mut pacing, physical, false);
         pacing.note_submit(
@@ -377,8 +472,8 @@ fn long_predictive_physical_identity_stress_reconciles_without_capacity_growth()
         );
     }
 
-    assert_eq!(pacing.predictive_o1_created, 1_000);
-    assert_eq!(pacing.predictive_o1_presented, 1_000);
+    assert_eq!(pacing.predictive_o1_created, 10_000);
+    assert_eq!(pacing.predictive_o1_presented, 10_000);
     assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
     assert!(pacing.predictive_o1_lifecycle.peak_entries <= PREDICTIVE_O1_LIFECYCLE_CAPACITY as u64);
     assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
