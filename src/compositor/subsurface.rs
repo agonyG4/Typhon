@@ -1256,6 +1256,13 @@ struct SubsurfaceRoleState {
     pending_position: Option<(i32, i32)>,
 }
 
+#[derive(Debug)]
+pub(super) struct DetachedSubsurfaceRole {
+    pub(super) relationship: CapturedSubsurfaceRelationship,
+    pub(super) client_id: Option<ClientId>,
+    pub(super) cached_commits: Vec<CachedSubsurfaceCommit>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct SubsurfaceTransactionState {
     roles: HashMap<u32, SubsurfaceRoleState>,
@@ -1316,9 +1323,12 @@ impl SubsurfaceTransactionState {
         true
     }
 
-    pub(super) fn remove_role(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
-        let Some(role) = self.roles.remove(&surface_id) else {
-            return Vec::new();
+    pub(super) fn detach_role(&mut self, surface_id: u32) -> Option<DetachedSubsurfaceRole> {
+        let role = self.roles.remove(&surface_id)?;
+        let relationship = CapturedSubsurfaceRelationship {
+            surface_id,
+            parent_id: role.parent_id,
+            relationship_id: role.relationship_id,
         };
         let client_id = role.client_id.clone();
         let cached_commits = role.cached_commits.into_iter().collect::<Vec<_>>();
@@ -1335,7 +1345,18 @@ impl SubsurfaceTransactionState {
             0,
         );
         debug_assert!(self.debug_accounting_is_consistent());
-        cached_commits
+        Some(DetachedSubsurfaceRole {
+            relationship,
+            client_id,
+            cached_commits,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_role(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
+        self.detach_role(surface_id)
+            .map(|detached| detached.cached_commits)
+            .unwrap_or_default()
     }
 
     pub(super) fn remove_subtree(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
@@ -1441,6 +1462,53 @@ impl SubsurfaceTransactionState {
             role.parent_id == parent_id
                 && role.relationship_phase == SubsurfaceRelationshipPhase::Applied
         })
+    }
+
+    pub(super) fn is_in_detached_subtree(&self, surface_id: u32, detached_surface_id: u32) -> bool {
+        let mut current = surface_id;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if current == detached_surface_id {
+                return true;
+            }
+            if !visited.insert(current) {
+                return false;
+            }
+            let Some(role) = self.roles.get(&current) else {
+                return false;
+            };
+            current = role.parent_id;
+        }
+    }
+
+    pub(super) fn component_root_after_detach(
+        &self,
+        surface_id: u32,
+        detached_surface_id: u32,
+    ) -> u32 {
+        if !self.is_in_detached_subtree(surface_id, detached_surface_id) {
+            return surface_id;
+        }
+        let mut current = surface_id;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if current == detached_surface_id {
+                return detached_surface_id;
+            }
+            if !visited.insert(current) {
+                return current;
+            }
+            if !self.is_effectively_synchronized(current) {
+                return current;
+            }
+            let Some(role) = self.roles.get(&current) else {
+                return current;
+            };
+            if role.parent_id == detached_surface_id {
+                return detached_surface_id;
+            }
+            current = role.parent_id;
+        }
     }
 
     pub(super) fn take_pending_relationship_activations_for_parent(
@@ -1870,7 +1938,10 @@ impl SubsurfaceTransactionState {
         commits
     }
 
-    fn take_cached_commits_for_surface(&mut self, surface_id: u32) -> Vec<CachedSubsurfaceCommit> {
+    pub(super) fn take_cached_commits_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) -> Vec<CachedSubsurfaceCommit> {
         let (client_id, old_entries, old_obligations, commits) = {
             let Some(role) = self.roles.get_mut(&surface_id) else {
                 return Vec::new();
@@ -2090,6 +2161,25 @@ mod tests {
         assert!(state.is_effectively_synchronized(3));
         assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
         assert!(!state.is_effectively_synchronized(3));
+    }
+
+    #[test]
+    fn detached_component_roots_follow_post_detach_effective_sync() {
+        let mut state = SubsurfaceTransactionState::default();
+        assert!(state.register(2, 1));
+        assert!(state.register(3, 2));
+        assert!(state.register(4, 3));
+        assert!(state.set_mode(4, SubsurfaceSyncMode::Desynchronized));
+        assert!(state.detach_role(2).is_some());
+
+        assert_eq!(state.component_root_after_detach(2, 2), 2);
+        assert_eq!(state.component_root_after_detach(3, 2), 2);
+        assert_eq!(state.component_root_after_detach(4, 2), 2);
+
+        assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
+        assert!(state.set_mode(4, SubsurfaceSyncMode::Synchronized));
+        assert_eq!(state.component_root_after_detach(3, 2), 3);
+        assert_eq!(state.component_root_after_detach(4, 2), 3);
     }
 
     #[test]

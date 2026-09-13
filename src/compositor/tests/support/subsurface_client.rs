@@ -465,6 +465,499 @@ pub(in crate::compositor::tests) fn capture_mapped_subsurface_unmap_remap(
     })
 }
 
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DestroyedSubsurfaceRecreateSnapshots {
+    pub(in crate::compositor::tests) parent_id: u32,
+    pub(in crate::compositor::tests) before_destroy: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_destroy: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_recreate: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) parent_stack_after_destroy: SubsurfaceStackStateSnapshot,
+}
+
+pub(in crate::compositor::tests) fn capture_destroyed_subsurface_recreate(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DestroyedSubsurfaceRecreateSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_position(2, 3);
+    child_subsurface.set_desync();
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let parent_id = parent.id().protocol_id();
+    let child_id = child.id().protocol_id();
+    let capture_tree = |commands: &Sender<ServerCommand>| SubsurfaceTreeContentSnapshots {
+        parent: capture_xdg_role_snapshot(commands, parent_id),
+        child: capture_xdg_role_snapshot(commands, child_id),
+        grandchild: capture_xdg_role_snapshot(commands, child_id),
+    };
+
+    let before_destroy = capture_tree(commands);
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_destroy = capture_tree(commands);
+    let parent_stack_after_destroy =
+        capture_subsurface_stack_state(commands, before_destroy.parent.surface_id);
+
+    let recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    recreated.set_desync();
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_recreate = capture_tree(commands);
+
+    Ok(DestroyedSubsurfaceRecreateSnapshots {
+        parent_id,
+        before_destroy,
+        after_destroy,
+        after_recreate,
+        parent_stack_after_destroy,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DestroyedDmabufSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) before_destroy: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_destroy: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_dormant_replacement: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_recreate: SurfaceBufferOwnershipSnapshot,
+}
+
+pub(in crate::compositor::tests) fn capture_destroyed_dmabuf_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DestroyedDmabufSubsurfaceSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_desync();
+    let first_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff11_2233)?;
+    child.attach(Some(&first_buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child_id = child.id().protocol_id();
+    let before_destroy = capture_surface_buffer_ownership(commands, child_id);
+
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_destroy = capture_surface_buffer_ownership(commands, child_id);
+
+    let second_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff44_5566)?;
+    child.attach(Some(&second_buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_dormant_replacement = capture_surface_buffer_ownership(commands, child_id);
+
+    let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_recreate = capture_surface_buffer_ownership(commands, child_id);
+
+    Ok(DestroyedDmabufSubsurfaceSnapshots {
+        before_destroy,
+        after_destroy,
+        after_dormant_replacement,
+        after_recreate,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DestroyedCachedSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) before_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_dormant_commit: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_recreate: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_recreate_renderables: Vec<RenderableSurfaceSnapshot>,
+}
+
+pub(in crate::compositor::tests) fn capture_destroyed_cached_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DestroyedCachedSubsurfaceSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child_id = child.id().protocol_id();
+    let before_destroy = capture_xdg_role_snapshot(commands, child_id);
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_destroy = capture_xdg_role_snapshot(commands, child_id);
+
+    commit_test_buffered_surface(&child, &shm, &qh, 17, 11)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_dormant_commit = capture_xdg_role_snapshot(commands, child_id);
+
+    let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_recreate = capture_xdg_role_snapshot(commands, child_id);
+    let after_recreate_renderables = capture_renderable_surface_snapshot(commands);
+
+    Ok(DestroyedCachedSubsurfaceSnapshots {
+        before_destroy,
+        after_destroy,
+        after_dormant_commit,
+        after_recreate,
+        after_recreate_renderables,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DetachedLatchedSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) parent: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) child_after_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) child_after_parent_release: XdgRoleSnapshot,
+}
+
+pub(in crate::compositor::tests) fn capture_detached_latched_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DetachedLatchedSubsurfaceSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let timing: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+
+    let timer = timing.get_timer(&parent, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic)?;
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let parent_id = parent.id().protocol_id();
+    let child_id = child.id().protocol_id();
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let child_after_destroy = capture_xdg_role_snapshot(commands, child_id);
+    let parent_after_destroy = capture_xdg_role_snapshot(commands, parent_id);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let child_after_parent_release = capture_xdg_role_snapshot(commands, child_id);
+
+    Ok(DetachedLatchedSubsurfaceSnapshots {
+        parent: parent_after_destroy,
+        child_after_destroy,
+        child_after_parent_release,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DetachedInheritedDesyncSnapshots {
+    pub(in crate::compositor::tests) child_after_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) grandchild_after_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) child_after_recreate: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) grandchild_after_recreate: XdgRoleSnapshot,
+}
+
+pub(in crate::compositor::tests) fn capture_detached_inherited_desync_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DetachedInheritedDesyncSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let grandchild = compositor.create_surface(&qh, ());
+    let grandchild_subsurface = subcompositor.get_subsurface(&grandchild, &child, &qh, ());
+    grandchild_subsurface.set_desync();
+    commit_test_buffered_surface(&grandchild, &shm, &qh, 3, 3)?;
+    child.commit();
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child_id = child.id().protocol_id();
+    let grandchild_id = grandchild.id().protocol_id();
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let child_after_destroy = capture_xdg_role_snapshot(commands, child_id);
+    let grandchild_after_destroy = capture_xdg_role_snapshot(commands, grandchild_id);
+
+    let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let child_after_recreate = capture_xdg_role_snapshot(commands, child_id);
+    let grandchild_after_recreate = capture_xdg_role_snapshot(commands, grandchild_id);
+
+    Ok(DetachedInheritedDesyncSnapshots {
+        child_after_destroy,
+        grandchild_after_destroy,
+        child_after_recreate,
+        grandchild_after_recreate,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DetachedSiblingTransactionSnapshots {
+    pub(in crate::compositor::tests) child_after_destroy: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) renderables_after_destroy: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) renderables_after_parent_release:
+        Vec<RenderableSurfaceSnapshot>,
+}
+
+pub(in crate::compositor::tests) fn capture_detached_sibling_transaction(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DetachedSiblingTransactionSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let timing: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let sibling = compositor.create_surface(&qh, ());
+    let _sibling_subsurface = subcompositor.get_subsurface(&sibling, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&sibling, &shm, &qh, 6, 6)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+    commit_test_buffered_surface(&sibling, &shm, &qh, 9, 9)?;
+    let timer = timing.get_timer(&parent, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic)?;
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child_id = child.id().protocol_id();
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let child_after_destroy = capture_xdg_role_snapshot(commands, child_id);
+    let renderables_after_destroy = capture_renderable_surface_snapshot(commands);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let renderables_after_parent_release = capture_renderable_surface_snapshot(commands);
+
+    Ok(DetachedSiblingTransactionSnapshots {
+        child_after_destroy,
+        renderables_after_destroy,
+        renderables_after_parent_release,
+    })
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DestroyedNestedSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) parent_id: u32,
+    pub(in crate::compositor::tests) child_id: u32,
+    pub(in crate::compositor::tests) grandchild_id: u32,
+    pub(in crate::compositor::tests) before_destroy: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_destroy: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_recreate: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) parent_stack_after_destroy: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) child_stack_before_destroy: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) child_stack_after_destroy: SubsurfaceStackStateSnapshot,
+}
+
+pub(in crate::compositor::tests) fn capture_destroyed_nested_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<DestroyedNestedSubsurfaceSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_position(2, 3);
+    child_subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let grandchild = compositor.create_surface(&qh, ());
+    let grandchild_subsurface = subcompositor.get_subsurface(&grandchild, &child, &qh, ());
+    grandchild_subsurface.set_position(4, 5);
+    grandchild_subsurface.set_desync();
+    commit_test_buffered_surface(&grandchild, &shm, &qh, 3, 3)?;
+    child.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let parent_id = parent.id().protocol_id();
+    let child_id = child.id().protocol_id();
+    let grandchild_id = grandchild.id().protocol_id();
+    let capture_tree = |commands: &Sender<ServerCommand>| SubsurfaceTreeContentSnapshots {
+        parent: capture_xdg_role_snapshot(commands, parent_id),
+        child: capture_xdg_role_snapshot(commands, child_id),
+        grandchild: capture_xdg_role_snapshot(commands, grandchild_id),
+    };
+
+    let before_destroy = capture_tree(commands);
+    let child_stack_before_destroy =
+        capture_subsurface_stack_state(commands, before_destroy.child.surface_id);
+    child_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_destroy = capture_tree(commands);
+    let parent_stack_after_destroy =
+        capture_subsurface_stack_state(commands, before_destroy.parent.surface_id);
+    let child_stack_after_destroy =
+        capture_subsurface_stack_state(commands, before_destroy.child.surface_id);
+
+    let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_recreate = capture_tree(commands);
+
+    Ok(DestroyedNestedSubsurfaceSnapshots {
+        parent_id,
+        child_id,
+        grandchild_id,
+        before_destroy,
+        after_destroy,
+        after_recreate,
+        parent_stack_after_destroy,
+        child_stack_before_destroy,
+        child_stack_after_destroy,
+    })
+}
+
 pub(in crate::compositor::tests) fn capture_inactive_descendant_across_parent_null(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

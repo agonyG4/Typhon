@@ -270,6 +270,23 @@ fn applied_subsurface_under_roleless_parent_never_reports_presented() {
 }
 
 #[test]
+fn dormant_subsurface_role_is_inactive_after_relationship_destroy() {
+    let mut state = CompositorState::default();
+    state.surface_role_lifecycles.insert(
+        7,
+        SurfaceRoleLifecycle {
+            permanent: Some(PermanentSurfaceRole::Subsurface),
+            live_instance: None,
+            xdg_association: false,
+        },
+    );
+
+    assert_eq!(state.surface_role(7), SurfaceRole::Unassigned);
+    assert!(state.subsurface_content_is_inactive(7));
+    assert!(!state.subsurface_can_map(7));
+}
+
+#[test]
 fn default_synchronized_child_is_invisible_until_parent_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -957,6 +974,345 @@ fn mapped_subsurface_tree_retains_current_content_across_parent_null_and_remap()
             .map(|surface| (surface.width, surface.height))
             .collect::<Vec<_>>(),
         vec![(20, 15), (6, 6), (3, 3)]
+    );
+}
+
+#[test]
+fn destroying_subsurface_retains_current_content_for_recreation() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_destroyed_subsurface_recreate(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.before_destroy.child.current_surface_buffer);
+    assert!(snapshots.before_destroy.child.renderable_surface);
+
+    let after_destroy = &snapshots.after_destroy;
+    assert_eq!(
+        after_destroy.child.permanent_role,
+        Some(PermanentSurfaceRole::Subsurface)
+    );
+    assert!(!after_destroy.child.renderable_surface);
+    assert!(after_destroy.child.current_surface_buffer);
+    assert_eq!(after_destroy.child.placement, None);
+    assert_eq!(snapshots.parent_stack_after_destroy.committed, None);
+
+    let after_recreate = &snapshots.after_recreate;
+    assert!(after_recreate.child.renderable_surface);
+    assert!(after_recreate.child.current_surface_buffer);
+    assert_eq!(
+        after_recreate.child.placement,
+        Some(SurfacePlacement::subsurface(
+            after_recreate.parent.surface_id,
+            0,
+            0,
+        ))
+    );
+}
+
+#[test]
+fn destroying_subsurface_retains_dmabuf_ownership_until_dormant_replacement() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_destroyed_dmabuf_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.before_destroy.current_surface_buffer);
+    assert!(snapshots.before_destroy.active_dmabuf);
+    assert_eq!(snapshots.before_destroy.pending_dmabuf_releases, 0);
+
+    assert!(snapshots.after_destroy.current_surface_buffer);
+    assert!(snapshots.after_destroy.active_dmabuf);
+    assert_eq!(snapshots.after_destroy.pending_dmabuf_releases, 0);
+
+    assert!(snapshots.after_dormant_replacement.current_surface_buffer);
+    assert!(snapshots.after_dormant_replacement.active_dmabuf);
+    assert_eq!(
+        snapshots.after_dormant_replacement.pending_dmabuf_releases,
+        1
+    );
+
+    assert!(snapshots.after_recreate.current_surface_buffer);
+    assert!(snapshots.after_recreate.active_dmabuf);
+    assert_eq!(snapshots.after_recreate.pending_dmabuf_releases, 1);
+}
+
+#[test]
+fn destroying_synchronized_subsurface_promotes_cached_content_for_recreation() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_destroyed_cached_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.before_destroy.renderable_surface);
+    assert!(snapshots.before_destroy.current_surface_buffer);
+    assert_eq!(
+        snapshots.before_destroy.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+
+    assert!(!snapshots.after_destroy.renderable_surface);
+    assert!(snapshots.after_destroy.current_surface_buffer);
+    assert_eq!(
+        snapshots.after_destroy.permanent_role,
+        Some(PermanentSurfaceRole::Subsurface)
+    );
+    assert_eq!(snapshots.after_destroy.subsurface_relationship_phase, None);
+
+    assert!(!snapshots.after_dormant_commit.renderable_surface);
+    assert!(snapshots.after_dormant_commit.current_surface_buffer);
+
+    assert!(snapshots.after_recreate.renderable_surface);
+    assert!(snapshots.after_recreate.current_surface_buffer);
+    assert_eq!(
+        (
+            snapshots.after_recreate.placement.unwrap().local_x,
+            snapshots.after_recreate.placement.unwrap().local_y
+        ),
+        (0, 0)
+    );
+    assert!(
+        snapshots
+            .after_recreate_renderables
+            .iter()
+            .any(|surface| (surface.width, surface.height) == (17, 11))
+    );
+}
+
+#[test]
+fn destroying_latched_subsurface_detaches_it_from_parent_timing() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_detached_latched_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.child_after_destroy.current_surface_buffer);
+    assert!(!snapshots.child_after_destroy.renderable_surface);
+    assert_eq!(
+        snapshots.child_after_destroy.subsurface_relationship_phase,
+        None
+    );
+    assert_eq!(
+        snapshots
+            .child_after_destroy
+            .pending_surface_tree_transactions,
+        0
+    );
+    assert!(snapshots.parent.pending_surface_tree_transactions >= 1);
+    assert!(snapshots.child_after_parent_release.current_surface_buffer);
+    assert!(!snapshots.child_after_parent_release.renderable_surface);
+}
+
+#[test]
+fn destroying_sync_ancestor_releases_inherited_desync_cache() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_detached_inherited_desync_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.child_after_destroy.current_surface_buffer);
+    assert!(!snapshots.child_after_destroy.renderable_surface);
+    assert!(snapshots.grandchild_after_destroy.current_surface_buffer);
+    assert!(!snapshots.grandchild_after_destroy.renderable_surface);
+    assert_eq!(
+        snapshots
+            .grandchild_after_destroy
+            .subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+
+    assert!(snapshots.child_after_recreate.renderable_surface);
+    assert!(snapshots.grandchild_after_recreate.renderable_surface);
+}
+
+#[test]
+fn destroying_subsurface_conserves_unrelated_delayed_sibling_work() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_detached_sibling_transaction(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.child_after_destroy.current_surface_buffer);
+    assert!(!snapshots.child_after_destroy.renderable_surface);
+    assert!(
+        snapshots
+            .renderables_after_destroy
+            .iter()
+            .any(|surface| (surface.width, surface.height) == (6, 6))
+    );
+    assert!(
+        !snapshots
+            .renderables_after_destroy
+            .iter()
+            .any(|surface| (surface.width, surface.height) == (9, 9))
+    );
+    assert!(
+        snapshots
+            .renderables_after_parent_release
+            .iter()
+            .any(|surface| (surface.width, surface.height) == (9, 9))
+    );
+}
+
+#[test]
+fn destroying_subsurface_preserves_child_acquire_constraint() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, 3..=3, ()).unwrap();
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let acquire_timeline_fd = acquire_timeline.export_timeline_fd().unwrap();
+    let release_timeline_fd = release_timeline.export_timeline_fd().unwrap();
+    let sync_surface = syncobj.get_surface(&child, &qh, ());
+    let sync_acquire_timeline = syncobj.import_timeline(acquire_timeline_fd.as_fd(), &qh, ());
+    let sync_release_timeline = syncobj.import_timeline(release_timeline_fd.as_fd(), &qh, ());
+    let child_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff11_2233).unwrap();
+    sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 1);
+    sync_surface.set_release_point(&sync_release_timeline, 0, 2);
+    child.attach(Some(&child_buffer), 0, 0);
+    child.damage_buffer(0, 0, 2, 2);
+    child.commit();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    wait_for_server_commands(&commands);
+
+    child_subsurface.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    wait_for_server_commands(&commands);
+    let blocked = capture_xdg_role_snapshot(&commands, child.id().protocol_id());
+    assert!(blocked.current_surface_buffer);
+    assert!(!blocked.renderable_surface);
+    assert_eq!(blocked.pending_surface_tree_transactions, 1);
+
+    acquire_timeline.signal_point(1).unwrap();
+    wait_for_server_commands(&commands);
+    let ready = capture_xdg_role_snapshot(&commands, child.id().protocol_id());
+    assert!(ready.current_surface_buffer);
+    assert!(!ready.renderable_surface);
+    assert_eq!(ready.pending_surface_tree_transactions, 0);
+
+    drop(sync_surface);
+    drop(sync_acquire_timeline);
+    drop(sync_release_timeline);
+    drop(syncobj);
+    drop(dmabuf);
+    drop(child_buffer);
+    drop(child_subsurface);
+    drop(child);
+    drop(parent);
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn destroying_subsurface_preserves_nested_relationships_and_current_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_destroyed_nested_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.before_destroy.child.renderable_surface);
+    assert!(snapshots.before_destroy.grandchild.renderable_surface);
+    assert_eq!(
+        snapshots.child_stack_before_destroy.committed,
+        Some(vec![
+            snapshots.before_destroy.child.surface_id,
+            snapshots.before_destroy.grandchild.surface_id,
+        ])
+    );
+
+    let after_destroy = &snapshots.after_destroy;
+    assert!(!after_destroy.child.renderable_surface);
+    assert!(!after_destroy.grandchild.renderable_surface);
+    assert!(after_destroy.child.current_surface_buffer);
+    assert!(after_destroy.grandchild.current_surface_buffer);
+    assert_eq!(after_destroy.child.placement, None);
+    assert_eq!(
+        after_destroy.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        snapshots.child_stack_after_destroy.committed,
+        Some(vec![
+            snapshots.before_destroy.child.surface_id,
+            snapshots.before_destroy.grandchild.surface_id,
+        ])
+    );
+    assert_eq!(snapshots.parent_stack_after_destroy.committed, None);
+
+    let after_recreate = &snapshots.after_recreate;
+    assert!(after_recreate.child.renderable_surface);
+    assert!(after_recreate.grandchild.renderable_surface);
+    assert!(after_recreate.child.current_surface_buffer);
+    assert!(after_recreate.grandchild.current_surface_buffer);
+    assert_eq!(
+        after_recreate.child.placement,
+        Some(SurfacePlacement::subsurface(
+            after_recreate.parent.surface_id,
+            0,
+            0,
+        ))
     );
 }
 

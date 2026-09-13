@@ -100,6 +100,14 @@ pub(in crate::compositor) enum TransactionOrdering {
     PacingProtected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum SurfaceTreeSubmissionKind {
+    /// A new client Content Update subject to normal admission bounds.
+    ClientAdmission,
+    /// Already-admitted work reclassified after a relationship detach.
+    InternalMigration,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct SurfacePublicationState {
     pub(in crate::compositor) latest_received: SurfaceCommitSequence,
@@ -578,7 +586,28 @@ mod tests {
                 ),
             ],
             publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
-            dependencies: Vec::new(),
+            dependencies: vec![
+                SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(8),
+                    commit_id: AcquireCommitId::for_tests(9),
+                    surface_id: 2,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
+                    buffer_id: 10,
+                    acquire: ExplicitSyncPoint::for_tests(11, 12),
+                    state: PendingAcquireState::Ready,
+                },
+                SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(13),
+                    commit_id: AcquireCommitId::for_tests(14),
+                    surface_id: 4,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
+                    buffer_id: 15,
+                    acquire: ExplicitSyncPoint::for_tests(16, 17),
+                    state: PendingAcquireState::Ready,
+                },
+            ],
             commit_timing_readiness: None,
             received_at: Instant::now(),
         };
@@ -619,5 +648,21 @@ mod tests {
             partitions[1].publication_lifetimes,
             SurfaceTreeNodeLifetimes::Synthetic
         ));
+        assert_eq!(
+            partitions[0]
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.surface_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(
+            partitions[1]
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.surface_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 }

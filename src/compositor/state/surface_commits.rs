@@ -1143,7 +1143,10 @@ impl CompositorState {
         }
     }
 
-    fn hide_renderable_surface_subtree(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn hide_renderable_surface_subtree(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
         let renderable_ids = self
             .renderable_surfaces
             .iter()
@@ -1824,7 +1827,7 @@ impl CompositorState {
                 }
             }
         };
-        if activated {
+        if activated && !self.subsurface_content_is_inactive(surface_id) {
             if let Some(surface_generation) = self
                 .surface_presentation_generations
                 .get(&surface_id)

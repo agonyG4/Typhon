@@ -144,7 +144,7 @@ pub(in crate::compositor) use surface_transactions::{
     PreparedSurfaceTreeTransactionPartition, ReleasedSurfaceTreeState, SurfacePublicationContext,
     SurfacePublicationDecision, SurfacePublicationSource, SurfacePublicationState,
     SurfaceTreeAcquireDependency, SurfaceTreeMergeStats, SurfaceTreeNodeLifetime,
-    SurfaceTreeNodeLifetimes, TransactionOrdering,
+    SurfaceTreeNodeLifetimes, SurfaceTreeSubmissionKind, TransactionOrdering,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
