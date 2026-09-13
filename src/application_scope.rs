@@ -240,22 +240,13 @@ where
     }
 }
 
-fn scope_unit_name(pid: u32, start_time: Option<u64>) -> String {
-    let identity = start_time
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let name = format!("app-typhon-{pid}-{identity}.scope");
+fn scope_unit_name(pid: u32, start_time: u64) -> Option<String> {
+    let name = format!("app-typhon-{pid}-{start_time}.scope");
     if name.len() <= MAX_UNIT_NAME_BYTES {
-        return name;
+        return Some(name);
     }
-    let identity = start_time
-        .map(|value| format!("{value:x}"))
-        .unwrap_or_else(|| "unknown".to_owned());
-    let compact = format!("app-typhon-{pid:x}-{identity}.scope");
-    if compact.len() <= MAX_UNIT_NAME_BYTES {
-        return compact;
-    }
-    "app-typhon-unknown.scope".to_owned()
+    let compact = format!("app-typhon-{pid:x}-{start_time:x}.scope");
+    (compact.len() <= MAX_UNIT_NAME_BYTES).then_some(compact)
 }
 
 fn parse_scope_process_start_time(contents: &str) -> Option<u64> {
@@ -271,6 +262,30 @@ fn current_process_start_time() -> Option<u64> {
     std::fs::read_to_string("/proc/self/stat")
         .ok()
         .and_then(|contents| parse_scope_process_start_time(&contents))
+}
+
+fn establish_application_scope<R, F>(
+    registrar: R,
+    pid: u32,
+    start_time: Option<u64>,
+    timeouts: ScopeSetupTimeouts,
+    migration_verified: F,
+) -> ScopeSetupOutcome
+where
+    R: ScopeRegistrar,
+    F: FnMut(&str) -> bool,
+{
+    let Some(start_time) = start_time else {
+        return ScopeSetupOutcome::Fallback {
+            reason: "process start time unavailable".to_owned(),
+        };
+    };
+    let Some(unit_name) = scope_unit_name(pid, start_time) else {
+        return ScopeSetupOutcome::Fallback {
+            reason: "process start time cannot produce a bounded scope name".to_owned(),
+        };
+    };
+    establish_scope(registrar, &unit_name, pid, timeouts, migration_verified)
 }
 
 fn wrap_application_argv(
@@ -404,6 +419,7 @@ pub fn poll_status() {
 }
 
 pub fn run_internal_scope_exec(args: &[String]) -> Result<Infallible, ScopeError> {
+    let helper_status = HelperStatusFd::from_env();
     let Some(delimiter) = args.iter().position(|arg| arg == "--") else {
         return Err(ScopeError::InvalidInvocation("missing -- delimiter"));
     };
@@ -412,21 +428,18 @@ pub fn run_internal_scope_exec(args: &[String]) -> Result<Infallible, ScopeError
         return Err(ScopeError::EmptyTarget);
     }
 
-    if ApplicationScopePolicy::from_env() != ApplicationScopePolicy::Off {
-        let pid = std::process::id();
-        let unit_name = scope_unit_name(pid, current_process_start_time());
-        let outcome = establish_scope(
-            UserSystemdRegistrar,
-            &unit_name,
-            pid,
-            ScopeSetupTimeouts::production(),
-            current_process_is_in_scope,
-        );
-        match outcome {
-            ScopeSetupOutcome::Scoped => report_helper_status("S"),
-            ScopeSetupOutcome::Fallback { reason } => {
-                report_helper_status(&format!("F:{reason}"));
-            }
+    let pid = std::process::id();
+    let outcome = establish_application_scope(
+        UserSystemdRegistrar,
+        pid,
+        current_process_start_time(),
+        ScopeSetupTimeouts::production(),
+        current_process_is_in_scope,
+    );
+    match outcome {
+        ScopeSetupOutcome::Scoped => helper_status.report("S"),
+        ScopeSetupOutcome::Fallback { reason } => {
+            helper_status.report(&format!("F:{reason}"));
         }
     }
 
@@ -499,28 +512,51 @@ async fn register_user_scope(unit_name: &str, pid: u32) -> zbus::Result<()> {
         .map(|_| ())
 }
 
-fn report_helper_status(status: &str) {
-    let Ok(fd) = env::var(STATUS_FD_ENV)
-        .ok()
-        .and_then(|value| value.parse::<RawFd>().ok())
-        .ok_or(())
-    else {
-        return;
-    };
-    let status = bounded_string(status.to_owned(), 192);
-    let bytes = status.as_bytes();
-    let mut written = 0;
-    while written < bytes.len() {
-        let result =
-            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
-        if result <= 0 {
-            break;
-        }
-        written += result as usize;
+struct HelperStatusFd {
+    fd: Option<OwnedFd>,
+}
+
+impl HelperStatusFd {
+    fn from_env() -> Self {
+        let fd = env::var(STATUS_FD_ENV)
+            .ok()
+            .and_then(|value| value.parse::<RawFd>().ok());
+        fd.and_then(Self::from_raw_fd).unwrap_or(Self { fd: None })
     }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags >= 0 {
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+
+    fn from_raw_fd(fd: RawFd) -> Option<Self> {
+        if fd < 0 {
+            return None;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return None;
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            let _ = unsafe { libc::close(fd) };
+            return None;
+        }
+        // SAFETY: F_GETFD succeeded, so fd is an open descriptor now owned by this helper.
+        Some(Self {
+            fd: Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+        })
+    }
+
+    fn report(&self, status: &str) {
+        let Some(fd) = self.fd.as_ref().map(AsRawFd::as_raw_fd) else {
+            return;
+        };
+        let status = bounded_string(status.to_owned(), 192);
+        let bytes = status.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            let result =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            if result <= 0 {
+                break;
+            }
+            written += result as usize;
+        }
     }
 }
 
@@ -629,6 +665,7 @@ fn bounded_string(value: String, limit: usize) -> String {
 mod tests {
     use super::*;
     use std::{
+        os::fd::IntoRawFd,
         path::Path,
         sync::{
             Arc,
@@ -662,6 +699,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct CountingRegistrar {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScopeRegistrar for CountingRegistrar {
+        fn register(&self, _unit_name: &str, _pid: u32) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn clear_cloexec(fd: RawFd) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
     }
 
     #[test]
@@ -906,7 +964,7 @@ mod tests {
 
     #[test]
     fn generated_scope_names_are_valid_and_bounded() {
-        let name = scope_unit_name(1234, Some(7));
+        let name = scope_unit_name(1234, 7).expect("scope name");
         assert!(name.ends_with(".scope"));
         assert!(name.len() <= MAX_UNIT_NAME_BYTES);
         assert!(
@@ -915,19 +973,18 @@ mod tests {
                     || matches!(character, '-' | '_' | '.'))
         );
 
-        assert!(scope_unit_name(u32::MAX, Some(u64::MAX)).len() <= MAX_UNIT_NAME_BYTES);
+        assert!(
+            scope_unit_name(u32::MAX, u64::MAX)
+                .expect("scope name")
+                .len()
+                <= MAX_UNIT_NAME_BYTES
+        );
     }
 
     #[test]
     fn scope_names_use_process_lifetime_identity() {
-        assert_ne!(
-            scope_unit_name(1234, Some(7)),
-            scope_unit_name(1234, Some(8))
-        );
-        assert_ne!(
-            scope_unit_name(1234, Some(7)),
-            scope_unit_name(1235, Some(7))
-        );
+        assert_ne!(scope_unit_name(1234, 7), scope_unit_name(1234, 8));
+        assert_ne!(scope_unit_name(1234, 7), scope_unit_name(1235, 7));
         assert_eq!(
             parse_scope_process_start_time(
                 "123 (application name) with ) punctuation) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21"
@@ -935,7 +992,60 @@ mod tests {
             .expect("start time"),
             19
         );
-        assert_eq!(scope_unit_name(1234, None), "app-typhon-1234-unknown.scope");
+        assert_eq!(
+            scope_unit_name(1234, 5678).expect("scope name"),
+            "app-typhon-1234-5678.scope"
+        );
+    }
+
+    #[test]
+    fn helper_scope_setup_attempts_registration_without_policy_recheck() {
+        let outcome = establish_application_scope(
+            SuccessfulRegistrar,
+            1234,
+            Some(5678),
+            ScopeSetupTimeouts::test(),
+            |_| true,
+        );
+        assert_eq!(outcome, ScopeSetupOutcome::Scoped);
+    }
+
+    #[test]
+    fn helper_status_fd_is_cloexec_before_scope_setup() {
+        let (reader, writer) = status_pipe().expect("status pipe");
+        let raw_fd = writer.into_raw_fd();
+        clear_cloexec(raw_fd);
+
+        let status = HelperStatusFd::from_raw_fd(raw_fd);
+        assert!(status.is_some());
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+
+        let status = status.expect("status fd");
+        status.report("S");
+        let mut buffer = [0_u8; 1];
+        assert_eq!(
+            unsafe { libc::read(reader.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) },
+            1
+        );
+        assert_eq!(&buffer, b"S");
+    }
+
+    #[test]
+    fn missing_process_start_time_falls_back_without_registration() {
+        let registrar = CountingRegistrar::default();
+        let calls = Arc::clone(&registrar.calls);
+        let outcome =
+            establish_application_scope(registrar, 1234, None, ScopeSetupTimeouts::test(), |_| {
+                true
+            });
+
+        assert!(matches!(
+            outcome,
+            ScopeSetupOutcome::Fallback { ref reason }
+                if reason.contains("process start time")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
