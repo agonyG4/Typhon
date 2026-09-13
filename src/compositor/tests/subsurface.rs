@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::subsurface::SubsurfaceRelationshipPhase;
 
 #[test]
 fn new_subsurface_pending_stack_uses_latched_baseline() {
@@ -160,6 +161,112 @@ fn gecko_pre_role_surface_waits_for_parent_commit_before_adoption() {
         .position(|surface| surface.surface_id == child_nodes[0].surface_id)
         .expect("child should be renderable");
     assert!(child_index > parent_index);
+}
+
+#[test]
+fn roleless_parent_current_content_does_not_map_applied_subsurface() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let RolelessParentSubsurfaceSnapshots {
+        after_parent_roleless_commit,
+        after_child_commit,
+        after_parent_relationship_commit,
+        child_after_parent_relationship_commit,
+    } = capture_roleless_parent_subsurface_mapping(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(after_parent_roleless_commit.current_surface_buffer);
+    assert_eq!(after_parent_roleless_commit.permanent_role, None);
+    assert!(!after_parent_roleless_commit.renderable_surface);
+    assert!(!after_parent_roleless_commit.subsurface_parent_is_mapped);
+
+    assert_eq!(
+        after_child_commit.permanent_role,
+        Some(PermanentSurfaceRole::Subsurface)
+    );
+    assert_eq!(
+        after_child_commit.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::PendingParentCommit)
+    );
+    assert!(after_child_commit.current_surface_buffer);
+    assert!(!after_child_commit.renderable_surface);
+    assert!(!after_child_commit.subsurface_can_map);
+    assert!(after_child_commit.subsurface_content_is_inactive);
+
+    assert_eq!(
+        after_parent_relationship_commit.subsurface_relationship_phase,
+        None
+    );
+    assert!(after_parent_relationship_commit.current_surface_buffer);
+    assert!(!after_parent_relationship_commit.renderable_surface);
+    assert!(!after_parent_relationship_commit.subsurface_parent_is_mapped);
+
+    assert_eq!(
+        child_after_parent_relationship_commit.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert!(child_after_parent_relationship_commit.current_surface_buffer);
+    assert!(!child_after_parent_relationship_commit.renderable_surface);
+    assert!(!child_after_parent_relationship_commit.subsurface_can_map);
+    assert!(child_after_parent_relationship_commit.subsurface_content_is_inactive);
+}
+
+#[test]
+fn roleless_parent_retains_latest_child_until_genuine_parent_mapping() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let RolelessParentMappingSnapshots {
+        after_child_relationship_commit,
+        after_child_replacement,
+        after_parent_becomes_mapped,
+    } = capture_roleless_parent_later_mapping(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        after_child_relationship_commit
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>(),
+        vec![(30, 20)]
+    );
+    assert_eq!(
+        after_child_replacement
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>(),
+        vec![(30, 20)]
+    );
+    assert_eq!(
+        after_parent_becomes_mapped
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>(),
+        vec![(30, 20), (20, 15), (13, 11)]
+    );
+    assert_eq!(
+        after_parent_becomes_mapped[2].parent_surface_id,
+        Some(after_parent_becomes_mapped[1].surface_id)
+    );
+}
+
+#[test]
+fn applied_subsurface_under_roleless_parent_never_reports_presented() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let state = capture_roleless_applied_subsurface_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
 }
 
 #[test]

@@ -245,6 +245,133 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
     })
 }
 
+pub(in crate::compositor::tests) fn capture_roleless_parent_subsurface_mapping(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RolelessParentSubsurfaceSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let parent_id = parent.id().protocol_id();
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_parent_roleless_commit = capture_xdg_role_snapshot(commands, parent_id);
+
+    let child = compositor.create_surface(&qh, ());
+    let child_id = child.id().protocol_id();
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_child_commit = capture_xdg_role_snapshot(commands, child_id);
+
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    Ok(RolelessParentSubsurfaceSnapshots {
+        after_parent_roleless_commit,
+        after_child_commit,
+        after_parent_relationship_commit: capture_xdg_role_snapshot(commands, parent_id),
+        child_after_parent_relationship_commit: capture_xdg_role_snapshot(commands, child_id),
+    })
+}
+
+pub(in crate::compositor::tests) fn capture_roleless_parent_later_mapping(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RolelessParentMappingSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (root, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 30, 20)?;
+    root.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commit_test_buffered_surface(&root, &shm, &qh, 30, 20)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_child_relationship_commit = capture_renderable_surface_snapshot(commands);
+
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 11)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_child_replacement = capture_renderable_surface_snapshot(commands);
+
+    let _parent_subsurface = subcompositor.get_subsurface(&parent, &root, &qh, ());
+    root.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_parent_becomes_mapped = capture_renderable_surface_snapshot(commands);
+
+    Ok(RolelessParentMappingSnapshots {
+        after_child_relationship_commit,
+        after_child_replacement,
+        after_parent_becomes_mapped,
+    })
+}
+
+pub(in crate::compositor::tests) fn capture_roleless_applied_subsurface_feedback(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let presentation: client_wp_presentation::WpPresentation = globals.bind(&qh, 1..=2, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let _feedback = presentation.feedback(&child, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 11)?;
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn capture_desynchronized_subsurface_before_parent_commit(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

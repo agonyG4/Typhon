@@ -70,12 +70,6 @@ impl CompositorState {
 
     pub(in crate::compositor) fn subsurface_parent_is_mapped(&self, parent_id: u32) -> bool {
         self.renderable_surface_index(parent_id).is_some()
-            // Roleless surfaces retain current content without a renderable
-            // parent node. Preserve the compositor's existing bootstrap model
-            // for their already-current subsurfaces while still requiring the
-            // relationship itself to be Applied.
-            || (matches!(self.surface_role(parent_id), SurfaceRole::Unassigned)
-                && self.current_surface_buffers.contains_key(&parent_id))
     }
 
     pub(in crate::compositor) fn subsurface_can_map(&self, surface_id: u32) -> bool {

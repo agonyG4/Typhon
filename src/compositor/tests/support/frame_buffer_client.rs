@@ -2635,15 +2635,21 @@ pub(in crate::compositor::tests) fn capture_root_commit_before_synchronized_chil
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
     let root = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&root, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
     let child = compositor.create_surface(&qh, ());
     let _subsurface = subcompositor.get_subsurface(&child, &root, &qh, ());
+    root.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
     commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
     commit_test_buffered_surface(&root, &shm, &qh, 20, 15)?;
     connection.flush()?;
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     commit_test_buffered_surface(&root, &shm, &qh, 30, 25)?;

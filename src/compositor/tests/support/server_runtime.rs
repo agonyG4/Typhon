@@ -1183,6 +1183,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .compliance_metrics
                                 .xdg_reassociation_blocked_stale_unpublished_work,
+                            subsurface_relationship_phase: server
+                                .state
+                                .subsurface_transactions
+                                .relationship_phase(tracked_surface_id),
+                            subsurface_parent_is_mapped: server
+                                .state
+                                .subsurface_parent_is_mapped(tracked_surface_id),
+                            subsurface_can_map: server.state.subsurface_can_map(tracked_surface_id),
+                            subsurface_content_is_inactive: server
+                                .state
+                                .subsurface_content_is_inactive(tracked_surface_id),
                         });
                     }
                     ServerCommand::CapturePendingSurfaceTreeTransactions(reply) => {

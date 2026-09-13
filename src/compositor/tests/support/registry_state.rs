@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+use crate::compositor::subsurface::SubsurfaceRelationshipPhase;
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1 as client_ext_background_effect_manager_v1;
 use wayland_protocols::wp::content_type::v1::client::{
     wp_content_type_manager_v1 as client_wp_content_type_manager_v1,
@@ -268,6 +269,27 @@ pub(in crate::compositor::tests) struct XdgRoleSnapshot {
     pub(in crate::compositor::tests) role_destroyed_pending_trees_retired: u64,
     pub(in crate::compositor::tests) role_destroyed_acquire_watches_cancelled: u64,
     pub(in crate::compositor::tests) reassociation_blocked_stale_work: u64,
+    pub(in crate::compositor::tests) subsurface_relationship_phase:
+        Option<SubsurfaceRelationshipPhase>,
+    pub(in crate::compositor::tests) subsurface_parent_is_mapped: bool,
+    pub(in crate::compositor::tests) subsurface_can_map: bool,
+    pub(in crate::compositor::tests) subsurface_content_is_inactive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct RolelessParentSubsurfaceSnapshots {
+    pub(in crate::compositor::tests) after_parent_roleless_commit: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_child_commit: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) after_parent_relationship_commit: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) child_after_parent_relationship_commit: XdgRoleSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct RolelessParentMappingSnapshots {
+    pub(in crate::compositor::tests) after_child_relationship_commit:
+        Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_child_replacement: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_parent_becomes_mapped: Vec<RenderableSurfaceSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
