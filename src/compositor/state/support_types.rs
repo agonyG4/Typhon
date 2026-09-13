@@ -37,7 +37,9 @@ impl Default for CursorVisibilityState {
 }
 
 impl CursorVisibilityState {
-    pub(in crate::compositor) fn desired_visible(&self) -> bool {
+    /// Visibility requested from the backend for the compositor theme cursor.
+    /// Client-owned cursor presentation is intentionally represented as false.
+    pub(in crate::compositor) fn theme_fallback_visible(&self) -> bool {
         self.client_hidden_pointer.is_none()
             && self.client_cursor_pointer.is_none()
             && self.lock_hidden_constraint_id.is_none()

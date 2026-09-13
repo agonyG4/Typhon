@@ -21,7 +21,7 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) atomic_cursor: Option<&'a NativeAtomicCursor>,
     pub(super) cursor_render_mode: NativeCursorRenderMode,
     pub(super) cursor_visible: bool,
-    pub(super) client_cursor_active: bool,
+    pub(super) client_surface_content_active: bool,
     pub(super) client_cursor_hardware_usable: bool,
     pub(super) legacy_cursor_available: bool,
     pub(super) page_flip_pending: bool,
@@ -71,7 +71,7 @@ pub(super) fn inspect_direct_presentation(
         if let Some(decision) = inputs.plane_decision {
             decision.direct_scanout_compatible
         } else {
-            if inputs.client_cursor_active {
+            if inputs.client_surface_content_active {
                 !inputs.cursor_visible || inputs.client_cursor_hardware_usable
             } else {
                 inputs.atomic_cursor.as_ref().is_some_and(|cursor| {
@@ -119,7 +119,7 @@ pub(super) fn inspect_direct_presentation(
     *inputs.last_direct_candidate_key = direct_candidate_key;
     let primary_visual_work_pending =
         inputs.scene_changed || inputs.pending_frame_work || inputs.primary_redraw_requested;
-    let composition_required = (inputs.client_cursor_active
+    let composition_required = (inputs.client_surface_content_active
         && !inputs.client_cursor_hardware_usable)
         || (inputs.cursor_render_mode.is_software() && inputs.cursor_visible)
         || (inputs.cursor_visible

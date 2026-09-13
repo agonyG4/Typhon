@@ -566,6 +566,13 @@ impl CompositorState {
             .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
     }
 
+    pub(in crate::compositor) fn client_cursor_surface_active(&self) -> bool {
+        self.focused_client_cursor
+            .as_ref()
+            .and_then(ClientCursorChoice::surface)
+            .is_some()
+    }
+
     pub(in crate::compositor) fn client_cursor_explicitly_hidden(&self) -> bool {
         self.cursor_visibility.client_hidden_pointer.is_some()
             || self

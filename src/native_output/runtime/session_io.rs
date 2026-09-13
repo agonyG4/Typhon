@@ -352,14 +352,12 @@ impl NativeSessionIo for NativeRuntime {
         } else {
             None
         };
+        let effective_cursor_visible =
+            resolve_native_cursor_for_server(&self.server, &self.input_state).visible;
         let cursor_kms_state = self.atomic_cursor.as_ref().and_then(|cursor| {
-            effective_atomic_cursor_state(
-                cursor,
-                self.cursor_render_mode,
-                self.input_state.cursor_visible(),
-            )
-            .kms_state()
-            .cloned()
+            effective_atomic_cursor_state(cursor, self.cursor_render_mode, effective_cursor_visible)
+                .kms_state()
+                .cloned()
         });
         self.kms_backend
             .recover_with_cursor(framebuffer, cursor_kms_state.as_ref())?;
@@ -582,7 +580,11 @@ impl NativeSessionIo for NativeRuntime {
         ) {
             Ok(mut cursor) => {
                 let (x, y) = self.input_state.cursor_position();
-                cursor.enable().and_then(|()| cursor.move_to(x, y))?;
+                let resolved_cursor =
+                    resolve_native_cursor_for_server(&self.server, &self.input_state);
+                if resolved_cursor.visible && resolved_cursor.source.legacy_hardware_eligible() {
+                    cursor.enable().and_then(|()| cursor.move_to(x, y))?;
+                }
                 self.legacy_cursor = Some(cursor);
                 self.cursor_render_mode = NativeCursorRenderMode::Hardware;
             }

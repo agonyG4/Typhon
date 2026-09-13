@@ -1345,12 +1345,13 @@ impl NativeFrameRenderer {
             .set_decoration_instances(&resolved_scene.decorations);
         self.scene_renderer
             .set_popup_surface_ids(&resolved_scene.popup_surface_ids);
+        let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
         self.render_frame(NativeFrameRequest {
             width,
             height,
             surfaces: resolved_scene.surfaces.as_ref(),
             external_overlay_surface_ids: resolved_scene.external_overlay_surface_ids.clone(),
-            visual_state: input_state.desktop_visual_state(cursor_mode),
+            visual_state: input_state.desktop_visual_state(cursor_mode, cursor_visible),
             render_generation: resolved_scene.render_generation,
             client_cursor: cursor_mode
                 .is_software()
@@ -1409,6 +1410,7 @@ impl NativeFrameRenderer {
         // Keeping the lookup at this synchronous request boundary prevents a
         // deferred renderer from pairing frozen surfaces with newer journal
         // metadata; such a renderer would need an explicit snapshot identity.
+        let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
         let surface_resource_sync_states = server.surface_resource_sync_states(
             resolved_scene
                 .surfaces
@@ -1437,7 +1439,7 @@ impl NativeFrameRenderer {
             external_overlay_surface_ids: &resolved_scene.external_overlay_surface_ids,
             popup_surface_ids: &resolved_scene.popup_surface_ids,
             content_generation: native_scene_content_generation(resolved_scene.render_generation),
-            visual_state: input_state.desktop_visual_state(cursor_mode),
+            visual_state: input_state.desktop_visual_state(cursor_mode, cursor_visible),
             output_scale: 1.0,
             decoration_instances: &resolved_scene.decorations,
             presentation_geometry_signature: resolved_scene.presentation.geometry_signature(),

@@ -126,7 +126,14 @@ impl NativeInputState {
         true
     }
 
+    /// Raw backend/theme-fallback visibility. Presentation must resolve the
+    /// effective cursor source before treating this as final visibility.
     pub(crate) const fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    /// The backend/theme visibility signal, named for its non-authoritative role.
+    pub(crate) const fn theme_fallback_visible(&self) -> bool {
         self.cursor_visible
     }
 
@@ -144,9 +151,10 @@ impl NativeInputState {
     pub(crate) fn desktop_visual_state(
         &self,
         cursor_mode: NativeCursorRenderMode,
+        cursor_visible: bool,
     ) -> DesktopVisualState {
         match cursor_mode {
-            NativeCursorRenderMode::Software if self.cursor_visible => {
+            NativeCursorRenderMode::Software if cursor_visible => {
                 let (x, y) = self.cursor_position();
                 DesktopVisualState::with_cursor(x, y)
             }

@@ -1033,6 +1033,8 @@ impl NativeRuntime {
         });
         let mut frame_renderer = NativeFrameRenderer::with_cursor_image(cursor_image.clone());
         let input_state = NativeInputState::new(target.width, target.height);
+        let initial_cursor_visible =
+            resolve_native_cursor_for_server(&server, &input_state).visible;
         let cursor_preference = NativeCursorPreference::from_env();
         let cursor_scheduling_policy = NativeCursorSchedulingPolicy::from_env();
         let direct_scanout_preference = NativeDirectScanoutPreference::from_env();
@@ -1057,10 +1059,7 @@ impl NativeRuntime {
                         Ok(mut cursor) => {
                             let (x, y) = input_state.cursor_position();
                             cursor.set_position(x, y);
-                            cursor.set_visible(
-                                input_state.cursor_visible()
-                                    && server.client_cursor_render_state().is_none(),
-                            );
+                            cursor.set_visible(initial_cursor_visible);
                             println!(
                                 "atomic cursor: framebuffer allocated id={} backing=dumb",
                                 cursor.desired().framebuffer_id.unwrap_or(0)
@@ -1144,7 +1143,7 @@ impl NativeRuntime {
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
         let initial_resolved_scene = ResolvedNativeFrameScene::from_server(&server).into_owned();
         let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
-            effective_atomic_cursor_state(cursor, cursor_render_mode, input_state.cursor_visible())
+            effective_atomic_cursor_state(cursor, cursor_render_mode, initial_cursor_visible)
                 .kms_state()
                 .cloned()
         });

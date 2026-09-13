@@ -173,9 +173,9 @@ impl NativeRuntime {
         let cursor_planning_started_at_ns =
             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
         #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
-        let (client_cursor, client_cursor_active, cursor_visible) =
+        let (client_cursor, client_surface_content_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
-        #[rustfmt::skip] prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, client_cursor_active, perf)?;
+        #[rustfmt::skip] prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, server.client_cursor_surface_active(), perf)?;
         let (mut runtime_plane_plan, mut client_cursor_hardware_usable) = (None, false);
         if let Some(cursor) = atomic_cursor.as_mut() {
             let cursor_image_ready = prepare_cursor_image(
@@ -200,7 +200,7 @@ impl NativeRuntime {
                     cursor_scheduling_policy: *cursor_scheduling_policy,
                     presented_primary: presented_planes.primary,
                     predictive_triple_active: adaptive_buffering.desired_credit() > 1,
-                    client_cursor_active,
+                    client_surface_content_active,
                     cursor_render_mode,
                     last_client_cursor_damage,
                 },
@@ -215,7 +215,7 @@ impl NativeRuntime {
             trace_cursor_plane_plan(server, cursor, &plan, presented_planes.cursor);
             client_cursor_hardware_usable = plan_uses_hardware_cursor(&plan);
             runtime_plane_plan = Some(plan);
-        } else if client_cursor_active {
+        } else if client_surface_content_active {
             *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
         } else if *cursor_preference == NativeCursorPreference::Software || legacy_cursor.is_none()
         {
@@ -235,7 +235,7 @@ impl NativeRuntime {
             target.height,
             *cursor_render_mode,
             cursor_visible,
-            client_cursor_active,
+            client_surface_content_active,
             input_state,
             cursor_image,
         );
@@ -244,7 +244,7 @@ impl NativeRuntime {
             client_cursor_hardware_usable,
             last_client_cursor_damage.as_ref(),
             current_client_cursor_damage,
-            client_cursor_active,
+            client_surface_content_active,
         );
         let mut effective_cursor = effective_cursor_for_plan(
             runtime_plane_plan.as_ref(),
@@ -269,7 +269,7 @@ impl NativeRuntime {
         );
         log_client_cursor_path_if_changed(
             last_client_cursor_path,
-            client_cursor_active,
+            client_surface_content_active,
             client_cursor_hardware_usable,
             presented_planes
                 .primary
@@ -504,7 +504,7 @@ impl NativeRuntime {
             *cursor_render_mode,
             cursor_visible,
         );
-        if client_cursor_active {
+        if client_surface_content_active {
             cursor_hardware_usable = client_cursor_hardware_usable;
         }
         let cursor_plane_update_usable = cursor_hardware_usable
@@ -517,7 +517,7 @@ impl NativeRuntime {
             atomic_cursor: atomic_cursor.as_ref(),
             cursor_render_mode: *cursor_render_mode,
             cursor_visible,
-            client_cursor_active,
+            client_surface_content_active,
             client_cursor_hardware_usable,
             legacy_cursor_available: legacy_cursor.is_some(),
             page_flip_pending: scanout.page_flip_pending(),
@@ -660,7 +660,7 @@ impl NativeRuntime {
                 frame_scheduler,
                 pacing_now_ns,
                 perf,
-                client_cursor_active,
+                client_surface_content_active,
                 cursor_render_mode,
                 server,
                 &mut effective_cursor,

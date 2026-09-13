@@ -1,4 +1,4 @@
-use super::cursor_cycle::apply_cursor_position;
+use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::*;
 
 use oblivion_one::control::{
@@ -1367,7 +1367,7 @@ impl NativeRuntime {
     fn cursor_backend_snapshot(&self) -> oblivion_one::control_snapshots::CursorBackendSnapshot {
         if self.scanout_destroyed {
             oblivion_one::control_snapshots::CursorBackendSnapshot::Unavailable
-        } else if !self.input_state.cursor_visible() {
+        } else if !resolve_native_cursor_for_server(&self.server, &self.input_state).visible {
             oblivion_one::control_snapshots::CursorBackendSnapshot::Hidden
         } else {
             match self.cursor_render_mode {
@@ -1737,10 +1737,7 @@ impl NativeRuntime {
                     render_telemetry.resource_efficiency.record_pointer_sample();
                 }
                 let effect_requested_redraw = effect.redraw_requested;
-                let cursor_visible = !server.client_cursor_explicitly_hidden()
-                    && (server.client_cursor_render_state().is_some()
-                        || server.interaction_cursor_override_active()
-                        || input_state.cursor_visible());
+                let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
                 if let Err(error) = apply_cursor_position(
                     atomic_cursor,
                     legacy_cursor,
@@ -1843,13 +1840,15 @@ impl NativeRuntime {
             if let Some(start_ns) = cursor_sync_start_at_ns {
                 pointer_timing.record_cursor_sync(start_ns, monotonic_now_ns()?);
             }
+            let effective_cursor_visible =
+                resolve_native_cursor_for_server(server, input_state).visible;
             let _ = observe_atomic_cursor_output_liveness(
                 atomic_cursor.as_ref(),
                 cursor_output_arbitration,
                 frame_scheduler,
                 monotonic_now_ns()?,
                 *cursor_render_mode,
-                input_state.cursor_visible(),
+                effective_cursor_visible,
             );
             let client_flush = server.end_native_input_batch()?;
             if timing_enabled {

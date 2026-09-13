@@ -1,7 +1,9 @@
 use super::*;
 use crate::native_output::OutputTransactionId;
 use crate::native_output::runtime::{
-    NativeCursorOutputArbitration, NativeCursorRenderMode, observe_atomic_cursor_output_liveness,
+    NativeCursorOutputArbitration, NativeCursorRenderMode, NativeCursorSourceInput,
+    NativeResolvedCursorSource, effective_atomic_cursor_state,
+    observe_atomic_cursor_output_liveness, resolve_native_cursor_source,
     update_cursor_output_arbitration,
 };
 use oblivion_one::native::kms::{
@@ -610,6 +612,104 @@ fn cursor_revision_advances_only_the_changed_field() {
     assert_eq!(visible.image, moved.image);
     assert_eq!(visible.motion, moved.motion);
     assert_ne!(visible.visibility, moved.visibility);
+}
+
+#[test]
+fn client_shape_motion_does_not_churn_visibility_revision() {
+    let shape = NativeCursorSourceInput {
+        client_shape_active: true,
+        theme_fallback_visible: false,
+        ..Default::default()
+    };
+    let mut cursor = test_cursor();
+
+    let resolved = resolve_native_cursor_source(shape);
+    assert_eq!(resolved.source, NativeResolvedCursorSource::ClientShape);
+    assert!(resolved.visible);
+    cursor.set_visible(resolved.visible);
+    let stable_revision = cursor.desired_revision();
+
+    for position in 0..32 {
+        cursor.set_position(position, position * 2);
+        cursor.set_visible(resolve_native_cursor_source(shape).visible);
+    }
+
+    let revision = cursor.desired_revision();
+    assert_eq!(revision.visibility, stable_revision.visibility);
+    assert_ne!(revision.motion, stable_revision.motion);
+}
+
+#[test]
+fn pointer_lock_replacement_keeps_shape_hidden_until_final_unlock() {
+    let visible_shape = NativeCursorSourceInput {
+        client_shape_active: true,
+        theme_fallback_visible: false,
+        ..Default::default()
+    };
+    let locked_shape = NativeCursorSourceInput {
+        pointer_lock_hidden: true,
+        ..visible_shape
+    };
+    let mut cursor = test_cursor();
+
+    cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
+    let visible_revision = cursor.desired_revision().visibility;
+
+    let lock_a = locked_shape;
+    let lock_b = locked_shape;
+    cursor.set_visible(resolve_native_cursor_source(lock_a).visible);
+    let locked_visibility = cursor.desired_revision().visibility;
+    assert_ne!(locked_visibility, visible_revision);
+
+    // The compositor applies Retire(A) + Install(B) as one effective
+    // transition. The native side must observe the still-hidden committed
+    // state throughout the replacement.
+    cursor.set_visible(resolve_native_cursor_source(lock_b).visible);
+    assert_eq!(cursor.desired_revision().visibility, locked_visibility);
+
+    for position in 0..32 {
+        cursor.set_position(position, position);
+        cursor.set_visible(resolve_native_cursor_source(lock_b).visible);
+    }
+    assert_eq!(cursor.desired_revision().visibility, locked_visibility);
+
+    cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
+    let revealed_visibility = cursor.desired_revision().visibility;
+    assert_ne!(revealed_visibility, locked_visibility);
+    assert!(cursor.desired().visible);
+}
+
+#[test]
+fn session_recovery_uses_effective_shape_visibility() {
+    let shape = NativeCursorSourceInput {
+        client_shape_active: true,
+        theme_fallback_visible: false,
+        ..Default::default()
+    };
+    let locked_shape = NativeCursorSourceInput {
+        pointer_lock_hidden: true,
+        ..shape
+    };
+    let mut cursor = test_cursor();
+    cursor.set_visible(true);
+
+    assert!(
+        effective_atomic_cursor_state(
+            &cursor,
+            NativeCursorRenderMode::Hardware,
+            resolve_native_cursor_source(shape).visible,
+        )
+        .hardware_usable()
+    );
+    assert!(
+        effective_atomic_cursor_state(
+            &cursor,
+            NativeCursorRenderMode::Hardware,
+            resolve_native_cursor_source(locked_shape).visible,
+        )
+        .kms_state()
+        .is_none()
+    );
 }
 
 #[test]

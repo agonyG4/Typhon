@@ -6,7 +6,7 @@ pub(crate) fn observe_atomic_cursor_output_liveness(
     frame_scheduler: &NativeFrameScheduler,
     now_ns: u64,
     cursor_render_mode: NativeCursorRenderMode,
-    input_visible: bool,
+    effective_cursor_visible: bool,
 ) -> bool {
     let Some(cursor) = atomic_cursor else {
         return false;
@@ -16,7 +16,7 @@ pub(crate) fn observe_atomic_cursor_output_liveness(
             cursor.desired().visible,
             cursor.capability_quarantined(),
             cursor_render_mode,
-            input_visible,
+            effective_cursor_visible,
         ),
         AtomicCursorVisibilityPolicy::HardwareVisible
     )
@@ -111,31 +111,90 @@ pub(crate) const fn resolve_client_cursor_path(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeCursorSourceInput {
+    pub(crate) interaction_override_active: bool,
+    pub(crate) pointer_lock_hidden: bool,
+    pub(crate) client_explicitly_hidden: bool,
+    pub(crate) client_surface_active: bool,
+    pub(crate) client_surface_content_active: bool,
+    pub(crate) client_shape_active: bool,
+    pub(crate) theme_fallback_visible: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeResolvedCursorSource {
     Hidden,
     Theme,
     InteractionOverride,
-    Client,
+    ClientSurface,
+    ClientShape,
 }
 
-pub(crate) const fn resolve_native_cursor_source_with_hidden(
-    client_active: bool,
-    client_explicitly_hidden: bool,
-    interaction_override_active: bool,
-    theme_visible: bool,
-) -> NativeResolvedCursorSource {
-    if interaction_override_active {
+impl NativeResolvedCursorSource {
+    pub(crate) const fn legacy_hardware_eligible(self) -> bool {
+        matches!(
+            self,
+            Self::Theme | Self::InteractionOverride | Self::ClientShape
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeResolvedCursor {
+    pub(crate) source: NativeResolvedCursorSource,
+    pub(crate) visible: bool,
+}
+
+pub(crate) const fn resolve_native_cursor_source(
+    input: NativeCursorSourceInput,
+) -> NativeResolvedCursor {
+    // This ordering mirrors CompositorState::sync_cursor_visibility_request:
+    // an active compositor interaction override intentionally keeps the
+    // cursor visible even while ordinary client or lock concealment is set.
+    let source = if input.interaction_override_active {
         NativeResolvedCursorSource::InteractionOverride
-    } else if client_active {
-        NativeResolvedCursorSource::Client
-    } else if client_explicitly_hidden {
+    } else if input.pointer_lock_hidden || input.client_explicitly_hidden {
         NativeResolvedCursorSource::Hidden
-    } else if theme_visible {
+    } else if input.client_surface_active {
+        NativeResolvedCursorSource::ClientSurface
+    } else if input.client_shape_active {
+        NativeResolvedCursorSource::ClientShape
+    } else if input.theme_fallback_visible {
         NativeResolvedCursorSource::Theme
     } else {
         NativeResolvedCursorSource::Hidden
+    };
+    let visible = match source {
+        NativeResolvedCursorSource::Hidden => false,
+        NativeResolvedCursorSource::ClientSurface => input.client_surface_content_active,
+        NativeResolvedCursorSource::Theme
+        | NativeResolvedCursorSource::InteractionOverride
+        | NativeResolvedCursorSource::ClientShape => true,
+    };
+    NativeResolvedCursor { source, visible }
+}
+
+pub(crate) fn native_cursor_source_input(
+    server: &OwnCompositorServer,
+    input_state: &NativeInputState,
+) -> NativeCursorSourceInput {
+    NativeCursorSourceInput {
+        interaction_override_active: server.interaction_cursor_override_active(),
+        pointer_lock_hidden: server.cursor_hidden_by_pointer_lock(),
+        client_explicitly_hidden: server.client_cursor_explicitly_hidden(),
+        client_surface_active: server.client_cursor_surface_active(),
+        client_surface_content_active: server.client_cursor_render_state().is_some(),
+        client_shape_active: server.client_cursor_shape().is_some(),
+        theme_fallback_visible: input_state.theme_fallback_visible(),
     }
+}
+
+pub(crate) fn resolve_native_cursor_for_server(
+    server: &OwnCompositorServer,
+    input_state: &NativeInputState,
+) -> NativeResolvedCursor {
+    resolve_native_cursor_source(native_cursor_source_input(server, input_state))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +205,8 @@ pub(crate) enum AtomicCursorVisibilityPolicy {
 }
 
 impl AtomicCursorVisibilityPolicy {
-    pub(crate) const fn direct_compatible(self, input_visible: bool) -> bool {
-        !input_visible || matches!(self, Self::HardwareVisible)
+    pub(crate) const fn direct_compatible(self, effective_cursor_visible: bool) -> bool {
+        !effective_cursor_visible || matches!(self, Self::HardwareVisible)
     }
 }
 
@@ -174,13 +233,13 @@ impl<'a> AtomicCursorSubmissionState<'a> {
 pub(crate) fn effective_atomic_cursor_state<'a>(
     cursor: &'a NativeAtomicCursor,
     render_mode: NativeCursorRenderMode,
-    input_visible: bool,
+    effective_cursor_visible: bool,
 ) -> AtomicCursorSubmissionState<'a> {
     match atomic_cursor_visibility_policy(
         cursor.desired().visible,
         cursor.capability_quarantined(),
         render_mode,
-        input_visible,
+        effective_cursor_visible,
     ) {
         AtomicCursorVisibilityPolicy::HardwareVisible => {
             AtomicCursorSubmissionState::Visible(cursor.desired())
@@ -196,7 +255,7 @@ pub(crate) fn atomic_cursor_visibility_policy(
     desired_visible: bool,
     capability_quarantined: bool,
     render_mode: NativeCursorRenderMode,
-    input_visible: bool,
+    effective_cursor_visible: bool,
 ) -> AtomicCursorVisibilityPolicy {
     let selection = select_cursor_delivery_mode(CursorModePolicyInput {
         preference: if render_mode == NativeCursorRenderMode::Hardware {
@@ -204,7 +263,7 @@ pub(crate) fn atomic_cursor_visibility_policy(
         } else {
             CursorPreference::Software
         },
-        visible: input_visible && desired_visible,
+        visible: effective_cursor_visible && desired_visible,
         hardware_status: if capability_quarantined {
             CursorHardwareStatus::Quarantined
         } else {
@@ -237,13 +296,11 @@ pub(crate) fn synchronize_cursor_state(
     if let Some(cursor) = legacy_cursor.as_mut() {
         if !legacy_visible {
             cursor.disable()?;
-        } else if input_state.cursor_visible() {
+        } else {
             if !cursor.active {
                 cursor.enable()?;
             }
             cursor.move_to(x, y)?;
-        } else {
-            cursor.disable()?;
         }
     }
     Ok(())
@@ -255,18 +312,13 @@ pub(crate) fn synchronize_cursor_state_for_server(
     legacy_cursor: &mut Option<NativeLegacyHardwareCursor>,
     input_state: &NativeInputState,
 ) -> io::Result<()> {
-    let source = resolve_native_cursor_source_with_hidden(
-        server.client_cursor_render_state().is_some(),
-        server.client_cursor_explicitly_hidden(),
-        server.interaction_cursor_override_active(),
-        input_state.cursor_visible(),
-    );
+    let resolved = resolve_native_cursor_for_server(server, input_state);
     synchronize_cursor_state(
         atomic_cursor,
         legacy_cursor,
         input_state,
-        !matches!(source, NativeResolvedCursorSource::Hidden),
-        server.client_cursor_render_state().is_none(),
+        resolved.visible,
+        resolved.visible && resolved.source.legacy_hardware_eligible(),
     )
 }
 
@@ -405,43 +457,111 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_cursor_source_stays_visible_when_theme_cursor_is_hidden() {
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(true, false, false, false),
-            NativeResolvedCursorSource::Client
-        );
+    fn native_cursor_source_resolver_truth_table() {
+        let cases = [
+            (
+                NativeCursorSourceInput {
+                    theme_fallback_visible: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::Theme,
+                true,
+            ),
+            (
+                NativeCursorSourceInput::default(),
+                NativeResolvedCursorSource::Hidden,
+                false,
+            ),
+            (
+                NativeCursorSourceInput {
+                    client_shape_active: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::ClientShape,
+                true,
+            ),
+            (
+                NativeCursorSourceInput {
+                    client_surface_active: true,
+                    client_surface_content_active: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::ClientSurface,
+                true,
+            ),
+            (
+                NativeCursorSourceInput {
+                    client_explicitly_hidden: true,
+                    client_shape_active: true,
+                    theme_fallback_visible: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::Hidden,
+                false,
+            ),
+            (
+                NativeCursorSourceInput {
+                    pointer_lock_hidden: true,
+                    client_shape_active: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::Hidden,
+                false,
+            ),
+            (
+                NativeCursorSourceInput {
+                    pointer_lock_hidden: true,
+                    client_surface_active: true,
+                    client_surface_content_active: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::Hidden,
+                false,
+            ),
+            (
+                NativeCursorSourceInput {
+                    interaction_override_active: true,
+                    client_explicitly_hidden: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::InteractionOverride,
+                true,
+            ),
+            (
+                NativeCursorSourceInput {
+                    interaction_override_active: true,
+                    pointer_lock_hidden: true,
+                    client_shape_active: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::InteractionOverride,
+                true,
+            ),
+            (
+                NativeCursorSourceInput {
+                    client_surface_active: true,
+                    theme_fallback_visible: true,
+                    ..Default::default()
+                },
+                NativeResolvedCursorSource::ClientSurface,
+                false,
+            ),
+        ];
+
+        for (input, expected_source, expected_visible) in cases {
+            let resolved = resolve_native_cursor_source(input);
+            assert_eq!(resolved.source, expected_source);
+            assert_eq!(resolved.visible, expected_visible);
+        }
     }
 
     #[test]
-    fn hidden_and_interaction_sources_keep_their_precedence() {
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(false, false, true, false),
-            NativeResolvedCursorSource::InteractionOverride
-        );
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(false, true, false, true),
-            NativeResolvedCursorSource::Hidden
-        );
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(false, false, false, false),
-            NativeResolvedCursorSource::Hidden
-        );
-    }
-
-    #[test]
-    fn explicit_client_concealment_is_restored_after_interaction_override() {
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(false, true, true, true),
-            NativeResolvedCursorSource::InteractionOverride
-        );
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(false, true, false, true),
-            NativeResolvedCursorSource::Hidden
-        );
-        assert_eq!(
-            resolve_native_cursor_source_with_hidden(true, false, false, true),
-            NativeResolvedCursorSource::Client
-        );
+    fn legacy_hardware_eligibility_preserves_cursor_source_distinctions() {
+        assert!(NativeResolvedCursorSource::Theme.legacy_hardware_eligible());
+        assert!(NativeResolvedCursorSource::ClientShape.legacy_hardware_eligible());
+        assert!(NativeResolvedCursorSource::InteractionOverride.legacy_hardware_eligible());
+        assert!(!NativeResolvedCursorSource::ClientSurface.legacy_hardware_eligible());
+        assert!(!NativeResolvedCursorSource::Hidden.legacy_hardware_eligible());
     }
 
     #[test]

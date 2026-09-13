@@ -985,12 +985,14 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
             _ => None,
         })
         .expect("expected locked backend activation request");
+    assert!(!capture_cursor_hidden_by_pointer_lock(&commands));
     commands
         .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     let _ = capture_pointer_constraint_backend_requests(&commands);
+    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
 
     commands
         .send(ServerCommand::PointerConstraintBackendDeactivated(

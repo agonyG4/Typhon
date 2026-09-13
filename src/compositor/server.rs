@@ -1473,6 +1473,10 @@ impl OwnCompositorServer {
         self.state.client_cursor_render_state()
     }
 
+    pub fn client_cursor_surface_active(&self) -> bool {
+        self.state.client_cursor_surface_active()
+    }
+
     pub fn interaction_cursor_override_active(&self) -> bool {
         self.state.interaction_cursor_override_active()
     }
@@ -1490,6 +1494,11 @@ impl OwnCompositorServer {
 
     pub fn client_cursor_explicitly_hidden(&self) -> bool {
         self.state.client_cursor_explicitly_hidden()
+    }
+
+    /// Returns the effective committed pointer-lock cursor-hiding state.
+    pub fn cursor_hidden_by_pointer_lock(&self) -> bool {
+        self.state.cursor_hidden_by_pointer_lock()
     }
 
     pub fn client_cursor_shape(&self) -> Option<u32> {

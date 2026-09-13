@@ -93,10 +93,14 @@ pub(super) use atomic_commit::{
     AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind, AtomicCommitPhase,
     register_atomic_primary_submission,
 };
+#[cfg(test)]
+pub(crate) use cursor_cycle::{
+    NativeCursorSourceInput, NativeResolvedCursorSource, resolve_native_cursor_source,
+};
 pub(super) use cursor_cycle::{
     atomic_cursor_visibility_policy, effective_atomic_cursor_state, log_client_cursor_path,
     observe_atomic_cursor_output_liveness, resolve_client_cursor_path,
-    synchronize_cursor_state_for_server,
+    resolve_native_cursor_for_server, synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
 use cycle_dispatch::NativeWaylandInputDispatchOutcome;

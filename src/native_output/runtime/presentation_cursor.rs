@@ -1,4 +1,4 @@
-use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source_with_hidden};
+use super::cursor_cycle::{native_cursor_source_input, resolve_native_cursor_source};
 use super::*;
 use crate::native_output::kms_worker::AttachablePrimary;
 use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
@@ -40,7 +40,7 @@ pub(super) fn prepare_legacy_cursor_for_frame(
     cursor_image: &std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     cursor_render_mode: &mut NativeCursorRenderMode,
     cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
-    client_cursor_active: bool,
+    client_surface_active: bool,
     perf: NativePerfLogger,
 ) -> NativeResult<()> {
     refresh_legacy_cursor_theme(
@@ -52,7 +52,7 @@ pub(super) fn prepare_legacy_cursor_for_frame(
         cursor_manager,
         perf,
     )?;
-    if client_cursor_active && let Some(mut cursor) = legacy_cursor.take() {
+    if client_surface_active && let Some(mut cursor) = legacy_cursor.take() {
         if let Err(error) = cursor.disable() {
             cursor.disarm_drm_cleanup();
             cursor_manager.note_hardware_fallback();
@@ -77,18 +77,10 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
     bool,
     bool,
 ) {
-    let theme_cursor_visible = input_state.cursor_visible();
     let client_cursor = server.client_cursor_render_state();
-    let client_cursor_active = client_cursor.is_some();
-    let client_shape_active =
-        !server.interaction_cursor_override_active() && server.client_cursor_shape().is_some();
-    let resolved_cursor_source = resolve_native_cursor_source_with_hidden(
-        client_cursor_active || client_shape_active,
-        server.client_cursor_explicitly_hidden(),
-        server.interaction_cursor_override_active(),
-        theme_cursor_visible,
-    );
-    let cursor_visible = !matches!(resolved_cursor_source, NativeResolvedCursorSource::Hidden);
+    let source_input = native_cursor_source_input(server, input_state);
+    let resolved_cursor = resolve_native_cursor_source(source_input);
+    let client_surface_content_active = source_input.client_surface_content_active;
     if server.cursor_reveal_authority().is_some() {
         let (pointer_x, pointer_y) = server.last_pointer_position();
         crate::pointer_debug::cursor_presentation_log_lazy(|| {
@@ -115,22 +107,28 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
                 )
             });
             format!(
-                "event=cursor_source_resolved constraint={}/{} source={:?} cursor_visible={} logical_pointer=({},{}) client_cursor_active={} client_cursor_explicitly_hidden={} interaction_override_active={} theme_cursor_visible={} client_surface={:?}",
+                "event=cursor_source_resolved constraint={}/{} source={:?} cursor_visible={} logical_pointer=({},{}) client_surface_content_active={} client_surface_active={} client_cursor_explicitly_hidden={} pointer_lock_hidden={} interaction_override_active={} theme_fallback_visible={} client_surface={:?}",
                 reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
                 reveal.map_or(0, |reveal| reveal.constraint.generation),
-                resolved_cursor_source,
-                cursor_visible,
+                resolved_cursor.source,
+                resolved_cursor.visible,
                 pointer_x,
                 pointer_y,
-                client_cursor_active,
-                server.client_cursor_explicitly_hidden(),
-                server.interaction_cursor_override_active(),
-                theme_cursor_visible,
+                client_surface_content_active,
+                source_input.client_surface_active,
+                source_input.client_explicitly_hidden,
+                source_input.pointer_lock_hidden,
+                source_input.interaction_override_active,
+                source_input.theme_fallback_visible,
                 client
             )
         });
     }
-    (client_cursor, client_cursor_active, cursor_visible)
+    (
+        client_cursor,
+        client_surface_content_active,
+        resolved_cursor.visible,
+    )
 }
 
 pub(super) fn refresh_legacy_cursor_theme(
@@ -286,7 +284,7 @@ pub(super) struct CursorPolicyContext<'a> {
     pub(super) cursor_scheduling_policy: NativeCursorSchedulingPolicy,
     pub(super) presented_primary: Option<PresentedPrimaryAssignment>,
     pub(super) predictive_triple_active: bool,
-    pub(super) client_cursor_active: bool,
+    pub(super) client_surface_content_active: bool,
     pub(super) cursor_render_mode: &'a mut NativeCursorRenderMode,
     pub(super) last_client_cursor_damage: &'a mut Option<NativeClientCursorDamageState>,
 }
@@ -783,13 +781,13 @@ pub(super) fn planned_client_cursor_software_work(
     client_cursor_hardware_usable: bool,
     last_damage: Option<&NativeClientCursorDamageState>,
     current_damage: Option<NativeClientCursorDamageState>,
-    client_cursor_active: bool,
+    client_surface_content_active: bool,
 ) -> bool {
     plan.is_some_and(|plan| {
         plan.decision.pacing_constraint == CursorPacingConstraint::ReactiveDouble
     }) && !client_cursor_hardware_usable
         && last_damage != current_damage.as_ref()
-        && (client_cursor_active || last_damage.is_some())
+        && (client_surface_content_active || last_damage.is_some())
 }
 
 pub(super) fn planned_hardware_cursor_work_pending(
@@ -828,7 +826,7 @@ pub(super) fn cursor_damage_states(
     output_height: u32,
     cursor_render_mode: NativeCursorRenderMode,
     cursor_visible: bool,
-    client_cursor_active: bool,
+    client_surface_content_active: bool,
     input_state: &NativeInputState,
     cursor_image: &oblivion_one::cursor_theme::CompositorCursorImage,
 ) -> (
@@ -840,7 +838,7 @@ pub(super) fn cursor_damage_states(
     });
     let software_damage = (cursor_render_mode == NativeCursorRenderMode::Software
         && cursor_visible
-        && !client_cursor_active)
+        && !client_surface_content_active)
         .then(|| {
             native_theme_cursor_rect(
                 output_width,
@@ -855,13 +853,13 @@ pub(super) fn cursor_damage_states(
 
 pub(super) fn log_client_cursor_path_if_changed(
     last_path: &mut Option<NativeClientCursorPath>,
-    client_cursor_active: bool,
+    client_surface_content_active: bool,
     hardware_eligible: bool,
     direct_active: bool,
     client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'_>>,
     perf: NativePerfLogger,
 ) {
-    let path = resolve_client_cursor_path(client_cursor_active, hardware_eligible);
+    let path = resolve_client_cursor_path(client_surface_content_active, hardware_eligible);
     if *last_path != Some(path) {
         *last_path = Some(path);
         log_client_cursor_path(perf, path, hardware_eligible, direct_active, client_cursor);
@@ -934,7 +932,7 @@ fn build_runtime_plane_plan(
     previous_delivery: CursorDeliveryMode,
     previous_state: Option<&AtomicCursorVisualState>,
     next_state: Option<&AtomicCursorVisualState>,
-    client_cursor_active: bool,
+    client_surface_content_active: bool,
     attachable_primary: Option<AttachablePrimary>,
     capability_key_unchanged: bool,
 ) -> RuntimePlanePlan {
@@ -965,14 +963,14 @@ fn build_runtime_plane_plan(
     let render_mode = match decision.delivery {
         CursorDeliveryChoice::Hardware { .. } => NativeCursorRenderMode::Hardware,
         CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. } => {
-            if client_cursor_active {
+            if client_surface_content_active {
                 NativeCursorRenderMode::SoftwareClient
             } else {
                 NativeCursorRenderMode::Software
             }
         }
         CursorDeliveryChoice::Hidden { .. } => {
-            if client_cursor_active {
+            if client_surface_content_active {
                 NativeCursorRenderMode::SoftwareClient
             } else {
                 NativeCursorRenderMode::Software
@@ -1007,7 +1005,7 @@ pub(super) fn apply_cursor_policy(
         cursor_scheduling_policy,
         presented_primary,
         predictive_triple_active,
-        client_cursor_active,
+        client_surface_content_active,
         cursor_render_mode,
         last_client_cursor_damage,
     } = context;
@@ -1066,7 +1064,7 @@ pub(super) fn apply_cursor_policy(
         previous_delivery,
         Some(cursor.current()),
         Some(&prospective),
-        client_cursor_active,
+        client_surface_content_active,
         attachable_primary,
         previous_capability_key == capability_key,
     );
