@@ -21,6 +21,7 @@ impl CompositorState {
             explicit_sync.state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                 "explicit sync points were set without an attached buffer",
             );
@@ -293,7 +294,7 @@ impl CompositorState {
             let transaction =
                 self.build_surface_tree_transaction(root_surface_id, nodes, dependencies);
             if self.transaction_is_ready(&transaction) {
-                self.publish_surface_tree_nodes(root_surface_id, transaction.nodes);
+                self.publish_surface_tree_nodes(transaction);
             } else {
                 self.queue_waiting_surface_tree_transaction(transaction);
             }
@@ -581,6 +582,7 @@ impl CompositorState {
                     state.post_error_with_metrics(
                         &mut self.compliance_metrics,
                         &mut self.protocol_error_trace,
+                        &mut self.terminal_client_ids,
                         SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                         "explicit sync points were set without an attached buffer",
                     );
@@ -592,6 +594,7 @@ impl CompositorState {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
+                    &mut self.terminal_client_ids,
                     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                     "explicit sync is only supported for linux-dmabuf buffers",
                 );
@@ -601,6 +604,7 @@ impl CompositorState {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
+                    &mut self.terminal_client_ids,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "dmabuf commit is missing an acquire timeline point",
                 );
@@ -610,6 +614,7 @@ impl CompositorState {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
+                    &mut self.terminal_client_ids,
                     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                     "dmabuf commit is missing a release timeline point",
                 );
@@ -619,6 +624,7 @@ impl CompositorState {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
+                    &mut self.terminal_client_ids,
                     SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                     "acquire timeline point must be lower than release point on the same timeline",
                 );
@@ -633,9 +639,15 @@ impl CompositorState {
                 state.post_error_with_metrics(
                     &mut self.compliance_metrics,
                     &mut self.protocol_error_trace,
+                    &mut self.terminal_client_ids,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "explicit sync commit identity space exhausted",
                 );
+                return None;
+            };
+            let Some((owner_client_id, surface_presentation_generation)) =
+                self.capture_surface_publication_lifetime(*surface_id)
+            else {
                 return None;
             };
             client_pacing_log(
@@ -659,6 +671,8 @@ impl CompositorState {
                 surface_commit_id: commit.commit_id,
                 commit_id,
                 surface_id: *surface_id,
+                owner_client_id: Some(owner_client_id),
+                surface_presentation_generation: Some(surface_presentation_generation),
                 buffer_id: pending.resource.id().protocol_id(),
                 acquire,
                 state: PendingAcquireState::RegistrationPending,
@@ -874,9 +888,70 @@ impl CompositorState {
 
     pub(in crate::compositor) fn publish_surface_tree_nodes(
         &mut self,
-        root_surface_id: u32,
-        mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        transaction: PendingSurfaceTreeTransaction,
     ) {
+        if let Some((surface_id, decision)) =
+            self.surface_tree_async_publication_rejection(&transaction)
+        {
+            let (commit_sequence, buffer_id) = transaction
+                .nodes
+                .iter()
+                .find(|(node_surface_id, _)| *node_surface_id == surface_id)
+                .map_or((SurfaceCommitSequence::initial(), None), |(_, commit)| {
+                    (
+                        commit.commit_sequence,
+                        commit
+                            .attachment
+                            .as_ref()
+                            .and_then(|attachment| match attachment {
+                                PendingSurfaceAttachment::Buffer(buffer) => {
+                                    Some(buffer.data.buffer_id())
+                                }
+                                PendingSurfaceAttachment::RemoveContent => None,
+                            }),
+                    )
+                });
+            if matches!(
+                decision,
+                SurfacePublicationDecision::SurfaceGone
+                    | SurfacePublicationDecision::OwnerGone
+                    | SurfacePublicationDecision::TerminalClient
+                    | SurfacePublicationDecision::StaleSurfaceGeneration
+            ) {
+                let has_node = transaction
+                    .nodes
+                    .iter()
+                    .any(|(node_surface_id, _)| *node_surface_id == surface_id);
+                if has_node {
+                    self.trace_surface_pipeline_event_with_reason(
+                        SurfacePipelineEvent::AcquireReadyDiscarded,
+                        surface_id,
+                        commit_sequence,
+                        buffer_id.map(BufferId::get),
+                        None,
+                        Some(transaction.id.get()),
+                        None,
+                        None,
+                        None,
+                        decision.pipeline_rejection_reason(),
+                    );
+                }
+            }
+            self.record_surface_publication_rejection(
+                surface_id,
+                commit_sequence,
+                buffer_id,
+                SurfacePublicationSource::SurfaceTree,
+                decision,
+            );
+            self.discard_surface_tree_transaction(transaction);
+            return;
+        }
+        let PendingSurfaceTreeTransaction {
+            root_surface_id,
+            mut nodes,
+            ..
+        } = transaction;
         let stale_node = nodes.iter().find_map(|(surface_id, commit)| {
             if commit.attachment.is_none() {
                 return None;
@@ -919,6 +994,21 @@ impl CompositorState {
         };
         let (_, root_commit) = nodes.remove(root_index);
         self.publish_surface_tree(root_surface_id, root_commit, nodes);
+    }
+
+    pub(in crate::compositor) fn discard_surface_tree_transaction(
+        &mut self,
+        transaction: PendingSurfaceTreeTransaction,
+    ) {
+        let root_surface_id = transaction.root_surface_id;
+        let released = self.release_pending_surface_tree_transaction(
+            transaction,
+            AcquireWatchCancelReason::SurfaceDestroyed,
+        );
+        if let Some(resize_commit) = released.resize_commit {
+            self.release_detached_resize_capture(root_surface_id, resize_commit);
+        }
+        self.complete_frame_callbacks(released.callbacks);
     }
 
     pub(in crate::compositor) fn cancel_pending_surface_trees_for_root(
@@ -1020,6 +1110,9 @@ impl CompositorState {
         }
         if self.external_acquire_readiness {
             for dependency in &transaction.dependencies {
+                if dependency.state == PendingAcquireState::Ready {
+                    continue;
+                }
                 self.pending_acquire_watch_changes
                     .push(AcquireWatchChange::Cancel {
                         commit_id: dependency.commit_id,

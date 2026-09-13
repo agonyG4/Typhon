@@ -353,7 +353,7 @@ pub use surface::{
     SurfaceResourceSyncState,
 };
 pub use surface_pipeline_trace::SurfacePipelineEvent;
-use surface_pipeline_trace::SurfacePipelineTrace;
+use surface_pipeline_trace::{SurfacePipelineRejectionReason, SurfacePipelineTrace};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameCallbackTime(u32);
 impl FrameCallbackTime {
@@ -731,6 +731,7 @@ pub struct CompositorState {
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
+    terminal_client_ids: HashSet<ClientId>,
     pending_client_resource_exhaustions: Vec<PendingClientResourceExhaustion>,
     pending_client_resource_exhaustion_clients: HashSet<ClientId>,
     pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,

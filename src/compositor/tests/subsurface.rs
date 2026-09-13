@@ -352,7 +352,10 @@ fn destroying_new_subsurface_before_parent_commit_preserves_surviving_stack() {
 
     assert_eq!(surviving.len(), 3);
     assert_eq!(
-        surviving.iter().collect::<std::collections::HashSet<_>>().len(),
+        surviving
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
         surviving.len()
     );
     assert_eq!(after_destroy.latched, Some(surviving.clone()));

@@ -18,6 +18,7 @@ impl OwnCompositorServer {
     pub(super) fn kill_pending_resource_exhaustion_clients(&mut self) {
         let handle = self.display.handle();
         for pending in self.state.take_client_resource_exhaustions() {
+            self.state.mark_client_terminal(pending.client.id());
             pending.client.kill(
                 &handle,
                 ProtocolError {

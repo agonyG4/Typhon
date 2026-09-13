@@ -129,6 +129,7 @@ pub enum SurfacePipelineEvent {
     CommitCaptured,
     AcquirePending,
     AcquireReady,
+    AcquireReadyDiscarded,
     FifoBarrierSet,
     FifoWaitBlocked,
     FifoWaitReleased,
@@ -148,9 +149,33 @@ pub enum SurfacePipelineEvent {
     PresentationFeedbackCompleted,
     BufferReleaseCompleted,
     CommitDiscarded,
+    PublicationRejected,
     CommitSuperseded,
     TransactionAbandoned,
     SurfaceDetached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfacePipelineRejectionReason {
+    SurfaceGone,
+    OwnerGone,
+    TerminalClient,
+    StaleSurfaceGeneration,
+    AlreadyPublished,
+    SupersededByNewerAttachment,
+}
+
+impl SurfacePipelineRejectionReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SurfaceGone => "surface_gone",
+            Self::OwnerGone => "owner_gone",
+            Self::TerminalClient => "terminal_client",
+            Self::StaleSurfaceGeneration => "stale_surface_generation",
+            Self::AlreadyPublished => "already_published",
+            Self::SupersededByNewerAttachment => "superseded_by_newer_attachment",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +194,7 @@ pub(crate) struct SurfacePipelineRecord {
     pub(crate) output_transaction_id: Option<u64>,
     pub(crate) output_frame_id: Option<u64>,
     pub(crate) pageflip_token: Option<u64>,
+    pub(crate) rejection_reason: Option<SurfacePipelineRejectionReason>,
 }
 
 impl SurfacePipelineRecord {
@@ -188,6 +214,7 @@ impl SurfacePipelineRecord {
             output_transaction_id: None,
             output_frame_id: None,
             pageflip_token: None,
+            rejection_reason: None,
         }
     }
 
@@ -263,6 +290,34 @@ impl CompositorState {
         output_frame_id: Option<u64>,
         pageflip_token: Option<u64>,
     ) {
+        self.trace_surface_pipeline_event_with_reason(
+            kind,
+            surface_id,
+            commit_sequence,
+            buffer_id,
+            frame_batch_id,
+            surface_tree_transaction_id,
+            output_transaction_id,
+            output_frame_id,
+            pageflip_token,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::compositor) fn trace_surface_pipeline_event_with_reason(
+        &mut self,
+        kind: SurfacePipelineEvent,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        buffer_id: Option<u64>,
+        frame_batch_id: Option<u64>,
+        surface_tree_transaction_id: Option<u64>,
+        output_transaction_id: Option<u64>,
+        output_frame_id: Option<u64>,
+        pageflip_token: Option<u64>,
+        rejection_reason: Option<SurfacePipelineRejectionReason>,
+    ) {
         if !self.surface_pipeline_trace.enabled() {
             return;
         }
@@ -277,6 +332,7 @@ impl CompositorState {
         record.output_transaction_id = output_transaction_id;
         record.output_frame_id = output_frame_id;
         record.pageflip_token = pageflip_token;
+        record.rejection_reason = rejection_reason;
 
         if let Some(xwayland_state) = self.xwayland.surface_states.get(&surface_id) {
             record.xwayland_generation = Some(xwayland_state.generation.get());

@@ -699,6 +699,7 @@ impl CompositorState {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                 "explicit sync is only supported for linux-dmabuf buffers",
             );
@@ -710,6 +711,7 @@ impl CompositorState {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "dmabuf commit is missing an acquire timeline point",
             );
@@ -720,6 +722,7 @@ impl CompositorState {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                 "dmabuf commit is missing a release timeline point",
             );
@@ -731,6 +734,7 @@ impl CompositorState {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                 "acquire timeline point must be lower than release point on the same timeline",
             );
@@ -752,9 +756,18 @@ impl CompositorState {
                     sync_state.post_error_with_metrics(
                         &mut self.compliance_metrics,
                         &mut self.protocol_error_trace,
+                        &mut self.terminal_client_ids,
                         SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                         "explicit sync commit identity space exhausted",
                     );
+                    self.discard_presentation_feedbacks(presentation_feedbacks);
+                    return;
+                };
+                let Some((owner_client_id, surface_presentation_generation)) =
+                    self.capture_surface_publication_lifetime(surface_id)
+                else {
+                    self.release_pending_surface_buffer(pending);
+                    self.complete_frame_callbacks(frame_callbacks);
                     self.discard_presentation_feedbacks(presentation_feedbacks);
                     return;
                 };
@@ -768,6 +781,8 @@ impl CompositorState {
                         surface_commit_id,
                         commit_id,
                         surface_id,
+                        owner_client_id,
+                        surface_presentation_generation,
                         commit_sequence,
                         pending,
                         damage,
@@ -811,6 +826,7 @@ impl CompositorState {
             sync_state.post_error_with_metrics(
                 &mut self.compliance_metrics,
                 &mut self.protocol_error_trace,
+                &mut self.terminal_client_ids,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "explicit sync commit identity space exhausted",
             );
@@ -820,6 +836,14 @@ impl CompositorState {
         let mut callbacks =
             self.retain_oldest_pending_acquire_for_surface(surface_id, surface_commit_id);
         callbacks.extend(frame_callbacks);
+        let Some((owner_client_id, surface_presentation_generation)) =
+            self.capture_surface_publication_lifetime(surface_id)
+        else {
+            self.release_pending_surface_buffer(pending);
+            self.complete_frame_callbacks(callbacks);
+            self.discard_presentation_feedbacks(presentation_feedbacks);
+            return;
+        };
         self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
         let buffer_id = pending.resource.id().protocol_id();
         let received_at = Instant::now();
@@ -846,6 +870,8 @@ impl CompositorState {
                 surface_commit_id,
                 commit_id,
                 surface_id,
+                owner_client_id,
+                surface_presentation_generation,
                 commit_sequence,
                 pending,
                 damage,

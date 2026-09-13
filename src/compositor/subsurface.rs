@@ -77,41 +77,170 @@ pub(super) struct CapturedPointerConstraintCommit {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct CapturedPointerConstraintSurfaceTransition {
+    // The old effective constraint and the new requested mutation are
+    // independent: a replacement must carry both through one surface commit.
+    pub(super) retire: Option<CapturedPointerConstraintCommit>,
+    pub(super) install_or_update: Option<CapturedPointerConstraintCommit>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) enum CapturedPointerConstraintSurfaceState {
     #[default]
     NoChange,
     Mutation(CapturedPointerConstraintCommit),
+    Transition(CapturedPointerConstraintSurfaceTransition),
 }
 
 impl CapturedPointerConstraintSurfaceState {
     pub(super) fn merge(self, newer: Self) -> Self {
-        match (self, newer) {
-            (Self::NoChange, newer) | (newer, Self::NoChange) => newer,
-            (Self::Mutation(older), Self::Mutation(newer)) => {
-                if older.constraint_id != newer.constraint_id {
-                    return Self::Mutation(newer);
-                }
-                let lifecycle =
-                    merge_pointer_constraint_lifecycle(older.lifecycle, newer.lifecycle);
-                if lifecycle == PointerConstraintLifecycleCommit::Cancel {
-                    return Self::Mutation(CapturedPointerConstraintCommit {
-                        constraint_id: newer.constraint_id,
-                        lifecycle,
-                        region: PointerConstraintRegionCommit::NoChange,
-                        cursor_position_hint: PointerConstraintHintCommit::NoChange,
-                    });
-                }
-                Self::Mutation(CapturedPointerConstraintCommit {
-                    constraint_id: newer.constraint_id,
-                    lifecycle,
-                    region: merge_pointer_constraint_region(older.region, newer.region),
-                    cursor_position_hint: merge_pointer_constraint_hint(
-                        older.cursor_position_hint,
-                        newer.cursor_position_hint,
-                    ),
+        let Some(older) = self.into_transition() else {
+            return newer;
+        };
+        let Some(newer) = newer.into_transition() else {
+            return Self::from_transition(older);
+        };
+        Self::from_transition(merge_pointer_constraint_transition(older, newer))
+    }
+
+    fn from_transition(transition: CapturedPointerConstraintSurfaceTransition) -> Self {
+        match (transition.retire, transition.install_or_update) {
+            (None, None) => Self::NoChange,
+            (Some(retire), None) => Self::Mutation(retire),
+            (None, Some(install)) => Self::Mutation(install),
+            (Some(retire), Some(install)) => {
+                Self::Transition(CapturedPointerConstraintSurfaceTransition {
+                    retire: Some(retire),
+                    install_or_update: Some(install),
                 })
             }
         }
+    }
+
+    pub(super) fn into_transition(self) -> Option<CapturedPointerConstraintSurfaceTransition> {
+        match self {
+            Self::NoChange => None,
+            Self::Mutation(mutation) => Some(match mutation.lifecycle {
+                PointerConstraintLifecycleCommit::Remove => {
+                    CapturedPointerConstraintSurfaceTransition {
+                        retire: Some(mutation),
+                        install_or_update: None,
+                    }
+                }
+                PointerConstraintLifecycleCommit::Install
+                | PointerConstraintLifecycleCommit::NoChange
+                | PointerConstraintLifecycleCommit::Cancel => {
+                    CapturedPointerConstraintSurfaceTransition {
+                        retire: None,
+                        install_or_update: Some(mutation),
+                    }
+                }
+            }),
+            Self::Transition(transition) => Some(transition),
+        }
+    }
+}
+
+fn merge_pointer_constraint_transition(
+    mut older: CapturedPointerConstraintSurfaceTransition,
+    newer: CapturedPointerConstraintSurfaceTransition,
+) -> CapturedPointerConstraintSurfaceTransition {
+    if let Some(newer_retire) = newer.retire {
+        let retire_id = newer_retire.constraint_id;
+        let same_identity_install = older
+            .install_or_update
+            .as_ref()
+            .filter(|install| install.constraint_id == retire_id)
+            .cloned();
+        match same_identity_install {
+            Some(install) if install.lifecycle == PointerConstraintLifecycleCommit::Install => {
+                // The request was canceled before it became effective. Its
+                // protocol object is removed immediately, so there is no
+                // surface transition left for this install.
+                older.install_or_update = None;
+            }
+            Some(install) if install.lifecycle == PointerConstraintLifecycleCommit::NoChange => {
+                // A region/hint update belongs to the already-effective
+                // constraint, so its later destruction is a real retirement.
+                // Preserve those fields for retirement-only behavior (notably
+                // the oneshot cursor-hint warp), without carrying them into a
+                // replacement install.
+                let retirement = merge_pointer_constraint_mutation(install, newer_retire);
+                older.install_or_update = None;
+                if let Some(existing) = older.retire.as_mut() {
+                    if existing.constraint_id == retirement.constraint_id {
+                        *existing = merge_pointer_constraint_mutation(existing.clone(), retirement);
+                    } else {
+                        debug_assert_eq!(existing.constraint_id, retirement.constraint_id);
+                    }
+                } else {
+                    older.retire = Some(retirement);
+                }
+            }
+            Some(install) if install.lifecycle == PointerConstraintLifecycleCommit::Cancel => {
+                // A canceled request never owned effective surface state.
+                older.install_or_update = None;
+            }
+            Some(_) | None => {
+                if let Some(existing) = older.retire.as_mut() {
+                    if existing.constraint_id == retire_id {
+                        *existing =
+                            merge_pointer_constraint_mutation(existing.clone(), newer_retire);
+                    } else {
+                        // One effective constraint exists for a surface/seat
+                        // relationship. Keep the first retirement if malformed
+                        // input retires two IDs.
+                        debug_assert_eq!(existing.constraint_id, retire_id);
+                    }
+                } else {
+                    older.retire = Some(newer_retire);
+                }
+            }
+        }
+    }
+    if let Some(newer_install) = newer.install_or_update {
+        if newer_install.lifecycle == PointerConstraintLifecycleCommit::Cancel
+            && older
+                .install_or_update
+                .as_ref()
+                .is_some_and(|install| install.constraint_id == newer_install.constraint_id)
+        {
+            older.install_or_update = None;
+        } else {
+            older.install_or_update = Some(match older.install_or_update.take() {
+                Some(older_install)
+                    if older_install.constraint_id == newer_install.constraint_id =>
+                {
+                    merge_pointer_constraint_mutation(older_install, newer_install)
+                }
+                _ => newer_install,
+            });
+        }
+    }
+    older
+}
+
+fn merge_pointer_constraint_mutation(
+    older: CapturedPointerConstraintCommit,
+    newer: CapturedPointerConstraintCommit,
+) -> CapturedPointerConstraintCommit {
+    let lifecycle = merge_pointer_constraint_lifecycle(older.lifecycle, newer.lifecycle);
+    if lifecycle == PointerConstraintLifecycleCommit::Cancel {
+        return CapturedPointerConstraintCommit {
+            constraint_id: newer.constraint_id,
+            lifecycle,
+            region: PointerConstraintRegionCommit::NoChange,
+            cursor_position_hint: PointerConstraintHintCommit::NoChange,
+        };
+    }
+    CapturedPointerConstraintCommit {
+        constraint_id: newer.constraint_id,
+        lifecycle,
+        region: merge_pointer_constraint_region(older.region, newer.region),
+        cursor_position_hint: merge_pointer_constraint_hint(
+            older.cursor_position_hint,
+            newer.cursor_position_hint,
+        ),
     }
 }
 
@@ -530,6 +659,93 @@ mod window_geometry_tests {
     }
 
     #[test]
+    fn remove_and_install_different_constraints_preserve_both_sides() {
+        let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
+        cached.pointer_constraint_state = pointer_state(
+            22,
+            PointerConstraintLifecycleCommit::Remove,
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::NoChange,
+        );
+        let mut newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
+        newer.pointer_constraint_state = pointer_state(
+            23,
+            PointerConstraintLifecycleCommit::Install,
+            PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(vec![
+                InputRegionOp::Add(InputRegionRect::new(5, 6, 7, 8).unwrap()),
+            ])),
+            PointerConstraintHintCommit::Set((9.0, 10.0)),
+        );
+
+        cached.merge(newer);
+
+        assert_eq!(
+            cached.pointer_constraint_state,
+            CapturedPointerConstraintSurfaceState::Transition(
+                CapturedPointerConstraintSurfaceTransition {
+                    retire: Some(CapturedPointerConstraintCommit {
+                        constraint_id: 22,
+                        lifecycle: PointerConstraintLifecycleCommit::Remove,
+                        region: PointerConstraintRegionCommit::NoChange,
+                        cursor_position_hint: PointerConstraintHintCommit::NoChange,
+                    }),
+                    install_or_update: Some(CapturedPointerConstraintCommit {
+                        constraint_id: 23,
+                        lifecycle: PointerConstraintLifecycleCommit::Install,
+                        region: PointerConstraintRegionCommit::Set(SurfaceInputRegion::Custom(
+                            vec![InputRegionOp::Add(
+                                InputRegionRect::new(5, 6, 7, 8).unwrap()
+                            )],
+                        )),
+                        cursor_position_hint: PointerConstraintHintCommit::Set((9.0, 10.0)),
+                    }),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn canceled_replacement_does_not_lose_old_retirement() {
+        let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
+        cached.pointer_constraint_state = pointer_state(
+            22,
+            PointerConstraintLifecycleCommit::Remove,
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::NoChange,
+        );
+        let mut install = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(1, 2, 3, 4));
+        install.pointer_constraint_state = pointer_state(
+            23,
+            PointerConstraintLifecycleCommit::Install,
+            PointerConstraintRegionCommit::Set(SurfaceInputRegion::Default),
+            PointerConstraintHintCommit::Set((9.0, 10.0)),
+        );
+        cached.merge(install);
+        let mut cancel = cached_commit_with_window_geometry(3, XdgWindowGeometry::new(1, 2, 3, 4));
+        cancel.pointer_constraint_state = pointer_state(
+            23,
+            PointerConstraintLifecycleCommit::Cancel,
+            PointerConstraintRegionCommit::NoChange,
+            PointerConstraintHintCommit::NoChange,
+        );
+
+        cached.merge(cancel);
+
+        assert_eq!(
+            cached.pointer_constraint_state.into_transition(),
+            Some(CapturedPointerConstraintSurfaceTransition {
+                retire: Some(CapturedPointerConstraintCommit {
+                    constraint_id: 22,
+                    lifecycle: PointerConstraintLifecycleCommit::Remove,
+                    region: PointerConstraintRegionCommit::NoChange,
+                    cursor_position_hint: PointerConstraintHintCommit::NoChange,
+                }),
+                install_or_update: None,
+            })
+        );
+    }
+
+    #[test]
     fn newer_region_replaces_older_region_but_no_change_preserves_it() {
         let mut cached = cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 3, 4));
         cached.pointer_constraint_state = pointer_state(
@@ -640,12 +856,7 @@ mod window_geometry_tests {
 
         assert_eq!(
             cached.pointer_constraint_state,
-            CapturedPointerConstraintSurfaceState::Mutation(CapturedPointerConstraintCommit {
-                constraint_id: 22,
-                lifecycle: PointerConstraintLifecycleCommit::Cancel,
-                region: PointerConstraintRegionCommit::NoChange,
-                cursor_position_hint: PointerConstraintHintCommit::NoChange,
-            })
+            CapturedPointerConstraintSurfaceState::NoChange
         );
     }
 
@@ -1086,6 +1297,14 @@ impl SubsurfaceTransactionState {
                         PointerConstraintHintCommit::NoChange => None,
                     }
                 }
+                CapturedPointerConstraintSurfaceState::Transition(transition) => transition
+                    .install_or_update
+                    .as_ref()
+                    .filter(|captured| captured.constraint_id == constraint_id)
+                    .and_then(|captured| match &captured.cursor_position_hint {
+                        PointerConstraintHintCommit::Set(hint) => Some(*hint),
+                        PointerConstraintHintCommit::NoChange => None,
+                    }),
                 _ => None,
             })
     }

@@ -18,6 +18,10 @@ pub(in crate::compositor) struct SurfaceTreeAcquireDependency {
     pub(in crate::compositor) surface_commit_id: SurfaceCommitId,
     pub(in crate::compositor) commit_id: AcquireCommitId,
     pub(in crate::compositor) surface_id: u32,
+    // `None` is only used by synthetic legacy tests; production admissions
+    // always capture both values and therefore fail closed if either is absent.
+    pub(in crate::compositor) owner_client_id: Option<ClientId>,
+    pub(in crate::compositor) surface_presentation_generation: Option<u64>,
     pub(in crate::compositor) buffer_id: u32,
     pub(in crate::compositor) acquire: ExplicitSyncPoint,
     pub(in crate::compositor) state: PendingAcquireState,
@@ -58,6 +62,10 @@ pub(in crate::compositor) enum SurfacePublicationDecision {
     Publish,
     StaleAlreadyPublished,
     SupersededByNewerAttachment,
+    SurfaceGone,
+    OwnerGone,
+    TerminalClient,
+    StaleSurfaceGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +161,92 @@ impl PendingSurfaceTreeTransaction {
     }
 }
 
+impl SurfacePublicationDecision {
+    pub(in crate::compositor) const fn pipeline_rejection_reason(
+        self,
+    ) -> Option<SurfacePipelineRejectionReason> {
+        match self {
+            Self::Publish => None,
+            Self::StaleAlreadyPublished => Some(SurfacePipelineRejectionReason::AlreadyPublished),
+            Self::SupersededByNewerAttachment => {
+                Some(SurfacePipelineRejectionReason::SupersededByNewerAttachment)
+            }
+            Self::SurfaceGone => Some(SurfacePipelineRejectionReason::SurfaceGone),
+            Self::OwnerGone => Some(SurfacePipelineRejectionReason::OwnerGone),
+            Self::TerminalClient => Some(SurfacePipelineRejectionReason::TerminalClient),
+            Self::StaleSurfaceGeneration => {
+                Some(SurfacePipelineRejectionReason::StaleSurfaceGeneration)
+            }
+        }
+    }
+}
+
 impl CompositorState {
+    pub(in crate::compositor) fn surface_tree_async_publication_rejection(
+        &self,
+        transaction: &PendingSurfaceTreeTransaction,
+    ) -> Option<(u32, SurfacePublicationDecision)> {
+        let dependency = transaction.dependencies.first()?;
+        let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
+            return Some((
+                dependency.surface_id,
+                SurfacePublicationDecision::SurfaceGone,
+            ));
+        };
+        if let Some(rejection) =
+            self.async_surface_lifecycle_rejection(transaction.root_surface_id, owner_client_id)
+        {
+            return Some((transaction.root_surface_id, rejection));
+        }
+        let Some(root_owner) = self.surface_client_ids.get(&transaction.root_surface_id) else {
+            return Some((
+                transaction.root_surface_id,
+                SurfacePublicationDecision::SurfaceGone,
+            ));
+        };
+        if root_owner != owner_client_id {
+            return Some((
+                transaction.root_surface_id,
+                SurfacePublicationDecision::OwnerGone,
+            ));
+        }
+        for dependency in &transaction.dependencies {
+            let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
+                return Some((
+                    dependency.surface_id,
+                    SurfacePublicationDecision::SurfaceGone,
+                ));
+            };
+            let Some(surface_presentation_generation) = dependency.surface_presentation_generation
+            else {
+                return Some((
+                    dependency.surface_id,
+                    SurfacePublicationDecision::StaleSurfaceGeneration,
+                ));
+            };
+            if let Some(rejection) =
+                self.async_surface_lifecycle_rejection(dependency.surface_id, owner_client_id)
+            {
+                return Some((dependency.surface_id, rejection));
+            }
+            if self
+                .surface_presentation_generations
+                .get(&dependency.surface_id)
+                .copied()
+                != Some(surface_presentation_generation)
+            {
+                return Some((
+                    dependency.surface_id,
+                    SurfacePublicationDecision::StaleSurfaceGeneration,
+                ));
+            }
+            if owner_client_id != root_owner {
+                return Some((dependency.surface_id, SurfacePublicationDecision::OwnerGone));
+            }
+        }
+        None
+    }
+
     pub(in crate::compositor) fn allocate_surface_tree_transaction_id(
         &mut self,
     ) -> SurfaceTreeTransactionId {

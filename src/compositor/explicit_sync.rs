@@ -10,6 +10,7 @@ use wayland_protocols::wp::{
 };
 use wayland_server::{
     Resource, Weak,
+    backend::ClientId,
     protocol::{wl_callback, wl_surface},
 };
 
@@ -198,6 +199,8 @@ pub(super) struct PendingExplicitSyncCommit {
     pub(super) surface_commit_id: SurfaceCommitId,
     pub(super) commit_id: AcquireCommitId,
     pub(super) surface_id: u32,
+    pub(super) owner_client_id: ClientId,
+    pub(super) surface_presentation_generation: u64,
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) pending: PendingSurfaceBuffer,
     pub(super) damage: RenderableSurfaceDamage,
@@ -319,10 +322,12 @@ impl SyncobjSurfaceState {
         }
     }
 
+    #[allow(clippy::mutable_key_type)] // ClientId is the compositor's authoritative owner token.
     pub(super) fn post_error_with_metrics(
         &self,
         metrics: &mut CoreComplianceMetrics,
         trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<ClientId>,
         code: u32,
         message: &str,
     ) {
@@ -338,6 +343,9 @@ impl SyncobjSurfaceState {
                     Some(resource.id().protocol_id()),
                 )
             });
+        if let Some(client_id) = client_id.as_ref() {
+            terminal_client_ids.insert(client_id.clone());
+        }
         trace.record(ProtocolErrorRecord {
             timestamp_ns: protocol_error_timestamp_ns(),
             client_id,

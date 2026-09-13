@@ -1822,12 +1822,34 @@ impl CompositorState {
             self.release_resize_capture(surface_id, commit_sequence);
         }
         for mut commit in ready {
-            let decision = self.surface_publication_decision(
+            let decision = self.async_surface_publication_decision(
                 commit.surface_id,
+                &commit.owner_client_id,
+                commit.surface_presentation_generation,
                 commit.commit_sequence,
                 SurfacePublicationContext::OrderedExplicitSyncQueue,
             );
             if decision != SurfacePublicationDecision::Publish {
+                if matches!(
+                    decision,
+                    SurfacePublicationDecision::SurfaceGone
+                        | SurfacePublicationDecision::OwnerGone
+                        | SurfacePublicationDecision::TerminalClient
+                        | SurfacePublicationDecision::StaleSurfaceGeneration
+                ) {
+                    self.trace_surface_pipeline_event_with_reason(
+                        SurfacePipelineEvent::AcquireReadyDiscarded,
+                        commit.surface_id,
+                        commit.commit_sequence,
+                        Some(commit.pending.data.buffer_id().get()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        decision.pipeline_rejection_reason(),
+                    );
+                }
                 self.record_surface_publication_rejection(
                     commit.surface_id,
                     commit.commit_sequence,

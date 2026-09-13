@@ -89,6 +89,10 @@ impl CompositorState {
         });
     }
 
+    pub(in crate::compositor) fn mark_client_terminal(&mut self, client_id: ClientId) {
+        self.terminal_client_ids.insert(client_id);
+    }
+
     pub(in crate::compositor) fn note_protocol_error_for_resource<I: Resource>(
         &mut self,
         client: &Client,
@@ -154,6 +158,10 @@ impl CompositorState {
         let client_id = client.id();
         let code = code.into();
         let message = message.into();
+        // wayland-server kills the wire from inside post_error, while Typhon
+        // drains the resulting disconnected-client notification later in the
+        // dispatch cycle. Make that interval non-publishable immediately.
+        self.mark_client_terminal(client_id.clone());
         self.note_protocol_error_for_resource(
             client,
             resource,
@@ -188,6 +196,8 @@ impl CompositorState {
             );
         }
         let renderables_removed = renderables_before.saturating_sub(self.renderable_surfaces.len());
+
+        self.terminal_client_ids.remove(client_id);
 
         ClientTeardownSummary {
             surfaces_removed,

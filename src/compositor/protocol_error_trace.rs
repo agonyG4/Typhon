@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
 
     fn record(
         interface: ProtocolErrorInterface,
@@ -85,6 +86,14 @@ mod tests {
         ));
         assert_eq!(trace.len(), 0);
     }
+
+    #[test]
+    fn pointer_constraints_manager_errors_are_classified_explicitly() {
+        assert_eq!(
+            ProtocolErrorInterface::for_resource::<ZwpPointerConstraintsV1>(),
+            ProtocolErrorInterface::PointerConstraints
+        );
+    }
 }
 use std::{any::type_name, collections::VecDeque, sync::OnceLock, time::Instant};
 
@@ -95,6 +104,7 @@ pub(crate) const PROTOCOL_ERROR_TRACE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProtocolErrorInterface {
     CoreSurface,
+    PointerConstraints,
     XdgShell,
     XwaylandShell,
     Syncobj,
@@ -110,6 +120,8 @@ impl ProtocolErrorInterface {
         let name = type_name::<I>();
         if name.contains("WlSurface") {
             Self::CoreSurface
+        } else if name.contains("PointerConstraints") {
+            Self::PointerConstraints
         } else if name.contains("Xwayland") {
             Self::XwaylandShell
         } else if name.contains("Syncobj") || name.contains("DrmSyncobj") {

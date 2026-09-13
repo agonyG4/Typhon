@@ -307,6 +307,64 @@ impl CompositorState {
         }
         SurfacePublicationDecision::Publish
     }
+
+    pub(in crate::compositor) fn async_surface_publication_decision(
+        &self,
+        surface_id: u32,
+        owner_client_id: &ClientId,
+        surface_presentation_generation: u64,
+        commit_sequence: SurfaceCommitSequence,
+        context: SurfacePublicationContext,
+    ) -> SurfacePublicationDecision {
+        if let Some(rejection) = self.async_surface_lifecycle_rejection(surface_id, owner_client_id)
+        {
+            return rejection;
+        }
+        if self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+            != Some(surface_presentation_generation)
+        {
+            return SurfacePublicationDecision::StaleSurfaceGeneration;
+        }
+        self.surface_publication_decision(surface_id, commit_sequence, context)
+    }
+
+    pub(in crate::compositor) fn async_surface_lifecycle_rejection(
+        &self,
+        surface_id: u32,
+        owner_client_id: &ClientId,
+    ) -> Option<SurfacePublicationDecision> {
+        if self.terminal_client_ids.contains(owner_client_id) {
+            return Some(SurfacePublicationDecision::TerminalClient);
+        }
+        let Some(current_owner) = self.surface_client_ids.get(&surface_id) else {
+            return Some(SurfacePublicationDecision::SurfaceGone);
+        };
+        if current_owner != owner_client_id {
+            return Some(SurfacePublicationDecision::OwnerGone);
+        }
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            return Some(SurfacePublicationDecision::SurfaceGone);
+        };
+        if !surface.is_alive() || surface.client().is_none() {
+            return Some(SurfacePublicationDecision::OwnerGone);
+        }
+        None
+    }
+
+    pub(in crate::compositor) fn capture_surface_publication_lifetime(
+        &self,
+        surface_id: u32,
+    ) -> Option<(ClientId, u64)> {
+        Some((
+            self.surface_client_ids.get(&surface_id)?.clone(),
+            self.surface_presentation_generations
+                .get(&surface_id)
+                .copied()?,
+        ))
+    }
     pub(in crate::compositor) fn record_surface_publication(
         &mut self,
         surface_id: u32,
@@ -379,6 +437,20 @@ impl CompositorState {
             .resize_flow_metrics
             .surface_content_stale_rejections
             .saturating_add(1);
+        if let Some(reason) = decision.pipeline_rejection_reason() {
+            self.trace_surface_pipeline_event_with_reason(
+                SurfacePipelineEvent::PublicationRejected,
+                surface_id,
+                commit_sequence,
+                buffer_id.map(BufferId::get),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(reason),
+            );
+        }
         if source == SurfacePublicationSource::SurfaceTree {
             self.subsurface_transaction_metrics
                 .surface_tree_stale_rejections = self
@@ -402,13 +474,10 @@ impl CompositorState {
                 state
                     .latest_attachment_received
                     .map(SurfaceCommitSequence::get),
-                match decision {
-                    SurfacePublicationDecision::Publish => "publish",
-                    SurfacePublicationDecision::StaleAlreadyPublished => "reject_stale",
-                    SurfacePublicationDecision::SupersededByNewerAttachment => {
-                        "reject_superseded_attachment"
-                    }
-                },
+                decision
+                    .pipeline_rejection_reason()
+                    .map(SurfacePipelineRejectionReason::as_str)
+                    .unwrap_or("publish"),
             );
         }
     }
@@ -1377,8 +1446,20 @@ impl CompositorState {
 
 #[cfg(test)]
 mod ordered_publication_tests {
+    use std::os::unix::net::UnixStream;
+
     use super::*;
     use crate::render_backend::buffer::CommittedSurfaceBuffer;
+
+    fn test_client_id() -> ClientId {
+        let (stream, _peer) = UnixStream::pair().expect("test client socket");
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        display
+            .handle()
+            .insert_client(stream, Arc::new(()))
+            .expect("test client")
+            .id()
+    }
 
     fn test_cursor_surface(
         surface_id: u32,
@@ -1434,6 +1515,44 @@ mod ordered_publication_tests {
                 SurfacePublicationContext::ImmediateLatestAttachment,
             ),
             SurfacePublicationDecision::SupersededByNewerAttachment
+        );
+    }
+
+    #[test]
+    fn async_publication_rejects_terminal_owner_before_surface_lookup() {
+        let mut state = CompositorState {
+            surface_pipeline_trace:
+                crate::compositor::surface_pipeline_trace::SurfacePipelineTrace::new(true, 8),
+            ..Default::default()
+        };
+        let client_id = test_client_id();
+        state.mark_client_terminal(client_id.clone());
+
+        let decision = state.async_surface_publication_decision(
+            150,
+            &client_id,
+            1,
+            SurfaceCommitSequence(1),
+            SurfacePublicationContext::OrderedExplicitSyncQueue,
+        );
+        assert_eq!(decision, SurfacePublicationDecision::TerminalClient);
+        assert!(state.renderable_surface(150).is_none());
+
+        state.record_surface_publication_rejection(
+            150,
+            SurfaceCommitSequence(1),
+            None,
+            SurfacePublicationSource::ExplicitSync,
+            decision,
+        );
+        let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
+        let rejection = records
+            .iter()
+            .find(|record| record.kind == SurfacePipelineEvent::PublicationRejected)
+            .expect("terminal rejection must be traceable");
+        assert_eq!(
+            rejection.rejection_reason,
+            Some(SurfacePipelineRejectionReason::TerminalClient)
         );
     }
 

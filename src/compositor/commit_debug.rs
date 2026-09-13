@@ -91,7 +91,11 @@ impl ExplicitSyncCommitMetrics {
                     .unready_commits_rejected_newer_attachment
                     .saturating_add(1);
             }
-            (_, super::SurfacePublicationDecision::Publish) => {}
+            (_, super::SurfacePublicationDecision::Publish)
+            | (_, super::SurfacePublicationDecision::SurfaceGone)
+            | (_, super::SurfacePublicationDecision::OwnerGone)
+            | (_, super::SurfacePublicationDecision::TerminalClient)
+            | (_, super::SurfacePublicationDecision::StaleSurfaceGeneration) => {}
         }
     }
 }
@@ -491,6 +495,12 @@ impl super::CompositorState {
                     super::SurfacePublicationDecision::StaleAlreadyPublished => "stale",
                     super::SurfacePublicationDecision::SupersededByNewerAttachment =>
                         "newer_attachment",
+                    super::SurfacePublicationDecision::SurfaceGone => "surface_gone",
+                    super::SurfacePublicationDecision::OwnerGone => "owner_gone",
+                    super::SurfacePublicationDecision::TerminalClient => "terminal_client",
+                    super::SurfacePublicationDecision::StaleSurfaceGeneration => {
+                        "stale_surface_generation"
+                    }
                 },
                 latest_published
                     .map_or_else(|| "none".to_string(), |value| value.get().to_string()),

@@ -1309,6 +1309,8 @@ mod tests {
                         surface_commit_id: SurfaceCommitId::for_tests(index as u64 + 20),
                         commit_id: AcquireCommitId::for_tests(index as u64 + 30),
                         surface_id,
+                        owner_client_id: None,
+                        surface_presentation_generation: None,
                         buffer_id: index + 40,
                         acquire: ExplicitSyncPoint::for_tests_with_signal_script(
                             index + 50,

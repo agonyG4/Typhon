@@ -89,6 +89,63 @@ impl CompositorState {
                 break;
             };
             let transaction = transactions.remove(index);
+            if let Some((surface_id, decision)) =
+                self.surface_tree_async_publication_rejection(&transaction)
+            {
+                let (commit_sequence, buffer_id) = transaction
+                    .nodes
+                    .iter()
+                    .find(|(node_surface_id, _)| *node_surface_id == surface_id)
+                    .map_or((SurfaceCommitSequence::initial(), None), |(_, commit)| {
+                        (
+                            commit.commit_sequence,
+                            commit
+                                .attachment
+                                .as_ref()
+                                .and_then(|attachment| match attachment {
+                                    PendingSurfaceAttachment::Buffer(buffer) => {
+                                        Some(buffer.data.buffer_id())
+                                    }
+                                    PendingSurfaceAttachment::RemoveContent => None,
+                                }),
+                        )
+                    });
+                if matches!(
+                    decision,
+                    SurfacePublicationDecision::SurfaceGone
+                        | SurfacePublicationDecision::OwnerGone
+                        | SurfacePublicationDecision::TerminalClient
+                        | SurfacePublicationDecision::StaleSurfaceGeneration
+                ) {
+                    let has_node = transaction
+                        .nodes
+                        .iter()
+                        .any(|(node_surface_id, _)| *node_surface_id == surface_id);
+                    if has_node {
+                        self.trace_surface_pipeline_event_with_reason(
+                            SurfacePipelineEvent::AcquireReadyDiscarded,
+                            surface_id,
+                            commit_sequence,
+                            buffer_id.map(BufferId::get),
+                            None,
+                            Some(transaction.id.get()),
+                            None,
+                            None,
+                            None,
+                            decision.pipeline_rejection_reason(),
+                        );
+                    }
+                }
+                self.record_surface_publication_rejection(
+                    surface_id,
+                    commit_sequence,
+                    buffer_id,
+                    SurfacePublicationSource::SurfaceTree,
+                    decision,
+                );
+                self.discard_surface_tree_transaction(transaction);
+                continue;
+            }
             pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();
             let mut transaction = transaction;
             if let Some(readiness) = transaction.commit_timing_readiness {
@@ -159,7 +216,7 @@ impl CompositorState {
                     None,
                 );
             }
-            self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
+            self.publish_surface_tree_nodes(transaction);
         }
         self.pending_surface_tree_transactions = transactions;
         if pacing_deadline_changed {

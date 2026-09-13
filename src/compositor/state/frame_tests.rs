@@ -4,8 +4,19 @@ use crate::wm::{WindowManagementState, WorkspaceId, WorkspaceLocation};
 #[cfg(test)]
 mod frame_consumption_tests {
     use std::num::NonZeroU64;
+    use std::os::unix::net::UnixStream;
 
     use super::*;
+
+    fn test_client_id() -> ClientId {
+        let (stream, _peer) = UnixStream::pair().expect("test client socket");
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        display
+            .handle()
+            .insert_client(stream, Arc::new(()))
+            .expect("test client")
+            .id()
+    }
 
     #[test]
     fn empty_submitted_frame_batch_is_still_owned_until_completion() {
@@ -113,6 +124,8 @@ mod frame_consumption_tests {
                     surface_commit_id: SurfaceCommitId::for_tests(7),
                     commit_id: AcquireCommitId::for_tests(8),
                     surface_id: 9,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
                     buffer_id: 10,
                     acquire: ExplicitSyncPoint::for_tests_with_signal_script(11, 12, [false]),
                     state: PendingAcquireState::EventfdBacked,
@@ -156,6 +169,8 @@ mod frame_consumption_tests {
                     surface_commit_id: SurfaceCommitId::for_tests(9),
                     commit_id: AcquireCommitId::for_tests(10),
                     surface_id: 10,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
                     buffer_id: 11,
                     acquire: ExplicitSyncPoint::for_tests_with_signal_script(12, 13, [false]),
                     state: PendingAcquireState::EventfdBacked,
@@ -182,6 +197,59 @@ mod frame_consumption_tests {
                 .map(|transaction| transaction.id)
                 .collect::<Vec<_>>(),
             vec![blocked_id]
+        );
+    }
+
+    #[test]
+    fn terminal_surface_tree_transaction_is_discarded_without_watcher_cancel() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            surface_pipeline_trace:
+                crate::compositor::surface_pipeline_trace::SurfacePipelineTrace::new(true, 16),
+            ..Default::default()
+        };
+        let client_id = test_client_id();
+        state.mark_client_terminal(client_id.clone());
+        let mut node = empty_cached_subsurface_commit();
+        node.commit_sequence = SurfaceCommitSequence(1);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(101),
+                root_surface_id: 150,
+                nodes: vec![(150, node)],
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(102),
+                    commit_id: AcquireCommitId::for_tests(103),
+                    surface_id: 150,
+                    owner_client_id: Some(client_id),
+                    surface_presentation_generation: Some(1),
+                    buffer_id: 308,
+                    acquire: ExplicitSyncPoint::for_tests_with_signal_script(104, 105, [true]),
+                    state: PendingAcquireState::Ready,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert!(state.renderable_surface(150).is_none());
+        assert!(state.pending_acquire_watch_changes.is_empty());
+        let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
+        assert!(records.iter().any(|record| {
+            record.kind == SurfacePipelineEvent::AcquireReadyDiscarded
+                && record.rejection_reason == Some(SurfacePipelineRejectionReason::TerminalClient)
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == SurfacePipelineEvent::PublicationRejected
+                && record.rejection_reason == Some(SurfacePipelineRejectionReason::TerminalClient)
+        }));
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.kind == SurfacePipelineEvent::TransactionPromoted)
         );
     }
 
@@ -354,6 +422,8 @@ mod frame_consumption_tests {
                     surface_commit_id: SurfaceCommitId::for_tests(22),
                     commit_id: AcquireCommitId::for_tests(23),
                     surface_id: 21,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
                     buffer_id: 24,
                     acquire,
                     state: PendingAcquireState::EventfdBacked,
@@ -437,6 +507,8 @@ mod frame_consumption_tests {
                     surface_commit_id: SurfaceCommitId::for_tests(16),
                     commit_id,
                     surface_id: 15,
+                    owner_client_id: None,
+                    surface_presentation_generation: None,
                     buffer_id: 17,
                     acquire: acquire.clone(),
                     state: PendingAcquireState::EventfdBacked,
