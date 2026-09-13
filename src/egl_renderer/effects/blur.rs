@@ -3,12 +3,12 @@ use oblivion_one::effects::{EffectRect, EffectValidationError};
 pub(crate) const DUAL_KAWASE_VERTEX_SHADER: &str = r#"#version 300 es
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_uv;
-uniform int u_effect_origin_bottom_left;
+uniform int u_effect_flip_y;
 out vec2 v_uv;
 
 void main() {
     gl_Position = vec4(a_position, 0.0, 1.0);
-    v_uv = u_effect_origin_bottom_left != 0 ? a_uv : vec2(a_uv.x, 1.0 - a_uv.y);
+    v_uv = u_effect_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv;
 }
 "#;
 
@@ -130,5 +130,15 @@ mod tests {
         assert!(DUAL_KAWASE_DOWNSAMPLE_SHADER.contains("u_effect_blur_radius"));
         assert!(DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER.contains("u_effect_blur_radius"));
         assert!(!DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER.contains("typhon_srgb_to_linear"));
+    }
+
+    #[test]
+    fn effect_vertex_shader_uses_explicit_y_flip_semantics() {
+        assert!(DUAL_KAWASE_VERTEX_SHADER.contains("uniform int u_effect_flip_y;"));
+        assert!(
+            DUAL_KAWASE_VERTEX_SHADER
+                .contains("u_effect_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv")
+        );
+        assert!(!DUAL_KAWASE_VERTEX_SHADER.contains("u_effect_origin_bottom_left"));
     }
 }

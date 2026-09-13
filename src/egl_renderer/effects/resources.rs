@@ -500,6 +500,24 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         texture: &PooledEffectTexture,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.bind_render_target_to(gl, texture, glow::FRAMEBUFFER)
+            .map(|_| ())
+    }
+
+    pub(crate) fn bind_draw_target(
+        &mut self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+    ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
+        self.bind_render_target_to(gl, texture, glow::DRAW_FRAMEBUFFER)
+    }
+
+    fn bind_render_target_to(
+        &mut self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+        framebuffer_target: u32,
+    ) -> Result<glow::Framebuffer, Box<dyn std::error::Error>> {
         let gl_texture = self
             .texture(texture)
             .ok_or_else(|| io::Error::other("effect texture was not realized"))?;
@@ -511,20 +529,20 @@ impl EffectGlResourceCache {
             framebuffer
         };
         unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+            gl.bind_framebuffer(framebuffer_target, Some(framebuffer));
             gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
+                framebuffer_target,
                 glow::COLOR_ATTACHMENT0,
                 glow::TEXTURE_2D,
                 Some(gl_texture),
                 0,
             );
-            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if gl.check_framebuffer_status(framebuffer_target) != glow::FRAMEBUFFER_COMPLETE {
+                gl.bind_framebuffer(framebuffer_target, None);
                 return Err(io::Error::other("effect framebuffer is incomplete").into());
             }
         }
-        Ok(())
+        Ok(framebuffer)
     }
 
     pub(crate) fn unbind_render_target(&self, gl: &glow::Context) {

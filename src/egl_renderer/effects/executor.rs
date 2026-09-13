@@ -940,6 +940,7 @@ fn execute_fullscreen_stage(
     );
     let program = renderer.effect_shaders.lookup(shader_key)?;
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
+    let flip_y = effect_input_requires_y_flip(input_plan.origin, false, framebuffer_origin);
     unsafe {
         renderer
             .gl
@@ -951,15 +952,11 @@ fn execute_fullscreen_stage(
             &renderer.gl,
             shader_key,
             program,
-            "u_effect_origin_bottom_left",
+            "u_effect_flip_y",
         ) {
-            renderer.gl.uniform_1_i32(
-                Some(&location),
-                i32::from(matches!(
-                    input_plan.origin,
-                    oblivion_one::effects::GraphTextureOrigin::BottomLeft
-                )),
-            );
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(flip_y));
         }
         renderer.gl.active_texture(glow::TEXTURE0);
         renderer
@@ -1458,71 +1455,11 @@ fn execute_capture(
         .capture_pixels
         .saturating_add(u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height)));
     if lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture {
-        let target_texture = renderer
-            .effect_resources
-            .texture(target)
-            .ok_or_else(|| io::Error::other("lifecycle backdrop texture was not realized"))?;
-        let source_x = target_plan.domain.x.max(0);
-        let source_y = match framebuffer_origin {
-            OutputFramebufferOrigin::BottomLeft => target_plan.domain.y.max(0),
-            OutputFramebufferOrigin::TopLeftScanout => renderer
-                .current_size
-                .1
-                .saturating_sub(target_plan.domain.bottom().max(0) as u32)
-                as i32,
-        };
-        renderer.bind_active_output_framebuffer();
-        unsafe {
-            renderer
-                .gl
-                .bind_texture(glow::TEXTURE_2D, Some(target_texture));
-            renderer.gl.copy_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                source_x,
-                source_y,
-                target_plan.width as i32,
-                target_plan.height as i32,
-            );
-            renderer.gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        restore_output_viewport(renderer);
+        capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
         return Ok(());
     }
     if !pass.checkpoint_dependencies.is_empty() {
-        let target_texture = renderer
-            .effect_resources
-            .texture(target)
-            .ok_or_else(|| io::Error::other("checkpoint texture was not realized"))?;
-        let source_x = target_plan.domain.x.max(0);
-        let source_y = match framebuffer_origin {
-            OutputFramebufferOrigin::BottomLeft => target_plan.domain.y.max(0),
-            OutputFramebufferOrigin::TopLeftScanout => renderer
-                .current_size
-                .1
-                .saturating_sub(target_plan.domain.bottom().max(0) as u32)
-                as i32,
-        };
-        renderer.bind_active_output_framebuffer();
-        unsafe {
-            renderer
-                .gl
-                .bind_texture(glow::TEXTURE_2D, Some(target_texture));
-            renderer.gl.copy_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                source_x,
-                source_y,
-                target_plan.width as i32,
-                target_plan.height as i32,
-            );
-            renderer.gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        restore_output_viewport(renderer);
+        capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
         return Ok(());
     }
     renderer
@@ -1611,6 +1548,136 @@ fn execute_capture(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlBlitRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphTextureCaptureBlit {
+    source: GlBlitRect,
+    destination: GlBlitRect,
+}
+
+fn effect_input_requires_y_flip(
+    input_origin: oblivion_one::effects::GraphTextureOrigin,
+    output_is_framebuffer: bool,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> bool {
+    let input_is_bottom_left = matches!(
+        input_origin,
+        oblivion_one::effects::GraphTextureOrigin::BottomLeft
+    );
+    if !output_is_framebuffer {
+        return input_is_bottom_left;
+    }
+    match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => input_is_bottom_left,
+        OutputFramebufferOrigin::TopLeftScanout => !input_is_bottom_left,
+    }
+}
+
+fn plan_graph_texture_capture(
+    output_size: (u32, u32),
+    domain: oblivion_one::effects::EffectRect,
+    target_size: (u32, u32),
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Option<GraphTextureCaptureBlit> {
+    if target_size.0 == 0 || target_size.1 == 0 || domain.x < 0 || domain.y < 0 {
+        return None;
+    }
+    let domain_right = i64::from(domain.x).checked_add(i64::from(domain.width))?;
+    let domain_bottom = i64::from(domain.y).checked_add(i64::from(domain.height))?;
+    if domain_right > i64::from(output_size.0) || domain_bottom > i64::from(output_size.1) {
+        return None;
+    }
+    let source_y = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => {
+            i64::from(output_size.1).checked_sub(domain_bottom)?
+        }
+        OutputFramebufferOrigin::TopLeftScanout => i64::from(domain.y),
+    };
+    let source = GlBlitRect {
+        x0: domain.x,
+        y0: i32::try_from(source_y).ok()?,
+        x1: i32::try_from(domain_right).ok()?,
+        y1: i32::try_from(source_y.checked_add(i64::from(domain.height))?).ok()?,
+    };
+    let target_width = i32::try_from(target_size.0).ok()?;
+    let target_height = i32::try_from(target_size.1).ok()?;
+    let destination = match framebuffer_origin {
+        OutputFramebufferOrigin::BottomLeft => GlBlitRect {
+            x0: 0,
+            y0: 0,
+            x1: target_width,
+            y1: target_height,
+        },
+        OutputFramebufferOrigin::TopLeftScanout => GlBlitRect {
+            x0: 0,
+            y0: target_height,
+            x1: target_width,
+            y1: 0,
+        },
+    };
+    Some(GraphTextureCaptureBlit {
+        source,
+        destination,
+    })
+}
+
+/// Capture a logical output domain into a graph texture with the canonical
+/// `GraphTextureOrigin::BottomLeft` orientation.
+fn capture_output_region_to_graph_texture(
+    renderer: &mut GlesSceneRenderer,
+    target: &PooledEffectTexture,
+    target_plan: &oblivion_one::effects::GraphTexturePlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> RendererResult<()> {
+    if target_plan.origin != oblivion_one::effects::GraphTextureOrigin::BottomLeft {
+        return Err(io::Error::other("direct capture target is not bottom-left oriented").into());
+    }
+    let transfer = plan_graph_texture_capture(
+        renderer.current_size,
+        target_plan.domain,
+        (target_plan.width, target_plan.height),
+        framebuffer_origin,
+    )
+    .ok_or_else(|| io::Error::other("direct capture domain is outside the output"))?;
+    let result = (|| {
+        renderer.bind_active_output_framebuffer();
+        let draw_framebuffer = renderer
+            .effect_resources
+            .bind_draw_target(&renderer.gl, target)?;
+        unsafe {
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer
+                .gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, renderer.active_output_framebuffer);
+            renderer
+                .gl
+                .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw_framebuffer));
+            renderer.gl.blit_framebuffer(
+                transfer.source.x0,
+                transfer.source.y0,
+                transfer.source.x1,
+                transfer.source.y1,
+                transfer.destination.x0,
+                transfer.destination.y0,
+                transfer.destination.x1,
+                transfer.destination.y1,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+        }
+        Ok(())
+    })();
+    renderer.establish_ordinary_scene_state();
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_fullscreen_pass(
     renderer: &mut GlesSceneRenderer,
@@ -1685,6 +1752,8 @@ fn execute_fullscreen_pass(
     );
     let program = renderer.effect_shaders.lookup(shader_key)?;
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
+    let flip_y =
+        effect_input_requires_y_flip(input_plan.origin, output_is_framebuffer, framebuffer_origin);
     unsafe {
         renderer.gl.use_program(Some(program));
         if let Some(location) = uniform_location(
@@ -1692,15 +1761,11 @@ fn execute_fullscreen_pass(
             &renderer.gl,
             shader_key,
             program,
-            "u_effect_origin_bottom_left",
+            "u_effect_flip_y",
         ) {
-            renderer.gl.uniform_1_i32(
-                Some(&location),
-                i32::from(
-                    !output_is_framebuffer
-                        || framebuffer_origin == OutputFramebufferOrigin::BottomLeft,
-                ),
-            );
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(flip_y));
         }
         renderer.gl.active_texture(glow::TEXTURE0);
         renderer
@@ -2045,6 +2110,89 @@ mod coordinate_tests {
     }
 
     #[test]
+    fn effect_input_flip_y_matches_graph_and_output_orientation_contract() {
+        use oblivion_one::effects::GraphTextureOrigin;
+
+        assert!(effect_input_requires_y_flip(
+            GraphTextureOrigin::BottomLeft,
+            false,
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(effect_input_requires_y_flip(
+            GraphTextureOrigin::BottomLeft,
+            false,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ));
+        assert!(effect_input_requires_y_flip(
+            GraphTextureOrigin::BottomLeft,
+            true,
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(!effect_input_requires_y_flip(
+            GraphTextureOrigin::BottomLeft,
+            true,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ));
+    }
+
+    #[test]
+    fn direct_capture_transfer_selects_and_normalizes_each_output_origin() {
+        let domain = oblivion_one::effects::EffectRect::new(8, 10, 20, 20).unwrap();
+
+        let bottom_left = plan_graph_texture_capture(
+            (100, 100),
+            domain,
+            (20, 20),
+            OutputFramebufferOrigin::BottomLeft,
+        )
+        .expect("bottom-left capture domain should be valid");
+        assert_eq!(
+            bottom_left.source,
+            GlBlitRect {
+                x0: 8,
+                y0: 70,
+                x1: 28,
+                y1: 90,
+            }
+        );
+        assert_eq!(
+            bottom_left.destination,
+            GlBlitRect {
+                x0: 0,
+                y0: 0,
+                x1: 20,
+                y1: 20,
+            }
+        );
+
+        let top_left = plan_graph_texture_capture(
+            (100, 100),
+            domain,
+            (20, 20),
+            OutputFramebufferOrigin::TopLeftScanout,
+        )
+        .expect("top-left capture domain should be valid");
+        assert_eq!(
+            top_left.source,
+            GlBlitRect {
+                x0: 8,
+                y0: 10,
+                x1: 28,
+                y1: 30,
+            }
+        );
+        assert_eq!(
+            top_left.destination,
+            GlBlitRect {
+                x0: 0,
+                y0: 20,
+                x1: 20,
+                y1: 0,
+            }
+        );
+    }
+
+    #[test]
     fn disjoint_damage_rectangles_preserve_their_hole() {
         let target = target(
             GraphTextureSource::Intermediate,
@@ -2084,6 +2232,52 @@ mod coordinate_tests {
                 oblivion_one::compositor::EffectAnchor::AfterSurface(20),
             ),
             3
+        );
+    }
+
+    #[test]
+    fn checkpoint_backdrop_capture_preserves_before_surface_exclusion() {
+        let command = |layer| EglDrawCommand {
+            layer,
+            visual_group: None,
+            bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::SolidRgba(0xff22_2222)),
+            command(EglDrawLayer::Surface(10)),
+            command(EglDrawLayer::Surface(20)),
+        ];
+        let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(20);
+        let (draw_end, _) = composition_range(
+            &commands,
+            anchor,
+            None,
+            oblivion_one::compositor::EffectAnchorScope::Surface,
+        );
+        assert_eq!(draw_end, 2, "checkpoint scene must stop before target");
+
+        let layers = commands
+            .iter()
+            .map(|command| match command.layer {
+                EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+                _ => capture::CaptureLayer::Other,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            capture::indices_for_capture(
+                &layers,
+                &[None; 3],
+                anchor,
+                false,
+                None,
+                oblivion_one::compositor::EffectAnchorScope::Surface,
+            ),
+            vec![0, 1],
+            "direct checkpoint capture must not include target surface"
         );
     }
 
