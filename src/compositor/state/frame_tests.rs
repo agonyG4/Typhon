@@ -275,6 +275,98 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn terminal_pending_explicit_sync_commit_is_discarded_before_teardown() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..Default::default()
+        };
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
+        let owner_client_id = client.id();
+        let buffer_data = ShmBufferData {
+            identity: state.allocate_buffer_identity().expect("buffer identity"),
+            pool: Arc::new(ShmPoolData::new(
+                Arc::new(std::fs::File::open("/dev/null").expect("test file")),
+                4,
+            )),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: wayland_server::WEnum::Value(wl_shm::Format::Argb8888),
+        };
+        let buffer = client
+            .create_resource::<wl_buffer::WlBuffer, ShmBufferData, CompositorState>(
+                &display_handle,
+                2,
+                buffer_data.clone(),
+            )
+            .expect("buffer resource");
+        let callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(&display_handle, 3, ())
+            .expect("frame callback resource");
+        let acquire = ExplicitSyncPoint::for_tests_with_signal_script(301, 302, [true]);
+        let commit_id = AcquireCommitId::for_tests(303);
+        state
+            .pending_explicit_sync_commits
+            .push(PendingExplicitSyncCommit {
+                surface_commit_id: SurfaceCommitId::for_tests(304),
+                commit_id,
+                surface_id,
+                owner_client_id: owner_client_id.clone(),
+                surface_presentation_generation: 1,
+                commit_sequence: SurfaceCommitSequence(1),
+                pending: PendingSurfaceBuffer {
+                    resource: buffer,
+                    data: PendingBufferData::Shm(buffer_data),
+                    x: 0,
+                    y: 0,
+                    explicit_release: None,
+                    surface_size: Some(BufferSize::new(1, 1).expect("buffer size")),
+                    viewport_source: None,
+                    viewport_destination: None,
+                    buffer_scale: 1,
+                    commit_sequence: SurfaceCommitSequence(1),
+                    resize_commit: None,
+                    resize_capture_finalized: false,
+                    buffer_transform: wl_output::Transform::Normal,
+                    opaque_region: SurfaceOpaqueRegion::None,
+                },
+                damage: RenderableSurfaceDamage::Full,
+                window_geometry: None,
+                frame_callbacks: vec![callback.clone()],
+                presentation_feedbacks: Vec::new(),
+                acquire: acquire.clone(),
+                acquire_state: PendingAcquireState::EventfdBacked,
+            });
+        state.rebuild_scene_work_index();
+        assert_eq!(state.pending_explicit_sync_commits.len(), 1);
+
+        state.post_protocol_error_deferred(
+            &client,
+            &surface,
+            1u32,
+            "test fatal error before normal client teardown",
+        );
+        assert!(state.terminal_client_ids.contains(&owner_client_id));
+        assert!(state.mark_acquire_commit_ready(commit_id, surface_id, &acquire));
+        state.commit_ready_explicit_sync_buffers();
+
+        assert!(state.pending_explicit_sync_commits.is_empty());
+        assert!(state.renderable_surface(surface_id).is_none());
+        assert!(!state.surface_publications.contains_key(&surface_id));
+        assert!(callback.is_alive());
+    }
+
+    #[test]
     fn commit_timing_only_surface_tree_is_rejected_after_terminal_owner_before_release() {
         let mut state = CompositorState::default();
         let display = wayland_server::Display::<CompositorState>::new().expect("test display");
