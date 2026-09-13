@@ -6153,6 +6153,11 @@ mod tests {
         );
         assert_eq!(stats.missing_required_decoration_resources, 0);
 
+        renderer
+            .repaint_planner
+            .commit_presented_transition(OutputDamage::Full);
+        assert_eq!(renderer.repaint_planner.history_depth(), 1);
+
         renderer.decoration_resources.clear();
         renderer.frame_stats = GlesSceneFrameStats::default();
         renderer
@@ -6186,6 +6191,7 @@ mod tests {
         assert_eq!(fallbacks.failed.len(), 1);
         assert_eq!(fallbacks.failed[0].window_id.get(), 1);
         assert!(renderer.lifecycle_render_evidence.consumed.is_empty());
+        assert_eq!(renderer.repaint_planner.history_depth(), 0);
 
         let mut resolved_effect_lifecycle = lamp_test_sample(0.5);
         resolved_effect_lifecycle.visual_sources = vec![LifecycleVisualSource {

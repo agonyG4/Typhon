@@ -649,6 +649,19 @@ impl AtomicEglGbmScanout {
         Ok(self.slot(slot)?.framebuffer)
     }
 
+    /// Abandon an unpresented render after the caller has proven completion of
+    /// all GLES work for this context. The slot's recorded presentation age is
+    /// invalidated before its rendering ownership is released.
+    fn complete_unpresented_render(&mut self, slot: OutputSlotId) -> io::Result<()> {
+        if self.swapchain()?.rendering_slot() != Some(slot) {
+            return Err(io::Error::other(
+                "completed unpresented output slot does not match active rendering ownership",
+            ));
+        }
+        self.slot_mut(slot)?.invalidate_after_unpresented_render();
+        self.swapchain_mut()?.complete_unpresented_render(slot)
+    }
+
     pub(crate) fn plane_count(&self) -> io::Result<u32> {
         self.pool
             .as_ref()
@@ -1096,7 +1109,7 @@ impl AtomicEglGbmScanout {
                             io::Error::other("lifecycle fallback transaction has no frame batch")
                         })?;
                         server.restore_frame_batch_after_render_failure(batch_id);
-                        self.swapchain_mut()?.complete_unpresented_render(slot)?;
+                        self.complete_unpresented_render(slot)?;
                         Ok(())
                     },
                 )
@@ -1334,8 +1347,8 @@ impl AtomicEglGbmScanout {
                 self.scene
                     .commit_presented(scene_commit, presented_transition_damage);
                 if let Some(pool) = self.pool.as_mut() {
-                    pool.slots[usize::from(completed.new_current.get())].last_presented_serial =
-                        Some(completed.presentation_serial);
+                    pool.slots[usize::from(completed.new_current.get())]
+                        .record_presentation(completed.presentation_serial);
                 }
             },
         );
@@ -1475,7 +1488,7 @@ impl AtomicEglGbmScanout {
             AtomicOutputSwapchain::from_presented_slots(slots, slot, pool.pool_generation)?;
         swapchain.set_current_framebuffer_id(framebuffer_id);
         self.swapchain = Some(swapchain);
-        pool.slots[usize::from(slot.get())].last_presented_serial = Some(0);
+        pool.slots[usize::from(slot.get())].record_presentation(0);
         self.scene
             .commit_presented(scene_commit, OutputDamage::Full);
         self.direct.inhibit_until_composited_present = false;
@@ -1576,6 +1589,17 @@ impl AtomicEglGbmScanout {
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
         pool.slots
             .get(usize::from(slot.get()))
+            .filter(|candidate| candidate.id == slot)
+            .ok_or_else(|| io::Error::other("explicit output slot is unavailable"))
+    }
+
+    fn slot_mut(&mut self, slot: OutputSlotId) -> io::Result<&mut AtomicOutputSlot> {
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
+        pool.slots
+            .get_mut(usize::from(slot.get()))
             .filter(|candidate| candidate.id == slot)
             .ok_or_else(|| io::Error::other("explicit output slot is unavailable"))
     }

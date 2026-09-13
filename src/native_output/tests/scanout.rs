@@ -313,6 +313,32 @@ fn complete_unpresented_render_returns_slot_to_free_without_changing_output_owne
 }
 
 #[test]
+fn abandoned_atomic_slot_content_reports_zero_age_until_represented() {
+    let mut content = AtomicOutputSlotContentValidity::presented_at(9);
+
+    assert_eq!(
+        content.buffer_age(12),
+        crate::egl_renderer::BufferAge::Value(4)
+    );
+
+    content.invalidate_after_unpresented_render();
+
+    assert_eq!(content.last_presented_serial(), None);
+    assert_eq!(
+        content.buffer_age(12),
+        crate::egl_renderer::BufferAge::Value(0)
+    );
+
+    content.record_presentation(13);
+
+    assert_eq!(content.last_presented_serial(), Some(13));
+    assert_eq!(
+        content.buffer_age(13),
+        crate::egl_renderer::BufferAge::Value(1)
+    );
+}
+
+#[test]
 fn ready_frame_keeps_its_frozen_cursor_contract() {
     let slots = OutputSlotSet::new([
         OutputSlotId::new(0).unwrap(),

@@ -32,12 +32,58 @@ pub(crate) struct AtomicOutputSlot {
     pub(crate) egl_image: egl::Image,
     pub(crate) texture: glow::Texture,
     pub(crate) gl_framebuffer: glow::Framebuffer,
-    pub(crate) last_presented_serial: Option<u64>,
+    content_validity: AtomicOutputSlotContentValidity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicOutputSlotContentValidity {
+    // `Some` is valid only while the BO still contains the presentation at
+    // this serial. An abandoned render clears the lineage before reuse.
+    last_presented_serial: Option<u64>,
+}
+
+impl AtomicOutputSlotContentValidity {
+    pub(crate) const fn presented_at(last_presented_serial: u64) -> Self {
+        Self {
+            last_presented_serial: Some(last_presented_serial),
+        }
+    }
+
+    pub(crate) const fn unpresented() -> Self {
+        Self {
+            last_presented_serial: None,
+        }
+    }
+
+    pub(crate) fn buffer_age(&self, presentation_serial: u64) -> BufferAge {
+        render_target_buffer_age(presentation_serial, self.last_presented_serial)
+    }
+
+    pub(crate) fn invalidate_after_unpresented_render(&mut self) {
+        self.last_presented_serial = None;
+    }
+
+    pub(crate) fn record_presentation(&mut self, presentation_serial: u64) {
+        self.last_presented_serial = Some(presentation_serial);
+    }
+
+    pub(crate) const fn last_presented_serial(&self) -> Option<u64> {
+        self.last_presented_serial
+    }
 }
 
 impl AtomicOutputSlot {
     pub(crate) fn buffer_age(&self, presentation_serial: u64) -> BufferAge {
-        render_target_buffer_age(presentation_serial, self.last_presented_serial)
+        self.content_validity.buffer_age(presentation_serial)
+    }
+
+    pub(crate) fn invalidate_after_unpresented_render(&mut self) {
+        self.content_validity.invalidate_after_unpresented_render();
+    }
+
+    pub(crate) fn record_presentation(&mut self, presentation_serial: u64) {
+        self.content_validity
+            .record_presentation(presentation_serial);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -160,7 +206,7 @@ impl AtomicOutputSlot {
             egl_image: image_guard.disarm(),
             texture,
             gl_framebuffer,
-            last_presented_serial: None,
+            content_validity: AtomicOutputSlotContentValidity::unpresented(),
         })
     }
 }
