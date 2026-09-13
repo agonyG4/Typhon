@@ -244,6 +244,7 @@ impl NativeRuntime {
                 .continuation
                 .contains(NativeContinuationReason::ControlTimeout)
         {
+            oblivion_one::application_scope::poll_status();
             let slow_phase_started_at_ns = slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
             self.control_server.expire_idle_clients(
                 &mut self.event_loop,

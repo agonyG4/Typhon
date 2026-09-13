@@ -337,6 +337,7 @@ impl NativeRuntime {
         &mut self,
         cycle: &NativeCycleState,
     ) -> NativeResult<()> {
+        oblivion_one::application_scope::poll_status();
         self.astrea_launch_tracker.prune_dead();
         if !cycle.wakeup.reasons.child_signal()
             && self.shutdown.state() != ShutdownState::StoppingChildren

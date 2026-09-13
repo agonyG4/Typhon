@@ -155,7 +155,12 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
             )
         }
         _ => match native_application_command(&request, &socket_name, xwayland, cursor.as_ref())? {
-            Some(command) => spawn_native_process(supervisor, command, process_options),
+            Some(launch) => spawn_native_process(
+                supervisor,
+                launch.command,
+                process_options,
+                &launch.scope_plan,
+            ),
             None => return Ok(None),
         },
     };
@@ -235,8 +240,8 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
         };
         let spawn_start = Instant::now();
         let process_options = native_process_options(&request);
-        let command = match native_application_command(&request, &socket_name, xwayland, cursor) {
-            Ok(Some(command)) => command,
+        let launch = match native_application_command(&request, &socket_name, xwayland, cursor) {
+            Ok(Some(launch)) => launch,
             Ok(None) => {
                 pending.request.failed(5, "empty command".to_string());
                 continue;
@@ -248,7 +253,12 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
                 continue;
             }
         };
-        match spawn_native_process(supervisor, command, process_options) {
+        match spawn_native_process(
+            supervisor,
+            launch.command,
+            process_options,
+            &launch.scope_plan,
+        ) {
             Ok(pid) => {
                 launch_tracker.track(pid, pending.request.clone());
                 pending.request.accepted(pid);
@@ -292,22 +302,18 @@ fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {
     }
 }
 
+#[cfg(test)]
 fn native_application_argv(
     request: &NativeLaunchRequest,
     argv: &[String],
 ) -> io::Result<Vec<String>> {
     let eligible = application_scope_eligible(&native_process_options(request));
-    match oblivion_one::application_scope::maybe_wrap_application_argv(argv, eligible) {
-        Ok(argv) => Ok(argv),
-        Err(error) if eligible => {
-            eprintln!(
-                "application scope preparation unavailable for `{}`; launching directly: {error}",
-                request.program
-            );
-            Ok(argv.to_vec())
-        }
-        Err(error) => Err(error),
-    }
+    Ok(oblivion_one::application_scope::application_scope_launch_plan(argv, eligible).argv)
+}
+
+struct NativeApplicationLaunch {
+    command: Command,
+    scope_plan: oblivion_one::application_scope::ApplicationScopeLaunchPlan,
 }
 
 fn native_application_command(
@@ -315,13 +321,15 @@ fn native_application_command(
     socket_name: &str,
     xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
     cursor: Option<&oblivion_one::cursor_theme::CursorConfiguration>,
-) -> io::Result<Option<Command>> {
+) -> io::Result<Option<NativeApplicationLaunch>> {
     let Some(argv) = compositor_app_spawn_argv_for_policy(&request.argv, request.gpu_policy) else {
         return Ok(None);
     };
-    let argv = native_application_argv(request, &argv)?;
+    let eligible = application_scope_eligible(&native_process_options(request));
+    let scope_plan =
+        oblivion_one::application_scope::application_scope_launch_plan(&argv, eligible);
     let Some(mut command) =
-        compositor_app_command_from_argv(socket_name, &argv, request.gpu_policy)
+        compositor_app_command_from_argv(socket_name, &scope_plan.argv, request.gpu_policy)
     else {
         return Ok(None);
     };
@@ -336,16 +344,19 @@ fn native_application_command(
         command.env("XCURSOR_THEME", &cursor.theme);
         command.env("XCURSOR_SIZE", cursor.size_px.to_string());
     }
-    Ok(Some(command))
+    Ok(Some(NativeApplicationLaunch {
+        command,
+        scope_plan,
+    }))
 }
 
 fn spawn_native_process(
     supervisor: &mut ChildSupervisor,
     command: Command,
     options: ProcessOptions,
+    scope_plan: &oblivion_one::application_scope::ApplicationScopeLaunchPlan,
 ) -> io::Result<u32> {
-    let eligible = application_scope_eligible(&options);
-    oblivion_one::application_scope::prepare_application_spawn(command, eligible)?
+    oblivion_one::application_scope::prepare_application_spawn(command, scope_plan)?
         .spawn(supervisor, options)
         .map(|spawned| spawned.pid)
 }

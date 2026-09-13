@@ -72,6 +72,18 @@ pub enum ApplicationScopeSupport {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationScopeLaunchMode {
+    Direct,
+    ScopeHelper,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationScopeLaunchPlan {
+    pub argv: Vec<String>,
+    pub mode: ApplicationScopeLaunchMode,
+}
+
 impl ApplicationScopeSupport {
     const fn as_str(self) -> &'static str {
         match self {
@@ -91,6 +103,7 @@ pub struct ApplicationScopeSnapshot {
     pub fallback_launches: u64,
     pub pending_launches: usize,
     pub last_failure: Option<String>,
+    pub dropped_status_reports: u64,
 }
 
 impl ApplicationScopeSnapshot {
@@ -98,7 +111,7 @@ impl ApplicationScopeSnapshot {
         if self.policy == ApplicationScopePolicy::Off {
             return DoctorSeverity::Ok;
         }
-        if self.fallback_launches > 0 || self.support == ApplicationScopeSupport::Unavailable {
+        if self.support == ApplicationScopeSupport::Unavailable {
             return DoctorSeverity::Warning;
         }
         DoctorSeverity::Ok
@@ -106,12 +119,13 @@ impl ApplicationScopeSnapshot {
 
     pub fn detail(&self) -> String {
         format!(
-            "policy={} support={} attempts={} scoped={} fallback={} pending={} last_failure={}",
+            "policy={} support={} attempts={} scoped={} fallback={} dropped={} pending={} last_failure={}",
             self.policy.as_str(),
             self.support.as_str(),
             self.attempted_launches,
             self.scoped_launches,
             self.fallback_launches,
+            self.dropped_status_reports,
             self.pending_launches,
             self.last_failure.as_deref().unwrap_or("none"),
         )
@@ -251,47 +265,110 @@ fn wrap_application_argv(
     Ok(wrapped)
 }
 
-pub fn maybe_wrap_application_argv(
+pub fn application_scope_launch_plan(
     real_argv: &[String],
     eligible: bool,
-) -> io::Result<Vec<String>> {
+) -> ApplicationScopeLaunchPlan {
     let policy = ApplicationScopePolicy::from_env();
-    if !eligible || policy == ApplicationScopePolicy::Off {
-        return Ok(real_argv.to_vec());
-    }
-    let executable = env::current_exe()?;
-    wrap_application_argv(real_argv, &executable)
-        .map_err(|error| io::Error::other(error.to_string()))
+    let executable = if eligible && policy != ApplicationScopePolicy::Off {
+        env::current_exe()
+    } else {
+        Ok(std::path::PathBuf::new())
+    };
+    application_scope_launch_plan_with_executable(real_argv, eligible, policy, executable)
 }
 
-pub fn prepare_application_spawn(mut command: Command, eligible: bool) -> io::Result<SpawnCommand> {
-    let policy = ApplicationScopePolicy::from_env();
+fn application_scope_launch_plan_with_executable(
+    real_argv: &[String],
+    eligible: bool,
+    policy: ApplicationScopePolicy,
+    executable: io::Result<std::path::PathBuf>,
+) -> ApplicationScopeLaunchPlan {
     if !eligible || policy == ApplicationScopePolicy::Off {
+        return ApplicationScopeLaunchPlan {
+            argv: real_argv.to_vec(),
+            mode: ApplicationScopeLaunchMode::Direct,
+        };
+    }
+
+    let wrapped = executable
+        .map_err(ScopeError::Exec)
+        .and_then(|executable| wrap_application_argv(real_argv, &executable));
+    match wrapped {
+        Ok(argv) => ApplicationScopeLaunchPlan {
+            argv,
+            mode: ApplicationScopeLaunchMode::ScopeHelper,
+        },
+        Err(error) => {
+            eprintln!("application scope preparation unavailable; launching directly: {error}");
+            ApplicationScopeLaunchPlan {
+                argv: real_argv.to_vec(),
+                mode: ApplicationScopeLaunchMode::Direct,
+            }
+        }
+    }
+}
+
+pub fn prepare_application_spawn(
+    mut command: Command,
+    plan: &ApplicationScopeLaunchPlan,
+) -> io::Result<SpawnCommand> {
+    poll_status();
+    if plan.mode == ApplicationScopeLaunchMode::Direct {
         return Ok(SpawnCommand::new(command));
     }
 
-    let (reader, writer) = status_pipe()?;
-    command.env(STATUS_FD_ENV, STATUS_FD.to_string());
-    let mut spawn = SpawnCommand::new(command);
-    spawn.map_fd(writer, STATUS_FD)?;
     let mut state = diagnostics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.snapshot.attempted_launches = state.snapshot.attempted_launches.saturating_add(1);
-    if state.readers.len() < MAX_PENDING_STATUS_READERS {
-        state.readers.push(reader);
+    if state.readers.len() >= MAX_PENDING_STATUS_READERS {
+        state.snapshot.dropped_status_reports =
+            state.snapshot.dropped_status_reports.saturating_add(1);
+        return Ok(SpawnCommand::new(command));
     }
+
+    let (reader, writer) = match status_pipe() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            state.snapshot.dropped_status_reports =
+                state.snapshot.dropped_status_reports.saturating_add(1);
+            eprintln!(
+                "application scope status pipe unavailable; launching without telemetry: {error}"
+            );
+            return Ok(SpawnCommand::new(command));
+        }
+    };
+    command.env(STATUS_FD_ENV, STATUS_FD.to_string());
+    let mut spawn = SpawnCommand::new(command);
+    if let Err(error) = spawn.map_fd(writer, STATUS_FD) {
+        let SpawnCommand { mut command, .. } = spawn;
+        command.env_remove(STATUS_FD_ENV);
+        state.snapshot.dropped_status_reports =
+            state.snapshot.dropped_status_reports.saturating_add(1);
+        eprintln!("application scope status fd unavailable; launching without telemetry: {error}");
+        return Ok(SpawnCommand::new(command));
+    }
+    state.readers.push(reader);
     Ok(spawn)
 }
 
 pub fn snapshot() -> ApplicationScopeSnapshot {
+    poll_status();
+    let mut state = diagnostics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.snapshot.policy = ApplicationScopePolicy::from_env();
+    state.snapshot.pending_launches = state.readers.len();
+    state.snapshot.clone()
+}
+
+pub fn poll_status() {
     let mut state = diagnostics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     drain_status_readers(&mut state);
-    state.snapshot.policy = ApplicationScopePolicy::from_env();
     state.snapshot.pending_launches = state.readers.len();
-    state.snapshot.clone()
 }
 
 pub fn run_internal_scope_exec(args: &[String]) -> Result<Infallible, ScopeError> {
@@ -442,6 +519,7 @@ fn diagnostics() -> &'static Mutex<Diagnostics> {
                 fallback_launches: 0,
                 pending_launches: 0,
                 last_failure: None,
+                dropped_status_reports: 0,
             },
             readers: Vec::new(),
         })
@@ -474,6 +552,7 @@ fn drain_status_readers(state: &mut Diagnostics) {
         if status.starts_with('S') {
             state.snapshot.scoped_launches = state.snapshot.scoped_launches.saturating_add(1);
             state.snapshot.support = ApplicationScopeSupport::Available;
+            state.snapshot.last_failure = None;
             state.readers.swap_remove(index);
         } else if let Some(reason) = status.strip_prefix("F:") {
             state.snapshot.fallback_launches = state.snapshot.fallback_launches.saturating_add(1);
@@ -516,6 +595,8 @@ mod tests {
         },
         time::Duration,
     };
+
+    static DIAGNOSTICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct SuccessfulRegistrar;
 
@@ -586,6 +667,154 @@ mod tests {
     }
 
     #[test]
+    fn direct_fallback_plan_does_not_install_helper_plumbing() {
+        let plan = application_scope_launch_plan_with_executable(
+            &["app".to_owned(), "arg with spaces".to_owned()],
+            true,
+            ApplicationScopePolicy::On,
+            Err(io::Error::other("executable lookup failed")),
+        );
+        assert_eq!(plan.mode, ApplicationScopeLaunchMode::Direct);
+
+        let spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
+        assert!(spawn.inherited_fds.is_empty());
+        assert!(
+            spawn
+                .command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new(STATUS_FD_ENV))
+        );
+    }
+
+    #[test]
+    fn launch_plan_owns_helper_decision_after_policy_changes() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+        let plan = application_scope_launch_plan_with_executable(
+            &["app".to_owned(), "$(literal)".to_owned()],
+            true,
+            ApplicationScopePolicy::On,
+            Ok(std::path::PathBuf::from("/usr/bin/typhon")),
+        );
+        assert_eq!(plan.mode, ApplicationScopeLaunchMode::ScopeHelper);
+        assert_eq!(plan.argv[4], "$(literal)");
+
+        let spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
+        assert!(
+            spawn
+                .command
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new(STATUS_FD_ENV)
+                    && value == Some(std::ffi::OsStr::new("63")))
+        );
+        diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .readers
+            .clear();
+    }
+
+    #[test]
+    fn completed_status_readers_are_reclaimed_by_nonblocking_poll() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+        let (reader, writer) = status_pipe().expect("status pipe");
+        let writer_fd = writer.as_raw_fd();
+        diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .readers
+            .push(reader);
+        let status = b"S";
+        assert_eq!(
+            unsafe { libc::write(writer_fd, status.as_ptr().cast(), status.len()) },
+            1
+        );
+        drop(writer);
+
+        poll_status();
+
+        let state = diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.readers.is_empty());
+        assert_eq!(state.snapshot.support, ApplicationScopeSupport::Available);
+    }
+
+    #[test]
+    fn status_reader_cap_drops_telemetry_without_disabling_scope_launch() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+        let mut writers = Vec::new();
+        let mut state = diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.readers.clear();
+        let dropped_before = state.snapshot.dropped_status_reports;
+        for _ in 0..MAX_PENDING_STATUS_READERS {
+            let (reader, writer) = status_pipe().expect("status pipe");
+            state.readers.push(reader);
+            writers.push(writer);
+        }
+        drop(state);
+
+        let plan = application_scope_launch_plan_with_executable(
+            &["app".to_owned()],
+            true,
+            ApplicationScopePolicy::On,
+            Ok(std::path::PathBuf::from("/usr/bin/typhon")),
+        );
+        let spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
+        assert!(spawn.inherited_fds.is_empty());
+        assert!(
+            spawn
+                .command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new(STATUS_FD_ENV))
+        );
+
+        let mut state = diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.readers.len(), MAX_PENDING_STATUS_READERS);
+        assert_eq!(
+            state.snapshot.dropped_status_reports,
+            dropped_before.saturating_add(1)
+        );
+        state.readers.clear();
+        drop(writers);
+    }
+
+    #[test]
+    fn successful_scope_status_clears_active_failure_but_keeps_history() {
+        let mut state = Diagnostics {
+            snapshot: ApplicationScopeSnapshot {
+                policy: ApplicationScopePolicy::Auto,
+                support: ApplicationScopeSupport::Unavailable,
+                attempted_launches: 2,
+                scoped_launches: 0,
+                fallback_launches: 1,
+                pending_launches: 1,
+                last_failure: Some("timeout".to_owned()),
+                dropped_status_reports: 0,
+            },
+            readers: Vec::new(),
+        };
+        let (reader, writer) = status_pipe().expect("status pipe");
+        state.readers.push(reader);
+        assert_eq!(
+            unsafe { libc::write(writer.as_raw_fd(), b"S".as_ptr().cast(), 1) },
+            1
+        );
+        drop(writer);
+
+        drain_status_readers(&mut state);
+
+        assert_eq!(state.snapshot.support, ApplicationScopeSupport::Available);
+        assert_eq!(state.snapshot.last_failure, None);
+        assert_eq!(state.snapshot.fallback_launches, 1);
+        assert_eq!(state.snapshot.scoped_launches, 1);
+        assert_eq!(state.snapshot.doctor_severity(), DoctorSeverity::Ok);
+    }
+
+    #[test]
     fn generated_scope_names_are_valid_and_bounded() {
         let name = scope_unit_name(1234, 7);
         assert!(name.ends_with(".scope"));
@@ -609,6 +838,7 @@ mod tests {
             fallback_launches: 1,
             pending_launches: 0,
             last_failure: Some("timeout".to_owned()),
+            dropped_status_reports: 0,
         };
         assert_eq!(fallback.doctor_severity(), DoctorSeverity::Warning);
 
