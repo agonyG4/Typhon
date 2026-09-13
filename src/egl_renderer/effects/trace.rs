@@ -4,7 +4,8 @@ use std::{collections::HashMap, ffi::OsStr, sync::OnceLock};
 use std::cell::RefCell;
 
 use oblivion_one::effects::{
-    CompiledFrameGraph, CompiledRenderPass, GraphTextureId, GraphTextureSource, RenderPassKind,
+    CompiledFrameGraph, CompiledRenderPass, EffectDemandPlanStats, GraphTextureId,
+    GraphTextureSource, RenderPassKind,
 };
 
 use super::resources::PooledEffectTexture;
@@ -56,6 +57,7 @@ pub(crate) struct FrameTraceSummary {
     pub(crate) graph_pass_count: Option<usize>,
     pub(crate) graph_texture_count: Option<usize>,
     pub(crate) peak_live_intermediate_count: Option<usize>,
+    pub(crate) demand_plan: Option<EffectDemandPlanStats>,
 }
 
 #[cfg(test)]
@@ -228,7 +230,7 @@ impl EffectExecutionTrace {
     ) {
         self.event(|| {
             format!(
-                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={}",
+                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} conservative_full={}",
                 optional_u64(self.frame_id),
                 optional_u64(summary.render_generation.or(self.render_generation)),
                 optional_u64(summary.scene_generation.or(self.scene_generation)),
@@ -241,6 +243,26 @@ impl EffectExecutionTrace {
                 optional_usize(summary.graph_pass_count),
                 optional_usize(summary.graph_texture_count),
                 optional_usize(summary.peak_live_intermediate_count),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.repair_rect_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.dependency_edge_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.dependency_propagations)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.max_instance_region_rect_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary.demand_plan.map_or_else(
+                    || "unknown".to_owned(),
+                    |stats| stats.conservative_full.to_string(),
+                ),
             )
         });
     }
@@ -491,5 +513,28 @@ mod tests {
         assert!(output_line.contains("physical=output:source=output"));
         assert!(capture_line.contains("physical=unrealized:source=captured_scene"));
         assert!(!capture_line.contains("physical=output"));
+    }
+
+    #[test]
+    fn demand_plan_trace_line_includes_bounded_planner_stats() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let mut summary = FrameTraceSummary::default();
+        summary.demand_plan = Some(oblivion_one::effects::EffectDemandPlanStats {
+            repair_rect_count: 71,
+            dependency_edge_count: 6,
+            dependency_propagations: 6,
+            max_instance_region_rect_count: 72,
+            conservative_full: false,
+        });
+
+        clear_test_events();
+        trace.frame_boundary("effect_demand_plan", "end", summary);
+        let line = take_test_events().pop().expect("demand trace event");
+
+        assert!(line.contains("repair_rect_count=71"));
+        assert!(line.contains("dependency_edge_count=6"));
+        assert!(line.contains("dependency_propagations=6"));
+        assert!(line.contains("max_instance_region_rect_count=72"));
+        assert!(line.contains("conservative_full=false"));
     }
 }

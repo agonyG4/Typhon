@@ -278,6 +278,15 @@ pub struct CompiledEffectInstance {
     pub dependencies: Vec<EffectInstanceId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EffectDemandPlanStats {
+    pub repair_rect_count: usize,
+    pub dependency_edge_count: usize,
+    pub dependency_propagations: usize,
+    pub max_instance_region_rect_count: usize,
+    pub conservative_full: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectInstanceExecutionDemand {
     pub id: EffectInstanceId,
@@ -289,6 +298,7 @@ pub struct EffectExecutionDemand {
     pub instances: Vec<EffectInstanceExecutionDemand>,
     pub execution_region: EffectRegion,
     pub(crate) conservative_full: bool,
+    plan_stats: EffectDemandPlanStats,
 }
 
 impl EffectExecutionDemand {
@@ -300,6 +310,7 @@ impl EffectExecutionDemand {
             instances,
             execution_region,
             conservative_full: false,
+            plan_stats: EffectDemandPlanStats::default(),
         }
     }
 
@@ -317,14 +328,24 @@ impl EffectExecutionDemand {
             .find(|instance| instance.id == id)
             .map(|instance| &instance.output_region)
     }
+
+    pub fn plan_stats(&self) -> EffectDemandPlanStats {
+        self.plan_stats
+    }
 }
 
-fn all_visible_instances_with_output_regions(graph: &CompiledFrameGraph) -> EffectExecutionDemand {
+fn all_visible_instances_with_output_regions(
+    graph: &CompiledFrameGraph,
+    repair_rect_count: usize,
+) -> EffectExecutionDemand {
     let mut execution_region = EffectRegion::empty();
+    let mut max_instance_region_rect_count = 0;
     let instances = graph
         .instances
         .iter()
         .map(|instance| {
+            max_instance_region_rect_count =
+                max_instance_region_rect_count.max(instance.output_influence_region.rects().len());
             execution_region = execution_region.union(&instance.output_influence_region);
             if !instance.dependencies.is_empty() {
                 execution_region = execution_region.union(&instance.capture_region);
@@ -339,6 +360,13 @@ fn all_visible_instances_with_output_regions(graph: &CompiledFrameGraph) -> Effe
         instances,
         execution_region,
         conservative_full: true,
+        plan_stats: EffectDemandPlanStats {
+            repair_rect_count,
+            dependency_edge_count: dependency_edge_count(graph),
+            dependency_propagations: 0,
+            max_instance_region_rect_count,
+            conservative_full: true,
+        },
     }
 }
 
@@ -356,59 +384,63 @@ fn unique_instance_index(graph: &CompiledFrameGraph, id: EffectInstanceId) -> Op
     found
 }
 
+fn dependency_edge_count(graph: &CompiledFrameGraph) -> usize {
+    graph.instances.iter().fold(0, |count, instance| {
+        count.saturating_add(instance.dependencies.len())
+    })
+}
+
 pub fn plan_effect_execution_demand(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
     conservative_full: bool,
 ) -> EffectExecutionDemand {
+    let repair_rect_count = repair_region.rects().len();
     if conservative_full
         || (!repair_region.is_empty() && repair_region.bounding_rect().is_none())
         || !graph_execution_metadata_is_complete(graph)
     {
-        return all_visible_instances_with_output_regions(graph);
+        return all_visible_instances_with_output_regions(graph, repair_rect_count);
     }
 
     let mut output_regions = vec![None; graph.instances.len()];
+    let mut max_instance_region_rect_count = 0;
     for (index, instance) in graph.instances.iter().enumerate() {
         let direct = repair_region.intersect(&instance.output_influence_region);
         if !direct.is_empty() {
+            max_instance_region_rect_count =
+                max_instance_region_rect_count.max(direct.rects().len());
             output_regions[index] = Some(direct);
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for consumer_index in 0..graph.instances.len() {
-            if output_regions[consumer_index].is_none() {
+    // Backdrop dependencies are compiled from checkpoints already seen for
+    // earlier instances. Reverse traversal therefore sees each consumer's
+    // final demand before propagating it to an earlier dependency. Each edge
+    // is visited once; structural region equality is not a convergence test.
+    let mut dependency_propagations: usize = 0;
+    for consumer_index in (0..graph.instances.len()).rev() {
+        let consumer = &graph.instances[consumer_index];
+        if output_regions[consumer_index].is_none() {
+            continue;
+        }
+        for dependency_id in &consumer.dependencies {
+            let Some(dependency_index) = unique_instance_index(graph, *dependency_id) else {
+                return all_visible_instances_with_output_regions(graph, repair_rect_count);
+            };
+            let dependency = &graph.instances[dependency_index];
+            let required = dependency
+                .output_influence_region
+                .intersect(&consumer.capture_region);
+            if required.is_empty() {
                 continue;
             }
-            let consumer = &graph.instances[consumer_index];
-            for dependency_id in &consumer.dependencies {
-                let Some(dependency_index) = unique_instance_index(graph, *dependency_id) else {
-                    return all_visible_instances_with_output_regions(graph);
-                };
-                let dependency = &graph.instances[dependency_index];
-                let required = dependency
-                    .output_influence_region
-                    .intersect(&consumer.capture_region);
-                if required.is_empty() {
-                    continue;
-                }
-                if output_regions[dependency_index]
-                    .as_ref()
-                    .is_some_and(|existing| existing.intersect(&required) == required)
-                {
-                    continue;
-                }
-                let next = output_regions[dependency_index]
-                    .as_ref()
-                    .map_or_else(|| required.clone(), |existing| existing.union(&required));
-                if output_regions[dependency_index].as_ref() != Some(&next) {
-                    output_regions[dependency_index] = Some(next);
-                    changed = true;
-                }
-            }
+            dependency_propagations = dependency_propagations.saturating_add(1);
+            let next = output_regions[dependency_index]
+                .as_ref()
+                .map_or_else(|| required.clone(), |existing| existing.union(&required));
+            max_instance_region_rect_count = max_instance_region_rect_count.max(next.rects().len());
+            output_regions[dependency_index] = Some(next);
         }
     }
 
@@ -434,28 +466,39 @@ pub fn plan_effect_execution_demand(
         instances,
         execution_region,
         conservative_full: false,
+        plan_stats: EffectDemandPlanStats {
+            repair_rect_count,
+            dependency_edge_count: dependency_edge_count(graph),
+            dependency_propagations,
+            max_instance_region_rect_count,
+            conservative_full: false,
+        },
     }
 }
 
 fn graph_execution_metadata_is_complete(graph: &CompiledFrameGraph) -> bool {
-    graph
-        .instances
-        .iter()
-        .enumerate()
-        .all(|(index, instance)| unique_instance_index(graph, instance.id) == Some(index))
-        && graph.passes.iter().all(|pass| {
-            unique_instance_index(graph, pass.instance).is_some()
-                && pass
-                    .inputs
-                    .iter()
-                    .chain(pass.output.iter())
-                    .all(|texture_id| {
-                        graph
-                            .textures
-                            .iter()
-                            .any(|texture| texture.id == *texture_id)
-                    })
-        })
+    // The compiler records dependencies from checkpoints that precede the
+    // current instance. Demand planning relies on that topological ordering,
+    // so malformed metadata takes the conservative fallback below.
+    graph.instances.iter().enumerate().all(|(index, instance)| {
+        unique_instance_index(graph, instance.id) == Some(index)
+            && instance.dependencies.iter().all(|dependency_id| {
+                unique_instance_index(graph, *dependency_id)
+                    .is_some_and(|dependency_index| dependency_index < index)
+            })
+    }) && graph.passes.iter().all(|pass| {
+        unique_instance_index(graph, pass.instance).is_some()
+            && pass
+                .inputs
+                .iter()
+                .chain(pass.output.iter())
+                .all(|texture_id| {
+                    graph
+                        .textures
+                        .iter()
+                        .any(|texture| texture.id == *texture_id)
+                })
+    })
 }
 
 impl CompiledFrameGraph {
@@ -2054,6 +2097,303 @@ mod tests {
             pass.kind == RenderPassKind::Composite
                 && captures[1].checkpoint_dependencies.contains(&pass.id)
         }));
+    }
+
+    fn repeated_region(rect: EffectRect, count: usize) -> EffectRegion {
+        let mut region = EffectRegion::empty();
+        for _ in 0..count {
+            region.push(rect);
+        }
+        region
+    }
+
+    fn demand_test_instance(
+        id: u64,
+        output_influence_region: EffectRegion,
+        capture_region: EffectRegion,
+        dependencies: Vec<EffectInstanceId>,
+    ) -> CompiledEffectInstance {
+        CompiledEffectInstance {
+            id: EffectInstanceId::new(id).unwrap(),
+            output_influence_region,
+            capture_region,
+            dependencies,
+        }
+    }
+
+    fn demand_test_graph(instances: Vec<CompiledEffectInstance>) -> CompiledFrameGraph {
+        CompiledFrameGraph {
+            passes: Vec::new(),
+            textures: Vec::new(),
+            instances,
+            final_damage: EffectRegion::empty(),
+            stats: RenderGraphCompileStats::default(),
+        }
+    }
+
+    fn region_covers_region(container: &EffectRegion, required: &EffectRegion) -> bool {
+        if required.is_empty() {
+            return true;
+        }
+        if required.bounding_rect().is_none() {
+            return false;
+        }
+        required.rects().iter().all(|rect| {
+            let right = rect.right().saturating_sub(1);
+            let bottom = rect.bottom().saturating_sub(1);
+            [
+                (rect.x, rect.y),
+                (right, rect.y),
+                (rect.x, bottom),
+                (right, bottom),
+            ]
+            .into_iter()
+            .all(|(x, y)| container.contains_point(x, y))
+        })
+    }
+
+    fn semantically_equal_regions(left: &EffectRegion, right: &EffectRegion) -> bool {
+        left.subtract(right).is_empty() && right.subtract(left).is_empty()
+    }
+
+    #[test]
+    fn fragmented_dependency_coverage_is_propagated_once() {
+        let rect = EffectRect::new(20, 30, 100, 80).unwrap();
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        let graph = demand_test_graph(vec![
+            demand_test_instance(
+                1,
+                EffectRegion::from_rect(rect),
+                EffectRegion::from_rect(rect),
+                Vec::new(),
+            ),
+            demand_test_instance(
+                2,
+                EffectRegion::from_rect(rect),
+                EffectRegion::from_rect(rect),
+                vec![first_id],
+            ),
+        ]);
+        let repair = repeated_region(rect, 71);
+
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+
+        assert!(demand.contains(first_id));
+        assert!(demand.contains(second_id));
+        assert_eq!(demand.plan_stats().dependency_edge_count, 1);
+        assert_eq!(demand.plan_stats().dependency_propagations, 1);
+        assert!(demand.plan_stats().max_instance_region_rect_count <= 128);
+    }
+
+    #[test]
+    fn fragmented_transitive_dependencies_propagate_in_reverse_order() {
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        let third_id = EffectInstanceId::new(3).unwrap();
+        let first_region = EffectRegion::from_rect(EffectRect::new(0, 0, 100, 100).unwrap());
+        let second_region = repeated_region(EffectRect::new(200, 0, 50, 100).unwrap(), 9);
+        let third_region = EffectRegion::from_rect(EffectRect::new(400, 0, 50, 100).unwrap());
+        let graph = demand_test_graph(vec![
+            demand_test_instance(1, first_region.clone(), first_region.clone(), Vec::new()),
+            demand_test_instance(2, second_region, first_region.clone(), vec![first_id]),
+            demand_test_instance(
+                3,
+                third_region,
+                EffectRegion::from_rect(EffectRect::new(200, 0, 50, 100).unwrap()),
+                vec![second_id],
+            ),
+        ]);
+        let repair = EffectRegion::from_rect(EffectRect::new(400, 0, 50, 100).unwrap());
+
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+
+        assert!(demand.contains(first_id));
+        assert!(demand.contains(second_id));
+        assert!(demand.contains(third_id));
+        assert_eq!(demand.plan_stats().dependency_edge_count, 2);
+        assert_eq!(demand.plan_stats().dependency_propagations, 2);
+    }
+
+    #[test]
+    fn dependency_metadata_must_reference_earlier_instances() {
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(0, 0, 20, 20).unwrap());
+        let mut graph = demand_test_graph(vec![
+            demand_test_instance(1, region.clone(), region.clone(), Vec::new()),
+            demand_test_instance(2, region.clone(), region, vec![first_id]),
+        ]);
+        assert!(graph_execution_metadata_is_complete(&graph));
+
+        graph.instances[0].dependencies.push(second_id);
+
+        assert!(!graph_execution_metadata_is_complete(&graph));
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 20, 20).unwrap()),
+            false,
+        );
+        assert!(demand.is_conservative_full());
+    }
+
+    #[test]
+    fn moving_visual_group_backdrop_demand_is_bounded_across_fragmented_repairs() {
+        let output_bounds = EffectRect::new(0, 0, 256, 192).unwrap();
+        let source_damage = EffectRegion::from_rect(output_bounds);
+        let (base_scene, registry) = blur_scene();
+        let base_instance = base_scene.instances[0].clone();
+        let translations = [-16, -8, 0, 1, 32, 80, 128, 80, 1, -8, -16];
+        let mut graph_shape = None;
+
+        for translation in translations.into_iter().cycle().take(256) {
+            let instances = [0_u32, 1, 2, 3]
+                .into_iter()
+                .map(|index| {
+                    let mut instance = base_instance.clone();
+                    let x = 16 + translation + i32::try_from(index).unwrap() * 24;
+                    let region = EffectRegion::from_rect(EffectRect::new(x, 48, 64, 80).unwrap());
+                    instance.id = EffectInstanceId::new(u64::from(index + 1)).unwrap();
+                    instance.anchor = EffectAnchor::BeforeSurface(100 + index);
+                    instance.anchor_scope = EffectAnchorScope::VisualGroup;
+                    instance.visual_group = Some(VisualGroupId::new(index + 1).unwrap());
+                    instance.scene_order = EffectSceneOrder::for_anchor(instance.anchor);
+                    instance.target_bounds = region.bounding_rect().unwrap();
+                    instance.region = region;
+                    instance.signature = u64::from(index + 1);
+                    instance
+                })
+                .collect();
+            let scene = ResolvedEffectScene::new(1, instances);
+            let FrameExecutionPlan::EffectGraph(graph) =
+                compile_frame_execution_plan(&scene, &source_damage, output_bounds, &registry)
+                    .unwrap()
+            else {
+                panic!("moving visual-group backdrop topology must compile");
+            };
+
+            assert_eq!(graph.instances.len(), 4);
+            assert!(
+                graph.passes.iter().all(|pass| {
+                    pass.anchor_scope == EffectAnchorScope::VisualGroup
+                        && (!matches!(
+                            pass.kind,
+                            RenderPassKind::SceneCapture | RenderPassKind::Composite
+                        ) || pass.visual_group.is_some())
+                }),
+                "unexpected pass topology"
+            );
+            assert!(graph.instances.iter().enumerate().all(|(index, instance)| {
+                instance.dependencies.iter().all(|dependency_id| {
+                    unique_instance_index(&graph, *dependency_id)
+                        .is_some_and(|dependency_index| dependency_index < index)
+                })
+            }));
+
+            let moving_region = graph
+                .instances
+                .last()
+                .expect("fourth visual-group instance")
+                .output_influence_region
+                .clone();
+            let fragmented_repair = moving_region
+                .rects()
+                .first()
+                .copied()
+                .map_or_else(EffectRegion::empty, |rect| repeated_region(rect, 71));
+            let equivalent_repair = moving_region.clone();
+            let fragmented_demand = plan_effect_execution_demand(&graph, &fragmented_repair, false);
+            let equivalent_demand = plan_effect_execution_demand(&graph, &equivalent_repair, false);
+            let edge_count = graph
+                .instances
+                .iter()
+                .map(|instance| instance.dependencies.len())
+                .sum::<usize>();
+            assert!(
+                edge_count > 0,
+                "overlapping backdrop topology lost dependencies"
+            );
+            assert!(
+                graph
+                    .passes
+                    .iter()
+                    .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                    .any(|pass| !pass.checkpoint_dependencies.is_empty())
+            );
+            let shape = (graph.passes.len(), graph.textures.len());
+            if let Some(first_shape) = graph_shape {
+                assert_eq!(first_shape, shape, "translation changed graph topology");
+            } else {
+                graph_shape = Some(shape);
+            }
+
+            assert!(!fragmented_demand.is_conservative_full());
+            assert_eq!(
+                fragmented_demand
+                    .instances
+                    .iter()
+                    .map(|instance| instance.id)
+                    .collect::<Vec<_>>(),
+                equivalent_demand
+                    .instances
+                    .iter()
+                    .map(|instance| instance.id)
+                    .collect::<Vec<_>>(),
+                "repair representation changed selected identities at translation {translation}"
+            );
+            assert!(semantically_equal_regions(
+                &fragmented_demand.execution_region,
+                &equivalent_demand.execution_region
+            ));
+            assert!(
+                fragmented_demand.plan_stats().dependency_propagations <= edge_count,
+                "dependency edge propagated more than once at translation {translation}"
+            );
+            assert!(
+                fragmented_demand
+                    .plan_stats()
+                    .max_instance_region_rect_count
+                    <= MAX_EFFECT_REGION_RECTS
+            );
+            assert!(
+                fragmented_demand
+                    .instances
+                    .iter()
+                    .all(|instance| !instance.output_region.is_empty())
+            );
+            for (consumer_index, consumer) in graph.instances.iter().enumerate() {
+                let Some(consumer_demand) = fragmented_demand.output_region(consumer.id) else {
+                    continue;
+                };
+                assert!(region_covers_region(
+                    &fragmented_demand.execution_region,
+                    consumer_demand
+                ));
+                if !consumer.dependencies.is_empty() {
+                    assert!(region_covers_region(
+                        &fragmented_demand.execution_region,
+                        &consumer.capture_region
+                    ));
+                }
+                for dependency_id in &consumer.dependencies {
+                    let dependency_index = unique_instance_index(&graph, *dependency_id)
+                        .expect("validated dependency index");
+                    let required = graph.instances[dependency_index]
+                        .output_influence_region
+                        .intersect(&consumer.capture_region);
+                    if !required.is_empty() {
+                        let dependency_demand = fragmented_demand
+                            .output_region(*dependency_id)
+                            .expect("required dependency must be selected");
+                        assert!(region_covers_region(dependency_demand, &required));
+                    }
+                }
+                assert!(
+                    consumer_demand.rects().len() <= MAX_EFFECT_REGION_RECTS,
+                    "selected output region exceeded representation bound at instance {consumer_index}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1632,11 +1632,24 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
-        self.effect_trace.frame_boundary(
-            "effect_demand_plan",
-            "begin",
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, None),
-        );
+        let demand_trace_seed = if self.effect_trace.enabled() {
+            compiled_graph.map(|graph| oblivion_one::effects::EffectDemandPlanStats {
+                repair_rect_count: plan.repair_damage.rect_count(),
+                dependency_edge_count: graph.instances.iter().fold(0, |count, instance| {
+                    count.saturating_add(instance.dependencies.len())
+                }),
+                dependency_propagations: 0,
+                max_instance_region_rect_count: 0,
+                conservative_full: plan.mode == RepaintMode::Full,
+            })
+        } else {
+            None
+        };
+        let mut demand_trace_begin_summary =
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, None);
+        demand_trace_begin_summary.demand_plan = demand_trace_seed;
+        self.effect_trace
+            .frame_boundary("effect_demand_plan", "begin", demand_trace_begin_summary);
         let effect_execution_demand = match &execution_plan {
             FrameExecutionPlan::LegacyScene => None,
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -1652,11 +1665,18 @@ impl GlesSceneRenderer {
         let selected_effect_count = effect_execution_demand
             .as_ref()
             .map(|demand| demand.instances.len());
-        self.effect_trace.frame_boundary(
-            "effect_demand_plan",
-            "end",
-            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
-        );
+        let demand_trace_stats = if self.effect_trace.enabled() {
+            effect_execution_demand
+                .as_ref()
+                .map(|demand| demand.plan_stats())
+        } else {
+            None
+        };
+        let mut demand_trace_end_summary =
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count);
+        demand_trace_end_summary.demand_plan = demand_trace_stats;
+        self.effect_trace
+            .frame_boundary("effect_demand_plan", "end", demand_trace_end_summary);
         if let Some(demand) = &effect_execution_demand {
             self.frame_stats.effect_instances_pruned = self
                 .frame_stats
