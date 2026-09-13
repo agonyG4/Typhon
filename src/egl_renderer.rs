@@ -28,7 +28,7 @@ use oblivion_one::{
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
     window_lifecycle_animation::{
-        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
+        lamp_stage_channels, LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
         LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleRenderFallbacks,
         LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
     },
@@ -87,7 +87,8 @@ struct SurfaceResourceInputs<'a> {
 const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
 const EGL_BUFFER_AGE_EXT: egl::Int = 0x313d;
 const MAX_LAMP_VERTICES: usize = 65_536;
-const LAMP_TARGET_CELL_PIXELS: f32 = 48.0;
+const LAMP_TARGET_CELL_PIXELS: f32 = 32.0;
+const LAMP_MAX_GRID_SUBDIVISIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmabufImportGlStage {
@@ -541,18 +542,24 @@ pub struct EglSceneDrawRequest<'a> {
 struct LifecycleResolvedVisualResource {
     texture: PooledEffectTexture,
     source_signature: u64,
-    source_rect: compositor::PresentationRect,
+    source_visual_rect: compositor::PresentationRect,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
     source_rect: Option<glow::UniformLocation>,
+    source_visual_rect: Option<glow::UniformLocation>,
     full_window_rect: Option<glow::UniformLocation>,
     anchor_rect: Option<glow::UniformLocation>,
     progress: Option<glow::UniformLocation>,
     opacity: Option<glow::UniformLocation>,
-    pull_constant: Option<glow::UniformLocation>,
+    direction: Option<glow::UniformLocation>,
+    shape_factor: Option<glow::UniformLocation>,
+    bump_distance: Option<glow::UniformLocation>,
+    bump_progress: Option<glow::UniformLocation>,
+    stretch_progress: Option<glow::UniformLocation>,
+    squash_progress: Option<glow::UniformLocation>,
     framebuffer_origin_bottom_left: Option<glow::UniformLocation>,
     texture: Option<glow::UniformLocation>,
 }
@@ -684,6 +691,31 @@ struct LampGridSpec {
     uv: EglUvRect,
 }
 
+fn lamp_grid_subdivisions(
+    width: f32,
+    height: f32,
+    available_vertices: usize,
+) -> Option<(usize, usize)> {
+    let mut columns = ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize)
+        .clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
+    let mut rows = ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize)
+        .clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
+    let available_cells = available_vertices / 6;
+    if available_cells == 0 {
+        return None;
+    }
+    while columns.saturating_mul(rows) > available_cells {
+        if columns >= rows && columns > 1 {
+            columns -= 1;
+        } else if rows > 1 {
+            rows -= 1;
+        } else {
+            return None;
+        }
+    }
+    Some((columns, rows))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegacySceneScissoredPhase {
     BaseRepair(usize),
@@ -755,17 +787,11 @@ fn append_lamp_grid(
     {
         return false;
     }
-    let mut columns = ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
-    let mut rows = ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, 32);
-    let required = columns.saturating_mul(rows).saturating_mul(6);
-    if vertices.len().saturating_add(required) > MAX_LAMP_VERTICES {
-        columns = 1;
-        rows = 1;
-    }
-    let required = columns.saturating_mul(rows).saturating_mul(6);
-    if vertices.len().saturating_add(required) > MAX_LAMP_VERTICES {
+    let available_vertices = MAX_LAMP_VERTICES.saturating_sub(vertices.len());
+    let Some((columns, rows)) = lamp_grid_subdivisions(width, height, available_vertices) else {
         return false;
-    }
+    };
+    let required = columns.saturating_mul(rows).saturating_mul(6);
     let vertex_start = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
     let columns_f = columns as f32;
     let rows_f = rows as f32;
@@ -827,18 +853,34 @@ fn lamp_geometry_key(
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
             lamp.transition_id.get(),
-            lamp.source_rect.x().to_bits(),
-            lamp.source_rect.y().to_bits(),
-            lamp.source_rect.width().to_bits(),
-            lamp.source_rect.height().to_bits(),
-            lamp.full_window_rect.x().to_bits(),
-            lamp.full_window_rect.y().to_bits(),
-            lamp.full_window_rect.width().to_bits(),
-            lamp.full_window_rect.height().to_bits(),
-            lamp.anchor_rect.x().to_bits(),
-            lamp.anchor_rect.y().to_bits(),
-            lamp.anchor_rect.width().to_bits(),
-            lamp.anchor_rect.height().to_bits(),
+            lamp.visual_group.canonical_client_rect.x().to_bits(),
+            lamp.visual_group.canonical_client_rect.y().to_bits(),
+            lamp.visual_group.canonical_client_rect.width().to_bits(),
+            lamp.visual_group.canonical_client_rect.height().to_bits(),
+            lamp.visual_group.canonical_visual_rect.x().to_bits(),
+            lamp.visual_group.canonical_visual_rect.y().to_bits(),
+            lamp.visual_group.canonical_visual_rect.width().to_bits(),
+            lamp.visual_group.canonical_visual_rect.height().to_bits(),
+            lamp.visual_group.presented_source_client_rect.x().to_bits(),
+            lamp.visual_group.presented_source_client_rect.y().to_bits(),
+            lamp.visual_group.presented_source_client_rect.width().to_bits(),
+            lamp.visual_group.presented_source_client_rect.height().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.x().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.y().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.width().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.height().to_bits(),
+            lamp.visual_group.anchor_rect.x().to_bits(),
+            lamp.visual_group.anchor_rect.y().to_bits(),
+            lamp.visual_group.anchor_rect.width().to_bits(),
+            lamp.visual_group.anchor_rect.height().to_bits(),
+            lamp.visual_group.shape_factor.to_bits(),
+            lamp.visual_group.bump_distance.to_bits(),
+            match lamp.visual_group.lamp_direction {
+                oblivion_one::window_lifecycle_animation::LampDirection::Top => 1,
+                oblivion_one::window_lifecycle_animation::LampDirection::Right => 2,
+                oblivion_one::window_lifecycle_animation::LampDirection::Bottom => 3,
+                oblivion_one::window_lifecycle_animation::LampDirection::Left => 4,
+            },
         ] {
             mix(value);
         }
@@ -899,8 +941,7 @@ fn lifecycle_damage_for_samples(
 ) -> OutputDamage {
     let mut rects = Vec::new();
     for lamp in &lifecycle.lamps {
-        if let Some(footprint) =
-            lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect)
+        if let Some(footprint) = lamp_footprint(lamp.visual_group)
         {
             let left = footprint.x();
             let top = footprint.y();
@@ -1030,11 +1071,17 @@ impl GlesSceneRenderer {
             LampUniformLocations {
                 output_size: gl.get_uniform_location(program, "u_output_size"),
                 source_rect: gl.get_uniform_location(program, "u_source_rect"),
+                source_visual_rect: gl.get_uniform_location(program, "u_source_visual_rect"),
                 full_window_rect: gl.get_uniform_location(program, "u_full_window_rect"),
                 anchor_rect: gl.get_uniform_location(program, "u_anchor_rect"),
                 progress: gl.get_uniform_location(program, "u_progress"),
                 opacity: gl.get_uniform_location(program, "u_opacity"),
-                pull_constant: gl.get_uniform_location(program, "u_pull_constant"),
+                direction: gl.get_uniform_location(program, "u_direction"),
+                shape_factor: gl.get_uniform_location(program, "u_shape_factor"),
+                bump_distance: gl.get_uniform_location(program, "u_bump_distance"),
+                bump_progress: gl.get_uniform_location(program, "u_bump_progress"),
+                stretch_progress: gl.get_uniform_location(program, "u_stretch_progress"),
+                squash_progress: gl.get_uniform_location(program, "u_squash_progress"),
                 framebuffer_origin_bottom_left: gl
                     .get_uniform_location(program, "u_framebuffer_origin_bottom_left"),
                 texture: gl.get_uniform_location(program, "u_texture"),
@@ -2952,8 +2999,8 @@ impl GlesSceneRenderer {
                 reproject_lifecycle_source_commands(
                     &mut vertices,
                     &mut commands,
-                    lamp.full_window_rect,
-                    lamp.source_rect,
+                    lamp.visual_group.canonical_client_rect,
+                    lamp.visual_group.presented_source_client_rect,
                     output_scale,
                     self.current_size,
                     self.current_framebuffer_origin,
@@ -2968,10 +3015,12 @@ impl GlesSceneRenderer {
                         layer: EglDrawLayer::LifecycleResolvedVisual(source.window_id),
                         window_id: source.window_id,
                         bounds: EglRect::new(
-                            (lamp.full_window_rect.x() * output_scale) as f32,
-                            (lamp.full_window_rect.y() * output_scale) as f32,
-                            (lamp.full_window_rect.width() * output_scale) as f32,
-                            (lamp.full_window_rect.height() * output_scale) as f32,
+                            (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
+                            (lamp.visual_group.canonical_visual_rect.y() * output_scale) as f32,
+                            (lamp.visual_group.canonical_visual_rect.width() * output_scale)
+                                as f32,
+                            (lamp.visual_group.canonical_visual_rect.height() * output_scale)
+                                as f32,
                         ),
                         uv: EglUvRect::new(0.0, 1.0, 1.0, 0.0),
                     },
@@ -3131,8 +3180,11 @@ impl GlesSceneRenderer {
             else {
                 continue;
             };
-            let source_rect = scaled_presentation_rect(lamp.source_rect, output_scale);
-            let Some((width, height)) = lifecycle_visual_texture_size(source_rect) else {
+            let source_visual_rect = scaled_presentation_rect(
+                lamp.visual_group.presented_source_visual_rect,
+                output_scale,
+            );
+            let Some((width, height)) = lifecycle_visual_texture_size(source_visual_rect) else {
                 self.record_lifecycle_render_fallback(
                     lamp,
                     LifecycleRenderFallbackReason::ResolvedSourceAllocation,
@@ -3145,7 +3197,8 @@ impl GlesSceneRenderer {
                 .get(&source.window_id)
                 .is_some_and(|resource| {
                     resource.source_signature == source_signature
-                        && resource.source_rect == lamp.source_rect
+                        && resource.source_visual_rect
+                            == lamp.visual_group.presented_source_visual_rect
                         && self.effect_resources.texture(&resource.texture).is_some()
                 });
             if ready {
@@ -3185,7 +3238,7 @@ impl GlesSceneRenderer {
                 LifecycleResolvedVisualResource {
                     texture,
                     source_signature,
-                    source_rect: lamp.source_rect,
+                    source_visual_rect: lamp.visual_group.presented_source_visual_rect,
                 },
             );
         }
@@ -3216,7 +3269,12 @@ impl GlesSceneRenderer {
         clear_effect_texture(self, &target)?;
         let backup = self.effect_resources.acquire(&self.gl, target.key)?;
         let result = (|| {
-            copy_output_region_to_texture(self, &backup, lamp.source_rect, framebuffer_origin)?;
+            copy_output_region_to_texture(
+                self,
+                &backup,
+                lamp.visual_group.presented_source_visual_rect,
+                framebuffer_origin,
+            )?;
 
             let source_vertices = self
                 .lifecycle_source_vertices
@@ -3238,7 +3296,9 @@ impl GlesSceneRenderer {
             let saved_commands = std::mem::replace(&mut self.commands, source_commands);
             self.scene_geometry_dirty = true;
             let draw_result = (|| {
-                let source_damage = lifecycle_visual_effect_damage(lamp.source_rect);
+                let source_damage = lifecycle_visual_effect_damage(
+                    lamp.visual_group.presented_source_visual_rect,
+                );
                 let output_bounds =
                     EffectRect::new(0, 0, self.current_size.0.max(1), self.current_size.1.max(1))
                         .expect("non-zero renderer dimensions must form valid effect bounds");
@@ -3263,13 +3323,18 @@ impl GlesSceneRenderer {
                     &graph,
                     framebuffer_origin,
                     &[lifecycle_visual_output_rect(
-                        lamp.source_rect,
+                        lamp.visual_group.presented_source_visual_rect,
                         output_bounds,
                     )],
                     &demand,
                     &selection,
                 )?;
-                copy_output_region_to_texture(self, &target, lamp.source_rect, framebuffer_origin)?;
+                copy_output_region_to_texture(
+                    self,
+                    &target,
+                    lamp.visual_group.presented_source_visual_rect,
+                    framebuffer_origin,
+                )?;
                 Ok(())
             })();
             self.vertices = saved_vertices;
@@ -3281,8 +3346,12 @@ impl GlesSceneRenderer {
             draw_result
         })();
 
-        let restore_result =
-            restore_output_region_from_texture(self, &backup, lamp.source_rect, framebuffer_origin);
+        let restore_result = restore_output_region_from_texture(
+            self,
+            &backup,
+            lamp.visual_group.presented_source_visual_rect,
+            framebuffer_origin,
+        );
         let release_result = self.effect_resources.release(backup);
         match (result, restore_result, release_result) {
             (Err(error), _, _) => Err(error),
@@ -3383,12 +3452,6 @@ impl GlesSceneRenderer {
                     self.current_size.1 as f32,
                 );
             }
-            if let Some(location) = &uniforms.pull_constant {
-                self.gl.uniform_1_f32(
-                    Some(location),
-                    oblivion_one::window_lifecycle_animation::ASTREA_LAMP_PULL as f32,
-                );
-            }
             if let Some(location) = &uniforms.framebuffer_origin_bottom_left {
                 self.gl.uniform_1_i32(
                     Some(location),
@@ -3435,21 +3498,65 @@ impl GlesSceneRenderer {
                 set_lamp_uniform_rect(
                     &self.gl,
                     uniforms.source_rect.as_ref(),
-                    sample.source_rect,
+                    sample.visual_group.presented_source_client_rect,
                     output_scale,
                 );
                 set_lamp_uniform_rect(
                     &self.gl,
                     uniforms.full_window_rect.as_ref(),
-                    sample.full_window_rect,
+                    sample.visual_group.canonical_client_rect,
+                    output_scale,
+                );
+                set_lamp_uniform_rect(
+                    &self.gl,
+                    uniforms.source_visual_rect.as_ref(),
+                    sample.visual_group.presented_source_visual_rect,
                     output_scale,
                 );
                 set_lamp_uniform_rect(
                     &self.gl,
                     uniforms.anchor_rect.as_ref(),
-                    sample.anchor_rect,
+                    sample.visual_group.anchor_rect,
                     output_scale,
                 );
+                if let Some(location) = &uniforms.direction {
+                    let direction = match sample.visual_group.lamp_direction {
+                        oblivion_one::window_lifecycle_animation::LampDirection::Top => 0,
+                        oblivion_one::window_lifecycle_animation::LampDirection::Right => 1,
+                        oblivion_one::window_lifecycle_animation::LampDirection::Bottom => 2,
+                        oblivion_one::window_lifecycle_animation::LampDirection::Left => 3,
+                    };
+                    self.gl.uniform_1_i32(Some(location), direction);
+                }
+                if let Some(location) = &uniforms.shape_factor {
+                    self.gl.uniform_1_f32(
+                        Some(location),
+                        sample.visual_group.shape_factor as f32,
+                    );
+                }
+                if let Some(location) = &uniforms.bump_distance {
+                    self.gl.uniform_1_f32(
+                        Some(location),
+                        (sample.visual_group.bump_distance * output_scale) as f32,
+                    );
+                }
+                let channels = lamp_stage_channels(
+                    sample.progress,
+                    sample.visual_group.shape_factor,
+                    sample.visual_group.bump_distance,
+                );
+                if let Some(location) = &uniforms.bump_progress {
+                    self.gl
+                        .uniform_1_f32(Some(location), channels.bump_progress as f32);
+                }
+                if let Some(location) = &uniforms.stretch_progress {
+                    self.gl
+                        .uniform_1_f32(Some(location), channels.stretch_progress as f32);
+                }
+                if let Some(location) = &uniforms.squash_progress {
+                    self.gl
+                        .uniform_1_f32(Some(location), channels.squash_progress as f32);
+                }
                 if let Some(location) = &uniforms.progress {
                     self.gl
                         .uniform_1_f32(Some(location), sample.progress as f32);
@@ -3517,7 +3624,7 @@ impl GlesSceneRenderer {
 
     fn lamp_intersects_current_output(&self, lamp: &LampWindowSample) -> bool {
         let scale = self.effect_output_scale.max(1.0) as f64;
-        lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect).is_some_and(
+        lamp_footprint(lamp.visual_group).is_some_and(
             |footprint| {
                 let x = footprint.x() * scale;
                 let y = footprint.y() * scale;
@@ -4768,14 +4875,14 @@ fn push_egl_surface_commands(
 fn reproject_lifecycle_source_commands(
     vertices: &mut [EglTexturedVertex],
     commands: &mut [EglDrawCommand],
-    full_window_rect: compositor::PresentationRect,
-    source_rect: compositor::PresentationRect,
+    canonical_client_rect: compositor::PresentationRect,
+    presented_source_client_rect: compositor::PresentationRect,
     output_scale: f64,
     output_size: (u32, u32),
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
-    let full = scaled_presentation_rect(full_window_rect, output_scale);
-    let source = scaled_presentation_rect(source_rect, output_scale);
+    let full = scaled_presentation_rect(canonical_client_rect, output_scale);
+    let source = scaled_presentation_rect(presented_source_client_rect, output_scale);
     let map_point = |point: [f64; 2]| {
         [
             source.x() + (point[0] - full.x()) * source.width() / full.width(),
@@ -4860,14 +4967,22 @@ fn lifecycle_visual_source_signature(
 ) -> u64 {
     let mut signature = source.effect_scene.signature;
     for value in [
-        lamp.source_rect.x().to_bits(),
-        lamp.source_rect.y().to_bits(),
-        lamp.source_rect.width().to_bits(),
-        lamp.source_rect.height().to_bits(),
-        lamp.full_window_rect.x().to_bits(),
-        lamp.full_window_rect.y().to_bits(),
-        lamp.full_window_rect.width().to_bits(),
-        lamp.full_window_rect.height().to_bits(),
+        lamp.visual_group.canonical_client_rect.x().to_bits(),
+        lamp.visual_group.canonical_client_rect.y().to_bits(),
+        lamp.visual_group.canonical_client_rect.width().to_bits(),
+        lamp.visual_group.canonical_client_rect.height().to_bits(),
+        lamp.visual_group.canonical_visual_rect.x().to_bits(),
+        lamp.visual_group.canonical_visual_rect.y().to_bits(),
+        lamp.visual_group.canonical_visual_rect.width().to_bits(),
+        lamp.visual_group.canonical_visual_rect.height().to_bits(),
+        lamp.visual_group.presented_source_client_rect.x().to_bits(),
+        lamp.visual_group.presented_source_client_rect.y().to_bits(),
+        lamp.visual_group.presented_source_client_rect.width().to_bits(),
+        lamp.visual_group.presented_source_client_rect.height().to_bits(),
+        lamp.visual_group.presented_source_visual_rect.x().to_bits(),
+        lamp.visual_group.presented_source_visual_rect.y().to_bits(),
+        lamp.visual_group.presented_source_visual_rect.width().to_bits(),
+        lamp.visual_group.presented_source_visual_rect.height().to_bits(),
         output_scale.to_bits(),
     ] {
         signature ^= value;
@@ -6079,7 +6194,7 @@ mod tests {
     };
     use oblivion_one::window_lifecycle_animation::{
         LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
-        LifecycleVisualSource, LifecycleVisualSourceKind,
+        LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind,
     };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
@@ -7318,9 +7433,15 @@ mod tests {
                     .expect("valid window id"),
                 root_surface_id: 1,
                 transition_id: LifecycleTransitionId::new(1),
-                source_rect: rect,
-                full_window_rect: rect,
-                anchor_rect: anchor,
+                visual_group: LifecycleVisualGroup::from_bounds(
+                    rect,
+                    rect,
+                    rect,
+                    anchor,
+                    1920,
+                    1080,
+                )
+                .expect("valid visual group"),
                 progress,
                 opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
@@ -7679,6 +7800,74 @@ mod tests {
                 OutputFramebufferOrigin::BottomLeft,
             )
         );
+    }
+
+    #[test]
+    fn every_visible_lamp_progress_sample_has_lifecycle_damage() {
+        for progress in [0.01, 0.5, 0.97] {
+            let sample = lamp_test_sample(progress);
+            let damage = lifecycle_damage_for_samples(&sample, 1920, 1080, 1.0);
+            assert!(
+                !matches!(damage, OutputDamage::Empty),
+                "progress {progress} must remain eligible for presentation"
+            );
+        }
+    }
+
+    #[test]
+    fn lamp_mesh_topology_upload_count_is_independent_of_progress_frames() {
+        let early = lamp_test_sample(0.1);
+        let middle = lamp_test_sample(0.5);
+        let late = lamp_test_sample(0.9);
+        let early_key = lamp_geometry_key(
+            &early,
+            &[],
+            &[],
+            1.0,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        assert_eq!(
+            early_key,
+            lamp_geometry_key(
+                &middle,
+                &[],
+                &[],
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+        );
+        assert_eq!(
+            early_key,
+            lamp_geometry_key(
+                &late,
+                &[],
+                &[],
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+        );
+    }
+
+    #[test]
+    fn lamp_mesh_reaches_preferred_cell_size_before_global_budget() {
+        let (columns, rows) = lamp_grid_subdivisions(1920.0, 1080.0, MAX_LAMP_VERTICES)
+            .expect("preferred Lamp grid fits in global budget");
+        assert_eq!(columns, 60);
+        assert_eq!(rows, 34);
+        assert!(1920.0 / columns as f32 <= 36.0);
+        assert!(1080.0 / rows as f32 <= 36.0);
+    }
+
+    #[test]
+    fn lamp_mesh_coarsens_deterministically_under_global_vertex_budget() {
+        let available = 60 * 20 * 6;
+        let first = lamp_grid_subdivisions(1920.0, 1080.0, available)
+            .expect("reduced Lamp grid fits");
+        let second = lamp_grid_subdivisions(1920.0, 1080.0, available)
+            .expect("reduced Lamp grid fits");
+        assert_eq!(first, second);
+        assert!(first.0.saturating_mul(first.1).saturating_mul(6) <= available);
+        assert!(first.0 > 1 || first.1 > 1);
     }
 
     #[test]
