@@ -6483,6 +6483,7 @@ mod tests {
         let mut first_dimensions = None;
         let mut warm_cache_bytes = None;
         let mut warm_allocation_count = None;
+        let mut capture_radii = None;
 
         for (step, (x, y)) in positions.iter().copied().cycle().take(512).enumerate() {
             let rect = EffectRect::new(x, y, 32, 24).expect("moving target rectangle");
@@ -6549,14 +6550,32 @@ mod tests {
                 .find(|texture| texture.source == GraphTextureSource::CapturedScene)
                 .expect("visual-group blur capture texture");
             assert!(capture.domain.width > 0 && capture.domain.height > 0);
+            let (capture_radius_x, capture_radius_y) = *capture_radii.get_or_insert((
+                x.saturating_sub(capture.domain.x).max(0),
+                y.saturating_sub(capture.domain.y).max(0),
+            ));
+            let expected_left = (x - capture_radius_x).max(0);
+            let expected_top = (y - capture_radius_y).max(0);
+            let expected_right = (x + 32 + capture_radius_x).min(256);
+            let expected_bottom = (y + 24 + capture_radius_y).min(192);
+            let expected_capture = EffectRect::new(
+                expected_left,
+                expected_top,
+                u32::try_from(expected_right - expected_left).expect("capture width"),
+                u32::try_from(expected_bottom - expected_top).expect("capture height"),
+            )
+            .expect("expected capture domain");
+            assert_eq!(capture.domain, expected_capture, "step {step}");
             let dimensions = graph
                 .textures
                 .iter()
                 .filter(|texture| texture.source != GraphTextureSource::Output)
                 .map(|texture| (texture.width, texture.height))
                 .collect::<Vec<_>>();
-            let interior =
-                x >= 0 && y >= 0 && x.saturating_add(32) <= 256 && y.saturating_add(24) <= 192;
+            let interior = expected_left == x - capture_radius_x
+                && expected_top == y - capture_radius_y
+                && expected_right == x + 32 + capture_radius_x
+                && expected_bottom == y + 24 + capture_radius_y;
             if interior {
                 if let Some(first) = &first_dimensions {
                     assert_eq!(first, &dimensions, "translation changed texture dimensions");
