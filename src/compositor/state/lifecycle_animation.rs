@@ -176,6 +176,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_invisible_lamp_endpoint_can_settle_without_visual_change() {
+        let window_id = WindowId::from_raw(309).expect("valid window ID");
+        let mut state = CompositorState {
+            output_size: OutputSize::new(100, 100),
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let transition_id = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    window_id,
+                    309,
+                    rect(10.0, 10.0, 60.0, 60.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("Lamp transition starts");
+        assert!(state.window_lifecycle_animator.snap_to_endpoint(
+            window_id,
+            transition_id,
+            AnimationTime::monotonic_now().expect("monotonic time"),
+        ));
+
+        assert!(!state.lifecycle_animation_has_pending_visible());
+        assert!(state.settle_lifecycle_no_visual_change());
+        assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    }
+
+    #[test]
     fn old_visible_physical_lamp_prevents_no_visual_settlement() {
         let window_id = WindowId::from_raw(303).expect("valid window ID");
         let mut state = CompositorState {
@@ -212,9 +245,6 @@ mod tests {
                     100,
                 )
                 .expect("valid visual group"),
-                source_rect: rect(0.0, 0.0, 80.0, 80.0),
-                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
-                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
                 progress: 0.5,
                 opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
@@ -223,6 +253,7 @@ mod tests {
             visual_sources: Vec::new(),
         };
         state.presented_lifecycle = LifecycleFrameSnapshot::from_sample(&old);
+        assert!(!state.settle_lifecycle_no_visual_change());
         assert!(!state.settle_lifecycle_no_visual_change());
         assert_eq!(state.window_lifecycle_animator.active_count(), 1);
         assert!(state.lifecycle_animation_has_pending_visible());
@@ -266,9 +297,6 @@ mod tests {
                     100,
                 )
                 .expect("valid visual group"),
-                source_rect: rect(0.0, 0.0, 80.0, 80.0),
-                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
-                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
                 progress: 0.5,
                 opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
@@ -330,9 +358,6 @@ mod tests {
                     100,
                 )
                 .expect("valid visual group"),
-                source_rect: rect(0.0, 0.0, 80.0, 80.0),
-                full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
-                anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
                 progress: 0.5,
                 opacity: 1.0,
                 direction: LifecycleDirection::Minimize,
@@ -710,25 +735,13 @@ impl CompositorState {
             self.lifecycle_decorations.remove(&root_surface_id);
             return;
         }
-        let Some(full_window_rect) = self.lifecycle_window_rect(root_surface_id) else {
-            self.window_lifecycle_animator.cancel(window_id);
-            self.lifecycle_render_suppressed_roots
-                .remove(&root_surface_id);
-            self.lifecycle_decorations.remove(&root_surface_id);
-            return;
-        };
-        let Some(anchor_rect) = self.lifecycle_anchor_rect(window_id) else {
-            self.window_lifecycle_animator.cancel(window_id);
-            self.lifecycle_render_suppressed_roots
-                .remove(&root_surface_id);
-            self.lifecycle_decorations.remove(&root_surface_id);
-            return;
-        };
         let visual_group = self
             .window_lifecycle_animator
             .visual_group(window_id)
             .or(visual_group)
             .or_else(|| {
+                let full_window_rect = self.lifecycle_window_rect(root_surface_id)?;
+                let anchor_rect = self.lifecycle_anchor_rect(window_id)?;
                 LifecycleVisualGroup::from_bounds(
                     full_window_rect,
                     full_window_rect,
@@ -876,6 +889,13 @@ impl CompositorState {
         )
     }
 
+    fn lifecycle_lamp_has_visible_pixels(
+        &self,
+        lamp: &crate::window_lifecycle_animation::LampWindowSample,
+    ) -> bool {
+        lamp.opacity > f64::EPSILON && self.lifecycle_lamp_intersects_output(lamp)
+    }
+
     pub(in crate::compositor) fn settle_lifecycle_no_visual_change(&mut self) -> bool {
         let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         let candidates = self
@@ -883,11 +903,12 @@ impl CompositorState {
             .sample_scene(now)
             .lamps
             .into_iter()
-            .filter(|lamp| !self.lifecycle_lamp_intersects_output(lamp))
+            .filter(|lamp| !self.lifecycle_lamp_has_visible_pixels(lamp))
             .filter(|lamp| {
                 !self.presented_lifecycle.lamps.iter().any(|presented| {
                     presented.window_id == lamp.window_id
                         && !presented.mathematically_settled
+                        && presented.opacity > f64::EPSILON
                         && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
                             presented.visual_group,
                             self.output_size.width,
@@ -918,7 +939,7 @@ impl CompositorState {
             .sample_scene(AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0)))
             .lamps
             .iter()
-            .any(|lamp| self.lifecycle_lamp_intersects_output(lamp));
+            .any(|lamp| self.lifecycle_lamp_has_visible_pixels(lamp));
         let presented_intersects = self.presented_lifecycle.lamps.iter().any(|lamp| {
             !lamp.mathematically_settled
                 && lamp.opacity > f64::EPSILON

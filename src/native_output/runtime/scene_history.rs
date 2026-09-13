@@ -336,9 +336,6 @@ mod tests {
                     1080,
                 )
                 .expect("valid visual group"),
-                source_rect: source,
-                full_window_rect: source,
-                anchor_rect: anchor,
                 progress,
                 opacity: if progress >= 1.0 { 0.0 } else { 1.0 },
                 mathematically_settled: progress >= 1.0,
@@ -380,6 +377,47 @@ mod tests {
                 .lamps[0]
                 .mathematically_settled
         );
+    }
+
+    #[test]
+    fn lifecycle_damage_repairs_ssd_titlebar_above_client() {
+        let client = oblivion_one::compositor::PresentationRect::new(
+            400.0, 100.0, 800.0, 600.0,
+        )
+        .expect("valid client rectangle");
+        let ssd_outer = oblivion_one::compositor::PresentationRect::new(
+            384.0, 60.0, 832.0, 640.0,
+        )
+        .expect("valid SSD rectangle");
+        let anchor = oblivion_one::compositor::PresentationRect::new(
+            1200.0, 900.0, 64.0, 64.0,
+        )
+        .expect("valid anchor rectangle");
+        let group = LifecycleVisualGroup::from_bounds(
+            client, ssd_outer, client, anchor, 1920, 1080,
+        )
+        .expect("valid visual group");
+        let snapshot = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
+            sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
+            lamps: vec![LampWindowSample {
+                window_id: oblivion_one::compositor::WindowId::from_raw(8)
+                    .expect("valid window id"),
+                root_surface_id: 8,
+                transition_id: LifecycleTransitionId::new(8),
+                visual_group: group,
+                progress: 0.5,
+                opacity: 1.0,
+                mathematically_settled: false,
+                direction: LifecycleDirection::Minimize,
+            }],
+            visual_sources: Vec::new(),
+        });
+
+        let damage = lifecycle_damage_rects(&snapshot, 1920, 1080);
+
+        assert_eq!(damage.len(), 1);
+        assert!(damage[0].y <= 60);
+        assert!(damage[0].y + i32::try_from(damage[0].height).expect("damage fits") >= 964);
     }
 
     #[test]

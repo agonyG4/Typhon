@@ -1427,49 +1427,57 @@ impl CompositorState {
         }
         let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
         let lifecycle_visual_group = self
-            .lifecycle_window_rect(root_surface_id)
-            .zip(self.lifecycle_anchor_rect(window_id))
-            .and_then(|(canonical_client, anchor)| {
-                let owned_bounds = self
-                    .renderable_surfaces
-                    .iter()
-                    .filter(|surface| {
-                        root_surface_id_for_surface_in_placements(
-                            &self.surface_placements,
-                            surface.surface_id,
-                        ) == root_surface_id
-                    })
-                    .filter_map(|surface| {
-                        PresentationRect::new(
-                            f64::from(surface.x),
-                            f64::from(surface.y),
-                            f64::from(surface.width),
-                            f64::from(surface.height),
+            .window_lifecycle_animator
+            .visual_group(window_id)
+            .or_else(|| {
+                self.lifecycle_window_rect(root_surface_id)
+                    .zip(self.lifecycle_anchor_rect(window_id))
+                    .and_then(|(canonical_client, anchor)| {
+                        let owned_bounds = self
+                            .renderable_surfaces
+                            .iter()
+                            .filter(|surface| {
+                                root_surface_id_for_surface_in_placements(
+                                    &self.surface_placements,
+                                    surface.surface_id,
+                                ) == root_surface_id
+                            })
+                            .filter_map(|surface| {
+                                PresentationRect::new(
+                                    f64::from(surface.x),
+                                    f64::from(surface.y),
+                                    f64::from(surface.width),
+                                    f64::from(surface.height),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let decoration_bounds = self
+                            .native_decoration_render_instances_for_scale(
+                                &self.renderable_surfaces,
+                                1.0,
+                            )
+                            .into_iter()
+                            .find(|decoration| decoration.root_surface_id() == root_surface_id)
+                            .and_then(|decoration| {
+                                let (x, y, width, height) = decoration.scene_snapshot().bounds();
+                                PresentationRect::new(
+                                    f64::from(x),
+                                    f64::from(y),
+                                    f64::from(width),
+                                    f64::from(height),
+                                )
+                            });
+                        let visual =
+                            canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                        LifecycleVisualGroup::from_bounds(
+                            canonical_client,
+                            visual,
+                            canonical_client,
+                            anchor,
+                            self.output_size.width,
+                            self.output_size.height,
                         )
                     })
-                    .collect::<Vec<_>>();
-                let decoration_bounds = self
-                    .native_decoration_render_instances_for_scale(&self.renderable_surfaces, 1.0)
-                    .into_iter()
-                    .find(|decoration| decoration.root_surface_id() == root_surface_id)
-                    .and_then(|decoration| {
-                        let (x, y, width, height) = decoration.scene_snapshot().bounds();
-                        PresentationRect::new(
-                            f64::from(x),
-                            f64::from(y),
-                            f64::from(width),
-                            f64::from(height),
-                        )
-                    });
-                let visual = canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                LifecycleVisualGroup::from_bounds(
-                    canonical_client,
-                    visual,
-                    canonical_client,
-                    anchor,
-                    self.output_size.width,
-                    self.output_size.height,
-                )
             });
         self.begin_lifecycle_restore(
             window_id,
