@@ -32,7 +32,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> AppResult<()> {
-    match parse_args(std::env::args().skip(1).collect())? {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == oblivion_one::application_scope::INTERNAL_SCOPE_EXEC_COMMAND)
+    {
+        match oblivion_one::application_scope::run_internal_scope_exec(&args[1..]) {
+            Ok(never) => match never {},
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+
+    match parse_args(args)? {
         CliCommand::Help => {
             print_help();
             Ok(())

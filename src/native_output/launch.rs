@@ -1,5 +1,10 @@
 use super::*;
 use oblivion_one::astrea_shell_control::server::astrea_launch_request_v1;
+use oblivion_one::{
+    compositor_app_command_from_argv, compositor_app_spawn_argv_for_policy,
+    configure_compositor_app_command_with_xwayland_environment,
+};
+use std::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -149,14 +154,8 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
                 process_options,
             )
         }
-        _ => match compositor_app_command_with_policy_and_xwayland_and_cursor(
-            &socket_name,
-            &request.argv,
-            request.gpu_policy,
-            xwayland,
-            cursor.as_ref(),
-        )? {
-            Some(command) => supervisor.spawn(command, process_options),
+        _ => match native_application_command(&request, &socket_name, xwayland, cursor.as_ref())? {
+            Some(command) => spawn_native_process(supervisor, command, process_options),
             None => return Ok(None),
         },
     };
@@ -236,13 +235,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
         };
         let spawn_start = Instant::now();
         let process_options = native_process_options(&request);
-        let command = match compositor_app_command_with_policy_and_xwayland_and_cursor(
-            &socket_name,
-            &request.argv,
-            request.gpu_policy,
-            xwayland,
-            cursor,
-        ) {
+        let command = match native_application_command(&request, &socket_name, xwayland, cursor) {
             Ok(Some(command)) => command,
             Ok(None) => {
                 pending.request.failed(5, "empty command".to_string());
@@ -255,7 +248,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
                 continue;
             }
         };
-        match supervisor.spawn(command, process_options) {
+        match spawn_native_process(supervisor, command, process_options) {
             Ok(pid) => {
                 launch_tracker.track(pid, pending.request.clone());
                 pending.request.accepted(pid);
@@ -297,6 +290,68 @@ fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {
             ProcessOptions::new(ProcessKind::SessionService).with_label(request.program.clone())
         }
     }
+}
+
+fn native_application_argv(
+    request: &NativeLaunchRequest,
+    argv: &[String],
+) -> io::Result<Vec<String>> {
+    let eligible = application_scope_eligible(&native_process_options(request));
+    match oblivion_one::application_scope::maybe_wrap_application_argv(argv, eligible) {
+        Ok(argv) => Ok(argv),
+        Err(error) if eligible => {
+            eprintln!(
+                "application scope preparation unavailable for `{}`; launching directly: {error}",
+                request.program
+            );
+            Ok(argv.to_vec())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn native_application_command(
+    request: &NativeLaunchRequest,
+    socket_name: &str,
+    xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
+    cursor: Option<&oblivion_one::cursor_theme::CursorConfiguration>,
+) -> io::Result<Option<Command>> {
+    let Some(argv) = compositor_app_spawn_argv_for_policy(&request.argv, request.gpu_policy) else {
+        return Ok(None);
+    };
+    let argv = native_application_argv(request, &argv)?;
+    let Some(mut command) =
+        compositor_app_command_from_argv(socket_name, &argv, request.gpu_policy)
+    else {
+        return Ok(None);
+    };
+    if let Some(xwayland) = xwayland {
+        configure_compositor_app_command_with_xwayland_environment(
+            &mut command,
+            socket_name,
+            xwayland,
+        );
+    }
+    if let Some(cursor) = cursor {
+        command.env("XCURSOR_THEME", &cursor.theme);
+        command.env("XCURSOR_SIZE", cursor.size_px.to_string());
+    }
+    Ok(Some(command))
+}
+
+fn spawn_native_process(
+    supervisor: &mut ChildSupervisor,
+    command: Command,
+    options: ProcessOptions,
+) -> io::Result<u32> {
+    let eligible = application_scope_eligible(&options);
+    oblivion_one::application_scope::prepare_application_spawn(command, eligible)?
+        .spawn(supervisor, options)
+        .map(|spawned| spawned.pid)
+}
+
+fn application_scope_eligible(options: &ProcessOptions) -> bool {
+    options.kind == ProcessKind::Application && !options.session_owned
 }
 
 pub(crate) fn external_shell_command() -> Option<Vec<String>> {
@@ -469,6 +524,70 @@ mod tests {
 
         assert_eq!(options.kind, ProcessKind::Application);
         assert!(!options.session_owned);
+    }
+
+    #[test]
+    fn application_scope_wraps_only_normal_application_sources() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("OBLIVION_ONE_APP_SCOPES");
+        unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", "on") };
+
+        let real_argv = vec!["app".to_owned(), "arg with spaces".to_owned()];
+        for source in [
+            NativeLaunchSource::Startup,
+            NativeLaunchSource::BindingApplication,
+            NativeLaunchSource::ShellControl,
+        ] {
+            let request = native_launch_request(
+                real_argv.clone(),
+                EffectiveCompositorAppGpuPolicy::CpuOnly,
+                source,
+            )
+            .expect("request");
+            let wrapped = native_application_argv(&request, &real_argv).expect("wrapped argv");
+            assert_eq!(
+                wrapped[1],
+                oblivion_one::application_scope::INTERNAL_SCOPE_EXEC_COMMAND
+            );
+            assert_eq!(wrapped[3..], real_argv);
+        }
+
+        for source in [
+            NativeLaunchSource::ExternalShell,
+            NativeLaunchSource::Spotlight,
+            NativeLaunchSource::AltTab,
+            NativeLaunchSource::BindingSessionCommand,
+        ] {
+            let request = native_launch_request(
+                real_argv.clone(),
+                EffectiveCompositorAppGpuPolicy::CpuOnly,
+                source,
+            )
+            .expect("request");
+            assert_eq!(
+                native_application_argv(&request, &real_argv).unwrap(),
+                real_argv
+            );
+        }
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", value) },
+            None => unsafe { std::env::remove_var("OBLIVION_ONE_APP_SCOPES") },
+        }
+    }
+
+    #[test]
+    fn application_scope_off_preserves_direct_argv() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os("OBLIVION_ONE_APP_SCOPES");
+        unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", "off") };
+        let request = request_for_source(NativeLaunchSource::Startup);
+        let argv = vec!["app".to_owned(), "$(literal)".to_owned()];
+        assert_eq!(native_application_argv(&request, &argv).unwrap(), argv);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", value) },
+            None => unsafe { std::env::remove_var("OBLIVION_ONE_APP_SCOPES") },
+        }
     }
 
     #[test]
