@@ -294,6 +294,7 @@ pub(super) struct DmabufParamsData {
     planes: Mutex<Vec<PendingDmabufPlane>>,
 }
 
+#[allow(clippy::mutable_key_type)]
 impl DmabufParamsData {
     pub(super) fn add_plane(
         &self,
@@ -521,6 +522,7 @@ impl DmabufParamsData {
     }
 }
 
+#[allow(clippy::mutable_key_type)]
 fn post_dmabuf_protocol_error(
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,

@@ -733,7 +733,6 @@ mod commit_context_tests {
                     CapturedSubsurfaceStackEntry::Parent,
                     CapturedSubsurfaceStackEntry::Child(relationship(10, 1)),
                 ]),
-                ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
         };
@@ -749,7 +748,6 @@ mod commit_context_tests {
                     CapturedSubsurfaceStackEntry::Parent,
                     CapturedSubsurfaceStackEntry::Child(relationship(10, 2)),
                 ]),
-                ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
         };
@@ -812,8 +810,10 @@ mod relationship_phase_tests {
 
     #[test]
     fn relationship_id_allocation_fails_without_wrapping() {
-        let mut transactions = SubsurfaceTransactionState::default();
-        transactions.next_relationship_id = u64::MAX;
+        let mut transactions = SubsurfaceTransactionState {
+            next_relationship_id: u64::MAX,
+            ..SubsurfaceTransactionState::default()
+        };
 
         assert!(!transactions.register(2, 1));
         assert_eq!(transactions.relationship_phase(2), None);

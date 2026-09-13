@@ -584,10 +584,12 @@ impl CompositorState {
             if let Some(resize_commit) = old_resize_commit {
                 self.release_detached_resize_capture(surface_id, resize_commit);
             }
-            if let Some(lifetimes) = transaction.publication_lifetimes.captured_mut() {
-                if let Some(lifetime) = lifetimes.get_mut(existing_index) {
-                    *lifetime = incoming_lifetime.clone();
-                }
+            if let Some(lifetime) = transaction
+                .publication_lifetimes
+                .captured_mut()
+                .and_then(|lifetimes| lifetimes.get_mut(existing_index))
+            {
+                *lifetime = incoming_lifetime.clone();
             }
             if !attachment_changed && existing.resize_commit.is_some() {
                 stats.resize_snapshots_preserved =
@@ -845,6 +847,7 @@ impl CompositorState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_waiting_surface_tree_parts(
         &mut self,
         root_surface_id: u32,

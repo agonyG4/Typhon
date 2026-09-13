@@ -327,7 +327,7 @@ mod frame_consumption_tests {
 
         assert!(state.pending_surface_tree_transactions.is_empty());
         assert!(state.renderable_surface(surface_id).is_none());
-        assert!(state.surface_publications.get(&surface_id).is_none());
+        assert!(!state.surface_publications.contains_key(&surface_id));
     }
 
     #[test]
@@ -389,7 +389,7 @@ mod frame_consumption_tests {
 
         assert!(state.pending_surface_tree_transactions.is_empty());
         assert!(state.renderable_surface(surface_id).is_none());
-        assert!(state.surface_publications.get(&surface_id).is_none());
+        assert!(!state.surface_publications.contains_key(&surface_id));
     }
 
     #[test]
@@ -470,8 +470,8 @@ mod frame_consumption_tests {
         assert!(state.pending_surface_tree_transactions.is_empty());
         assert!(state.renderable_surface(surface_a_id).is_none());
         assert!(state.renderable_surface(surface_b_id).is_none());
-        assert!(state.surface_publications.get(&surface_a_id).is_none());
-        assert!(state.surface_publications.get(&surface_b_id).is_none());
+        assert!(!state.surface_publications.contains_key(&surface_a_id));
+        assert!(!state.surface_publications.contains_key(&surface_b_id));
     }
 
     #[test]

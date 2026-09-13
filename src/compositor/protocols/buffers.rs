@@ -273,6 +273,7 @@ struct WlDrmPrimeBufferRequest {
     stride0: i32,
 }
 
+#[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
 fn wl_drm_prime_buffer_data(
     drm: &wl_drm::WlDrm,
     request: WlDrmPrimeBufferRequest,
@@ -353,6 +354,7 @@ fn wl_drm_prime_buffer_data(
     Some(DmabufBufferData { identity, handle })
 }
 
+#[allow(clippy::mutable_key_type)]
 fn post_wl_drm_protocol_error(
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,

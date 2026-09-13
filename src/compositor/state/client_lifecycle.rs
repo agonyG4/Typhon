@@ -1,6 +1,6 @@
 use super::*;
 
-#[allow(clippy::mutable_key_type)]
+#[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
 pub(in crate::compositor) fn post_fatal_protocol_error<I: Resource>(
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,
@@ -195,6 +195,7 @@ impl CompositorState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn post_protocol_error_with_cleanup_and_details<I: Resource>(
         &mut self,
         client: &Client,

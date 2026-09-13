@@ -1699,7 +1699,7 @@ impl CompositorState {
                     .is_none()
                     && dependency
                         .surface_presentation_generation
-                        .map_or(true, |generation| {
+                        .is_none_or(|generation| {
                             self.surface_presentation_generations
                                 .get(&dependency.surface_id)
                                 .copied()
