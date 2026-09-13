@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, ffi::OsStr};
+use std::{
+    collections::VecDeque,
+    ffi::{OsStr, c_void},
+};
 
 use glow::HasContext;
 use oblivion_one::effects::{MAX_EFFECT_INSTANCES_PER_OUTPUT, MAX_GRAPH_PASSES, RenderPassKind};
@@ -355,6 +358,11 @@ impl TimingState {
         })
     }
 
+    #[cfg(test)]
+    fn aggregate_count_for_test(&self) -> usize {
+        self.aggregates.len()
+    }
+
     fn poll_front(&mut self, available: bool, timestamps: Option<(u64, u64)>) -> PollOutcome {
         if self.pending.is_empty() {
             return PollOutcome::Empty;
@@ -502,15 +510,152 @@ impl TimingState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionAction {
+    StopUnavailable,
+    InvalidateDisjoint,
+    ReadResults,
+}
+
+fn collection_action(available: bool, disjoint: bool, uses_disjoint: bool) -> CollectionAction {
+    if !available {
+        CollectionAction::StopUnavailable
+    } else if uses_disjoint && disjoint {
+        CollectionAction::InvalidateDisjoint
+    } else {
+        CollectionAction::ReadResults
+    }
+}
+
+fn observe_disjoint(timing: &mut TimingState, disjoint: bool) -> bool {
+    if disjoint {
+        timing.invalidate_pending();
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
 enum TimestampPath {
-    ExtDisjoint,
-    DesktopCore,
+    ExtDisjoint(QueryTargetFunction),
+    DesktopCore(QueryTargetFunction),
 }
 
 impl TimestampPath {
-    const fn uses_disjoint(self) -> bool {
-        matches!(self, Self::ExtDisjoint)
+    fn uses_disjoint(self) -> bool {
+        match self {
+            Self::ExtDisjoint(query_target) => {
+                query_target.target == GL_TIMESTAMP_EXT
+                    && query_target.pname == GL_QUERY_COUNTER_BITS_EXT
+            }
+            Self::DesktopCore(query_target) => {
+                debug_assert_eq!(query_target.target, glow::TIMESTAMP);
+                false
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimestampQueryPath {
+    Ext,
+    Core,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimestampCapabilityInfo {
+    embedded: bool,
+    major: u32,
+    minor: u32,
+    has_ext: bool,
+    has_arb: bool,
+}
+
+type GetQueryiv = unsafe extern "system" fn(u32, u32, *mut i32);
+
+const GL_TIMESTAMP_EXT: u32 = 0x8e28;
+const GL_QUERY_COUNTER_BITS_EXT: u32 = 0x8864;
+
+#[cfg(test)]
+unsafe extern "system" fn test_queryiv(_target: u32, _pname: u32, _params: *mut i32) {}
+
+#[derive(Clone, Copy)]
+struct QueryTargetFunction {
+    function: GetQueryiv,
+    target: u32,
+    pname: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct QueryTargetFunctions {
+    core: Option<QueryTargetFunction>,
+    ext: Option<QueryTargetFunction>,
+}
+
+impl QueryTargetFunctions {
+    fn load_with(mut load: impl FnMut(&str) -> Option<*const c_void>) -> Self {
+        Self {
+            core: load_queryiv(&mut load, "glGetQueryiv").map(|function| QueryTargetFunction {
+                function,
+                target: glow::TIMESTAMP,
+                pname: glow::QUERY_COUNTER_BITS,
+            }),
+            ext: load_queryiv(&mut load, "glGetQueryivEXT").map(|function| QueryTargetFunction {
+                function,
+                target: GL_TIMESTAMP_EXT,
+                pname: GL_QUERY_COUNTER_BITS_EXT,
+            }),
+        }
+    }
+
+    fn function_for(self, path: TimestampQueryPath) -> Option<QueryTargetFunction> {
+        match path {
+            TimestampQueryPath::Core => self.core,
+            TimestampQueryPath::Ext => self.ext,
+        }
+    }
+
+    fn counter_bits(self, path: TimestampQueryPath) -> Result<i32, &'static str> {
+        let Some(queryiv) = self.function_for(path) else {
+            return Err("timestamp-query-counter-function-unavailable");
+        };
+        let mut counter_bits = 0;
+        // SAFETY: the pointer was loaded by its exact EGL symbol name and the
+        // arguments use the target/pname pair specified by the selected path.
+        unsafe { (queryiv.function)(queryiv.target, queryiv.pname, &mut counter_bits) };
+        Ok(counter_bits)
+    }
+}
+
+fn load_queryiv(
+    load: &mut impl FnMut(&str) -> Option<*const c_void>,
+    name: &str,
+) -> Option<GetQueryiv> {
+    let symbol = load(name).filter(|symbol| !symbol.is_null())?;
+    // SAFETY: the EGL proc-address loader returned the address for this exact
+    // GL entry point, whose ABI and signature are fixed by GLES/OpenGL.
+    Some(unsafe { std::mem::transmute::<*const c_void, GetQueryiv>(symbol) })
+}
+
+fn select_timestamp_path(
+    info: TimestampCapabilityInfo,
+    functions: QueryTargetFunctions,
+) -> Result<TimestampQueryPath, &'static str> {
+    let desktop_core_or_arb =
+        !info.embedded && (info.major > 3 || (info.major == 3 && info.minor >= 3) || info.has_arb);
+    let path = if desktop_core_or_arb && functions.core.is_some() {
+        TimestampQueryPath::Core
+    } else if info.has_ext && functions.ext.is_some() {
+        TimestampQueryPath::Ext
+    } else if desktop_core_or_arb || info.has_ext {
+        return Err("timestamp-query-counter-function-unavailable");
+    } else {
+        return Err("timestamp-query-unavailable");
+    };
+    if functions.counter_bits(path)? <= 0 {
+        return Err("timestamp-query-counter-unavailable");
+    }
+    Ok(path)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -530,24 +675,29 @@ pub(crate) struct PassTimingSpan {
     token: SpanToken,
 }
 
-fn timestamp_path(gl: &glow::Context) -> Result<TimestampPath, &'static str> {
+fn timestamp_path(
+    gl: &glow::Context,
+    functions: QueryTargetFunctions,
+) -> Result<TimestampPath, &'static str> {
+    let path = select_timestamp_path(timestamp_capability_info(gl), functions)?;
+    let query_target = functions
+        .function_for(path)
+        .ok_or("timestamp-query-counter-function-unavailable")?;
+    Ok(match path {
+        TimestampQueryPath::Ext => TimestampPath::ExtDisjoint(query_target),
+        TimestampQueryPath::Core => TimestampPath::DesktopCore(query_target),
+    })
+}
+
+fn timestamp_capability_info(gl: &glow::Context) -> TimestampCapabilityInfo {
     let extensions = gl.supported_extensions();
-    let has_ext = extensions.contains("GL_EXT_disjoint_timer_query");
     let version = gl.version();
-    let has_desktop_core =
-        !version.is_embedded && (version.major > 3 || (version.major == 3 && version.minor >= 3));
-    let has_arb = extensions.contains("GL_ARB_timer_query");
-    if !has_ext && !has_desktop_core && !has_arb {
-        return Err("timestamp-query-unavailable");
-    }
-    let counter_bits = unsafe { gl.get_parameter_i32(glow::QUERY_COUNTER_BITS) };
-    if counter_bits <= 0 {
-        return Err("timestamp-query-counter-unavailable");
-    }
-    if has_ext {
-        Ok(TimestampPath::ExtDisjoint)
-    } else {
-        Ok(TimestampPath::DesktopCore)
+    TimestampCapabilityInfo {
+        embedded: version.is_embedded,
+        major: version.major,
+        minor: version.minor,
+        has_ext: extensions.contains("GL_EXT_disjoint_timer_query"),
+        has_arb: extensions.contains("GL_ARB_timer_query"),
     }
 }
 
@@ -638,13 +788,17 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
 }
 
 impl EffectGpuProfiler {
-    pub(crate) fn new(gl: &glow::Context) -> Self {
+    pub(crate) fn new(
+        gl: &glow::Context,
+        load_with: impl FnMut(&str) -> Option<*const c_void>,
+    ) -> Self {
         if !gpu_timing_requested(std::env::var_os(GPU_TIMING_ENV).as_deref()) {
             return Self {
                 state: ProfilerState::Disabled,
             };
         }
-        let path = match timestamp_path(gl) {
+        let functions = QueryTargetFunctions::load_with(load_with);
+        let path = match timestamp_path(gl, functions) {
             Ok(path) => path,
             Err(reason) => {
                 eprintln!("typhon effect: event=effect_gpu_timing_unsupported reason={reason}");
@@ -677,10 +831,6 @@ impl EffectGpuProfiler {
         let ProfilerState::Active(active) = &mut self.state else {
             return;
         };
-        if active.path.uses_disjoint() && gpu_disjoint(gl) {
-            active.timing.invalidate_pending();
-            return;
-        }
         for _ in 0..MAX_COLLECTION_PER_CALL {
             let Some((_, end_slot)) = active.timing.pending_query_slots() else {
                 break;
@@ -690,6 +840,15 @@ impl EffectGpuProfiler {
                 unsafe { gl.get_query_parameter_u32(pair.end, glow::QUERY_RESULT_AVAILABLE) } != 0;
             if !available {
                 break;
+            }
+            let disjoint = active.path.uses_disjoint() && gpu_disjoint(gl);
+            match collection_action(true, disjoint, active.path.uses_disjoint()) {
+                CollectionAction::InvalidateDisjoint => {
+                    observe_disjoint(&mut active.timing, true);
+                    return;
+                }
+                CollectionAction::ReadResults => {}
+                CollectionAction::StopUnavailable => unreachable!("availability was checked"),
             }
             let start_ns = unsafe { gl.get_query_parameter_u64(pair.start, glow::QUERY_RESULT) };
             let end_ns = unsafe { gl.get_query_parameter_u64(pair.end, glow::QUERY_RESULT) };
@@ -711,7 +870,7 @@ impl EffectGpuProfiler {
         let ProfilerState::Active(active) = &mut self.state else {
             return None;
         };
-        if active.path.uses_disjoint() && gpu_disjoint(gl) {
+        if active.path.uses_disjoint() && observe_disjoint(&mut active.timing, gpu_disjoint(gl)) {
             return None;
         }
         let scope = active.timing.begin_scope(frame_id)?;
@@ -786,7 +945,11 @@ impl EffectGpuProfiler {
     fn active_for_test(capacity: usize) -> Self {
         Self {
             state: ProfilerState::Active(ActiveProfiler {
-                path: TimestampPath::DesktopCore,
+                path: TimestampPath::DesktopCore(QueryTargetFunction {
+                    function: test_queryiv,
+                    target: glow::TIMESTAMP,
+                    pname: glow::QUERY_COUNTER_BITS,
+                }),
                 queries: Vec::new(),
                 timing: TimingState::active_for_test(capacity),
             }),
@@ -832,8 +995,44 @@ impl EffectGpuProfiler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI32, AtomicUsize, Ordering},
+    };
+
     use super::*;
     use oblivion_one::effects::RenderPassKind;
+
+    static CORE_QUERYIV_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CORE_QUERYIV_TARGET: AtomicI32 = AtomicI32::new(0);
+    static CORE_QUERYIV_PNAME: AtomicI32 = AtomicI32::new(0);
+    static EXT_QUERYIV_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXT_QUERYIV_TARGET: AtomicI32 = AtomicI32::new(0);
+    static EXT_QUERYIV_PNAME: AtomicI32 = AtomicI32::new(0);
+    static QUERYIV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe extern "system" fn fake_core_get_queryiv(target: u32, pname: u32, params: *mut i32) {
+        CORE_QUERYIV_CALLS.fetch_add(1, Ordering::Relaxed);
+        CORE_QUERYIV_TARGET.store(target as i32, Ordering::Relaxed);
+        CORE_QUERYIV_PNAME.store(pname as i32, Ordering::Relaxed);
+        unsafe { *params = 64 };
+    }
+
+    unsafe extern "system" fn fake_ext_get_queryiv(target: u32, pname: u32, params: *mut i32) {
+        EXT_QUERYIV_CALLS.fetch_add(1, Ordering::Relaxed);
+        EXT_QUERYIV_TARGET.store(target as i32, Ordering::Relaxed);
+        EXT_QUERYIV_PNAME.store(pname as i32, Ordering::Relaxed);
+        unsafe { *params = 64 };
+    }
+
+    fn reset_queryiv_calls() {
+        CORE_QUERYIV_CALLS.store(0, Ordering::Relaxed);
+        CORE_QUERYIV_TARGET.store(0, Ordering::Relaxed);
+        CORE_QUERYIV_PNAME.store(0, Ordering::Relaxed);
+        EXT_QUERYIV_CALLS.store(0, Ordering::Relaxed);
+        EXT_QUERYIV_TARGET.store(0, Ordering::Relaxed);
+        EXT_QUERYIV_PNAME.store(0, Ordering::Relaxed);
+    }
 
     fn pass_metadata(pass_id: u64, kind: RenderPassKind, pixels: u64) -> TimingSpanMetadata {
         TimingSpanMetadata {
@@ -1128,5 +1327,158 @@ mod tests {
         assert!(!gpu_timing_requested(Some(OsStr::new("0"))));
         assert!(!gpu_timing_requested(Some(OsStr::new("true"))));
         assert!(gpu_timing_requested(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn query_counter_bits_uses_query_target_api() {
+        let _lock = QUERYIV_TEST_LOCK.lock().expect("queryiv test lock");
+        reset_queryiv_calls();
+        let functions = QueryTargetFunctions::load_with(|name| {
+            (name == "glGetQueryiv").then_some(fake_core_get_queryiv as *const c_void)
+        });
+
+        assert_eq!(functions.counter_bits(TimestampQueryPath::Core), Ok(64));
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            CORE_QUERYIV_TARGET.load(Ordering::Relaxed) as u32,
+            glow::TIMESTAMP
+        );
+        assert_eq!(
+            CORE_QUERYIV_PNAME.load(Ordering::Relaxed) as u32,
+            glow::QUERY_COUNTER_BITS
+        );
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn missing_query_target_function_degrades_without_gl_work() {
+        let _lock = QUERYIV_TEST_LOCK.lock().expect("queryiv test lock");
+        reset_queryiv_calls();
+        let functions = QueryTargetFunctions::load_with(|_| None);
+
+        assert_eq!(
+            select_timestamp_path(
+                TimestampCapabilityInfo {
+                    embedded: true,
+                    major: 3,
+                    minor: 0,
+                    has_ext: true,
+                    has_arb: false,
+                },
+                functions,
+            ),
+            Err("timestamp-query-counter-function-unavailable")
+        );
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ext_capability_uses_ext_query_target_when_core_is_unavailable() {
+        let _lock = QUERYIV_TEST_LOCK.lock().expect("queryiv test lock");
+        reset_queryiv_calls();
+        let functions = QueryTargetFunctions::load_with(|name| {
+            (name == "glGetQueryivEXT").then_some(fake_ext_get_queryiv as *const c_void)
+        });
+
+        assert_eq!(
+            select_timestamp_path(
+                TimestampCapabilityInfo {
+                    embedded: false,
+                    major: 3,
+                    minor: 3,
+                    has_ext: true,
+                    has_arb: false,
+                },
+                functions,
+            ),
+            Ok(TimestampQueryPath::Ext)
+        );
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            EXT_QUERYIV_TARGET.load(Ordering::Relaxed) as u32,
+            GL_TIMESTAMP_EXT
+        );
+        assert_eq!(
+            EXT_QUERYIV_PNAME.load(Ordering::Relaxed) as u32,
+            GL_QUERY_COUNTER_BITS_EXT
+        );
+    }
+
+    #[test]
+    fn desktop_core_capability_uses_core_query_target_function() {
+        let _lock = QUERYIV_TEST_LOCK.lock().expect("queryiv test lock");
+        reset_queryiv_calls();
+        let functions = QueryTargetFunctions::load_with(|name| {
+            (name == "glGetQueryiv").then_some(fake_core_get_queryiv as *const c_void)
+        });
+
+        assert_eq!(
+            select_timestamp_path(
+                TimestampCapabilityInfo {
+                    embedded: false,
+                    major: 3,
+                    minor: 3,
+                    has_ext: false,
+                    has_arb: false,
+                },
+                functions,
+            ),
+            Ok(TimestampQueryPath::Core)
+        );
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+
+        reset_queryiv_calls();
+        assert_eq!(
+            select_timestamp_path(
+                TimestampCapabilityInfo {
+                    embedded: false,
+                    major: 3,
+                    minor: 2,
+                    has_ext: false,
+                    has_arb: true,
+                },
+                functions,
+            ),
+            Ok(TimestampQueryPath::Core)
+        );
+        assert_eq!(CORE_QUERYIV_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(EXT_QUERYIV_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disjoint_before_new_graph_invalidates_pending_measurements() {
+        let mut state = TimingState::active_for_test(2);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        assert!(state.finish(scope.total));
+
+        assert!(observe_disjoint(&mut state, true));
+        assert_eq!(state.pending_span_count(), 0);
+        assert_eq!(state.free_slot_count(), 2);
+        assert_eq!(state.aggregate_count_for_test(), 0);
+        assert_eq!(state.disjoint_invalidated_span_count(), 1);
+        assert_eq!(state.poll_front(true, Some((100, 140))), PollOutcome::Empty);
+        assert!(observe_disjoint(&mut state, true));
+        assert_eq!(state.free_slot_count(), 2);
+        assert_eq!(state.disjoint_invalidated_span_count(), 1);
+    }
+
+    #[test]
+    fn available_result_requires_disjoint_validation_before_read() {
+        let mut state = TimingState::active_for_test(1);
+        let scope = state.begin_scope(Some(120)).expect("scope slot");
+        assert!(state.finish(scope.total));
+
+        assert_eq!(
+            collection_action(true, true, true),
+            CollectionAction::InvalidateDisjoint
+        );
+        if collection_action(true, true, true) == CollectionAction::InvalidateDisjoint {
+            observe_disjoint(&mut state, true);
+        }
+        assert_eq!(state.read_count_for_test(), 0);
+        assert_eq!(state.pending_span_count(), 0);
     }
 }

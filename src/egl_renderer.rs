@@ -1043,7 +1043,10 @@ impl GlesSceneRenderer {
         let mut effect_shaders = ShaderProgramCache::new(builtin_shader_program_count())
             .expect("built-in shader cache capacity is non-zero");
         effect_shaders.prewarm_builtins(&gl)?;
-        let effect_gpu_profiler = EffectGpuProfiler::new(&gl);
+        let effect_gpu_profiler = EffectGpuProfiler::new(&gl, |name| {
+            egl.get_proc_address(name)
+                .map(|symbol| symbol as *const c_void)
+        });
 
         Ok(Self {
             gl,
