@@ -10,6 +10,30 @@ use oblivion_one::render_backend::buffer::{
 use oblivion_one::{CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy};
 use std::sync::{Mutex, OnceLock};
 
+struct ApplicationScopeDisabledGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for ApplicationScopeDisabledGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", value) },
+            None => unsafe { std::env::remove_var("OBLIVION_ONE_APP_SCOPES") },
+        }
+    }
+}
+
+fn disable_application_scopes_for_test() -> ApplicationScopeDisabledGuard {
+    let lock = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("OBLIVION_ONE_APP_SCOPES");
+    unsafe { std::env::set_var("OBLIVION_ONE_APP_SCOPES", "off") };
+    ApplicationScopeDisabledGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
 fn test_buffer_identity() -> BufferIdentity {
     static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
     IDS.get_or_init(|| Mutex::new(BufferIdAllocator::default()))

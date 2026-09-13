@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf, time::Duration};
 
 #[test]
 fn binding_application_launch_receives_current_xwayland_environment() {
+    let _application_scopes = disable_application_scopes_for_test();
     let output = std::env::temp_dir().join(format!(
         "typhon-binding-launch-environment-{}",
         std::process::id()

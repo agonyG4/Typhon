@@ -222,6 +222,7 @@ fn stop_runtime(
 
 #[test]
 fn shell_control_successful_exit_emits_accepted_then_finished() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-success-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
@@ -257,6 +258,7 @@ fn shell_control_successful_exit_emits_accepted_then_finished() {
 
 #[test]
 fn shell_control_spawn_failure_emits_failed_without_acceptance() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-failure-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
@@ -283,6 +285,7 @@ fn shell_control_spawn_failure_emits_failed_without_acceptance() {
 
 #[test]
 fn shell_control_zero_exit_emits_finished_zero() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-zero-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
@@ -304,6 +307,7 @@ fn shell_control_zero_exit_emits_finished_zero() {
 
 #[test]
 fn shell_control_signal_exit_emits_negative_signal_number() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-signal-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
@@ -330,6 +334,7 @@ fn shell_control_signal_exit_emits_negative_signal_number() {
 
 #[test]
 fn shell_control_destroy_after_acceptance_prunes_observer_without_killing_child() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-observer-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
@@ -365,6 +370,7 @@ fn shell_control_destroy_after_acceptance_prunes_observer_without_killing_child(
 
 #[test]
 fn shell_control_destroy_before_drain_does_not_spawn_or_track() {
+    let _application_scopes = disable_application_scopes_for_test();
     let socket_name = format!("typhon-shell-control-destroy-{}", std::process::id());
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
     server.authorize_astrea_shell_pid(std::process::id());
