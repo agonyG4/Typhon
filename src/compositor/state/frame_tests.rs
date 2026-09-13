@@ -475,6 +475,57 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn terminal_frame_callback_discard_removes_bookkeeping_without_done() {
+        let mut state = CompositorState::default();
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = compositor_surface_id(&surface);
+        let callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(&display_handle, 1, ())
+            .expect("callback resource");
+        state.queue_frame_callbacks_for_surface(surface_id, vec![callback.clone()]);
+        state.discard_frame_callbacks(vec![callback.clone()]);
+
+        assert!(state.pending_frame_callbacks.is_empty());
+        assert!(state.visible_pending_frame_callbacks.is_empty());
+        assert!(
+            !state
+                .pending_frame_callback_surfaces
+                .contains_key(&callback.id())
+        );
+        assert!(
+            !state
+                .pending_frame_callback_timing
+                .contains_key(&callback.id())
+        );
+        assert!(callback.is_alive());
+
+        let callback_in_batch = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(&display_handle, 1, ())
+            .expect("batch callback resource");
+        state
+            .pending_frame_callback_surfaces
+            .insert(callback_in_batch.id(), surface_id);
+        state
+            .visible_pending_frame_callbacks
+            .push(callback_in_batch.clone());
+        state.visible_pending_frame_callback_count = 1;
+        let batch_id = state.take_frame_batch_for_render(300);
+        state.discard_frame_callbacks(vec![callback_in_batch]);
+
+        let batch = state.frame_batches.get(&batch_id).expect("frame batch");
+        assert!(batch.callbacks.is_empty());
+        assert_eq!(batch.callback_settlement.cancelled, 1);
+        assert!(batch.callback_settlement.is_reconciled());
+    }
+
+    #[test]
     fn stale_fifo_generation_cannot_clear_the_current_barrier() {
         let mut state = CompositorState::default();
         let current = ActiveFifoBarrier {
