@@ -28,9 +28,10 @@ use oblivion_one::{
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
     window_lifecycle_animation::{
-        lamp_stage_channels, LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
+        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
         LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleRenderFallbacks,
         LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
+        lamp_stage_channels,
     },
 };
 
@@ -696,10 +697,10 @@ fn lamp_grid_subdivisions(
     height: f32,
     available_vertices: usize,
 ) -> Option<(usize, usize)> {
-    let mut columns = ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize)
-        .clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
-    let mut rows = ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize)
-        .clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
+    let mut columns =
+        ((width / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
+    let mut rows =
+        ((height / LAMP_TARGET_CELL_PIXELS).ceil() as usize).clamp(1, LAMP_MAX_GRID_SUBDIVISIONS);
     let available_cells = available_vertices / 6;
     if available_cells == 0 {
         return None;
@@ -863,12 +864,24 @@ fn lamp_geometry_key(
             lamp.visual_group.canonical_visual_rect.height().to_bits(),
             lamp.visual_group.presented_source_client_rect.x().to_bits(),
             lamp.visual_group.presented_source_client_rect.y().to_bits(),
-            lamp.visual_group.presented_source_client_rect.width().to_bits(),
-            lamp.visual_group.presented_source_client_rect.height().to_bits(),
+            lamp.visual_group
+                .presented_source_client_rect
+                .width()
+                .to_bits(),
+            lamp.visual_group
+                .presented_source_client_rect
+                .height()
+                .to_bits(),
             lamp.visual_group.presented_source_visual_rect.x().to_bits(),
             lamp.visual_group.presented_source_visual_rect.y().to_bits(),
-            lamp.visual_group.presented_source_visual_rect.width().to_bits(),
-            lamp.visual_group.presented_source_visual_rect.height().to_bits(),
+            lamp.visual_group
+                .presented_source_visual_rect
+                .width()
+                .to_bits(),
+            lamp.visual_group
+                .presented_source_visual_rect
+                .height()
+                .to_bits(),
             lamp.visual_group.anchor_rect.x().to_bits(),
             lamp.visual_group.anchor_rect.y().to_bits(),
             lamp.visual_group.anchor_rect.width().to_bits(),
@@ -941,8 +954,7 @@ fn lifecycle_damage_for_samples(
 ) -> OutputDamage {
     let mut rects = Vec::new();
     for lamp in &lifecycle.lamps {
-        if let Some(footprint) = lamp_footprint(lamp.visual_group)
-        {
+        if let Some(footprint) = lamp_footprint(lamp.visual_group) {
             let left = footprint.x();
             let top = footprint.y();
             let right = footprint.x() + footprint.width();
@@ -3017,8 +3029,7 @@ impl GlesSceneRenderer {
                         bounds: EglRect::new(
                             (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
                             (lamp.visual_group.canonical_visual_rect.y() * output_scale) as f32,
-                            (lamp.visual_group.canonical_visual_rect.width() * output_scale)
-                                as f32,
+                            (lamp.visual_group.canonical_visual_rect.width() * output_scale) as f32,
                             (lamp.visual_group.canonical_visual_rect.height() * output_scale)
                                 as f32,
                         ),
@@ -3296,9 +3307,8 @@ impl GlesSceneRenderer {
             let saved_commands = std::mem::replace(&mut self.commands, source_commands);
             self.scene_geometry_dirty = true;
             let draw_result = (|| {
-                let source_damage = lifecycle_visual_effect_damage(
-                    lamp.visual_group.presented_source_visual_rect,
-                );
+                let source_damage =
+                    lifecycle_visual_effect_damage(lamp.visual_group.presented_source_visual_rect);
                 let output_bounds =
                     EffectRect::new(0, 0, self.current_size.0.max(1), self.current_size.1.max(1))
                         .expect("non-zero renderer dimensions must form valid effect bounds");
@@ -3529,10 +3539,8 @@ impl GlesSceneRenderer {
                     self.gl.uniform_1_i32(Some(location), direction);
                 }
                 if let Some(location) = &uniforms.shape_factor {
-                    self.gl.uniform_1_f32(
-                        Some(location),
-                        sample.visual_group.shape_factor as f32,
-                    );
+                    self.gl
+                        .uniform_1_f32(Some(location), sample.visual_group.shape_factor as f32);
                 }
                 if let Some(location) = &uniforms.bump_distance {
                     self.gl.uniform_1_f32(
@@ -3624,18 +3632,16 @@ impl GlesSceneRenderer {
 
     fn lamp_intersects_current_output(&self, lamp: &LampWindowSample) -> bool {
         let scale = self.effect_output_scale.max(1.0) as f64;
-        lamp_footprint(lamp.visual_group).is_some_and(
-            |footprint| {
-                let x = footprint.x() * scale;
-                let y = footprint.y() * scale;
-                let width = footprint.width() * scale;
-                let height = footprint.height() * scale;
-                x < f64::from(self.current_size.0)
-                    && y < f64::from(self.current_size.1)
-                    && x + width > 0.0
-                    && y + height > 0.0
-            },
-        )
+        lamp_footprint(lamp.visual_group).is_some_and(|footprint| {
+            let x = footprint.x() * scale;
+            let y = footprint.y() * scale;
+            let width = footprint.width() * scale;
+            let height = footprint.height() * scale;
+            x < f64::from(self.current_size.0)
+                && y < f64::from(self.current_size.1)
+                && x + width > 0.0
+                && y + height > 0.0
+        })
     }
 
     pub(crate) fn draw_lifecycle_overlays(
@@ -4977,12 +4983,24 @@ fn lifecycle_visual_source_signature(
         lamp.visual_group.canonical_visual_rect.height().to_bits(),
         lamp.visual_group.presented_source_client_rect.x().to_bits(),
         lamp.visual_group.presented_source_client_rect.y().to_bits(),
-        lamp.visual_group.presented_source_client_rect.width().to_bits(),
-        lamp.visual_group.presented_source_client_rect.height().to_bits(),
+        lamp.visual_group
+            .presented_source_client_rect
+            .width()
+            .to_bits(),
+        lamp.visual_group
+            .presented_source_client_rect
+            .height()
+            .to_bits(),
         lamp.visual_group.presented_source_visual_rect.x().to_bits(),
         lamp.visual_group.presented_source_visual_rect.y().to_bits(),
-        lamp.visual_group.presented_source_visual_rect.width().to_bits(),
-        lamp.visual_group.presented_source_visual_rect.height().to_bits(),
+        lamp.visual_group
+            .presented_source_visual_rect
+            .width()
+            .to_bits(),
+        lamp.visual_group
+            .presented_source_visual_rect
+            .height()
+            .to_bits(),
         output_scale.to_bits(),
     ] {
         signature ^= value;
@@ -7434,12 +7452,7 @@ mod tests {
                 root_surface_id: 1,
                 transition_id: LifecycleTransitionId::new(1),
                 visual_group: LifecycleVisualGroup::from_bounds(
-                    rect,
-                    rect,
-                    rect,
-                    anchor,
-                    1920,
-                    1080,
+                    rect, rect, rect, anchor, 1920, 1080,
                 )
                 .expect("valid visual group"),
                 progress,
@@ -7819,32 +7832,15 @@ mod tests {
         let early = lamp_test_sample(0.1);
         let middle = lamp_test_sample(0.5);
         let late = lamp_test_sample(0.9);
-        let early_key = lamp_geometry_key(
-            &early,
-            &[],
-            &[],
-            1.0,
-            OutputFramebufferOrigin::BottomLeft,
+        let early_key =
+            lamp_geometry_key(&early, &[], &[], 1.0, OutputFramebufferOrigin::BottomLeft);
+        assert_eq!(
+            early_key,
+            lamp_geometry_key(&middle, &[], &[], 1.0, OutputFramebufferOrigin::BottomLeft,)
         );
         assert_eq!(
             early_key,
-            lamp_geometry_key(
-                &middle,
-                &[],
-                &[],
-                1.0,
-                OutputFramebufferOrigin::BottomLeft,
-            )
-        );
-        assert_eq!(
-            early_key,
-            lamp_geometry_key(
-                &late,
-                &[],
-                &[],
-                1.0,
-                OutputFramebufferOrigin::BottomLeft,
-            )
+            lamp_geometry_key(&late, &[], &[], 1.0, OutputFramebufferOrigin::BottomLeft,)
         );
     }
 
@@ -7861,10 +7857,10 @@ mod tests {
     #[test]
     fn lamp_mesh_coarsens_deterministically_under_global_vertex_budget() {
         let available = 60 * 20 * 6;
-        let first = lamp_grid_subdivisions(1920.0, 1080.0, available)
-            .expect("reduced Lamp grid fits");
-        let second = lamp_grid_subdivisions(1920.0, 1080.0, available)
-            .expect("reduced Lamp grid fits");
+        let first =
+            lamp_grid_subdivisions(1920.0, 1080.0, available).expect("reduced Lamp grid fits");
+        let second =
+            lamp_grid_subdivisions(1920.0, 1080.0, available).expect("reduced Lamp grid fits");
         assert_eq!(first, second);
         assert!(first.0.saturating_mul(first.1).saturating_mul(6) <= available);
         assert!(first.0 > 1 || first.1 > 1);
