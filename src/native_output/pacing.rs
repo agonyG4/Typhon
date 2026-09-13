@@ -2511,7 +2511,37 @@ impl NativeFramePacing {
             .flatten()
     }
 
-    pub(crate) fn note_render_started(
+    pub(crate) fn note_render_decision(
+        &mut self,
+        pacing_mode: NativeOutputPacingMode,
+        render_ahead: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match (pacing_mode, render_ahead) {
+            (NativeOutputPacingMode::ReactiveDouble, false) => {
+                self.reactive_double_frames += 1;
+            }
+            (NativeOutputPacingMode::PredictiveTriple, true) => {
+                self.predictive_triple_frames += 1;
+                self.render_ahead_attempts += 1;
+                self.predictive_render_ahead_attempts += 1;
+            }
+            (NativeOutputPacingMode::ReactiveDouble, true) => {
+                self.multiple_deadline_owner_violation_count += 1;
+            }
+            (NativeOutputPacingMode::PredictiveTriple, false) => {
+                self.predictive_triple_frames += 1;
+            }
+        }
+        // A scheduler decision is not yet a render attempt. Keep the active
+        // frame unowned until the caller has passed all recoverable
+        // no-visual-change and submit-window exits.
+        self.active_origin = PreparedFrameOrigin::Normal;
+    }
+
+    pub(crate) fn begin_render_attempt(
         &mut self,
         pacing_mode: NativeOutputPacingMode,
         render_ahead: bool,
@@ -2520,26 +2550,11 @@ impl NativeFramePacing {
             return Ok(());
         }
         let origin = match (pacing_mode, render_ahead) {
-            (NativeOutputPacingMode::ReactiveDouble, false) => {
-                self.reactive_double_frames += 1;
-                PreparedFrameOrigin::ReactiveDouble
-            }
-            (NativeOutputPacingMode::PredictiveTriple, true) => {
-                self.predictive_triple_frames += 1;
-                self.render_ahead_attempts += 1;
-                self.predictive_render_ahead_attempts += 1;
-                PreparedFrameOrigin::PredictiveO1
-            }
-            (NativeOutputPacingMode::ReactiveDouble, true) => {
-                self.multiple_deadline_owner_violation_count += 1;
-                PreparedFrameOrigin::ReactiveDouble
-            }
-            (NativeOutputPacingMode::PredictiveTriple, false) => {
-                self.predictive_triple_frames += 1;
-                PreparedFrameOrigin::Normal
-            }
+            (NativeOutputPacingMode::ReactiveDouble, false) => PreparedFrameOrigin::ReactiveDouble,
+            (NativeOutputPacingMode::PredictiveTriple, true) => PreparedFrameOrigin::PredictiveO1,
+            (NativeOutputPacingMode::ReactiveDouble, true) => PreparedFrameOrigin::ReactiveDouble,
+            (NativeOutputPacingMode::PredictiveTriple, false) => PreparedFrameOrigin::Normal,
         };
-        self.active_origin = origin;
         if origin == PreparedFrameOrigin::PredictiveO1 {
             let frame_id = self
                 .active
@@ -2549,7 +2564,48 @@ impl NativeFramePacing {
             self.predictive_o1_created = self.predictive_o1_created.saturating_add(1);
             self.note_predictive_unbound_created();
         }
+        self.active_origin = origin;
         Ok(())
+    }
+
+    /// Test-facing compatibility wrapper for the old combined operation.
+    #[cfg(test)]
+    pub(crate) fn note_render_started(
+        &mut self,
+        pacing_mode: NativeOutputPacingMode,
+        render_ahead: bool,
+    ) -> Result<(), &'static str> {
+        self.note_render_decision(pacing_mode, render_ahead);
+        self.begin_render_attempt(pacing_mode, render_ahead)
+    }
+
+    /// Drop a queued visual decision which never reached a backend render.
+    ///
+    /// Production callers use this for no-primary-work and recoverable
+    /// submit-window exits. A pre-physical lifecycle should not exist here,
+    /// but terminalizing one defensively keeps the bounded ledger exact if a
+    /// future caller accidentally moves admission earlier again.
+    fn clear_unsubmitted_render(&mut self, terminal: PredictiveReadyTerminal) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(frame_id) = self.active {
+            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+            self.terminalize_predictive_frame(identity, terminal);
+        }
+        self.active = None;
+        self.active_physical_identity = None;
+        self.active_origin = PreparedFrameOrigin::Normal;
+        self.active_queued_frame_id = None;
+        self.active_queued_ns = None;
+    }
+
+    pub(crate) fn cancel_unsubmitted_render(&mut self) {
+        self.clear_unsubmitted_render(PredictiveReadyTerminal::Failed);
+    }
+
+    pub(crate) fn complete_unsubmitted_render_without_visual_change(&mut self) {
+        self.clear_unsubmitted_render(PredictiveReadyTerminal::OtherSafeAbandonment);
     }
     pub(crate) fn note_submit(
         &mut self,

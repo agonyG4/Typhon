@@ -805,6 +805,7 @@ impl NativeRuntime {
                         )
                     })
                     .ok_or_else(|| {
+                        frame_pacing.cancel_unsubmitted_render();
                         io::Error::other(
                             "explicit Atomic render started without a presentation target",
                         )
@@ -818,6 +819,7 @@ impl NativeRuntime {
                     Err(_) => {
                         presentation_timing.record_unreachable_target();
                         presentation_deadline.clear_scheduled_target();
+                        frame_pacing.cancel_unsubmitted_render();
                         *queued_redraw_requested = true;
                         return Ok(());
                     }
@@ -1039,24 +1041,7 @@ impl NativeRuntime {
                 );
                 *queued_redraw_requested = false;
             } else {
-                frame_pacing
-                    .note_render_started(pacing_mode, render_ahead)
-                    .map_err(io::Error::other)?;
-                let render_observed_at_ns = monotonic_now_ns()?;
-                let render_begin_fields = build_render_begin_fields(
-                    frame_pacing.active,
-                    frame_pacing.active_predictive_attempt_id(),
-                    render_generation,
-                    render_observed_at_ns,
-                    render_ahead,
-                    adaptive_buffering,
-                    overlap_required_ns,
-                    presentation_deadline.pre_render_abandoned(),
-                    &prediction,
-                    refresh_interval,
-                    scanout.buffer_snapshot(),
-                );
-                frame_pacing.log("render_begin", render_begin_fields);
+                frame_pacing.note_render_decision(pacing_mode, render_ahead);
                 let effective_redraw_requested = redraw_requested || *queued_redraw_requested;
                 let render_cause = native_repaint_cause_label(
                     server.render_generation_cause(),
@@ -1160,11 +1145,13 @@ impl NativeRuntime {
                         !logical_scene_changed(*last_rendered_scene_generation, scene_generation),
                         "terminal NoVisualChange must retire the logical scene baseline"
                     );
+                    frame_pacing.cancel_unsubmitted_render();
                     frame_completed = terminal_work_completed;
                     *queued_redraw_requested = false;
                     *last_software_cursor_damage = current_software_cursor_damage;
                 } else {
                     #[rustfmt::skip] let atomic_kms_lane_free = !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
+                    let render_buffer_snapshot = scanout.buffer_snapshot();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
                         let presentation_snapshot = resolved_scene.presentation_snapshot.clone();
@@ -1199,6 +1186,7 @@ impl NativeRuntime {
                                     )
                                 })
                                 .ok_or_else(|| {
+                                    frame_pacing.cancel_unsubmitted_render();
                                     io::Error::other(
                                         "explicit Atomic render started without a presentation target",
                                     )
@@ -1212,6 +1200,7 @@ impl NativeRuntime {
                                 Err(_) => {
                                     presentation_timing.record_unreachable_target();
                                     presentation_deadline.clear_scheduled_target();
+                                    frame_pacing.cancel_unsubmitted_render();
                                     *queued_redraw_requested = true;
                                     return Ok(());
                                 }
@@ -1259,8 +1248,26 @@ impl NativeRuntime {
                             > 0)
                         .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
                         .transpose()?;
+                        let render_observed_at_ns = monotonic_now_ns()?;
                         let render_call_started_at_ns =
                             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
+                        frame_pacing
+                            .begin_render_attempt(pacing_mode, render_ahead)
+                            .map_err(io::Error::other)?;
+                        let render_begin_fields = build_render_begin_fields(
+                            frame_pacing.active,
+                            frame_pacing.active_predictive_attempt_id(),
+                            render_generation,
+                            render_observed_at_ns,
+                            render_ahead,
+                            adaptive_buffering,
+                            overlap_required_ns,
+                            presentation_deadline.pre_render_abandoned(),
+                            &prediction,
+                            refresh_interval,
+                            render_buffer_snapshot,
+                        );
+                        frame_pacing.log("render_begin", render_begin_fields);
                         #[rustfmt::skip] let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -1293,9 +1300,18 @@ impl NativeRuntime {
                             dmabuf_gpu_release_lease_id,
                         ).inspect_err(|_| {
                             frame_pacing.note_predictive_o1_failed();
+                            frame_pacing.cancel_unsubmitted_render();
                         })?;
                         if let Some(start_ns) = render_call_started_at_ns {
-                            let render_call_ns = monotonic_now_ns()?.saturating_sub(start_ns);
+                            let render_finished_at_ns = match monotonic_now_ns() {
+                                Ok(now) => now,
+                                Err(error) => {
+                                    frame_pacing.note_predictive_o1_failed();
+                                    frame_pacing.cancel_unsubmitted_render();
+                                    return Err(Box::new(error));
+                                }
+                            };
+                            let render_call_ns = render_finished_at_ns.saturating_sub(start_ns);
                             let renderer_ns = match &render_outcome {
                                 AtomicFrameRenderOutcome::Skipped { render_us, .. }
                                 | AtomicFrameRenderOutcome::Rendered { render_us, .. }
@@ -1319,6 +1335,7 @@ impl NativeRuntime {
                                 dmabuf_gpu_release,
                             } => {
                                 frame_pacing.note_predictive_o1_other_safe_abandonment();
+                                frame_pacing.cancel_unsubmitted_render();
                                 if let Some((lease_id, release_fence)) = dmabuf_gpu_release {
                                     let completion_fd = release_fence.duplicate_completion_fd();
                                     match completion_fd {
@@ -1418,6 +1435,7 @@ impl NativeRuntime {
                                     server.apply_lifecycle_render_fallback(fallback);
                                 }
                                 frame_pacing.note_predictive_o1_other_safe_abandonment();
+                                frame_pacing.cancel_unsubmitted_render();
                                 frame_scheduler.note_immediate_completion();
                                 frame_completed = true;
                                 *queued_redraw_requested = true;
@@ -1438,12 +1456,29 @@ impl NativeRuntime {
                                 if slow_cycle_enabled {
                                     slow_cycle_trace.note_compositor_render_us(render_us);
                                 }
-                                let physical_identity = explicit.swapchain()?.ready_identity().ok_or_else(
-                                    || io::Error::other("rendered Atomic frame has no physical identity"),
-                                )?;
-                                frame_pacing
-                                    .bind_predictive_o1(physical_identity)
-                                    .map_err(io::Error::other)?;
+                                let physical_identity = match explicit.swapchain() {
+                                    Ok(swapchain) => swapchain.ready_identity().ok_or_else(|| {
+                                        io::Error::other(
+                                            "rendered Atomic frame has no physical identity",
+                                        )
+                                    }),
+                                    Err(error) => Err(error),
+                                };
+                                let physical_identity = match physical_identity {
+                                    Ok(identity) => identity,
+                                    Err(error) => {
+                                        frame_pacing.note_predictive_o1_failed();
+                                        frame_pacing.cancel_unsubmitted_render();
+                                        return Err(Box::new(error));
+                                    }
+                                };
+                                if let Err(error) =
+                                    frame_pacing.bind_predictive_o1(physical_identity)
+                                {
+                                    frame_pacing.note_predictive_o1_failed();
+                                    frame_pacing.cancel_unsubmitted_render();
+                                    return Err(Box::new(io::Error::other(error)));
+                                }
                                 frame_pacing.note_render_ready();
                                 if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
                                     frame_pacing.note_predictive_binding_after_render_completion(
@@ -1684,6 +1719,24 @@ impl NativeRuntime {
                             }
                         }
                     } else {
+                        let render_observed_at_ns = monotonic_now_ns()?;
+                        frame_pacing
+                            .begin_render_attempt(pacing_mode, render_ahead)
+                            .map_err(io::Error::other)?;
+                        let render_begin_fields = build_render_begin_fields(
+                            frame_pacing.active,
+                            frame_pacing.active_predictive_attempt_id(),
+                            render_generation,
+                            render_observed_at_ns,
+                            render_ahead,
+                            adaptive_buffering,
+                            overlap_required_ns,
+                            presentation_deadline.pre_render_abandoned(),
+                            &prediction,
+                            refresh_interval,
+                            render_buffer_snapshot,
+                        );
+                        frame_pacing.log("render_begin", render_begin_fields);
                         let cpu_before = perf
                             .enabled()
                             .then(NativeProcessCpuSample::read_current)
@@ -1724,6 +1777,8 @@ impl NativeRuntime {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 server.restore_prepared_frame_batch_after_render_failure();
+                                frame_pacing.note_predictive_o1_failed();
+                                frame_pacing.cancel_unsubmitted_render();
                                 return Err(Box::new(error));
                             }
                         };
@@ -1734,13 +1789,22 @@ impl NativeRuntime {
                             | NativePaintOutcome::LifecycleFallback { .. } => Default::default(),
                         };
                         render_telemetry.record_native_paint(paint_stats);
+                        let render_end_ns = match monotonic_now_ns() {
+                            Ok(now) => now,
+                            Err(error) => {
+                                server.restore_prepared_frame_batch_after_render_failure();
+                                frame_pacing.note_predictive_o1_failed();
+                                frame_pacing.cancel_unsubmitted_render();
+                                return Err(Box::new(error));
+                            }
+                        };
                         frame_pacing.log(
                             "render_complete",
                             vec![
                                 frame_id_field(frame_pacing.active),
                                 PacingField::u64("render_generation", render_generation),
                                 PacingField::u64("render_observed_at_ns", render_observed_at_ns),
-                                PacingField::u64("render_end_ns", monotonic_now_ns()?),
+                                PacingField::u64("render_end_ns", render_end_ns),
                                 PacingField::u64("gpu_draw_us", paint_stats.gpu_draw_us),
                                 PacingField::u64("egl_swap_us", paint_stats.egl_swap_us),
                                 PacingField::u64("render_total_us", paint_stats.total_us),
@@ -1757,6 +1821,8 @@ impl NativeRuntime {
                             for fallback in fallbacks.failed {
                                 server.apply_lifecycle_render_fallback(fallback);
                             }
+                            frame_pacing.note_predictive_o1_other_safe_abandonment();
+                            frame_pacing.cancel_unsubmitted_render();
                             frame_scheduler.note_immediate_completion();
                             frame_completed = true;
                             *queued_redraw_requested = true;
@@ -1785,6 +1851,7 @@ impl NativeRuntime {
                                 current_client_cursor_damage,
                                 current_software_cursor_damage,
                             ) {
+                                frame_pacing.complete_unsubmitted_render_without_visual_change();
                                 frame_completed = true;
                                 perf.log("native.frame_skip", || {
                                     let mut fields = paint_stats.fields();
