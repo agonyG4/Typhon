@@ -293,6 +293,53 @@ pub(in crate::compositor::tests) struct RolelessParentMappingSnapshots {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct SubsurfaceTreeContentSnapshots {
+    pub(in crate::compositor::tests) parent: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) child: XdgRoleSnapshot,
+    pub(in crate::compositor::tests) grandchild: XdgRoleSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct SubsurfaceUnmapRemapSnapshots {
+    pub(in crate::compositor::tests) before_parent_null: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_parent_null: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_hidden_child_replacement: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_parent_remap: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_child_null: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_child_remap: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) before_parent_null_renderables: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_parent_null_renderables: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_hidden_child_replacement_renderables:
+        Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_parent_remap_renderables: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_child_null_renderables: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_child_remap_renderables: Vec<RenderableSurfaceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct InactiveDescendantSnapshots {
+    pub(in crate::compositor::tests) before_parent_null: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_parent_null: SubsurfaceTreeContentSnapshots,
+    pub(in crate::compositor::tests) after_parent_remap: SubsurfaceTreeContentSnapshots,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct SurfaceBufferOwnershipSnapshot {
+    pub(in crate::compositor::tests) current_surface_buffer: bool,
+    pub(in crate::compositor::tests) active_dmabuf: bool,
+    pub(in crate::compositor::tests) pending_dmabuf_releases: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct DmabufSubsurfaceOwnershipSnapshots {
+    pub(in crate::compositor::tests) before_parent_null: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) before_parent_null_child: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_parent_null: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_parent_null_child: SurfaceBufferOwnershipSnapshot,
+    pub(in crate::compositor::tests) after_child_null: SurfaceBufferOwnershipSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) surface_id: u32,
     pub(in crate::compositor::tests) width: u32,

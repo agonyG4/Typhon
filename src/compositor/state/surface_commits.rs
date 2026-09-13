@@ -1121,7 +1121,8 @@ impl CompositorState {
         }
         self.refresh_active_scene_popup_view();
         self.dismiss_popup_children_for_parent(surface_id);
-        self.unmap_surface_content(surface_id);
+        self.clear_current_surface_content(surface_id);
+        self.hide_renderable_surface_subtree(surface_id);
         self.note_layer_surface_unmapped(surface_id);
         self.record_surface_publication(
             surface_id,
@@ -1134,26 +1135,28 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
         true
     }
-    pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
+
+    fn clear_current_surface_content(&mut self, surface_id: u32) {
+        self.remove_current_surface_buffer(surface_id);
+        if let Some(buffer) = self.active_dmabuf_buffers.remove(&surface_id) {
+            self.queue_dmabuf_buffer_release(buffer);
+        }
+    }
+
+    fn hide_renderable_surface_subtree(&mut self, surface_id: u32) -> bool {
         let renderable_ids = self
             .renderable_surfaces
             .iter()
             .map(|surface| surface.surface_id)
             .collect::<Vec<_>>();
-        let current_buffer_ids = self
-            .current_surface_buffers
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        let mut removed_surface_ids = renderable_ids
+        let removed_surface_ids = renderable_ids
             .into_iter()
             .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id))
             .collect::<Vec<_>>();
-        removed_surface_ids.extend(
-            current_buffer_ids
-                .into_iter()
-                .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id)),
-        );
+        self.reconcile_hidden_surface_ids(removed_surface_ids)
+    }
+
+    fn reconcile_hidden_surface_ids(&mut self, mut removed_surface_ids: Vec<u32>) -> bool {
         removed_surface_ids.sort_unstable();
         removed_surface_ids.dedup();
         if removed_surface_ids.is_empty() {
@@ -1161,12 +1164,6 @@ impl CompositorState {
             return false;
         }
 
-        for removed_surface_id in &removed_surface_ids {
-            self.remove_current_surface_buffer(*removed_surface_id);
-            if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
-                self.queue_dmabuf_buffer_release(buffer);
-            }
-        }
         self.retain_renderable_surfaces(|surface| {
             !removed_surface_ids.contains(&surface.surface_id)
         });
@@ -1224,6 +1221,37 @@ impl CompositorState {
             scene_effect,
         );
         true
+    }
+
+    pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
+        let renderable_ids = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let current_buffer_ids = self
+            .current_surface_buffers
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut removed_surface_ids = renderable_ids
+            .into_iter()
+            .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id))
+            .collect::<Vec<_>>();
+        removed_surface_ids.extend(
+            current_buffer_ids
+                .into_iter()
+                .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id)),
+        );
+        if removed_surface_ids.is_empty() {
+            self.reconcile_idle_inhibition();
+            return false;
+        }
+
+        for removed_surface_id in &removed_surface_ids {
+            self.clear_current_surface_content(*removed_surface_id);
+        }
+        self.reconcile_hidden_surface_ids(removed_surface_ids)
     }
 
     pub(in crate::compositor) fn unmap_xdg_role_surfaces(&mut self, surface_id: u32) -> bool {

@@ -880,6 +880,206 @@ fn wayland_surface_attach_null_unmaps_nested_subsurface_tree() {
 }
 
 #[test]
+fn mapped_subsurface_tree_retains_current_content_across_parent_null_and_remap() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_mapped_subsurface_unmap_remap(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let before = &snapshots.before_parent_null;
+    assert!(before.parent.current_surface_buffer);
+    assert!(before.child.current_surface_buffer);
+    assert!(before.grandchild.current_surface_buffer);
+    assert!(before.parent.renderable_surface);
+    assert!(before.child.renderable_surface);
+    assert!(before.grandchild.renderable_surface);
+    assert_eq!(
+        before.child.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        before.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+
+    let after_null = &snapshots.after_parent_null;
+    assert!(!after_null.parent.current_surface_buffer);
+    assert!(after_null.child.current_surface_buffer);
+    assert!(after_null.grandchild.current_surface_buffer);
+    assert!(!after_null.parent.renderable_surface);
+    assert!(!after_null.child.renderable_surface);
+    assert!(!after_null.grandchild.renderable_surface);
+    assert_eq!(
+        after_null.child.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        after_null.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(after_null.child.placement, before.child.placement);
+    assert_eq!(after_null.grandchild.placement, before.grandchild.placement);
+
+    let after_hidden_child_replacement = &snapshots.after_hidden_child_replacement;
+    assert!(!after_hidden_child_replacement.parent.current_surface_buffer);
+    assert!(after_hidden_child_replacement.child.current_surface_buffer);
+    assert!(
+        after_hidden_child_replacement
+            .grandchild
+            .current_surface_buffer
+    );
+    assert!(!after_hidden_child_replacement.parent.renderable_surface);
+    assert!(!after_hidden_child_replacement.child.renderable_surface);
+    assert!(!after_hidden_child_replacement.grandchild.renderable_surface);
+
+    let after_remap = &snapshots.after_parent_remap;
+    assert!(after_remap.parent.current_surface_buffer);
+    assert!(after_remap.child.current_surface_buffer);
+    assert!(after_remap.grandchild.current_surface_buffer);
+    assert!(after_remap.parent.renderable_surface);
+    assert!(after_remap.child.renderable_surface);
+    assert!(after_remap.grandchild.renderable_surface);
+    assert_eq!(
+        after_remap.child.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        after_remap.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        snapshots
+            .after_parent_remap_renderables
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>(),
+        vec![(20, 15), (6, 6), (3, 3)]
+    );
+}
+
+#[test]
+fn subsurface_null_clears_only_own_content_and_remaps_retained_grandchild() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_mapped_subsurface_unmap_remap(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let after_parent_remap = &snapshots.after_parent_remap;
+    assert!(after_parent_remap.parent.renderable_surface);
+    assert!(after_parent_remap.child.renderable_surface);
+    assert!(after_parent_remap.grandchild.renderable_surface);
+
+    let after_child_null = &snapshots.after_child_null;
+    assert!(after_child_null.parent.current_surface_buffer);
+    assert!(!after_child_null.child.current_surface_buffer);
+    assert!(after_child_null.grandchild.current_surface_buffer);
+    assert!(after_child_null.parent.renderable_surface);
+    assert!(!after_child_null.child.renderable_surface);
+    assert!(!after_child_null.grandchild.renderable_surface);
+    assert_eq!(
+        after_child_null.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+    assert_eq!(
+        after_child_null.grandchild.placement,
+        after_parent_remap.grandchild.placement
+    );
+
+    let after_child_remap = &snapshots.after_child_remap;
+    assert!(after_child_remap.parent.renderable_surface);
+    assert!(after_child_remap.child.renderable_surface);
+    assert!(after_child_remap.grandchild.renderable_surface);
+    assert!(after_child_remap.grandchild.current_surface_buffer);
+    assert_eq!(
+        snapshots
+            .after_child_remap_renderables
+            .iter()
+            .map(|surface| (surface.width, surface.height))
+            .collect::<Vec<_>>(),
+        vec![(20, 15), (7, 7), (3, 3)]
+    );
+}
+
+#[test]
+fn ancestor_null_does_not_clear_already_inactive_descendant_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_inactive_descendant_across_parent_null(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let before = &snapshots.before_parent_null;
+    assert!(before.parent.current_surface_buffer);
+    assert!(before.parent.renderable_surface);
+    assert!(!before.child.current_surface_buffer);
+    assert!(!before.child.renderable_surface);
+    assert!(before.grandchild.current_surface_buffer);
+    assert!(!before.grandchild.renderable_surface);
+    assert_eq!(
+        before.grandchild.subsurface_relationship_phase,
+        Some(SubsurfaceRelationshipPhase::Applied)
+    );
+
+    let after_null = &snapshots.after_parent_null;
+    assert!(!after_null.parent.current_surface_buffer);
+    assert!(!after_null.parent.renderable_surface);
+    assert!(!after_null.child.current_surface_buffer);
+    assert!(!after_null.child.renderable_surface);
+    assert!(after_null.grandchild.current_surface_buffer);
+    assert!(!after_null.grandchild.renderable_surface);
+
+    let after_remap = &snapshots.after_parent_remap;
+    assert!(after_remap.parent.current_surface_buffer);
+    assert!(after_remap.parent.renderable_surface);
+    assert!(!after_remap.child.current_surface_buffer);
+    assert!(!after_remap.child.renderable_surface);
+    assert!(after_remap.grandchild.current_surface_buffer);
+    assert!(!after_remap.grandchild.renderable_surface);
+}
+
+#[test]
+fn descendant_dmabuf_ownership_survives_ancestor_hide_until_own_null() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_dmabuf_subsurface_ownership_across_parent_null(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.before_parent_null.current_surface_buffer);
+    assert!(snapshots.before_parent_null.active_dmabuf);
+    assert_eq!(snapshots.before_parent_null.pending_dmabuf_releases, 0);
+    assert!(snapshots.before_parent_null_child.current_surface_buffer);
+    assert!(snapshots.before_parent_null_child.active_dmabuf);
+    assert_eq!(
+        snapshots.before_parent_null_child.pending_dmabuf_releases,
+        0
+    );
+
+    assert!(!snapshots.after_parent_null.current_surface_buffer);
+    assert!(!snapshots.after_parent_null.active_dmabuf);
+    assert_eq!(snapshots.after_parent_null.pending_dmabuf_releases, 1);
+    assert!(snapshots.after_parent_null_child.current_surface_buffer);
+    assert!(snapshots.after_parent_null_child.active_dmabuf);
+    assert_eq!(snapshots.after_parent_null_child.pending_dmabuf_releases, 1);
+
+    assert!(!snapshots.after_child_null.current_surface_buffer);
+    assert!(!snapshots.after_child_null.active_dmabuf);
+    assert_eq!(snapshots.after_child_null.pending_dmabuf_releases, 2);
+}
+
+#[test]
 fn parent_null_commit_applies_pending_subsurface_without_discarding_current_content() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

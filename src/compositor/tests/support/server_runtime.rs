@@ -190,6 +190,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureSurfaceBufferOwnership {
+        surface_id: u32,
+        reply: Sender<SurfaceBufferOwnershipSnapshot>,
+    },
     CaptureSubsurfaceStackState {
         parent_id: u32,
         reply: Sender<SubsurfaceStackStateSnapshot>,
@@ -781,6 +785,28 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 )
                                 .collect(),
                         );
+                    }
+                    ServerCommand::CaptureSurfaceBufferOwnership { surface_id, reply } => {
+                        let tracked_surface_id = server
+                            .state
+                            .surface_resources
+                            .iter()
+                            .find(|(_, surface)| surface.id().protocol_id() == surface_id)
+                            .map_or(surface_id, |(tracked_id, _)| *tracked_id);
+                        let _ = reply.send(SurfaceBufferOwnershipSnapshot {
+                            current_surface_buffer: server
+                                .state
+                                .current_surface_buffers
+                                .contains_key(&tracked_surface_id),
+                            active_dmabuf: server
+                                .state
+                                .active_dmabuf_buffers
+                                .contains_key(&tracked_surface_id),
+                            pending_dmabuf_releases: server
+                                .state
+                                .pending_dmabuf_buffer_releases
+                                .len(),
+                        });
                     }
                     ServerCommand::CaptureSubsurfaceStackState { parent_id, reply } => {
                         let _ = reply.send(SubsurfaceStackStateSnapshot {
@@ -1783,6 +1809,19 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_surface_buffer_ownership(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) -> SurfaceBufferOwnershipSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfaceBufferOwnership { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report surface buffer ownership")
 }
 
 pub(in crate::compositor::tests) fn capture_layer_surface_commit_state(
