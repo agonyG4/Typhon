@@ -74,7 +74,7 @@ pub(crate) struct PassTraceSummary {
     pub(crate) capture_command_count: Option<usize>,
     pub(crate) read_framebuffer: Option<String>,
     pub(crate) draw_framebuffer: Option<String>,
-    pub(crate) scratch_fbo_complete: Option<bool>,
+    pub(crate) scratch_fbo_present: Option<bool>,
 }
 
 #[cfg(test)]
@@ -212,7 +212,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_complete={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -242,7 +242,7 @@ impl EffectExecutionTrace {
                     .as_deref()
                     .unwrap_or("none"),
                 summary
-                    .scratch_fbo_complete
+                    .scratch_fbo_present
                     .map_or_else(|| "unknown".to_owned(), |complete| complete.to_string()),
             )
         });
@@ -274,15 +274,18 @@ fn graph_texture_trace(
     resources: &HashMap<GraphTextureId, PooledEffectTexture>,
 ) -> Option<String> {
     let texture = graph.textures.iter().find(|texture| texture.id == id)?;
-    let physical = resources
-        .get(&id)
-        .map_or_else(|| "output".to_owned(), |texture| texture.id.to_string());
     let source = match texture.source {
         GraphTextureSource::Output => "output",
         GraphTextureSource::CapturedScene => "captured_scene",
         GraphTextureSource::CapturedTarget => "captured_target",
         GraphTextureSource::Intermediate => "intermediate",
         GraphTextureSource::Static(_) => "static",
+    };
+    let physical = match texture.source {
+        GraphTextureSource::Output => "output".to_owned(),
+        _ => resources
+            .get(&id)
+            .map_or_else(|| "unrealized".to_owned(), |texture| texture.id.to_string()),
     };
     let origin = match texture.origin {
         oblivion_one::effects::GraphTextureOrigin::BottomLeft => "bottom_left",
@@ -312,6 +315,10 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use oblivion_one::effects::{
+        EffectRegion, EffectWorkingSpace, GraphTextureOrigin, GraphTexturePlan,
+        RenderGraphCompileStats,
+    };
 
     #[test]
     fn trace_gate_requires_exact_one() {
@@ -363,5 +370,51 @@ mod tests {
         assert!(line.contains("inputs=2,3,4,5,6,7,8"));
         assert!(!line.contains("shader"));
         assert!(!line.contains("scene_commands"));
+    }
+
+    #[test]
+    fn unrealized_graph_textures_are_not_reported_as_output() {
+        let output_id = GraphTextureId::new(1).expect("output texture id");
+        let capture_id = GraphTextureId::new(2).expect("capture texture id");
+        let domain =
+            oblivion_one::effects::EffectRect::new(5, 6, 10, 11).expect("trace texture domain");
+        let graph = CompiledFrameGraph {
+            passes: Vec::new(),
+            textures: vec![
+                GraphTexturePlan {
+                    id: output_id,
+                    source: GraphTextureSource::Output,
+                    width: 100,
+                    height: 80,
+                    domain,
+                    working_space: EffectWorkingSpace::OutputEncodedSrgb,
+                    origin: GraphTextureOrigin::BottomLeft,
+                    first_use: None,
+                    last_use: None,
+                },
+                GraphTexturePlan {
+                    id: capture_id,
+                    source: GraphTextureSource::CapturedScene,
+                    width: 10,
+                    height: 11,
+                    domain,
+                    working_space: EffectWorkingSpace::OutputEncodedSrgb,
+                    origin: GraphTextureOrigin::BottomLeft,
+                    first_use: None,
+                    last_use: None,
+                },
+            ],
+            instances: Vec::new(),
+            final_damage: EffectRegion::empty(),
+            stats: RenderGraphCompileStats::default(),
+        };
+        let resources = HashMap::new();
+
+        let output_line = graph_texture_trace(&graph, output_id, &resources).unwrap();
+        let capture_line = graph_texture_trace(&graph, capture_id, &resources).unwrap();
+
+        assert!(output_line.contains("physical=output:source=output"));
+        assert!(capture_line.contains("physical=unrealized:source=captured_scene"));
+        assert!(!capture_line.contains("physical=output"));
     }
 }

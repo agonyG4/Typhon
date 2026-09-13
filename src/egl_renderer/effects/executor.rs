@@ -709,7 +709,40 @@ fn execute_graph_passes(
                 ),
             );
         }
-        ensure_pass_textures(renderer, graph, pass, textures, &mut stats)?;
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "resources_begin",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        let resource_result = ensure_pass_textures(renderer, graph, pass, textures, &mut stats);
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "resources_end",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        resource_result?;
         if matches!(
             pass.kind,
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
@@ -749,18 +782,67 @@ fn execute_graph_passes(
             )?;
             scene_cursor = next_cursor.max(scene_cursor);
         }
-        if let Err(error) = validate_effect_pass_resources(
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "validate_begin",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        let validation_result = validate_effect_pass_resources(
             renderer,
             graph,
             pass,
             textures,
             &execution_damage,
             framebuffer_origin,
-        ) {
+        );
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "validate_end",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        if let Err(error) = validation_result {
             renderer.effect_trace.invariant_failure(&error);
             return Err(Box::new(error));
         }
-        if let Err(error) = execute_pass(
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "execute_begin",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        let execute_result = execute_pass(
             renderer,
             graph,
             textures,
@@ -769,7 +851,24 @@ fn execute_graph_passes(
             &execution_damage,
             lifecycle_backdrop,
             &mut stats,
-        ) {
+        );
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "execute_end",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
+        if let Err(error) = execute_result {
             if let Some(invariant) = error.downcast_ref::<EffectExecutionInvariantError>() {
                 renderer.effect_trace.invariant_failure(invariant);
             }
@@ -1145,7 +1244,7 @@ fn pass_trace_summary(
         draw_framebuffer: direct_capture
             .then(|| renderer.effect_resources.scratch_framebuffer_identity())
             .flatten(),
-        scratch_fbo_complete: direct_capture.then(|| {
+        scratch_fbo_present: direct_capture.then(|| {
             renderer
                 .effect_resources
                 .scratch_framebuffer_identity()

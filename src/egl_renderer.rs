@@ -6224,6 +6224,61 @@ mod tests {
         (ResolvedEffectScene::new(1, vec![instance]), registry)
     }
 
+    fn moving_visual_group_blur_scene(
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+    ) -> ResolvedEffectScene {
+        let (mut scene, _) = moving_blur_scene(rect);
+        let instance = scene.instances.first_mut().expect("moving blur instance");
+        instance.anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+        instance.visual_group = Some(visual_group);
+        instance.anchor_scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+        instance.scene_order =
+            oblivion_one::compositor::EffectSceneOrder::for_anchor(instance.anchor);
+        scene
+    }
+
+    fn install_visual_group_scene_commands(
+        renderer: &mut GlesSceneRenderer,
+        rect: EffectRect,
+        visual_group: VisualGroupId,
+    ) {
+        const BACKGROUND_COLOR: u32 = 0xff20_4060;
+        renderer.vertices.clear();
+        renderer.commands.clear();
+        push_draw_command(
+            &mut renderer.vertices,
+            &mut renderer.commands,
+            EglDrawLayer::SolidRgba(BACKGROUND_COLOR),
+            EglRect::new(
+                0.0,
+                0.0,
+                renderer.current_size.0 as f32,
+                renderer.current_size.1 as f32,
+            ),
+            renderer.current_size.0,
+            renderer.current_size.1,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        let target_command = renderer.commands.len();
+        push_draw_command(
+            &mut renderer.vertices,
+            &mut renderer.commands,
+            EglDrawLayer::Surface(42),
+            EglRect::new(
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+            ),
+            renderer.current_size.0,
+            renderer.current_size.1,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        renderer.commands[target_command].visual_group = Some(visual_group);
+        renderer.scene_geometry_dirty = true;
+    }
+
     #[test]
     fn moving_blur_domain_reuses_real_gles_resources() {
         let mut harness = GlesEffectTestHarness::new(256, 192);
@@ -6370,6 +6425,172 @@ mod tests {
         assert!(
             metrics.reuse_count > 0,
             "moving blur did not reuse pooled textures"
+        );
+        assert_eq!(metrics.checked_out_texture_count, 0);
+    }
+
+    #[test]
+    fn moving_visual_group_blur_replays_only_background_below_target() {
+        let mut harness = GlesEffectTestHarness::new(256, 192);
+        const BACKGROUND_COLOR: u32 = 0xff20_4060;
+        let target_texture =
+            create_uploaded_resource(&harness.gl, 32, 24).expect("target scene texture creates");
+        harness.renderer.surface_resources.insert(
+            42,
+            EglSurfaceResource {
+                image: target_texture,
+                dmabuf_key: None,
+                buffer_lifetime: None,
+                shm_synced_commit: None,
+            },
+        );
+        let background_texture =
+            create_uploaded_resource(&harness.gl, 1, 1).expect("background scene texture creates");
+        harness.renderer.decoration_resources.insert(
+            DecorationResourceKey::Solid(BACKGROUND_COLOR),
+            background_texture,
+        );
+
+        let output_bounds = EffectRect::new(0, 0, 256, 192).expect("output bounds");
+        let full_damage = EffectRegion::from_rect(output_bounds);
+        let repaint_plan = RepaintPlan {
+            render_damage: OutputDamage::Full,
+            repair_damage: OutputDamage::Full,
+            buffer_age: None,
+            mode: RepaintMode::Full,
+            fallback_reason: None,
+        };
+        let visual_group = VisualGroupId::new(9).expect("visual group id");
+        let (_, registry) = moving_blur_scene(output_bounds);
+        let positions = [
+            (32, 32),
+            (33, 33),
+            (184, 32),
+            (183, 31),
+            (224, 144),
+            (240, 168),
+            (240, 180),
+            (0, 168),
+            (-8, 180),
+            (-8, -4),
+            (0, 0),
+            (112, 80),
+            (113, 81),
+            (112, 80),
+            (32, 32),
+            (184, 144),
+        ];
+        let mut first_dimensions = None;
+        let mut warm_cache_bytes = None;
+        let mut warm_allocation_count = None;
+
+        for (step, (x, y)) in positions.iter().copied().cycle().take(512).enumerate() {
+            let rect = EffectRect::new(x, y, 32, 24).expect("moving target rectangle");
+            install_visual_group_scene_commands(&mut harness.renderer, rect, visual_group);
+            let scene = moving_visual_group_blur_scene(rect, visual_group);
+            let plan = oblivion_one::effects::compile_frame_execution_plan(
+                &scene,
+                &full_damage,
+                output_bounds,
+                &registry,
+            )
+            .expect("visual-group blur graph compiles");
+            let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+                panic!("visual-group blur must compile to an effect graph");
+            };
+            let capture_pass = graph
+                .passes
+                .iter()
+                .find(|pass| pass.kind == oblivion_one::effects::RenderPassKind::SceneCapture)
+                .expect("visual-group blur capture pass");
+            assert_eq!(
+                capture_pass.anchor,
+                oblivion_one::compositor::EffectAnchor::BeforeSurface(42)
+            );
+            assert_eq!(capture_pass.visual_group, Some(visual_group));
+            assert_eq!(
+                capture_pass.anchor_scope,
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup
+            );
+            assert!(capture_pass.checkpoint_dependencies.is_empty());
+
+            let demand = plan_effect_execution_demand(&graph, &full_damage, true);
+            let selection = effects::select_effect_execution(&graph, &demand);
+            let before_replays = harness.renderer.last_frame_stats().draw_command_replays;
+            effects::execute_effect_graph(
+                &mut harness.renderer,
+                &graph,
+                OutputFramebufferOrigin::BottomLeft,
+                &repaint_plan,
+                &demand,
+                &selection,
+            )
+            .expect("visual-group blur graph executes in real GLES");
+            let after_replays = harness.renderer.last_frame_stats().draw_command_replays;
+            assert_eq!(
+                after_replays.saturating_sub(before_replays),
+                3,
+                "step {step}: capture replays one background command and the final scene replays both commands"
+            );
+
+            let mut first_gl_error = None;
+            loop {
+                let error = unsafe { harness.gl.get_error() };
+                if error == glow::NO_ERROR {
+                    break;
+                }
+                first_gl_error.get_or_insert(error);
+            }
+            assert_eq!(first_gl_error, None, "step {step} left a GLES error");
+
+            let capture = graph
+                .textures
+                .iter()
+                .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+                .expect("visual-group blur capture texture");
+            assert!(capture.domain.width > 0 && capture.domain.height > 0);
+            let dimensions = graph
+                .textures
+                .iter()
+                .filter(|texture| texture.source != GraphTextureSource::Output)
+                .map(|texture| (texture.width, texture.height))
+                .collect::<Vec<_>>();
+            let interior =
+                x >= 0 && y >= 0 && x.saturating_add(32) <= 256 && y.saturating_add(24) <= 192;
+            if interior {
+                if let Some(first) = &first_dimensions {
+                    assert_eq!(first, &dimensions, "translation changed texture dimensions");
+                } else {
+                    first_dimensions = Some(dimensions);
+                }
+            }
+
+            let metrics = harness.renderer.effect_resources.metrics();
+            assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
+            if step == positions.len() - 1 {
+                warm_cache_bytes = Some(metrics.current_bytes);
+                warm_allocation_count = Some(metrics.allocation_count);
+            }
+            if step >= positions.len() {
+                assert_eq!(
+                    metrics.current_bytes,
+                    warm_cache_bytes.expect("warm cache bytes"),
+                    "step {step} changed cache size"
+                );
+                assert_eq!(
+                    metrics.allocation_count,
+                    warm_allocation_count.expect("warm allocation count"),
+                    "step {step} allocated again"
+                );
+            }
+            assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
+            assert!(metrics.cached_texture_count <= 32);
+        }
+
+        let metrics = harness.renderer.effect_resources.metrics();
+        assert!(
+            metrics.reuse_count > 0,
+            "visual-group blur did not reuse pooled textures"
         );
         assert_eq!(metrics.checked_out_texture_count, 0);
     }
