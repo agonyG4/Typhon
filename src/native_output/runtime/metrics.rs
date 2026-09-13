@@ -549,6 +549,7 @@ impl NativeRuntime {
             NativeContinuationReason::CommitTimingPlanning,
             NativeContinuationReason::XwaylandContinuation,
             NativeContinuationReason::ControlTimeout,
+            NativeContinuationReason::SceneVisualDebt,
         ] {
             if plan.continuation.contains(reason) {
                 self.wake_authority.note_continuation(reason);
@@ -585,9 +586,20 @@ impl NativeRuntime {
             .then(|| self.server.next_surface_pacing_deadline_ns())
             .flatten();
         let control_timeout_deadline = self.control_server.next_deadline_ns();
+        let scheduler_deadline = self.current_scheduler_wake_deadline(now_ns)?;
+        let visual_scene_debt = super::commit_timing::logical_scene_changed(
+            self.last_rendered_scene_generation,
+            self.server.scene_render_generation(),
+        );
+        let scene_visual_debt_has_external_wake_owner = self.scanout.page_flip_pending()
+            || self.atomic_commit_arbiter.atomic_commit_pending()
+            || self.output_render_fence_token.is_some();
+        let scene_visual_debt_continuation = visual_scene_debt
+            && scheduler_deadline.is_none()
+            && !scene_visual_debt_has_external_wake_owner;
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
-            scheduler_deadline: self.current_scheduler_wake_deadline(now_ns)?,
+            scheduler_deadline,
             atomic_commit_watchdog_deadline_ns: atomic_commit_watchdog_deadline_for_timeout_owner(
                 self.atomic_commit_arbiter.watchdog_deadline_ns(),
                 pageflip_timeout_owner,
@@ -606,7 +618,62 @@ impl NativeRuntime {
                 && self.server.has_pending_xwayland_backend_commands(),
             control_timeout_pending: control_timeout_deadline
                 .is_some_and(|deadline| deadline <= now_ns),
+            scene_visual_debt_continuation,
         });
+        if visual_scene_debt
+            && plan.deadline.is_none()
+            && !scene_visual_debt_has_external_wake_owner
+            && !plan
+                .continuation
+                .contains(NativeContinuationReason::SceneVisualDebt)
+        {
+            self.wake_authority
+                .note_scene_visual_debt_without_wake_owner();
+        }
+        if visual_scene_debt {
+            let wake_owner = if let Some(deadline) = plan.deadline {
+                match deadline.owner {
+                    NativeDeadlineOwner::FrameScheduler => "deadline:frame_scheduler",
+                    NativeDeadlineOwner::PresentationTarget => "deadline:presentation_target",
+                    NativeDeadlineOwner::AtomicCommitWatchdog => "deadline:atomic_commit_watchdog",
+                    NativeDeadlineOwner::ExplicitSyncFallback => "deadline:explicit_sync_fallback",
+                    NativeDeadlineOwner::XwaylandTimeout => "deadline:xwayland_timeout",
+                    NativeDeadlineOwner::CursorResponse => "deadline:cursor_response",
+                    NativeDeadlineOwner::ControlTimeout => "deadline:control_timeout",
+                    NativeDeadlineOwner::SurfacePacing => "deadline:surface_pacing",
+                    NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
+                }
+            } else if plan
+                .continuation
+                .contains(NativeContinuationReason::SceneVisualDebt)
+            {
+                "continuation:scene_visual_debt"
+            } else if scene_visual_debt_has_external_wake_owner {
+                if self.scanout.page_flip_pending() {
+                    "external:pageflip"
+                } else if self.atomic_commit_arbiter.atomic_commit_pending() {
+                    "external:atomic_commit"
+                } else {
+                    "external:render_fence"
+                }
+            } else {
+                "none"
+            };
+            self.perf.log("native.scene_liveness", || {
+                vec![
+                    NativePerfField::u64(
+                        "last_rendered_scene_generation",
+                        self.last_rendered_scene_generation,
+                    ),
+                    NativePerfField::u64(
+                        "scene_render_generation",
+                        self.server.scene_render_generation(),
+                    ),
+                    NativePerfField::bool("visual_scene_debt", true),
+                    NativePerfField::str("wake_owner", wake_owner),
+                ]
+            });
+        }
         self.install_native_wake_plan(plan, now_ns)
     }
 
@@ -688,6 +755,22 @@ impl NativeRuntime {
                 NativePerfField::bool("frame_rendered", cycle.frame_rendered),
                 NativePerfField::bool("frame_submitted", cycle.frame_submitted),
                 NativePerfField::bool("frame_completed", cycle.frame_completed),
+                NativePerfField::bool("presentation_admitted", cycle.presentation_admitted),
+                NativePerfField::u64(
+                    "last_rendered_scene_generation",
+                    self.last_rendered_scene_generation,
+                ),
+                NativePerfField::u64(
+                    "scene_render_generation",
+                    self.server.scene_render_generation(),
+                ),
+                NativePerfField::bool(
+                    "visual_scene_debt",
+                    super::commit_timing::logical_scene_changed(
+                        self.last_rendered_scene_generation,
+                        self.server.scene_render_generation(),
+                    ),
+                ),
                 NativePerfField::u64(
                     "watchdog_timeout_count",
                     self.frame_scheduler.watchdog_timeout_count(),

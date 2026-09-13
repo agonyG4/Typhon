@@ -176,6 +176,7 @@ pub(super) struct NativeCycleState {
     pub(super) frame_completed: bool,
     pub(super) frame_rendered: bool,
     pub(super) frame_submitted: bool,
+    pub(super) presentation_admitted: bool,
     pub(super) present_us: u64,
     pub(super) pageflip_pending_at_tick: bool,
     pub(super) tick_us: u64,
@@ -198,6 +199,7 @@ pub(super) struct NativeCycleMicroturnBaseline {
     frame_completed: bool,
     frame_rendered: bool,
     frame_submitted: bool,
+    presentation_admitted: bool,
     present_us: u64,
     pageflip_pending_at_tick: bool,
     accepted: usize,
@@ -221,6 +223,7 @@ impl NativeCycleState {
             frame_completed: self.frame_completed,
             frame_rendered: self.frame_rendered,
             frame_submitted: self.frame_submitted,
+            presentation_admitted: self.presentation_admitted,
             present_us: self.present_us,
             pageflip_pending_at_tick: self.pageflip_pending_at_tick,
             accepted: self.accepted,
@@ -243,6 +246,7 @@ impl NativeCycleState {
         self.frame_completed = baseline.frame_completed;
         self.frame_rendered = baseline.frame_rendered;
         self.frame_submitted = baseline.frame_submitted;
+        self.presentation_admitted |= baseline.presentation_admitted;
         self.present_us = baseline.present_us;
         self.pageflip_pending_at_tick = baseline.pageflip_pending_at_tick;
         self.accepted = baseline.accepted.saturating_add(self.accepted);
@@ -300,6 +304,7 @@ mod microturn_tests {
             frame_completed: true,
             frame_rendered: true,
             frame_submitted: true,
+            presentation_admitted: true,
             present_us: 13,
             pageflip_pending_at_tick: true,
             tick_us: 14,

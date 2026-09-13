@@ -246,6 +246,7 @@ pub enum NativeContinuationReason {
     CommitTimingPlanning,
     XwaylandContinuation,
     ControlTimeout,
+    SceneVisualDebt,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -257,6 +258,7 @@ impl NativeContinuationReasons {
     const COMMIT_TIMING_PLANNING: u32 = 1 << 2;
     const XWAYLAND_CONTINUATION: u32 = 1 << 3;
     const CONTROL_TIMEOUT: u32 = 1 << 4;
+    const SCENE_VISUAL_DEBT: u32 = 1 << 5;
 
     pub const fn contains(self, reason: NativeContinuationReason) -> bool {
         self.0 & reason.bit() != 0
@@ -292,6 +294,7 @@ impl NativeContinuationReason {
             Self::CommitTimingPlanning => NativeContinuationReasons::COMMIT_TIMING_PLANNING,
             Self::XwaylandContinuation => NativeContinuationReasons::XWAYLAND_CONTINUATION,
             Self::ControlTimeout => NativeContinuationReasons::CONTROL_TIMEOUT,
+            Self::SceneVisualDebt => NativeContinuationReasons::SCENE_VISUAL_DEBT,
         }
     }
 }

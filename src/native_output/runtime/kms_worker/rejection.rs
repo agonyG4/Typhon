@@ -63,9 +63,15 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
         cursor_output_arbitration.clear_pending();
     } else {
         if drop_reason == OutputTransactionDropReason::SafeAbandonment && job.ready_submit {
-            frame_pacing.note_predictive_ready_other_safe_abandonment(job.pacing_frame_id);
+            frame_pacing.note_predictive_ready_other_safe_abandonment_physical(
+                job.predictive_output_identity,
+            );
         }
-        if !frame_pacing.cancel_worker_submission(job.pacing_frame_id, job.ready_submit) {
+        if !frame_pacing.cancel_worker_submission_exact(
+            job.pacing_frame_id,
+            job.predictive_output_identity,
+            job.ready_submit,
+        ) {
             return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
         }
         if compatibility_primary {
@@ -314,10 +320,11 @@ impl NativeRuntime {
                 .ok_or_else(|| io::Error::other("invalidated cursor job has no cursor"))?;
             cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
             self.cursor_output_arbitration.clear_pending();
-        } else if !self
-            .frame_pacing
-            .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
-        {
+        } else if !self.frame_pacing.cancel_worker_submission_exact(
+            job.pacing_frame_id,
+            job.predictive_output_identity,
+            job.ready_submit,
+        ) {
             return Err(io::Error::other("invalidated worker pacing identity mismatch").into());
         }
 
@@ -434,10 +441,11 @@ impl NativeRuntime {
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
         }
-        if !self
-            .frame_pacing
-            .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
-        {
+        if !self.frame_pacing.cancel_worker_submission_exact(
+            job.pacing_frame_id,
+            job.predictive_output_identity,
+            job.ready_submit,
+        ) {
             return Err(io::Error::other("worker rejection pacing identity mismatch").into());
         }
         let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
@@ -602,10 +610,11 @@ impl NativeRuntime {
             cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
             self.cursor_output_arbitration.clear_pending();
         } else {
-            if !self
-                .frame_pacing
-                .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
-            {
+            if !self.frame_pacing.cancel_worker_submission_exact(
+                job.pacing_frame_id,
+                job.predictive_output_identity,
+                job.ready_submit,
+            ) {
                 return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
             }
             if compatibility_primary {
@@ -881,6 +890,7 @@ mod ownership_tests {
             direct_primary_lease: None,
             test_only_duration_ns: None,
             pacing_frame_id: None,
+            predictive_output_identity: None,
             test_policy: KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Required),
             ready_submit: true,
         }

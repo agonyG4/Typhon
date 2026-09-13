@@ -7,7 +7,7 @@ use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
-use crate::native_output::scanout::DirectPrimaryLease;
+use crate::native_output::scanout::{DirectPrimaryLease, OutputFrameIdentitySnapshot};
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
     PrimaryPlaneAssignment,
@@ -44,6 +44,9 @@ pub(crate) struct KmsCommitJob {
     pub(crate) direct_primary_lease: Option<DirectPrimaryLease>,
     pub(crate) test_only_duration_ns: Option<u64>,
     pub(crate) pacing_frame_id: Option<u64>,
+    /// Exact physical identity for an Atomic predictive frame. The logical
+    /// pacing ID remains separate for scheduler bookkeeping.
+    pub(crate) predictive_output_identity: Option<OutputFrameIdentitySnapshot>,
     pub(crate) test_policy: KmsCommitTestPolicy,
     pub(crate) ready_submit: bool,
 }

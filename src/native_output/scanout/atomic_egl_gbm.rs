@@ -1324,6 +1324,7 @@ impl AtomicEglGbmScanout {
             .ok()
             .and_then(Option::as_ref)
             .is_some_and(|evidence| evidence.render_sample_recorded);
+        let physical_identity = OutputFrameIdentitySnapshot::from(&completed_frame);
         let RenderedOutputFrame {
             id,
             transaction_id,
@@ -1366,6 +1367,7 @@ impl AtomicEglGbmScanout {
         Ok(CompositedPageflipCompletion {
             presented: PresentedOutputFrame {
                 frame_id: id,
+                physical_identity,
                 transaction_id,
                 target,
                 submit_window,
@@ -1699,6 +1701,7 @@ pub(crate) struct CompositedPageflipCompletion {
 #[derive(Debug)]
 pub(crate) struct PresentedOutputFrame {
     pub(crate) frame_id: u64,
+    pub(crate) physical_identity: OutputFrameIdentitySnapshot,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) target: PresentationTarget,
     pub(crate) submit_window: KmsSubmitWindow,

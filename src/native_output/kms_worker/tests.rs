@@ -129,6 +129,7 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
+        predictive_output_identity: None,
         test_policy: KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Skip),
         ready_submit: false,
     }

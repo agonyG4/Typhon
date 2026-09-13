@@ -102,8 +102,13 @@ impl NativeRuntime {
     }
 
     fn native_runtime_state(&self, cycle: &NativeCycleState, now_ns: u64) -> NativeRuntimeState {
+        let visual_scene_debt = super::commit_timing::logical_scene_changed(
+            self.last_rendered_scene_generation,
+            self.server.scene_render_generation(),
+        );
         NativeRuntimeState {
             scene_dirty: cycle.redraw_requested || self.server.has_pending_frame_prepare_work(),
+            visual_scene_debt,
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
@@ -562,6 +567,7 @@ impl NativeRuntime {
             cycle.frame_completed,
             prepare_outcome.visual_work_created,
         );
+        cycle.presentation_admitted = presentation_work;
         if presentation_work {
             let _ = self.service_input_at_routing_guard_checkpoint(
                 &mut routing_guard,
@@ -608,7 +614,11 @@ impl NativeRuntime {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
         }
-        if !presentation_work || self.input_epoch.backlog_pending() {
+        let visual_scene_debt = super::commit_timing::logical_scene_changed(
+            self.last_rendered_scene_generation,
+            self.server.scene_render_generation(),
+        );
+        if !presentation_work || self.input_epoch.backlog_pending() || visual_scene_debt {
             self.arm_runtime_deadline()?;
         }
         if !cycle.shutdown_requested

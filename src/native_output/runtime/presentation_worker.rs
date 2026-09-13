@@ -840,6 +840,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
     pacing_frame_id: Option<u64>,
+    predictive_output_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
@@ -859,6 +860,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         cursor_delivery,
         primary_cursor_presentation,
         pacing_frame_id,
+        predictive_output_identity,
         test_policy,
         ready_submit,
         validation_base,
@@ -910,6 +912,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             .frame_pacing
             .reserve_worker_submission(ready_submit)
             .map_err(io::Error::other)?;
+        let predictive_output_identity = context.frame_pacing.worker_submission_output_identity();
         let test_only = match frozen_cursor_plan.cursor_test_policy {
             FrozenCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
             FrozenCursorTestPolicy::Skip => KmsTestOnlyPolicy::Skip,
@@ -940,6 +943,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
             pacing_frame_id,
+            predictive_output_identity,
             KmsCommitTestPolicy {
                 primary: if primary_test_only {
                     KmsTestOnlyPolicy::Required
@@ -956,9 +960,11 @@ pub(super) fn submit_explicit_ready_for_presentation(
             }),
             Err(error) => {
                 if pacing_frame_id.is_some()
-                    && !context
-                        .frame_pacing
-                        .cancel_worker_submission(pacing_frame_id, ready_submit)
+                    && !context.frame_pacing.cancel_worker_submission_exact(
+                        pacing_frame_id,
+                        predictive_output_identity,
+                        ready_submit,
+                    )
                 {
                     return Err(io::Error::other(
                         "failed explicit worker submission pacing identity mismatch",
@@ -970,9 +976,11 @@ pub(super) fn submit_explicit_ready_for_presentation(
         };
         if result.is_none()
             && pacing_frame_id.is_some()
-            && !context
-                .frame_pacing
-                .cancel_worker_submission(pacing_frame_id, ready_submit)
+            && !context.frame_pacing.cancel_worker_submission_exact(
+                pacing_frame_id,
+                predictive_output_identity,
+                ready_submit,
+            )
         {
             return Err(io::Error::other(
                 "unavailable explicit worker submission pacing identity mismatch",
@@ -1206,6 +1214,7 @@ pub(super) fn finish_direct_worker_queued(
         direct_primary_lease: Some(direct_lease),
         test_only_duration_ns: None,
         pacing_frame_id,
+        predictive_output_identity: None,
         test_policy: KmsCommitTestPolicy::from_primary(test_only),
         ready_submit: false,
     };

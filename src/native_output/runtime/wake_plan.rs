@@ -78,6 +78,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) commit_timing_planning: bool,
     pub(crate) xwayland_continuation: bool,
     pub(crate) control_timeout_pending: bool,
+    pub(crate) scene_visual_debt_continuation: bool,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +94,8 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) commit_timing_planning_continuations: u64,
     pub(crate) xwayland_continuations: u64,
     pub(crate) control_timeout_continuations: u64,
+    pub(crate) scene_visual_debt_continuations: u64,
+    pub(crate) scene_visual_debt_without_wake_owner: u64,
     pub(crate) deadline_owner_frame_scheduler: u64,
     pub(crate) deadline_owner_presentation_target: u64,
     pub(crate) deadline_owner_atomic_watchdog: u64,
@@ -126,7 +129,16 @@ impl NativeWakeAuthorityMetrics {
                 self.control_timeout_continuations =
                     self.control_timeout_continuations.saturating_add(1)
             }
+            NativeContinuationReason::SceneVisualDebt => {
+                self.scene_visual_debt_continuations =
+                    self.scene_visual_debt_continuations.saturating_add(1)
+            }
         }
+    }
+
+    pub(crate) fn note_scene_visual_debt_without_wake_owner(&mut self) {
+        self.scene_visual_debt_without_wake_owner =
+            self.scene_visual_debt_without_wake_owner.saturating_add(1);
     }
 
     pub(crate) fn observe_plan(
@@ -215,7 +227,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_control={} past_surface_pacing={} past_dmabuf_retry={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -226,6 +238,8 @@ impl NativeWakeAuthorityMetrics {
             self.commit_timing_planning_continuations,
             self.xwayland_continuations,
             self.control_timeout_continuations,
+            self.scene_visual_debt_continuations,
+            self.scene_visual_debt_without_wake_owner,
             self.stale_deadline_rearms,
             self.past_deadline_arms,
             self.stale_deadline_arms_by_owner
@@ -293,6 +307,9 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
     }
     if inputs.control_timeout_pending {
         continuation = continuation.insert(NativeContinuationReason::ControlTimeout);
+    }
+    if inputs.scene_visual_debt_continuation {
+        continuation = continuation.insert(NativeContinuationReason::SceneVisualDebt);
     }
 
     let mut deadline = inputs.scheduler_deadline;
@@ -547,6 +564,45 @@ mod tests {
                 .contains(NativeContinuationReason::XwaylandContinuation)
         );
         assert_eq!(plan.deadline, None);
+    }
+
+    #[test]
+    fn visual_scene_debt_owns_a_one_shot_continuation_when_no_deadline_exists() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scene_visual_debt_continuation: true,
+            ..NativeWakePlanInputs::default()
+        });
+        assert!(
+            plan.continuation
+                .contains(NativeContinuationReason::SceneVisualDebt)
+        );
+        assert_eq!(plan.deadline, None);
+
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        metrics.note_continuation(NativeContinuationReason::SceneVisualDebt);
+        assert_eq!(metrics.scene_visual_debt_continuations, 1);
+        assert_eq!(metrics.scene_visual_debt_without_wake_owner, 0);
+    }
+
+    #[test]
+    fn scheduler_wake_is_sufficient_owner_for_future_visual_debt() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_deadline: Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 20_000,
+            }),
+            scene_visual_debt_continuation: false,
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 20_000,
+            })
+        );
+        assert!(plan.continuation.is_empty());
     }
 
     #[test]

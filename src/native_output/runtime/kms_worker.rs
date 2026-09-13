@@ -113,6 +113,7 @@ pub(super) fn queue_explicit_composited_frame(
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
     pacing_frame_id: Option<u64>,
+    predictive_output_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
@@ -242,6 +243,7 @@ pub(super) fn queue_explicit_composited_frame(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id,
+        predictive_output_identity,
         test_policy,
         ready_submit,
     };
@@ -481,6 +483,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id,
+        predictive_output_identity: None,
         test_policy,
         ready_submit: true,
     };
@@ -1278,6 +1281,7 @@ impl NativeRuntime {
                     self.frame_pacing
                         .note_worker_submit_exact(
                             pacing_frame_id,
+                            ownership.job.predictive_output_identity,
                             token.get(),
                             submit_returned_at,
                             ready_submit,

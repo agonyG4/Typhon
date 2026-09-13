@@ -1045,6 +1045,7 @@ impl NativeRuntime {
                 let render_observed_at_ns = monotonic_now_ns()?;
                 let render_begin_fields = build_render_begin_fields(
                     frame_pacing.active,
+                    frame_pacing.active_predictive_attempt_id(),
                     render_generation,
                     render_observed_at_ns,
                     render_ahead,
@@ -1437,6 +1438,12 @@ impl NativeRuntime {
                                 if slow_cycle_enabled {
                                     slow_cycle_trace.note_compositor_render_us(render_us);
                                 }
+                                let physical_identity = explicit.swapchain()?.ready_identity().ok_or_else(
+                                    || io::Error::other("rendered Atomic frame has no physical identity"),
+                                )?;
+                                frame_pacing
+                                    .bind_predictive_o1(physical_identity)
+                                    .map_err(io::Error::other)?;
                                 frame_pacing.note_render_ready();
                                 if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
                                     frame_pacing.note_predictive_binding_after_render_completion(
@@ -1509,14 +1516,16 @@ impl NativeRuntime {
                                     )?;
                                     match failure {
                                         DeferredO1BindingFailure::IdentityMismatch => {
-                                            frame_pacing.note_predictive_unbound_abandoned_identity(
-                                                Some(owner.frame_id),
-                                            );
+                                            frame_pacing
+                                                .note_predictive_unbound_abandoned_identity_physical(
+                                                    Some(owner),
+                                                );
                                         }
                                         DeferredO1BindingFailure::GenerationMismatch => {
-                                            frame_pacing.note_predictive_unbound_abandoned_generation(
-                                                Some(owner.frame_id),
-                                            );
+                                            frame_pacing
+                                                .note_predictive_unbound_abandoned_generation_physical(
+                                                    Some(owner),
+                                                );
                                         }
                                     }
                                     super::cycle::abandon_overtaken_ready(
@@ -1642,6 +1651,13 @@ impl NativeRuntime {
                                     "render_complete",
                                     vec![
                                         PacingField::u64("frame_id", frame_id),
+                                        PacingField::option_u64(
+                                            "predictive_attempt_id",
+                                            frame_pacing
+                                                .active_predictive_attempt_id()
+                                                .map(|attempt| attempt.get()),
+                                        ),
+                                        PacingField::u64("output_frame_id", frame_id),
                                         PacingField::u64("render_generation", render_generation),
                                         PacingField::u64(
                                             "render_observed_at_ns",

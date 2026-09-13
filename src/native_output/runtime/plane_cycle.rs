@@ -241,6 +241,7 @@ pub(super) fn queue_plane_delta(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
+        predictive_output_identity: None,
         test_policy: KmsCommitTestPolicy::from_cursor(scheduled_kms_test_policy(cursor)),
         ready_submit: false,
     };

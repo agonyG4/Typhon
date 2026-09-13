@@ -10,6 +10,7 @@ use oblivion_one::native::event_loop::NativeContinuationReason;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeRuntimeState {
     pub(super) scene_dirty: bool,
+    pub(super) visual_scene_debt: bool,
     pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
     pub(super) explicit_sync_service_due: bool,
@@ -50,6 +51,7 @@ pub(crate) struct NativeCycleOperationPlan {
     pub(super) service_acquire_and_prepare: bool,
     pub(super) explicit_sync_service: bool,
     pub(super) presentation_due: bool,
+    pub(super) visual_scene_debt: bool,
 }
 
 impl NativeCycleOperationPlan {
@@ -59,7 +61,11 @@ impl NativeCycleOperationPlan {
         frame_completed: bool,
         visual_work_created: bool,
     ) -> bool {
-        self.presentation_due || redraw_requested || frame_completed || visual_work_created
+        self.presentation_due
+            || self.visual_scene_debt
+            || redraw_requested
+            || frame_completed
+            || visual_work_created
     }
 }
 
@@ -142,6 +148,7 @@ impl NativeWorkDomains {
             service_acquire_and_prepare: self.scene || self.explicit_sync,
             explicit_sync_service: self.explicit_sync,
             presentation_due: self.presentation,
+            visual_scene_debt: self.presentation && self.scene,
         }
     }
 
@@ -194,11 +201,15 @@ impl NativeWorkDomains {
             || state.cursor_only_due;
         let wayland_dispatch = wayland_protocol;
         let surface_pacing = state.pacing_due;
-        let scene = state.scene_dirty || state.visual_work_deadline_due || state.recovery_required;
+        let scene = state.scene_dirty
+            || state.visual_scene_debt
+            || state.visual_work_deadline_due
+            || state.recovery_required;
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
             || reasons.output_render_fence()
             || state.visual_work_deadline_due
+            || state.visual_scene_debt
             || state.cursor_only_due
             || state.recovery_required;
 
@@ -414,6 +425,79 @@ mod tests {
         .operation_plan();
 
         assert!(plan.service_acquire_and_prepare);
+        assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn active_scene_debt_admits_presentation_without_a_redraw_edge() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                visual_scene_debt: true,
+                ..state()
+            },
+        );
+        let plan = domains.operation_plan();
+
+        assert!(domains.scene);
+        assert!(domains.presentation);
+        assert!(plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn async_scene_publication_is_reclassified_at_the_presentation_boundary() {
+        let initial = NativeWorkDomains::classify(&wakeup(0), &state()).operation_plan();
+        assert!(!initial.presentation_admitted(false, false, false));
+
+        // An acquire/fifo completion can publish after the first classification
+        // and without leaving a redraw edge or frame-prepare callback behind.
+        let after_publication = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                visual_scene_debt: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        assert!(after_publication.service_acquire_and_prepare);
+        assert!(after_publication.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn coalesced_scene_generations_need_one_level_service_until_acknowledged() {
+        let mut last_rendered = 41;
+        let mut current = last_rendered;
+        for next in [42, 43, 44] {
+            assert!(super::super::commit_timing::logical_scene_changed(
+                last_rendered,
+                next,
+            ));
+            // The acknowledgement remains at the last sampled scene while
+            // newer publications coalesce behind the same level-triggered
+            // debt.
+            current = next;
+        }
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                visual_scene_debt: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        assert!(plan.presentation_admitted(false, false, false));
+        last_rendered = current;
+        assert!(!super::super::commit_timing::logical_scene_changed(
+            last_rendered,
+            current
+        ));
+    }
+
+    #[test]
+    fn acknowledged_scene_debt_returns_to_true_idle() {
+        let plan = NativeWorkDomains::classify(&wakeup(0), &state()).operation_plan();
+
+        assert!(!plan.visual_scene_debt);
         assert!(!plan.presentation_admitted(false, false, false));
     }
 

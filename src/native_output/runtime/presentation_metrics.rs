@@ -5,6 +5,7 @@ use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, Rend
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_render_begin_fields(
     frame_id: Option<NativeOutputFrameId>,
+    predictive_attempt_id: Option<PredictiveO1AttemptId>,
     render_generation: u64,
     render_observed_at_ns: u64,
     render_ahead: bool,
@@ -17,6 +18,11 @@ pub(super) fn build_render_begin_fields(
 ) -> Vec<PacingField> {
     let mut fields = vec![
         frame_id_field(frame_id),
+        PacingField::option_u64(
+            "predictive_attempt_id",
+            predictive_attempt_id.map(|attempt| attempt.get()),
+        ),
+        PacingField::none("output_frame_id"),
         PacingField::u64("render_generation", render_generation),
         PacingField::u64("render_observed_at_ns", render_observed_at_ns),
         PacingField::bool("render_ahead", render_ahead),

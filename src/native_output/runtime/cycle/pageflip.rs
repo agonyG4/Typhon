@@ -221,7 +221,7 @@ fn abandon_overtaken_worker_queued(
         KmsWorkerQueuedCancellation::Cancelled(job) => {
             if job.ready_submit {
                 frame_pacing
-                    .note_predictive_ready_overtaken_worker_queued(Some(owner.frame.frame_id));
+                    .note_predictive_ready_overtaken_worker_queued_physical(Some(owner.frame));
             }
             drop_queued_worker_job_with_reason_parts(
                 *job,
@@ -521,6 +521,7 @@ impl NativeRuntime {
                 frame_completed: false,
                 frame_rendered: false,
                 frame_submitted: false,
+                presentation_admitted: false,
                 present_us: 0,
                 pageflip_pending_at_tick: false,
                 tick_us: 0,
@@ -877,6 +878,7 @@ impl NativeRuntime {
                 let presented_at_ns =
                     compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
                 *last_primary_presented_at_ns = Some(presented_at_ns);
+                let mut completed_physical_identity = None;
                 if direct_pending {
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let prepared_physical = presentation_deadline.prepare_presented(presented_at);
@@ -1111,6 +1113,7 @@ impl NativeRuntime {
                         )
                         .into());
                     }
+                    completed_physical_identity = Some(frame.physical_identity);
                     explicit.note_physical_primary_presentation(physical_claim)?;
                     match explicit.bind_ready_deferred_o1(
                         output_transactions,
@@ -1133,14 +1136,16 @@ impl NativeRuntime {
                                 })?;
                             match failure {
                                 DeferredO1BindingFailure::IdentityMismatch => {
-                                    frame_pacing.note_predictive_unbound_abandoned_identity(Some(
-                                        owner.frame_id,
-                                    ));
+                                    frame_pacing
+                                        .note_predictive_unbound_abandoned_identity_physical(Some(
+                                            owner,
+                                        ));
                                 }
                                 DeferredO1BindingFailure::GenerationMismatch => {
-                                    frame_pacing.note_predictive_unbound_abandoned_generation(
-                                        Some(owner.frame_id),
-                                    );
+                                    frame_pacing
+                                        .note_predictive_unbound_abandoned_generation_physical(
+                                            Some(owner),
+                                        );
                                 }
                             }
                             abandon_overtaken_ready(
@@ -1481,7 +1486,8 @@ impl NativeRuntime {
                         server.finish_frame_with_presentation(presentation);
                     }
                 }
-                frame_pacing.note_pageflip(
+                frame_pacing.note_pageflip_exact(
+                    completed_physical_identity,
                     presented_at_ns,
                     submitted_at_ns,
                     pageflip.user_data,
@@ -1749,6 +1755,7 @@ impl NativeRuntime {
             frame_completed,
             frame_rendered,
             frame_submitted,
+            presentation_admitted: false,
             present_us: 0,
             pageflip_pending_at_tick: false,
             tick_us: 0,

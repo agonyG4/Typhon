@@ -109,6 +109,7 @@ impl NativeRuntime {
             frame_completed: false,
             frame_rendered: false,
             frame_submitted: false,
+            presentation_admitted: false,
             present_us: 0,
             pageflip_pending_at_tick: self.scanout.page_flip_pending(),
             tick_us: 0,

@@ -220,6 +220,7 @@ mod tests {
         pacing
             .note_worker_submit_exact(
                 reserved,
+                None,
                 41,
                 3,
                 false,
@@ -263,6 +264,7 @@ mod tests {
             pacing
                 .note_worker_submit_exact(
                     stale,
+                    None,
                     41,
                     3,
                     false,
@@ -285,6 +287,7 @@ mod tests {
         pacing
             .note_worker_submit_exact(
                 reserved,
+                None,
                 41,
                 2,
                 false,
@@ -296,6 +299,7 @@ mod tests {
             pacing
                 .note_worker_submit_exact(
                     reserved,
+                    None,
                     42,
                     3,
                     false,
@@ -315,7 +319,14 @@ mod tests {
 
         assert!(pacing.cancel_worker_submission(None, true));
         pacing
-            .note_worker_submit_exact(None, 41, 2, true, NativeOutputPacingMode::ReactiveDouble)
+            .note_worker_submit_exact(
+                None,
+                None,
+                41,
+                2,
+                true,
+                NativeOutputPacingMode::ReactiveDouble,
+            )
             .expect("a compatibility job without a pacing reservation is valid");
 
         assert_eq!(pacing.worker_submission_frame_id(false), active);
@@ -363,6 +374,7 @@ mod tests {
         pacing
             .note_worker_submit_exact(
                 reserved,
+                None,
                 41,
                 51_000,
                 true,
@@ -564,6 +576,7 @@ mod tests {
         pacing
             .note_worker_submit_exact(
                 Some(p1),
+                None,
                 41,
                 5,
                 true,
@@ -578,6 +591,7 @@ mod tests {
         pacing
             .note_worker_submit_exact(
                 Some(p2),
+                None,
                 42,
                 6,
                 true,
@@ -618,12 +632,14 @@ mod tests {
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(older_worker))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(
+                    older_worker
+                )))
         );
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(newer_ready))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(newer_ready)))
         );
     }
 
@@ -651,12 +667,14 @@ mod tests {
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(older_worker))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(
+                    older_worker
+                )))
         );
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(newer_ready))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(newer_ready)))
         );
     }
 
@@ -676,7 +694,7 @@ mod tests {
         assert!(
             pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(live))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(live)))
         );
 
         pacing.note_predictive_ready_other_safe_abandonment(Some(live));
@@ -685,7 +703,7 @@ mod tests {
         assert!(
             !pacing
                 .predictive_o1_lifecycle
-                .contains(NativeOutputFrameId(live))
+                .contains_attempt(PredictiveO1AttemptId::new(NativeOutputFrameId(live)))
         );
     }
 
@@ -724,12 +742,20 @@ mod tests {
         let id = pacing.reserve_worker_submission(true).unwrap();
 
         pacing
-            .note_worker_submit_exact(id, 41, 3, true, NativeOutputPacingMode::PredictiveTriple)
+            .note_worker_submit_exact(
+                id,
+                None,
+                41,
+                3,
+                true,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
             .unwrap();
         assert!(
             pacing
                 .note_worker_submit_exact(
                     id,
+                    None,
                     42,
                     4,
                     true,
@@ -817,7 +843,14 @@ mod tests {
         pacing.note_predictive_binding_after_render_completion(0);
         let id = pacing.reserve_worker_submission(true).unwrap();
         pacing
-            .note_worker_submit_exact(id, 41, 3, true, NativeOutputPacingMode::PredictiveTriple)
+            .note_worker_submit_exact(
+                id,
+                None,
+                41,
+                3,
+                true,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
             .unwrap();
         pacing.note_pageflip(4, 3, 41, 6_060);
 
@@ -1393,7 +1426,7 @@ mod tests {
         );
     }
 }
-use super::scanout::NativeScanoutBufferSnapshot;
+use super::scanout::{NativeScanoutBufferSnapshot, OutputFrameIdentitySnapshot};
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss, RenderPrediction,
 };
@@ -1412,12 +1445,30 @@ use std::sync::{
 use std::thread;
 #[path = "pacing_o1.rs"]
 mod pacing_o1;
+#[cfg(test)]
+#[path = "predictive_o1_tests.rs"]
+mod predictive_o1_tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NativeOutputFrameId(u64);
 
 impl NativeOutputFrameId {
     pub(crate) const fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// Identity allocated by pacing before the output backend has created a
+/// concrete frame. It is valid for scheduling decisions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PredictiveO1AttemptId(NativeOutputFrameId);
+
+impl PredictiveO1AttemptId {
+    const fn new(frame_id: NativeOutputFrameId) -> Self {
+        Self(frame_id)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
     }
 }
 #[derive(Debug)]
@@ -1563,6 +1614,9 @@ impl PacingField {
     }
     pub(crate) fn u64(key: &'static str, value: u64) -> Self {
         Self::str(key, value.to_string())
+    }
+    pub(crate) fn option_u64(key: &'static str, value: Option<u64>) -> Self {
+        value.map_or_else(|| Self::none(key), |v| Self::u64(key, v))
     }
     pub(crate) fn i64(key: &'static str, value: i64) -> Self {
         Self::str(key, value.to_string())
@@ -1714,15 +1768,17 @@ const PREDICTIVE_O1_LIFECYCLE_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct PredictiveO1LifecycleEntry {
-    frame_id: NativeOutputFrameId,
+    attempt_id: PredictiveO1AttemptId,
+    physical_identity: Option<OutputFrameIdentitySnapshot>,
     stage: PredictiveO1Stage,
     observed_stages: u8,
 }
 
 impl PredictiveO1LifecycleEntry {
-    const fn new(frame_id: NativeOutputFrameId) -> Self {
+    const fn new(attempt_id: PredictiveO1AttemptId) -> Self {
         Self {
-            frame_id,
+            attempt_id,
+            physical_identity: None,
             stage: PredictiveO1Stage::Rendering,
             observed_stages: 1u8 << (PredictiveO1Stage::Rendering as u8),
         }
@@ -1745,50 +1801,136 @@ impl Default for PredictiveO1LifecycleLedger {
 }
 
 impl PredictiveO1LifecycleLedger {
-    fn insert(&mut self, frame_id: NativeOutputFrameId) -> Result<(), &'static str> {
-        if self.contains(frame_id) {
+    fn insert(&mut self, attempt_id: PredictiveO1AttemptId) -> Result<(), &'static str> {
+        if self.contains_attempt(attempt_id) {
             return Err("Predictive O1 frame identity was admitted twice");
         }
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
             return Err("Predictive O1 lifecycle capacity was exceeded");
         };
-        *entry = Some(PredictiveO1LifecycleEntry::new(frame_id));
+        *entry = Some(PredictiveO1LifecycleEntry::new(attempt_id));
         let active_entries = self.active_entries();
         self.peak_entries = self.peak_entries.max(active_entries);
         Ok(())
     }
 
-    fn contains(&self, frame_id: NativeOutputFrameId) -> bool {
+    fn contains_attempt(&self, attempt_id: PredictiveO1AttemptId) -> bool {
         self.entries
             .iter()
             .flatten()
-            .any(|entry| entry.frame_id == frame_id)
+            .any(|entry| entry.attempt_id == attempt_id)
     }
 
-    fn record_stage(&mut self, frame_id: NativeOutputFrameId, stage: PredictiveO1Stage) -> bool {
+    fn contains_identity(&self, identity: PredictiveO1LifecycleIdentity) -> bool {
+        self.entries.iter().flatten().any(|entry| match identity {
+            PredictiveO1LifecycleIdentity::Attempt(attempt_id) => entry.attempt_id == attempt_id,
+            PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
+                entry.physical_identity == Some(physical_identity)
+            }
+        })
+    }
+
+    fn has_observed_stage(
+        &self,
+        identity: PredictiveO1LifecycleIdentity,
+        stage: PredictiveO1Stage,
+    ) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| match identity {
+                PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
+                    entry.attempt_id == attempt_id
+                }
+                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
+                    entry.physical_identity == Some(physical_identity)
+                }
+            })
+            .is_some_and(|entry| entry.observed_stages & (1u8 << (stage as u8)) != 0)
+    }
+
+    fn bind(
+        &mut self,
+        attempt_id: PredictiveO1AttemptId,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.physical_identity == Some(physical_identity))
+        {
+            return Err("Predictive O1 physical identity was bound twice");
+        }
         let Some(entry) = self
             .entries
             .iter_mut()
             .flatten()
-            .find(|entry| entry.frame_id == frame_id)
+            .find(|entry| entry.attempt_id == attempt_id)
         else {
-            return false;
+            return Err("Predictive O1 attempt identity was not live");
         };
-        let bit = 1u8 << (stage as u8);
-        if entry.observed_stages & bit != 0 || !stage_transition_is_valid(entry.stage, stage) {
-            return false;
+        if entry.physical_identity.is_some() {
+            return Err("Predictive O1 attempt identity was bound twice");
         }
-        entry.stage = stage;
-        entry.observed_stages |= bit;
-        true
+        entry.physical_identity = Some(physical_identity);
+        Ok(())
     }
 
-    fn remove(&mut self, frame_id: NativeOutputFrameId) -> bool {
+    fn physical_identity_for_attempt(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+    ) -> Option<OutputFrameIdentitySnapshot> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+            .and_then(|entry| entry.physical_identity)
+    }
+
+    fn record_stage(
+        &mut self,
+        identity: PredictiveO1LifecycleIdentity,
+        stage: PredictiveO1Stage,
+    ) -> PredictiveO1StageRecord {
         let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.is_some_and(|entry| entry.frame_id == frame_id))
+            .flatten()
+            .find(|entry| match identity {
+                PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
+                    entry.attempt_id == attempt_id
+                }
+                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
+                    entry.physical_identity == Some(physical_identity)
+                }
+            })
         else {
+            return PredictiveO1StageRecord::Missing;
+        };
+        let bit = 1u8 << (stage as u8);
+        if entry.observed_stages & bit != 0 {
+            return PredictiveO1StageRecord::Duplicate;
+        }
+        if !stage_transition_is_valid(entry.stage, stage) {
+            return PredictiveO1StageRecord::Invalid;
+        }
+        entry.stage = stage;
+        entry.observed_stages |= bit;
+        PredictiveO1StageRecord::Accepted
+    }
+
+    fn remove(&mut self, identity: PredictiveO1LifecycleIdentity) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.is_some_and(|entry| match identity {
+                PredictiveO1LifecycleIdentity::Attempt(attempt_id) => {
+                    entry.attempt_id == attempt_id
+                }
+                PredictiveO1LifecycleIdentity::Physical(physical_identity) => {
+                    entry.physical_identity == Some(physical_identity)
+                }
+            })
+        }) else {
             return false;
         };
         *entry = None;
@@ -1806,6 +1948,30 @@ impl PredictiveO1LifecycleLedger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredictiveO1LifecycleIdentity {
+    Attempt(PredictiveO1AttemptId),
+    Physical(OutputFrameIdentitySnapshot),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredictiveO1StageRecord {
+    Accepted,
+    Duplicate,
+    Invalid,
+    Missing,
+}
+
+const fn lifecycle_identity(
+    attempt_id: NativeOutputFrameId,
+    physical_identity: Option<OutputFrameIdentitySnapshot>,
+) -> PredictiveO1LifecycleIdentity {
+    match physical_identity {
+        Some(identity) => PredictiveO1LifecycleIdentity::Physical(identity),
+        None => PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(attempt_id)),
+    }
+}
+
 const fn stage_transition_is_valid(from: PredictiveO1Stage, to: PredictiveO1Stage) -> bool {
     matches!(
         (from, to),
@@ -1816,6 +1982,10 @@ const fn stage_transition_is_valid(from: PredictiveO1Stage, to: PredictiveO1Stag
             )
             | (PredictiveO1Stage::RenderReady, PredictiveO1Stage::Bound)
             | (PredictiveO1Stage::RenderReady, PredictiveO1Stage::Submitted)
+            | (
+                PredictiveO1Stage::RenderReady,
+                PredictiveO1Stage::WorkerQueued
+            )
             | (PredictiveO1Stage::ReadyUnbound, PredictiveO1Stage::Bound)
             | (PredictiveO1Stage::Bound, PredictiveO1Stage::WorkerQueued)
             | (PredictiveO1Stage::Bound, PredictiveO1Stage::Submitted)
@@ -1836,11 +2006,13 @@ enum PredictiveReadyTerminal {
     OvertakenWorkerQueued,
     OtherSafeAbandonment,
     Failed,
+    InvalidStage,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct WorkerPacingReservation {
     frame_id: NativeOutputFrameId,
+    physical_identity: Option<OutputFrameIdentitySnapshot>,
 }
 
 #[derive(Debug)]
@@ -1883,12 +2055,15 @@ pub(crate) struct NativeFramePacing {
     trace: Option<NativeTraceSink>,
     ids: NativeOutputFrameIdSequence,
     pub(crate) active: Option<NativeOutputFrameId>,
+    active_physical_identity: Option<OutputFrameIdentitySnapshot>,
     active_origin: PreparedFrameOrigin,
     pub(crate) active_queued_ns: Option<u64>,
     active_queued_frame_id: Option<NativeOutputFrameId>,
     pub(crate) pending: Option<NativeOutputFrameId>,
+    pending_physical_identity: Option<OutputFrameIdentitySnapshot>,
     pending_token: Option<u64>,
     pub(crate) ready: Option<NativeOutputFrameId>,
+    ready_physical_identity: Option<OutputFrameIdentitySnapshot>,
     ready_waiting_frame_id: Option<NativeOutputFrameId>,
     worker_reservation: Option<WorkerPacingReservation>,
     pub(crate) render_ahead_attempts: u64,
@@ -1911,10 +2086,13 @@ pub(crate) struct NativeFramePacing {
     pub(crate) predictive_o1_worker_queued: u64,
     pub(crate) predictive_o1_submitted: u64,
     pub(crate) predictive_o1_presented: u64,
+    pub(crate) predictive_o1_invalid_stage_transitions: u64,
+    pub(crate) predictive_o1_stale_stage_events: u64,
     pub(crate) predictive_o1_abandoned_identity: u64,
     pub(crate) predictive_o1_abandoned_generation: u64,
     pub(crate) predictive_o1_other_safe_abandonment: u64,
     pub(crate) predictive_o1_failed: u64,
+    pub(crate) predictive_o1_invalid_stage_terminalized: u64,
     pub(crate) predictive_o1_current_at_shutdown: u64,
     pub(crate) predictive_unbound_created: u64,
     pub(crate) predictive_unbound_ready: u64,
@@ -2086,12 +2264,15 @@ impl NativeFramePacing {
             trace: trace_enabled.then(NativeTraceSink::new),
             ids: NativeOutputFrameIdSequence::new(1),
             active: None,
+            active_physical_identity: None,
             active_origin: PreparedFrameOrigin::Normal,
             active_queued_ns: None,
             active_queued_frame_id: None,
             pending: None,
+            pending_physical_identity: None,
             pending_token: None,
             ready: None,
+            ready_physical_identity: None,
             ready_waiting_frame_id: None,
             worker_reservation: None,
             render_ahead_attempts: 0,
@@ -2114,10 +2295,13 @@ impl NativeFramePacing {
             predictive_o1_worker_queued: 0,
             predictive_o1_submitted: 0,
             predictive_o1_presented: 0,
+            predictive_o1_invalid_stage_transitions: 0,
+            predictive_o1_stale_stage_events: 0,
             predictive_o1_abandoned_identity: 0,
             predictive_o1_abandoned_generation: 0,
             predictive_o1_other_safe_abandonment: 0,
             predictive_o1_failed: 0,
+            predictive_o1_invalid_stage_terminalized: 0,
             predictive_o1_current_at_shutdown: 0,
             predictive_unbound_created: 0,
             predictive_unbound_ready: 0,
@@ -2264,6 +2448,7 @@ impl NativeFramePacing {
         }
         let id = self.ids.next();
         self.active = Some(id);
+        self.active_physical_identity = None;
         self.active_origin = PreparedFrameOrigin::Normal;
         self.active_queued_ns = Some(now_ns);
         self.active_queued_frame_id = Some(id);
@@ -2285,6 +2470,45 @@ impl NativeFramePacing {
         if self.enabled {
             self.last_prediction = Some(prediction);
         }
+    }
+
+    /// Transfer a predictive attempt from the scheduler namespace to the
+    /// exact output frame created by the physical scanout backend.
+    pub(crate) fn bind_predictive_o1(
+        &mut self,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled || self.active_origin != PreparedFrameOrigin::PredictiveO1 {
+            return Ok(());
+        }
+        let attempt_id = self
+            .active
+            .map(PredictiveO1AttemptId::new)
+            .ok_or("Predictive O1 physical frame has no active attempt")?;
+        self.predictive_o1_lifecycle
+            .bind(attempt_id, physical_identity)?;
+        self.active_physical_identity = Some(physical_identity);
+        self.log(
+            "predictive_attempt_bound",
+            vec![
+                PacingField::u64("predictive_attempt_id", attempt_id.get()),
+                PacingField::u64("output_frame_id", physical_identity.frame_id),
+                PacingField::u64("transaction_id", physical_identity.transaction_id.get()),
+                PacingField::u64(
+                    "protocol_batch_id",
+                    physical_identity.protocol_batch_id.get(),
+                ),
+                PacingField::u64("pool_generation", physical_identity.pool_generation),
+                PacingField::u64("render_generation", physical_identity.render_generation),
+            ],
+        );
+        Ok(())
+    }
+
+    pub(crate) fn active_predictive_attempt_id(&self) -> Option<PredictiveO1AttemptId> {
+        (self.active_origin == PreparedFrameOrigin::PredictiveO1)
+            .then(|| self.active.map(PredictiveO1AttemptId::new))
+            .flatten()
     }
 
     pub(crate) fn note_render_started(
@@ -2320,7 +2544,8 @@ impl NativeFramePacing {
             let frame_id = self
                 .active
                 .ok_or("Predictive O1 render started without an active frame")?;
-            self.predictive_o1_lifecycle.insert(frame_id)?;
+            self.predictive_o1_lifecycle
+                .insert(PredictiveO1AttemptId::new(frame_id))?;
             self.predictive_o1_created = self.predictive_o1_created.saturating_add(1);
             self.note_predictive_unbound_created();
         }
@@ -2336,21 +2561,29 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
-        let id = if ready_submit {
-            self.ready.take()
+        let (id, physical_identity) = if ready_submit {
+            (self.ready.take(), self.ready_physical_identity.take())
         } else {
-            self.active.take()
+            (self.active.take(), self.active_physical_identity.take())
         };
         if !ready_submit {
             self.clear_active_worker_timing(id);
             self.active_origin = PreparedFrameOrigin::Normal;
         }
-        self.note_submit_frame(id, token, now_ns, ready_submit, pacing_mode);
+        self.note_submit_frame(
+            id,
+            physical_identity,
+            token,
+            now_ns,
+            ready_submit,
+            pacing_mode,
+        );
     }
 
     fn note_submit_frame(
         &mut self,
         id: Option<NativeOutputFrameId>,
+        physical_identity: Option<OutputFrameIdentitySnapshot>,
         token: u64,
         now_ns: u64,
         ready_submit: bool,
@@ -2359,10 +2592,15 @@ impl NativeFramePacing {
         if ready_submit {
             self.ready_submit_count += 1;
             if let Some(frame_id) = id
-                && self.predictive_o1_lifecycle.contains(frame_id)
+                && self
+                    .predictive_o1_lifecycle
+                    .contains_attempt(PredictiveO1AttemptId::new(frame_id))
             {
                 self.predictive_ready_submits += 1;
-                if self.note_predictive_stage(frame_id, PredictiveO1Stage::Submitted) {
+                if self.note_predictive_stage(
+                    lifecycle_identity(frame_id, physical_identity),
+                    PredictiveO1Stage::Submitted,
+                ) {
                     self.predictive_ready_submitted =
                         self.predictive_ready_submitted.saturating_add(1);
                 }
@@ -2375,13 +2613,28 @@ impl NativeFramePacing {
                 self.ready_waiting_frame_id = None;
             }
         }
-        if !ready_submit && let Some(frame_id) = id {
-            self.note_predictive_stage(frame_id, PredictiveO1Stage::Submitted);
+        if !ready_submit
+            && let Some(frame_id) = id
+            && self
+                .predictive_o1_lifecycle
+                .contains_attempt(PredictiveO1AttemptId::new(frame_id))
+        {
+            self.note_predictive_stage(
+                lifecycle_identity(frame_id, physical_identity),
+                PredictiveO1Stage::Submitted,
+            );
         }
         if pacing_mode == NativeOutputPacingMode::ReactiveDouble && !ready_submit {
             self.reactive_double_immediate_submits += 1;
         }
+        let predictive_attempt_id = id
+            .filter(|frame_id| {
+                self.predictive_o1_lifecycle
+                    .contains_attempt(PredictiveO1AttemptId::new(*frame_id))
+            })
+            .map(|frame_id| frame_id.get());
         self.pending = id;
+        self.pending_physical_identity = physical_identity;
         self.pending_token = id.map(|_| token);
         if !ready_submit && self.active_queued_frame_id == id {
             self.active_queued_ns = None;
@@ -2391,6 +2644,11 @@ impl NativeFramePacing {
             "submit",
             vec![
                 frame_id_field(id),
+                PacingField::option_u64("predictive_attempt_id", predictive_attempt_id),
+                PacingField::option_u64(
+                    "output_frame_id",
+                    physical_identity.map(|identity| identity.frame_id),
+                ),
                 PacingField::u64("pageflip_token", token),
                 PacingField::u64("submit_ns", now_ns),
                 PacingField::bool("ready_submit", ready_submit),
@@ -2400,11 +2658,28 @@ impl NativeFramePacing {
 
     fn note_predictive_stage(
         &mut self,
-        frame_id: NativeOutputFrameId,
+        identity: PredictiveO1LifecycleIdentity,
         stage: PredictiveO1Stage,
     ) -> bool {
-        if !self.predictive_o1_lifecycle.record_stage(frame_id, stage) {
-            return false;
+        match self.predictive_o1_lifecycle.record_stage(identity, stage) {
+            PredictiveO1StageRecord::Accepted => {}
+            PredictiveO1StageRecord::Duplicate => {
+                self.predictive_o1_stale_stage_events =
+                    self.predictive_o1_stale_stage_events.saturating_add(1);
+                return false;
+            }
+            PredictiveO1StageRecord::Missing => {
+                self.predictive_o1_stale_stage_events =
+                    self.predictive_o1_stale_stage_events.saturating_add(1);
+                return false;
+            }
+            PredictiveO1StageRecord::Invalid => {
+                self.predictive_o1_invalid_stage_transitions = self
+                    .predictive_o1_invalid_stage_transitions
+                    .saturating_add(1);
+                self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::InvalidStage);
+                return false;
+            }
         }
         match stage {
             PredictiveO1Stage::Rendering => {}
@@ -2439,7 +2714,10 @@ impl NativeFramePacing {
         let Some(frame_id) = self.active else {
             return;
         };
-        if self.note_predictive_stage(frame_id, PredictiveO1Stage::RenderReady) {
+        let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+        if self.predictive_o1_lifecycle.contains_identity(identity)
+            && self.note_predictive_stage(identity, PredictiveO1Stage::RenderReady)
+        {
             self.predictive_render_ahead_ready =
                 self.predictive_render_ahead_ready.saturating_add(1);
             self.render_ahead_successes = self.render_ahead_successes.saturating_add(1);
@@ -2448,10 +2726,10 @@ impl NativeFramePacing {
 
     fn terminalize_predictive_frame(
         &mut self,
-        frame_id: NativeOutputFrameId,
+        identity: PredictiveO1LifecycleIdentity,
         terminal: PredictiveReadyTerminal,
     ) -> bool {
-        if !self.predictive_o1_lifecycle.remove(frame_id) {
+        if !self.predictive_o1_lifecycle.remove(identity) {
             return false;
         }
         match terminal {
@@ -2495,11 +2773,36 @@ impl NativeFramePacing {
                 self.predictive_ready_failed = self.predictive_ready_failed.saturating_add(1);
                 self.predictive_o1_failed = self.predictive_o1_failed.saturating_add(1);
             }
+            PredictiveReadyTerminal::InvalidStage => {
+                self.predictive_o1_invalid_stage_terminalized = self
+                    .predictive_o1_invalid_stage_terminalized
+                    .saturating_add(1);
+            }
         }
         self.log(
             "predictive_ready_terminal",
             vec![
-                frame_id_field(Some(frame_id)),
+                PacingField::str(
+                    "identity",
+                    match identity {
+                        PredictiveO1LifecycleIdentity::Attempt(_) => "attempt",
+                        PredictiveO1LifecycleIdentity::Physical(_) => "physical",
+                    },
+                ),
+                PacingField::u64(
+                    "predictive_attempt_id",
+                    match identity {
+                        PredictiveO1LifecycleIdentity::Attempt(attempt_id) => attempt_id.get(),
+                        PredictiveO1LifecycleIdentity::Physical(_) => 0,
+                    },
+                ),
+                PacingField::u64(
+                    "output_frame_id",
+                    match identity {
+                        PredictiveO1LifecycleIdentity::Attempt(_) => 0,
+                        PredictiveO1LifecycleIdentity::Physical(identity) => identity.frame_id,
+                    },
+                ),
                 PacingField::str(
                     "terminal",
                     match terminal {
@@ -2510,6 +2813,7 @@ impl NativeFramePacing {
                         PredictiveReadyTerminal::OvertakenWorkerQueued => "overtaken_worker_queued",
                         PredictiveReadyTerminal::OtherSafeAbandonment => "other_safe_abandonment",
                         PredictiveReadyTerminal::Failed => "failed",
+                        PredictiveReadyTerminal::InvalidStage => "invalid_stage",
                     },
                 ),
             ],
@@ -2517,6 +2821,7 @@ impl NativeFramePacing {
         true
     }
 
+    #[cfg(test)]
     fn note_predictive_terminal_exact(
         &mut self,
         frame_id: Option<u64>,
@@ -2525,9 +2830,28 @@ impl NativeFramePacing {
         let Some(frame_id) = frame_id else {
             return false;
         };
-        self.terminalize_predictive_frame(NativeOutputFrameId(frame_id), terminal)
+        self.terminalize_predictive_frame(
+            PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(
+                NativeOutputFrameId(frame_id),
+            )),
+            terminal,
+        )
     }
 
+    fn note_predictive_terminal_physical(
+        &mut self,
+        identity: Option<OutputFrameIdentitySnapshot>,
+        terminal: PredictiveReadyTerminal,
+    ) -> bool {
+        identity.is_some_and(|identity| {
+            self.terminalize_predictive_frame(
+                PredictiveO1LifecycleIdentity::Physical(identity),
+                terminal,
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn note_predictive_ready_overtaken_worker_queued(&mut self, frame_id: Option<u64>) {
         if self.enabled {
             self.note_predictive_terminal_exact(
@@ -2537,10 +2861,35 @@ impl NativeFramePacing {
         }
     }
 
+    pub(crate) fn note_predictive_ready_overtaken_worker_queued_physical(
+        &mut self,
+        identity: Option<OutputFrameIdentitySnapshot>,
+    ) {
+        if self.enabled {
+            self.note_predictive_terminal_physical(
+                identity,
+                PredictiveReadyTerminal::OvertakenWorkerQueued,
+            );
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn note_predictive_ready_other_safe_abandonment(&mut self, frame_id: Option<u64>) {
         if self.enabled {
             self.note_predictive_terminal_exact(
                 frame_id,
+                PredictiveReadyTerminal::OtherSafeAbandonment,
+            );
+        }
+    }
+
+    pub(crate) fn note_predictive_ready_other_safe_abandonment_physical(
+        &mut self,
+        identity: Option<OutputFrameIdentitySnapshot>,
+    ) {
+        if self.enabled {
+            self.note_predictive_terminal_physical(
+                identity,
                 PredictiveReadyTerminal::OtherSafeAbandonment,
             );
         }
@@ -2551,7 +2900,8 @@ impl NativeFramePacing {
             return;
         }
         if let Some(frame_id) = self.active {
-            self.terminalize_predictive_frame(frame_id, PredictiveReadyTerminal::Failed);
+            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+            self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::Failed);
         }
     }
 
@@ -2560,8 +2910,9 @@ impl NativeFramePacing {
             return;
         }
         if let Some(frame_id) = self.active {
+            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
             self.terminalize_predictive_frame(
-                frame_id,
+                identity,
                 PredictiveReadyTerminal::OtherSafeAbandonment,
             );
         }
@@ -2609,9 +2960,21 @@ impl NativeFramePacing {
         let Some(frame_id) = self.worker_submission_frame(ready_submit) else {
             return Ok(None);
         };
-        self.worker_reservation = Some(WorkerPacingReservation { frame_id });
-        self.note_predictive_stage(frame_id, PredictiveO1Stage::WorkerQueued);
+        let physical_identity = self.physical_identity_for_frame(frame_id);
+        self.worker_reservation = Some(WorkerPacingReservation {
+            frame_id,
+            physical_identity,
+        });
+        let identity = lifecycle_identity(frame_id, physical_identity);
+        if self.predictive_o1_lifecycle.contains_identity(identity) {
+            self.note_predictive_stage(identity, PredictiveO1Stage::WorkerQueued);
+        }
         Ok(Some(frame_id.get()))
+    }
+
+    pub(crate) fn worker_submission_output_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
+        self.worker_reservation
+            .and_then(|reservation| reservation.physical_identity)
     }
 
     fn worker_submission_frame(&self, ready_submit: bool) -> Option<NativeOutputFrameId> {
@@ -2620,6 +2983,14 @@ impl NativeFramePacing {
         } else {
             self.active
         }
+    }
+
+    fn physical_identity_for_frame(
+        &self,
+        frame_id: NativeOutputFrameId,
+    ) -> Option<OutputFrameIdentitySnapshot> {
+        self.predictive_o1_lifecycle
+            .physical_identity_for_attempt(PredictiveO1AttemptId::new(frame_id))
     }
 
     fn clear_active_worker_timing(&mut self, frame_id: Option<NativeOutputFrameId>) {
@@ -2651,9 +3022,11 @@ impl NativeFramePacing {
             self.worker_reservation = None;
             if self.active == Some(reservation.frame_id) {
                 self.active = None;
+                self.active_physical_identity = None;
             }
             if self.ready == Some(reservation.frame_id) {
                 self.ready = None;
+                self.ready_physical_identity = None;
             }
             self.clear_active_worker_timing(Some(reservation.frame_id));
             return Ok(Some(reservation.frame_id));
@@ -2666,11 +3039,24 @@ impl NativeFramePacing {
         expected: Option<u64>,
         ready_submit: bool,
     ) -> bool {
+        let physical_identity = self.worker_submission_output_identity();
+        self.cancel_worker_submission_exact(expected, physical_identity, ready_submit)
+    }
+
+    pub(crate) fn cancel_worker_submission_exact(
+        &mut self,
+        expected: Option<u64>,
+        physical_identity: Option<OutputFrameIdentitySnapshot>,
+        ready_submit: bool,
+    ) -> bool {
         if !self.enabled {
             return true;
         }
         if expected.is_none() {
             return true;
+        }
+        if self.worker_submission_output_identity() != physical_identity {
+            return false;
         }
         let current = match self.take_worker_submission_frame(expected) {
             Ok(current) => current,
@@ -2680,7 +3066,10 @@ impl NativeFramePacing {
             return false;
         }
         if let Some(frame_id) = current {
-            self.terminalize_predictive_frame(frame_id, PredictiveReadyTerminal::Failed);
+            self.terminalize_predictive_frame(
+                lifecycle_identity(frame_id, physical_identity),
+                PredictiveReadyTerminal::Failed,
+            );
         }
         self.clear_ready_waiting_timing(current);
         self.log(
@@ -2696,6 +3085,7 @@ impl NativeFramePacing {
     pub(crate) fn note_worker_submit_exact(
         &mut self,
         expected: Option<u64>,
+        physical_identity: Option<OutputFrameIdentitySnapshot>,
         token: u64,
         now_ns: u64,
         ready_submit: bool,
@@ -2707,8 +3097,18 @@ impl NativeFramePacing {
         if expected.is_none() {
             return Ok(());
         }
+        if self.worker_submission_output_identity() != physical_identity {
+            return Err("worker physical output identity does not match queued state");
+        }
         let id = self.take_worker_submission_frame(expected)?;
-        self.note_submit_frame(id, token, now_ns, ready_submit, pacing_mode);
+        self.note_submit_frame(
+            id,
+            physical_identity,
+            token,
+            now_ns,
+            ready_submit,
+            pacing_mode,
+        );
         Ok(())
     }
 
@@ -2718,11 +3118,12 @@ impl NativeFramePacing {
         }
         if let Some(frame_id) = self.pending {
             self.terminalize_predictive_frame(
-                frame_id,
+                lifecycle_identity(frame_id, self.pending_physical_identity),
                 PredictiveReadyTerminal::OtherSafeAbandonment,
             );
         }
         self.pending = None;
+        self.pending_physical_identity = None;
         self.pending_token = None;
         self.log(
             "worker_submit_abandoned",
@@ -2748,7 +3149,10 @@ impl NativeFramePacing {
             .predictive_binding_advanced_intervals
             .saturating_add(advanced_intervals);
         if let Some(frame_id) = self.ready {
-            self.note_predictive_stage(frame_id, PredictiveO1Stage::Bound);
+            let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+            if self.predictive_o1_lifecycle.contains_identity(identity) {
+                self.note_predictive_stage(identity, PredictiveO1Stage::Bound);
+            }
         }
     }
 
@@ -2762,7 +3166,10 @@ impl NativeFramePacing {
         if self.enabled {
             self.predictive_unbound_ready = self.predictive_unbound_ready.saturating_add(1);
             if let Some(frame_id) = self.ready {
-                self.note_predictive_stage(frame_id, PredictiveO1Stage::ReadyUnbound);
+                let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+                if self.predictive_o1_lifecycle.contains_identity(identity) {
+                    self.note_predictive_stage(identity, PredictiveO1Stage::ReadyUnbound);
+                }
             }
         }
     }
@@ -2781,10 +3188,14 @@ impl NativeFramePacing {
             .predictive_binding_advanced_intervals
             .saturating_add(advanced_intervals);
         if let Some(frame_id) = self.ready {
-            self.note_predictive_stage(frame_id, PredictiveO1Stage::Bound);
+            let identity = lifecycle_identity(frame_id, self.ready_physical_identity);
+            if self.predictive_o1_lifecycle.contains_identity(identity) {
+                self.note_predictive_stage(identity, PredictiveO1Stage::Bound);
+            }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn note_predictive_unbound_abandoned_identity(&mut self, frame_id: Option<u64>) {
         if self.enabled {
             self.note_predictive_terminal_exact(
@@ -2794,6 +3205,19 @@ impl NativeFramePacing {
         }
     }
 
+    pub(crate) fn note_predictive_unbound_abandoned_identity_physical(
+        &mut self,
+        identity: Option<OutputFrameIdentitySnapshot>,
+    ) {
+        if self.enabled {
+            self.note_predictive_terminal_physical(
+                identity,
+                PredictiveReadyTerminal::AbandonedIdentity,
+            );
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn note_predictive_unbound_abandoned_generation(&mut self, frame_id: Option<u64>) {
         if self.enabled {
             self.note_predictive_terminal_exact(
@@ -2803,15 +3227,39 @@ impl NativeFramePacing {
         }
     }
 
+    pub(crate) fn note_predictive_unbound_abandoned_generation_physical(
+        &mut self,
+        identity: Option<OutputFrameIdentitySnapshot>,
+    ) {
+        if self.enabled {
+            self.note_predictive_terminal_physical(
+                identity,
+                PredictiveReadyTerminal::AbandonedGeneration,
+            );
+        }
+    }
+
     pub(crate) fn note_ready_frame(&mut self, now_ns: u64, _waits_for_target: bool) {
         if !self.enabled {
             return;
         }
-        self.note_render_ready();
+        if let Some(frame_id) = self.active {
+            let identity = lifecycle_identity(frame_id, self.active_physical_identity);
+            if !self
+                .predictive_o1_lifecycle
+                .has_observed_stage(identity, PredictiveO1Stage::RenderReady)
+            {
+                self.note_render_ready();
+            }
+        }
         let ready = self.active.take();
         let origin = std::mem::take(&mut self.active_origin);
+        let physical_identity = self.active_physical_identity.take();
         if origin == PreparedFrameOrigin::PredictiveO1
-            && ready.is_some_and(|frame_id| self.predictive_o1_lifecycle.contains(frame_id))
+            && ready.is_some_and(|frame_id| {
+                self.predictive_o1_lifecycle
+                    .contains_attempt(PredictiveO1AttemptId::new(frame_id))
+            })
         {
             self.predictive_ready_created = self.predictive_ready_created.saturating_add(1);
             self.ready_waiting_started_ns = None;
@@ -2823,12 +3271,27 @@ impl NativeFramePacing {
             self.ready_waiting_frame_id = ready;
         }
         self.ready = ready;
+        self.ready_physical_identity = physical_identity;
         self.active_queued_frame_id = None;
         self.active_queued_ns = None;
         self.log(
             "ready_queued",
             vec![
                 frame_id_field(self.ready),
+                PacingField::option_u64(
+                    "predictive_attempt_id",
+                    self.ready
+                        .filter(|frame_id| {
+                            self.predictive_o1_lifecycle
+                                .contains_attempt(PredictiveO1AttemptId::new(*frame_id))
+                        })
+                        .map(|frame_id| frame_id.get()),
+                ),
+                PacingField::option_u64(
+                    "output_frame_id",
+                    self.ready_physical_identity
+                        .map(|identity| identity.frame_id),
+                ),
                 PacingField::u64("render_end_ns", now_ns),
             ],
         );
@@ -2841,7 +3304,11 @@ impl NativeFramePacing {
         let Some(frame_id) = self.ready.take() else {
             return false;
         };
-        self.terminalize_predictive_frame(frame_id, PredictiveReadyTerminal::OvertakenReady);
+        let physical_identity = self.ready_physical_identity.take();
+        self.terminalize_predictive_frame(
+            lifecycle_identity(frame_id, physical_identity),
+            PredictiveReadyTerminal::OvertakenReady,
+        );
         self.clear_ready_waiting_timing(Some(frame_id));
         self.log(
             "ready_frame_abandoned",
@@ -2850,8 +3317,20 @@ impl NativeFramePacing {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn note_pageflip(
         &mut self,
+        now_ns: u64,
+        submitted_at_ns: u64,
+        token: u64,
+        refresh_interval_us: u64,
+    ) {
+        self.note_pageflip_exact(None, now_ns, submitted_at_ns, token, refresh_interval_us);
+    }
+
+    pub(crate) fn note_pageflip_exact(
+        &mut self,
+        physical_identity: Option<OutputFrameIdentitySnapshot>,
         now_ns: u64,
         submitted_at_ns: u64,
         token: u64,
@@ -2874,16 +3353,91 @@ impl NativeFramePacing {
         let commit_us = now_ns.saturating_sub(submitted_at_ns) / 1_000;
         self.commit_to_present.record(commit_us);
         let id = self.pending.take();
+        let pending_physical_identity = self.pending_physical_identity.take();
         self.pending_token = None;
-        if let Some(frame_id) = id
-            && self.note_predictive_stage(frame_id, PredictiveO1Stage::Presented)
-        {
-            self.terminalize_predictive_frame(frame_id, PredictiveReadyTerminal::Presented);
+        let predictive_pending = id.is_some_and(|frame_id| {
+            self.predictive_o1_lifecycle
+                .contains_attempt(PredictiveO1AttemptId::new(frame_id))
+        });
+        let predictive_attempt_id = id
+            .filter(|_| predictive_pending)
+            .map(|frame_id| frame_id.get());
+        if predictive_pending && let Some(frame_id) = id {
+            let identity = match (pending_physical_identity, physical_identity) {
+                (Some(expected), Some(actual)) if expected == actual => {
+                    Some(PredictiveO1LifecycleIdentity::Physical(actual))
+                }
+                (Some(expected), Some(actual)) => {
+                    self.predictive_o1_invalid_stage_transitions = self
+                        .predictive_o1_invalid_stage_transitions
+                        .saturating_add(1);
+                    self.terminalize_predictive_frame(
+                        PredictiveO1LifecycleIdentity::Physical(expected),
+                        PredictiveReadyTerminal::InvalidStage,
+                    );
+                    self.log(
+                        "predictive_physical_identity_mismatch",
+                        vec![
+                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("expected_output_frame_id", expected.frame_id),
+                            PacingField::u64("actual_output_frame_id", actual.frame_id),
+                        ],
+                    );
+                    None
+                }
+                (Some(expected), None) => {
+                    self.predictive_o1_invalid_stage_transitions = self
+                        .predictive_o1_invalid_stage_transitions
+                        .saturating_add(1);
+                    self.terminalize_predictive_frame(
+                        PredictiveO1LifecycleIdentity::Physical(expected),
+                        PredictiveReadyTerminal::InvalidStage,
+                    );
+                    self.log(
+                        "predictive_physical_identity_missing",
+                        vec![
+                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("expected_output_frame_id", expected.frame_id),
+                        ],
+                    );
+                    None
+                }
+                (None, Some(actual)) => {
+                    self.predictive_o1_invalid_stage_transitions = self
+                        .predictive_o1_invalid_stage_transitions
+                        .saturating_add(1);
+                    self.terminalize_predictive_frame(
+                        PredictiveO1LifecycleIdentity::Attempt(PredictiveO1AttemptId::new(
+                            frame_id,
+                        )),
+                        PredictiveReadyTerminal::InvalidStage,
+                    );
+                    self.log(
+                        "predictive_physical_identity_unbound",
+                        vec![
+                            PacingField::u64("predictive_attempt_id", frame_id.get()),
+                            PacingField::u64("actual_output_frame_id", actual.frame_id),
+                        ],
+                    );
+                    None
+                }
+                (None, None) => Some(lifecycle_identity(frame_id, None)),
+            };
+            if let Some(identity) = identity
+                && self.note_predictive_stage(identity, PredictiveO1Stage::Presented)
+            {
+                self.terminalize_predictive_frame(identity, PredictiveReadyTerminal::Presented);
+            }
         }
         self.log(
             "pageflip_complete",
             vec![
                 frame_id_field(id),
+                PacingField::option_u64("predictive_attempt_id", predictive_attempt_id),
+                PacingField::option_u64(
+                    "output_frame_id",
+                    physical_identity.map(|identity| identity.frame_id),
+                ),
                 PacingField::u64("pageflip_token", token),
                 PacingField::u64("pageflip_complete_ns", now_ns),
                 PacingField::u64("commit_to_present_us", commit_us),
@@ -3656,6 +4210,7 @@ impl NativeFramePacing {
             .saturating_add(self.predictive_o1_abandoned_generation)
             .saturating_add(self.predictive_o1_other_safe_abandonment)
             .saturating_add(self.predictive_o1_failed)
+            .saturating_add(self.predictive_o1_invalid_stage_terminalized)
             .saturating_add(self.predictive_o1_current_at_shutdown);
         let predictive_o1_remainder = self
             .predictive_o1_created
@@ -3703,6 +4258,14 @@ impl NativeFramePacing {
                 PacingField::u64("predictive_o1_submitted", self.predictive_o1_submitted),
                 PacingField::u64("predictive_o1_presented", self.predictive_o1_presented),
                 PacingField::u64(
+                    "predictive_o1_invalid_stage_transitions",
+                    self.predictive_o1_invalid_stage_transitions,
+                ),
+                PacingField::u64(
+                    "predictive_o1_stale_stage_events",
+                    self.predictive_o1_stale_stage_events,
+                ),
+                PacingField::u64(
                     "predictive_o1_abandoned_identity",
                     self.predictive_o1_abandoned_identity,
                 ),
@@ -3715,6 +4278,10 @@ impl NativeFramePacing {
                     self.predictive_o1_other_safe_abandonment,
                 ),
                 PacingField::u64("predictive_o1_failed", self.predictive_o1_failed),
+                PacingField::u64(
+                    "predictive_o1_invalid_stage_terminalized",
+                    self.predictive_o1_invalid_stage_terminalized,
+                ),
                 PacingField::u64(
                     "predictive_o1_current_at_shutdown",
                     self.predictive_o1_current_at_shutdown,
