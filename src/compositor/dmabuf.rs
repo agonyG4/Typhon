@@ -19,7 +19,7 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     CompositorState, CoreComplianceMetrics, ProtocolErrorCategory, ProtocolErrorTrace,
-    gpu_protocol_capabilities::GpuFormat, unique_runtime_file_path,
+    gpu_protocol_capabilities::GpuFormat, post_fatal_protocol_error, unique_runtime_file_path,
 };
 
 const WL_DRM_CAPABILITIES_SINCE: u32 = 2;
@@ -301,43 +301,38 @@ impl DmabufParamsData {
         plane: PendingDmabufPlane,
         metrics: &mut CoreComplianceMetrics,
         trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     ) {
         if self.is_used() {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::AlreadyUsed,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::AlreadyUsed,
-                "linux-dmabuf params already used".to_string(),
+                "linux-dmabuf params already used",
             );
             return;
         }
         if plane.plane_idx > 3 {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::PlaneIdx,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::PlaneIdx,
-                "dmabuf plane index is outside the supported EGL import range".to_string(),
+                "dmabuf plane index is outside the supported EGL import range",
             );
             return;
         }
         if plane.stride == 0 {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::OutOfBounds,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::OutOfBounds,
-                "invalid dmabuf plane offset or stride".to_string(),
+                "invalid dmabuf plane offset or stride",
             );
             return;
         }
@@ -346,15 +341,13 @@ impl DmabufParamsData {
             .iter()
             .any(|existing| existing.plane_idx == plane.plane_idx)
         {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::PlaneSet,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::PlaneSet,
-                "dmabuf plane index was already provided".to_string(),
+                "dmabuf plane index was already provided",
             );
             return;
         }
@@ -372,34 +365,31 @@ impl DmabufParamsData {
         allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
         trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     ) -> bool {
-        if !self.mark_used(params, metrics, trace) {
+        if !self.mark_used(params, metrics, trace, terminal_client_ids) {
             return false;
         }
         if width <= 0 || height <= 0 {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::InvalidDimensions,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::InvalidDimensions,
-                "dmabuf width and height must be positive".to_string(),
+                "dmabuf width and height must be positive",
             );
             return false;
         }
         let planes = self.planes.lock().unwrap();
         let Some(plane) = planes.first() else {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::Incomplete,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::Incomplete,
-                "dmabuf create requires at least one plane".to_string(),
+                "dmabuf create requires at least one plane",
             );
             return false;
         };
@@ -410,30 +400,25 @@ impl DmabufParamsData {
                 allowed_formats,
             )
         {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::InvalidFormat,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::InvalidFormat,
-                "dmabuf format + modifier pair is not advertised by compositor feedback"
-                    .to_string(),
+                "dmabuf format + modifier pair is not advertised by compositor feedback",
             );
             return false;
         }
         let _fd = plane.fd.as_fd();
         if plane.offset % 4 != 0 {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::OutOfBounds,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::OutOfBounds,
-                "dmabuf plane offset is not aligned".to_string(),
+                "dmabuf plane offset is not aligned",
             );
             return false;
         }
@@ -452,6 +437,7 @@ impl DmabufParamsData {
         allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
         trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
         identity: BufferIdentity,
     ) -> Option<DmabufBufferData> {
         if !self.validate_for_create(
@@ -463,6 +449,7 @@ impl DmabufParamsData {
             allowed_formats,
             metrics,
             trace,
+            terminal_client_ids,
         ) {
             return None;
         }
@@ -486,15 +473,13 @@ impl DmabufParamsData {
         match DmabufBufferHandle::new(size, drm_format, planes) {
             Ok(handle) => Some(DmabufBufferData { identity, handle }),
             Err(_) => {
-                note_dmabuf_protocol_error(
+                post_dmabuf_protocol_error(
                     metrics,
                     trace,
+                    terminal_client_ids,
                     params,
                     zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
-                );
-                params.post_error(
-                    zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
-                    "invalid dmabuf buffer metadata".to_string(),
+                    "invalid dmabuf buffer metadata",
                 );
                 None
             }
@@ -513,18 +498,17 @@ impl DmabufParamsData {
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         metrics: &mut CoreComplianceMetrics,
         trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     ) -> bool {
         let mut used = self.used.lock().unwrap();
         if *used {
-            note_dmabuf_protocol_error(
+            post_dmabuf_protocol_error(
                 metrics,
                 trace,
+                terminal_client_ids,
                 params,
                 zwp_linux_buffer_params_v1::Error::AlreadyUsed,
-            );
-            params.post_error(
-                zwp_linux_buffer_params_v1::Error::AlreadyUsed,
-                "linux-dmabuf params already used".to_string(),
+                "linux-dmabuf params already used",
             );
             return false;
         }
@@ -537,14 +521,25 @@ impl DmabufParamsData {
     }
 }
 
-fn note_dmabuf_protocol_error(
+fn post_dmabuf_protocol_error(
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,
+    terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     resource: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
     code: zwp_linux_buffer_params_v1::Error,
+    message: &str,
 ) {
-    metrics.note_protocol_error();
-    trace.record_for_resource(resource, code.into(), ProtocolErrorCategory::Wire);
+    let _ = post_fatal_protocol_error(
+        metrics,
+        trace,
+        terminal_client_ids,
+        resource,
+        code,
+        message,
+        None,
+        ProtocolErrorCategory::Wire,
+        None,
+    );
 }
 
 #[derive(Debug, Clone)]

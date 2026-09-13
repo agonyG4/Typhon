@@ -1,5 +1,54 @@
 use super::*;
 
+#[allow(clippy::mutable_key_type)]
+pub(in crate::compositor) fn post_fatal_protocol_error<I: Resource>(
+    metrics: &mut CoreComplianceMetrics,
+    trace: &mut ProtocolErrorTrace,
+    terminal_client_ids: &mut HashSet<ClientId>,
+    resource: &I,
+    code: impl Into<u32>,
+    message: impl Into<String>,
+    surface_id: Option<u32>,
+    category: ProtocolErrorCategory,
+    xwayland_generation: Option<u64>,
+) -> bool {
+    let code = code.into();
+    let message = message.into();
+    let Some(client) = resource.client() else {
+        metrics.note_protocol_error();
+        trace.record(ProtocolErrorRecord {
+            timestamp_ns: protocol_error_timestamp_ns(),
+            client_id: None,
+            peer_pid: None,
+            interface: ProtocolErrorInterface::for_resource::<I>(),
+            resource_id: Some(resource.id().protocol_id()),
+            error_code: Some(code),
+            surface_id,
+            xwayland_generation,
+            category: ProtocolErrorCategory::Unavailable,
+        });
+        return false;
+    };
+    let client_id = client.id();
+    terminal_client_ids.insert(client_id);
+    metrics.note_protocol_error();
+    trace.record(ProtocolErrorRecord {
+        timestamp_ns: protocol_error_timestamp_ns(),
+        client_id: Some(client.id()),
+        peer_pid: None,
+        interface: ProtocolErrorInterface::for_resource::<I>(),
+        resource_id: Some(resource.id().protocol_id()),
+        error_code: Some(code),
+        surface_id,
+        xwayland_generation,
+        category,
+    });
+    // This is the only raw fatal emitter in compositor source. The owning client
+    // is terminal and diagnostics are recorded before the wire is killed.
+    resource.post_error(code, message);
+    true
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct ClientTeardownSummary {
     pub(in crate::compositor) surfaces_removed: usize,
@@ -93,37 +142,6 @@ impl CompositorState {
         self.terminal_client_ids.insert(client_id);
     }
 
-    pub(in crate::compositor) fn note_protocol_error_for_resource<I: Resource>(
-        &mut self,
-        client: &Client,
-        resource: &I,
-        code: impl Into<u32>,
-        surface_id: Option<u32>,
-        category: ProtocolErrorCategory,
-    ) {
-        self.compliance_metrics.note_protocol_error();
-        let interface = ProtocolErrorInterface::for_resource::<I>();
-        let xwayland_generation = matches!(interface, ProtocolErrorInterface::XwaylandShell)
-            .then(|| {
-                self.xwayland
-                    .client_identity
-                    .as_ref()
-                    .map(|identity| identity.generation.get())
-            })
-            .flatten();
-        self.protocol_error_trace.record(ProtocolErrorRecord {
-            timestamp_ns: protocol_error_timestamp_ns(),
-            client_id: Some(client.id()),
-            peer_pid: None,
-            interface,
-            resource_id: Some(resource.id().protocol_id()),
-            error_code: Some(code.into()),
-            surface_id,
-            xwayland_generation,
-            category,
-        });
-    }
-
     pub(in crate::compositor) fn post_protocol_error<I: Resource>(
         &mut self,
         client: &Client,
@@ -131,7 +149,15 @@ impl CompositorState {
         code: impl Into<u32>,
         message: impl Into<String>,
     ) {
-        self.post_protocol_error_with_cleanup(client, resource, code, message, true);
+        self.post_protocol_error_with_cleanup_and_details(
+            client,
+            resource,
+            code,
+            message,
+            None,
+            ProtocolErrorCategory::Wire,
+            true,
+        );
     }
 
     pub(in crate::compositor) fn post_protocol_error_deferred<I: Resource>(
@@ -144,32 +170,59 @@ impl CompositorState {
         // Pointer-constraint dispatch may have queued a valid earlier request in the
         // same wire batch. Preserve that request's backend ordering; normal client
         // disconnect teardown remains the terminal cleanup authority.
-        self.post_protocol_error_with_cleanup(client, resource, code, message, false);
+        self.post_protocol_error_with_cleanup_and_details(
+            client,
+            resource,
+            code,
+            message,
+            None,
+            ProtocolErrorCategory::Wire,
+            false,
+        );
     }
 
-    fn post_protocol_error_with_cleanup<I: Resource>(
+    pub(in crate::compositor) fn post_protocol_error_deferred_with_details<I: Resource>(
         &mut self,
         client: &Client,
         resource: &I,
         code: impl Into<u32>,
         message: impl Into<String>,
+        surface_id: Option<u32>,
+        category: ProtocolErrorCategory,
+    ) {
+        self.post_protocol_error_with_cleanup_and_details(
+            client, resource, code, message, surface_id, category, false,
+        );
+    }
+
+    fn post_protocol_error_with_cleanup_and_details<I: Resource>(
+        &mut self,
+        client: &Client,
+        resource: &I,
+        code: impl Into<u32>,
+        message: impl Into<String>,
+        surface_id: Option<u32>,
+        category: ProtocolErrorCategory,
         cleanup_now: bool,
     ) {
         let client_id = client.id();
-        let code = code.into();
-        let message = message.into();
         // wayland-server kills the wire from inside post_error, while Typhon
         // drains the resulting disconnected-client notification later in the
         // dispatch cycle. Make that interval non-publishable immediately.
-        self.mark_client_terminal(client_id.clone());
-        self.note_protocol_error_for_resource(
-            client,
+        let _ = post_fatal_protocol_error(
+            &mut self.compliance_metrics,
+            &mut self.protocol_error_trace,
+            &mut self.terminal_client_ids,
             resource,
             code,
-            None,
-            ProtocolErrorCategory::Wire,
+            message,
+            surface_id,
+            category,
+            self.xwayland
+                .client_identity
+                .as_ref()
+                .map(|identity| identity.generation.get()),
         );
-        resource.post_error(code, message);
         if cleanup_now {
             self.teardown_client_resources(&client_id);
         }

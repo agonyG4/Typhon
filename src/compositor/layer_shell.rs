@@ -421,17 +421,17 @@ impl CompositorState {
         if let Err(message) = validate_layer_surface_size(role.pending) {
             let resource = role.resource.clone();
             if let Some(client) = resource.client() {
-                self.note_protocol_error_for_resource(
+                self.post_protocol_error_deferred_with_details(
                     &client,
                     &resource,
                     zwlr_layer_surface_v1::Error::InvalidSize,
+                    message,
                     Some(surface_id),
                     ProtocolErrorCategory::InvalidState,
                 );
             } else {
                 self.note_protocol_error_metric();
             }
-            resource.post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
             return Err(());
         }
         let role = self
@@ -512,20 +512,17 @@ impl CompositorState {
             let resource = role.resource.clone();
             let debug_details = layer_surface_debug_details(surface_id, role, pending_surface_size);
             if let Some(client) = resource.client() {
-                self.note_protocol_error_for_resource(
+                self.post_protocol_error_deferred_with_details(
                     &client,
                     &resource,
                     zwlr_layer_surface_v1::Error::InvalidSurfaceState,
+                    "layer surface buffer committed before configure was acknowledged".to_string(),
                     Some(surface_id),
                     ProtocolErrorCategory::InvalidState,
                 );
             } else {
                 self.note_protocol_error_metric();
             }
-            resource.post_error(
-                zwlr_layer_surface_v1::Error::InvalidSurfaceState,
-                "layer surface buffer committed before configure was acknowledged".to_string(),
-            );
             layer_shell_debug_log(|| {
                 format!("commit {debug_details} rejected=buffer-before-configure-ack")
             });
@@ -762,17 +759,17 @@ impl CompositorState {
         if let Err(message) = validate_layer_surface_size(captured.state) {
             let resource = self.layer_surfaces[&surface_id].resource.clone();
             if let Some(client) = resource.client() {
-                self.note_protocol_error_for_resource(
+                self.post_protocol_error_deferred_with_details(
                     &client,
                     &resource,
                     zwlr_layer_surface_v1::Error::InvalidSize,
+                    message,
                     Some(surface_id),
                     ProtocolErrorCategory::InvalidState,
                 );
             } else {
                 self.note_protocol_error_metric();
             }
-            resource.post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
             return None;
         }
         let mut rerun_focus = false;

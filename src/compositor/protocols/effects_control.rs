@@ -56,7 +56,9 @@ impl Dispatch<astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for Composi
             astrea_effects_manager_v1::Request::Destroy => {}
             astrea_effects_manager_v1::Request::GetSurfaceEffect { id, surface, slot } => {
                 if !state.astrea_shell_client_allowed(client, handle) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         astrea_effects_manager_v1::Error::Unauthorized,
                         "client is not an authorized Astrea shell client",
                     );
@@ -65,7 +67,9 @@ impl Dispatch<astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for Composi
                 if !surface.id().same_client_as(&resource.id())
                     || surface.data::<SurfaceData>().is_none()
                 {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         astrea_effects_manager_v1::Error::InvalidSurface,
                         "surface is not owned by this client or is not a wl_surface",
                     );
@@ -75,14 +79,18 @@ impl Dispatch<astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for Composi
                     || slot.len() > MAX_SLOT_BYTES
                     || slot.chars().any(char::is_control)
                 {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         astrea_effects_manager_v1::Error::InvalidSlot,
                         "effect slot is outside the bounded name policy",
                     );
                     return;
                 }
                 let Some(slot) = SurfaceEffectSlot::parse(&slot) else {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         astrea_effects_manager_v1::Error::InvalidSlot,
                         "surface effect slot is unsupported for v1",
                     );
@@ -90,7 +98,9 @@ impl Dispatch<astrea_effects_manager_v1::AstreaEffectsManagerV1, ()> for Composi
                 };
                 let surface_id = compositor_surface_id(&surface);
                 let Some(binding_id) = state.claim_protocol_surface_effect(surface_id, slot) else {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         astrea_effects_manager_v1::Error::EffectExists,
                         "a surface effect already occupies this surface slot",
                     );
@@ -127,6 +137,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             && !state.astrea_shell_client_allowed(client, handle)
         {
             post_surface_error(
+                state,
+                client,
                 resource,
                 astrea_surface_effect_v1::Error::Unauthorized,
                 "client is not an authorized Astrea shell client",
@@ -147,6 +159,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             astrea_surface_effect_v1::Request::SetProgram { name } => {
                 if !data.surface.is_alive() {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::SurfaceDestroyed,
                         "associated wl_surface is destroyed",
@@ -155,6 +169,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                 }
                 let Some(program) = state.effect_program_id_for_name(&name) else {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::UnknownProgram,
                         "effect name is not in the trusted registry",
@@ -169,6 +185,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     program,
                 ) {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::InvalidValue,
                         "trusted effect generation changed; set_program cannot be applied",
@@ -196,6 +214,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     )
                 {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::InvalidValue,
                         "surface is not currently renderable",
@@ -216,6 +236,7 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             } => {
                 update_parameter(
                     state,
+                    client,
                     resource,
                     data,
                     &parameter,
@@ -229,6 +250,7 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             } => {
                 update_parameter(
                     state,
+                    client,
                     resource,
                     data,
                     &parameter,
@@ -244,6 +266,7 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             } => {
                 update_parameter(
                     state,
+                    client,
                     resource,
                     data,
                     &parameter,
@@ -258,6 +281,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
             astrea_surface_effect_v1::Request::SetEnabled { enabled } => {
                 if enabled > 1 {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::InvalidValue,
                         "enabled must be zero or one",
@@ -270,6 +295,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     .expect("effect binding lock is not poisoned");
                 let Some(program) = current.program else {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::InvalidValue,
                         "set_program is required before enabling an effect",
@@ -290,6 +317,8 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
                     )
                 {
                     post_surface_error(
+                        state,
+                        client,
                         resource,
                         astrea_surface_effect_v1::Error::InvalidValue,
                         "surface is not currently renderable",
@@ -332,6 +361,7 @@ impl Dispatch<astrea_surface_effect_v1::AstreaSurfaceEffectV1, AstreaSurfaceEffe
 
 fn update_parameter(
     state: &mut CompositorState,
+    client: &Client,
     resource: &astrea_surface_effect_v1::AstreaSurfaceEffectV1,
     data: &AstreaSurfaceEffectData,
     name: &str,
@@ -344,6 +374,8 @@ fn update_parameter(
         .program
     else {
         post_surface_error(
+            state,
+            client,
             resource,
             astrea_surface_effect_v1::Error::UnknownProgram,
             "set_program is required before setting parameters",
@@ -352,6 +384,8 @@ fn update_parameter(
     };
     let Some(definition) = state.effect_parameter_definition(program, name) else {
         post_surface_error(
+            state,
+            client,
             resource,
             astrea_surface_effect_v1::Error::UnknownParameter,
             "parameter is not declared by the trusted effect",
@@ -362,6 +396,8 @@ fn update_parameter(
         || !value_in_range(definition.spec.range, value)
     {
         post_surface_error(
+            state,
+            client,
             resource,
             astrea_surface_effect_v1::Error::InvalidValue,
             "parameter type or range is invalid",
@@ -387,6 +423,8 @@ fn update_parameter(
         )
     {
         post_surface_error(
+            state,
+            client,
             resource,
             astrea_surface_effect_v1::Error::InvalidValue,
             "surface is not currently renderable",
@@ -480,11 +518,13 @@ fn fixed(value: i32) -> f32 {
 }
 
 fn post_surface_error(
+    state: &mut CompositorState,
+    client: &Client,
     resource: &astrea_surface_effect_v1::AstreaSurfaceEffectV1,
     error: astrea_surface_effect_v1::Error,
     message: &str,
 ) {
-    resource.post_error(error, message);
+    state.post_protocol_error_deferred(client, resource, error, message);
 }
 
 #[cfg(test)]

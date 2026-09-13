@@ -1,7 +1,36 @@
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+
+    fn collect_raw_fatal_emitters(path: &Path, root: &Path, emitters: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_raw_fatal_emitters(&path, root, emitters);
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let needle = format!(".{}(", "post_error");
+            if source.lines().any(|line| line.contains(&needle))
+                && path.strip_prefix(root).is_ok_and(|relative| {
+                    relative != Path::new("src/compositor/state/client_lifecycle.rs")
+                })
+            {
+                emitters.push(path);
+            }
+        }
+    }
 
     fn record(
         interface: ProtocolErrorInterface,
@@ -92,6 +121,18 @@ mod tests {
         assert_eq!(
             ProtocolErrorInterface::for_resource::<ZwpPointerConstraintsV1>(),
             ProtocolErrorInterface::PointerConstraints
+        );
+    }
+
+    #[test]
+    fn raw_fatal_protocol_emitters_are_centralized() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut emitters = Vec::new();
+        collect_raw_fatal_emitters(&root.join("src/compositor"), root, &mut emitters);
+        emitters.sort();
+        assert!(
+            emitters.is_empty(),
+            "raw Resource::post_error emitters must remain in client_lifecycle.rs: {emitters:?}"
         );
     }
 }
@@ -188,25 +229,6 @@ impl ProtocolErrorTrace {
             records.pop_front();
         }
         records.push_back(record);
-    }
-
-    pub(crate) fn record_for_resource<I: Resource>(
-        &mut self,
-        resource: &I,
-        error_code: u32,
-        category: ProtocolErrorCategory,
-    ) {
-        self.record(ProtocolErrorRecord {
-            timestamp_ns: protocol_error_timestamp_ns(),
-            client_id: resource.client().map(|client| client.id()),
-            peer_pid: None,
-            interface: ProtocolErrorInterface::for_resource::<I>(),
-            resource_id: Some(resource.id().protocol_id()),
-            error_code: Some(error_code),
-            surface_id: None,
-            xwayland_generation: None,
-            category,
-        });
     }
 
     #[cfg(test)]

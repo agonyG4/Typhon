@@ -22,7 +22,7 @@ impl GlobalDispatch<wp_commit_timing_manager_v1::WpCommitTimingManagerV1, ()> fo
 impl Dispatch<wp_commit_timing_manager_v1::WpCommitTimingManagerV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
         request: wp_commit_timing_manager_v1::Request,
         _data: &(),
@@ -34,7 +34,9 @@ impl Dispatch<wp_commit_timing_manager_v1::WpCommitTimingManagerV1, ()> for Comp
             wp_commit_timing_manager_v1::Request::GetTimer { id, surface } => {
                 let surface_id = compositor_surface_id(&surface);
                 if state.commit_timer_resources.contains_key(&surface_id) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         wp_commit_timing_manager_v1::Error::CommitTimerExists,
                         "a commit timer already exists for this surface",
                     );
@@ -81,16 +83,13 @@ impl Dispatch<wp_commit_timer_v1::WpCommitTimerV1, CommitTimerResourceData> for 
                 tv_nsec,
             } => {
                 if !data.surface.is_alive() {
-                    state.note_protocol_error_for_resource(
+                    state.post_protocol_error_deferred_with_details(
                         client,
                         resource,
                         wp_commit_timer_v1::Error::SurfaceDestroyed,
+                        "associated wl_surface was destroyed",
                         Some(data.surface_id),
                         ProtocolErrorCategory::SurfaceDestroyed,
-                    );
-                    resource.post_error(
-                        wp_commit_timer_v1::Error::SurfaceDestroyed,
-                        "associated wl_surface was destroyed",
                     );
                     return;
                 }
@@ -101,7 +100,9 @@ impl Dispatch<wp_commit_timer_v1::WpCommitTimerV1, CommitTimerResourceData> for 
                         .surface_pacing_metrics
                         .timing_protocol_errors
                         .saturating_add(1);
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         wp_commit_timer_v1::Error::InvalidTimestamp,
                         "tv_nsec must be less than one billion",
                     );
@@ -112,7 +113,9 @@ impl Dispatch<wp_commit_timer_v1::WpCommitTimerV1, CommitTimerResourceData> for 
                         .surface_pacing_metrics
                         .timing_protocol_errors
                         .saturating_add(1);
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         wp_commit_timer_v1::Error::TimestampExists,
                         "a commit timestamp is already pending",
                     );

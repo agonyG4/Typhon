@@ -53,7 +53,9 @@ impl Dispatch<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInh
                     .contains_pair(&surface, logical_seat)
                 {
                     state.shortcut_inhibition.note_duplicate();
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         zwp_keyboard_shortcuts_inhibit_manager_v1::Error::AlreadyInhibited,
                         "keyboard shortcuts are already inhibited for this surface and seat",
                     );

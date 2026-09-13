@@ -32,7 +32,7 @@ impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()
 {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1,
         request: ext_background_effect_manager_v1::Request,
         _data: &(),
@@ -47,7 +47,9 @@ impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, ()
                 }
                 let surface_id = compositor_surface_id(&surface);
                 if state.background_effect_resources.contains_key(&surface_id) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         ext_background_effect_manager_v1::Error::BackgroundEffectExists,
                         "a background effect object already exists for this surface",
                     );
@@ -87,7 +89,7 @@ impl
 {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
         request: ext_background_effect_surface_v1::Request,
         data: &BackgroundEffectResourceData,
@@ -100,20 +102,13 @@ impl
             }
             ext_background_effect_surface_v1::Request::SetBlurRegion { region } => {
                 if !data.surface.is_alive() {
-                    if let Some(client) = resource.client() {
-                        state.note_protocol_error_for_resource(
-                            &client,
-                            resource,
-                            ext_background_effect_surface_v1::Error::SurfaceDestroyed,
-                            Some(data.surface_id),
-                            ProtocolErrorCategory::SurfaceDestroyed,
-                        );
-                    } else {
-                        state.note_protocol_error_metric();
-                    }
-                    resource.post_error(
+                    state.post_protocol_error_deferred_with_details(
+                        client,
+                        resource,
                         ext_background_effect_surface_v1::Error::SurfaceDestroyed,
                         "associated wl_surface was destroyed",
+                        Some(data.surface_id),
+                        ProtocolErrorCategory::SurfaceDestroyed,
                     );
                     return;
                 }

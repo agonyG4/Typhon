@@ -17,9 +17,8 @@ use wayland_server::{
 use crate::syncobj::DrmSyncobjTimeline;
 
 use super::{
-    CoreComplianceMetrics, PendingSurfaceBuffer, ProtocolErrorCategory, ProtocolErrorInterface,
-    ProtocolErrorRecord, ProtocolErrorTrace, RenderableSurfaceDamage, SurfaceCommitId,
-    SurfaceCommitSequence, protocol_error_timestamp_ns,
+    CoreComplianceMetrics, PendingSurfaceBuffer, ProtocolErrorCategory, ProtocolErrorTrace,
+    RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, post_fatal_protocol_error,
 };
 
 pub(super) const SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS: u32 = 0;
@@ -314,14 +313,6 @@ impl SyncobjSurfaceState {
         }
     }
 
-    pub(super) fn post_error(&self, code: u32, message: &str) {
-        if let Ok(guard) = self.resource.lock()
-            && let Some(resource) = guard.as_ref()
-        {
-            resource.post_error(code, message);
-        }
-    }
-
     #[allow(clippy::mutable_key_type)] // ClientId is the compositor's authoritative owner token.
     pub(super) fn post_error_with_metrics(
         &self,
@@ -331,33 +322,24 @@ impl SyncobjSurfaceState {
         code: u32,
         message: &str,
     ) {
-        metrics.note_protocol_error();
-        let (client_id, resource_id) = self
+        let resource = self
             .resource
             .lock()
             .ok()
-            .and_then(|resource| resource.as_ref().cloned())
-            .map_or((None, None), |resource| {
-                (
-                    resource.client().map(|client| client.id()),
-                    Some(resource.id().protocol_id()),
-                )
-            });
-        if let Some(client_id) = client_id.as_ref() {
-            terminal_client_ids.insert(client_id.clone());
+            .and_then(|resource| resource.as_ref().cloned());
+        if let Some(resource) = resource {
+            let _ = post_fatal_protocol_error(
+                metrics,
+                trace,
+                terminal_client_ids,
+                &resource,
+                code,
+                message,
+                Some(self.surface_id),
+                ProtocolErrorCategory::InvalidState,
+                None,
+            );
         }
-        trace.record(ProtocolErrorRecord {
-            timestamp_ns: protocol_error_timestamp_ns(),
-            client_id,
-            peer_pid: None,
-            interface: ProtocolErrorInterface::Syncobj,
-            resource_id,
-            error_code: Some(code),
-            surface_id: Some(self.surface_id),
-            xwayland_generation: None,
-            category: ProtocolErrorCategory::InvalidState,
-        });
-        self.post_error(code, message);
     }
 
     pub(super) fn set_pending_acquire(&self, point: ExplicitSyncPoint) {

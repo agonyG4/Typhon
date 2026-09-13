@@ -30,7 +30,7 @@ impl GlobalDispatch<wp_tearing_control_manager_v1::WpTearingControlManagerV1, ()
 impl Dispatch<wp_tearing_control_manager_v1::WpTearingControlManagerV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_tearing_control_manager_v1::WpTearingControlManagerV1,
         request: wp_tearing_control_manager_v1::Request,
         _data: &(),
@@ -42,7 +42,9 @@ impl Dispatch<wp_tearing_control_manager_v1::WpTearingControlManagerV1, ()> for 
             wp_tearing_control_manager_v1::Request::GetTearingControl { id, surface } => {
                 let surface_id = compositor_surface_id(&surface);
                 if state.tearing_control_resources.contains_key(&surface_id) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         wp_tearing_control_manager_v1::Error::TearingControlExists,
                         "a tearing control object already exists for this surface",
                     );
@@ -146,7 +148,7 @@ impl GlobalDispatch<wp_content_type_manager_v1::WpContentTypeManagerV1, ()> for 
 impl Dispatch<wp_content_type_manager_v1::WpContentTypeManagerV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_content_type_manager_v1::WpContentTypeManagerV1,
         request: wp_content_type_manager_v1::Request,
         _data: &(),
@@ -158,7 +160,9 @@ impl Dispatch<wp_content_type_manager_v1::WpContentTypeManagerV1, ()> for Compos
             wp_content_type_manager_v1::Request::GetSurfaceContentType { id, surface } => {
                 let surface_id = compositor_surface_id(&surface);
                 if state.content_type_resources.contains_key(&surface_id) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         wp_content_type_manager_v1::Error::AlreadyConstructed,
                         "a content type object already exists for this surface",
                     );

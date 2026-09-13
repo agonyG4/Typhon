@@ -245,6 +245,7 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
                         state.gpu_protocol_capabilities.wl_drm_formats(),
                         &mut state.compliance_metrics,
                         &mut state.protocol_error_trace,
+                        &mut state.terminal_client_ids,
                         identity,
                     )
                 }) {
@@ -279,33 +280,43 @@ fn wl_drm_prime_buffer_data(
     allowed_formats: &[u32],
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,
+    terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     identity: BufferIdentity,
 ) -> Option<DmabufBufferData> {
     if request.width <= 0 || request.height <= 0 || request.offset0 < 0 || request.stride0 <= 0 {
-        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidName);
-        drm.post_error(
+        post_wl_drm_protocol_error(
+            metrics,
+            trace,
+            terminal_client_ids,
+            drm,
             wl_drm::Error::InvalidName,
-            "wl_drm prime buffer dimensions are invalid".to_string(),
+            "wl_drm prime buffer dimensions are invalid",
         );
         return None;
     }
 
     let drm_format = DrmFormat::from_fourcc(request.format);
     if !matches!(drm_format, DrmFormat::Argb8888 | DrmFormat::Xrgb8888) {
-        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidFormat);
-        drm.post_error(
+        post_wl_drm_protocol_error(
+            metrics,
+            trace,
+            terminal_client_ids,
+            drm,
             wl_drm::Error::InvalidFormat,
-            "unsupported wl_drm prime buffer format".to_string(),
+            "unsupported wl_drm prime buffer format",
         );
         return None;
     }
     if !feedback.supports(drm_format, DrmModifier::LINEAR)
         || !allowed_formats.contains(&request.format)
     {
-        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidFormat);
-        drm.post_error(
+        post_wl_drm_protocol_error(
+            metrics,
+            trace,
+            terminal_client_ids,
+            drm,
             wl_drm::Error::InvalidFormat,
-            "wl_drm prime buffers require a linear advertised format".to_string(),
+            "wl_drm prime buffers require a linear advertised format",
         );
         return None;
     }
@@ -313,10 +324,13 @@ fn wl_drm_prime_buffer_data(
     let minimum_stride = (request.width as u32).saturating_mul(4);
     let stride = request.stride0 as u32;
     if stride < minimum_stride || request.offset0 % 4 != 0 {
-        note_wl_drm_protocol_error(metrics, trace, drm, wl_drm::Error::InvalidName);
-        drm.post_error(
+        post_wl_drm_protocol_error(
+            metrics,
+            trace,
+            terminal_client_ids,
+            drm,
             wl_drm::Error::InvalidName,
-            "wl_drm prime buffer plane metadata is out of bounds".to_string(),
+            "wl_drm prime buffer plane metadata is out of bounds",
         );
         return None;
     }
@@ -339,14 +353,25 @@ fn wl_drm_prime_buffer_data(
     Some(DmabufBufferData { identity, handle })
 }
 
-fn note_wl_drm_protocol_error(
+fn post_wl_drm_protocol_error(
     metrics: &mut CoreComplianceMetrics,
     trace: &mut ProtocolErrorTrace,
+    terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
     resource: &wl_drm::WlDrm,
     code: wl_drm::Error,
+    message: &str,
 ) {
-    metrics.note_protocol_error();
-    trace.record_for_resource(resource, code.into(), ProtocolErrorCategory::Wire);
+    let _ = post_fatal_protocol_error(
+        metrics,
+        trace,
+        terminal_client_ids,
+        resource,
+        code,
+        message,
+        None,
+        ProtocolErrorCategory::Wire,
+        None,
+    );
 }
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
@@ -443,6 +468,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     },
                     &mut state.compliance_metrics,
                     &mut state.protocol_error_trace,
+                    &mut state.terminal_client_ids,
                 );
             }
             zwp_linux_buffer_params_v1::Request::Create {
@@ -464,6 +490,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
                     &mut state.protocol_error_trace,
+                    &mut state.terminal_client_ids,
                     identity,
                 ) else {
                     resource.failed();
@@ -497,6 +524,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
                     &mut state.protocol_error_trace,
+                    &mut state.terminal_client_ids,
                     identity,
                 ) {
                     _data_init.init(buffer_id, buffer_data);

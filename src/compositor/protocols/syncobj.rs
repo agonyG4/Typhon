@@ -130,16 +130,13 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
-                    state.note_protocol_error_for_resource(
+                    state.post_protocol_error_deferred_with_details(
                         client,
                         resource,
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
+                        "associated wl_surface was destroyed",
                         Some(data.surface_id()),
                         ProtocolErrorCategory::SurfaceDestroyed,
-                    );
-                    data.post_error(
-                        SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
-                        "associated wl_surface was destroyed",
                     );
                     return;
                 }
@@ -157,16 +154,13 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
-                    state.note_protocol_error_for_resource(
+                    state.post_protocol_error_deferred_with_details(
                         client,
                         resource,
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
+                        "associated wl_surface was destroyed",
                         Some(data.surface_id()),
                         ProtocolErrorCategory::SurfaceDestroyed,
-                    );
-                    data.post_error(
-                        SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
-                        "associated wl_surface was destroyed",
                     );
                     return;
                 }
