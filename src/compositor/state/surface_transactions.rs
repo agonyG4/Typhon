@@ -27,11 +27,46 @@ pub(in crate::compositor) struct SurfaceTreeAcquireDependency {
     pub(in crate::compositor) state: PendingAcquireState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor) struct SurfaceTreeNodeLifetime {
+    pub(in crate::compositor) surface_id: u32,
+    pub(in crate::compositor) owner_client_id: ClientId,
+    pub(in crate::compositor) surface_presentation_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::compositor) enum SurfaceTreeNodeLifetimes {
+    Captured(Vec<SurfaceTreeNodeLifetime>),
+    #[cfg(test)]
+    Synthetic,
+}
+
+impl SurfaceTreeNodeLifetimes {
+    pub(in crate::compositor) fn captured(&self) -> Option<&[SurfaceTreeNodeLifetime]> {
+        match self {
+            Self::Captured(lifetimes) => Some(lifetimes),
+            #[cfg(test)]
+            Self::Synthetic => None,
+        }
+    }
+
+    pub(in crate::compositor) fn captured_mut(
+        &mut self,
+    ) -> Option<&mut Vec<SurfaceTreeNodeLifetime>> {
+        match self {
+            Self::Captured(lifetimes) => Some(lifetimes),
+            #[cfg(test)]
+            Self::Synthetic => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::compositor) struct PendingSurfaceTreeTransaction {
     pub(in crate::compositor) id: SurfaceTreeTransactionId,
     pub(in crate::compositor) root_surface_id: u32,
     pub(in crate::compositor) nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    pub(in crate::compositor) publication_lifetimes: SurfaceTreeNodeLifetimes,
     pub(in crate::compositor) dependencies: Vec<SurfaceTreeAcquireDependency>,
     pub(in crate::compositor) commit_timing_readiness: Option<CommitTimingReadiness>,
     pub(in crate::compositor) received_at: Instant,
@@ -186,62 +221,40 @@ impl CompositorState {
         &self,
         transaction: &PendingSurfaceTreeTransaction,
     ) -> Option<(u32, SurfacePublicationDecision)> {
-        let dependency = transaction.dependencies.first()?;
-        let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
-            return Some((
-                dependency.surface_id,
-                SurfacePublicationDecision::SurfaceGone,
-            ));
+        let Some(lifetimes) = transaction.publication_lifetimes.captured() else {
+            // Synthetic transactions are used only by legacy unit tests that do not
+            // model Wayland surface resources. Production admissions always capture
+            // one lifetime record for every transaction node.
+            return None;
         };
-        if let Some(rejection) =
-            self.async_surface_lifecycle_rejection(transaction.root_surface_id, owner_client_id)
-        {
-            return Some((transaction.root_surface_id, rejection));
-        }
-        let Some(root_owner) = self.surface_client_ids.get(&transaction.root_surface_id) else {
+        if lifetimes.len() != transaction.nodes.len() {
             return Some((
                 transaction.root_surface_id,
                 SurfacePublicationDecision::SurfaceGone,
             ));
-        };
-        if root_owner != owner_client_id {
-            return Some((
-                transaction.root_surface_id,
-                SurfacePublicationDecision::OwnerGone,
-            ));
         }
-        for dependency in &transaction.dependencies {
-            let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
+        for (node_index, lifetime) in lifetimes.iter().enumerate() {
+            if transaction.nodes[node_index].0 != lifetime.surface_id {
                 return Some((
-                    dependency.surface_id,
-                    SurfacePublicationDecision::SurfaceGone,
-                ));
-            };
-            let Some(surface_presentation_generation) = dependency.surface_presentation_generation
-            else {
-                return Some((
-                    dependency.surface_id,
+                    lifetime.surface_id,
                     SurfacePublicationDecision::StaleSurfaceGeneration,
                 ));
-            };
-            if let Some(rejection) =
-                self.async_surface_lifecycle_rejection(dependency.surface_id, owner_client_id)
+            }
+            if let Some(rejection) = self
+                .async_surface_lifecycle_rejection(lifetime.surface_id, &lifetime.owner_client_id)
             {
-                return Some((dependency.surface_id, rejection));
+                return Some((lifetime.surface_id, rejection));
             }
             if self
                 .surface_presentation_generations
-                .get(&dependency.surface_id)
+                .get(&lifetime.surface_id)
                 .copied()
-                != Some(surface_presentation_generation)
+                != Some(lifetime.surface_presentation_generation)
             {
                 return Some((
-                    dependency.surface_id,
+                    lifetime.surface_id,
                     SurfacePublicationDecision::StaleSurfaceGeneration,
                 ));
-            }
-            if owner_client_id != root_owner {
-                return Some((dependency.surface_id, SurfacePublicationDecision::OwnerGone));
             }
         }
         None
@@ -335,8 +348,8 @@ impl CompositorState {
         });
         let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
-        self.apply_captured_subsurface_parent_state(surface_id, commit_context.subsurface_parent);
         let inactive_subsurface = self.subsurface_content_is_inactive(surface_id);
+        let mut parent_commit_applied = true;
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
                 pending.opaque_region = opaque_region;
@@ -345,7 +358,7 @@ impl CompositorState {
                     pending.y = y;
                 }
                 debug_assert!(pending.surface_size.is_some());
-                self.commit_surface_request_with_captured_sync(
+                parent_commit_applied = self.commit_surface_request_with_captured_sync(
                     surface_id,
                     commit_id,
                     commit_sequence,
@@ -392,6 +405,7 @@ impl CompositorState {
                     } else {
                         self.discard_presentation_feedbacks(presentation_feedbacks);
                     }
+                    parent_commit_applied = activated;
                 }
             }
             None => {
@@ -423,7 +437,14 @@ impl CompositorState {
                 } else {
                     self.discard_presentation_feedbacks(presentation_feedbacks);
                 }
+                parent_commit_applied = activated;
             }
+        }
+        if parent_commit_applied {
+            self.apply_captured_subsurface_parent_state(
+                surface_id,
+                commit_context.subsurface_parent,
+            );
         }
         self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
         if input_region_changed {

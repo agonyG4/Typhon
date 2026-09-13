@@ -143,7 +143,7 @@ impl CompositorState {
                     SurfacePublicationSource::SurfaceTree,
                     decision,
                 );
-                self.discard_surface_tree_transaction(transaction);
+                self.discard_surface_tree_transaction_with_decision(transaction, decision);
                 continue;
             }
             pacing_deadline_changed |= transaction.commit_timing_readiness.is_some();

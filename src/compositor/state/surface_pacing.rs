@@ -595,6 +595,7 @@ mod tests {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 10,
                 nodes: vec![(10, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -904,6 +905,7 @@ mod tests {
                 id: first_id,
                 root_surface_id: 1,
                 nodes: vec![(1, first)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -912,6 +914,7 @@ mod tests {
                 id: second_id,
                 root_surface_id: 2,
                 nodes: vec![(2, second)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -970,6 +973,7 @@ mod tests {
                 id: first_id,
                 root_surface_id: 4,
                 nodes: vec![(4, first)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -978,6 +982,7 @@ mod tests {
                 id: second_id,
                 root_surface_id: 4,
                 nodes: vec![(4, second)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -1250,6 +1255,7 @@ mod tests {
         let surface =
             state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
         let surface_id = crate::compositor::compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
         let requested = CommitTimingConstraint::from_protocol(
             client_pacing_now_ns() / 1_000_000_000 + 3_600,
             0,
@@ -1264,6 +1270,7 @@ mod tests {
                     id: SurfaceTreeTransactionId::new(index as u64 + 1),
                     root_surface_id: surface_id,
                     nodes: vec![(surface_id, commit)],
+                    publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                     dependencies: Vec::new(),
                     commit_timing_readiness: None,
                     received_at: Instant::now(),
@@ -1298,6 +1305,7 @@ mod tests {
         let surface =
             state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
         let surface_id = crate::compositor::compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
         for index in 0..8 {
             state
                 .pending_surface_tree_transactions
@@ -1305,6 +1313,7 @@ mod tests {
                     id: SurfaceTreeTransactionId::new(index as u64 + 1),
                     root_surface_id: surface_id,
                     nodes: vec![(surface_id, empty_cached_subsurface_commit())],
+                    publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                     dependencies: vec![SurfaceTreeAcquireDependency {
                         surface_commit_id: SurfaceCommitId::for_tests(index as u64 + 20),
                         commit_id: AcquireCommitId::for_tests(index as u64 + 30),

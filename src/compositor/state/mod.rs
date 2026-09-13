@@ -143,7 +143,7 @@ pub(in crate::compositor) use surface_transactions::{
     ActiveSurfacePresentationCommit, BufferlessSurfaceCommitState, PendingSurfaceTreeTransaction,
     ReleasedSurfaceTreeState, SurfacePublicationContext, SurfacePublicationDecision,
     SurfacePublicationSource, SurfacePublicationState, SurfaceTreeAcquireDependency,
-    SurfaceTreeMergeStats, TransactionOrdering,
+    SurfaceTreeMergeStats, SurfaceTreeNodeLifetime, SurfaceTreeNodeLifetimes, TransactionOrdering,
 };
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;

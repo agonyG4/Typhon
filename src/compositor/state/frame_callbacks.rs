@@ -57,6 +57,25 @@ impl CompositorState {
             return;
         }
 
+        self.discard_frame_callback_ids(&callback_ids);
+    }
+
+    pub(in crate::compositor) fn discard_frame_callbacks(
+        &mut self,
+        callbacks: Vec<wl_callback::WlCallback>,
+    ) {
+        let callback_ids = callbacks
+            .iter()
+            .map(|callback| callback.id())
+            .collect::<Vec<_>>();
+        self.discard_frame_callback_ids(&callback_ids);
+    }
+
+    fn discard_frame_callback_ids(&mut self, callback_ids: &[wayland_server::backend::ObjectId]) {
+        if callback_ids.is_empty() {
+            return;
+        }
+
         let visible_discarded = self
             .visible_pending_frame_callbacks
             .iter()
@@ -69,11 +88,24 @@ impl CompositorState {
         self.visible_pending_frame_callback_count = self
             .visible_pending_frame_callback_count
             .saturating_sub(visible_discarded);
-        for callback_id in &callback_ids {
+        for callback_id in callback_ids {
             self.pending_frame_callback_surfaces.remove(callback_id);
             self.pending_frame_callback_timing.remove(callback_id);
         }
         for batch in self.frame_batches.values_mut() {
+            if batch.callback_terminal_ownership_checked {
+                continue;
+            }
+            let before = batch.callbacks.len();
+            batch
+                .callbacks
+                .retain(|callback| !callback_ids.contains(&callback.id()));
+            let discarded = before.saturating_sub(batch.callbacks.len());
+            if discarded > 0 {
+                batch.callback_settlement.cancel(discarded);
+            }
+        }
+        for batch in self.retired_frame_batches.values_mut() {
             if batch.callback_terminal_ownership_checked {
                 continue;
             }

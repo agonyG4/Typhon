@@ -1686,6 +1686,27 @@ impl CompositorState {
                 .find(|dependency| dependency.commit_id == commit_id)
                 .map(|dependency| dependency.surface_commit_id)
         });
+        let tree_dependency_lifetime_is_current = self
+            .pending_surface_tree_transactions
+            .iter()
+            .flat_map(|transaction| &transaction.dependencies)
+            .find(|dependency| dependency.commit_id == commit_id)
+            .map(|dependency| {
+                let Some(owner_client_id) = dependency.owner_client_id.as_ref() else {
+                    return true;
+                };
+                self.async_surface_lifecycle_rejection(dependency.surface_id, owner_client_id)
+                    .is_none()
+                    && dependency
+                        .surface_presentation_generation
+                        .map_or(true, |generation| {
+                            self.surface_presentation_generations
+                                .get(&dependency.surface_id)
+                                .copied()
+                                == Some(generation)
+                        })
+            })
+            .unwrap_or(true);
         let ready = if self
             .pending_explicit_sync_commits
             .iter_mut()
@@ -1709,6 +1730,15 @@ impl CompositorState {
                 .is_some_and(|dependency| dependency.state.mark_ready())
         };
         if ready {
+            if !tree_dependency_lifetime_is_current {
+                client_pacing_log(
+                    "acquire_ready_stale_surface_lifetime",
+                    &[
+                        ("surface", surface_id.to_string()),
+                        ("acquire_commit_id", commit_id.get().to_string()),
+                    ],
+                );
+            }
             if let Some(surface_commit_id) = surface_commit_id {
                 self.note_explicit_commit_ready(surface_commit_id);
             }
@@ -1861,7 +1891,11 @@ impl CompositorState {
                     self.release_resize_capture(commit.surface_id, resize.commit_sequence);
                 }
                 self.release_pending_surface_buffer(commit.pending);
-                self.complete_frame_callbacks(commit.frame_callbacks);
+                if decision == SurfacePublicationDecision::TerminalClient {
+                    self.discard_frame_callbacks(commit.frame_callbacks);
+                } else {
+                    self.complete_frame_callbacks(commit.frame_callbacks);
+                }
                 self.discard_presentation_feedbacks(commit.presentation_feedbacks);
                 continue;
             }

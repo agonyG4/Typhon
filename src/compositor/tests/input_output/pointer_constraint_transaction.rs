@@ -710,6 +710,279 @@ fn destroyed_committed_constraint_releases_request_slot_before_next_surface_comm
 }
 
 #[test]
+fn committed_constraint_replacement_applies_retirement_and_installation_in_one_commit() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let lock_a = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let a_id = activate_locked_backend(&commands, &mut state, &mut queue);
+    lock_a.destroy();
+
+    let _confine_b = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let before_commit = capture_pointer_constraint_backend_requests(&commands);
+    assert!(before_commit.iter().all(|request| {
+        !matches!(
+            request,
+            PointerConstraintBackendRequest::ActivateConfined { .. }
+        )
+    }));
+
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let mut transition_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(transition_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. } if *id == a_id
+    )));
+    let mut b_id = transition_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        });
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(a_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    if b_id.is_none() {
+        transition_requests = capture_pointer_constraint_backend_requests(&commands);
+        b_id = transition_requests
+            .iter()
+            .find_map(|request| match request {
+                PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+                _ => None,
+            });
+    }
+    let b_id = b_id.expect("constraint B installation must be issued after A retirement");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(b_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let b_snapshot = capture_pointer_constraint_snapshot(&commands, b_id.constraint_id)
+        .expect("constraint B must remain current");
+    assert!(b_snapshot.committed);
+    assert!(!b_snapshot.backend_pending);
+    assert_eq!(state.confined_count, 1);
+    assert_eq!(
+        capture_pointer_constraint_snapshot(&commands, a_id.constraint_id),
+        None,
+        "constraint A must retire after its backend generation completes"
+    );
+
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(a_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(a_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let b_after_stale = capture_pointer_constraint_snapshot(&commands, b_id.constraint_id)
+        .expect("stale A completion must not remove B");
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert!(b_after_stale.committed);
+    assert!(!b_after_stale.backend_pending);
+    assert_eq!(state.confined_count, 1);
+    assert!(connection.protocol_error().is_none());
+}
+
+#[test]
+fn destroyed_replacement_before_commit_skips_but_installs_c() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let lock_a = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let a_id = activate_locked_backend(&commands, &mut state, &mut queue);
+    lock_a.destroy();
+
+    let confine_b = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    confine_b.destroy();
+    let _lock_c = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let transition_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(transition_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. } if *id == a_id
+    )));
+    assert!(transition_requests.iter().all(|request| {
+        !matches!(
+            request,
+            PointerConstraintBackendRequest::ActivateConfined { .. }
+        )
+    }));
+    let c_id = transition_requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked { id } => Some(*id),
+            _ => None,
+        });
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(a_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let c_id = c_id
+        .or_else(|| {
+            capture_pointer_constraint_backend_requests(&commands)
+                .into_iter()
+                .find_map(|request| match request {
+                    PointerConstraintBackendRequest::ActivateLocked { id } => Some(id),
+                    _ => None,
+                })
+        })
+        .expect("constraint C installation must be issued");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(c_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let c_snapshot = capture_pointer_constraint_snapshot(&commands, c_id.constraint_id)
+        .expect("constraint C must remain current");
+    let ids = capture_pointer_constraint_ids(&commands);
+    let b_id = ids
+        .iter()
+        .copied()
+        .find(|id| *id != a_id.constraint_id && *id != c_id.constraint_id)
+        .expect("constraint B must have been registered before it was destroyed");
+    let b_snapshot = capture_pointer_constraint_snapshot(&commands, b_id)
+        .expect("destroyed B remains inspectable until lifecycle cleanup");
+    let a_snapshot = capture_pointer_constraint_snapshot(&commands, a_id.constraint_id);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert!(c_snapshot.committed);
+    assert!(
+        !b_snapshot.committed,
+        "destroyed B must never become effective"
+    );
+    assert!(a_snapshot.is_none(), "A must be retired after deactivation");
+    assert!(connection.protocol_error().is_none());
+}
+
+#[test]
 fn destroyed_committed_confined_constraint_releases_request_slot_for_lock() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {

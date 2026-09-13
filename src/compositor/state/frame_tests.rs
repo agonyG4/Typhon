@@ -6,17 +6,9 @@ mod frame_consumption_tests {
     use std::num::NonZeroU64;
     use std::os::unix::net::UnixStream;
 
-    use super::*;
+    use wayland_server::protocol::wl_callback;
 
-    fn test_client_id() -> ClientId {
-        let (stream, _peer) = UnixStream::pair().expect("test client socket");
-        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
-        display
-            .handle()
-            .insert_client(stream, Arc::new(()))
-            .expect("test client")
-            .id()
-    }
+    use super::*;
 
     #[test]
     fn empty_submitted_frame_batch_is_still_owned_until_completion() {
@@ -51,6 +43,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 7,
                 nodes: vec![(7, first)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -59,6 +52,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(2),
                 root_surface_id: 7,
                 nodes: vec![(7, second)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -91,6 +85,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(3),
                 root_surface_id: 8,
                 nodes: vec![(8, timed)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -99,6 +94,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(4),
                 root_surface_id: 8,
                 nodes: vec![(8, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -120,6 +116,7 @@ mod frame_consumption_tests {
                 id: first_id,
                 root_surface_id: 9,
                 nodes: vec![(9, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: vec![SurfaceTreeAcquireDependency {
                     surface_commit_id: SurfaceCommitId::for_tests(7),
                     commit_id: AcquireCommitId::for_tests(8),
@@ -137,6 +134,7 @@ mod frame_consumption_tests {
                 id: second_id,
                 root_surface_id: 9,
                 nodes: vec![(9, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -165,6 +163,7 @@ mod frame_consumption_tests {
                 id: blocked_id,
                 root_surface_id: 10,
                 nodes: vec![(10, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: vec![SurfaceTreeAcquireDependency {
                     surface_commit_id: SurfaceCommitId::for_tests(9),
                     commit_id: AcquireCommitId::for_tests(10),
@@ -182,6 +181,7 @@ mod frame_consumption_tests {
                 id: ready_id,
                 root_surface_id: 11,
                 nodes: vec![(11, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -208,21 +208,41 @@ mod frame_consumption_tests {
                 crate::compositor::surface_pipeline_trace::SurfacePipelineTrace::new(true, 16),
             ..Default::default()
         };
-        let client_id = test_client_id();
-        state.mark_client_terminal(client_id.clone());
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
+        state.mark_client_terminal(client.id());
         let mut node = empty_cached_subsurface_commit();
         node.commit_sequence = SurfaceCommitSequence(1);
+        let callback = client
+            .create_resource::<wl_callback::WlCallback, (), CompositorState>(&display_handle, 1, ())
+            .expect("frame callback resource");
+        node.frame_callbacks.push(callback.clone());
         state
             .pending_surface_tree_transactions
             .push(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(101),
-                root_surface_id: 150,
-                nodes: vec![(150, node)],
+                root_surface_id: surface_id,
+                nodes: vec![(surface_id, node)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Captured(vec![
+                    SurfaceTreeNodeLifetime {
+                        surface_id,
+                        owner_client_id: client.id(),
+                        surface_presentation_generation: 1,
+                    },
+                ]),
                 dependencies: vec![SurfaceTreeAcquireDependency {
                     surface_commit_id: SurfaceCommitId::for_tests(102),
                     commit_id: AcquireCommitId::for_tests(103),
-                    surface_id: 150,
-                    owner_client_id: Some(client_id),
+                    surface_id,
+                    owner_client_id: Some(client.id()),
                     surface_presentation_generation: Some(1),
                     buffer_id: 308,
                     acquire: ExplicitSyncPoint::for_tests_with_signal_script(104, 105, [true]),
@@ -235,8 +255,9 @@ mod frame_consumption_tests {
         state.commit_ready_surface_tree_transactions();
 
         assert!(state.pending_surface_tree_transactions.is_empty());
-        assert!(state.renderable_surface(150).is_none());
+        assert!(state.renderable_surface(surface_id).is_none());
         assert!(state.pending_acquire_watch_changes.is_empty());
+        assert!(callback.is_alive());
         let records = state.surface_pipeline_trace.records().collect::<Vec<_>>();
         assert!(records.iter().any(|record| {
             record.kind == SurfacePipelineEvent::AcquireReadyDiscarded
@@ -251,6 +272,206 @@ mod frame_consumption_tests {
                 .iter()
                 .any(|record| record.kind == SurfacePipelineEvent::TransactionPromoted)
         );
+    }
+
+    #[test]
+    fn commit_timing_only_surface_tree_is_rejected_after_terminal_owner_before_release() {
+        let mut state = CompositorState::default();
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
+        let owner_client_id = client.id();
+        let now = client_pacing_now_ns();
+        let future = CommitTimingConstraint::from_protocol(now / 1_000_000_000 + 3_600, 0)
+            .expect("future timing");
+        let due =
+            CommitTimingConstraint::from_protocol(now / 1_000_000_000 - 1, 0).expect("past timing");
+        let mut commit = empty_cached_subsurface_commit();
+        commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        commit.pacing.commit_timing = Some(future);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(200),
+                root_surface_id: surface_id,
+                nodes: vec![(surface_id, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Captured(vec![
+                    SurfaceTreeNodeLifetime {
+                        surface_id,
+                        owner_client_id: owner_client_id.clone(),
+                        surface_presentation_generation: 1,
+                    },
+                ]),
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+
+        assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        state.mark_client_terminal(owner_client_id);
+        state.commit_ready_surface_tree_transactions();
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+
+        state.pending_surface_tree_transactions[0].nodes[0]
+            .1
+            .pacing
+            .commit_timing = Some(due);
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert!(state.renderable_surface(surface_id).is_none());
+        assert!(state.surface_publications.get(&surface_id).is_none());
+    }
+
+    #[test]
+    fn fifo_only_surface_tree_is_rejected_after_terminal_owner_before_barrier_release() {
+        let mut state = CompositorState::default();
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_id = compositor_surface_id(&surface);
+        state.surface_presentation_generations.insert(surface_id, 1);
+        let owner_client_id = client.id();
+        state.active_fifo_barriers.insert(
+            surface_id,
+            ActiveFifoBarrier {
+                surface_generation: 1,
+                fifo_barrier_generation: FifoBarrierGeneration::new(1),
+                commit_sequence: SurfaceCommitSequence(1),
+                fallback_deadline_ns: client_pacing_now_ns().saturating_add(3_600_000_000_000),
+            },
+        );
+        let mut commit = empty_cached_subsurface_commit();
+        commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        commit.pacing.fifo_wait_barrier = true;
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(201),
+                root_surface_id: surface_id,
+                nodes: vec![(surface_id, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Captured(vec![
+                    SurfaceTreeNodeLifetime {
+                        surface_id,
+                        owner_client_id: owner_client_id.clone(),
+                        surface_presentation_generation: 1,
+                    },
+                ]),
+                dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+
+        assert!(
+            state.pending_surface_tree_transactions[0]
+                .dependencies
+                .is_empty()
+        );
+        assert!(!state.transaction_is_ready(&state.pending_surface_tree_transactions[0]));
+        state.mark_client_terminal(owner_client_id);
+        state.commit_ready_surface_tree_transactions();
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+
+        state.active_fifo_barriers.remove(&surface_id);
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert!(state.renderable_surface(surface_id).is_none());
+        assert!(state.surface_publications.get(&surface_id).is_none());
+    }
+
+    #[test]
+    fn mixed_surface_tree_lifetimes_reject_unrelated_stale_node_when_acquire_is_ready() {
+        let mut state = CompositorState::default();
+        let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+        let mut display_handle = display.handle();
+        let (server_end, _peer) = UnixStream::pair().expect("test client socket");
+        let client = display_handle
+            .insert_client(server_end, Arc::new(()))
+            .expect("test client");
+        let surface_a =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_b =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let surface_a_id = compositor_surface_id(&surface_a);
+        let surface_b_id = compositor_surface_id(&surface_b);
+        state
+            .surface_presentation_generations
+            .insert(surface_a_id, 1);
+        state
+            .surface_presentation_generations
+            .insert(surface_b_id, 1);
+        let owner_client_id = client.id();
+        let mut commit_a = empty_cached_subsurface_commit();
+        commit_a.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        let mut commit_b = empty_cached_subsurface_commit();
+        commit_b.attachment = Some(PendingSurfaceAttachment::RemoveContent);
+        let acquire = ExplicitSyncPoint::for_tests_with_signal_script(202, 203, [true]);
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(202),
+                root_surface_id: surface_a_id,
+                nodes: vec![(surface_a_id, commit_a), (surface_b_id, commit_b)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Captured(vec![
+                    SurfaceTreeNodeLifetime {
+                        surface_id: surface_a_id,
+                        owner_client_id: owner_client_id.clone(),
+                        surface_presentation_generation: 1,
+                    },
+                    SurfaceTreeNodeLifetime {
+                        surface_id: surface_b_id,
+                        owner_client_id: owner_client_id.clone(),
+                        surface_presentation_generation: 1,
+                    },
+                ]),
+                dependencies: vec![SurfaceTreeAcquireDependency {
+                    surface_commit_id: SurfaceCommitId::for_tests(204),
+                    commit_id: AcquireCommitId::for_tests(205),
+                    surface_id: surface_a_id,
+                    owner_client_id: Some(owner_client_id),
+                    surface_presentation_generation: Some(1),
+                    buffer_id: 206,
+                    acquire,
+                    state: PendingAcquireState::EventfdBacked,
+                }],
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        state
+            .surface_presentation_generations
+            .insert(surface_b_id, 2);
+
+        assert_eq!(
+            state.pending_surface_tree_transactions[0]
+                .dependencies
+                .len(),
+            1
+        );
+        assert!(state.mark_acquire_commit_ready(
+            AcquireCommitId::for_tests(205),
+            surface_a_id,
+            &acquire
+        ));
+        state.commit_ready_surface_tree_transactions();
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert!(state.renderable_surface(surface_a_id).is_none());
+        assert!(state.renderable_surface(surface_b_id).is_none());
+        assert!(state.surface_publications.get(&surface_a_id).is_none());
+        assert!(state.surface_publications.get(&surface_b_id).is_none());
     }
 
     #[test]
@@ -352,6 +573,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 8,
                 nodes: vec![(8, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -378,6 +600,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(11),
                 root_surface_id: 12,
                 nodes: vec![(12, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -398,6 +621,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(17),
                 root_surface_id: 18,
                 nodes: vec![(18, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -418,6 +642,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(20),
                 root_surface_id: 21,
                 nodes: vec![(21, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: vec![SurfaceTreeAcquireDependency {
                     surface_commit_id: SurfaceCommitId::for_tests(22),
                     commit_id: AcquireCommitId::for_tests(23),
@@ -463,6 +688,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(26),
                 root_surface_id: 27,
                 nodes: vec![(27, first)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -479,6 +705,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(28),
                 root_surface_id: 29,
                 nodes: vec![(29, second)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
@@ -503,6 +730,7 @@ mod frame_consumption_tests {
                 id: SurfaceTreeTransactionId::new(14),
                 root_surface_id: 15,
                 nodes: vec![(15, empty_cached_subsurface_commit())],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: vec![SurfaceTreeAcquireDependency {
                     surface_commit_id: SurfaceCommitId::for_tests(16),
                     commit_id,
