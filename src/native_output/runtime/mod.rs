@@ -499,6 +499,7 @@ pub(crate) struct NativeRuntime {
     acquire_watches: ExplicitSyncWatchRegistry,
     parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
+    dmem_foreground: oblivion_one::native::dmem_foreground::DmemForeground,
     dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry,
     control_server: NativeControlServer,
     started_at: Instant,
@@ -722,6 +723,7 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        self.dmem_foreground.shutdown();
         self.slow_cycle_trace.dump();
         let _ = self
             .dmabuf_gpu_release_registry

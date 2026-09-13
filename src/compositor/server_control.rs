@@ -139,6 +139,20 @@ impl OwnCompositorServer {
             .focused_window_id
             .and_then(|id| self.control_window_snapshot(id))
     }
+
+    /// Returns the focused normal desktop application's in-memory identity.
+    ///
+    /// This deliberately exposes no cgroup or filesystem details. Native
+    /// runtime code submits the identity to its asynchronous dmem worker.
+    pub fn dmem_foreground_target(&self) -> Option<(WindowId, u32)> {
+        let window_id = self.state.focused_window_id?;
+        let window = self.state.window(window_id)?;
+        if !window.is_workspace_managed() {
+            return None;
+        }
+        let pid = window.metadata.pid.filter(|pid| *pid != 0)?;
+        Some((window_id, pid))
+    }
 }
 
 fn control_workspace_label(management: Option<WindowManagementState>) -> Option<String> {

@@ -916,6 +916,7 @@ impl NativeRuntime {
                 let output_available = !self.scanout_destroyed;
                 let session_severity = self.session.doctor_severity();
                 let direct_state = self.direct_scanout_state();
+                let dmem_snapshot = self.dmem_foreground.snapshot();
                 let checks = vec![
                     doctor_check(
                         "control.endpoint",
@@ -990,6 +991,12 @@ impl NativeRuntime {
                             _ => DoctorSeverity::Ok,
                         },
                         format!("XWayland {}", self.xwayland.state_kind().as_str()),
+                    ),
+                    doctor_check_with_detail(
+                        "dmem_foreground.state",
+                        dmem_snapshot.doctor_severity(),
+                        format!("dmem foreground policy={}", dmem_snapshot.policy.as_str()),
+                        dmem_snapshot.detail(),
                     ),
                     doctor_check(
                         "shutdown.state",
@@ -2753,6 +2760,20 @@ fn doctor_check(id: &str, severity: DoctorSeverity, summary: impl Into<String>) 
         severity,
         summary: summary.into(),
         detail: None,
+    }
+}
+
+fn doctor_check_with_detail(
+    id: &str,
+    severity: DoctorSeverity,
+    summary: impl Into<String>,
+    detail: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        id: id.to_string(),
+        severity,
+        summary: summary.into(),
+        detail: Some(detail.into()),
     }
 }
 

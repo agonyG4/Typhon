@@ -282,6 +282,7 @@ impl NativeRuntime {
                 self.service_cursor_io_completions(&cycle.wakeup)?;
             }
             self.service_keyboard_persistence_completions(&cycle.wakeup)?;
+            self.reconcile_dmem_foreground();
             self.arm_suspended_deadline()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
@@ -452,6 +453,7 @@ impl NativeRuntime {
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
         }
+        self.reconcile_dmem_foreground();
         if !self.shutdown.is_running() || !self.session.permits_output() {
             if !self.shutdown.is_running() {
                 self.quiesce_control_server()?;
@@ -980,7 +982,24 @@ impl NativeRuntime {
         }
         Ok(())
     }
+
+    fn reconcile_dmem_foreground(&mut self) {
+        let target = self
+            .session
+            .permits_output()
+            .then(|| self.server.dmem_foreground_target())
+            .flatten()
+            .map(
+                |(window_id, pid)| oblivion_one::native::dmem_foreground::ForegroundTarget {
+                    window_id,
+                    pid,
+                },
+            );
+        self.dmem_foreground.submit(target);
+    }
+
     fn suspend_native_session(&mut self, seat: &NativeSeatSession) -> NativeResult<()> {
+        self.dmem_foreground.submit(None);
         self.log_session_transition("active", "suspending", "seat_disable");
         self.perf.log("native.session_suspend", || {
             vec![
@@ -1016,6 +1035,7 @@ impl NativeRuntime {
 
     fn finish_native_session_recovery(&mut self) {
         self.session.finish_resume();
+        self.reconcile_dmem_foreground();
         self.log_session_transition("resuming", "active", "output_recovered");
     }
 

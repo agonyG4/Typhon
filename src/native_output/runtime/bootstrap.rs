@@ -12,6 +12,7 @@ use oblivion_one::cursor_theme::{CompositorCursorImage, install_shared_composito
 use oblivion_one::keyboard_persistence::{
     KeyboardConfigurationStore, KeyboardPersistenceError, KeyboardPersistenceWorker,
 };
+use oblivion_one::native::dmem_foreground::{DmemForeground, DmemForegroundPolicy, DmemPaths};
 use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
 use std::{
     fs::OpenOptions,
@@ -414,6 +415,12 @@ impl NativeRuntime {
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
         let control_server = create_native_control_server(&mut event_loop, &server)?;
+        let dmem_foreground = DmemForeground::start(
+            DmemForegroundPolicy::from_env(),
+            DmemPaths::production(),
+            unsafe { libc::geteuid() },
+            std::process::id(),
+        );
         let cursor_io_worker = cursor_manager.start_io_worker()?;
         let cursor_io_worker_reactor_token = Some(event_loop.register(
             cursor_io_worker.event_fd(),
@@ -665,6 +672,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: Vec::new(),
             event_loop,
+            dmem_foreground,
             dmabuf_gpu_release_registry: DmabufGpuReleaseRegistry::default(),
             control_server,
             started_at: Instant::now(),

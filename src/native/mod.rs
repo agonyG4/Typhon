@@ -3,6 +3,7 @@
 pub mod adaptive_buffering;
 pub mod buffering;
 pub mod control;
+pub mod dmem_foreground;
 pub mod drm;
 pub mod event_loop;
 #[doc(hidden)]
