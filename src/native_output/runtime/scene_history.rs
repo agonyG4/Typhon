@@ -328,12 +328,7 @@ mod tests {
                 root_surface_id: 7,
                 transition_id: LifecycleTransitionId::new(1),
                 visual_group: LifecycleVisualGroup::from_bounds(
-                    source,
-                    source,
-                    source,
-                    anchor,
-                    1920,
-                    1080,
+                    source, source, source, anchor, 1920, 1080,
                 )
                 .expect("valid visual group"),
                 progress,
@@ -381,22 +376,15 @@ mod tests {
 
     #[test]
     fn lifecycle_damage_repairs_ssd_titlebar_above_client() {
-        let client = oblivion_one::compositor::PresentationRect::new(
-            400.0, 100.0, 800.0, 600.0,
-        )
-        .expect("valid client rectangle");
-        let ssd_outer = oblivion_one::compositor::PresentationRect::new(
-            384.0, 60.0, 832.0, 640.0,
-        )
-        .expect("valid SSD rectangle");
-        let anchor = oblivion_one::compositor::PresentationRect::new(
-            1200.0, 900.0, 64.0, 64.0,
-        )
-        .expect("valid anchor rectangle");
-        let group = LifecycleVisualGroup::from_bounds(
-            client, ssd_outer, client, anchor, 1920, 1080,
-        )
-        .expect("valid visual group");
+        let client = oblivion_one::compositor::PresentationRect::new(400.0, 100.0, 800.0, 600.0)
+            .expect("valid client rectangle");
+        let ssd_outer = oblivion_one::compositor::PresentationRect::new(384.0, 60.0, 832.0, 640.0)
+            .expect("valid SSD rectangle");
+        let anchor = oblivion_one::compositor::PresentationRect::new(1200.0, 900.0, 64.0, 64.0)
+            .expect("valid anchor rectangle");
+        let group =
+            LifecycleVisualGroup::from_bounds(client, ssd_outer, client, anchor, 1920, 1080)
+                .expect("valid visual group");
         let snapshot = LifecycleFrameSnapshot::from_sample(&LifecycleSceneSample {
             sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(1),
             lamps: vec![LampWindowSample {

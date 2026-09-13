@@ -623,8 +623,8 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
         root_surface_id: u32,
-        source_rect: Option<PresentationRect>,
-        full_window_rect: Option<PresentationRect>,
+        presented_source_client_rect: Option<PresentationRect>,
+        canonical_client_rect: Option<PresentationRect>,
         visual_group: Option<LifecycleVisualGroup>,
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
@@ -636,8 +636,8 @@ impl CompositorState {
             self.lifecycle_decorations.remove(&root_surface_id);
             return;
         }
-        let Some(source_rect) =
-            source_rect.or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))
+        let Some(presented_source_client_rect) = presented_source_client_rect
+            .or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))
         else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
@@ -645,8 +645,8 @@ impl CompositorState {
             self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
-        let Some(full_window_rect) =
-            full_window_rect.or_else(|| self.lifecycle_window_rect(root_surface_id))
+        let Some(canonical_client_rect) =
+            canonical_client_rect.or_else(|| self.lifecycle_window_rect(root_surface_id))
         else {
             self.window_lifecycle_animator.cancel(window_id);
             self.lifecycle_render_suppressed_roots
@@ -663,9 +663,9 @@ impl CompositorState {
         };
         let visual_group = visual_group.or_else(|| {
             LifecycleVisualGroup::from_bounds(
-                full_window_rect,
-                full_window_rect,
-                source_rect,
+                canonical_client_rect,
+                canonical_client_rect,
+                presented_source_client_rect,
                 anchor_rect,
                 self.output_size.width,
                 self.output_size.height,

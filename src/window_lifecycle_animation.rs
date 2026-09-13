@@ -106,16 +106,10 @@ impl LifecycleVisualGroup {
             output_width,
             output_height,
         );
-        let shape_factor = lamp_shape_factor(
-            presented_source_visual_rect,
-            anchor_rect,
-            lamp_direction,
-        );
-        let bump_distance = lamp_bump_distance(
-            presented_source_visual_rect,
-            anchor_rect,
-            lamp_direction,
-        );
+        let shape_factor =
+            lamp_shape_factor(presented_source_visual_rect, anchor_rect, lamp_direction);
+        let bump_distance =
+            lamp_bump_distance(presented_source_visual_rect, anchor_rect, lamp_direction);
         Some(Self {
             canonical_client_rect,
             canonical_visual_rect,
@@ -330,9 +324,7 @@ impl LifecycleRenderFallbacks {
 /// Returns the finite conservative region that can be affected by a Lamp
 /// representation. All three lifecycle rectangles participate because the
 /// warp can cover any of them over the transition.
-pub fn lamp_footprint(
-    visual_group: LifecycleVisualGroup,
-) -> Option<PresentationRect> {
+pub fn lamp_footprint(visual_group: LifecycleVisualGroup) -> Option<PresentationRect> {
     if !valid_visual_group(visual_group) {
         return None;
     }
@@ -348,12 +340,12 @@ pub fn lamp_footprint(
         .min(visual_group.anchor_rect.y());
     let right = (visual_group.presented_source_visual_rect.x()
         + visual_group.presented_source_visual_rect.width())
-        .max(visual_group.canonical_visual_rect.x() + visual_group.canonical_visual_rect.width())
-        .max(visual_group.anchor_rect.x() + visual_group.anchor_rect.width());
+    .max(visual_group.canonical_visual_rect.x() + visual_group.canonical_visual_rect.width())
+    .max(visual_group.anchor_rect.x() + visual_group.anchor_rect.width());
     let bottom = (visual_group.presented_source_visual_rect.y()
         + visual_group.presented_source_visual_rect.height())
-        .max(visual_group.canonical_visual_rect.y() + visual_group.canonical_visual_rect.height())
-        .max(visual_group.anchor_rect.y() + visual_group.anchor_rect.height());
+    .max(visual_group.canonical_visual_rect.y() + visual_group.canonical_visual_rect.height())
+    .max(visual_group.anchor_rect.y() + visual_group.anchor_rect.height());
     let bump = visual_group.bump_distance.max(0.0);
     let (axis_start, axis_end) = axis_bounds(
         visual_group.presented_source_visual_rect,
@@ -407,12 +399,24 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             lamp.visual_group.canonical_visual_rect.height().to_bits(),
             lamp.visual_group.presented_source_client_rect.x().to_bits(),
             lamp.visual_group.presented_source_client_rect.y().to_bits(),
-            lamp.visual_group.presented_source_client_rect.width().to_bits(),
-            lamp.visual_group.presented_source_client_rect.height().to_bits(),
+            lamp.visual_group
+                .presented_source_client_rect
+                .width()
+                .to_bits(),
+            lamp.visual_group
+                .presented_source_client_rect
+                .height()
+                .to_bits(),
             lamp.visual_group.presented_source_visual_rect.x().to_bits(),
             lamp.visual_group.presented_source_visual_rect.y().to_bits(),
-            lamp.visual_group.presented_source_visual_rect.width().to_bits(),
-            lamp.visual_group.presented_source_visual_rect.height().to_bits(),
+            lamp.visual_group
+                .presented_source_visual_rect
+                .width()
+                .to_bits(),
+            lamp.visual_group
+                .presented_source_visual_rect
+                .height()
+                .to_bits(),
             lamp.visual_group.anchor_rect.x().to_bits(),
             lamp.visual_group.anchor_rect.y().to_bits(),
             lamp.visual_group.anchor_rect.width().to_bits(),
@@ -868,12 +872,8 @@ fn fallback_lamp_direction(
 
 fn axis_bounds(rect: PresentationRect, direction: LampDirection) -> (f64, f64) {
     match direction {
-        LampDirection::Top | LampDirection::Bottom => {
-            (rect.y(), rect.y() + rect.height())
-        }
-        LampDirection::Left | LampDirection::Right => {
-            (rect.x(), rect.x() + rect.width())
-        }
+        LampDirection::Top | LampDirection::Bottom => (rect.y(), rect.y() + rect.height()),
+        LampDirection::Left | LampDirection::Right => (rect.x(), rect.x() + rect.width()),
     }
 }
 
@@ -899,7 +899,10 @@ fn lamp_shape_factor(
     let closeness = 1.0 / (1.0 + gap / extent);
     (ASTREA_LAMP_INITIAL_SHAPE_FACTOR
         + (ASTREA_LAMP_MAX_SHAPE_FACTOR - ASTREA_LAMP_INITIAL_SHAPE_FACTOR) * closeness)
-        .clamp(ASTREA_LAMP_INITIAL_SHAPE_FACTOR, ASTREA_LAMP_MAX_SHAPE_FACTOR)
+        .clamp(
+            ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
+            ASTREA_LAMP_MAX_SHAPE_FACTOR,
+        )
 }
 
 fn lamp_bump_distance(
@@ -958,7 +961,10 @@ fn stage_fractions(shape_factor: f64, bump_distance: f64) -> (f64, f64, f64) {
     };
     let stretch_weight = (ASTREA_LAMP_STRETCH_WEIGHT
         * if shape_factor.is_finite() {
-            shape_factor.clamp(ASTREA_LAMP_INITIAL_SHAPE_FACTOR, ASTREA_LAMP_MAX_SHAPE_FACTOR)
+            shape_factor.clamp(
+                ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
+                ASTREA_LAMP_MAX_SHAPE_FACTOR,
+            )
         } else {
             ASTREA_LAMP_INITIAL_SHAPE_FACTOR
         })
@@ -1041,8 +1047,7 @@ pub fn lamp_warp_point_directional(
         LampDirection::Top | LampDirection::Bottom => u,
         LampDirection::Left | LampDirection::Right => v,
     };
-    let (bump_fraction, stretch_fraction, _) =
-        stage_fractions(shape_factor, bump_distance);
+    let (bump_fraction, stretch_fraction, _) = stage_fractions(shape_factor, bump_distance);
     let base_motion = (bump_fraction * channels.bump_progress
         + stretch_fraction * channels.stretch_progress)
         .clamp(0.0, 1.0);
@@ -1061,7 +1066,10 @@ pub fn lamp_warp_point_directional(
     let target_cross = cross_position(anchor, direction, cross_normalized);
     let source_cross_center = cross_position(source, direction, 0.5);
     let shape_factor = if shape_factor.is_finite() {
-        shape_factor.clamp(ASTREA_LAMP_INITIAL_SHAPE_FACTOR, ASTREA_LAMP_MAX_SHAPE_FACTOR)
+        shape_factor.clamp(
+            ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
+            ASTREA_LAMP_MAX_SHAPE_FACTOR,
+        )
     } else {
         ASTREA_LAMP_INITIAL_SHAPE_FACTOR
     };
@@ -1071,13 +1079,12 @@ pub fn lamp_warp_point_directional(
             * (ASTREA_LAMP_NECK_BASE + ASTREA_LAMP_NECK_RANGE * movement_normalized))
         .clamp(0.05, 1.0);
     let neck_candidate = source_cross_center + (source_cross - source_cross_center) * neck_scale;
-    let stretched_cross = if (target_cross - neck_candidate).abs()
-        <= (target_cross - source_cross).abs()
-    {
-        neck_candidate
-    } else {
-        source_cross
-    };
+    let stretched_cross =
+        if (target_cross - neck_candidate).abs() <= (target_cross - source_cross).abs() {
+            neck_candidate
+        } else {
+            source_cross
+        };
     let cross_motion = (biased_motion + channels.squash_progress).clamp(0.0, 1.0);
     let cross = stretched_cross + (target_cross - stretched_cross) * cross_motion;
 
@@ -1105,7 +1112,10 @@ pub fn lamp_warp_point(
     if progress >= 1.0 {
         let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
         let v = ((point[1] - source.y()) / source.height()).clamp(0.0, 1.0);
-        return [anchor.x() + u * anchor.width(), anchor.y() + v * anchor.height()];
+        return [
+            anchor.x() + u * anchor.width(),
+            anchor.y() + v * anchor.height(),
+        ];
     }
     let direction = infer_lamp_direction(source, anchor, 1920, 1080);
     let shape_factor = lamp_shape_factor(source, anchor, direction);
@@ -1251,15 +1261,9 @@ mod tests {
         let ssd_outer = rect(384.0, 60.0, 832.0, 640.0);
         let anchor = rect(900.0, 900.0, 64.0, 64.0);
 
-        let visual = LifecycleVisualGroup::from_bounds(
-            client,
-            ssd_outer,
-            client,
-            anchor,
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
+        let visual =
+            LifecycleVisualGroup::from_bounds(client, ssd_outer, client, anchor, 1920, 1080)
+                .expect("valid visual group");
         let footprint = lamp_footprint(visual).expect("valid footprint");
 
         assert!(footprint.y() <= ssd_outer.y());
@@ -1319,12 +1323,7 @@ mod tests {
         let mut animator = WindowLifecycleAnimator::new(true);
         let first = animator
             .start_or_reverse(
-                request_with_group(
-                    window,
-                    18,
-                    first_group,
-                    LifecycleDirection::Minimize,
-                ),
+                request_with_group(window, 18, first_group, LifecycleDirection::Minimize),
                 AnimationTime::from_nanos(0),
                 1.0,
             )
@@ -1380,11 +1379,7 @@ mod tests {
                 1.0,
             )
             .expect("minimize starts");
-        assert!(animator.snap_to_endpoint(
-            window,
-            first,
-            AnimationTime::from_nanos(280_000_000),
-        ));
+        assert!(animator.snap_to_endpoint(window, first, AnimationTime::from_nanos(280_000_000),));
         assert!(animator.acknowledge(window, first, true));
         animator
             .start_or_reverse(
@@ -1426,15 +1421,9 @@ mod tests {
     fn lifecycle_footprint_includes_overlap_bump_excursion() {
         let source = rect(400.0, 800.0, 800.0, 200.0);
         let anchor = rect(900.0, 900.0, 64.0, 64.0);
-        let visual_group = LifecycleVisualGroup::from_bounds(
-            source,
-            source,
-            source,
-            anchor,
-            1920,
-            1080,
-        )
-        .expect("valid visual group");
+        let visual_group =
+            LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                .expect("valid visual group");
         assert!(visual_group.bump_distance > 0.0);
         let footprint = lamp_footprint(visual_group).expect("valid footprint");
         assert!(footprint.y() < source.y());
@@ -1444,25 +1433,33 @@ mod tests {
     #[test]
     fn lifecycle_footprint_intersection_is_finite_at_every_output_edge() {
         let cases = [
-            (rect(-90.0, 100.0, 120.0, 120.0), rect(-30.0, 110.0, 20.0, 20.0)),
-            (rect(1870.0, 100.0, 120.0, 120.0), rect(1900.0, 110.0, 20.0, 20.0)),
-            (rect(100.0, -90.0, 120.0, 120.0), rect(110.0, -30.0, 20.0, 20.0)),
-            (rect(100.0, 1070.0, 120.0, 120.0), rect(110.0, 1090.0, 20.0, 20.0)),
+            (
+                rect(-90.0, 100.0, 120.0, 120.0),
+                rect(-30.0, 110.0, 20.0, 20.0),
+            ),
+            (
+                rect(1870.0, 100.0, 120.0, 120.0),
+                rect(1900.0, 110.0, 20.0, 20.0),
+            ),
+            (
+                rect(100.0, -90.0, 120.0, 120.0),
+                rect(110.0, -30.0, 20.0, 20.0),
+            ),
+            (
+                rect(100.0, 1070.0, 120.0, 120.0),
+                rect(110.0, 1090.0, 20.0, 20.0),
+            ),
         ];
         for (source, anchor) in cases {
-            let visual_group = LifecycleVisualGroup::from_bounds(
-                source,
-                source,
-                source,
-                anchor,
-                1920,
-                1080,
-            )
-            .expect("valid visual group");
-            assert!(lamp_footprint(visual_group)
-                .expect("finite footprint")
-                .x()
-                .is_finite());
+            let visual_group =
+                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                    .expect("valid visual group");
+            assert!(
+                lamp_footprint(visual_group)
+                    .expect("finite footprint")
+                    .x()
+                    .is_finite()
+            );
             assert!(lamp_footprint_intersects_output(visual_group, 1920, 1080));
         }
     }
@@ -1508,15 +1505,9 @@ mod tests {
             (rect(12.0, 480.0, 64.0, 64.0), LampDirection::Left),
         ];
         for (anchor, expected) in anchors {
-            let group = LifecycleVisualGroup::from_bounds(
-                source,
-                source,
-                source,
-                anchor,
-                1920,
-                1080,
-            )
-            .expect("valid visual group");
+            let group =
+                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                    .expect("valid visual group");
             assert_eq!(group.lamp_direction, expected);
         }
     }
@@ -1542,7 +1533,10 @@ mod tests {
         assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
         assert_eq!(
             lamp_warp_point(source, anchor, point, 1.0),
-            [anchor.x() + 0.5 * anchor.width(), anchor.y() + 0.5 * anchor.height()]
+            [
+                anchor.x() + 0.5 * anchor.width(),
+                anchor.y() + 0.5 * anchor.height()
+            ]
         );
     }
 
@@ -1582,22 +1576,20 @@ mod tests {
     #[test]
     fn directional_warp_handles_tiny_and_huge_geometry_without_nonfinite_values() {
         for (source, anchor, point) in [
-            (rect(0.0, 0.0, 0.001, 0.001), rect(0.002, 0.002, 0.001, 0.001), [0.0, 0.0]),
+            (
+                rect(0.0, 0.0, 0.001, 0.001),
+                rect(0.002, 0.002, 0.001, 0.001),
+                [0.0, 0.0],
+            ),
             (
                 rect(-1.0e6, -1.0e6, 2.0e6, 2.0e6),
                 rect(1.0e6, 1.0e6, 1.0, 1.0),
                 [0.0, 0.0],
             ),
         ] {
-            let group = LifecycleVisualGroup::from_bounds(
-                source,
-                source,
-                source,
-                anchor,
-                1920,
-                1080,
-            )
-            .expect("valid extreme visual group");
+            let group =
+                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                    .expect("valid extreme visual group");
             let warped = lamp_warp_visual_point(group, point, 0.5);
             assert!(warped.into_iter().all(f64::is_finite));
         }
@@ -1846,20 +1838,11 @@ mod tests {
         let source = rect(300.0, 300.0, 20.0, 20.0);
         let full = rect(310.0, 310.0, 30.0, 30.0);
         let anchor = rect(330.0, 330.0, 10.0, 10.0);
-        let visual_group = LifecycleVisualGroup::from_bounds(
-            source, full, source, anchor, 400, 400,
-        )
-        .expect("valid visual group");
-        assert!(!lamp_footprint_intersects_output(
-            visual_group,
-            100,
-            100,
-        ));
-        assert!(lamp_footprint_intersects_output(
-            visual_group,
-            400,
-            400,
-        ));
+        let visual_group =
+            LifecycleVisualGroup::from_bounds(source, full, source, anchor, 400, 400)
+                .expect("valid visual group");
+        assert!(!lamp_footprint_intersects_output(visual_group, 100, 100,));
+        assert!(lamp_footprint_intersects_output(visual_group, 400, 400,));
     }
 
     #[test]

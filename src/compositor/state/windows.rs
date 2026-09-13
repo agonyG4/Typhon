@@ -2,7 +2,7 @@ use super::hit_testing::PointerSceneHit;
 use super::*;
 use crate::animation_control::AnimationEffect;
 use crate::window_lifecycle_animation::{
-    canonical_visual_rect, LifecycleDirection, LifecycleVisualGroup,
+    LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
@@ -1204,10 +1204,10 @@ impl CompositorState {
         else {
             return false;
         };
-        let lifecycle_source = self.lifecycle_minimize_source_rect(root_surface_id);
-        let lifecycle_full_window = self.lifecycle_window_rect(root_surface_id);
+        let presented_source_client_rect = self.lifecycle_minimize_source_rect(root_surface_id);
+        let canonical_client_rect = self.lifecycle_window_rect(root_surface_id);
         let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
-        let lifecycle_effect_scene = match (lifecycle_source, lifecycle_full_window) {
+        let lifecycle_effect_scene = match (presented_source_client_rect, canonical_client_rect) {
             (Some(source), Some(full_window)) => {
                 Self::map_effect_scene_to_presentation(&lifecycle_effect_scene, full_window, source)
             }
@@ -1275,8 +1275,8 @@ impl CompositorState {
         let lifecycle_visual_group = if self.lifecycle_effect(LifecycleDirection::Minimize)
             == AnimationEffect::MinimizeLamp
         {
-            lifecycle_source
-                .zip(lifecycle_full_window)
+            presented_source_client_rect
+                .zip(canonical_client_rect)
                 .zip(self.lifecycle_anchor_rect(window_id))
                 .and_then(|((presented_source, canonical_client), anchor)| {
                     let owned_bounds = minimized_surfaces.iter().filter_map(|surface| {
@@ -1299,11 +1299,8 @@ impl CompositorState {
                                 f64::from(height),
                             )
                         });
-                    let visual = canonical_visual_rect(
-                        canonical_client,
-                        owned_bounds,
-                        decoration_bounds,
-                    )?;
+                    let visual =
+                        canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
                     LifecycleVisualGroup::from_bounds(
                         canonical_client,
                         visual,
@@ -1323,8 +1320,8 @@ impl CompositorState {
         self.begin_lifecycle_minimize(
             window_id,
             root_surface_id,
-            lifecycle_source,
-            lifecycle_full_window,
+            presented_source_client_rect,
+            canonical_client_rect,
             lifecycle_visual_group,
             lifecycle_effect_scene,
             lifecycle_decorations,
@@ -1467,8 +1464,11 @@ impl CompositorState {
                                     f64::from(height),
                                 )
                             });
-                        let visual =
-                            canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                        let visual = canonical_visual_rect(
+                            canonical_client,
+                            owned_bounds,
+                            decoration_bounds,
+                        )?;
                         LifecycleVisualGroup::from_bounds(
                             canonical_client,
                             visual,
