@@ -1,7 +1,9 @@
 use super::hit_testing::PointerSceneHit;
 use super::*;
 use crate::animation_control::AnimationEffect;
-use crate::window_lifecycle_animation::LifecycleDirection;
+use crate::window_lifecycle_animation::{
+    canonical_visual_rect, LifecycleDirection, LifecycleVisualGroup,
+};
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
 impl CompositorState {
@@ -1270,6 +1272,50 @@ impl CompositorState {
         } else {
             Vec::new()
         };
+        let lifecycle_visual_group = if self.lifecycle_effect(LifecycleDirection::Minimize)
+            == AnimationEffect::MinimizeLamp
+        {
+            lifecycle_source
+                .zip(lifecycle_full_window)
+                .zip(self.lifecycle_anchor_rect(window_id))
+                .and_then(|((presented_source, canonical_client), anchor)| {
+                    let owned_bounds = minimized_surfaces.iter().filter_map(|surface| {
+                        PresentationRect::new(
+                            f64::from(surface.x),
+                            f64::from(surface.y),
+                            f64::from(surface.width),
+                            f64::from(surface.height),
+                        )
+                    });
+                    let decoration_bounds = lifecycle_decorations
+                        .iter()
+                        .find(|decoration| decoration.root_surface_id() == root_surface_id)
+                        .and_then(|decoration| {
+                            let (x, y, width, height) = decoration.scene_snapshot().bounds();
+                            PresentationRect::new(
+                                f64::from(x),
+                                f64::from(y),
+                                f64::from(width),
+                                f64::from(height),
+                            )
+                        });
+                    let visual = canonical_visual_rect(
+                        canonical_client,
+                        owned_bounds,
+                        decoration_bounds,
+                    )?;
+                    LifecycleVisualGroup::from_bounds(
+                        canonical_client,
+                        visual,
+                        presented_source,
+                        anchor,
+                        self.output_size.width,
+                        self.output_size.height,
+                    )
+                })
+        } else {
+            None
+        };
 
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
@@ -1279,6 +1325,7 @@ impl CompositorState {
             root_surface_id,
             lifecycle_source,
             lifecycle_full_window,
+            lifecycle_visual_group,
             lifecycle_effect_scene,
             lifecycle_decorations,
         );
@@ -1379,7 +1426,57 @@ impl CompositorState {
             let _ = self.finish_layout_reflow_batch();
         }
         let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
-        self.begin_lifecycle_restore(window_id, root_surface_id, lifecycle_effect_scene);
+        let lifecycle_visual_group = self
+            .lifecycle_window_rect(root_surface_id)
+            .zip(self.lifecycle_anchor_rect(window_id))
+            .and_then(|(canonical_client, anchor)| {
+                let owned_bounds = self
+                    .renderable_surfaces
+                    .iter()
+                    .filter(|surface| {
+                        root_surface_id_for_surface_in_placements(
+                            &self.surface_placements,
+                            surface.surface_id,
+                        ) == root_surface_id
+                    })
+                    .filter_map(|surface| {
+                        PresentationRect::new(
+                            f64::from(surface.x),
+                            f64::from(surface.y),
+                            f64::from(surface.width),
+                            f64::from(surface.height),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let decoration_bounds = self
+                    .native_decoration_render_instances_for_scale(&self.renderable_surfaces, 1.0)
+                    .into_iter()
+                    .find(|decoration| decoration.root_surface_id() == root_surface_id)
+                    .and_then(|decoration| {
+                        let (x, y, width, height) = decoration.scene_snapshot().bounds();
+                        PresentationRect::new(
+                            f64::from(x),
+                            f64::from(y),
+                            f64::from(width),
+                            f64::from(height),
+                        )
+                    });
+                let visual = canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                LifecycleVisualGroup::from_bounds(
+                    canonical_client,
+                    visual,
+                    canonical_client,
+                    anchor,
+                    self.output_size.width,
+                    self.output_size.height,
+                )
+            });
+        self.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            lifecycle_visual_group,
+            lifecycle_effect_scene,
+        );
         true
     }
 

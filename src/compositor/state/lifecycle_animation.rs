@@ -3,7 +3,7 @@ use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, An
 use crate::presentation_animation::{PresentationGroupTransform, TransitionId};
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleFrameSnapshot, LifecycleRenderFallbackEntry, LifecycleSceneSample,
-    LifecycleTransitionRequest,
+    LifecycleTransitionRequest, LifecycleVisualGroup,
 };
 use std::num::NonZeroU64;
 
@@ -88,9 +88,15 @@ mod tests {
         LifecycleTransitionRequest {
             window_id,
             root_surface_id,
-            source_rect,
-            full_window_rect: source_rect,
-            anchor_rect,
+            visual_group: LifecycleVisualGroup::from_bounds(
+                source_rect,
+                source_rect,
+                source_rect,
+                anchor_rect,
+                1920,
+                1080,
+            )
+            .expect("valid test visual group"),
             direction,
             resolved_effect_scene: ResolvedEffectScene::default(),
         }
@@ -197,6 +203,15 @@ mod tests {
                 window_id,
                 root_surface_id: 303,
                 transition_id: LifecycleTransitionId::new(99),
+                visual_group: LifecycleVisualGroup::from_bounds(
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    100,
+                    100,
+                )
+                .expect("valid visual group"),
                 source_rect: rect(0.0, 0.0, 80.0, 80.0),
                 full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
                 anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
@@ -242,6 +257,15 @@ mod tests {
                 window_id,
                 root_surface_id,
                 transition_id,
+                visual_group: LifecycleVisualGroup::from_bounds(
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    100,
+                    100,
+                )
+                .expect("valid visual group"),
                 source_rect: rect(0.0, 0.0, 80.0, 80.0),
                 full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
                 anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
@@ -297,6 +321,15 @@ mod tests {
                 window_id,
                 root_surface_id: 304,
                 transition_id: LifecycleTransitionId::new(100),
+                visual_group: LifecycleVisualGroup::from_bounds(
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(0.0, 0.0, 80.0, 80.0),
+                    rect(20.0, 20.0, 20.0, 20.0),
+                    100,
+                    100,
+                )
+                .expect("valid visual group"),
                 source_rect: rect(0.0, 0.0, 80.0, 80.0),
                 full_window_rect: rect(0.0, 0.0, 80.0, 80.0),
                 anchor_rect: rect(20.0, 20.0, 20.0, 20.0),
@@ -567,6 +600,7 @@ impl CompositorState {
         root_surface_id: u32,
         source_rect: Option<PresentationRect>,
         full_window_rect: Option<PresentationRect>,
+        visual_group: Option<LifecycleVisualGroup>,
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
@@ -602,10 +636,25 @@ impl CompositorState {
             self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
+        let visual_group = visual_group.or_else(|| {
+            LifecycleVisualGroup::from_bounds(
+                full_window_rect,
+                full_window_rect,
+                source_rect,
+                anchor_rect,
+                self.output_size.width,
+                self.output_size.height,
+            )
+        });
+        let Some(visual_group) = visual_group else {
+            self.window_lifecycle_animator.cancel(window_id);
+            self.lifecycle_render_suppressed_roots
+                .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
+            return;
+        };
         if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            source_rect,
-            full_window_rect,
-            anchor_rect,
+            visual_group,
             self.output_size.width,
             self.output_size.height,
         ) {
@@ -638,9 +687,7 @@ impl CompositorState {
             LifecycleTransitionRequest {
                 window_id,
                 root_surface_id,
-                source_rect,
-                full_window_rect,
-                anchor_rect,
+                visual_group,
                 direction: LifecycleDirection::Minimize,
                 resolved_effect_scene,
             },
@@ -653,6 +700,7 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
         root_surface_id: u32,
+        visual_group: Option<LifecycleVisualGroup>,
         resolved_effect_scene: ResolvedEffectScene,
     ) {
         if self.lifecycle_effect(LifecycleDirection::Restore) != AnimationEffect::MinimizeLamp {
@@ -676,10 +724,29 @@ impl CompositorState {
             self.lifecycle_decorations.remove(&root_surface_id);
             return;
         };
+        let visual_group = self
+            .window_lifecycle_animator
+            .visual_group(window_id)
+            .or(visual_group)
+            .or_else(|| {
+                LifecycleVisualGroup::from_bounds(
+                    full_window_rect,
+                    full_window_rect,
+                    full_window_rect,
+                    anchor_rect,
+                    self.output_size.width,
+                    self.output_size.height,
+                )
+            });
+        let Some(visual_group) = visual_group else {
+            self.window_lifecycle_animator.cancel(window_id);
+            self.lifecycle_render_suppressed_roots
+                .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
+            return;
+        };
         if !crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            full_window_rect,
-            full_window_rect,
-            anchor_rect,
+            visual_group,
             self.output_size.width,
             self.output_size.height,
         ) {
@@ -703,9 +770,7 @@ impl CompositorState {
                 LifecycleTransitionRequest {
                     window_id,
                     root_surface_id,
-                    source_rect: full_window_rect,
-                    full_window_rect,
-                    anchor_rect,
+                    visual_group,
                     direction: LifecycleDirection::Restore,
                     resolved_effect_scene,
                 },
@@ -805,9 +870,7 @@ impl CompositorState {
         lamp: &crate::window_lifecycle_animation::LampWindowSample,
     ) -> bool {
         crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-            lamp.source_rect,
-            lamp.full_window_rect,
-            lamp.anchor_rect,
+            lamp.visual_group,
             self.output_size.width,
             self.output_size.height,
         )
@@ -826,9 +889,7 @@ impl CompositorState {
                     presented.window_id == lamp.window_id
                         && !presented.mathematically_settled
                         && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                            presented.source_rect,
-                            presented.full_window_rect,
-                            presented.anchor_rect,
+                            presented.visual_group,
                             self.output_size.width,
                             self.output_size.height,
                         )
@@ -862,9 +923,7 @@ impl CompositorState {
             !lamp.mathematically_settled
                 && lamp.opacity > f64::EPSILON
                 && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                    lamp.source_rect,
-                    lamp.full_window_rect,
-                    lamp.anchor_rect,
+                    lamp.visual_group,
                     self.output_size.width,
                     self.output_size.height,
                 )
@@ -903,9 +962,7 @@ impl CompositorState {
             let still_visible = !old.mathematically_settled
                 && old.opacity > f64::EPSILON
                 && crate::window_lifecycle_animation::lamp_footprint_intersects_output(
-                    old.source_rect,
-                    old.full_window_rect,
-                    old.anchor_rect,
+                    old.visual_group,
                     self.output_size.width,
                     self.output_size.height,
                 );

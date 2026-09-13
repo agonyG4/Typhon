@@ -258,8 +258,7 @@ fn lifecycle_damage_rects(
         .lamps
         .iter()
         .filter_map(|lamp| {
-            let footprint =
-                lamp_footprint(lamp.source_rect, lamp.full_window_rect, lamp.anchor_rect)?;
+            let footprint = lamp_footprint(lamp.visual_group)?;
             let left = footprint.x();
             let top = footprint.y();
             let right = footprint.x() + footprint.width();
@@ -280,6 +279,7 @@ mod tests {
     use super::*;
     use oblivion_one::window_lifecycle_animation::{
         LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
+        LifecycleVisualGroup,
     };
 
     fn snapshot(frame_id: u64) -> NativeFrameSceneSnapshot {
@@ -327,6 +327,15 @@ mod tests {
                     .expect("valid window id"),
                 root_surface_id: 7,
                 transition_id: LifecycleTransitionId::new(1),
+                visual_group: LifecycleVisualGroup::from_bounds(
+                    source,
+                    source,
+                    source,
+                    anchor,
+                    1920,
+                    1080,
+                )
+                .expect("valid visual group"),
                 source_rect: source,
                 full_window_rect: source,
                 anchor_rect: anchor,

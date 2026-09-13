@@ -6,6 +6,11 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 pub const ASTREA_LAMP_BASE_DURATION_MS: u64 = 280;
+pub const ASTREA_LAMP_INITIAL_SHAPE_FACTOR: f64 = 0.20;
+pub const ASTREA_LAMP_MAX_SHAPE_FACTOR: f64 = 0.80;
+pub const ASTREA_LAMP_STRETCH_WEIGHT: f64 = 0.70;
+pub const ASTREA_LAMP_SQUASH_WEIGHT: f64 = 1.0;
+pub const ASTREA_LAMP_FINAL_OPACITY_START: f64 = 0.98;
 pub const ASTREA_LAMP_PULL: f64 = 2.5;
 const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
 const MAX_LIFECYCLE_RENDER_FALLBACK_ENTRIES: usize = 65_536;
@@ -44,6 +49,77 @@ pub enum LifecycleVisualSourceKind {
     ResolvedOwnedEffects,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LampDirection {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LifecycleVisualGroup {
+    pub canonical_client_rect: PresentationRect,
+    pub canonical_visual_rect: PresentationRect,
+    pub presented_source_client_rect: PresentationRect,
+    pub presented_source_visual_rect: PresentationRect,
+    pub anchor_rect: PresentationRect,
+    pub lamp_direction: LampDirection,
+    pub shape_factor: f64,
+    pub bump_distance: f64,
+}
+
+impl LifecycleVisualGroup {
+    pub fn from_bounds(
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        anchor_rect: PresentationRect,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<Self> {
+        if !valid_lamp_rects(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+        ) || !valid_rect(anchor_rect)
+        {
+            return None;
+        }
+        let lamp_direction = infer_lamp_direction(
+            presented_source_client_rect,
+            anchor_rect,
+            output_width,
+            output_height,
+        );
+        let shape_factor = lamp_shape_factor(
+            presented_source_client_rect,
+            anchor_rect,
+            lamp_direction,
+        );
+        let bump_distance = lamp_bump_distance(
+            presented_source_client_rect,
+            anchor_rect,
+            lamp_direction,
+        );
+        let presented_source_visual_rect = presented_visual_rect(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+        )?;
+        Some(Self {
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+            presented_source_visual_rect,
+            anchor_rect,
+            lamp_direction,
+            shape_factor,
+            bump_distance,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleVisualSource {
     pub window_id: WindowId,
@@ -57,9 +133,7 @@ pub struct LifecycleVisualSource {
 pub struct LifecycleTransitionRequest {
     pub window_id: WindowId,
     pub root_surface_id: u32,
-    pub source_rect: PresentationRect,
-    pub full_window_rect: PresentationRect,
-    pub anchor_rect: PresentationRect,
+    pub visual_group: LifecycleVisualGroup,
     pub direction: LifecycleDirection,
     pub resolved_effect_scene: ResolvedEffectScene,
 }
@@ -69,8 +143,12 @@ pub struct LampWindowSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub transition_id: LifecycleTransitionId,
+    pub visual_group: LifecycleVisualGroup,
+    #[doc(hidden)]
     pub source_rect: PresentationRect,
+    #[doc(hidden)]
     pub full_window_rect: PresentationRect,
+    #[doc(hidden)]
     pub anchor_rect: PresentationRect,
     pub progress: f64,
     pub opacity: f64,
@@ -98,8 +176,12 @@ pub struct LifecycleFrameLamp {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub transition_id: LifecycleTransitionId,
+    pub visual_group: LifecycleVisualGroup,
+    #[doc(hidden)]
     pub source_rect: PresentationRect,
+    #[doc(hidden)]
     pub full_window_rect: PresentationRect,
+    #[doc(hidden)]
     pub anchor_rect: PresentationRect,
     pub progress: f64,
     pub opacity: f64,
@@ -123,9 +205,10 @@ impl LifecycleFrameSnapshot {
                 window_id: lamp.window_id,
                 root_surface_id: lamp.root_surface_id,
                 transition_id: lamp.transition_id,
-                source_rect: lamp.source_rect,
-                full_window_rect: lamp.full_window_rect,
-                anchor_rect: lamp.anchor_rect,
+                visual_group: lamp.visual_group,
+                source_rect: lamp.visual_group.presented_source_client_rect,
+                full_window_rect: lamp.visual_group.canonical_client_rect,
+                anchor_rect: lamp.visual_group.anchor_rect,
                 progress: lamp.progress,
                 opacity: lamp.opacity,
                 mathematically_settled: lamp.mathematically_settled,
@@ -254,38 +337,57 @@ impl LifecycleRenderFallbacks {
 /// representation. All three lifecycle rectangles participate because the
 /// warp can cover any of them over the transition.
 pub fn lamp_footprint(
-    source_rect: PresentationRect,
-    full_window_rect: PresentationRect,
-    anchor_rect: PresentationRect,
+    visual_group: LifecycleVisualGroup,
 ) -> Option<PresentationRect> {
-    if !valid_lamp_rects(source_rect, full_window_rect, anchor_rect) {
+    if !valid_visual_group(visual_group) {
         return None;
     }
-    let left = source_rect
+    let left = visual_group
+        .presented_source_visual_rect
         .x()
-        .min(full_window_rect.x())
-        .min(anchor_rect.x());
-    let top = source_rect
+        .min(visual_group.canonical_visual_rect.x())
+        .min(visual_group.anchor_rect.x());
+    let top = visual_group
+        .presented_source_visual_rect
         .y()
-        .min(full_window_rect.y())
-        .min(anchor_rect.y());
-    let right = (source_rect.x() + source_rect.width())
-        .max(full_window_rect.x() + full_window_rect.width())
-        .max(anchor_rect.x() + anchor_rect.width());
-    let bottom = (source_rect.y() + source_rect.height())
-        .max(full_window_rect.y() + full_window_rect.height())
-        .max(anchor_rect.y() + anchor_rect.height());
+        .min(visual_group.canonical_visual_rect.y())
+        .min(visual_group.anchor_rect.y());
+    let right = (visual_group.presented_source_visual_rect.x()
+        + visual_group.presented_source_visual_rect.width())
+        .max(visual_group.canonical_visual_rect.x() + visual_group.canonical_visual_rect.width())
+        .max(visual_group.anchor_rect.x() + visual_group.anchor_rect.width());
+    let bottom = (visual_group.presented_source_visual_rect.y()
+        + visual_group.presented_source_visual_rect.height())
+        .max(visual_group.canonical_visual_rect.y() + visual_group.canonical_visual_rect.height())
+        .max(visual_group.anchor_rect.y() + visual_group.anchor_rect.height());
+    let bump = visual_group.bump_distance.max(0.0);
+    let (axis_start, axis_end) = axis_bounds(
+        visual_group.presented_source_visual_rect,
+        visual_group.lamp_direction,
+    );
+    let (left, top, right, bottom) = match visual_group.lamp_direction {
+        LampDirection::Top | LampDirection::Bottom => (
+            left,
+            top.min(axis_start - bump),
+            right,
+            bottom.max(axis_end + bump),
+        ),
+        LampDirection::Left | LampDirection::Right => (
+            left.min(axis_start - bump),
+            top,
+            right.max(axis_end + bump),
+            bottom,
+        ),
+    };
     PresentationRect::new(left, top, right - left, bottom - top)
 }
 
 pub fn lamp_footprint_intersects_output(
-    source_rect: PresentationRect,
-    full_window_rect: PresentationRect,
-    anchor_rect: PresentationRect,
+    visual_group: LifecycleVisualGroup,
     output_width: u32,
     output_height: u32,
 ) -> bool {
-    let Some(footprint) = lamp_footprint(source_rect, full_window_rect, anchor_rect) else {
+    let Some(footprint) = lamp_footprint(visual_group) else {
         return false;
     };
     footprint.x() < f64::from(output_width)
@@ -301,24 +403,40 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             lamp.window_id.get(),
             u64::from(lamp.root_surface_id),
             lamp.transition_id.get(),
-            lamp.source_rect.x().to_bits(),
-            lamp.source_rect.y().to_bits(),
-            lamp.source_rect.width().to_bits(),
-            lamp.source_rect.height().to_bits(),
-            lamp.full_window_rect.x().to_bits(),
-            lamp.full_window_rect.y().to_bits(),
-            lamp.full_window_rect.width().to_bits(),
-            lamp.full_window_rect.height().to_bits(),
-            lamp.anchor_rect.x().to_bits(),
-            lamp.anchor_rect.y().to_bits(),
-            lamp.anchor_rect.width().to_bits(),
-            lamp.anchor_rect.height().to_bits(),
+            lamp.visual_group.canonical_client_rect.x().to_bits(),
+            lamp.visual_group.canonical_client_rect.y().to_bits(),
+            lamp.visual_group.canonical_client_rect.width().to_bits(),
+            lamp.visual_group.canonical_client_rect.height().to_bits(),
+            lamp.visual_group.canonical_visual_rect.x().to_bits(),
+            lamp.visual_group.canonical_visual_rect.y().to_bits(),
+            lamp.visual_group.canonical_visual_rect.width().to_bits(),
+            lamp.visual_group.canonical_visual_rect.height().to_bits(),
+            lamp.visual_group.presented_source_client_rect.x().to_bits(),
+            lamp.visual_group.presented_source_client_rect.y().to_bits(),
+            lamp.visual_group.presented_source_client_rect.width().to_bits(),
+            lamp.visual_group.presented_source_client_rect.height().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.x().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.y().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.width().to_bits(),
+            lamp.visual_group.presented_source_visual_rect.height().to_bits(),
+            lamp.visual_group.anchor_rect.x().to_bits(),
+            lamp.visual_group.anchor_rect.y().to_bits(),
+            lamp.visual_group.anchor_rect.width().to_bits(),
+            lamp.visual_group.anchor_rect.height().to_bits(),
+            lamp.visual_group.shape_factor.to_bits(),
+            lamp.visual_group.bump_distance.to_bits(),
             lamp.progress.to_bits(),
             lamp.opacity.to_bits(),
             u64::from(lamp.mathematically_settled),
             match lamp.direction {
                 LifecycleDirection::Minimize => 1,
                 LifecycleDirection::Restore => 2,
+            },
+            match lamp.visual_group.lamp_direction {
+                LampDirection::Top => 3,
+                LampDirection::Right => 4,
+                LampDirection::Bottom => 5,
+                LampDirection::Left => 6,
             },
         ] {
             signature ^= value;
@@ -333,9 +451,7 @@ struct LifecycleTransition {
     window_id: WindowId,
     root_surface_id: u32,
     transition_id: LifecycleTransitionId,
-    source_rect: PresentationRect,
-    full_window_rect: PresentationRect,
-    anchor_rect: PresentationRect,
+    visual_group: LifecycleVisualGroup,
     direction: LifecycleDirection,
     start_progress: f64,
     target_progress: f64,
@@ -392,15 +508,10 @@ impl WindowLifecycleAnimator {
         let LifecycleTransitionRequest {
             window_id,
             root_surface_id,
-            source_rect,
-            full_window_rect,
-            anchor_rect,
+            visual_group,
             direction,
             resolved_effect_scene,
         } = request;
-        if !valid_lamp_rects(source_rect, full_window_rect, anchor_rect) {
-            return None;
-        }
 
         let existing = self.transitions.get(&window_id).cloned();
         let start_progress = existing
@@ -410,16 +521,13 @@ impl WindowLifecycleAnimator {
                 LifecycleDirection::Minimize => 0.0,
                 LifecycleDirection::Restore => 1.0,
             });
-        let (source_rect, full_window_rect, anchor_rect) =
-            existing
-                .as_ref()
-                .map_or((source_rect, full_window_rect, anchor_rect), |transition| {
-                    (
-                        transition.source_rect,
-                        transition.full_window_rect,
-                        transition.anchor_rect,
-                    )
-                });
+        let visual_group = existing
+            .as_ref()
+            .map(|transition| transition.visual_group)
+            .unwrap_or(visual_group);
+        if !valid_visual_group(visual_group) {
+            return None;
+        }
         let resolved_effect_scene = existing
             .as_ref()
             .map(|transition| Arc::clone(&transition.resolved_effect_scene))
@@ -434,9 +542,7 @@ impl WindowLifecycleAnimator {
                 window_id,
                 root_surface_id,
                 transition_id,
-                source_rect,
-                full_window_rect,
-                anchor_rect,
+                visual_group,
                 direction,
                 start_progress,
                 target_progress: direction.target_progress(),
@@ -461,6 +567,12 @@ impl WindowLifecycleAnimator {
             .get(&window_id)
             .cloned()
             .map(|transition| sample_transition(transition, now))
+    }
+
+    pub fn visual_group(&self, window_id: WindowId) -> Option<LifecycleVisualGroup> {
+        self.transitions
+            .get(&window_id)
+            .map(|transition| transition.visual_group)
     }
 
     pub fn sample_scene(&self, now: AnimationTime) -> LifecycleSceneSample {
@@ -582,9 +694,10 @@ fn sample_transition(transition: LifecycleTransition, now: AnimationTime) -> Lam
         window_id: transition.window_id,
         root_surface_id: transition.root_surface_id,
         transition_id: transition.transition_id,
-        source_rect: transition.source_rect,
-        full_window_rect: transition.full_window_rect,
-        anchor_rect: transition.anchor_rect,
+        visual_group: transition.visual_group,
+        source_rect: transition.visual_group.presented_source_client_rect,
+        full_window_rect: transition.visual_group.canonical_client_rect,
+        anchor_rect: transition.visual_group.anchor_rect,
         progress,
         opacity: lamp_opacity(progress),
         direction: transition.direction,
@@ -620,6 +733,192 @@ fn effective_duration_nanos(speed: f64) -> u64 {
         1.0
     };
     ((ASTREA_LAMP_BASE_DURATION_MS as f64 * 1_000_000.0) / speed).round() as u64
+}
+
+pub fn canonical_visual_rect(
+    canonical_client_rect: PresentationRect,
+    owned_visual_rects: impl IntoIterator<Item = PresentationRect>,
+    decoration_rect: Option<PresentationRect>,
+) -> Option<PresentationRect> {
+    if !valid_rect(canonical_client_rect) {
+        return None;
+    }
+    let mut left = canonical_client_rect.x();
+    let mut top = canonical_client_rect.y();
+    let mut right = left + canonical_client_rect.width();
+    let mut bottom = top + canonical_client_rect.height();
+    for rect in owned_visual_rects {
+        if !valid_rect(rect) {
+            return None;
+        }
+        left = left.min(rect.x());
+        top = top.min(rect.y());
+        right = right.max(rect.x() + rect.width());
+        bottom = bottom.max(rect.y() + rect.height());
+    }
+    if let Some(rect) = decoration_rect {
+        if !valid_rect(rect) {
+            return None;
+        }
+        left = left.min(rect.x());
+        top = top.min(rect.y());
+        right = right.max(rect.x() + rect.width());
+        bottom = bottom.max(rect.y() + rect.height());
+    }
+    PresentationRect::new(left, top, right - left, bottom - top)
+}
+
+pub fn presented_visual_rect(
+    canonical_client_rect: PresentationRect,
+    canonical_visual_rect: PresentationRect,
+    presented_source_client_rect: PresentationRect,
+) -> Option<PresentationRect> {
+    if !valid_lamp_rects(
+        canonical_client_rect,
+        canonical_visual_rect,
+        presented_source_client_rect,
+    ) {
+        return None;
+    }
+    let scale_x = presented_source_client_rect.width() / canonical_client_rect.width();
+    let scale_y = presented_source_client_rect.height() / canonical_client_rect.height();
+    PresentationRect::new(
+        presented_source_client_rect.x()
+            + (canonical_visual_rect.x() - canonical_client_rect.x()) * scale_x,
+        presented_source_client_rect.y()
+            + (canonical_visual_rect.y() - canonical_client_rect.y()) * scale_y,
+        canonical_visual_rect.width() * scale_x,
+        canonical_visual_rect.height() * scale_y,
+    )
+}
+
+fn valid_rect(rect: PresentationRect) -> bool {
+    rect.x().is_finite()
+        && rect.y().is_finite()
+        && rect.width().is_finite()
+        && rect.height().is_finite()
+        && rect.width() > 0.0
+        && rect.height() > 0.0
+}
+
+fn valid_visual_group(group: LifecycleVisualGroup) -> bool {
+    valid_rect(group.canonical_client_rect)
+        && valid_rect(group.canonical_visual_rect)
+        && valid_rect(group.presented_source_client_rect)
+        && valid_rect(group.presented_source_visual_rect)
+        && valid_rect(group.anchor_rect)
+        && group.shape_factor.is_finite()
+        && group.shape_factor >= 0.0
+        && group.bump_distance.is_finite()
+        && group.bump_distance >= 0.0
+}
+
+fn infer_lamp_direction(
+    source_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    output_width: u32,
+    output_height: u32,
+) -> LampDirection {
+    let output_width = f64::from(output_width.max(1));
+    let output_height = f64::from(output_height.max(1));
+    let distances = [
+        (anchor_rect.y().abs(), LampDirection::Top),
+        (
+            (output_height - anchor_rect.y() - anchor_rect.height()).abs(),
+            LampDirection::Bottom,
+        ),
+        (anchor_rect.x().abs(), LampDirection::Left),
+        (
+            (output_width - anchor_rect.x() - anchor_rect.width()).abs(),
+            LampDirection::Right,
+        ),
+    ];
+    let minimum = distances
+        .iter()
+        .map(|(distance, _)| *distance)
+        .fold(f64::INFINITY, f64::min);
+    let ties = distances
+        .iter()
+        .filter(|(distance, _)| (*distance - minimum).abs() <= 1.0)
+        .count();
+    if ties == 1 && minimum <= output_width.min(output_height) * 0.25 {
+        distances
+            .iter()
+            .find(|(distance, _)| (*distance - minimum).abs() <= 1.0)
+            .map(|(_, direction)| *direction)
+            .unwrap_or_else(|| fallback_lamp_direction(source_rect, anchor_rect))
+    } else {
+        fallback_lamp_direction(source_rect, anchor_rect)
+    }
+}
+
+fn fallback_lamp_direction(
+    source_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+) -> LampDirection {
+    let source_center_x = source_rect.x() + source_rect.width() * 0.5;
+    let source_center_y = source_rect.y() + source_rect.height() * 0.5;
+    let anchor_center_x = anchor_rect.x() + anchor_rect.width() * 0.5;
+    let anchor_center_y = anchor_rect.y() + anchor_rect.height() * 0.5;
+    let delta_x = anchor_center_x - source_center_x;
+    let delta_y = anchor_center_y - source_center_y;
+    if delta_y.abs() >= delta_x.abs() {
+        if delta_y >= 0.0 {
+            LampDirection::Bottom
+        } else {
+            LampDirection::Top
+        }
+    } else if delta_x >= 0.0 {
+        LampDirection::Right
+    } else {
+        LampDirection::Left
+    }
+}
+
+fn axis_bounds(rect: PresentationRect, direction: LampDirection) -> (f64, f64) {
+    match direction {
+        LampDirection::Top | LampDirection::Bottom => {
+            (rect.y(), rect.y() + rect.height())
+        }
+        LampDirection::Left | LampDirection::Right => {
+            (rect.x(), rect.x() + rect.width())
+        }
+    }
+}
+
+fn lamp_shape_factor(
+    source_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    direction: LampDirection,
+) -> f64 {
+    let extent = match direction {
+        LampDirection::Top | LampDirection::Bottom => source_rect.height(),
+        LampDirection::Left | LampDirection::Right => source_rect.width(),
+    }
+    .max(1.0);
+    let (source_start, source_end) = axis_bounds(source_rect, direction);
+    let (anchor_start, anchor_end) = axis_bounds(anchor_rect, direction);
+    let gap = if source_end < anchor_start {
+        anchor_start - source_end
+    } else if anchor_end < source_start {
+        source_start - anchor_end
+    } else {
+        0.0
+    };
+    let closeness = 1.0 / (1.0 + gap / extent);
+    (ASTREA_LAMP_INITIAL_SHAPE_FACTOR
+        + (ASTREA_LAMP_MAX_SHAPE_FACTOR - ASTREA_LAMP_INITIAL_SHAPE_FACTOR) * closeness)
+        .clamp(ASTREA_LAMP_INITIAL_SHAPE_FACTOR, ASTREA_LAMP_MAX_SHAPE_FACTOR)
+}
+
+fn lamp_bump_distance(
+    source_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    direction: LampDirection,
+) -> f64 {
+    let (source_start, source_end) = axis_bounds(source_rect, direction);
+    let (anchor_start, anchor_end) = axis_bounds(anchor_rect, direction);
+    (source_end.min(anchor_end) - source_start.max(anchor_start)).max(0.0)
 }
 
 fn valid_lamp_rects(
@@ -769,12 +1068,32 @@ mod tests {
         anchor_rect: PresentationRect,
         direction: LifecycleDirection,
     ) -> LifecycleTransitionRequest {
+        request_with_group(
+            window_id,
+            root_surface_id,
+            LifecycleVisualGroup::from_bounds(
+                source_rect,
+                source_rect,
+                source_rect,
+                anchor_rect,
+                1920,
+                1080,
+            )
+            .expect("valid visual group"),
+            direction,
+        )
+    }
+
+    fn request_with_group(
+        window_id: WindowId,
+        root_surface_id: u32,
+        visual_group: LifecycleVisualGroup,
+        direction: LifecycleDirection,
+    ) -> LifecycleTransitionRequest {
         LifecycleTransitionRequest {
             window_id,
             root_surface_id,
-            source_rect,
-            full_window_rect: source_rect,
-            anchor_rect,
+            visual_group,
             direction,
             resolved_effect_scene: ResolvedEffectScene::default(),
         }
@@ -786,15 +1105,151 @@ mod tests {
     }
 
     #[test]
-    fn lamp_footprint_does_not_cover_ssd_above_client_before_visual_group_fix() {
+    fn lamp_footprint_covers_ssd_above_client_after_visual_group_fix() {
         let client = rect(400.0, 100.0, 800.0, 600.0);
         let ssd_outer = rect(384.0, 60.0, 832.0, 640.0);
         let anchor = rect(900.0, 900.0, 64.0, 64.0);
 
-        let footprint = lamp_footprint(client, client, anchor).expect("valid footprint");
+        let visual = LifecycleVisualGroup::from_bounds(
+            client,
+            ssd_outer,
+            client,
+            anchor,
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let footprint = lamp_footprint(visual).expect("valid footprint");
 
         assert!(footprint.y() <= ssd_outer.y());
         assert!(footprint.y() + footprint.height() >= ssd_outer.y() + ssd_outer.height());
+    }
+
+    #[test]
+    fn canonical_visual_group_unions_client_subsurface_and_ssd_outer_bounds() {
+        let actual = canonical_visual_rect(
+            rect(400.0, 100.0, 800.0, 600.0),
+            [rect(360.0, 120.0, 32.0, 760.0)],
+            Some(rect(384.0, 60.0, 832.0, 640.0)),
+        );
+        assert_eq!(actual, Some(rect(360.0, 60.0, 856.0, 820.0)));
+    }
+
+    #[test]
+    fn canonical_visual_group_does_not_expand_csd_window() {
+        let actual = canonical_visual_rect(rect(400.0, 100.0, 800.0, 600.0), [], None);
+        assert_eq!(actual, Some(rect(400.0, 100.0, 800.0, 600.0)));
+    }
+
+    #[test]
+    fn presented_visual_group_reuses_canonical_to_presented_client_affine() {
+        let actual = presented_visual_rect(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(360.0, 60.0, 832.0, 640.0),
+            rect(200.0, 160.0, 960.0, 720.0),
+        );
+        assert_eq!(actual, Some(rect(152.0, 112.0, 998.4, 768.0)));
+    }
+
+    #[test]
+    fn reversal_reuses_frozen_visual_group_and_anchor_with_fresh_id() {
+        let window = WindowId::from_raw(18).expect("valid window id");
+        let first_group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 60.0, 832.0, 640.0),
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(900.0, 900.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let changed_group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 20.0, 832.0, 680.0),
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(1000.0, 900.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let mut animator = WindowLifecycleAnimator::new(true);
+        let first = animator
+            .start_or_reverse(
+                request_with_group(
+                    window,
+                    18,
+                    first_group,
+                    LifecycleDirection::Minimize,
+                ),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize starts");
+        let before = animator
+            .sample(window, AnimationTime::from_nanos(100_000_000))
+            .expect("sample before reversal");
+        let second = animator
+            .start_or_reverse(
+                request_with_group(window, 18, changed_group, LifecycleDirection::Restore),
+                AnimationTime::from_nanos(100_000_000),
+                1.0,
+            )
+            .expect("restore reverses");
+        let after = animator
+            .sample(window, AnimationTime::from_nanos(100_000_000))
+            .expect("sample after reversal");
+
+        assert_ne!(first, second);
+        assert_eq!(before.visual_group, after.visual_group);
+        assert_eq!(before.anchor_rect, after.anchor_rect);
+    }
+
+    #[test]
+    fn settled_new_transition_captures_new_visual_bounds() {
+        let window = WindowId::from_raw(19).expect("valid window id");
+        let first_group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 60.0, 832.0, 640.0),
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(900.0, 900.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let second_group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 20.0, 832.0, 680.0),
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(900.0, 900.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let mut animator = WindowLifecycleAnimator::new(true);
+        let first = animator
+            .start_or_reverse(
+                request_with_group(window, 19, first_group, LifecycleDirection::Minimize),
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize starts");
+        assert!(animator.snap_to_endpoint(
+            window,
+            first,
+            AnimationTime::from_nanos(280_000_000),
+        ));
+        assert!(animator.acknowledge(window, first, true));
+        animator
+            .start_or_reverse(
+                request_with_group(window, 19, second_group, LifecycleDirection::Minimize),
+                AnimationTime::from_nanos(300_000_000),
+                1.0,
+            )
+            .expect("new transition starts");
+        let sample = animator
+            .sample(window, AnimationTime::from_nanos(300_000_000))
+            .expect("new transition sample");
+        assert_eq!(sample.visual_group.canonical_visual_rect.y(), 20.0);
     }
 
     #[test]
@@ -1004,12 +1459,21 @@ mod tests {
             )
             .expect("second transition starts");
         assert!(lamp_footprint_intersects_output(
-            source, source, anchor, 800, 600
+            LifecycleVisualGroup::from_bounds(source, source, source, anchor, 800, 600)
+                .expect("valid visual group"),
+            800,
+            600,
         ));
         assert!(!lamp_footprint_intersects_output(
-            second_source,
-            second_source,
-            second_anchor,
+            LifecycleVisualGroup::from_bounds(
+                second_source,
+                second_source,
+                second_source,
+                second_anchor,
+                800,
+                600,
+            )
+            .expect("valid visual group"),
             800,
             600,
         ));
@@ -1031,11 +1495,19 @@ mod tests {
         let source = rect(300.0, 300.0, 20.0, 20.0);
         let full = rect(310.0, 310.0, 30.0, 30.0);
         let anchor = rect(330.0, 330.0, 10.0, 10.0);
+        let visual_group = LifecycleVisualGroup::from_bounds(
+            source, full, source, anchor, 400, 400,
+        )
+        .expect("valid visual group");
         assert!(!lamp_footprint_intersects_output(
-            source, full, anchor, 100, 100
+            visual_group,
+            100,
+            100,
         ));
         assert!(lamp_footprint_intersects_output(
-            source, full, anchor, 400, 400
+            visual_group,
+            400,
+            400,
         ));
     }
 
