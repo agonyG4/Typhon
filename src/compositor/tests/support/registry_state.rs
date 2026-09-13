@@ -354,6 +354,7 @@ pub(in crate::compositor::tests) struct RootBeforeChildSnapshots {
 pub(in crate::compositor::tests) struct GeckoPreRoleAdoptionSnapshots {
     pub(in crate::compositor::tests) after_roleless_commit: Vec<RenderableSurfaceSnapshot>,
     pub(in crate::compositor::tests) after_relationship: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) before_parent_commit: Vec<RenderableSurfaceSnapshot>,
     pub(in crate::compositor::tests) after_adoption: Vec<RenderableSurfaceSnapshot>,
 }
 

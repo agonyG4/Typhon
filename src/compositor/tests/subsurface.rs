@@ -27,6 +27,29 @@ fn new_subsurface_pending_stack_preserves_existing_restack() {
 }
 
 #[test]
+fn pending_sibling_is_a_valid_restack_reference_before_application() {
+    let mut state = CompositorState::default();
+    assert!(state.subsurface_transactions.register(2, 1));
+    assert!(state.subsurface_transactions.register(3, 1));
+    state.pending_subsurface_stacks.insert(1, vec![1, 3, 2]);
+
+    assert!(state.restack_subsurface(2, 1, 3, false));
+    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 2, 3]);
+}
+
+#[test]
+fn registering_subsurface_does_not_change_committed_stack() {
+    let mut state = CompositorState::default();
+    state.committed_subsurface_stacks.insert(1, vec![1, 2, 3]);
+
+    assert!(state.subsurface_transactions.register(4, 1));
+    state.add_subsurface_to_pending_stack(1, 4);
+
+    assert_eq!(state.committed_subsurface_stacks[&1], vec![1, 2, 3]);
+    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 2, 3, 4]);
+}
+
+#[test]
 fn wayland_client_can_create_subsurface_on_oblivion_server() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -92,7 +115,7 @@ fn subsurface_committed_before_parent_stays_above_parent_when_parent_maps() {
 }
 
 #[test]
-fn gecko_pre_role_surface_is_adopted_as_single_subsurface_node() {
+fn gecko_pre_role_surface_waits_for_parent_commit_before_adoption() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -107,6 +130,12 @@ fn gecko_pre_role_surface_is_adopted_as_single_subsurface_node() {
             .after_relationship
             .iter()
             .all(|surface| { surface.width != 1 || surface.height != 1 })
+    );
+    assert!(
+        snapshots
+            .before_parent_commit
+            .iter()
+            .all(|surface| { surface.width != 1920 || surface.height != 1080 })
     );
     let parent = snapshots
         .after_adoption
@@ -707,4 +736,23 @@ fn wayland_surface_attach_null_unmaps_nested_subsurface_tree() {
     let server = stop_test_server(running, server_thread);
 
     assert!(server.renderable_surfaces().is_empty());
+}
+
+#[test]
+fn parent_null_commit_applies_pending_subsurface_without_discarding_current_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshot =
+        capture_pending_subsurface_activation_across_parent_null(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        snapshot
+            .iter()
+            .any(|surface| (surface.width, surface.height) == (5, 5)),
+        "the retained child should map when the parent becomes mapped again"
+    );
 }

@@ -2726,3 +2726,41 @@ pub(in crate::compositor::tests) fn create_toplevel_with_nested_subsurfaces_then
     queue.roundtrip(&mut RegistryTestState::default())?;
     Ok(())
 }
+
+pub(in crate::compositor::tests) fn capture_pending_subsurface_activation_across_parent_null(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<Vec<RenderableSurfaceSnapshot>, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    parent.attach(None, 0, 0);
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    wait_for_server_commands(commands);
+    Ok(capture_renderable_surface_snapshot(commands))
+}

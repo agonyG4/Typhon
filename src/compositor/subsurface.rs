@@ -42,7 +42,30 @@ pub(super) enum SubsurfaceSyncMode {
 pub(super) enum SubsurfaceRelationshipPhase {
     PendingParentCommit,
     Latched,
-    Active,
+    Applied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct SubsurfaceRelationshipId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct CapturedSubsurfaceRelationship {
+    pub(super) surface_id: u32,
+    pub(super) parent_id: u32,
+    pub(super) relationship_id: SubsurfaceRelationshipId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CapturedSubsurfacePosition {
+    pub(super) relationship: CapturedSubsurfaceRelationship,
+    pub(super) x: i32,
+    pub(super) y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CapturedSubsurfaceStackEntry {
+    Parent,
+    Child(CapturedSubsurfaceRelationship),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -289,9 +312,9 @@ fn merge_pointer_constraint_hint(
 
 #[derive(Debug, Default)]
 pub(super) struct CapturedSubsurfaceParentState {
-    pub(super) activations: Vec<u32>,
-    pub(super) positions: Vec<(u32, i32, i32)>,
-    pub(super) stack: Option<Vec<u32>>,
+    pub(super) activations: Vec<CapturedSubsurfaceRelationship>,
+    pub(super) positions: Vec<CapturedSubsurfacePosition>,
+    pub(super) stack: Option<Vec<CapturedSubsurfaceStackEntry>>,
 }
 
 #[derive(Debug, Default)]
@@ -302,22 +325,21 @@ pub(super) struct CapturedSurfaceCommitContext {
 
 impl CapturedSurfaceCommitContext {
     pub(super) fn merge(&mut self, newer: Self) {
-        for surface_id in newer.subsurface_parent.activations {
-            if !self.subsurface_parent.activations.contains(&surface_id) {
-                self.subsurface_parent.activations.push(surface_id);
+        for relationship in newer.subsurface_parent.activations {
+            if !self.subsurface_parent.activations.contains(&relationship) {
+                self.subsurface_parent.activations.push(relationship);
             }
         }
-        for (surface_id, x, y) in newer.subsurface_parent.positions {
-            if let Some((_, current_x, current_y)) = self
+        for position in newer.subsurface_parent.positions {
+            if let Some(current) = self
                 .subsurface_parent
                 .positions
                 .iter_mut()
-                .find(|(current_surface_id, _, _)| *current_surface_id == surface_id)
+                .find(|current| current.relationship == position.relationship)
             {
-                *current_x = x;
-                *current_y = y;
+                *current = position;
             } else {
-                self.subsurface_parent.positions.push((surface_id, x, y));
+                self.subsurface_parent.positions.push(position);
             }
         }
         if newer.subsurface_parent.stack.is_some() {
@@ -591,21 +613,52 @@ where
 mod commit_context_tests {
     use super::*;
 
+    fn relationship(surface_id: u32, relationship_id: u64) -> CapturedSubsurfaceRelationship {
+        CapturedSubsurfaceRelationship {
+            surface_id,
+            parent_id: 1,
+            relationship_id: SubsurfaceRelationshipId(relationship_id),
+        }
+    }
+
     #[test]
     fn captured_context_merges_parent_state_chronologically() {
         let mut older = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
-                activations: vec![10],
-                positions: vec![(10, 10, 10), (20, 20, 20)],
-                stack: Some(vec![1, 10, 20]),
+                activations: vec![relationship(10, 1)],
+                positions: vec![
+                    CapturedSubsurfacePosition {
+                        relationship: relationship(10, 1),
+                        x: 10,
+                        y: 10,
+                    },
+                    CapturedSubsurfacePosition {
+                        relationship: relationship(20, 2),
+                        x: 20,
+                        y: 20,
+                    },
+                ],
+                stack: Some(vec![
+                    CapturedSubsurfaceStackEntry::Parent,
+                    CapturedSubsurfaceStackEntry::Child(relationship(10, 1)),
+                    CapturedSubsurfaceStackEntry::Child(relationship(20, 2)),
+                ]),
             },
             layer_surface: None,
         };
         let newer = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
-                activations: vec![20],
-                positions: vec![(10, 30, 30)],
-                stack: Some(vec![1, 20, 10]),
+                activations: vec![relationship(20, 2)],
+                positions: vec![CapturedSubsurfacePosition {
+                    relationship: relationship(10, 1),
+                    x: 30,
+                    y: 30,
+                }],
+                stack: Some(vec![
+                    CapturedSubsurfaceStackEntry::Parent,
+                    CapturedSubsurfaceStackEntry::Child(relationship(20, 2)),
+                    CapturedSubsurfaceStackEntry::Child(relationship(10, 1)),
+                ]),
             },
             layer_surface: None,
         };
@@ -614,24 +667,45 @@ mod commit_context_tests {
 
         assert_eq!(
             older.subsurface_parent.positions,
-            vec![(10, 30, 30), (20, 20, 20)]
+            vec![
+                CapturedSubsurfacePosition {
+                    relationship: relationship(10, 1),
+                    x: 30,
+                    y: 30,
+                },
+                CapturedSubsurfacePosition {
+                    relationship: relationship(20, 2),
+                    x: 20,
+                    y: 20,
+                },
+            ]
         );
-        assert_eq!(older.subsurface_parent.stack, Some(vec![1, 20, 10]));
-        assert_eq!(older.subsurface_parent.activations, vec![10, 20]);
+        assert_eq!(
+            older.subsurface_parent.stack,
+            Some(vec![
+                CapturedSubsurfaceStackEntry::Parent,
+                CapturedSubsurfaceStackEntry::Child(relationship(20, 2)),
+                CapturedSubsurfaceStackEntry::Child(relationship(10, 1)),
+            ])
+        );
+        assert_eq!(
+            older.subsurface_parent.activations,
+            vec![relationship(10, 1), relationship(20, 2)]
+        );
     }
 
     #[test]
     fn captured_context_merge_preserves_older_activations_without_duplicates() {
         let mut older = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
-                activations: vec![10],
+                activations: vec![relationship(10, 1)],
                 ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
         };
         let newer = CapturedSurfaceCommitContext {
             subsurface_parent: CapturedSubsurfaceParentState {
-                activations: vec![10, 20],
+                activations: vec![relationship(10, 1), relationship(20, 2)],
                 ..CapturedSubsurfaceParentState::default()
             },
             layer_surface: None,
@@ -639,7 +713,61 @@ mod commit_context_tests {
 
         older.merge(newer);
 
-        assert_eq!(older.subsurface_parent.activations, vec![10, 20]);
+        assert_eq!(
+            older.subsurface_parent.activations,
+            vec![relationship(10, 1), relationship(20, 2)]
+        );
+    }
+
+    #[test]
+    fn captured_context_merge_keeps_recreated_surface_relationships_distinct() {
+        let mut older = CapturedSurfaceCommitContext {
+            subsurface_parent: CapturedSubsurfaceParentState {
+                activations: vec![relationship(10, 1)],
+                positions: vec![CapturedSubsurfacePosition {
+                    relationship: relationship(10, 1),
+                    x: 1,
+                    y: 2,
+                }],
+                stack: Some(vec![
+                    CapturedSubsurfaceStackEntry::Parent,
+                    CapturedSubsurfaceStackEntry::Child(relationship(10, 1)),
+                ]),
+                ..CapturedSubsurfaceParentState::default()
+            },
+            layer_surface: None,
+        };
+        let newer = CapturedSurfaceCommitContext {
+            subsurface_parent: CapturedSubsurfaceParentState {
+                activations: vec![relationship(10, 2)],
+                positions: vec![CapturedSubsurfacePosition {
+                    relationship: relationship(10, 2),
+                    x: 3,
+                    y: 4,
+                }],
+                stack: Some(vec![
+                    CapturedSubsurfaceStackEntry::Parent,
+                    CapturedSubsurfaceStackEntry::Child(relationship(10, 2)),
+                ]),
+                ..CapturedSubsurfaceParentState::default()
+            },
+            layer_surface: None,
+        };
+
+        older.merge(newer);
+
+        assert_eq!(
+            older.subsurface_parent.activations,
+            vec![relationship(10, 1), relationship(10, 2)]
+        );
+        assert_eq!(older.subsurface_parent.positions.len(), 2);
+        assert_eq!(
+            older.subsurface_parent.stack,
+            Some(vec![
+                CapturedSubsurfaceStackEntry::Parent,
+                CapturedSubsurfaceStackEntry::Child(relationship(10, 2)),
+            ])
+        );
     }
 }
 
@@ -648,7 +776,7 @@ mod relationship_phase_tests {
     use super::*;
 
     #[test]
-    fn relationship_activation_follows_pending_latched_active_lifecycle() {
+    fn relationship_activation_follows_pending_latched_applied_lifecycle() {
         let mut transactions = SubsurfaceTransactionState::default();
 
         assert!(transactions.register(2, 1));
@@ -657,11 +785,12 @@ mod relationship_phase_tests {
             Some(SubsurfaceRelationshipPhase::PendingParentCommit)
         );
         assert!(transactions.relationship_is_registered_child_of(2, 1));
-        assert!(!transactions.relationship_is_active_child_of(2, 1));
+        assert!(!transactions.relationship_is_applied_child_of(2, 1));
 
+        let captured = transactions.captured_relationship(2).unwrap();
         assert_eq!(
             transactions.take_pending_relationship_activations_for_parent(1),
-            vec![2]
+            vec![captured]
         );
         assert_eq!(
             transactions.relationship_phase(2),
@@ -673,12 +802,21 @@ mod relationship_phase_tests {
                 .is_empty()
         );
 
-        assert!(transactions.activate_relationship(2, 1));
+        assert!(transactions.apply_captured_relationship(captured));
         assert_eq!(
             transactions.relationship_phase(2),
-            Some(SubsurfaceRelationshipPhase::Active)
+            Some(SubsurfaceRelationshipPhase::Applied)
         );
-        assert!(transactions.relationship_is_active_child_of(2, 1));
+        assert!(transactions.relationship_is_applied_child_of(2, 1));
+    }
+
+    #[test]
+    fn relationship_id_allocation_fails_without_wrapping() {
+        let mut transactions = SubsurfaceTransactionState::default();
+        transactions.next_relationship_id = u64::MAX;
+
+        assert!(!transactions.register(2, 1));
+        assert_eq!(transactions.relationship_phase(2), None);
     }
 
     #[test]
@@ -687,13 +825,15 @@ mod relationship_phase_tests {
         assert!(transactions.register(2, 1));
         assert!(transactions.register(3, 2));
 
+        let child = transactions.captured_relationship(2).unwrap();
+        let grandchild = transactions.captured_relationship(3).unwrap();
         assert_eq!(
             transactions.take_pending_relationship_activations_for_parent(1),
-            vec![2]
+            vec![child]
         );
         assert_eq!(
             transactions.take_pending_relationship_activations_for_parent(2),
-            vec![3]
+            vec![grandchild]
         );
     }
 
@@ -706,20 +846,51 @@ mod relationship_phase_tests {
         assert_eq!(transactions.relationship_phase(2), None);
 
         assert!(transactions.register(3, 1));
-        let captured = transactions.take_pending_relationship_activations_for_parent(1);
-        assert_eq!(captured, vec![3]);
-        assert!(transactions.remove_role(3).is_empty());
-        assert_eq!(transactions.relationship_phase(3), None);
-        assert!(!transactions.relationship_is_registered_child_of(captured[0], 1));
-
-        assert!(transactions.register(4, 1));
+        let captured = transactions.captured_relationship(3).unwrap();
         assert_eq!(
             transactions.take_pending_relationship_activations_for_parent(1),
-            vec![4]
+            vec![captured]
         );
-        assert!(transactions.activate_relationship(4, 1));
+        assert!(transactions.remove_role(3).is_empty());
+        assert_eq!(transactions.relationship_phase(3), None);
+        assert!(!transactions.relationship_matches(captured));
+
+        assert!(transactions.register(4, 1));
+        let captured = transactions.captured_relationship(4).unwrap();
+        assert_eq!(
+            transactions.take_pending_relationship_activations_for_parent(1),
+            vec![captured]
+        );
+        assert!(transactions.apply_captured_relationship(captured));
         assert!(transactions.remove_role(4).is_empty());
         assert_eq!(transactions.relationship_phase(4), None);
+    }
+
+    #[test]
+    fn relationship_ids_are_monotonic_and_stale_captures_are_rejected() {
+        let mut transactions = SubsurfaceTransactionState::default();
+
+        assert!(transactions.register(2, 1));
+        let first = transactions.captured_relationship(2).unwrap();
+        assert_eq!(
+            transactions.take_pending_relationship_activations_for_parent(1),
+            vec![first]
+        );
+        assert!(transactions.remove_role(2).is_empty());
+
+        assert!(transactions.register(2, 1));
+        let second = transactions.captured_relationship(2).unwrap();
+        assert_ne!(first.relationship_id, second.relationship_id);
+        assert!(!transactions.apply_captured_relationship(first));
+        assert_eq!(
+            transactions.relationship_phase(2),
+            Some(SubsurfaceRelationshipPhase::PendingParentCommit)
+        );
+        assert_eq!(
+            transactions.take_pending_relationship_activations_for_parent(1),
+            vec![second]
+        );
+        assert!(transactions.apply_captured_relationship(second));
     }
 }
 
@@ -1076,6 +1247,7 @@ mod window_geometry_tests {
 
 #[derive(Debug)]
 struct SubsurfaceRoleState {
+    relationship_id: SubsurfaceRelationshipId,
     parent_id: u32,
     client_id: Option<ClientId>,
     requested_mode: SubsurfaceSyncMode,
@@ -1087,6 +1259,7 @@ struct SubsurfaceRoleState {
 #[derive(Debug, Default)]
 pub(super) struct SubsurfaceTransactionState {
     roles: HashMap<u32, SubsurfaceRoleState>,
+    next_relationship_id: u64,
     cached_entries_per_surface: HashMap<u32, usize>,
     cached_obligations_per_surface: HashMap<u32, usize>,
     cached_entries_per_client: HashMap<ClientId, usize>,
@@ -1124,9 +1297,14 @@ impl SubsurfaceTransactionState {
             }
             ancestor = self.roles.get(&id).map(|role| role.parent_id);
         }
+        let Some(next_relationship_id) = self.next_relationship_id.checked_add(1) else {
+            return false;
+        };
+        self.next_relationship_id = next_relationship_id;
         self.roles.insert(
             surface_id,
             SubsurfaceRoleState {
+                relationship_id: SubsurfaceRelationshipId(next_relationship_id),
                 parent_id,
                 client_id,
                 requested_mode: SubsurfaceSyncMode::Synchronized,
@@ -1214,6 +1392,40 @@ impl SubsurfaceTransactionState {
             .map(|role| role.relationship_phase)
     }
 
+    pub(super) fn captured_relationship(
+        &self,
+        surface_id: u32,
+    ) -> Option<CapturedSubsurfaceRelationship> {
+        self.roles
+            .get(&surface_id)
+            .map(|role| CapturedSubsurfaceRelationship {
+                surface_id,
+                parent_id: role.parent_id,
+                relationship_id: role.relationship_id,
+            })
+    }
+
+    pub(super) fn relationship_matches(
+        &self,
+        relationship: CapturedSubsurfaceRelationship,
+    ) -> bool {
+        self.roles
+            .get(&relationship.surface_id)
+            .is_some_and(|role| {
+                role.parent_id == relationship.parent_id
+                    && role.relationship_id == relationship.relationship_id
+            })
+    }
+
+    pub(super) fn relationship_is_applied(
+        &self,
+        relationship: CapturedSubsurfaceRelationship,
+    ) -> bool {
+        self.relationship_matches(relationship)
+            && self.relationship_phase(relationship.surface_id)
+                == Some(SubsurfaceRelationshipPhase::Applied)
+    }
+
     pub(super) fn relationship_is_registered_child_of(
         &self,
         surface_id: u32,
@@ -1224,50 +1436,60 @@ impl SubsurfaceTransactionState {
             .is_some_and(|role| role.parent_id == parent_id)
     }
 
-    pub(super) fn relationship_is_active_child_of(&self, surface_id: u32, parent_id: u32) -> bool {
+    pub(super) fn relationship_is_applied_child_of(&self, surface_id: u32, parent_id: u32) -> bool {
         self.roles.get(&surface_id).is_some_and(|role| {
             role.parent_id == parent_id
-                && role.relationship_phase == SubsurfaceRelationshipPhase::Active
+                && role.relationship_phase == SubsurfaceRelationshipPhase::Applied
         })
     }
 
     pub(super) fn take_pending_relationship_activations_for_parent(
         &mut self,
         parent_id: u32,
-    ) -> Vec<u32> {
-        self.roles
+    ) -> Vec<CapturedSubsurfaceRelationship> {
+        let mut activations = self
+            .roles
             .iter_mut()
             .filter_map(|(surface_id, role)| {
                 (role.parent_id == parent_id
                     && role.relationship_phase == SubsurfaceRelationshipPhase::PendingParentCommit)
                     .then(|| {
                         role.relationship_phase = SubsurfaceRelationshipPhase::Latched;
-                        *surface_id
+                        CapturedSubsurfaceRelationship {
+                            surface_id: *surface_id,
+                            parent_id,
+                            relationship_id: role.relationship_id,
+                        }
                     })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        activations.sort_by_key(|relationship| relationship.relationship_id);
+        activations
     }
 
-    pub(super) fn activate_relationship(&mut self, surface_id: u32, parent_id: u32) -> bool {
-        if self.relationship_phase(surface_id) != Some(SubsurfaceRelationshipPhase::Latched) {
-            return false;
-        }
-        let Some(role) = self.roles.get_mut(&surface_id) else {
+    pub(super) fn apply_captured_relationship(
+        &mut self,
+        relationship: CapturedSubsurfaceRelationship,
+    ) -> bool {
+        let Some(role) = self.roles.get_mut(&relationship.surface_id) else {
             return false;
         };
-        if role.parent_id != parent_id {
+        if role.parent_id != relationship.parent_id
+            || role.relationship_id != relationship.relationship_id
+            || role.relationship_phase != SubsurfaceRelationshipPhase::Latched
+        {
             return false;
         }
-        role.relationship_phase = SubsurfaceRelationshipPhase::Active;
+        role.relationship_phase = SubsurfaceRelationshipPhase::Applied;
         true
     }
 
-    pub(super) fn active_children_of(&self, parent_id: u32) -> Vec<u32> {
+    pub(super) fn applied_children_of(&self, parent_id: u32) -> Vec<u32> {
         self.roles
             .iter()
             .filter_map(|(surface_id, role)| {
                 (role.parent_id == parent_id
-                    && role.relationship_phase == SubsurfaceRelationshipPhase::Active)
+                    && role.relationship_phase == SubsurfaceRelationshipPhase::Applied)
                     .then_some(*surface_id)
             })
             .collect()
@@ -1563,17 +1785,47 @@ impl SubsurfaceTransactionState {
     pub(super) fn take_pending_positions_for_parent(
         &mut self,
         parent_id: u32,
-    ) -> Vec<(u32, i32, i32)> {
-        self.roles
+    ) -> Vec<CapturedSubsurfacePosition> {
+        let mut positions = self
+            .roles
             .iter_mut()
             .filter_map(|(surface_id, role)| {
                 (role.parent_id == parent_id)
                     .then(|| {
                         role.pending_position
                             .take()
-                            .map(|(x, y)| (*surface_id, x, y))
+                            .map(|(x, y)| CapturedSubsurfacePosition {
+                                relationship: CapturedSubsurfaceRelationship {
+                                    surface_id: *surface_id,
+                                    parent_id,
+                                    relationship_id: role.relationship_id,
+                                },
+                                x,
+                                y,
+                            })
                     })
                     .flatten()
+            })
+            .collect::<Vec<_>>();
+        positions.sort_by_key(|position| position.relationship.relationship_id);
+        positions
+    }
+
+    pub(super) fn capture_subsurface_stack(
+        &self,
+        parent_id: u32,
+        stack: Vec<u32>,
+    ) -> Vec<CapturedSubsurfaceStackEntry> {
+        stack
+            .into_iter()
+            .filter_map(|surface_id| {
+                if surface_id == parent_id {
+                    Some(CapturedSubsurfaceStackEntry::Parent)
+                } else {
+                    self.captured_relationship(surface_id)
+                        .filter(|relationship| relationship.parent_id == parent_id)
+                        .map(CapturedSubsurfaceStackEntry::Child)
+                }
             })
             .collect()
     }

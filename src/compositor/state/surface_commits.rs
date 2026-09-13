@@ -337,7 +337,7 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Materialized(materialized),
         );
-        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         if let Some(release) = shm_release {
@@ -645,7 +645,7 @@ impl CompositorState {
         explicit_sync: Option<CapturedExplicitSyncState>,
         window_geometry: Option<XdgWindowGeometry>,
         layer_surface: Option<CapturedLayerSurfaceCommitState>,
-    ) {
+    ) -> bool {
         pending.commit_sequence = commit_sequence;
         if !self.is_cursor_surface(surface_id) {
             let pending_surface_size = pending.surface_size.or_else(|| {
@@ -660,13 +660,13 @@ impl CompositorState {
                     self.release_pending_surface_buffer(pending);
                     self.complete_frame_callbacks(frame_callbacks);
                     self.discard_presentation_feedbacks(presentation_feedbacks);
-                    return;
+                    return false;
                 }
             } else if self.layer_surfaces.contains_key(&surface_id) {
                 self.release_pending_surface_buffer(pending);
                 self.complete_frame_callbacks(frame_callbacks);
                 self.discard_presentation_feedbacks(presentation_feedbacks);
-                return;
+                return false;
             }
             if self.xdg_surface_is_configured(surface_id) {
                 self.mark_xdg_buffer_commit(surface_id);
@@ -686,7 +686,7 @@ impl CompositorState {
             ));
             callbacks.extend(frame_callbacks);
             self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
-            self.commit_surface_buffer_by_role(
+            return self.commit_surface_buffer_by_role(
                 surface_id,
                 pending,
                 damage,
@@ -695,7 +695,6 @@ impl CompositorState {
                 source,
                 window_geometry,
             );
-            return;
         };
 
         if !pending.data.is_dmabuf() {
@@ -707,7 +706,7 @@ impl CompositorState {
                 "explicit sync is only supported for linux-dmabuf buffers",
             );
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         }
 
         let Some(acquire) = acquire else {
@@ -719,7 +718,7 @@ impl CompositorState {
                 "dmabuf commit is missing an acquire timeline point",
             );
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         };
         let Some(release) = release else {
             sync_state.post_error_with_metrics(
@@ -730,7 +729,7 @@ impl CompositorState {
                 "dmabuf commit is missing a release timeline point",
             );
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         };
 
         if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
@@ -742,7 +741,7 @@ impl CompositorState {
                 "acquire timeline point must be lower than release point on the same timeline",
             );
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         }
 
         pending.explicit_release = Some(release);
@@ -764,7 +763,7 @@ impl CompositorState {
                         "explicit sync commit identity space exhausted",
                     );
                     self.discard_presentation_feedbacks(presentation_feedbacks);
-                    return;
+                    return false;
                 };
                 let Some((owner_client_id, surface_presentation_generation)) =
                     self.capture_surface_publication_lifetime(surface_id)
@@ -772,7 +771,7 @@ impl CompositorState {
                     self.release_pending_surface_buffer(pending);
                     self.complete_frame_callbacks(frame_callbacks);
                     self.discard_presentation_feedbacks(presentation_feedbacks);
-                    return;
+                    return false;
                 };
                 self.finalize_pending_buffer_resize_capture(
                     surface_id,
@@ -803,7 +802,7 @@ impl CompositorState {
                         <= 3
                 );
                 self.commit_ready_explicit_sync_buffers();
-                return;
+                return true;
             }
             let mut callbacks =
                 self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
@@ -813,7 +812,7 @@ impl CompositorState {
             ));
             callbacks.extend(frame_callbacks);
             self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
-            self.commit_surface_buffer_by_role(
+            return self.commit_surface_buffer_by_role(
                 surface_id,
                 pending,
                 damage,
@@ -822,7 +821,6 @@ impl CompositorState {
                 source,
                 window_geometry,
             );
-            return;
         }
 
         let Some(commit_id) = self.acquire_commit_ids.allocate() else {
@@ -834,7 +832,7 @@ impl CompositorState {
                 "explicit sync commit identity space exhausted",
             );
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         };
         let mut callbacks =
             self.retain_oldest_pending_acquire_for_surface(surface_id, surface_commit_id);
@@ -845,7 +843,7 @@ impl CompositorState {
             self.release_pending_surface_buffer(pending);
             self.complete_frame_callbacks(callbacks);
             self.discard_presentation_feedbacks(presentation_feedbacks);
-            return;
+            return false;
         };
         self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
         let buffer_id = pending.resource.id().protocol_id();
@@ -931,6 +929,7 @@ impl CompositorState {
                     received_at,
                 }));
         }
+        true
     }
 
     pub(in crate::compositor) fn commit_surface_without_buffer(
@@ -1569,7 +1568,7 @@ impl CompositorState {
             surface_id,
             CurrentSurfaceBuffer::Unmaterialized(pending),
         );
-        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         self.note_xwayland_buffer_ready(surface_id);
@@ -1642,8 +1641,10 @@ impl CompositorState {
         ) {
             return false;
         }
-        if let SurfaceRole::Subsurface { parent_id } = self.surface_role(surface_id)
-            && !self.current_surface_buffers.contains_key(&parent_id)
+        if matches!(
+            self.surface_role(surface_id),
+            SurfaceRole::Subsurface { .. }
+        ) && !self.subsurface_can_map(surface_id)
         {
             return false;
         }
@@ -1713,7 +1714,7 @@ impl CompositorState {
             generation,
             RenderGenerationCause::SurfaceCommit,
         );
-        for child_id in self.subsurface_transactions.active_children_of(surface_id) {
+        for child_id in self.subsurface_transactions.applied_children_of(surface_id) {
             self.adopt_current_surface_content_for_role(child_id);
         }
         if surface_tree_debug_enabled() {
@@ -1733,39 +1734,41 @@ impl CompositorState {
         presentation_feedbacks: Vec<PendingPresentationFeedback>,
         source: SurfacePublicationSource,
         window_geometry: Option<XdgWindowGeometry>,
-    ) {
+    ) -> bool {
         let commit_sequence = pending.commit_sequence;
-        let activated = match self.surface_role(surface_id) {
-            SurfaceRole::Cursor => {
-                self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks)
-            }
-            SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
-                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source)
-            }
-            SurfaceRole::Xwayland => {
-                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source)
-            }
+        let (accepted, activated) = match self.surface_role(surface_id) {
+            SurfaceRole::Cursor => (
+                true,
+                self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks),
+            ),
+            SurfaceRole::Unassigned | SurfaceRole::DragIcon => (
+                true,
+                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source),
+            ),
+            SurfaceRole::Xwayland => (
+                true,
+                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source),
+            ),
             SurfaceRole::XdgToplevel
             | SurfaceRole::XdgPopup
             | SurfaceRole::LayerSurface
             | SurfaceRole::Subsurface { .. } => {
-                if self.subsurface_content_is_inactive(surface_id) {
-                    self.retain_inactive_subsurface_buffer(
-                        surface_id,
-                        pending,
-                        frame_callbacks,
-                        source,
-                    );
-                    false
-                } else {
-                    let commit_sequence = pending.commit_sequence;
-                    let buffer_id = pending.data.buffer_id();
-                    match self.surface_publication_decision(
-                        surface_id,
-                        commit_sequence,
-                        source.publication_context(),
-                    ) {
-                        SurfacePublicationDecision::Publish => {
+                let buffer_id = pending.data.buffer_id();
+                match self.surface_publication_decision(
+                    surface_id,
+                    commit_sequence,
+                    source.publication_context(),
+                ) {
+                    SurfacePublicationDecision::Publish => {
+                        if self.subsurface_content_is_inactive(surface_id) {
+                            self.retain_inactive_subsurface_buffer(
+                                surface_id,
+                                pending,
+                                frame_callbacks,
+                                source,
+                            );
+                            (true, false)
+                        } else {
                             let activated = self.commit_surface_buffer(
                                 surface_id,
                                 pending,
@@ -1775,20 +1778,20 @@ impl CompositorState {
                             );
                             self.note_layer_surface_buffer_published(surface_id);
                             self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
-                            activated
+                            (true, activated)
                         }
-                        decision => {
-                            self.record_surface_publication_rejection(
-                                surface_id,
-                                commit_sequence,
-                                Some(buffer_id),
-                                source,
-                                decision,
-                            );
-                            self.release_pending_surface_buffer(pending);
-                            self.complete_frame_callbacks(frame_callbacks);
-                            false
-                        }
+                    }
+                    decision => {
+                        self.record_surface_publication_rejection(
+                            surface_id,
+                            commit_sequence,
+                            Some(buffer_id),
+                            source,
+                            decision,
+                        );
+                        self.release_pending_surface_buffer(pending);
+                        self.complete_frame_callbacks(frame_callbacks);
+                        (false, false)
                     }
                 }
             }
@@ -1811,5 +1814,6 @@ impl CompositorState {
         } else {
             self.discard_presentation_feedbacks(presentation_feedbacks);
         }
+        accepted
     }
 }

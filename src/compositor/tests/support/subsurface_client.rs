@@ -228,6 +228,10 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
     subsurface.set_position(10, 10);
     subsurface.set_desync();
     commit_test_buffered_surface(&child, &shm, &qh, 1972, 1132)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let before_parent_commit = capture_renderable_surface_snapshot(commands);
+
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;
@@ -236,6 +240,7 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
     Ok(GeckoPreRoleAdoptionSnapshots {
         after_roleless_commit,
         after_relationship,
+        before_parent_commit,
         after_adoption,
     })
 }
