@@ -692,10 +692,9 @@ pub(crate) fn update_cursor_output_arbitration(
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCursorOutputArbitration, NativeCursorRenderMode, NativeCursorSchedulingPolicy,
-        NativeFrameRenderer, NativeInputState, NativeSceneSnapshot, ResolvedNativeFrameScene,
-        finalize_snapshot, plane_delta_allowed_at_deadline, reset_snapshot_work_counters,
-        snapshot_work_counters, visibility_signature,
+        NativeCursorOutputArbitration, NativeCursorRenderMode, NativeFrameRenderer,
+        NativeInputState, NativeSceneSnapshot, ResolvedNativeFrameScene, finalize_snapshot,
+        reset_snapshot_work_counters, snapshot_work_counters, visibility_signature,
     };
     use oblivion_one::compositor::{
         AnimationTime, FullscreenRenderPlanMetrics, PresentationRect, RenderableSurface,
@@ -1030,33 +1029,6 @@ mod tests {
         assert_eq!(arbitration.deadline_ns(), Some(200));
 
         arbitration.consume_submitted_epoch(11, 220, 300);
-        assert!(!arbitration.pending());
-    }
-
-    #[test]
-    fn continuous_move_keeps_cursor_traffic_from_consuming_primary_opportunities() {
-        let mut arbitration = NativeCursorOutputArbitration::default();
-
-        for epoch in 1..=1_024 {
-            arbitration.request_hardware(epoch, epoch, epoch.saturating_add(1));
-            assert!(!plane_delta_allowed_at_deadline(
-                &mut arbitration,
-                NativeCursorSchedulingPolicy::Auto,
-                epoch.saturating_add(1),
-                true,
-                true,
-                true,
-            ));
-            assert_eq!(
-                arbitration.disposition(epoch.saturating_add(1), true, true),
-                super::NativeCursorOutputDisposition::PiggybackPrimary
-            );
-            arbitration.consume(epoch);
-        }
-
-        assert_eq!(arbitration.cursor_state_piggybacked(), 1_024);
-        assert_eq!(arbitration.plane_delta_submissions(), 0);
-        assert_eq!(arbitration.plane_delta_deferred_for_primary(), 0);
         assert!(!arbitration.pending());
     }
 }

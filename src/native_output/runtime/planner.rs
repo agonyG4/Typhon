@@ -382,7 +382,10 @@ pub(crate) fn plan_native_presentation_path(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{NativeCursorOutputArbitration, NativeCursorOutputDisposition};
+    use super::super::frame::plane_delta_allowed_at_deadline;
+    use super::super::{
+        NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorSchedulingPolicy,
+    };
     use crate::native_output::{NativeScanoutKind, runtime::NativeCursorPreference};
     use oblivion_one::native::kms::{
         AtomicKmsError, AtomicKmsErrorKind, KmsBackendKind, KmsPolicy,
@@ -693,6 +696,33 @@ mod tests {
             NativeCursorOutputDisposition::PiggybackPrimary
         );
         arbitration.consume(1);
+        assert!(!arbitration.pending());
+    }
+
+    #[test]
+    fn continuous_move_keeps_cursor_traffic_from_consuming_primary_opportunities() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+
+        for epoch in 1..=1_024 {
+            arbitration.request_hardware(epoch, epoch, epoch.saturating_add(1));
+            assert!(!plane_delta_allowed_at_deadline(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                epoch.saturating_add(1),
+                true,
+                true,
+                true,
+            ));
+            assert_eq!(
+                arbitration.disposition(epoch.saturating_add(1), true, true),
+                NativeCursorOutputDisposition::PiggybackPrimary
+            );
+            arbitration.consume(epoch);
+        }
+
+        assert_eq!(arbitration.cursor_state_piggybacked(), 1_024);
+        assert_eq!(arbitration.plane_delta_submissions(), 0);
+        assert_eq!(arbitration.plane_delta_deferred_for_primary(), 0);
         assert!(!arbitration.pending());
     }
 
