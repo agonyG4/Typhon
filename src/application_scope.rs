@@ -72,10 +72,11 @@ pub enum ApplicationScopeSupport {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationScopeLaunchMode {
     Direct,
     ScopeHelper,
+    DirectFallback { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,12 +240,37 @@ where
     }
 }
 
-fn scope_unit_name(pid: u32, counter: u64) -> String {
-    let name = format!("app-typhon-{pid}-{counter}.scope");
+fn scope_unit_name(pid: u32, start_time: Option<u64>) -> String {
+    let identity = start_time
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let name = format!("app-typhon-{pid}-{identity}.scope");
     if name.len() <= MAX_UNIT_NAME_BYTES {
         return name;
     }
-    format!("app-typhon-{pid:x}-{counter:x}.scope")
+    let identity = start_time
+        .map(|value| format!("{value:x}"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let compact = format!("app-typhon-{pid:x}-{identity}.scope");
+    if compact.len() <= MAX_UNIT_NAME_BYTES {
+        return compact;
+    }
+    "app-typhon-unknown.scope".to_owned()
+}
+
+fn parse_scope_process_start_time(contents: &str) -> Option<u64> {
+    let close_paren = contents.rfind(')')?;
+    contents[close_paren + 1..]
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn current_process_start_time() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|contents| parse_scope_process_start_time(&contents))
 }
 
 fn wrap_application_argv(
@@ -300,10 +326,11 @@ fn application_scope_launch_plan_with_executable(
             mode: ApplicationScopeLaunchMode::ScopeHelper,
         },
         Err(error) => {
+            let reason = bounded_string(error.to_string(), 192);
             eprintln!("application scope preparation unavailable; launching directly: {error}");
             ApplicationScopeLaunchPlan {
                 argv: real_argv.to_vec(),
-                mode: ApplicationScopeLaunchMode::Direct,
+                mode: ApplicationScopeLaunchMode::DirectFallback { reason },
             }
         }
     }
@@ -314,8 +341,13 @@ pub fn prepare_application_spawn(
     plan: &ApplicationScopeLaunchPlan,
 ) -> io::Result<SpawnCommand> {
     poll_status();
-    if plan.mode == ApplicationScopeLaunchMode::Direct {
-        return Ok(SpawnCommand::new(command));
+    match &plan.mode {
+        ApplicationScopeLaunchMode::Direct => return Ok(SpawnCommand::new(command)),
+        ApplicationScopeLaunchMode::DirectFallback { reason } => {
+            record_planning_fallback(reason);
+            return Ok(SpawnCommand::new(command));
+        }
+        ApplicationScopeLaunchMode::ScopeHelper => {}
     }
 
     let mut state = diagnostics()
@@ -382,7 +414,7 @@ pub fn run_internal_scope_exec(args: &[String]) -> Result<Infallible, ScopeError
 
     if ApplicationScopePolicy::from_env() != ApplicationScopePolicy::Off {
         let pid = std::process::id();
-        let unit_name = scope_unit_name(pid, next_scope_counter());
+        let unit_name = scope_unit_name(pid, current_process_start_time());
         let outcome = establish_scope(
             UserSystemdRegistrar,
             &unit_name,
@@ -533,6 +565,8 @@ fn drain_status_readers(state: &mut Diagnostics) {
         let mut buffer = [0_u8; 256];
         let result = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if result == 0 {
+            state.snapshot.dropped_status_reports =
+                state.snapshot.dropped_status_reports.saturating_add(1);
             state.readers.swap_remove(index);
             continue;
         }
@@ -545,6 +579,8 @@ fn drain_status_readers(state: &mut Diagnostics) {
                 index += 1;
                 continue;
             }
+            state.snapshot.dropped_status_reports =
+                state.snapshot.dropped_status_reports.saturating_add(1);
             state.readers.swap_remove(index);
             continue;
         }
@@ -565,6 +601,16 @@ fn drain_status_readers(state: &mut Diagnostics) {
     }
 }
 
+fn record_planning_fallback(reason: &str) {
+    let mut state = diagnostics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.snapshot.attempted_launches = state.snapshot.attempted_launches.saturating_add(1);
+    state.snapshot.fallback_launches = state.snapshot.fallback_launches.saturating_add(1);
+    state.snapshot.support = ApplicationScopeSupport::Unavailable;
+    state.snapshot.last_failure = Some(bounded_string(reason.to_owned(), 192));
+}
+
 fn bounded_string(value: String, limit: usize) -> String {
     if value.len() <= limit {
         return value;
@@ -577,11 +623,6 @@ fn bounded_string(value: String, limit: usize) -> String {
     value.truncate(end);
     value.push_str("...");
     value
-}
-
-fn next_scope_counter() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -668,13 +709,18 @@ mod tests {
 
     #[test]
     fn direct_fallback_plan_does_not_install_helper_plumbing() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
         let plan = application_scope_launch_plan_with_executable(
             &["app".to_owned(), "arg with spaces".to_owned()],
             true,
             ApplicationScopePolicy::On,
             Err(io::Error::other("executable lookup failed")),
         );
-        assert_eq!(plan.mode, ApplicationScopeLaunchMode::Direct);
+        assert!(matches!(
+            plan.mode,
+            ApplicationScopeLaunchMode::DirectFallback { .. }
+        ));
+        assert_eq!(plan.argv, ["app".to_owned(), "arg with spaces".to_owned()]);
 
         let spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
         assert!(spawn.inherited_fds.is_empty());
@@ -684,6 +730,50 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != std::ffi::OsStr::new(STATUS_FD_ENV))
         );
+    }
+
+    #[test]
+    fn planning_fallback_updates_diagnostics_without_helper_plumbing() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+        let before = snapshot();
+        let plan = application_scope_launch_plan_with_executable(
+            &["app".to_owned()],
+            true,
+            ApplicationScopePolicy::On,
+            Err(io::Error::other("executable lookup failed")),
+        );
+
+        let spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
+        assert!(spawn.inherited_fds.is_empty());
+        let after = snapshot();
+        assert_eq!(after.attempted_launches, before.attempted_launches + 1);
+        assert_eq!(after.fallback_launches, before.fallback_launches + 1);
+        assert_eq!(after.support, ApplicationScopeSupport::Unavailable);
+        assert!(
+            after
+                .last_failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("executable lookup failed"))
+        );
+    }
+
+    #[test]
+    fn policy_only_direct_launch_does_not_record_a_failure() {
+        let _guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+        let before = snapshot();
+        let plan = application_scope_launch_plan_with_executable(
+            &["app".to_owned()],
+            true,
+            ApplicationScopePolicy::Off,
+            Err(io::Error::other("must not be consulted")),
+        );
+        assert_eq!(plan.mode, ApplicationScopeLaunchMode::Direct);
+
+        let _spawn = prepare_application_spawn(Command::new("app"), &plan).expect("spawn plan");
+        let after = snapshot();
+        assert_eq!(after.attempted_launches, before.attempted_launches);
+        assert_eq!(after.fallback_launches, before.fallback_launches);
+        assert_eq!(after.last_failure, before.last_failure);
     }
 
     #[test]
@@ -816,7 +906,7 @@ mod tests {
 
     #[test]
     fn generated_scope_names_are_valid_and_bounded() {
-        let name = scope_unit_name(1234, 7);
+        let name = scope_unit_name(1234, Some(7));
         assert!(name.ends_with(".scope"));
         assert!(name.len() <= MAX_UNIT_NAME_BYTES);
         assert!(
@@ -825,7 +915,54 @@ mod tests {
                     || matches!(character, '-' | '_' | '.'))
         );
 
-        assert!(scope_unit_name(u32::MAX, u64::MAX).len() <= MAX_UNIT_NAME_BYTES);
+        assert!(scope_unit_name(u32::MAX, Some(u64::MAX)).len() <= MAX_UNIT_NAME_BYTES);
+    }
+
+    #[test]
+    fn scope_names_use_process_lifetime_identity() {
+        assert_ne!(
+            scope_unit_name(1234, Some(7)),
+            scope_unit_name(1234, Some(8))
+        );
+        assert_ne!(
+            scope_unit_name(1234, Some(7)),
+            scope_unit_name(1235, Some(7))
+        );
+        assert_eq!(
+            parse_scope_process_start_time(
+                "123 (application name) with ) punctuation) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21"
+            )
+            .expect("start time"),
+            19
+        );
+        assert_eq!(scope_unit_name(1234, None), "app-typhon-1234-unknown.scope");
+    }
+
+    #[test]
+    fn missing_status_at_eof_is_counted_without_marking_scope_unavailable() {
+        let mut state = Diagnostics {
+            snapshot: ApplicationScopeSnapshot {
+                policy: ApplicationScopePolicy::Auto,
+                support: ApplicationScopeSupport::Available,
+                attempted_launches: 1,
+                scoped_launches: 1,
+                fallback_launches: 0,
+                pending_launches: 1,
+                last_failure: None,
+                dropped_status_reports: 2,
+            },
+            readers: Vec::new(),
+        };
+        let (reader, writer) = status_pipe().expect("status pipe");
+        state.readers.push(reader);
+        drop(writer);
+
+        drain_status_readers(&mut state);
+
+        assert!(state.readers.is_empty());
+        assert_eq!(state.snapshot.dropped_status_reports, 3);
+        assert_eq!(state.snapshot.support, ApplicationScopeSupport::Available);
+        assert_eq!(state.snapshot.last_failure, None);
     }
 
     #[test]
