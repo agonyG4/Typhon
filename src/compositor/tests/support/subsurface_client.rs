@@ -286,6 +286,83 @@ pub(in crate::compositor::tests) fn capture_desynchronized_subsurface_before_par
     })
 }
 
+pub(in crate::compositor::tests) fn capture_destroyed_latched_subsurface_snapshot(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<Vec<RenderableSurfaceSnapshot>, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let timing: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 20, 15)?;
+    let child = compositor.create_surface(&qh, ());
+    let _child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    let doomed = compositor.create_surface(&qh, ());
+    let doomed_subsurface = subcompositor.get_subsurface(&doomed, &parent, &qh, ());
+    doomed_subsurface.set_position(30, 40);
+    commit_test_buffered_surface(&doomed, &shm, &qh, 9, 7)?;
+    let timer = timing.get_timer(&parent, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic)?;
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    doomed_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    Ok(capture_renderable_surface_snapshot(commands))
+}
+
+pub(in crate::compositor::tests) fn capture_preactivation_subsurface_presentation_feedback(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let presentation: client_wp_presentation::WpPresentation = globals.bind(&qh, 1..=2, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_desync();
+    let _feedback = presentation.feedback(&child, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_overlapping_subsurfaces_then_place_above_after_parent_commit(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

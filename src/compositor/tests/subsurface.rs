@@ -194,6 +194,38 @@ fn desynchronized_child_is_retained_until_parent_relationship_activation() {
 }
 
 #[test]
+fn preactivation_subsurface_feedback_is_not_presented() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = capture_preactivation_subsurface_presentation_feedback(&socket_path).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 0);
+    assert_eq!(state.presentation_discarded_count, 1);
+}
+
+#[test]
+fn destroyed_latched_subsurface_is_not_resurrected_by_delayed_parent_commit() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshot = capture_destroyed_latched_subsurface_snapshot(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        snapshot
+            .iter()
+            .all(|surface| (surface.width, surface.height) != (9, 7))
+    );
+}
+
+#[test]
 fn subsurface_position_changes_only_on_parent_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
