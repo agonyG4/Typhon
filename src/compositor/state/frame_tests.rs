@@ -444,7 +444,7 @@ mod frame_consumption_tests {
                     owner_client_id: Some(owner_client_id),
                     surface_presentation_generation: Some(1),
                     buffer_id: 206,
-                    acquire,
+                    acquire: acquire.clone(),
                     state: PendingAcquireState::EventfdBacked,
                 }],
                 commit_timing_readiness: None,
