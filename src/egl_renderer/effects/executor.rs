@@ -14,7 +14,7 @@ use super::super::geometry::{
 };
 use super::super::{GlesSceneRenderer, OutputFramebufferOrigin, OutputRect, RendererResult};
 use super::{
-    blur, capture,
+    FrameTraceSummary, PassTraceSummary, blur, capture,
     resources::{PooledEffectTexture, release_dead_graph_textures},
     shader_cache::{ShaderProgramCache, ShaderProgramKey},
 };
@@ -395,6 +395,29 @@ pub(crate) struct EffectExecutionStats {
     pub resource_acquisitions: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectExecutionInvariantError {
+    MissingPassOutput(GraphPassId),
+    UnknownTexture(GraphTextureId),
+    SampledOutputTexture(GraphTextureId),
+    MissingTextureResource(GraphTextureId),
+    FeedbackTextureAlias { input: u64, output: u64 },
+    InvalidTextureDimensions(GraphTextureId),
+    InvalidTextureDomain(GraphTextureId),
+    CaptureDomainOutsideOutput(GraphTextureId),
+    InvalidScissor(GraphPassId),
+    InvalidDomainMapping(GraphTextureId),
+    InvalidFramebufferBlitTargets,
+}
+
+impl std::fmt::Display for EffectExecutionInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for EffectExecutionInvariantError {}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EffectExecutionSelection {
     pub(crate) executed_passes: Vec<GraphPassId>,
@@ -533,6 +556,13 @@ pub(crate) fn execute_effect_graph(
     selection: &EffectExecutionSelection,
 ) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
+    let trace_summary = effect_trace_summary(renderer, graph, Some(repaint_plan), selection);
+    renderer
+        .effect_trace
+        .frame_boundary("effect_resource_sync", "begin", trace_summary);
+    renderer
+        .effect_trace
+        .frame_boundary("effect_graph_execute", "begin", trace_summary);
     let result = execute_graph_passes(
         renderer,
         graph,
@@ -545,11 +575,31 @@ pub(crate) fn execute_effect_graph(
         false,
         true,
     );
+    renderer.effect_trace.frame_boundary(
+        "effect_graph_execute",
+        "end",
+        effect_trace_summary(renderer, graph, Some(repaint_plan), selection),
+    );
+    renderer.effect_trace.frame_boundary(
+        "effect_resource_sync",
+        "end",
+        effect_trace_summary(renderer, graph, Some(repaint_plan), selection),
+    );
     if result.is_err() {
         renderer.establish_ordinary_scene_state();
         unsafe { renderer.gl.bind_texture(glow::TEXTURE_2D, None) };
     }
+    renderer.effect_trace.frame_boundary(
+        "effect_graph_release",
+        "begin",
+        effect_trace_summary(renderer, graph, Some(repaint_plan), selection),
+    );
     let release_result = renderer.effect_resources.release_graph(textures);
+    renderer.effect_trace.frame_boundary(
+        "effect_graph_release",
+        "end",
+        effect_trace_summary(renderer, graph, Some(repaint_plan), selection),
+    );
     match (result, release_result) {
         (Ok(stats), Ok(())) => Ok(stats),
         (Err(error), _) => Err(error),
@@ -566,6 +616,19 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     selection: &EffectExecutionSelection,
 ) -> RendererResult<EffectExecutionStats> {
     let mut textures = std::collections::HashMap::new();
+    let trace_summary = FrameTraceSummary {
+        selected_effect_count: Some(selection.executed_instances.len()),
+        graph_pass_count: Some(graph.stats.passes),
+        graph_texture_count: Some(graph.stats.textures),
+        peak_live_intermediate_count: Some(graph.stats.peak_live_intermediates),
+        ..FrameTraceSummary::default()
+    };
+    renderer
+        .effect_trace
+        .frame_boundary("effect_resource_sync", "begin", trace_summary);
+    renderer
+        .effect_trace
+        .frame_boundary("effect_graph_execute", "begin", trace_summary);
     let result = execute_graph_passes(
         renderer,
         graph,
@@ -578,11 +641,23 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
         true,
         false,
     );
+    renderer
+        .effect_trace
+        .frame_boundary("effect_graph_execute", "end", trace_summary);
+    renderer
+        .effect_trace
+        .frame_boundary("effect_resource_sync", "end", trace_summary);
     if result.is_err() {
         renderer.establish_ordinary_scene_state();
         unsafe { renderer.gl.bind_texture(glow::TEXTURE_2D, None) };
     }
+    renderer
+        .effect_trace
+        .frame_boundary("effect_graph_release", "begin", trace_summary);
     let release_result = renderer.effect_resources.release_graph(textures);
+    renderer
+        .effect_trace
+        .frame_boundary("effect_graph_release", "end", trace_summary);
     match (result, release_result) {
         (Ok(stats), Ok(())) => Ok(stats),
         (Err(error), _) => Err(error),
@@ -616,6 +691,23 @@ fn execute_graph_passes(
     for pass in &graph.passes {
         if !selection.executed_passes.contains(&pass.id) {
             continue;
+        }
+        let execution_damage = effective_pass_damage(graph, demand, pass);
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "begin",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
         }
         ensure_pass_textures(renderer, graph, pass, textures, &mut stats)?;
         if matches!(
@@ -657,16 +749,48 @@ fn execute_graph_passes(
             )?;
             scene_cursor = next_cursor.max(scene_cursor);
         }
-        execute_pass(
+        if let Err(error) = validate_effect_pass_resources(
+            renderer,
+            graph,
+            pass,
+            textures,
+            &execution_damage,
+            framebuffer_origin,
+        ) {
+            renderer.effect_trace.invariant_failure(&error);
+            return Err(Box::new(error));
+        }
+        if let Err(error) = execute_pass(
             renderer,
             graph,
             textures,
             pass,
             framebuffer_origin,
-            &effective_pass_damage(graph, demand, pass),
+            &execution_damage,
             lifecycle_backdrop,
             &mut stats,
-        )?;
+        ) {
+            if let Some(invariant) = error.downcast_ref::<EffectExecutionInvariantError>() {
+                renderer.effect_trace.invariant_failure(invariant);
+            }
+            return Err(error);
+        }
+        if renderer.effect_trace.enabled() {
+            renderer.effect_trace.pass_boundary(
+                "end",
+                pass,
+                graph,
+                textures,
+                pass_trace_summary(
+                    renderer,
+                    graph,
+                    pass,
+                    &execution_damage,
+                    framebuffer_origin,
+                    lifecycle_backdrop,
+                ),
+            );
+        }
         release_dead_graph_textures(&mut renderer.effect_resources, graph, pass.id, textures)?;
         stats.passes = stats.passes.saturating_add(1);
     }
@@ -717,6 +841,314 @@ fn effective_pass_damage(
             || output_region.clone(),
             |texture| EffectRegion::from_rect(texture.domain),
         )
+}
+
+fn validate_effect_pass_resources(
+    renderer: &GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+    textures: &std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    execution_damage: &EffectRegion,
+    framebuffer_origin: OutputFramebufferOrigin,
+) -> Result<(), EffectExecutionInvariantError> {
+    let output = pass
+        .output
+        .ok_or(EffectExecutionInvariantError::MissingPassOutput(pass.id))?;
+    let output_plan = graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == output)
+        .ok_or(EffectExecutionInvariantError::UnknownTexture(output))?;
+    validate_graph_texture_plan(renderer, output_plan)?;
+    validate_domain_mapping(output_plan)?;
+
+    let output_physical =
+        if output_plan.source == GraphTextureSource::Output {
+            None
+        } else {
+            let texture = textures.get(&output).ok_or(
+                EffectExecutionInvariantError::MissingTextureResource(output),
+            )?;
+            Some(
+                renderer
+                    .effect_resources
+                    .physical_texture_id(texture)
+                    .ok_or(EffectExecutionInvariantError::MissingTextureResource(
+                        output,
+                    ))?,
+            )
+        };
+
+    for input in &pass.inputs {
+        let input_plan = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == *input)
+            .ok_or(EffectExecutionInvariantError::UnknownTexture(*input))?;
+        validate_graph_texture_plan(renderer, input_plan)?;
+        validate_domain_mapping(input_plan)?;
+        if input_plan.source == GraphTextureSource::Output {
+            return Err(EffectExecutionInvariantError::SampledOutputTexture(*input));
+        }
+        let input_texture =
+            textures
+                .get(input)
+                .ok_or(EffectExecutionInvariantError::MissingTextureResource(
+                    *input,
+                ))?;
+        let input_physical = renderer
+            .effect_resources
+            .physical_texture_id(input_texture)
+            .ok_or(EffectExecutionInvariantError::MissingTextureResource(
+                *input,
+            ))?;
+        validate_no_texture_feedback(output_physical, std::iter::once(input_physical))?;
+    }
+
+    if matches!(
+        pass.kind,
+        RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+    ) {
+        let input = pass
+            .inputs
+            .first()
+            .and_then(|input| graph.textures.iter().find(|texture| texture.id == *input))
+            .ok_or(EffectExecutionInvariantError::UnknownTexture(
+                pass.inputs.first().copied().unwrap_or(output),
+            ))?;
+        if input.width == 0
+            || input.height == 0
+            || output_plan.width == 0
+            || output_plan.height == 0
+        {
+            return Err(EffectExecutionInvariantError::InvalidTextureDimensions(
+                output,
+            ));
+        }
+    }
+
+    if !execution_damage.is_empty() {
+        if let Some(bounding_box) = execution_damage.bounding_rect()
+            && effect_rect_to_texture_rect(bounding_box, output_plan, framebuffer_origin).is_none()
+        {
+            return Err(EffectExecutionInvariantError::InvalidScissor(pass.id));
+        }
+        for rect in execution_damage.rects() {
+            let Some(scissor) = effect_rect_to_texture_rect(*rect, output_plan, framebuffer_origin)
+            else {
+                continue;
+            };
+            let right = i64::from(scissor.x).saturating_add(i64::from(scissor.width));
+            let bottom = i64::from(scissor.y).saturating_add(i64::from(scissor.height));
+            if scissor.x < 0
+                || scissor.y < 0
+                || scissor.width == 0
+                || scissor.height == 0
+                || right > i64::from(output_plan.width)
+                || bottom > i64::from(output_plan.height)
+            {
+                return Err(EffectExecutionInvariantError::InvalidScissor(pass.id));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_domain_mapping(
+    texture: &oblivion_one::effects::GraphTexturePlan,
+) -> Result<(), EffectExecutionInvariantError> {
+    let domain_width = i128::from(texture.domain.width);
+    let domain_height = i128::from(texture.domain.height);
+    if domain_width
+        .checked_mul(i128::from(texture.width))
+        .is_none()
+        || domain_height
+            .checked_mul(i128::from(texture.height))
+            .is_none()
+        || domain_width * i128::from(texture.width) > i128::from(i64::MAX)
+        || domain_height * i128::from(texture.height) > i128::from(i64::MAX)
+    {
+        return Err(EffectExecutionInvariantError::InvalidDomainMapping(
+            texture.id,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_no_texture_feedback(
+    output_physical: Option<u64>,
+    input_physical_ids: impl Iterator<Item = u64>,
+) -> Result<(), EffectExecutionInvariantError> {
+    let Some(output_physical) = output_physical else {
+        return Ok(());
+    };
+    for input_physical in input_physical_ids {
+        if input_physical == output_physical {
+            return Err(EffectExecutionInvariantError::FeedbackTextureAlias {
+                input: input_physical,
+                output: output_physical,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_texture_plan(
+    renderer: &GlesSceneRenderer,
+    texture: &oblivion_one::effects::GraphTexturePlan,
+) -> Result<(), EffectExecutionInvariantError> {
+    let domain = texture.domain;
+    if texture.width == 0 || texture.height == 0 || domain.width == 0 || domain.height == 0 {
+        return Err(EffectExecutionInvariantError::InvalidTextureDimensions(
+            texture.id,
+        ));
+    }
+    let Some(domain_right) = i64::from(domain.x).checked_add(i64::from(domain.width)) else {
+        return Err(EffectExecutionInvariantError::InvalidTextureDomain(
+            texture.id,
+        ));
+    };
+    let Some(domain_bottom) = i64::from(domain.y).checked_add(i64::from(domain.height)) else {
+        return Err(EffectExecutionInvariantError::InvalidTextureDomain(
+            texture.id,
+        ));
+    };
+    if domain_right > i64::from(i32::MAX) || domain_bottom > i64::from(i32::MAX) {
+        return Err(EffectExecutionInvariantError::InvalidTextureDomain(
+            texture.id,
+        ));
+    }
+    if matches!(
+        texture.source,
+        GraphTextureSource::CapturedScene
+            | GraphTextureSource::CapturedTarget
+            | GraphTextureSource::Output
+    ) && (domain.x < 0
+        || domain.y < 0
+        || i64::from(domain.right()) > i64::from(renderer.current_size.0)
+        || i64::from(domain.bottom()) > i64::from(renderer.current_size.1))
+    {
+        return Err(EffectExecutionInvariantError::CaptureDomainOutsideOutput(
+            texture.id,
+        ));
+    }
+    Ok(())
+}
+
+fn effect_trace_summary(
+    renderer: &GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    repaint_plan: Option<&super::super::damage::RepaintPlan>,
+    selection: &EffectExecutionSelection,
+) -> FrameTraceSummary {
+    FrameTraceSummary {
+        repaint_mode: repaint_plan.map(|plan| plan.mode.as_str()),
+        render_damage_signature: repaint_plan.map(|plan| plan.render_damage.identity_signature()),
+        repair_damage_signature: repaint_plan.map(|plan| plan.repair_damage.identity_signature()),
+        visible_effect_count: Some(renderer.frame_stats.effect_instances_visible),
+        selected_effect_count: Some(selection.executed_instances.len()),
+        graph_pass_count: Some(graph.stats.passes),
+        graph_texture_count: Some(graph.stats.textures),
+        peak_live_intermediate_count: Some(graph.stats.peak_live_intermediates),
+        ..FrameTraceSummary::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pass_trace_summary(
+    renderer: &GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+    execution_damage: &EffectRegion,
+    framebuffer_origin: OutputFramebufferOrigin,
+    lifecycle_backdrop: bool,
+) -> PassTraceSummary {
+    if !renderer.effect_trace.enabled() {
+        return PassTraceSummary::default();
+    }
+
+    let input_flip_y = pass
+        .inputs
+        .first()
+        .and_then(|input| graph.textures.iter().find(|texture| texture.id == *input))
+        .is_some_and(|texture| effect_input_requires_sample_y_flip(texture.origin));
+    let output_plan = pass
+        .output
+        .and_then(|output| graph.textures.iter().find(|texture| texture.id == output));
+    let output_is_framebuffer =
+        output_plan.is_some_and(|texture| texture.source == GraphTextureSource::Output);
+    let target_flip_y =
+        effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
+    let direct_capture = matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    ) && ((lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture)
+        || !pass.checkpoint_dependencies.is_empty());
+    let capture_mode = matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    )
+    .then_some(if direct_capture {
+        "framebuffer_blit"
+    } else {
+        "replay"
+    });
+    let capture_command_count = if capture_mode == Some("replay") {
+        let layers = renderer
+            .commands
+            .iter()
+            .map(|command| match command.layer {
+                EglDrawLayer::Surface(id) => capture::CaptureLayer::Surface(id),
+                _ => capture::CaptureLayer::Other,
+            })
+            .collect::<Vec<_>>();
+        let visual_groups = renderer
+            .commands
+            .iter()
+            .map(|command| command.visual_group)
+            .collect::<Vec<_>>();
+        Some(
+            capture::indices_for_capture(
+                &layers,
+                &visual_groups,
+                pass.anchor,
+                pass.kind == RenderPassKind::SurfaceCapture,
+                pass.visual_group,
+                pass.anchor_scope,
+            )
+            .len(),
+        )
+    } else {
+        None
+    };
+    let damage_bounding_box = execution_damage
+        .bounding_rect()
+        .map(|rect| (rect.x, rect.y, rect.width, rect.height));
+    PassTraceSummary {
+        target_flip_y,
+        input_flip_y,
+        damage_rect_count: execution_damage.rects().len(),
+        damage_bounding_box,
+        capture_mode,
+        capture_command_count,
+        read_framebuffer: direct_capture
+            .then(|| {
+                renderer
+                    .active_output_framebuffer
+                    .map(|framebuffer| format!("{framebuffer:?}"))
+            })
+            .flatten(),
+        draw_framebuffer: direct_capture
+            .then(|| renderer.effect_resources.scratch_framebuffer_identity())
+            .flatten(),
+        scratch_fbo_complete: direct_capture.then(|| {
+            renderer
+                .effect_resources
+                .scratch_framebuffer_identity()
+                .is_some()
+        }),
+    }
 }
 
 fn ensure_pass_textures(
@@ -1630,8 +2062,21 @@ struct GraphTextureCaptureBlit {
     destination: GlBlitRect,
 }
 
-/// Returns whether the fullscreen quad must flip its vertex UVs so `v_uv`
-/// remains a logical top-left normalized coordinate for this destination.
+/// Effect coordinate contract:
+///
+/// * logical domains are top-left, integer output-space rectangles;
+/// * graph textures use bottom-left physical storage;
+/// * the framebuffer origin describes the active output image only;
+/// * fullscreen vertex UVs describe the logical destination and are flipped
+///   only when drawing directly to a top-left scanout framebuffer;
+/// * sampled graph inputs are converted independently using their storage
+///   origin; and
+/// * translating a logical domain must never change either orientation flag.
+///
+/// Scene replay uses `u_capture_domain` plus
+/// `u_capture_origin_bottom_left`. Direct framebuffer capture uses the
+/// explicit READ/DRAW blit mapping. Kawase, normalization, and final
+/// composite passes use the same independent target/input rules here.
 fn effect_target_requires_logical_y_flip(
     output_is_framebuffer: bool,
     framebuffer_origin: OutputFramebufferOrigin,
@@ -1721,6 +2166,14 @@ fn capture_output_region_to_graph_texture(
         let draw_framebuffer = renderer
             .effect_resources
             .bind_draw_target(&renderer.gl, target)?;
+        if renderer.active_output_framebuffer == Some(draw_framebuffer)
+            || target_plan.source == GraphTextureSource::Output
+        {
+            return Err(
+                Box::new(EffectExecutionInvariantError::InvalidFramebufferBlitTargets)
+                    as Box<dyn std::error::Error>,
+            );
+        }
         unsafe {
             renderer.gl.disable(glow::SCISSOR_TEST);
             renderer
@@ -2228,6 +2681,21 @@ mod coordinate_tests {
     }
 
     #[test]
+    fn texture_feedback_alias_is_rejected_even_when_pool_keys_match() {
+        let error = validate_no_texture_feedback(Some(17), [17].into_iter()).unwrap_err();
+        assert_eq!(
+            error,
+            EffectExecutionInvariantError::FeedbackTextureAlias {
+                input: 17,
+                output: 17,
+            }
+        );
+
+        validate_no_texture_feedback(Some(17), [18].into_iter())
+            .expect("different physical resources are safe to sample");
+    }
+
+    #[test]
     fn built_in_effect_shaders_keep_logical_and_sample_uv_spaces_separate() {
         for shader in [
             COPY_FRAGMENT_SHADER,
@@ -2249,6 +2717,39 @@ mod coordinate_tests {
         );
         assert!(!NORMALIZE_FRAGMENT_SHADER.contains("texture(u_effect_input, input_uv)"));
         assert!(!COMPOSITE_FRAGMENT_SHADER.contains("texture(u_effect_input, input_uv)"));
+    }
+
+    #[test]
+    fn every_fullscreen_pass_family_uses_the_shared_sample_orientation_contract() {
+        for shader in [
+            blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,
+            blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+            blur::DUAL_KAWASE_UPSAMPLE_SHADER,
+        ] {
+            assert!(shader.contains("uniform int u_effect_input_flip_y;"));
+            assert!(shader.contains("typhon_effect_sample_uv(v_uv)"));
+        }
+    }
+
+    #[test]
+    fn translating_a_domain_does_not_change_storage_orientation() {
+        let first = target(
+            GraphTextureSource::Intermediate,
+            oblivion_one::effects::EffectRect::new(20, 30, 80, 40).unwrap(),
+            40,
+            20,
+        );
+        let moved = target(
+            GraphTextureSource::Intermediate,
+            oblivion_one::effects::EffectRect::new(700, 500, 80, 40).unwrap(),
+            40,
+            20,
+        );
+        assert_eq!(first.origin, moved.origin);
+        assert_eq!(
+            effect_input_requires_sample_y_flip(first.origin),
+            effect_input_requires_sample_y_flip(moved.origin)
+        );
     }
 
     #[test]

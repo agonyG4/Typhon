@@ -294,6 +294,7 @@ mod frame_consumption_tests {
         let due =
             CommitTimingConstraint::from_protocol(now / 1_000_000_000 - 1, 0).expect("past timing");
         let mut commit = empty_cached_subsurface_commit();
+        commit.commit_sequence = SurfaceCommitSequence(1);
         commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
         commit.pacing.commit_timing = Some(future);
         state
@@ -354,6 +355,7 @@ mod frame_consumption_tests {
             },
         );
         let mut commit = empty_cached_subsurface_commit();
+        commit.commit_sequence = SurfaceCommitSequence(1);
         commit.attachment = Some(PendingSurfaceAttachment::RemoveContent);
         commit.pacing.fifo_wait_barrier = true;
         state
@@ -415,8 +417,10 @@ mod frame_consumption_tests {
             .insert(surface_b_id, 1);
         let owner_client_id = client.id();
         let mut commit_a = empty_cached_subsurface_commit();
+        commit_a.commit_sequence = SurfaceCommitSequence(1);
         commit_a.attachment = Some(PendingSurfaceAttachment::RemoveContent);
         let mut commit_b = empty_cached_subsurface_commit();
+        commit_b.commit_sequence = SurfaceCommitSequence(2);
         commit_b.attachment = Some(PendingSurfaceAttachment::RemoveContent);
         let acquire = ExplicitSyncPoint::for_tests_with_signal_script(202, 203, [true]);
         state

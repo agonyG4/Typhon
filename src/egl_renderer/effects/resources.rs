@@ -495,6 +495,18 @@ impl EffectGlResourceCache {
         self.gl_textures.get(&texture.id).copied()
     }
 
+    pub(crate) fn physical_texture_id(&self, texture: &PooledEffectTexture) -> Option<u64> {
+        self.gl_textures
+            .contains_key(&texture.id)
+            .then_some(texture.id)
+    }
+
+    pub(crate) fn scratch_framebuffer_identity(&self) -> Option<String> {
+        self.scratch_fbo
+            .as_ref()
+            .map(|framebuffer| format!("{framebuffer:?}"))
+    }
+
     pub(crate) fn bind_render_target(
         &mut self,
         gl: &glow::Context,
@@ -874,6 +886,31 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert!(pool.peak_bytes() <= DEFAULT_EFFECT_RESOURCE_BUDGET_BYTES);
         pool.return_texture(second).unwrap();
+    }
+
+    #[test]
+    fn same_key_concurrent_checkouts_have_distinct_physical_ids() {
+        let mut pool = EffectResourcePool::new();
+        let key = key(32, 32);
+        let first = pool.checkout(key).unwrap();
+        let second = pool.checkout(key).unwrap();
+
+        assert_ne!(first.id, second.id);
+
+        pool.return_texture(first).unwrap();
+        pool.return_texture(second).unwrap();
+    }
+
+    #[test]
+    fn same_key_reuse_is_allowed_only_after_return() {
+        let mut pool = EffectResourcePool::new();
+        let key = key(32, 32);
+        let first = pool.checkout(key).unwrap();
+        pool.return_texture(first.clone()).unwrap();
+
+        let reused = pool.checkout(key).unwrap();
+        assert_eq!(reused.id, first.id);
+        pool.return_texture(reused).unwrap();
     }
 
     fn fullscreen_blur_graph(width: u32, height: u32) -> CompiledFrameGraph {

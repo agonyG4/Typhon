@@ -432,10 +432,12 @@ pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::compositor::tests) struct PointerConstraintSurfaceSnapshot {
     pub(in crate::compositor::tests) committed: bool,
+    pub(in crate::compositor::tests) active: bool,
     pub(in crate::compositor::tests) protocol_resource_alive: bool,
     pub(in crate::compositor::tests) backend_pending: bool,
     pub(in crate::compositor::tests) surface_constraint_pending: bool,
     pub(in crate::compositor::tests) lifecycle_removal_pending: bool,
+    pub(in crate::compositor::tests) defunct: bool,
     pub(in crate::compositor::tests) committed_region: SurfaceInputRegion,
     pub(in crate::compositor::tests) committed_cursor_position_hint: Option<(f64, f64)>,
 }
@@ -1265,10 +1267,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let snapshot = server.state.pointer_constraints.get(&constraint_id).map(
                             |constraint| PointerConstraintSurfaceSnapshot {
                                 committed: constraint.committed,
+                                active: constraint.active,
                                 protocol_resource_alive: constraint.protocol_resource_alive,
                                 backend_pending: constraint.backend_pending,
                                 surface_constraint_pending: constraint.surface_constraint_pending,
                                 lifecycle_removal_pending: constraint.lifecycle_removal_pending,
+                                defunct: constraint.defunct,
                                 committed_region: constraint.committed_region.clone(),
                                 committed_cursor_position_hint: constraint
                                     .committed_cursor_position_hint,

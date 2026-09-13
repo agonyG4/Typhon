@@ -1201,6 +1201,7 @@ impl NativeRuntime {
             let mut initial_gpu_sampling_started = false;
             let parts = match explicit.render_to_slot(
                 slot,
+                0,
                 &mut frame_renderer,
                 &initial_resolved_scene,
                 &server,

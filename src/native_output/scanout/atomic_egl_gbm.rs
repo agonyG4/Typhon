@@ -673,6 +673,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn render_to_slot(
         &mut self,
         slot: OutputSlotId,
+        frame_id: u64,
         renderer: &mut NativeFrameRenderer,
         resolved_scene: &ResolvedNativeFrameScene<'_>,
         server: &OwnCompositorServer,
@@ -692,7 +693,7 @@ impl AtomicEglGbmScanout {
                 .map_or(0, AtomicOutputSwapchain::presentation_serial);
             (slot.gl_framebuffer, slot.buffer_age(presentation_serial))
         };
-        let request = renderer.egl_scene_draw_request(
+        let mut request = renderer.egl_scene_draw_request(
             self.width,
             self.height,
             resolved_scene,
@@ -701,6 +702,7 @@ impl AtomicEglGbmScanout {
             cursor_mode,
             Some(damage.as_renderer_damage(self.width, self.height)),
         );
+        request.frame_id = Some(frame_id);
         let started = Instant::now();
         *gpu_sampling_started = true;
         let outcome = self
@@ -724,7 +726,9 @@ impl AtomicEglGbmScanout {
                 stats,
                 lifecycle_evidence,
             } => {
+                self.scene.trace_render_fence_export_begin();
                 let fence = self.create_render_fence()?;
+                self.scene.trace_render_fence_export_end();
                 Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
                     AtomicRenderedFrameParts {
                         slot,
@@ -1023,6 +1027,7 @@ impl AtomicEglGbmScanout {
             }
             let outcome = self.render_to_slot(
                 slot,
+                frame_id,
                 renderer,
                 &resolved_scene,
                 &*server,

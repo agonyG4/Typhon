@@ -50,8 +50,9 @@ use damage::{
     RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
 };
 use effects::{
-    EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics, ShaderProgramCache,
-    builtin_shader_program_count, graph_metrics, shader_cache_capacity_for_custom_shaders,
+    EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics,
+    FrameTraceSummary, ShaderProgramCache, builtin_shader_program_count, graph_metrics,
+    shader_cache_capacity_for_custom_shaders,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
@@ -520,6 +521,10 @@ pub struct EglSceneDrawRequest<'a> {
     pub external_overlay_surface_ids: &'a [u32],
     pub popup_surface_ids: &'a [u32],
     pub content_generation: u64,
+    pub(crate) frame_id: Option<u64>,
+    pub(crate) render_generation: Option<u64>,
+    pub(crate) scene_generation: u64,
+    pub(crate) scene_signature: u64,
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
     pub decoration_instances: &'a [DecorationRenderInstance],
@@ -611,6 +616,7 @@ pub(crate) struct GlesSceneRenderer {
     failed_effect_generation: Option<u64>,
     effect_shaders: ShaderProgramCache,
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
+    effect_trace: EffectExecutionTrace,
     active_output_framebuffer: Option<glow::Framebuffer>,
     frame_stats: GlesSceneFrameStats,
     effect_clock_start: Instant,
@@ -1099,6 +1105,7 @@ impl GlesSceneRenderer {
             failed_effect_generation: None,
             effect_shaders,
             effect_quad: None,
+            effect_trace: EffectExecutionTrace::new(None, None, None, None),
             active_output_framebuffer: None,
             frame_stats: GlesSceneFrameStats::default(),
             effect_clock_start: Instant::now(),
@@ -1110,6 +1117,22 @@ impl GlesSceneRenderer {
 
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
         self.frame_stats
+    }
+
+    pub(crate) fn trace_render_fence_export_begin(&self) {
+        self.effect_trace.frame_boundary(
+            "render_fence_export",
+            "begin",
+            FrameTraceSummary::default(),
+        );
+    }
+
+    pub(crate) fn trace_render_fence_export_end(&self) {
+        self.effect_trace.frame_boundary(
+            "render_fence_export",
+            "end",
+            FrameTraceSummary::default(),
+        );
     }
 
     pub(crate) fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
@@ -1324,6 +1347,10 @@ impl GlesSceneRenderer {
             surfaces,
             external_overlay_surface_ids,
             content_generation,
+            frame_id,
+            render_generation,
+            scene_generation,
+            scene_signature,
             visual_state,
             output_scale,
             decoration_instances,
@@ -1337,6 +1364,17 @@ impl GlesSceneRenderer {
             lifecycle_surfaces,
             lifecycle_decorations,
         } = request;
+        self.effect_trace = EffectExecutionTrace::new(
+            frame_id,
+            render_generation,
+            Some(scene_generation),
+            Some(scene_signature),
+        );
+        self.effect_trace.frame_boundary(
+            "effect_scene_resolve",
+            "begin",
+            FrameTraceSummary::default(),
+        );
         let width = width.max(1);
         let height = height.max(1);
         self.current_framebuffer_origin = framebuffer_origin;
@@ -1374,6 +1412,16 @@ impl GlesSceneRenderer {
             .iter()
             .filter(|instance| !instance.region.is_empty())
             .count();
+        self.effect_trace.frame_boundary(
+            "effect_scene_resolve",
+            "end",
+            FrameTraceSummary {
+                scene_generation: Some(scene_generation),
+                scene_signature: Some(scene_signature),
+                visible_effect_count: Some(self.frame_stats.effect_instances_visible),
+                ..FrameTraceSummary::default()
+            },
+        );
         self.ensure_frame_resources()?;
         self.ensure_decoration_resources(
             egl,
@@ -1521,6 +1569,11 @@ impl GlesSceneRenderer {
         let effect_source_damage = effect_region_from_output_damage(&output_damage, width, height);
         let output_bounds = EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
+        self.effect_trace.frame_boundary(
+            "effect_graph_compile",
+            "begin",
+            self.effect_trace_summary(effects, None, None, None),
+        );
         let execution_plan = if self.failed_effect_generation
             == Some(self.effect_registry_generation)
             && self.frame_stats.effect_instances_visible != 0
@@ -1553,6 +1606,15 @@ impl GlesSceneRenderer {
                 }
             }
         };
+        let compiled_graph = match &execution_plan {
+            FrameExecutionPlan::EffectGraph(graph) => Some(graph),
+            FrameExecutionPlan::LegacyScene => None,
+        };
+        self.effect_trace.frame_boundary(
+            "effect_graph_compile",
+            "end",
+            self.effect_trace_summary(effects, None, compiled_graph, None),
+        );
         let output_damage = match &execution_plan {
             FrameExecutionPlan::LegacyScene => output_damage,
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -1570,6 +1632,11 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
+        self.effect_trace.frame_boundary(
+            "effect_demand_plan",
+            "begin",
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, None),
+        );
         let effect_execution_demand = match &execution_plan {
             FrameExecutionPlan::LegacyScene => None,
             FrameExecutionPlan::EffectGraph(graph) => {
@@ -1582,6 +1649,14 @@ impl GlesSceneRenderer {
                 ))
             }
         };
+        let selected_effect_count = effect_execution_demand
+            .as_ref()
+            .map(|demand| demand.instances.len());
+        self.effect_trace.frame_boundary(
+            "effect_demand_plan",
+            "end",
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
+        );
         if let Some(demand) = &effect_execution_demand {
             self.frame_stats.effect_instances_pruned = self
                 .frame_stats
@@ -1645,7 +1720,12 @@ impl GlesSceneRenderer {
             &consumer_plan,
             &surface_resource_sync_states,
         )?;
-        let draw_result = match execution_plan {
+        self.effect_trace.frame_boundary(
+            "renderer_draw_complete",
+            "begin",
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
+        );
+        let draw_result = match &execution_plan {
             FrameExecutionPlan::LegacyScene => self.draw_textured_layers(&plan, framebuffer_origin),
             FrameExecutionPlan::EffectGraph(graph) => {
                 let demand = effect_execution_demand
@@ -1656,7 +1736,7 @@ impl GlesSceneRenderer {
                     .expect("effect graph execution must have an execution selection");
                 match effects::execute_effect_graph(
                     self,
-                    &graph,
+                    graph,
                     framebuffer_origin,
                     &plan,
                     demand,
@@ -1691,9 +1771,24 @@ impl GlesSceneRenderer {
             }
         };
         if let Err(error) = draw_result {
+            self.effect_trace.frame_boundary(
+                "renderer_draw_complete",
+                "end",
+                self.effect_trace_summary(
+                    effects,
+                    Some(&plan),
+                    compiled_graph,
+                    selected_effect_count,
+                ),
+            );
             self.repaint_planner.invalidate();
             return Err(error);
         }
+        self.effect_trace.frame_boundary(
+            "renderer_draw_complete",
+            "end",
+            self.effect_trace_summary(effects, Some(&plan), compiled_graph, selected_effect_count),
+        );
         self.record_lifecycle_fallbacks_without_evidence();
         if !self.lifecycle_render_fallbacks.is_empty() {
             self.repaint_planner.invalidate();
@@ -1758,6 +1853,29 @@ impl GlesSceneRenderer {
         self.frame_stats.effect_graph_peak_live_bytes = metrics.peak_live_bytes;
         self.frame_stats.effect_capture_pixels = metrics.capture_pixels;
         self.frame_stats.effect_output_pixels = metrics.output_pixels;
+    }
+
+    fn effect_trace_summary(
+        &self,
+        effects: &compositor::ResolvedEffectScene,
+        repaint_plan: Option<&RepaintPlan>,
+        graph: Option<&oblivion_one::effects::CompiledFrameGraph>,
+        selected_effect_count: Option<usize>,
+    ) -> FrameTraceSummary {
+        FrameTraceSummary {
+            scene_generation: Some(effects.generation),
+            repaint_mode: repaint_plan.map(|plan| plan.mode.as_str()),
+            render_damage_signature: repaint_plan
+                .map(|plan| plan.render_damage.identity_signature()),
+            repair_damage_signature: repaint_plan
+                .map(|plan| plan.repair_damage.identity_signature()),
+            visible_effect_count: Some(self.frame_stats.effect_instances_visible),
+            selected_effect_count,
+            graph_pass_count: graph.map(|graph| graph.stats.passes),
+            graph_texture_count: graph.map(|graph| graph.stats.textures),
+            peak_live_intermediate_count: graph.map(|graph| graph.stats.peak_live_intermediates),
+            ..FrameTraceSummary::default()
+        }
     }
 
     fn record_effect_resource_metrics(&mut self) {
@@ -5918,8 +6036,13 @@ pub(crate) fn egl_swap_buffers_with_damage(
 mod tests {
     use super::*;
     use oblivion_one::compositor::{
-        RenderableSurfaceDamage, SurfaceCommitCounter, SurfaceCommitSequence, SurfaceOpaqueRegion,
-        SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
+        RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitCounter, SurfaceCommitSequence,
+        SurfaceOpaqueRegion, SurfacePlacement, SurfaceRenderBackend, SurfaceResourceSyncState,
+    };
+    use oblivion_one::effects::{
+        DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode,
+        EffectNodeId, EffectParameterBlock, EffectProgram, EffectProgramId, EffectSource,
+        EffectWorkingSpace, GraphTextureSource, validate_effect_program,
     };
     use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
     use oblivion_one::render_backend::buffer::{
@@ -6058,6 +6181,199 @@ mod tests {
         }
     }
 
+    fn moving_blur_scene(rect: EffectRect) -> (ResolvedEffectScene, EffectRegistry) {
+        let source = EffectNodeId::new(1).expect("source id");
+        let blur = EffectNodeId::new(2).expect("blur id");
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(1).expect("program id"),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::dual_kawase(
+                    blur,
+                    source,
+                    DualKawaseBlurSpec::new(4.0, 2, 1.0).expect("blur spec"),
+                ),
+            ],
+            output: blur,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: oblivion_one::effects::EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .expect("moving blur program validates");
+        let mut registry = EffectRegistry::empty();
+        registry
+            .insert(program)
+            .expect("moving blur program inserts");
+        let instance = oblivion_one::compositor::ResolvedEffectInstance {
+            id: oblivion_one::effects::EffectInstanceId::new(1).expect("instance id"),
+            program: EffectProgramId::new(1).expect("program id"),
+            anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            target_bounds: rect,
+            region: oblivion_one::effects::EffectRegion::from_rect(rect),
+            parameter_block: EffectParameterBlock::default(),
+            signature: 11,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(
+                oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            ),
+        };
+        (ResolvedEffectScene::new(1, vec![instance]), registry)
+    }
+
+    #[test]
+    fn moving_blur_domain_reuses_real_gles_resources() {
+        let mut harness = GlesEffectTestHarness::new(256, 192);
+        let output_bounds = EffectRect::new(0, 0, 256, 192).expect("output bounds");
+        let full_damage = EffectRegion::from_rect(output_bounds);
+        let repaint_plan = RepaintPlan {
+            render_damage: OutputDamage::Full,
+            repair_damage: OutputDamage::Full,
+            buffer_age: None,
+            mode: RepaintMode::Full,
+            fallback_reason: None,
+        };
+        let mut first_dimensions = None;
+        let mut first_cache_bytes = None;
+        let mut first_allocation_count = None;
+        let mut capture_radii = None;
+        let mut positions = Vec::with_capacity(512);
+        for step in 0..512 {
+            let phase = step % 16;
+            let (x, y) = match phase {
+                0 => (32, 32),
+                1 => (33, 33),
+                2 => (184, 32),
+                3 => (183, 31),
+                4 => (184, 144),
+                5 => (183, 143),
+                6 => (32, 144),
+                7 => (33, 143),
+                8 => (112, 80),
+                9 => (113, 81),
+                10 => (112, 80),
+                11 => (32, 32),
+                12 => (224, 168),
+                13 => (0, 168),
+                14 => (224, 0),
+                _ => (0, 0),
+            };
+            positions.push((x, y));
+        }
+
+        for (step, (x, y)) in positions.into_iter().enumerate() {
+            let rect = EffectRect::new(x, y, 32, 24).expect("moving blur rectangle");
+            let (scene, registry) = moving_blur_scene(rect);
+            let plan = oblivion_one::effects::compile_frame_execution_plan(
+                &scene,
+                &full_damage,
+                output_bounds,
+                &registry,
+            )
+            .expect("moving blur graph compiles");
+            let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+                panic!("moving blur must compile to an effect graph");
+            };
+            let demand = plan_effect_execution_demand(&graph, &full_damage, true);
+            let selection = effects::select_effect_execution(&graph, &demand);
+
+            effects::execute_effect_graph(
+                &mut harness.renderer,
+                &graph,
+                OutputFramebufferOrigin::BottomLeft,
+                &repaint_plan,
+                &demand,
+                &selection,
+            )
+            .expect("moving blur graph executes in real GLES");
+
+            let mut first_gl_error = None;
+            loop {
+                let error = unsafe { harness.gl.get_error() };
+                if error == glow::NO_ERROR {
+                    break;
+                }
+                first_gl_error.get_or_insert(error);
+            }
+            assert_eq!(first_gl_error, None, "step {step} left a GLES error");
+
+            let capture = graph
+                .textures
+                .iter()
+                .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+                .expect("moving blur capture texture");
+            let (capture_radius_x, capture_radius_y) = *capture_radii.get_or_insert((
+                x.saturating_sub(capture.domain.x).max(0),
+                y.saturating_sub(capture.domain.y).max(0),
+            ));
+            let expected_left = (x - capture_radius_x).max(0);
+            let expected_top = (y - capture_radius_y).max(0);
+            let expected_right = (x + 32 + capture_radius_x).min(256);
+            let expected_bottom = (y + 24 + capture_radius_y).min(192);
+            let expected_capture = EffectRect::new(
+                expected_left,
+                expected_top,
+                u32::try_from(expected_right - expected_left).expect("capture width"),
+                u32::try_from(expected_bottom - expected_top).expect("capture height"),
+            )
+            .expect("expected capture domain");
+            for texture in &graph.textures {
+                assert!(texture.width > 0 && texture.height > 0);
+                if texture.source != GraphTextureSource::Output {
+                    assert_eq!(texture.domain, expected_capture, "step {step}");
+                }
+            }
+            let dimensions = graph
+                .textures
+                .iter()
+                .filter(|texture| texture.source != GraphTextureSource::Output)
+                .map(|texture| (texture.width, texture.height))
+                .collect::<Vec<_>>();
+            let interior = expected_left == x - capture_radius_x
+                && expected_top == y - capture_radius_y
+                && expected_right == x + 32 + capture_radius_x
+                && expected_bottom == y + 24 + capture_radius_y;
+            if interior {
+                if let Some(first) = &first_dimensions {
+                    assert_eq!(first, &dimensions, "translation changed texture dimensions");
+                } else {
+                    first_dimensions = Some(dimensions);
+                }
+            }
+
+            let metrics = harness.renderer.effect_resources.metrics();
+            assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
+            if step == 15 {
+                first_cache_bytes = Some(metrics.current_bytes);
+                first_allocation_count = Some(metrics.allocation_count);
+            }
+            if step >= 16 {
+                assert_eq!(
+                    metrics.current_bytes,
+                    first_cache_bytes.expect("warm cache bytes"),
+                    "step {step} changed cache size"
+                );
+                assert_eq!(
+                    metrics.allocation_count,
+                    first_allocation_count.expect("warm allocation count"),
+                    "step {step} allocated again"
+                );
+            }
+            assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
+            assert!(metrics.cached_texture_count <= 16);
+        }
+
+        let metrics = harness.renderer.effect_resources.metrics();
+        assert!(
+            metrics.reuse_count > 0,
+            "moving blur did not reuse pooled textures"
+        );
+        assert_eq!(metrics.checked_out_texture_count, 0);
+    }
+
     fn create_effect_test_texture(
         gl: &glow::Context,
         width: u32,
@@ -6168,6 +6484,7 @@ mod tests {
         unsafe { gl.uniform_4_f32(Some(&location), values[0], values[1], values[2], values[3]) };
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_effect_test(
         gl: &glow::Context,
         program: glow::Program,

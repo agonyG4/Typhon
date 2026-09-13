@@ -506,6 +506,80 @@ mod tests {
     }
 
     #[test]
+    fn moving_effect_repairs_old_and_new_regions_without_widening_capture_domain() {
+        let bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let footprint = EffectFootprint::symmetric(12);
+        let old_region = EffectRegion::from_rect(EffectRect::new(120, 200, 240, 120).unwrap());
+        let new_region = EffectRegion::from_rect(EffectRect::new(136, 202, 240, 120).unwrap());
+        let old = EffectDamageSnapshot::new(7, old_region.clone());
+        let new = EffectDamageSnapshot::new(7, new_region.clone());
+
+        let repair = effect_transition_damage(&old, &new);
+        assert!(repair.contains_point(120, 200));
+        assert!(repair.contains_point(375, 321));
+        assert!(!repair.contains_point(800, 800));
+
+        let current = plan_effect_damage(footprint, &new_region, &EffectRegion::empty(), bounds);
+        assert_eq!(
+            current.capture_region,
+            EffectRegion::from_rect(EffectRect::new(124, 190, 264, 144).unwrap())
+        );
+        assert!(!current.capture_region.contains_point(100, 200));
+        assert!(current.output_damage.is_empty());
+    }
+
+    #[test]
+    fn large_moving_effect_transition_composites_only_the_new_visible_area() {
+        let bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let footprint = EffectFootprint::symmetric(16);
+        let old_region = EffectRegion::from_rect(EffectRect::new(40, 40, 180, 80).unwrap());
+        let new_region = EffectRegion::from_rect(EffectRect::new(1600, 900, 180, 80).unwrap());
+        let old = EffectDamageSnapshot::new(11, old_region.clone());
+        let new = EffectDamageSnapshot::new(11, new_region.clone());
+
+        let repair = effect_transition_damage(&old, &new);
+        assert!(repair.contains_point(40, 40));
+        assert!(repair.contains_point(1779, 979));
+        assert!(!repair.contains_point(900, 500));
+
+        let current = plan_effect_damage(footprint, &new_region, &new_region, bounds);
+        assert!(current.output_damage.contains_point(1600, 900));
+        assert!(!current.output_damage.contains_point(40, 40));
+        assert_eq!(
+            current.capture_region,
+            EffectRegion::from_rect(EffectRect::new(1584, 884, 212, 112).unwrap())
+        );
+    }
+
+    #[test]
+    fn moving_capture_domains_clip_independently_at_all_output_edges() {
+        let bounds = EffectRect::new(0, 0, 100, 80).unwrap();
+        let footprint = EffectFootprint::symmetric(8);
+        for visible in [
+            EffectRect::new(-6, 24, 32, 20).unwrap(),
+            EffectRect::new(74, 24, 32, 20).unwrap(),
+            EffectRect::new(34, -6, 32, 20).unwrap(),
+            EffectRect::new(34, 66, 32, 20).unwrap(),
+        ] {
+            let plan = plan_effect_damage(
+                footprint,
+                &EffectRegion::from_rect(visible),
+                &EffectRegion::empty(),
+                bounds,
+            );
+            let capture = plan
+                .capture_region
+                .bounding_rect()
+                .expect("clipped capture");
+            assert!(capture.x >= bounds.x);
+            assert!(capture.y >= bounds.y);
+            assert!(capture.right() <= bounds.right());
+            assert!(capture.bottom() <= bounds.bottom());
+            assert!(capture.width < bounds.width || capture.height < bounds.height);
+        }
+    }
+
+    #[test]
     fn overflow_uses_conservative_clamped_result() {
         let visible = EffectRegion::from_rect(EffectRect::new(i32::MAX - 4, 0, 4, 4).unwrap());
         let result = visible.expand_clamped(64, EffectRect::new(0, 0, 1920, 1080).unwrap());

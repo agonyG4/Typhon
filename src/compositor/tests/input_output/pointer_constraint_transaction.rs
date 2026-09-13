@@ -820,11 +820,13 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     assert!(b_snapshot.committed);
     assert!(!b_snapshot.backend_pending);
     assert_eq!(state.confined_count, 1);
-    assert_eq!(
-        capture_pointer_constraint_snapshot(&commands, a_id.constraint_id),
-        None,
-        "constraint A must retire after its backend generation completes"
-    );
+    let a_snapshot = capture_pointer_constraint_snapshot(&commands, a_id.constraint_id)
+        .expect("constraint A tombstone must remain to reject stale completions");
+    assert!(!a_snapshot.committed);
+    assert!(!a_snapshot.active);
+    assert!(!a_snapshot.protocol_resource_alive);
+    assert!(!a_snapshot.backend_pending);
+    assert!(a_snapshot.defunct, "constraint A must be retired");
 
     commands
         .send(ServerCommand::PointerConstraintBackendActivated(a_id))
@@ -962,23 +964,21 @@ fn destroyed_replacement_before_commit_skips_but_installs_c() {
     let c_snapshot = capture_pointer_constraint_snapshot(&commands, c_id.constraint_id)
         .expect("constraint C must remain current");
     let ids = capture_pointer_constraint_ids(&commands);
-    let b_id = ids
-        .iter()
-        .copied()
-        .find(|id| *id != a_id.constraint_id && *id != c_id.constraint_id)
-        .expect("constraint B must have been registered before it was destroyed");
-    let b_snapshot = capture_pointer_constraint_snapshot(&commands, b_id)
-        .expect("destroyed B remains inspectable until lifecycle cleanup");
     let a_snapshot = capture_pointer_constraint_snapshot(&commands, a_id.constraint_id);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
     assert!(c_snapshot.committed);
-    assert!(
-        !b_snapshot.committed,
-        "destroyed B must never become effective"
+    assert_eq!(
+        ids.len(),
+        2,
+        "destroyed B must not remain in compositor state"
     );
-    assert!(a_snapshot.is_none(), "A must be retired after deactivation");
+    let a_snapshot = a_snapshot.expect("A tombstone must remain for stale completions");
+    assert!(!a_snapshot.committed);
+    assert!(!a_snapshot.active);
+    assert!(!a_snapshot.protocol_resource_alive);
+    assert!(a_snapshot.defunct, "A must be retired after deactivation");
     assert!(connection.protocol_error().is_none());
 }
 
@@ -1133,7 +1133,7 @@ fn captured_synchronized_install_remains_already_constrained() {
         OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
-    let fixture = synchronized_constraint_fixture(&socket_path, &commands);
+    let mut fixture = synchronized_constraint_fixture(&socket_path, &commands);
     let qh = fixture.queue.handle();
     let lock_a = fixture.constraints.lock_pointer(
         &fixture.child,
@@ -1158,7 +1158,9 @@ fn captured_synchronized_install_remains_already_constrained() {
     fixture.connection.flush().unwrap();
     wait_for_server_commands(&commands);
     assert_eq!(capture_terminal_client_count(&commands), 1);
-    let result = fixture.connection.roundtrip();
+    let result = fixture
+        .queue
+        .blocking_dispatch(&mut RegistryTestState::default());
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
     drop(lock_a);
