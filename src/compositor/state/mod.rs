@@ -171,6 +171,8 @@ pub(in crate::compositor) use xwayland_scene::*;
 pub(in crate::compositor) use xwayland_windows::*;
 
 #[cfg(test)]
+mod async_surface_lifetime_tests;
+#[cfg(test)]
 mod desktop_window_tests;
 #[cfg(test)]
 mod frame_tests;
