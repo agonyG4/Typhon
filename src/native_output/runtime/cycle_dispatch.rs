@@ -917,6 +917,7 @@ impl NativeRuntime {
                 let session_severity = self.session.doctor_severity();
                 let direct_state = self.direct_scanout_state();
                 let dmem_snapshot = self.dmem_foreground.snapshot();
+                let app_scope_snapshot = oblivion_one::application_scope::snapshot();
                 let checks = vec![
                     doctor_check(
                         "control.endpoint",
@@ -997,6 +998,15 @@ impl NativeRuntime {
                         dmem_snapshot.doctor_severity(),
                         format!("dmem foreground policy={}", dmem_snapshot.policy.as_str()),
                         dmem_snapshot.detail(),
+                    ),
+                    doctor_check_with_detail(
+                        "app_scopes.state",
+                        app_scope_snapshot.doctor_severity(),
+                        format!(
+                            "application scopes policy={}",
+                            app_scope_snapshot.policy.as_str()
+                        ),
+                        app_scope_snapshot.detail(),
                     ),
                     doctor_check(
                         "shutdown.state",

@@ -6,6 +6,7 @@ impl NativeRuntime {
         let now_ns = monotonic_now_ns()?;
         let first_request = self.shutdown.is_running();
         if first_request {
+            self.dmem_foreground.submit(None);
             self.abandon_direct_fallback();
         }
         let worker_inflight = if first_request {

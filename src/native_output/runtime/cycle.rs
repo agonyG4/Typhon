@@ -69,6 +69,18 @@ mod trace_export_tests {
     }
 }
 
+#[cfg(test)]
+mod dmem_shutdown_tests {
+    use super::NativeRuntime;
+
+    #[test]
+    fn shutdown_request_disables_new_foreground_targets() {
+        assert!(NativeRuntime::foreground_dmem_is_eligible(true, true));
+        assert!(!NativeRuntime::foreground_dmem_is_eligible(true, false));
+        assert!(!NativeRuntime::foreground_dmem_is_eligible(false, true));
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct AcquirePrepareOutcome {
     acquire_service_ran: bool,
@@ -984,18 +996,21 @@ impl NativeRuntime {
     }
 
     fn reconcile_dmem_foreground(&mut self) {
-        let target = self
-            .session
-            .permits_output()
+        let target =
+            Self::foreground_dmem_is_eligible(
+                self.session.permits_output(),
+                self.shutdown.is_running(),
+            )
             .then(|| self.server.dmem_foreground_target())
             .flatten()
-            .map(
-                |(window_id, pid)| oblivion_one::native::dmem_foreground::ForegroundTarget {
-                    window_id,
-                    pid,
-                },
-            );
+            .map(|(window_id, pid)| {
+                oblivion_one::native::dmem_foreground::ForegroundTarget { window_id, pid }
+            });
         self.dmem_foreground.submit(target);
+    }
+
+    fn foreground_dmem_is_eligible(session_permits_output: bool, shutdown_running: bool) -> bool {
+        session_permits_output && shutdown_running
     }
 
     fn suspend_native_session(&mut self, seat: &NativeSeatSession) -> NativeResult<()> {
