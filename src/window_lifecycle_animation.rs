@@ -786,6 +786,18 @@ mod tests {
     }
 
     #[test]
+    fn lamp_footprint_does_not_cover_ssd_above_client_before_visual_group_fix() {
+        let client = rect(400.0, 100.0, 800.0, 600.0);
+        let ssd_outer = rect(384.0, 60.0, 832.0, 640.0);
+        let anchor = rect(900.0, 900.0, 64.0, 64.0);
+
+        let footprint = lamp_footprint(client, client, anchor).expect("valid footprint");
+
+        assert!(footprint.y() <= ssd_outer.y());
+        assert!(footprint.y() + footprint.height() >= ssd_outer.y() + ssd_outer.height());
+    }
+
+    #[test]
     fn lamp_is_identity_at_zero_and_reaches_anchor_at_one() {
         let source = rect(100.0, 80.0, 800.0, 600.0);
         let anchor = rect(1200.0, 900.0, 64.0, 64.0);
