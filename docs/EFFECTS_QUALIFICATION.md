@@ -42,6 +42,64 @@ The dry-run enumerates 18 labeled combinations across direct scanout policy,
 triple buffering, and cursor scheduling. It starts no compositor and measures no
 GPU or presentation timing.
 
+## GLES effect GPU timing
+
+GPU effect timing is a separate opt-in instrumentation capability. Enable it
+for a renderer process with:
+
+```bash
+TYPHON_EFFECT_GPU_TIMING=1
+```
+
+The default is disabled. When disabled, Typhon allocates no timer-query
+objects, issues no timestamp commands, polls no query results, and emits no
+GPU-timing diagnostics. When explicitly requested, timing is active only on a
+live context with a confirmed timestamp-query path: GLES
+`GL_EXT_disjoint_timer_query` (including the NVIDIA GLES path), or a valid
+desktop core/`GL_ARB_timer_query` path with non-zero timestamp counter bits.
+Unsupported contexts emit one stable `event=effect_gpu_timing_unsupported`
+diagnostic and continue rendering normally; this does not trigger effect
+fallback, repaint, or renderer shutdown.
+
+Results are asynchronous. Typhon polls old pending end queries at a renderer
+frame boundary, stops at the first unavailable FIFO query, and reads the start
+and end timestamps only after that end query reports
+`QUERY_RESULT_AVAILABLE`. Collection is capped at 64 resolved spans per
+boundary. A result retains the source effect-execution `frame_id`, which may be
+older than the frame in which the record is logged, and a monotonic `scope`
+that distinguishes multiple graph executions associated with one frame.
+
+When a graph-total query resolves, one aggregate record is emitted for that
+scope. Durations are integer nanoseconds and pixels are integer execution
+region pixel counts:
+
+```text
+typhon effect: event=effect_gpu_timing frame_id=<u64|unknown> scope=<u64> total_ns=<u64> capture_ns=<u64> normalize_ns=<u64> blur_downsample_ns=<u64> blur_upsample_ns=<u64> fragment_ns=<u64> blend_ns=<u64> mask_ns=<u64> composite_ns=<u64> postprocess_ns=<u64> timed_passes=<usize> dropped_passes=<usize> capture_pixels=<u64> normalize_pixels=<u64> blur_downsample_pixels=<u64> blur_upsample_pixels=<u64> fragment_pixels=<u64> blend_pixels=<u64> mask_pixels=<u64> composite_pixels=<u64> postprocess_pixels=<u64> query_pool_capacity=<usize> query_pool_high_water=<usize> dropped_spans=<usize> disjoint_invalidated_spans=<usize>
+```
+
+`capture_ns` and `capture_pixels` combine `SceneCapture` and `SurfaceCapture`;
+`postprocess_*` maps `OutputPostProcess`. The other duration/pixel fields map
+to their corresponding `RenderPassKind` categories. `timed_passes` counts
+valid pass samples included in the aggregate. `dropped_passes` counts pass
+spans that could not be published, including pool exhaustion and invalid
+timestamp data. `query_pool_capacity` and `query_pool_high_water` are query
+object counts. `dropped_spans` and `disjoint_invalidated_spans` are bounded
+cumulative diagnostics for the profiler lifetime.
+
+The active profiler preallocates a fixed pool of 4,096 query objects (2,048
+timestamp-pair slots), sized from Typhon's 128-instance bound, the current
+six-pass built-in blur instance shape, and two expected in-flight graph
+scopes. Pool exhaustion drops only timing spans; it never changes effect
+execution or rendering. No query is allocated in the per-pass path.
+
+With `GL_EXT_disjoint_timer_query`, a `GPU_DISJOINT_EXT` event invalidates all
+affected pending measurements. Their query slots are recycled, the invalidated
+count is recorded, and later non-disjoint boundaries resume collection. A
+timestamp with `end < start` is discarded rather than being subtracted with
+unsigned underflow. Timer-query records are useful qualification evidence, but
+GPU timing alone is not hardware qualification: real hardware, display-mode,
+presentation, and visual-acceptance runs remain required.
+
 ## Native matrix
 
 The target profile is a real TTY/DRM session at `1920x1080@165`. The live
@@ -73,8 +131,10 @@ Each native run must cover:
 Record CPU render p50/p95/p99, reliable GPU timing if available, target-slip or
 missed-vblank counters, draw calls, texture binds, effect GPU-cache bytes, and
 Direct Scanout state/blockers from the native perf lines. The effects renderer
-currently has no reliable timer-query result to report, so GPU effect timing is
-`UNAVAILABLE` unless the target run provides it independently.
+reports asynchronous per-graph GPU effect timing on supported contexts when
+`TYPHON_EFFECT_GPU_TIMING=1` is set. It remains `UNAVAILABLE` when timing is
+disabled, unsupported, disjoint-invalidated, or not enabled for the target
+run.
 
 ## Current result
 

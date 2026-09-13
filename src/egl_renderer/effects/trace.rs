@@ -167,6 +167,10 @@ impl EffectExecutionTrace {
         self.enabled
     }
 
+    pub(crate) const fn frame_id(self) -> Option<u64> {
+        self.frame_id
+    }
+
     pub(crate) fn event<F>(&self, make_line: F)
     where
         F: FnOnce() -> String,

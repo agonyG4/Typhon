@@ -50,9 +50,9 @@ use damage::{
     RenderExecution, RepaintPlan, merge_effect_damage, resolve_effect_execution_for_repaint_plan,
 };
 use effects::{
-    EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache, EffectGraphMetrics,
-    FrameTraceSummary, ShaderProgramCache, builtin_shader_program_count, graph_metrics,
-    shader_cache_capacity_for_custom_shaders,
+    EffectExecutionTrace, EffectFailureReason, EffectGlResourceCache, EffectGpuProfiler,
+    EffectGraphMetrics, FrameTraceSummary, ShaderProgramCache, builtin_shader_program_count,
+    graph_metrics, shader_cache_capacity_for_custom_shaders,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
 use geometry::{
@@ -617,6 +617,7 @@ pub(crate) struct GlesSceneRenderer {
     effect_shaders: ShaderProgramCache,
     effect_quad: Option<(GlVertexArray, GlBuffer)>,
     effect_trace: EffectExecutionTrace,
+    effect_gpu_profiler: EffectGpuProfiler,
     active_output_framebuffer: Option<glow::Framebuffer>,
     frame_stats: GlesSceneFrameStats,
     effect_clock_start: Instant,
@@ -1042,6 +1043,7 @@ impl GlesSceneRenderer {
         let mut effect_shaders = ShaderProgramCache::new(builtin_shader_program_count())
             .expect("built-in shader cache capacity is non-zero");
         effect_shaders.prewarm_builtins(&gl)?;
+        let effect_gpu_profiler = EffectGpuProfiler::new(&gl);
 
         Ok(Self {
             gl,
@@ -1106,6 +1108,7 @@ impl GlesSceneRenderer {
             effect_shaders,
             effect_quad: None,
             effect_trace: EffectExecutionTrace::new(None, None, None, None),
+            effect_gpu_profiler,
             active_output_framebuffer: None,
             frame_stats: GlesSceneFrameStats::default(),
             effect_clock_start: Instant::now(),
@@ -1370,6 +1373,7 @@ impl GlesSceneRenderer {
             Some(scene_generation),
             Some(scene_signature),
         );
+        self.effect_gpu_profiler.collect(&self.gl);
         self.effect_trace.frame_boundary(
             "effect_scene_resolve",
             "begin",
@@ -4054,6 +4058,7 @@ impl GlesSceneRenderer {
             destroy_image_resource(&self.gl, egl, egl_display, resource.image);
         }
         self.release_all_lifecycle_visual_resources();
+        self.effect_gpu_profiler.destroy(&self.gl);
         self.effect_shaders.clear(&self.gl);
         self.effect_resources.destroy(&self.gl);
         if let Some((vertex_array, vertex_buffer)) = self.effect_quad.take() {

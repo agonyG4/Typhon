@@ -665,8 +665,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_graph_passes(
+pub(crate) fn execute_graph_passes(
     renderer: &mut GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
@@ -677,6 +676,42 @@ fn execute_graph_passes(
     selection: &EffectExecutionSelection,
     lifecycle_backdrop: bool,
     draw_overlays: bool,
+) -> RendererResult<EffectExecutionStats> {
+    let graph_scope = renderer
+        .effect_gpu_profiler
+        .begin_graph(&renderer.gl, renderer.effect_trace.frame_id());
+    let result = execute_graph_passes_inner(
+        renderer,
+        graph,
+        textures,
+        framebuffer_origin,
+        repaint_plan,
+        explicit_repaint_rects,
+        demand,
+        selection,
+        lifecycle_backdrop,
+        draw_overlays,
+        graph_scope,
+    );
+    renderer
+        .effect_gpu_profiler
+        .end_graph(&renderer.gl, graph_scope);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_graph_passes_inner(
+    renderer: &mut GlesSceneRenderer,
+    graph: &CompiledFrameGraph,
+    textures: &mut std::collections::HashMap<GraphTextureId, PooledEffectTexture>,
+    framebuffer_origin: OutputFramebufferOrigin,
+    repaint_plan: Option<&super::super::damage::RepaintPlan>,
+    explicit_repaint_rects: Option<&[OutputRect]>,
+    demand: &EffectExecutionDemand,
+    selection: &EffectExecutionSelection,
+    lifecycle_backdrop: bool,
+    draw_overlays: bool,
+    graph_scope: Option<super::gpu_timing::GraphTimingScope>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
     let repaint_rects = if let Some(rects) = explicit_repaint_rects {
@@ -878,6 +913,16 @@ fn execute_graph_passes(
                 ),
             );
         }
+        let pass_timing = graph_scope.and_then(|scope| {
+            renderer.effect_gpu_profiler.begin_pass(
+                &renderer.gl,
+                scope,
+                u64::from(pass.id.get()),
+                pass.instance.get(),
+                pass.kind,
+                effect_region_pixels(&execution_damage),
+            )
+        });
         let execute_result = execute_pass(
             renderer,
             graph,
@@ -888,6 +933,9 @@ fn execute_graph_passes(
             lifecycle_backdrop,
             &mut stats,
         );
+        renderer
+            .effect_gpu_profiler
+            .end_pass(&renderer.gl, pass_timing);
         if renderer.effect_trace.enabled() {
             renderer.effect_trace.pass_boundary(
                 "execute_end",
@@ -967,6 +1015,12 @@ fn execute_graph_passes(
     renderer.establish_ordinary_scene_state();
     stats.instances = selection.executed_instances.len();
     Ok(stats)
+}
+
+fn effect_region_pixels(region: &EffectRegion) -> u64 {
+    region.rects().iter().fold(0u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+    })
 }
 
 fn effective_pass_damage(
