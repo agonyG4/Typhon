@@ -1156,6 +1156,8 @@ fn captured_synchronized_install_remains_already_constrained() {
         (),
     );
     fixture.connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_terminal_client_count(&commands), 1);
     let result = fixture.connection.roundtrip();
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();

@@ -355,6 +355,16 @@ pub(in crate::compositor::tests) fn capture_pointer_constraint_snapshot(
     receiver.recv().unwrap()
 }
 
+pub(in crate::compositor::tests) fn capture_terminal_client_count(
+    commands: &Sender<ServerCommand>,
+) -> usize {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureTerminalClientCount(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
 pub(in crate::compositor::tests) fn capture_pending_locked_pointer_reveal(
     commands: &Sender<ServerCommand>,
 ) -> bool {

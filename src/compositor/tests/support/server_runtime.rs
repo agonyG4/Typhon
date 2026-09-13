@@ -271,6 +271,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         Sender<(bool, Vec<PointerConstraintBackendRequest>)>,
     ),
     CapturePointerConstraintIds(Sender<Vec<u64>>),
+    CaptureTerminalClientCount(Sender<usize>),
     CapturePointerConstraintSnapshot {
         constraint_id: u64,
         reply: Sender<Option<PointerConstraintSurfaceSnapshot>>,
@@ -1253,6 +1254,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CapturePointerConstraintIds(reply) => {
                         let ids = server.state.pointer_constraints.keys().copied().collect();
                         let _ = reply.send(ids);
+                    }
+                    ServerCommand::CaptureTerminalClientCount(reply) => {
+                        let _ = reply.send(server.state.terminal_client_ids.len());
                     }
                     ServerCommand::CapturePointerConstraintSnapshot {
                         constraint_id,
