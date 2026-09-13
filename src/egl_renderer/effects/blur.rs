@@ -3,12 +3,12 @@ use oblivion_one::effects::{EffectRect, EffectValidationError};
 pub(crate) const DUAL_KAWASE_VERTEX_SHADER: &str = r#"#version 300 es
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_uv;
-uniform int u_effect_flip_y;
+uniform int u_effect_target_flip_y;
 out vec2 v_uv;
 
 void main() {
     gl_Position = vec4(a_position, 0.0, 1.0);
-    v_uv = u_effect_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv;
+    v_uv = u_effect_target_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv;
 }
 "#;
 
@@ -17,8 +17,15 @@ precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
 uniform float u_effect_blur_radius;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 vec4 typhon_decode_premultiplied_srgb(vec4 value) {
     if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
@@ -36,10 +43,11 @@ vec4 typhon_decode_premultiplied_srgb(vec4 value) {
 
 void main() {
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 sample_a = texture(u_effect_input, v_uv + offset);
-    vec4 sample_b = texture(u_effect_input, v_uv - offset);
-    vec4 sample_c = texture(u_effect_input, v_uv + vec2(offset.x, -offset.y));
-    vec4 sample_d = texture(u_effect_input, v_uv + vec2(-offset.x, offset.y));
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_a = texture(u_effect_input, sample_uv + offset);
+    vec4 sample_b = texture(u_effect_input, sample_uv - offset);
+    vec4 sample_c = texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y));
+    vec4 sample_d = texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y));
     vec4 result = (
         typhon_decode_premultiplied_srgb(sample_a) +
         typhon_decode_premultiplied_srgb(sample_b) +
@@ -58,15 +66,23 @@ precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
 uniform float u_effect_blur_radius;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
 
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
 void main() {
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 sample_a = texture(u_effect_input, v_uv + offset);
-    vec4 sample_b = texture(u_effect_input, v_uv - offset);
-    vec4 sample_c = texture(u_effect_input, v_uv + vec2(offset.x, -offset.y));
-    vec4 sample_d = texture(u_effect_input, v_uv + vec2(-offset.x, offset.y));
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_a = texture(u_effect_input, sample_uv + offset);
+    vec4 sample_b = texture(u_effect_input, sample_uv - offset);
+    vec4 sample_c = texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y));
+    vec4 sample_d = texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y));
     out_color = (sample_a + sample_b + sample_c + sample_d) * 0.25;
 }
 "#;
@@ -76,16 +92,24 @@ precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
 uniform float u_effect_blur_radius;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
 
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
 void main() {
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, v_uv) * 0.4;
-    result += texture(u_effect_input, v_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, v_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, v_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, v_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 result = texture(u_effect_input, sample_uv) * 0.4;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
     out_color = result;
 }
 "#;
@@ -134,11 +158,24 @@ mod tests {
 
     #[test]
     fn effect_vertex_shader_uses_explicit_y_flip_semantics() {
-        assert!(DUAL_KAWASE_VERTEX_SHADER.contains("uniform int u_effect_flip_y;"));
+        assert!(DUAL_KAWASE_VERTEX_SHADER.contains("uniform int u_effect_target_flip_y;"));
         assert!(
             DUAL_KAWASE_VERTEX_SHADER
-                .contains("u_effect_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv")
+                .contains("u_effect_target_flip_y != 0 ? vec2(a_uv.x, 1.0 - a_uv.y) : a_uv")
         );
-        assert!(!DUAL_KAWASE_VERTEX_SHADER.contains("u_effect_origin_bottom_left"));
+        assert!(!DUAL_KAWASE_VERTEX_SHADER.contains("u_effect_flip_y"));
+    }
+
+    #[test]
+    fn blur_fragment_shaders_define_explicit_input_sample_conversion() {
+        for shader in [
+            DUAL_KAWASE_DOWNSAMPLE_SHADER,
+            DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+            DUAL_KAWASE_UPSAMPLE_SHADER,
+        ] {
+            assert!(shader.contains("uniform int u_effect_input_flip_y;"));
+            assert!(shader.contains("vec2 typhon_effect_sample_uv(vec2 logical_uv)"));
+            assert!(shader.contains("typhon_effect_sample_uv(v_uv)"));
+        }
     }
 }

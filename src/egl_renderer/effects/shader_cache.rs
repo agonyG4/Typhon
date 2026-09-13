@@ -23,6 +23,7 @@ pub const RESERVED_SHADER_NAMES: &[&str] = &[
     "u_typhon_delta",
     "u_typhon_decode_srgb",
     "u_typhon_encode_srgb",
+    "u_typhon_input_flip_y",
     "u_typhon_aux0",
     "u_typhon_aux1",
     "u_typhon_aux2",
@@ -34,6 +35,7 @@ pub const RESERVED_SHADER_NAMES: &[&str] = &[
     "u_typhon_aux_count",
     "typhon_sample_primary",
     "typhon_sample_aux",
+    "typhon_effect_sample_uv",
     "v_uv",
     "out_color",
     "TyphonEffectContext",
@@ -464,6 +466,7 @@ uniform float u_typhon_time;
 uniform float u_typhon_delta;
 uniform int u_typhon_decode_srgb;
 uniform int u_typhon_encode_srgb;
+uniform int u_typhon_input_flip_y;
 uniform sampler2D u_typhon_aux0;
 uniform sampler2D u_typhon_aux1;
 uniform sampler2D u_typhon_aux2;
@@ -490,22 +493,29 @@ struct TyphonEffectContext {
 vec4 typhon_decode_premultiplied_srgb(vec4 value);
 vec4 typhon_encode_premultiplied_srgb(vec4 value);
 
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_typhon_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
 vec4 typhon_sample_primary(vec2 uv) {
-    vec4 result = texture(u_typhon_primary, uv);
+    vec4 result = texture(u_typhon_primary, typhon_effect_sample_uv(uv));
     if (u_typhon_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     return result;
 }
 
 vec4 typhon_sample_aux(int index, vec2 uv) {
     vec4 result = vec4(0.0);
-    if (index == 0) result = texture(u_typhon_aux0, uv);
-    if (index == 1) result = texture(u_typhon_aux1, uv);
-    if (index == 2) result = texture(u_typhon_aux2, uv);
-    if (index == 3) result = texture(u_typhon_aux3, uv);
-    if (index == 4) result = texture(u_typhon_aux4, uv);
-    if (index == 5) result = texture(u_typhon_aux5, uv);
-    if (index == 6) result = texture(u_typhon_aux6, uv);
-    if (index == 7) result = texture(u_typhon_aux7, uv);
+    vec2 sample_uv = typhon_effect_sample_uv(uv);
+    if (index == 0) result = texture(u_typhon_aux0, sample_uv);
+    if (index == 1) result = texture(u_typhon_aux1, sample_uv);
+    if (index == 2) result = texture(u_typhon_aux2, sample_uv);
+    if (index == 3) result = texture(u_typhon_aux3, sample_uv);
+    if (index == 4) result = texture(u_typhon_aux4, sample_uv);
+    if (index == 5) result = texture(u_typhon_aux5, sample_uv);
+    if (index == 6) result = texture(u_typhon_aux6, sample_uv);
+    if (index == 7) result = texture(u_typhon_aux7, sample_uv);
     if (u_typhon_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     return result;
 }
@@ -727,6 +737,9 @@ mod tests {
         .unwrap();
         assert!(source.contains("void main()"));
         assert!(source.contains("u_typhon_primary"));
+        assert!(source.contains("uniform int u_typhon_input_flip_y;"));
+        assert!(source.contains("vec2 typhon_effect_sample_uv(vec2 logical_uv)"));
+        assert!(source.contains("texture(u_typhon_primary, typhon_effect_sample_uv(uv))"));
         assert!(source.contains("struct TyphonEffectContext"));
         assert!(!source.contains("sampler2D primary"));
     }
@@ -742,7 +755,7 @@ mod tests {
         assert!(source.contains("u_typhon_aux7"));
         assert!(source.contains("u_typhon_aux_count"));
         assert!(source.contains("ctx.aux_count"));
-        assert!(source.contains("if (index == 7) result = texture(u_typhon_aux7, uv);"));
+        assert!(source.contains("if (index == 7) result = texture(u_typhon_aux7, sample_uv);"));
         for index in 0..8 {
             assert!(source.contains(&format!("u_typhon_aux{index}")));
         }

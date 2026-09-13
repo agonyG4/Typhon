@@ -22,11 +22,18 @@ use super::{
 pub(super) const COPY_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
 
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
 void main() {
-    out_color = texture(u_effect_input, v_uv);
+    out_color = texture(u_effect_input, typhon_effect_sample_uv(v_uv));
 }
 "#;
 
@@ -37,8 +44,15 @@ uniform vec4 u_effect_input_domain;
 uniform vec4 u_effect_output_domain;
 uniform int u_effect_decode_srgb;
 uniform int u_effect_encode_srgb;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 float typhon_decode_srgb_channel(float value);
 float typhon_encode_srgb_channel(float value);
@@ -80,13 +94,13 @@ vec4 typhon_sanitize_premultiplied(vec4 value) {
 
 void main() {
     vec2 output_position = u_effect_output_domain.xy + v_uv * u_effect_output_domain.zw;
-    vec2 input_uv = (output_position - u_effect_input_domain.xy) /
+    vec2 logical_input_uv = (output_position - u_effect_input_domain.xy) /
         u_effect_input_domain.zw;
-    if (any(lessThan(input_uv, vec2(0.0))) || any(greaterThan(input_uv, vec2(1.0)))) {
+    if (any(lessThan(logical_input_uv, vec2(0.0))) || any(greaterThan(logical_input_uv, vec2(1.0)))) {
         out_color = vec4(0.0);
         return;
     }
-    vec4 result = texture(u_effect_input, input_uv);
+    vec4 result = texture(u_effect_input, typhon_effect_sample_uv(logical_input_uv));
     if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     out_color = typhon_sanitize_premultiplied(result);
@@ -100,8 +114,15 @@ uniform vec4 u_effect_input_domain;
 uniform vec2 u_effect_output_size;
 uniform int u_effect_encode_srgb;
 uniform int u_effect_force_opaque;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 float typhon_encode_srgb_channel(float value) {
     value = max(value, 0.0);
@@ -125,12 +146,12 @@ vec4 typhon_encode_premultiplied_srgb(vec4 value) {
 
 void main() {
     vec2 output_position = v_uv * u_effect_output_size;
-    vec2 input_uv = (output_position - u_effect_input_domain.xy) /
+    vec2 logical_input_uv = (output_position - u_effect_input_domain.xy) /
         u_effect_input_domain.zw;
-    if (any(lessThan(input_uv, vec2(0.0))) || any(greaterThan(input_uv, vec2(1.0)))) {
+    if (any(lessThan(logical_input_uv, vec2(0.0))) || any(greaterThan(logical_input_uv, vec2(1.0)))) {
         discard;
     }
-    vec4 result = texture(u_effect_input, input_uv);
+    vec4 result = texture(u_effect_input, typhon_effect_sample_uv(logical_input_uv));
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
     out_color = typhon_sanitize_premultiplied(result);
@@ -147,8 +168,15 @@ uniform vec4 u_effect_color_bias;
 uniform vec4 u_effect_tint_color;
 uniform float u_effect_tint_amount;
 uniform float u_effect_noise_amount;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 float typhon_decode_srgb_channel(float value);
 float typhon_encode_srgb_channel(float value);
@@ -189,7 +217,7 @@ vec4 typhon_encode_premultiplied_srgb(vec4 value) {
 }
 
 void main() {
-    vec4 result = texture(u_effect_input, v_uv);
+    vec4 result = texture(u_effect_input, typhon_effect_sample_uv(v_uv));
     if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
@@ -207,8 +235,15 @@ uniform sampler2D u_effect_input;
 uniform int u_effect_decode_srgb;
 uniform int u_effect_encode_srgb;
 uniform int u_effect_inverted;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 float typhon_decode_srgb_channel(float value);
 float typhon_encode_srgb_channel(float value);
@@ -249,7 +284,7 @@ vec4 typhon_encode_premultiplied_srgb(vec4 value) {
 }
 
 void main() {
-    vec4 result = texture(u_effect_input, v_uv);
+    vec4 result = texture(u_effect_input, typhon_effect_sample_uv(v_uv));
     if (u_effect_decode_srgb != 0) result = typhon_decode_premultiplied_srgb(result);
     float coverage = u_effect_inverted != 0 ? 1.0 - result.a : result.a;
     result *= clamp(coverage, 0.0, 1.0);
@@ -267,8 +302,15 @@ uniform int u_effect_decode_srgb;
 uniform int u_effect_encode_srgb;
 uniform int u_effect_blend_mode;
 uniform float u_effect_blend_opacity;
+uniform int u_effect_input_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
 
 float typhon_decode_srgb_channel(float value);
 float typhon_encode_srgb_channel(float value);
@@ -309,8 +351,9 @@ vec4 typhon_encode_premultiplied_srgb(vec4 value) {
 }
 
 void main() {
-    vec4 first = texture(u_effect_input, v_uv);
-    vec4 second = texture(u_effect_input_secondary, v_uv);
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 first = texture(u_effect_input, sample_uv);
+    vec4 second = texture(u_effect_input_secondary, sample_uv);
     if (u_effect_decode_srgb != 0) {
         first = typhon_decode_premultiplied_srgb(first);
         second = typhon_decode_premultiplied_srgb(second);
@@ -940,7 +983,8 @@ fn execute_fullscreen_stage(
     );
     let program = renderer.effect_shaders.lookup(shader_key)?;
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
-    let flip_y = effect_input_requires_y_flip(input_plan.origin, false, framebuffer_origin);
+    let target_flip_y = effect_target_requires_logical_y_flip(false, framebuffer_origin);
+    let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
     unsafe {
         renderer
             .gl
@@ -952,11 +996,35 @@ fn execute_fullscreen_stage(
             &renderer.gl,
             shader_key,
             program,
-            "u_effect_flip_y",
+            "u_effect_target_flip_y",
         ) {
             renderer
                 .gl
-                .uniform_1_i32(Some(&location), i32::from(flip_y));
+                .uniform_1_i32(Some(&location), i32::from(target_flip_y));
+        }
+        if matches!(stage, EffectNodeKind::CustomFragment(_))
+            && let Some(location) = uniform_location(
+                &mut renderer.effect_shaders,
+                &renderer.gl,
+                shader_key,
+                program,
+                "u_typhon_input_flip_y",
+            )
+        {
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(input_flip_y));
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input_flip_y",
+        ) {
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(input_flip_y));
         }
         renderer.gl.active_texture(glow::TEXTURE0);
         renderer
@@ -1562,22 +1630,24 @@ struct GraphTextureCaptureBlit {
     destination: GlBlitRect,
 }
 
-fn effect_input_requires_y_flip(
-    input_origin: oblivion_one::effects::GraphTextureOrigin,
+/// Returns whether the fullscreen quad must flip its vertex UVs so `v_uv`
+/// remains a logical top-left normalized coordinate for this destination.
+fn effect_target_requires_logical_y_flip(
     output_is_framebuffer: bool,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> bool {
-    let input_is_bottom_left = matches!(
+    output_is_framebuffer && framebuffer_origin == OutputFramebufferOrigin::TopLeftScanout
+}
+
+/// Returns whether logical UVs must be converted to physical sampling UVs for
+/// the graph texture's canonical storage origin.
+fn effect_input_requires_sample_y_flip(
+    input_origin: oblivion_one::effects::GraphTextureOrigin,
+) -> bool {
+    matches!(
         input_origin,
         oblivion_one::effects::GraphTextureOrigin::BottomLeft
-    );
-    if !output_is_framebuffer {
-        return input_is_bottom_left;
-    }
-    match framebuffer_origin {
-        OutputFramebufferOrigin::BottomLeft => input_is_bottom_left,
-        OutputFramebufferOrigin::TopLeftScanout => !input_is_bottom_left,
-    }
+    )
 }
 
 fn plan_graph_texture_capture(
@@ -1752,8 +1822,9 @@ fn execute_fullscreen_pass(
     );
     let program = renderer.effect_shaders.lookup(shader_key)?;
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
-    let flip_y =
-        effect_input_requires_y_flip(input_plan.origin, output_is_framebuffer, framebuffer_origin);
+    let target_flip_y =
+        effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
+    let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
     unsafe {
         renderer.gl.use_program(Some(program));
         if let Some(location) = uniform_location(
@@ -1761,11 +1832,22 @@ fn execute_fullscreen_pass(
             &renderer.gl,
             shader_key,
             program,
-            "u_effect_flip_y",
+            "u_effect_target_flip_y",
         ) {
             renderer
                 .gl
-                .uniform_1_i32(Some(&location), i32::from(flip_y));
+                .uniform_1_i32(Some(&location), i32::from(target_flip_y));
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.effect_shaders,
+            &renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input_flip_y",
+        ) {
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(input_flip_y));
         }
         renderer.gl.active_texture(glow::TEXTURE0);
         renderer
@@ -2110,29 +2192,63 @@ mod coordinate_tests {
     }
 
     #[test]
-    fn effect_input_flip_y_matches_graph_and_output_orientation_contract() {
-        use oblivion_one::effects::GraphTextureOrigin;
+    fn effect_target_flip_y_matches_logical_destination_contract() {
+        let cases = [
+            (false, OutputFramebufferOrigin::BottomLeft, 0.0),
+            (true, OutputFramebufferOrigin::BottomLeft, 0.0),
+            (true, OutputFramebufferOrigin::TopLeftScanout, 1.0),
+        ];
+        for (output_is_framebuffer, origin, logical_top_a_uv_y) in cases {
+            let flip = effect_target_requires_logical_y_flip(output_is_framebuffer, origin);
+            let logical_top_v_uv_y = if flip {
+                1.0 - logical_top_a_uv_y
+            } else {
+                logical_top_a_uv_y
+            };
+            assert_eq!(logical_top_v_uv_y, 0.0);
+        }
+    }
 
-        assert!(effect_input_requires_y_flip(
-            GraphTextureOrigin::BottomLeft,
-            false,
-            OutputFramebufferOrigin::BottomLeft,
+    #[test]
+    fn effect_input_flip_y_matches_graph_texture_sample_contract() {
+        assert!(effect_input_requires_sample_y_flip(
+            oblivion_one::effects::GraphTextureOrigin::BottomLeft,
         ));
-        assert!(effect_input_requires_y_flip(
-            GraphTextureOrigin::BottomLeft,
-            false,
-            OutputFramebufferOrigin::TopLeftScanout,
-        ));
-        assert!(effect_input_requires_y_flip(
-            GraphTextureOrigin::BottomLeft,
-            true,
-            OutputFramebufferOrigin::BottomLeft,
-        ));
-        assert!(!effect_input_requires_y_flip(
-            GraphTextureOrigin::BottomLeft,
-            true,
-            OutputFramebufferOrigin::TopLeftScanout,
-        ));
+        let sample_y = |logical_y: f32| {
+            if effect_input_requires_sample_y_flip(
+                oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            ) {
+                1.0 - logical_y
+            } else {
+                logical_y
+            }
+        };
+        assert_eq!(sample_y(0.0), 1.0);
+        assert_eq!(sample_y(1.0), 0.0);
+    }
+
+    #[test]
+    fn built_in_effect_shaders_keep_logical_and_sample_uv_spaces_separate() {
+        for shader in [
+            COPY_FRAGMENT_SHADER,
+            NORMALIZE_FRAGMENT_SHADER,
+            COMPOSITE_FRAGMENT_SHADER,
+            FRAGMENT_STAGE_FRAGMENT_SHADER,
+            MASK_STAGE_FRAGMENT_SHADER,
+            BLEND_STAGE_FRAGMENT_SHADER,
+        ] {
+            assert!(shader.contains("uniform int u_effect_input_flip_y;"));
+            assert!(shader.contains("vec2 typhon_effect_sample_uv(vec2 logical_uv)"));
+        }
+        assert!(
+            NORMALIZE_FRAGMENT_SHADER
+                .contains("output_position = u_effect_output_domain.xy + v_uv")
+        );
+        assert!(
+            COMPOSITE_FRAGMENT_SHADER.contains("output_position = v_uv * u_effect_output_size")
+        );
+        assert!(!NORMALIZE_FRAGMENT_SHADER.contains("texture(u_effect_input, input_uv)"));
+        assert!(!COMPOSITE_FRAGMENT_SHADER.contains("texture(u_effect_input, input_uv)"));
     }
 
     #[test]

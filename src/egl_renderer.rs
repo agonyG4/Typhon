@@ -5934,6 +5934,533 @@ mod tests {
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
 
+    fn egl_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("EGL test lock is not poisoned")
+    }
+
+    struct GlesEffectTestHarness {
+        egl: EglInstance,
+        display: egl::Display,
+        context: egl::Context,
+        surface: egl::Surface,
+        gl: glow::Context,
+        renderer: GlesSceneRenderer,
+        _egl_test_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GlesEffectTestHarness {
+        fn new(width: u32, height: u32) -> Self {
+            let egl_test_lock = egl_test_lock();
+            const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
+            let egl = unsafe { EglInstance::load_required() }
+                .expect("EGL loader is required for the effect coordinate test");
+            let display = unsafe {
+                egl.get_platform_display(
+                    EGL_PLATFORM_SURFACELESS_MESA,
+                    std::ptr::null_mut(),
+                    &[egl::ATTRIB_NONE],
+                )
+                .or_else(|_| {
+                    egl.get_display(egl::DEFAULT_DISPLAY)
+                        .ok_or(egl::Error::BadDisplay)
+                })
+            }
+            .expect("EGL display is available");
+            egl.initialize(display).expect("EGL initializes");
+            egl.bind_api(egl::OPENGL_ES_API)
+                .expect("EGL binds the GLES API");
+            let config_attributes = [
+                egl::SURFACE_TYPE,
+                egl::PBUFFER_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_ES3_BIT,
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::ALPHA_SIZE,
+                8,
+                egl::NONE,
+            ];
+            let count = egl
+                .matching_config_count(display, &config_attributes)
+                .expect("EGL returns GLES3 pbuffer configs");
+            assert!(count > 0, "EGL exposes a GLES3 pbuffer config");
+            let mut configs = Vec::with_capacity(count);
+            egl.choose_config(display, &config_attributes, &mut configs)
+                .expect("EGL chooses a GLES3 pbuffer config");
+            let config = configs[0];
+            let context =
+                create_gles_context(&egl, display, config).expect("GLES3 context creates");
+            let surface = egl
+                .create_pbuffer_surface(
+                    display,
+                    config,
+                    &[
+                        egl::WIDTH,
+                        width as egl::Int,
+                        egl::HEIGHT,
+                        height as egl::Int,
+                        egl::NONE,
+                    ],
+                )
+                .expect("GLES3 pbuffer surface creates");
+            egl.make_current(display, Some(surface), Some(surface), Some(context))
+                .expect("EGL makes the GLES3 context current");
+            let cursor_image = Arc::new(
+                CompositorCursorImage::from_argb8888(vec![0xffff_ffff], 1, 1, 0, 0)
+                    .expect("test cursor image is valid"),
+            );
+            let renderer = GlesSceneRenderer::new_current(
+                &egl,
+                width,
+                height,
+                None,
+                EglPartialRepaintCapabilities {
+                    buffer_age: false,
+                    partial_render_repair: false,
+                    swap_buffers_with_damage: false,
+                },
+                cursor_image,
+            )
+            .expect("test GLES renderer creates");
+            let gl = unsafe {
+                glow::Context::from_loader_function(|name| {
+                    egl.get_proc_address(name)
+                        .map(|symbol| symbol as *const c_void)
+                        .unwrap_or(ptr::null())
+                })
+            };
+            Self {
+                _egl_test_lock: egl_test_lock,
+                egl,
+                display,
+                context,
+                surface,
+                gl,
+                renderer,
+            }
+        }
+    }
+
+    impl Drop for GlesEffectTestHarness {
+        fn drop(&mut self) {
+            self.renderer.destroy(&self.egl, self.display);
+            let _ = self.egl.make_current(self.display, None, None, None);
+            let _ = self.egl.destroy_surface(self.display, self.surface);
+            let _ = self.egl.destroy_context(self.display, self.context);
+            let _ = self.egl.terminate(self.display);
+        }
+    }
+
+    fn create_effect_test_texture(
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> glow::Texture {
+        let texture = unsafe { gl.create_texture().expect("effect test texture creates") };
+        unsafe {
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                width as i32,
+                height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(pixels)),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        texture
+    }
+
+    fn read_effect_test_pixels(gl: &glow::Context, width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        unsafe {
+            gl.flush();
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        pixels
+    }
+
+    fn assert_effect_test_pixel(pixels: &[u8], width: u32, x: u32, y: u32, expected: [u8; 4]) {
+        let index = ((y * width + x) * 4) as usize;
+        assert_eq!(&pixels[index..index + 4], &expected, "pixel ({x}, {y})");
+    }
+
+    fn set_effect_test_uniform_i32(
+        gl: &glow::Context,
+        program: glow::Program,
+        name: &str,
+        value: i32,
+    ) {
+        let location = unsafe {
+            gl.get_uniform_location(program, name)
+                .unwrap_or_else(|| panic!("uniform {name} is active"))
+        };
+        unsafe { gl.uniform_1_i32(Some(&location), value) };
+    }
+
+    fn set_effect_test_uniform_2_f32(
+        gl: &glow::Context,
+        program: glow::Program,
+        name: &str,
+        x: f32,
+        y: f32,
+    ) {
+        let location = unsafe {
+            gl.get_uniform_location(program, name)
+                .unwrap_or_else(|| panic!("uniform {name} is active"))
+        };
+        unsafe { gl.uniform_2_f32(Some(&location), x, y) };
+    }
+
+    fn set_effect_test_uniform_4_f32(
+        gl: &glow::Context,
+        program: glow::Program,
+        name: &str,
+        values: [f32; 4],
+    ) {
+        let location = unsafe {
+            gl.get_uniform_location(program, name)
+                .unwrap_or_else(|| panic!("uniform {name} is active"))
+        };
+        unsafe { gl.uniform_4_f32(Some(&location), values[0], values[1], values[2], values[3]) };
+    }
+
+    fn draw_effect_test(
+        gl: &glow::Context,
+        program: glow::Program,
+        quad: glow::VertexArray,
+        input_texture: glow::Texture,
+        width: u32,
+        height: u32,
+        target_flip_y: bool,
+        input_uniforms: Option<(&str, bool)>,
+        configure: impl Fn(&glow::Context, glow::Program),
+    ) {
+        unsafe {
+            gl.viewport(0, 0, width as i32, height as i32);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(program));
+            set_effect_test_uniform_i32(
+                gl,
+                program,
+                "u_effect_target_flip_y",
+                i32::from(target_flip_y),
+            );
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(input_texture));
+            if let Some((input_flip_uniform, input_flip_y)) = input_uniforms {
+                set_effect_test_uniform_i32(
+                    gl,
+                    program,
+                    input_flip_uniform,
+                    i32::from(input_flip_y),
+                );
+                set_effect_test_uniform_i32(gl, program, "u_effect_input", 0);
+            }
+            configure(gl, program);
+            gl.bind_vertex_array(Some(quad));
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.use_program(None);
+        }
+    }
+
+    fn canonical_two_by_two_pixels() -> Vec<u8> {
+        [
+            [0, 0, 255, 255],
+            [0, 0, 255, 255],
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    #[test]
+    fn real_gles_copy_preserves_logical_and_physical_orientation_contracts() {
+        let mut harness = GlesEffectTestHarness::new(2, 2);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            effects::COPY_FRAGMENT_SHADER,
+        )
+        .expect("copy effect program compiles with the shared vertex shader");
+        let input_texture =
+            create_effect_test_texture(&harness.gl, 2, 2, &canonical_two_by_two_pixels());
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("effect quad creates")
+            .0;
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            2,
+            2,
+            false,
+            Some(("u_effect_input_flip_y", true)),
+            |_, _| {},
+        );
+        let bottom_left_pixels = read_effect_test_pixels(&harness.gl, 2, 2);
+        assert_effect_test_pixel(&bottom_left_pixels, 2, 0, 0, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&bottom_left_pixels, 2, 0, 1, [255, 0, 0, 255]);
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            2,
+            2,
+            true,
+            Some(("u_effect_input_flip_y", true)),
+            |_, _| {},
+        );
+        let top_left_scanout_pixels = read_effect_test_pixels(&harness.gl, 2, 2);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 2, 0, 0, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 2, 0, 1, [0, 0, 255, 255]);
+
+        unsafe {
+            harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_composite_keeps_logical_domain_and_orientation() {
+        let mut harness = GlesEffectTestHarness::new(4, 6);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            effects::COMPOSITE_FRAGMENT_SHADER,
+        )
+        .expect("composite effect program compiles with the shared vertex shader");
+        let input_texture =
+            create_effect_test_texture(&harness.gl, 2, 2, &canonical_two_by_two_pixels());
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("effect quad creates")
+            .0;
+        let configure = |gl: &glow::Context, program: glow::Program| {
+            set_effect_test_uniform_4_f32(
+                gl,
+                program,
+                "u_effect_input_domain",
+                [1.0, 1.0, 2.0, 2.0],
+            );
+            set_effect_test_uniform_2_f32(gl, program, "u_effect_output_size", 4.0, 6.0);
+            set_effect_test_uniform_i32(gl, program, "u_effect_encode_srgb", 0);
+            set_effect_test_uniform_i32(gl, program, "u_effect_force_opaque", 0);
+        };
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            4,
+            6,
+            false,
+            Some(("u_effect_input_flip_y", true)),
+            configure,
+        );
+        let bottom_left_pixels = read_effect_test_pixels(&harness.gl, 4, 6);
+        assert_effect_test_pixel(&bottom_left_pixels, 4, 1, 4, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&bottom_left_pixels, 4, 2, 4, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&bottom_left_pixels, 4, 1, 3, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&bottom_left_pixels, 4, 2, 3, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&bottom_left_pixels, 4, 1, 1, [0, 0, 0, 0]);
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            4,
+            6,
+            true,
+            Some(("u_effect_input_flip_y", true)),
+            configure,
+        );
+        let top_left_scanout_pixels = read_effect_test_pixels(&harness.gl, 4, 6);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 4, 1, 1, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 4, 2, 1, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 4, 1, 2, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 4, 2, 2, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&top_left_scanout_pixels, 4, 1, 4, [0, 0, 0, 0]);
+
+        unsafe {
+            harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_normalize_uses_shared_logical_uv_and_sample_conversion() {
+        let mut harness = GlesEffectTestHarness::new(4, 4);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            effects::NORMALIZE_FRAGMENT_SHADER,
+        )
+        .expect("normalize effect program compiles with the shared vertex shader");
+        let mut input_pixels = Vec::with_capacity(4 * 4 * 4);
+        for y in 0..4 {
+            let color = if y < 2 {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            for _ in 0..4 {
+                input_pixels.extend(color);
+            }
+        }
+        let input_texture = create_effect_test_texture(&harness.gl, 4, 4, &input_pixels);
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("effect quad creates")
+            .0;
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            4,
+            4,
+            false,
+            Some(("u_effect_input_flip_y", true)),
+            |gl, program| {
+                set_effect_test_uniform_4_f32(
+                    gl,
+                    program,
+                    "u_effect_input_domain",
+                    [1.0, 1.0, 2.0, 2.0],
+                );
+                set_effect_test_uniform_4_f32(
+                    gl,
+                    program,
+                    "u_effect_output_domain",
+                    [0.0, 0.0, 4.0, 4.0],
+                );
+                set_effect_test_uniform_i32(gl, program, "u_effect_decode_srgb", 0);
+                set_effect_test_uniform_i32(gl, program, "u_effect_encode_srgb", 0);
+            },
+        );
+        let pixels = read_effect_test_pixels(&harness.gl, 4, 4);
+        assert_effect_test_pixel(&pixels, 4, 1, 2, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&pixels, 4, 2, 2, [255, 0, 0, 255]);
+        assert_effect_test_pixel(&pixels, 4, 1, 1, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&pixels, 4, 2, 1, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&pixels, 4, 0, 0, [0, 0, 0, 0]);
+
+        unsafe {
+            harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_trusted_wrapper_preserves_logical_context_uv() {
+        let mut harness = GlesEffectTestHarness::new(2, 2);
+        let wrapper = effects::generate_fragment_wrapper(
+            "vec4 typhon_effect_main(TyphonEffectContext ctx) { return typhon_sample_primary(ctx.uv); }",
+            &[],
+        )
+        .expect("trusted wrapper generates");
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            &wrapper,
+        )
+        .expect("trusted wrapper compiles with the shared vertex shader");
+        let input_texture =
+            create_effect_test_texture(&harness.gl, 2, 2, &canonical_two_by_two_pixels());
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("effect quad creates")
+            .0;
+
+        draw_effect_test(
+            &harness.gl,
+            program,
+            quad,
+            input_texture,
+            2,
+            2,
+            false,
+            None,
+            |gl, program| {
+                set_effect_test_uniform_i32(gl, program, "u_typhon_primary", 0);
+                set_effect_test_uniform_i32(gl, program, "u_typhon_input_flip_y", 1);
+                set_effect_test_uniform_i32(gl, program, "u_typhon_decode_srgb", 0);
+                set_effect_test_uniform_i32(gl, program, "u_typhon_encode_srgb", 0);
+            },
+        );
+        let pixels = read_effect_test_pixels(&harness.gl, 2, 2);
+        assert_effect_test_pixel(&pixels, 2, 0, 0, [0, 0, 255, 255]);
+        assert_effect_test_pixel(&pixels, 2, 0, 1, [255, 0, 0, 255]);
+
+        unsafe {
+            harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
     fn lamp_test_sample(progress: f64) -> LifecycleSceneSample {
         let rect = PresentationRect::new(100.0, 80.0, 800.0, 600.0).expect("valid rectangle");
         let anchor = PresentationRect::new(1200.0, 900.0, 64.0, 64.0).expect("valid anchor");
@@ -5998,6 +6525,7 @@ mod tests {
 
     #[test]
     fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_together() {
+        let _egl_test_lock = egl_test_lock();
         const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
         let egl = unsafe { EglInstance::load_required() }
             .expect("EGL loader is required for decoration reconciliation regression");
@@ -6965,6 +7493,7 @@ mod tests {
 
     #[test]
     fn trusted_custom_wrapper_compiles_and_links_in_real_gles_context() {
+        let _egl_test_lock = egl_test_lock();
         const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
         let egl = unsafe { EglInstance::load_required() }
             .expect("EGL loader is required for the GLES wrapper compile test");
