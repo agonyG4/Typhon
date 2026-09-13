@@ -9,6 +9,22 @@ use crate::wm::{LayoutMembership, WorkspaceId, WorkspaceLocation};
 
 type PendingSurfaceTreeTransactionsSnapshot = Vec<(u64, Vec<(u32, u64)>)>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct SubsurfaceStackStateSnapshot {
+    pub(in crate::compositor::tests) committed: Option<Vec<u32>>,
+    pub(in crate::compositor::tests) latched: Option<Vec<u32>>,
+    pub(in crate::compositor::tests) pending: Option<Vec<u32>>,
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct DelayedParentSubsurfaceStackSnapshots {
+    pub(in crate::compositor::tests) after_first_parent_commit: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) after_child_creation: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) after_second_restack: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) after_first_publication: SubsurfaceStackStateSnapshot,
+    pub(in crate::compositor::tests) after_second_publication: SubsurfaceStackStateSnapshot,
+}
+
 pub(in crate::compositor::tests) fn create_test_shm_file(
     pixels: &[u32],
 ) -> Result<File, Box<dyn std::error::Error>> {
@@ -174,6 +190,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureSubsurfaceStackState {
+        parent_id: u32,
+        reply: Sender<SubsurfaceStackStateSnapshot>,
+    },
     CaptureLayerSurfaceCommitState {
         surface_id: u32,
         reply: Sender<Option<(i32, u8)>>,
@@ -757,6 +777,25 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 )
                                 .collect(),
                         );
+                    }
+                    ServerCommand::CaptureSubsurfaceStackState { parent_id, reply } => {
+                        let _ = reply.send(SubsurfaceStackStateSnapshot {
+                            committed: server
+                                .state
+                                .committed_subsurface_stacks
+                                .get(&parent_id)
+                                .cloned(),
+                            latched: server
+                                .state
+                                .latched_subsurface_stacks
+                                .get(&parent_id)
+                                .cloned(),
+                            pending: server
+                                .state
+                                .pending_subsurface_stacks
+                                .get(&parent_id)
+                                .cloned(),
+                        });
                     }
                     ServerCommand::CaptureLayerSurfaceCommitState { surface_id, reply } => {
                         let state = server
@@ -2200,6 +2239,20 @@ pub(in crate::compositor::tests) fn capture_pending_surface_tree_transactions(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report pending surface-tree transactions")
+}
+
+pub(in crate::compositor::tests) fn capture_subsurface_stack_state(
+    commands: &Sender<ServerCommand>,
+    parent_id: u32,
+) -> SubsurfaceStackStateSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSubsurfaceStackState { parent_id, reply })
+        .unwrap();
+    wait_for_server_commands(commands);
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report subsurface stack state")
 }
 
 pub(in crate::compositor::tests) fn capture_pending_frame_callbacks(

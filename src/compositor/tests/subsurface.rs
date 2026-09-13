@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn new_subsurface_pending_stack_uses_latched_baseline() {
+    let mut state = CompositorState::default();
+    state.committed_subsurface_stacks.insert(1, vec![1, 2, 3]);
+    state.latched_subsurface_stacks.insert(1, vec![1, 3, 2]);
+
+    state.add_subsurface_to_pending_stack(1, 4);
+
+    assert_eq!(state.latched_subsurface_stacks[&1], vec![1, 3, 2]);
+    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
+}
+
+#[test]
+fn new_subsurface_pending_stack_preserves_existing_restack() {
+    let mut state = CompositorState::default();
+    state.pending_subsurface_stacks.insert(1, vec![1, 3, 2]);
+
+    state.add_subsurface_to_pending_stack(1, 4);
+
+    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
+
+    state.add_subsurface_to_pending_stack(1, 4);
+
+    assert_eq!(state.pending_subsurface_stacks[&1], vec![1, 3, 2, 4]);
+}
+
+#[test]
 fn wayland_client_can_create_subsurface_on_oblivion_server() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -180,6 +206,161 @@ fn delayed_parent_commit_uses_position_captured_at_commit_boundary() {
 
     assert_eq!(child_position(&after_delayed_parent), Some((10, 10)));
     assert_eq!(child_position(&after_next_parent), Some((20, 20)));
+}
+
+#[test]
+fn pending_subsurface_restack_survives_new_child_creation() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshot =
+        capture_pending_restack_survives_new_subsurface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let order = snapshot
+        .iter()
+        .map(|surface| (surface.width, surface.height))
+        .collect::<Vec<_>>();
+    assert_eq!(order, vec![(20, 15), (7, 7), (6, 6), (8, 8)]);
+    let unique_surface_count = snapshot
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(unique_surface_count, snapshot.len());
+}
+
+#[test]
+fn delayed_parent_stack_lineage_survives_new_child_creation() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_delayed_parent_restack_with_new_subsurface_stack_states(&socket_path, &commands)
+            .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let first_restack = snapshots
+        .after_first_parent_commit
+        .latched
+        .clone()
+        .expect("first parent commit should latch a subsurface stack");
+    let parent_id = first_restack[0];
+    let second_id = first_restack[1];
+    let first_id = first_restack[2];
+    let third_id = snapshots
+        .after_child_creation
+        .committed
+        .as_ref()
+        .and_then(|stack| stack.last().copied())
+        .expect("new child should be in committed stack");
+    let initial = vec![parent_id, first_id, second_id];
+
+    assert_eq!(snapshots.after_first_parent_commit.committed, Some(initial));
+    assert_eq!(
+        snapshots.after_first_parent_commit.latched,
+        Some(first_restack.clone())
+    );
+    assert_eq!(snapshots.after_first_parent_commit.pending, None);
+    assert_eq!(
+        snapshots.after_child_creation.latched,
+        Some(first_restack.clone())
+    );
+    assert_eq!(
+        snapshots.after_child_creation.pending,
+        Some(vec![parent_id, second_id, first_id, third_id])
+    );
+    assert_eq!(
+        snapshots.after_second_restack.pending,
+        Some(vec![parent_id, first_id, second_id, third_id])
+    );
+    assert_eq!(
+        snapshots.after_first_publication.committed,
+        Some(first_restack.clone())
+    );
+    assert_eq!(
+        snapshots.after_first_publication.latched,
+        Some(first_restack)
+    );
+    assert_eq!(
+        snapshots.after_first_publication.pending,
+        Some(vec![parent_id, first_id, second_id, third_id])
+    );
+    assert_eq!(
+        snapshots.after_second_publication.committed,
+        Some(vec![parent_id, first_id, second_id, third_id])
+    );
+    assert_eq!(
+        snapshots.after_second_publication.latched,
+        snapshots.after_second_publication.committed
+    );
+    assert_eq!(snapshots.after_second_publication.pending, None);
+}
+
+#[test]
+fn multiple_new_subsurfaces_remain_topmost_in_creation_order() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_, before, after_creation, after_commit) =
+        capture_multiple_new_subsurface_stack_states(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let baseline = before
+        .committed
+        .clone()
+        .expect("initial parent stack should be committed");
+    let expected = after_creation
+        .pending
+        .clone()
+        .expect("new children should be pending");
+
+    assert_eq!(expected.len(), baseline.len() + 2);
+    assert_eq!(&expected[..baseline.len()], baseline.as_slice());
+    assert_eq!(
+        expected
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        expected.len()
+    );
+    assert_eq!(after_creation.committed, Some(expected.clone()));
+    assert_eq!(after_commit.committed, Some(expected.clone()));
+    assert_eq!(after_commit.latched, Some(expected));
+    assert_eq!(after_commit.pending, None);
+}
+
+#[test]
+fn destroying_new_subsurface_before_parent_commit_preserves_surviving_stack() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_, before_destroy, after_destroy, after_commit) =
+        capture_destroyed_new_subsurface_stack_states(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let surviving = after_destroy
+        .committed
+        .clone()
+        .expect("surviving stack should remain committed");
+
+    assert_eq!(surviving.len(), 3);
+    assert_eq!(
+        surviving.iter().collect::<std::collections::HashSet<_>>().len(),
+        surviving.len()
+    );
+    assert_eq!(after_destroy.latched, Some(surviving.clone()));
+    assert_eq!(after_destroy.pending, Some(surviving.clone()));
+    assert_eq!(after_commit.committed, Some(surviving.clone()));
+    assert_eq!(after_commit.latched, Some(surviving));
+    assert_eq!(after_commit.pending, None);
+    assert_ne!(before_destroy.committed, after_destroy.committed);
 }
 
 #[test]

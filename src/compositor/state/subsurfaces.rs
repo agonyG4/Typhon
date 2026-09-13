@@ -43,6 +43,7 @@ impl CompositorState {
         ) {
             return false;
         }
+        self.add_subsurface_to_pending_stack(parent_id, surface_id);
         self.committed_subsurface_stacks
             .entry(parent_id)
             .or_insert_with(|| vec![parent_id])
@@ -51,11 +52,6 @@ impl CompositorState {
             .entry(parent_id)
             .or_insert_with(|| vec![parent_id])
             .push(surface_id);
-        self.latched_subsurface_stacks.insert(
-            parent_id,
-            self.committed_subsurface_stacks[&parent_id].clone(),
-        );
-        self.pending_subsurface_stacks.remove(&parent_id);
         self.reorder_renderable_surfaces_by_committed_stack();
         true
     }
@@ -1171,6 +1167,19 @@ impl CompositorState {
             })
     }
 
+    pub(in crate::compositor) fn add_subsurface_to_pending_stack(
+        &mut self,
+        parent_id: u32,
+        surface_id: u32,
+    ) {
+        let stack = self.pending_stack_for_parent(parent_id);
+        stack.retain(|id| *id == parent_id || *id != surface_id);
+        if !stack.contains(&parent_id) {
+            stack.insert(0, parent_id);
+        }
+        stack.push(surface_id);
+    }
+
     pub(in crate::compositor) fn restack_subsurface(
         &mut self,
         surface_id: u32,
@@ -1316,11 +1325,22 @@ impl CompositorState {
                 }
             }
             for (parent_id, stack) in &self.committed_subsurface_stacks {
-                let mut stack_ids = HashSet::new();
-                debug_assert!(stack.iter().all(|surface_id| stack_ids.insert(*surface_id)));
-                debug_assert!(stack.contains(parent_id));
+                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
+            }
+            for (parent_id, stack) in &self.latched_subsurface_stacks {
+                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
+            }
+            for (parent_id, stack) in &self.pending_subsurface_stacks {
+                Self::debug_assert_subsurface_stack_invariant(*parent_id, stack);
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_subsurface_stack_invariant(parent_id: u32, stack: &[u32]) {
+        let mut stack_ids = HashSet::new();
+        debug_assert!(stack.iter().all(|surface_id| stack_ids.insert(*surface_id)));
+        debug_assert_eq!(stack.iter().filter(|id| **id == parent_id).count(), 1);
     }
 
     pub(in crate::compositor) fn take_and_bind_surface_presentation_feedbacks(
