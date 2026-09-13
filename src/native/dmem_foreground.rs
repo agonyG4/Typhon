@@ -571,6 +571,9 @@ where
             if self.current.is_none() {
                 return Ok(TransitionResult::Noop);
             }
+            if !should_continue() {
+                return Ok(TransitionResult::Stale);
+            }
             self.revert_current()?;
             return Ok(TransitionResult::Reverted);
         };

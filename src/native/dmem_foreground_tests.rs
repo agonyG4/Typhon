@@ -453,6 +453,31 @@ fn stale_generation_before_revert_keeps_the_current_target_protected() {
     assert_eq!(controller.writer().writes, writes_before);
 }
 
+#[test]
+fn stale_generation_before_none_revert_keeps_the_current_target_protected() {
+    let first = RecordingWriter::path("/user.slice/app-a.scope", 42);
+    let resolver = StubResolver {
+        results: [(42, Ok(first.clone()))].into_iter().collect(),
+    };
+    let mut controller = controller_fixture(resolver);
+    let target_a = ForegroundTarget {
+        window_id: crate::core::WindowId::from_raw(1).expect("window id"),
+        pid: 42,
+    };
+
+    controller.reconcile(Some(target_a)).expect("first apply");
+    let writes_before = controller.writer().writes.clone();
+
+    assert_eq!(
+        controller
+            .reconcile_with(None, || false)
+            .expect("stale transition"),
+        TransitionResult::Stale
+    );
+    assert_eq!(controller.current_path(), Some(first.path.as_path()));
+    assert_eq!(controller.writer().writes, writes_before);
+}
+
 fn resolver_fixture(name: &str, pid: u32, uid: u32, cgroup: &str) -> DmemPaths {
     let root =
         std::env::temp_dir().join(format!("typhon-dmem-{}-{name}-{}", std::process::id(), pid));
