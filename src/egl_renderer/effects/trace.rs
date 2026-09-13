@@ -67,6 +67,7 @@ pub(crate) struct PassTraceFields<'a> {
 pub(crate) struct PassTraceSummary {
     pub(crate) target_flip_y: bool,
     pub(crate) input_flip_y: bool,
+    pub(crate) framebuffer_origin: Option<&'static str>,
     pub(crate) damage_rect_count: usize,
     pub(crate) damage_bounding_box: Option<(i32, i32, u32, u32)>,
     pub(crate) capture_mode: Option<&'static str>,
@@ -211,7 +212,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_complete={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_complete={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -222,6 +223,7 @@ impl EffectExecutionTrace {
                 input_ids,
                 input_details,
                 output_details,
+                summary.framebuffer_origin.unwrap_or("unknown"),
                 summary.target_flip_y,
                 summary.input_flip_y,
                 summary.damage_rect_count,
@@ -282,8 +284,11 @@ fn graph_texture_trace(
         GraphTextureSource::Intermediate => "intermediate",
         GraphTextureSource::Static(_) => "static",
     };
+    let origin = match texture.origin {
+        oblivion_one::effects::GraphTextureOrigin::BottomLeft => "bottom_left",
+    };
     Some(format!(
-        "id={}:physical={physical}:source={source}:domain={},{} {}x{}:dims={}x{}:origin=bottom_left",
+        "id={}:physical={physical}:source={source}:domain={},{} {}x{}:dims={}x{}:origin={origin}",
         id.get(),
         texture.domain.x,
         texture.domain.y,

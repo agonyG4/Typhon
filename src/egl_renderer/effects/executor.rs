@@ -1128,17 +1128,20 @@ fn pass_trace_summary(
     PassTraceSummary {
         target_flip_y,
         input_flip_y,
+        framebuffer_origin: Some(match framebuffer_origin {
+            OutputFramebufferOrigin::BottomLeft => "bottom_left",
+            OutputFramebufferOrigin::TopLeftScanout => "top_left_scanout",
+        }),
         damage_rect_count: execution_damage.rects().len(),
         damage_bounding_box,
         capture_mode,
         capture_command_count,
-        read_framebuffer: direct_capture
-            .then(|| {
-                renderer
-                    .active_output_framebuffer
-                    .map(|framebuffer| format!("{framebuffer:?}"))
-            })
-            .flatten(),
+        read_framebuffer: direct_capture.then(|| {
+            renderer.active_output_framebuffer.map_or_else(
+                || "default".to_owned(),
+                |framebuffer| format!("{framebuffer:?}"),
+            )
+        }),
         draw_framebuffer: direct_capture
             .then(|| renderer.effect_resources.scratch_framebuffer_identity())
             .flatten(),
