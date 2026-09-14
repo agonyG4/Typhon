@@ -347,9 +347,17 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) parent_surface_id: Option<u32>,
     pub(in crate::compositor::tests) local_x: i32,
     pub(in crate::compositor::tests) local_y: i32,
+    pub(in crate::compositor::tests) content_x: i32,
+    pub(in crate::compositor::tests) content_y: i32,
     pub(in crate::compositor::tests) origin_x: i32,
     pub(in crate::compositor::tests) origin_y: i32,
     pub(in crate::compositor::tests) buffer_id: u64,
+    pub(in crate::compositor::tests) pixel_checksum: Option<u64>,
+    pub(in crate::compositor::tests) buffer_scale: u32,
+    pub(in crate::compositor::tests) buffer_transform:
+        wayland_server::protocol::wl_output::Transform,
+    pub(in crate::compositor::tests) viewport_source: Option<(i64, i64, i64, i64)>,
+    pub(in crate::compositor::tests) viewport_destination: Option<(u32, u32)>,
     pub(in crate::compositor::tests) generation: u64,
     pub(in crate::compositor::tests) resize_preview_active: bool,
 }
@@ -450,6 +458,9 @@ pub(in crate::compositor::tests) struct ClientCursorSnapshot {
     pub(in crate::compositor::tests) logical_y: i32,
     pub(in crate::compositor::tests) width: u32,
     pub(in crate::compositor::tests) height: u32,
+    pub(in crate::compositor::tests) buffer_scale: u32,
+    pub(in crate::compositor::tests) buffer_transform:
+        wayland_server::protocol::wl_output::Transform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

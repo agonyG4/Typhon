@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::state_data::SurfaceContentMapping;
 use crate::compositor::subsurface::ContentUpdateRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -170,8 +171,7 @@ pub(in crate::compositor) struct SurfaceTreeMergeStats {
 pub(in crate::compositor) struct BufferlessSurfaceCommitState {
     pub(in crate::compositor) commit_sequence: SurfaceCommitSequence,
     pub(in crate::compositor) damage: Option<RenderableSurfaceDamage>,
-    pub(in crate::compositor) surface_size: Option<BufferSize>,
-    pub(in crate::compositor) buffer_scale: u32,
+    pub(in crate::compositor) mapping: Option<SurfaceContentMapping>,
     pub(in crate::compositor) resize_commit: Option<ResizeCommitSnapshot>,
     pub(in crate::compositor) resize_capture_finalized: bool,
     pub(in crate::compositor) window_geometry: Option<XdgWindowGeometry>,
@@ -315,15 +315,28 @@ impl CompositorState {
         };
         data.apply_presentation(presentation);
         let viewport = data.apply_viewport_change(viewport_destination);
-        let surface_size = viewport
-            .destination
-            .or_else(|| viewport.source.and_then(ViewportSourceRect::logical_size));
         let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
-        let _committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
+        let committed_buffer_transform = data.apply_buffer_transform_change(buffer_transform);
+        // These values come from this exact cached Content Update. Applying
+        // them before capturing the retained mapping keeps delayed
+        // publication independent from newer pending protocol state.
+        let retained_mapping = self
+            .current_surface_buffers
+            .get(&surface_id)
+            .and_then(|current| {
+                current
+                    .content_mapping_for_state(
+                        viewport,
+                        committed_buffer_scale,
+                        committed_buffer_transform,
+                        offset,
+                    )
+                    .ok()
+            });
         let opaque_region_changed = data.apply_opaque_region_change(opaque_region);
         let renderable_index = self.renderable_surface_index(surface_id);
-        let (opaque_width, opaque_height) = surface_size
-            .map(|size| (size.width, size.height))
+        let (opaque_width, opaque_height) = retained_mapping
+            .map(|mapping| (mapping.surface_size.width, mapping.surface_size.height))
             .or_else(|| {
                 renderable_index.and_then(|index| {
                     self.renderable_surfaces
@@ -421,8 +434,7 @@ impl CompositorState {
                     BufferlessSurfaceCommitState {
                         commit_sequence,
                         damage,
-                        surface_size,
-                        buffer_scale: committed_buffer_scale,
+                        mapping: retained_mapping,
                         resize_commit,
                         resize_capture_finalized,
                         window_geometry,

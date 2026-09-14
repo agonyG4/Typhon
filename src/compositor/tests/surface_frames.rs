@@ -1208,6 +1208,351 @@ fn wayland_surface_damage_only_commit_keeps_owned_shm_snapshot() {
 }
 
 #[test]
+fn wayland_bufferless_transform_commit_updates_retained_mapping_without_damage() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 2, 3).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    buffer.attach(&surface, 2, 3);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let no_op = capture_renderable_surface_snapshot(&commands);
+
+    let transforms = [
+        (
+            wayland_client::protocol::wl_output::Transform::Normal,
+            wayland_server::protocol::wl_output::Transform::Normal,
+            (2, 3),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::_90,
+            wayland_server::protocol::wl_output::Transform::_90,
+            (3, 2),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::_180,
+            wayland_server::protocol::wl_output::Transform::_180,
+            (2, 3),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::_270,
+            wayland_server::protocol::wl_output::Transform::_270,
+            (3, 2),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::Flipped,
+            wayland_server::protocol::wl_output::Transform::Flipped,
+            (2, 3),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::Flipped90,
+            wayland_server::protocol::wl_output::Transform::Flipped90,
+            (3, 2),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::Flipped180,
+            wayland_server::protocol::wl_output::Transform::Flipped180,
+            (2, 3),
+        ),
+        (
+            wayland_client::protocol::wl_output::Transform::Flipped270,
+            wayland_server::protocol::wl_output::Transform::Flipped270,
+            (3, 2),
+        ),
+    ];
+    let mut previous = no_op[0].clone();
+    for (client_transform, server_transform, (width, height)) in transforms {
+        surface.set_buffer_transform(client_transform);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+        let updated = capture_renderable_surface_snapshot(&commands);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].buffer_id, initial[0].buffer_id);
+        assert_eq!(updated[0].pixel_checksum, initial[0].pixel_checksum);
+        assert_eq!(updated[0].buffer_transform, server_transform);
+        assert_eq!((updated[0].width, updated[0].height), (width, height));
+        if server_transform != wayland_server::protocol::wl_output::Transform::Normal {
+            assert!(updated[0].generation > previous.generation);
+        }
+        previous = updated[0].clone();
+    }
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(no_op[0].generation, initial[0].generation);
+}
+
+#[test]
+fn wayland_bufferless_mapping_commit_publishes_viewport_resets_and_scale() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 2).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    viewport.set_source(0.0, 0.0, 2.0, 2.0);
+    viewport.set_destination(2, 2);
+    buffer.attach(&surface, 4, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+
+    viewport.set_source(1.0, 0.0, 2.0, 2.0);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let source_changed = capture_renderable_surface_snapshot(&commands);
+
+    viewport.set_destination(3, 4);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let destination_changed = capture_renderable_surface_snapshot(&commands);
+
+    viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+    viewport.set_destination(-1, -1);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let reset = capture_renderable_surface_snapshot(&commands);
+
+    surface.set_buffer_scale(2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let scaled = capture_renderable_surface_snapshot(&commands);
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let after_no_op = capture_renderable_surface_snapshot(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial.len(), 1);
+    assert_eq!(source_changed.len(), 1);
+    assert_eq!(destination_changed.len(), 1);
+    assert_eq!(reset.len(), 1);
+    assert_eq!(scaled.len(), 1);
+    let buffer_id = initial[0].buffer_id;
+    assert!(source_changed[0].buffer_id == buffer_id);
+    assert_eq!(source_changed[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(
+        destination_changed[0].pixel_checksum,
+        initial[0].pixel_checksum
+    );
+    assert_eq!(reset[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(scaled[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(initial[0].viewport_source, Some((0, 0, 512, 512)));
+    assert_eq!(source_changed[0].viewport_source, Some((256, 0, 512, 512)));
+    assert_eq!((initial[0].width, initial[0].height), (2, 2));
+    assert_eq!((source_changed[0].width, source_changed[0].height), (2, 2));
+    assert_eq!(destination_changed[0].viewport_destination, Some((3, 4)));
+    assert_eq!(reset[0].viewport_source, None);
+    assert_eq!(reset[0].viewport_destination, None);
+    assert_eq!((reset[0].width, reset[0].height), (4, 2));
+    assert_eq!(scaled[0].buffer_scale, 2);
+    assert_eq!((scaled[0].width, scaled[0].height), (2, 1));
+    assert_eq!(after_no_op[0].generation, scaled[0].generation);
+    assert!(source_changed[0].generation > initial[0].generation);
+    assert!(destination_changed[0].generation > source_changed[0].generation);
+    assert!(reset[0].generation > destination_changed[0].generation);
+    assert!(scaled[0].generation > reset[0].generation);
+}
+
+#[test]
+fn wayland_bufferless_offset_commit_updates_retained_mapping_without_damage() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 3).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    buffer.attach(&surface, 4, 3);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+
+    surface.offset(7, 9);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let updated = capture_renderable_surface_snapshot(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial.len(), 1);
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].buffer_id, initial[0].buffer_id);
+    assert_eq!(updated[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!((updated[0].content_x, updated[0].content_y), (7, 9));
+    assert!(updated[0].generation > initial[0].generation);
+}
+
+#[test]
+fn synchronized_bufferless_mapping_is_captured_before_delayed_publication() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let timing: client_wp_commit_timing_manager_v1::WpCommitTimingManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    commit_test_buffered_surface(&child, &shm, &qh, 4, 3).unwrap();
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial_surfaces = capture_renderable_surface_snapshot(&commands);
+    let initial = initial_surfaces
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .cloned()
+        .unwrap_or_else(|| panic!("synchronized child should be mapped: {initial_surfaces:?}"));
+
+    child.set_buffer_transform(client_wl_output::Transform::_180);
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let timer = timing.get_timer(&parent, &qh, ());
+    let now = PresentationTimestamp::from_clock(PresentationClock::Monotonic).unwrap();
+    let (seconds_hi, seconds_lo) = now.protocol_seconds();
+    timer.set_timestamp(seconds_hi, seconds_lo.saturating_add(1), now.nanoseconds());
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    child.set_buffer_transform(client_wl_output::Transform::_90);
+    child.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let before_release = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("delayed child should remain mapped");
+    assert_eq!(
+        before_release.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::Normal
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let after_first_release = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("first delayed child update should publish");
+    assert_eq!(
+        after_first_release.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::_180
+    );
+
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let after_second_parent = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("second delayed child update should publish");
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(
+        initial.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::Normal
+    );
+    assert_eq!(
+        after_second_parent.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::_90
+    );
+    assert_eq!(after_first_release.buffer_id, initial.buffer_id);
+    assert_eq!(after_first_release.pixel_checksum, initial.pixel_checksum);
+    assert_eq!(after_second_parent.buffer_id, initial.buffer_id);
+    assert_eq!(after_second_parent.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
 fn wayland_same_buffer_object_reuse_materializes_new_content_once() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

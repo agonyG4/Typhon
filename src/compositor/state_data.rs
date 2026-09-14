@@ -240,6 +240,22 @@ pub(in crate::compositor) struct SurfaceViewportCommit {
     pub(in crate::compositor) destination: Option<BufferSize>,
 }
 
+/// The complete effective mapping of the pixels retained by a surface.
+///
+/// This is deliberately a value rather than a collection of optional deltas:
+/// a bufferless commit publishes this snapshot for its exact Content Update,
+/// so publication never has to reconstruct mapping from older buffer state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::compositor) struct SurfaceContentMapping {
+    pub(in crate::compositor) x: i32,
+    pub(in crate::compositor) y: i32,
+    pub(in crate::compositor) surface_size: BufferSize,
+    pub(in crate::compositor) buffer_scale: u32,
+    pub(in crate::compositor) buffer_transform: wl_output::Transform,
+    pub(in crate::compositor) viewport_source: Option<ViewportSourceRect>,
+    pub(in crate::compositor) viewport_destination: Option<BufferSize>,
+}
+
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
     SurfacePlacement, SurfaceRenderBackend,
@@ -1547,14 +1563,79 @@ impl CurrentSurfaceBuffer {
         }
     }
 
-    pub(super) fn surface_size_for_state(
+    pub(super) fn content_mapping_for_state(
         &self,
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
         buffer_transform: wl_output::Transform,
-    ) -> io::Result<BufferSize> {
-        let size = BufferSize::new(self.width()?, self.height()?).ok_or_else(invalid_shm_buffer)?;
-        surface_size_for_state_with_buffer_size(size, viewport, buffer_scale, buffer_transform)
+        offset: Option<(i32, i32)>,
+    ) -> io::Result<SurfaceContentMapping> {
+        let buffer_size =
+            BufferSize::new(self.width()?, self.height()?).ok_or_else(invalid_shm_buffer)?;
+        validate_viewport_source(buffer_size, viewport.source)?;
+        let surface_size = surface_size_for_state_with_buffer_size(
+            buffer_size,
+            viewport,
+            buffer_scale,
+            buffer_transform,
+        )?;
+        Ok(SurfaceContentMapping {
+            x: offset.map_or_else(|| self.x(), |(x, _)| x),
+            y: offset.map_or_else(|| self.y(), |(_, y)| y),
+            surface_size,
+            buffer_scale,
+            buffer_transform,
+            viewport_source: viewport.source,
+            viewport_destination: viewport.destination,
+        })
+    }
+
+    pub(super) fn current_content_mapping(&self) -> io::Result<SurfaceContentMapping> {
+        self.content_mapping_for_state(
+            SurfaceViewportCommit {
+                source: self.viewport_source(),
+                destination: self.viewport_destination(),
+            },
+            self.buffer_scale(),
+            self.buffer_transform(),
+            None,
+        )
+    }
+
+    pub(super) fn update_content_mapping(
+        &mut self,
+        mapping: SurfaceContentMapping,
+        commit_sequence: SurfaceCommitSequence,
+    ) {
+        match self {
+            Self::Unmaterialized(buffer) => {
+                buffer.x = mapping.x;
+                buffer.y = mapping.y;
+                buffer.surface_size = Some(mapping.surface_size);
+                buffer.viewport_source = mapping.viewport_source;
+                buffer.viewport_destination = mapping.viewport_destination;
+                buffer.buffer_scale = mapping.buffer_scale;
+                buffer.commit_sequence = commit_sequence;
+                buffer.buffer_transform = mapping.buffer_transform;
+            }
+            Self::Materialized(buffer) => {
+                buffer.x = mapping.x;
+                buffer.y = mapping.y;
+                buffer.surface_size = Some(mapping.surface_size);
+                buffer.viewport_source = mapping.viewport_source;
+                buffer.viewport_destination = mapping.viewport_destination;
+                buffer.buffer_scale = mapping.buffer_scale;
+                buffer.commit_sequence = commit_sequence;
+                buffer.buffer_transform = mapping.buffer_transform;
+            }
+        }
+    }
+
+    fn buffer_scale(&self) -> u32 {
+        match self {
+            Self::Unmaterialized(buffer) => buffer.buffer_scale,
+            Self::Materialized(buffer) => buffer.buffer_scale,
+        }
     }
 }
 
@@ -1609,15 +1690,11 @@ impl PendingSurfaceBuffer {
         let Some(source) = source else {
             return Ok(());
         };
-        let width = f64::from(self.data.width()?);
-        let height = f64::from(self.data.height()?);
-        let tolerance = 1.0 / 256.0;
-        if source.x + source.width > width + tolerance
-            || source.y + source.height > height + tolerance
-        {
-            return Err(invalid_shm_buffer());
-        }
-        Ok(())
+        validate_viewport_source(
+            BufferSize::new(self.data.width()?, self.data.height()?)
+                .ok_or_else(invalid_shm_buffer)?,
+            Some(source),
+        )
     }
 
     pub(super) fn materialize_for_publication(
@@ -1757,6 +1834,23 @@ fn surface_size_for_state_with_buffer_size(
     )
     .map_err(|_| invalid_shm_buffer())?;
     BufferSize::new(size.width, size.height).ok_or_else(invalid_shm_buffer)
+}
+
+fn validate_viewport_source(
+    buffer_size: BufferSize,
+    source: Option<ViewportSourceRect>,
+) -> io::Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let width = f64::from(buffer_size.width);
+    let height = f64::from(buffer_size.height);
+    let tolerance = 1.0 / 256.0;
+    if source.x + source.width > width + tolerance || source.y + source.height > height + tolerance
+    {
+        return Err(invalid_shm_buffer());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

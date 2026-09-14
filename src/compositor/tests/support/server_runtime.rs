@@ -787,9 +787,29 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         parent_surface_id: surface.placement.parent_surface_id,
                                         local_x: surface.placement.local_x,
                                         local_y: surface.placement.local_y,
+                                        content_x: surface.x,
+                                        content_y: surface.y,
                                         origin_x,
                                         origin_y,
                                         buffer_id: surface.buffer_id().get(),
+                                        pixel_checksum: surface.cpu_pixels().map(|pixels| {
+                                            pixels.iter().fold(0_u64, |checksum, pixel| {
+                                                checksum.rotate_left(5) ^ u64::from(*pixel)
+                                            })
+                                        }),
+                                        buffer_scale: surface.buffer_scale,
+                                        buffer_transform: surface.buffer_transform,
+                                        viewport_source: surface.viewport_source.map(|source| {
+                                            (
+                                                (source.x * 256.0).round() as i64,
+                                                (source.y * 256.0).round() as i64,
+                                                (source.width * 256.0).round() as i64,
+                                                (source.height * 256.0).round() as i64,
+                                            )
+                                        }),
+                                        viewport_destination: surface
+                                            .viewport_destination
+                                            .map(|size| (size.width, size.height)),
                                         generation: surface.generation,
                                         resize_preview_active: surface.visual_clip.is_some(),
                                     },
@@ -1085,6 +1105,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 logical_y: cursor.logical_y,
                                 width: cursor.surface.width,
                                 height: cursor.surface.height,
+                                buffer_scale: cursor.surface.buffer_scale,
+                                buffer_transform: cursor.surface.buffer_transform,
                             }
                         });
                         let _ = reply.send(snapshot);

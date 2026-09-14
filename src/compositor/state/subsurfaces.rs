@@ -1901,6 +1901,30 @@ impl CompositorState {
                 _ => {}
             }
         }
+        if commit.attachment.is_none()
+            && let Some(surface) = self.surface_resource_by_id(surface_id)
+            && let Some(data) = surface.data::<SurfaceData>()
+            && let Some(current) = self.current_surface_buffers.get(&surface_id)
+            && current
+                .content_mapping_for_state(
+                    data.viewport_for_change(commit.viewport_destination),
+                    data.buffer_scale_for_change(commit.buffer_scale),
+                    data.buffer_transform_for_change(commit.buffer_transform),
+                    commit.offset,
+                )
+                .is_err()
+        {
+            if let Some(client) = surface.client() {
+                self.post_protocol_error(
+                    &client,
+                    &surface,
+                    wl_surface::Error::InvalidSize,
+                    "buffer dimensions are not integral after transform and scale".to_string(),
+                );
+            }
+            self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+            return;
+        }
         if self.is_effectively_synchronized_subsurface(surface_id) {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
@@ -2482,9 +2506,6 @@ impl CompositorState {
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
     ) -> bool {
         for (surface_id, commit) in nodes {
-            let Some(PendingSurfaceAttachment::Buffer(pending)) = commit.attachment.as_mut() else {
-                continue;
-            };
             let Some(surface) = self.surface_resource_by_id(*surface_id) else {
                 return false;
             };
@@ -2494,11 +2515,30 @@ impl CompositorState {
             let viewport = data.viewport_for_change(commit.viewport_destination);
             let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
             let buffer_transform = data.buffer_transform_for_change(commit.buffer_transform);
-            if pending
-                .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
-                .is_err()
-            {
-                return false;
+            match commit.attachment.as_mut() {
+                Some(PendingSurfaceAttachment::Buffer(pending)) => {
+                    if pending
+                        .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                Some(PendingSurfaceAttachment::RemoveContent) => {}
+                None => {
+                    if let Some(current) = self.current_surface_buffers.get(surface_id)
+                        && current
+                            .content_mapping_for_state(
+                                viewport,
+                                buffer_scale,
+                                buffer_transform,
+                                commit.offset,
+                            )
+                            .is_err()
+                    {
+                        return false;
+                    }
+                }
             }
         }
         true

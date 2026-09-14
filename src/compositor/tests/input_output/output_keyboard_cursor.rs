@@ -1018,6 +1018,30 @@ fn same_buffer_cursor_damage_commit_preserves_owned_content_identity() {
 }
 
 #[test]
+fn same_buffer_cursor_mapping_commit_updates_transform_without_damage() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = exercise_cursor_mapping_only_commit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let (initial, updated) = result.unwrap();
+    assert_eq!(initial.buffer_id, updated.buffer_id);
+    assert_eq!(initial.first_pixel, updated.first_pixel);
+    assert_eq!(
+        updated.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::_180
+    );
+    assert!(updated.commit_sequence > initial.commit_sequence);
+    assert_eq!(
+        (initial.width, initial.height),
+        (updated.width, updated.height)
+    );
+}
+
+#[test]
 fn cursor_surface_null_attachment_removes_overlay_without_mapping_client_content() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

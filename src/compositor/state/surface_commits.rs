@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::compositor::layer_shell::CapturedLayerSurfaceCommitState;
+use crate::compositor::state_data::SurfaceContentMapping;
 
 impl CompositorState {
     pub(in crate::compositor) fn commit_surface_buffer(
@@ -431,16 +432,15 @@ impl CompositorState {
         Ok(())
     }
 
-    pub(in crate::compositor) fn commit_surface_damage_only(
+    pub(in crate::compositor) fn commit_surface_mapping_only(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
-        damage: RenderableSurfaceDamage,
-        surface_size: Option<BufferSize>,
-        buffer_scale: u32,
+        damage: Option<RenderableSurfaceDamage>,
+        mapping: SurfaceContentMapping,
         window_geometry: Option<XdgWindowGeometry>,
     ) -> bool {
-        // This path updates committed surface metadata and damage without a
+        // This path publishes committed metadata and damage without a
         // wl_surface buffer attachment, so it retains the current content.
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
@@ -454,6 +454,17 @@ impl CompositorState {
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
             return false;
         };
+        let mapping_changed = current
+            .current_content_mapping()
+            .map_or(true, |previous| previous != mapping);
+        let window_geometry_changed =
+            self.surface_window_geometries.get(&surface_id).copied() != window_geometry;
+        if damage.is_none() && !mapping_changed && !window_geometry_changed {
+            if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
+                current.update_content_mapping(mapping, commit_sequence);
+            }
+            return true;
+        }
         let generation = self.next_render_generation_value();
         client_pacing_log(
             "visual_generation_queued",
@@ -470,14 +481,32 @@ impl CompositorState {
                 ("commit_sequence", commit_sequence.0.to_string()),
                 ("buffer", format!("{:?}", current.resource().id())),
                 ("buffer_id", current.buffer_id().get().to_string()),
-                ("damage", (!damage.is_empty()).to_string()),
+                (
+                    "damage",
+                    damage
+                        .as_ref()
+                        .is_some_and(|damage| !damage.is_empty())
+                        .to_string(),
+                ),
                 ("render_generation", generation.to_string()),
-                ("source", "damage_only".to_string()),
+                ("source", "retained_mapping".to_string()),
             ],
         );
-        let window_geometry_changed =
-            self.apply_committed_window_geometry(surface_id, window_geometry);
+        let window_geometry_changed = self
+            .apply_committed_window_geometry(surface_id, window_geometry)
+            || window_geometry_changed;
         let placement = self.surface_placement(surface_id);
+        let damage = damage.unwrap_or(RenderableSurfaceDamage::Empty);
+        let damage = if mapping_changed || window_geometry_changed {
+            self.compliance_metrics
+                .note_surface_commit_mapping_full_promotion();
+            RenderableSurfaceDamage::Full
+        } else {
+            damage
+        };
+        if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
+            current.update_content_mapping(mapping, commit_sequence);
+        }
         let Some(renderable_index) = self.content_renderable_surface_index(surface_id) else {
             return false;
         };
@@ -490,17 +519,6 @@ impl CompositorState {
         } else {
             RenderableSurfaceDamage::Full
         };
-        let requested_surface_size = match current.surface_size_for_state(
-            SurfaceViewportCommit {
-                source: current.viewport_source(),
-                destination: surface_size,
-            },
-            buffer_scale,
-            current.buffer_transform(),
-        ) {
-            Ok(surface_size) => surface_size,
-            Err(_) => buffer_size,
-        };
         let resize_pending = self
             .resize_configure_flows
             .get(&surface_id)
@@ -510,25 +528,25 @@ impl CompositorState {
                 width: existing.width,
                 height: existing.height,
             },
-            requested_surface_size,
+            mapping.surface_size,
             resize_pending,
         );
-        let visual_mapping_changed = existing.x != current.x()
-            || existing.y != current.y()
+        let visual_mapping_changed = existing.x != mapping.x
+            || existing.y != mapping.y
             || existing.width != surface_size.width
             || existing.height != surface_size.height
             || existing.placement != placement
-            || existing.buffer_scale != buffer_scale
-            || existing.buffer_transform != current.buffer_transform()
-            || existing.viewport_source != current.viewport_source()
-            || existing.viewport_destination != current.viewport_destination();
+            || existing.buffer_scale != mapping.buffer_scale
+            || existing.buffer_transform != mapping.buffer_transform
+            || existing.viewport_source != mapping.viewport_source
+            || existing.viewport_destination != mapping.viewport_destination;
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: damage-only commit surface {surface_id} buffer={}x{} requested_surface={}x{} applied_surface={}x{} shm={} dmabuf={} pending_resize={:?}",
+                "oblivion-one compositor: retained-mapping commit surface {surface_id} buffer={}x{} requested_surface={}x{} applied_surface={}x{} shm={} dmabuf={} pending_resize={:?}",
                 buffer_width,
                 buffer_height,
-                requested_surface_size.width,
-                requested_surface_size.height,
+                mapping.surface_size.width,
+                mapping.surface_size.height,
                 surface_size.width,
                 surface_size.height,
                 current.is_shm(),
@@ -538,17 +556,17 @@ impl CompositorState {
                     .and_then(ResizeConfigureFlow::in_flight_serial),
             );
         }
-        existing.x = current.x();
-        existing.y = current.y();
+        existing.x = mapping.x;
+        existing.y = mapping.y;
         existing.width = surface_size.width;
         existing.height = surface_size.height;
         existing.placement = placement;
         existing.generation = generation;
         existing.commit_sequence = commit_sequence;
-        existing.buffer_scale = buffer_scale;
-        existing.buffer_transform = current.buffer_transform();
-        existing.viewport_source = current.viewport_source();
-        existing.viewport_destination = current.viewport_destination();
+        existing.buffer_scale = mapping.buffer_scale;
+        existing.buffer_transform = mapping.buffer_transform;
+        existing.viewport_source = mapping.viewport_source;
+        existing.viewport_destination = mapping.viewport_destination;
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,
@@ -941,20 +959,18 @@ impl CompositorState {
         let BufferlessSurfaceCommitState {
             commit_sequence,
             damage,
-            surface_size,
-            buffer_scale,
+            mapping,
             resize_commit: captured_resize_commit,
             resize_capture_finalized,
             window_geometry,
         } = state;
         if self.is_cursor_surface(surface_id) {
-            if let Some(damage) = damage {
-                self.commit_cursor_surface_damage_only(
+            if let Some(mapping) = mapping {
+                self.commit_cursor_surface_mapping_only(
                     surface_id,
                     commit_sequence,
                     damage,
-                    surface_size,
-                    buffer_scale,
+                    mapping,
                 );
             }
             return true;
@@ -980,7 +996,7 @@ impl CompositorState {
                     width: geometry.width as u32,
                     height: geometry.height as u32,
                 })
-                .or(surface_size)
+                .or_else(|| mapping.map(|mapping| mapping.surface_size))
                 .or_else(|| self.current_committed_surface_content_size(surface_id))
                 .unwrap_or(BufferSize {
                     width: 1,
@@ -989,29 +1005,15 @@ impl CompositorState {
             *snapshot = snapshot.with_committed_size(committed_size.width, committed_size.height);
         }
         let has_current_buffer = self.current_surface_buffers.contains_key(&surface_id);
-        let viewport_size_changed = surface_size.is_some_and(|surface_size| {
-            self.renderable_surface(surface_id).is_some_and(|surface| {
-                surface.width != surface_size.width || surface.height != surface_size.height
-            })
-        });
-        let window_geometry_changed = window_geometry.is_some_and(|geometry| {
-            self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
-        });
         if !has_current_buffer {
             self.apply_committed_window_geometry(surface_id, window_geometry);
         }
-        let damage = if viewport_size_changed || window_geometry_changed {
-            Some(RenderableSurfaceDamage::Full)
-        } else {
-            damage
-        };
-        if has_current_buffer && let Some(damage) = damage {
-            self.commit_surface_damage_only(
+        if has_current_buffer && let Some(mapping) = mapping {
+            self.commit_surface_mapping_only(
                 surface_id,
                 commit_sequence,
                 damage,
-                surface_size,
-                buffer_scale,
+                mapping,
                 window_geometry,
             );
         }
@@ -1827,6 +1829,26 @@ impl CompositorState {
                 }
             }
         };
+        if accepted && matches!(self.surface_role(surface_id), SurfaceRole::Cursor) {
+            let current = self.current_surface_buffers.get(&surface_id);
+            let size = current.and_then(|buffer| {
+                buffer
+                    .width()
+                    .ok()
+                    .zip(buffer.height().ok())
+                    .and_then(|(width, height)| BufferSize::new(width, height))
+            });
+            self.record_surface_publication(
+                surface_id,
+                self.root_surface_id_for_surface(surface_id),
+                current
+                    .map(CurrentSurfaceBuffer::commit_sequence)
+                    .unwrap_or(SurfaceCommitSequence::initial()),
+                current.map(CurrentSurfaceBuffer::buffer_id),
+                source,
+                size,
+            );
+        }
         if activated && !self.subsurface_content_is_inactive(surface_id) {
             if let Some(surface_generation) = self
                 .surface_presentation_generations

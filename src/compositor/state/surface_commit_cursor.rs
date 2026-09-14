@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::state_data::SurfaceContentMapping;
 
 impl CompositorState {
     pub(in crate::compositor) fn commit_cursor_surface_buffer(
@@ -115,13 +116,12 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn commit_cursor_surface_damage_only(
+    pub(in crate::compositor) fn commit_cursor_surface_mapping_only(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
-        damage: RenderableSurfaceDamage,
-        surface_size: Option<BufferSize>,
-        buffer_scale: u32,
+        damage: Option<RenderableSurfaceDamage>,
+        mapping: SurfaceContentMapping,
     ) -> bool {
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
@@ -135,6 +135,21 @@ impl CompositorState {
         let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
             return false;
         };
+        let mapping_changed = current
+            .current_content_mapping()
+            .map_or(true, |previous| previous != mapping);
+        if damage.is_none() && !mapping_changed {
+            if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
+                current.update_content_mapping(mapping, commit_sequence);
+            }
+            return true;
+        }
+        let damage = damage.unwrap_or(RenderableSurfaceDamage::Empty);
+        let damage = if mapping_changed {
+            RenderableSurfaceDamage::Full
+        } else {
+            damage
+        };
         let generation = self.next_render_generation_value();
         let Some(existing) = self.client_cursor_surfaces.get_mut(&surface_id) else {
             return false;
@@ -144,21 +159,19 @@ impl CompositorState {
         } else {
             RenderableSurfaceDamage::Full
         };
-        if let Ok(size) = current.surface_size_for_state(
-            SurfaceViewportCommit {
-                source: current.viewport_source(),
-                destination: surface_size,
-            },
-            buffer_scale,
-            current.buffer_transform(),
-        ) {
-            existing.width = size.width;
-            existing.height = size.height;
-        }
-        existing.x = current.x();
-        existing.y = current.y();
+        existing.width = mapping.surface_size.width;
+        existing.height = mapping.surface_size.height;
+        existing.x = mapping.x;
+        existing.y = mapping.y;
         existing.generation = generation;
         existing.commit_sequence = commit_sequence;
+        existing.buffer_scale = mapping.buffer_scale;
+        existing.buffer_transform = mapping.buffer_transform;
+        existing.viewport_source = mapping.viewport_source;
+        existing.viewport_destination = mapping.viewport_destination;
+        if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
+            current.update_content_mapping(mapping, commit_sequence);
+        }
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,
@@ -177,7 +190,7 @@ impl CompositorState {
         let output_scale = f64::from(self.output_scale.preferred_scale()) / 120.0;
         pointer_debug_log_lazy(|| {
             cursor_geometry_debug_message(
-                "damage-only",
+                "retained-mapping",
                 &client,
                 surface_id,
                 "unchanged",
