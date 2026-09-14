@@ -6690,7 +6690,7 @@ mod tests {
             .expect("Lamp shader is available in the GLES test harness");
         assert!(uniforms.canonical_visual_rect.is_some());
         assert!(uniforms.source_visual_rect.is_some());
-        assert!(uniforms.portal_rect.is_some());
+        assert!(uniforms.sink_rect.is_some());
         assert!(uniforms.progress.is_some());
         assert!(uniforms.contraction_progress.is_some());
         assert!(uniforms.translation_progress.is_some());
