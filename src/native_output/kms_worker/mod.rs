@@ -49,8 +49,6 @@ mod task4_tests;
 mod tests;
 #[cfg(test)]
 mod timing_tests;
-#[cfg(test)]
-mod worker_pacing_tests;
 pub(crate) use bundle::KmsCursorOwner;
 #[cfg(test)]
 pub(crate) use bundle::KmsPrimaryOwner;

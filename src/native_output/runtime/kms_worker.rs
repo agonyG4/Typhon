@@ -612,14 +612,16 @@ impl NativeRuntime {
             .extend(snapshot.pending_sidecar);
         if let Some(inflight) = snapshot.inflight {
             self.forced_shutdown_inflight = Some(inflight);
-            let pacing_cleared = if let Some(ticket) = inflight.pacing_ticket {
-                self.frame_pacing.cancel_worker_submission(Some(ticket))
-                    || self
-                        .frame_pacing
-                        .abandon_pending_submission(inflight.token.get())
-            } else {
-                self.frame_pacing
-                    .abandon_pending_submission(inflight.token.get())
+            let pacing_cleared = match inflight.pacing_ticket {
+                Some(ticket) => {
+                    self.frame_pacing.cancel_worker_submission(Some(ticket))
+                        || self
+                            .frame_pacing
+                            .abandon_pending_submission(inflight.token.get())
+                }
+                None => self
+                    .frame_pacing
+                    .abandon_pending_submission(inflight.token.get()),
             };
             self.perf.log("native.kms_commit_worker", || {
                 vec![
