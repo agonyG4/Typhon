@@ -296,6 +296,162 @@ mod tests {
     }
 
     #[test]
+    fn pending_coalescing_rejects_discontinuous_lineage_without_mutating_target() {
+        let mut state = CompositorState {
+            external_acquire_readiness: true,
+            ..CompositorState::default()
+        };
+        let (display, client, parent_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let child_surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let child_id = compositor_surface_id(&child_surface);
+        state.surface_presentation_generations.insert(child_id, 1);
+
+        let acquire = SurfaceTreeAcquireDependency {
+            surface_commit_id: SurfaceCommitId::for_tests(100),
+            commit_id: AcquireCommitId::for_tests(101),
+            surface_id: child_id,
+            owner_client_id: Some(client.id()),
+            surface_presentation_generation: Some(1),
+            buffer_id: 308,
+            acquire: ExplicitSyncPoint::for_tests_with_signal_script(102, 103, [false]),
+            state: PendingAcquireState::EventfdBacked,
+        };
+        let a = test_mergeable_commit(1);
+        let a_ref = a.content_update_ref(child_id);
+        let mut p1 = test_mergeable_commit(2);
+        let p1_ref = p1.content_update_ref(parent_id);
+        p1.lineage.child_dependencies = vec![a_ref];
+        state.queue_waiting_surface_tree(
+            parent_id,
+            vec![(child_id, a), (parent_id, p1)],
+            vec![acquire],
+        );
+
+        let mut b = test_mergeable_commit(3);
+        b.lineage.predecessor = Some(a_ref);
+        let b_ref = b.content_update_ref(child_id);
+        state.queue_waiting_surface_tree_with_lifetimes(
+            child_id,
+            vec![(child_id, b)],
+            test_captured_lifetimes(&client.id(), &[child_id]),
+            Vec::new(),
+            vec![a_ref],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let mut d = test_mergeable_commit(4);
+        d.lineage.predecessor = Some(b_ref);
+        let mut p2 = test_mergeable_commit(5);
+        p2.lineage.predecessor = Some(p1_ref);
+        p2.lineage.child_dependencies = vec![d.content_update_ref(child_id)];
+        state.merge_or_queue_surface_tree_transaction(
+            parent_id,
+            vec![(child_id, d), (parent_id, p2)],
+            Vec::new(),
+            vec![b_ref],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let parent_transactions = state
+            .pending_surface_tree_transactions
+            .iter()
+            .filter(|transaction| transaction.root_surface_id == parent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(parent_transactions.len(), 2);
+        assert!(parent_transactions.iter().any(|transaction| {
+            transaction.nodes.iter().any(|(surface_id, commit)| {
+                *surface_id == child_id && commit.commit_sequence == SurfaceCommitSequence(1)
+            }) && transaction.dependencies.len() == 1
+        }));
+        let incoming = parent_transactions
+            .iter()
+            .find(|transaction| {
+                transaction.nodes.iter().any(|(surface_id, commit)| {
+                    *surface_id == child_id && commit.commit_sequence == SurfaceCommitSequence(4)
+                })
+            })
+            .expect("discontinuous incoming transaction remains separate");
+        assert_eq!(
+            incoming
+                .nodes
+                .iter()
+                .map(|(_, commit)| commit.commit_sequence)
+                .collect::<Vec<_>>(),
+            vec![SurfaceCommitSequence(4), SurfaceCommitSequence(5)]
+        );
+        assert_eq!(incoming.external_content_update_dependencies, vec![b_ref]);
+        assert!(!transaction_covers_content_update_ref(incoming, b_ref));
+        assert!(!state.content_update_dependencies_ready(incoming));
+        assert_eq!(state.pending_acquire_watch_changes.len(), 1);
+
+        let target = state
+            .pending_surface_tree_transactions
+            .iter_mut()
+            .find(|transaction| {
+                transaction.root_surface_id == parent_id
+                    && transaction
+                        .nodes
+                        .iter()
+                        .any(|(_, commit)| commit.commit_sequence == SurfaceCommitSequence(1))
+            })
+            .expect("original target transaction");
+        target.dependencies[0].state = PendingAcquireState::Ready;
+        state.commit_ready_surface_tree_transactions();
+
+        assert_eq!(
+            state.surface_publications[&child_id].latest_published,
+            Some(SurfaceCommitSequence(4))
+        );
+        assert!(state.pending_surface_tree_transactions.is_empty());
+    }
+
+    #[test]
+    fn pending_coalescing_requires_contiguous_lineage_for_same_surface_replacement() {
+        let a = test_mergeable_commit(10);
+        let a_ref = a.content_update_ref(2);
+        let mut b = test_mergeable_commit(11);
+        b.lineage.predecessor = Some(a_ref);
+        let b_ref = b.content_update_ref(2);
+
+        let mut target_a = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(20),
+            root_surface_id: 2,
+            nodes: vec![(2, a)],
+            publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+        let mut incoming_b = test_mergeable_commit(11);
+        incoming_b.lineage.predecessor = Some(a_ref);
+        assert!(can_coalesce_pending_surface_tree_transaction(
+            &target_a,
+            &[(2, incoming_b)]
+        ));
+
+        let mut merged_ab = test_mergeable_commit(10);
+        let _ = merged_ab.merge(b);
+        let mut incoming_c = test_mergeable_commit(12);
+        incoming_c.lineage.predecessor = Some(b_ref);
+        target_a.nodes[0].1 = merged_ab;
+        assert!(can_coalesce_pending_surface_tree_transaction(
+            &target_a,
+            &[(2, incoming_c)]
+        ));
+
+        let mut incoming_d = test_mergeable_commit(12);
+        incoming_d.lineage.predecessor = Some(b_ref);
+        target_a.nodes[0].1 = test_mergeable_commit(10);
+        assert!(!can_coalesce_pending_surface_tree_transaction(
+            &target_a,
+            &[(2, incoming_d)]
+        ));
+    }
+
+    #[test]
     fn coalesced_predecessor_is_internalized_and_publishes_after_other_readiness_clears() {
         let mut state = CompositorState::default();
         let (display, client, surface_id) = test_surface_and_client(&mut state);
@@ -1118,6 +1274,59 @@ fn transaction_covers_content_update_ref(
     reference: ContentUpdateRef,
 ) -> bool {
     transaction_node_index_covering_content_update_ref(transaction, reference).is_some()
+}
+
+fn can_coalesce_pending_surface_tree_transaction(
+    target: &PendingSurfaceTreeTransaction,
+    incoming_nodes: &[(u32, CachedSubsurfaceCommit)],
+) -> bool {
+    if target.ordering() != TransactionOrdering::Coalescible
+        || incoming_nodes
+            .iter()
+            .any(|(_, commit)| commit.pacing.is_boundary())
+    {
+        debug_assert_eq!(target.ordering(), TransactionOrdering::Coalescible);
+        debug_assert!(
+            incoming_nodes
+                .iter()
+                .all(|(_, commit)| !commit.pacing.is_boundary())
+        );
+        return false;
+    }
+
+    for (incoming_index, (surface_id, incoming)) in incoming_nodes.iter().enumerate() {
+        if incoming_nodes[..incoming_index]
+            .iter()
+            .any(|(previous_surface_id, _)| previous_surface_id == surface_id)
+        {
+            debug_assert!(false, "coalescible candidate retains duplicate surfaces");
+            return false;
+        }
+        let mut matching = target
+            .nodes
+            .iter()
+            .filter(|(existing_surface_id, _)| existing_surface_id == surface_id);
+        let Some((_, existing)) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_some() {
+            debug_assert!(false, "coalescible transaction retains duplicate surfaces");
+            return false;
+        }
+        if existing.commit_sequence >= incoming.commit_sequence {
+            return false;
+        }
+        let Some(predecessor) = incoming.lineage.predecessor else {
+            return false;
+        };
+        if predecessor.surface_id != *surface_id
+            || predecessor.commit_sequence >= incoming.commit_sequence
+            || !content_update_node_covers_ref(*surface_id, existing, predecessor)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn normalize_external_content_dependencies_for_nodes(
@@ -1977,6 +2186,22 @@ impl CompositorState {
                 publication_lifetimes.clone(),
                 dependencies,
                 external_content_update_dependencies.clone(),
+                submission_kind,
+            );
+            self.commit_ready_surface_tree_transactions();
+            return;
+        }
+
+        if !can_coalesce_pending_surface_tree_transaction(
+            &self.pending_surface_tree_transactions[target_index],
+            &nodes,
+        ) {
+            self.queue_waiting_surface_tree_with_lifetimes(
+                root_surface_id,
+                nodes,
+                publication_lifetimes,
+                dependencies,
+                external_content_update_dependencies,
                 submission_kind,
             );
             self.commit_ready_surface_tree_transactions();
