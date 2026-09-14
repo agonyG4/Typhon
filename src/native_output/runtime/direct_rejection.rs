@@ -52,11 +52,10 @@ impl NativeRuntime {
             .ok_or_else(|| io::Error::other("rejected direct transaction is missing"))?
             .descriptor()
             .obligations();
-        if !self.frame_pacing.cancel_worker_submission_exact(
-            job.pacing_frame_id,
-            job.predictive_output_identity,
-            job.ready_submit,
-        ) {
+        if !self
+            .frame_pacing
+            .cancel_worker_submission(job.pacing_ticket)
+        {
             self.worker_quarantine.jobs.push(job);
             return Err(io::Error::other("direct rejection pacing identity mismatch").into());
         }

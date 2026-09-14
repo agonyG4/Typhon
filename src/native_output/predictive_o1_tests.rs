@@ -156,29 +156,135 @@ fn predictive_worker_submission_and_pageflip_share_one_physical_identity() {
         .reserve_worker_submission(true)
         .expect("reserve physical predictive frame")
         .expect("predictive attempt ID");
-    assert_eq!(pacing.worker_submission_output_identity(), Some(physical));
+    assert_eq!(reserved.physical_identity(), Some(physical));
     assert_eq!(
-        pacing.worker_submission_output_key(),
+        reserved.physical_key(),
         Some(OutputFrameKey::from(&physical))
     );
 
     pacing
         .note_worker_submit_exact(
             Some(reserved),
-            Some(physical),
             41,
             3,
-            true,
             NativeOutputPacingMode::PredictiveTriple,
         )
         .expect("worker submission should consume the exact physical identity");
     pacing.note_pageflip_exact(Some(physical), 4, 3, 41, 6_060);
 
-    assert_ne!(reserved, physical.frame_id);
+    assert_ne!(reserved.frame_id().get(), physical.frame_id);
     assert_ne!(attempt.get(), physical.frame_id);
     assert_eq!(pacing.predictive_o1_presented, 1);
     assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
     assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+}
+
+#[test]
+fn worker_aba_overlap_stress_reconciles_predictive_lifecycles() {
+    let mut pacing = NativeFramePacing::from_env();
+    pacing.enabled = true;
+    let mut successful_successors = 0;
+
+    for iteration in 0..10_000u64 {
+        // Deliberately reuse the same logical scheduler ID on every iteration.
+        // Physical output identities and worker reservation capabilities remain
+        // distinct and must reconcile independently.
+        pacing.ids = NativeOutputFrameIdSequence::new(1);
+        pacing.queue_visual(iteration + 1, iteration + 1);
+        let logical_frame = pacing.active.expect("normal predecessor");
+        let predecessor_ticket = pacing
+            .reserve_worker_submission(false)
+            .expect("predecessor reservation")
+            .expect("predecessor ticket");
+
+        pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("predictive successor render");
+        let successor_attempt = pacing.active_predictive_attempt.expect("successor attempt");
+        let physical = physical_identity(20_000 + iteration + 1);
+        pacing
+            .bind_predictive_o1(physical)
+            .expect("successor physical binding");
+        pacing.note_render_ready();
+        pacing.note_ready_frame(iteration + 2, true);
+        pacing.note_predictive_unbound_ready();
+        pacing.note_predictive_binding_after_render_completion(0);
+
+        assert_eq!(predecessor_ticket.frame_id(), logical_frame);
+        assert_eq!(pacing.ready, Some(logical_frame));
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(
+            pacing.ready_physical_key,
+            Some(OutputFrameKey::from(&physical))
+        );
+
+        let predecessor_token = iteration.saturating_mul(2).saturating_add(1);
+        let successor_token = predecessor_token.saturating_add(1);
+        if iteration % 2 == 0 {
+            pacing
+                .note_worker_submit_exact(
+                    Some(predecessor_ticket),
+                    predecessor_token,
+                    iteration + 3,
+                    NativeOutputPacingMode::PredictiveTriple,
+                )
+                .expect("predecessor success");
+            assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+            pacing.note_pageflip_exact(
+                None,
+                iteration + 4,
+                iteration + 3,
+                predecessor_token,
+                6_060,
+            );
+
+            let successor_ticket = pacing
+                .reserve_worker_submission(true)
+                .expect("successor reservation")
+                .expect("successor ticket");
+            pacing
+                .note_worker_submit_exact(
+                    Some(successor_ticket),
+                    successor_token,
+                    iteration + 5,
+                    NativeOutputPacingMode::PredictiveTriple,
+                )
+                .expect("successor success");
+            pacing.note_pageflip_exact(
+                Some(physical),
+                iteration + 6,
+                iteration + 5,
+                successor_token,
+                6_060,
+            );
+            successful_successors += 1;
+        } else {
+            assert!(pacing.cancel_worker_submission(Some(predecessor_ticket)));
+            assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+
+            let successor_ticket = pacing
+                .reserve_worker_submission(true)
+                .expect("successor reservation after predecessor cancellation")
+                .expect("successor ticket after predecessor cancellation");
+            assert!(pacing.cancel_worker_submission(Some(successor_ticket)));
+        }
+
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
+        assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+        assert!(pacing.worker_reservation.is_none());
+        assert!(pacing.active.is_none());
+        assert!(pacing.ready.is_none());
+    }
+
+    assert_eq!(successful_successors, 5_000);
+    assert_eq!(pacing.predictive_o1_created, 10_000);
+    assert_eq!(pacing.predictive_o1_bound, 10_000);
+    assert_eq!(pacing.predictive_o1_submitted, 5_000);
+    assert_eq!(pacing.predictive_o1_presented, 5_000);
+    assert_eq!(pacing.predictive_o1_failed, 5_000);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
+    assert!(pacing.predictive_o1_lifecycle.peak_entries <= 4);
 }
 
 #[test]

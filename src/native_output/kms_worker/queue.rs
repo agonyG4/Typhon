@@ -287,6 +287,7 @@ pub(crate) struct WorkerInFlight {
     pub(crate) kind: crate::native_output::runtime::AtomicCommitKind,
     pub(crate) direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) submit_returned_at_ns: u64,
+    pub(crate) pacing_ticket: Option<crate::native_output::pacing::WorkerPacingTicket>,
 }
 
 #[derive(Debug)]

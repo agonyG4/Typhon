@@ -36,6 +36,7 @@ impl NativeRuntime {
                         kind: ownership.job.kind,
                         direct_content_key: None,
                         submit_returned_at_ns: ownership.submit_returned_at.get(),
+                        pacing_ticket: ownership.job.pacing_ticket,
                     })
             });
         }

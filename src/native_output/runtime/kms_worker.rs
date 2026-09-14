@@ -112,8 +112,7 @@ pub(super) fn queue_explicit_composited_frame(
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
-    pacing_frame_id: Option<u64>,
-    predictive_output_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
+    pacing_ticket: Option<WorkerPacingTicket>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
@@ -242,8 +241,7 @@ pub(super) fn queue_explicit_composited_frame(
         cursor_pin: frozen_cursor_owner.and_then(|owner| owner.pin),
         direct_primary_lease: None,
         test_only_duration_ns: None,
-        pacing_frame_id,
-        predictive_output_identity,
+        pacing_ticket,
         test_policy,
         ready_submit,
     };
@@ -333,7 +331,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
-    pacing_frame_id: Option<u64>,
+    pacing_ticket: Option<WorkerPacingTicket>,
     test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
@@ -482,8 +480,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
-        pacing_frame_id,
-        predictive_output_identity: None,
+        pacing_ticket,
         test_policy,
         ready_submit: true,
     };
@@ -615,9 +612,17 @@ impl NativeRuntime {
             .extend(snapshot.pending_sidecar);
         if let Some(inflight) = snapshot.inflight {
             self.forced_shutdown_inflight = Some(inflight);
-            let pacing_cleared = self
-                .frame_pacing
-                .abandon_pending_submission(inflight.token.get());
+            let pacing_cleared = match inflight.pacing_ticket {
+                Some(ticket) => {
+                    self.frame_pacing.cancel_worker_submission(Some(ticket))
+                        || self
+                            .frame_pacing
+                            .abandon_pending_submission(inflight.token.get())
+                }
+                None => self
+                    .frame_pacing
+                    .abandon_pending_submission(inflight.token.get()),
+            };
             self.perf.log("native.kms_commit_worker", || {
                 vec![
                     NativePerfField::str("event", snapshot.disposition.as_str()),
@@ -929,8 +934,6 @@ impl NativeRuntime {
                     .cursor()
                     .filter(|owner| owner.sidecar_id.is_some())
                     .cloned();
-                let pacing_frame_id = ownership.job.pacing_frame_id;
-                let ready_submit = ownership.job.ready_submit;
                 let out_fence = ownership.out_fence.take();
                 let direct_validation_key =
                     if matches!(kind, AtomicCommitKind::DirectPrimary { .. })
@@ -1280,11 +1283,9 @@ impl NativeRuntime {
                         .pacing_mode();
                     self.frame_pacing
                         .note_worker_submit_exact(
-                            pacing_frame_id,
-                            ownership.job.predictive_output_identity,
+                            ownership.job.pacing_ticket,
                             token.get(),
                             submit_returned_at,
-                            ready_submit,
                             pacing_mode,
                         )
                         .map_err(io::Error::other)?;

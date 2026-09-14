@@ -600,6 +600,7 @@ impl ExecutingDirectCandidateGuard {
             kind: job.kind,
             direct_content_key: self.candidate,
             submit_returned_at_ns,
+            pacing_ticket: job.pacing_ticket,
         });
         state.established_base = Some(EstablishedKmsBase::Pending(job.identity()));
         state.executing = false;

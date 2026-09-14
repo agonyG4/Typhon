@@ -206,7 +206,7 @@ pub(super) fn submit_ready_frame(
                 }
                 _ => None,
             };
-            let pacing_frame_id = frame_pacing
+            let pacing_ticket = frame_pacing
                 .reserve_worker_submission(true)
                 .map_err(io::Error::other)?;
             let test_only = atomic_cursor.as_ref().map_or(
@@ -223,6 +223,13 @@ pub(super) fn submit_ready_frame(
             let Some(compatibility_submit_window) = compatibility_submit_window else {
                 if let Some(batch_id) = callback_batch_id {
                     server.note_frame_callback_admission_failure(batch_id);
+                }
+                if pacing_ticket.is_some() && !frame_pacing.cancel_worker_submission(pacing_ticket)
+                {
+                    return Err(io::Error::other(
+                        "missing compatibility submit window left worker pacing reservation",
+                    )
+                    .into());
                 }
                 return Ok(ReadySubmissionResult::Unavailable);
             };
@@ -253,7 +260,7 @@ pub(super) fn submit_ready_frame(
                 atomic_cursor.as_ref().and_then(|native_cursor| {
                     cursor.and_then(|state| native_cursor.capability_key_for(state))
                 }),
-                pacing_frame_id,
+                pacing_ticket,
                 crate::native_output::kms_worker::KmsCommitTestPolicy::from_cursor(test_only),
                 cursor_epoch,
                 validation_base,
@@ -261,8 +268,8 @@ pub(super) fn submit_ready_frame(
                 Ok(result) => result,
                 Err(error) => {
                     scene_history.discard_ready();
-                    if pacing_frame_id.is_some()
-                        && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
+                    if pacing_ticket.is_some()
+                        && !frame_pacing.cancel_worker_submission(pacing_ticket)
                     {
                         return Err(io::Error::other(
                             "failed compatibility worker pacing identity mismatch",
@@ -276,8 +283,7 @@ pub(super) fn submit_ready_frame(
                 if let Some(batch_id) = callback_batch_id {
                     server.note_frame_callback_admission_failure(batch_id);
                 }
-                if pacing_frame_id.is_some()
-                    && !frame_pacing.cancel_worker_submission(pacing_frame_id, true)
+                if pacing_ticket.is_some() && !frame_pacing.cancel_worker_submission(pacing_ticket)
                 {
                     return Err(io::Error::other(
                         "unavailable compatibility worker pacing identity mismatch",

@@ -3,11 +3,12 @@
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::pacing::WorkerPacingTicket;
 use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
-use crate::native_output::scanout::{DirectPrimaryLease, OutputFrameIdentitySnapshot};
+use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
     PrimaryPlaneAssignment,
@@ -43,10 +44,11 @@ pub(crate) struct KmsCommitJob {
     pub(crate) cursor_pin: Option<CursorFramebufferPin>,
     pub(crate) direct_primary_lease: Option<DirectPrimaryLease>,
     pub(crate) test_only_duration_ns: Option<u64>,
-    pub(crate) pacing_frame_id: Option<u64>,
-    /// Exact physical identity for an Atomic predictive frame. The logical
-    /// pacing ID remains separate for scheduler bookkeeping.
-    pub(crate) predictive_output_identity: Option<OutputFrameIdentitySnapshot>,
+    /// Exact pacing ownership captured when this job was admitted. The
+    /// ticket carries logical, predictive, and physical metadata together so
+    /// worker completion never has to rediscover ownership from current
+    /// scheduler state.
+    pub(crate) pacing_ticket: Option<WorkerPacingTicket>,
     pub(crate) test_policy: KmsCommitTestPolicy,
     pub(crate) ready_submit: bool,
 }

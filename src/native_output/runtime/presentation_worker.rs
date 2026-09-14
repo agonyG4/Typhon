@@ -508,8 +508,7 @@ pub(super) enum DirectWorkerQueueResult {
 struct DirectWorkerAdmissionGuard {
     transaction_id: OutputTransactionId,
     token: PageFlipToken,
-    pacing_frame_id: Option<u64>,
-    ready_submit: bool,
+    pacing_ticket: Option<WorkerPacingTicket>,
     transaction_queued: bool,
     arbiter_reserved: bool,
     worker_permit: Option<KmsCommitAdmissionPermit>,
@@ -519,15 +518,13 @@ impl DirectWorkerAdmissionGuard {
     fn new(
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
-        pacing_frame_id: Option<u64>,
-        ready_submit: bool,
+        pacing_ticket: Option<WorkerPacingTicket>,
         worker_permit: KmsCommitAdmissionPermit,
     ) -> Self {
         Self {
             transaction_id,
             token,
-            pacing_frame_id,
-            ready_submit,
+            pacing_ticket,
             transaction_queued: false,
             arbiter_reserved: false,
             worker_permit: Some(worker_permit),
@@ -541,8 +538,8 @@ impl DirectWorkerAdmissionGuard {
         output_transactions: &mut OutputTransactionLedger,
     ) -> Result<(), String> {
         let mut failures = Vec::new();
-        if let Some(frame_id) = self.pacing_frame_id
-            && !frame_pacing.cancel_worker_submission(Some(frame_id), self.ready_submit)
+        if self.pacing_ticket.is_some()
+            && !frame_pacing.cancel_worker_submission(self.pacing_ticket)
         {
             failures.push("pacing reservation identity mismatch".to_string());
         }
@@ -839,8 +836,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
-    pacing_frame_id: Option<u64>,
-    predictive_output_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
+    pacing_ticket: Option<WorkerPacingTicket>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
@@ -859,8 +855,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         cursor_update,
         cursor_delivery,
         primary_cursor_presentation,
-        pacing_frame_id,
-        predictive_output_identity,
+        pacing_ticket,
         test_policy,
         ready_submit,
         validation_base,
@@ -908,11 +903,10 @@ pub(super) fn submit_explicit_ready_for_presentation(
         let frozen_primary_cursor_presentation =
             kms_primary_cursor_presentation(frozen_cursor_plan.primary_presentation);
         let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
-        let pacing_frame_id = context
+        let pacing_ticket = context
             .frame_pacing
             .reserve_worker_submission(ready_submit)
             .map_err(io::Error::other)?;
-        let predictive_output_identity = context.frame_pacing.worker_submission_output_identity();
         let test_only = match frozen_cursor_plan.cursor_test_policy {
             FrozenCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
             FrozenCursorTestPolicy::Skip => KmsTestOnlyPolicy::Skip,
@@ -942,8 +936,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             cursor_update,
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
-            pacing_frame_id,
-            predictive_output_identity,
+            pacing_ticket,
             KmsCommitTestPolicy {
                 primary: if primary_test_only {
                     KmsTestOnlyPolicy::Required
@@ -959,12 +952,8 @@ pub(super) fn submit_explicit_ready_for_presentation(
                 (token, framebuffer_id, transaction_id, true)
             }),
             Err(error) => {
-                if pacing_frame_id.is_some()
-                    && !context.frame_pacing.cancel_worker_submission_exact(
-                        pacing_frame_id,
-                        predictive_output_identity,
-                        ready_submit,
-                    )
+                if pacing_ticket.is_some()
+                    && !context.frame_pacing.cancel_worker_submission(pacing_ticket)
                 {
                     return Err(io::Error::other(
                         "failed explicit worker submission pacing identity mismatch",
@@ -975,12 +964,8 @@ pub(super) fn submit_explicit_ready_for_presentation(
             }
         };
         if result.is_none()
-            && pacing_frame_id.is_some()
-            && !context.frame_pacing.cancel_worker_submission_exact(
-                pacing_frame_id,
-                predictive_output_identity,
-                ready_submit,
-            )
+            && pacing_ticket.is_some()
+            && !context.frame_pacing.cancel_worker_submission(pacing_ticket)
         {
             return Err(io::Error::other(
                 "unavailable explicit worker submission pacing identity mismatch",
@@ -1043,7 +1028,7 @@ pub(super) fn queue_compatibility_for_presentation(
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
-    pacing_frame_id: Option<u64>,
+    pacing_ticket: Option<WorkerPacingTicket>,
     test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
@@ -1083,7 +1068,7 @@ pub(super) fn queue_compatibility_for_presentation(
         primary_cursor_presentation,
         cursor_pin,
         cursor_capability_key,
-        pacing_frame_id,
+        pacing_ticket,
         test_policy,
         cursor_epoch,
         validation_base,
@@ -1153,7 +1138,6 @@ pub(super) fn finish_direct_worker_queued(
         framebuffer_id,
     };
     let queued_at_ns = monotonic_now_ns()?;
-    let pacing_frame_id = context.frame_pacing.worker_submission_frame_id(false);
     let protocol_batch_id = {
         let transaction = output_transactions
             .transaction(transaction_id)
@@ -1213,8 +1197,7 @@ pub(super) fn finish_direct_worker_queued(
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
         direct_primary_lease: Some(direct_lease),
         test_only_duration_ns: None,
-        pacing_frame_id,
-        predictive_output_identity: None,
+        pacing_ticket: None,
         test_policy: KmsCommitTestPolicy::from_primary(test_only),
         ready_submit: false,
     };
@@ -1236,18 +1219,13 @@ pub(super) fn finish_direct_worker_queued(
         drop(job);
         return Err(io::Error::other(format!("invalid direct worker payload: {error:?}")).into());
     }
-    let pacing_frame_id = context
+    let pacing_ticket = context
         .frame_pacing
         .reserve_worker_submission(false)
         .map_err(io::Error::other)?;
-    job.pacing_frame_id = pacing_frame_id;
-    let mut guard = DirectWorkerAdmissionGuard::new(
-        transaction_id,
-        commit_token,
-        pacing_frame_id,
-        false,
-        admission,
-    );
+    job.pacing_ticket = pacing_ticket;
+    let mut guard =
+        DirectWorkerAdmissionGuard::new(transaction_id, commit_token, pacing_ticket, admission);
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,

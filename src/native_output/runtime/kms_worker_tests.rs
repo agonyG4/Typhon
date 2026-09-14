@@ -130,8 +130,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
         cursor_pin: None,
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,
-        pacing_frame_id: None,
-        predictive_output_identity: None,
+        pacing_ticket: None,
         test_policy: crate::native_output::kms_worker::KmsCommitTestPolicy::from_primary(
             KmsTestOnlyPolicy::Skip,
         ),
