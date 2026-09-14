@@ -1423,6 +1423,17 @@ impl CompositorState {
             let _ = self.finish_layout_reflow_batch();
         }
         let lifecycle_effect_scene = self.resolved_effect_scene_for_lifecycle_root(root_surface_id);
+        let lifecycle_decorations = if self.lifecycle_effect(LifecycleDirection::Restore)
+            == AnimationEffect::MinimizeLamp
+            && self
+                .window_lifecycle_animator
+                .visual_group(window_id)
+                .is_none()
+        {
+            self.native_decoration_render_instances_for_scale(&self.renderable_surfaces, 1.0)
+        } else {
+            Vec::new()
+        };
         let lifecycle_visual_group = self
             .window_lifecycle_animator
             .visual_group(window_id)
@@ -1448,12 +1459,8 @@ impl CompositorState {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        let decoration_bounds = self
-                            .native_decoration_render_instances_for_scale(
-                                &self.renderable_surfaces,
-                                1.0,
-                            )
-                            .into_iter()
+                        let decoration_bounds = lifecycle_decorations
+                            .iter()
                             .find(|decoration| decoration.root_surface_id() == root_surface_id)
                             .and_then(|decoration| {
                                 let (x, y, width, height) = decoration.scene_snapshot().bounds();
@@ -1484,6 +1491,7 @@ impl CompositorState {
             root_surface_id,
             lifecycle_visual_group,
             lifecycle_effect_scene,
+            lifecycle_decorations,
         );
         true
     }

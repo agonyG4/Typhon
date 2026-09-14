@@ -87,9 +87,8 @@ layout(location = 1) in vec2 a_uv;
 out vec2 v_uv;
 
 uniform vec2 u_output_size;
-uniform vec4 u_source_rect;
+uniform vec4 u_canonical_visual_rect;
 uniform vec4 u_source_visual_rect;
-uniform vec4 u_full_window_rect;
 uniform vec4 u_anchor_rect;
 uniform float u_progress;
 uniform int u_direction;
@@ -136,9 +135,9 @@ float movement_extent(vec4 rectangle) {
 }
 
 void main() {
-    vec2 source_point = u_source_rect.xy
-        + ((a_position - u_full_window_rect.xy) / u_full_window_rect.zw)
-        * u_source_rect.zw;
+    vec2 source_point = u_source_visual_rect.xy
+        + ((a_position - u_canonical_visual_rect.xy) / u_canonical_visual_rect.zw)
+        * u_source_visual_rect.zw;
     float progress = clamp(u_progress, 0.0, 1.0);
     vec2 group_uv = clamp(
         (source_point - u_source_visual_rect.xy) / u_source_visual_rect.zw,
@@ -173,7 +172,7 @@ void main() {
             0.0,
             1.0
         );
-        float bump_ratio = clamp(u_bump_distance / movement_extent(u_source_rect), 0.0, 1.0);
+        float bump_ratio = clamp(u_bump_distance / movement_extent(u_source_visual_rect), 0.0, 1.0);
         float biased_motion = clamp(
             base_motion
                 + (movement_normalized - 0.5)
@@ -182,13 +181,13 @@ void main() {
             0.0,
             1.0
         );
-        float source_axis = axis_position(u_source_rect, movement_normalized);
+        float source_axis = axis_position(u_source_visual_rect, movement_normalized);
         float target_axis = axis_position(u_anchor_rect, movement_normalized);
         float pre_squash_axis = mix(source_axis, target_axis, biased_motion);
         float axis = mix(pre_squash_axis, target_axis, clamp(u_squash_progress, 0.0, 1.0));
-        float source_cross = cross_position(u_source_rect, cross_normalized);
+        float source_cross = cross_position(u_source_visual_rect, cross_normalized);
         float target_cross = cross_position(u_anchor_rect, cross_normalized);
-        float source_cross_center = cross_position(u_source_rect, 0.5);
+        float source_cross_center = cross_position(u_source_visual_rect, 0.5);
         float neck_scale = clamp(
             1.0 - clamp(u_shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX)
                 * clamp(u_stretch_progress, 0.0, 1.0)
@@ -232,6 +231,97 @@ void main() {
     out_color = texture(u_texture, v_uv) * u_opacity;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::LAMP_VERTEX_SHADER;
+    use oblivion_one::presentation_animation::PresentationRect;
+    use oblivion_one::window_lifecycle_animation::{LifecycleVisualGroup, lamp_warp_visual_point};
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
+        PresentationRect::new(x, y, width, height).expect("valid test rectangle")
+    }
+
+    fn map_canonical_visual_point(
+        canonical_visual: PresentationRect,
+        source_visual: PresentationRect,
+        point: [f64; 2],
+    ) -> [f64; 2] {
+        [
+            source_visual.x()
+                + (point[0] - canonical_visual.x()) / canonical_visual.width()
+                    * source_visual.width(),
+            source_visual.y()
+                + (point[1] - canonical_visual.y()) / canonical_visual.height()
+                    * source_visual.height(),
+        ]
+    }
+
+    #[test]
+    fn lamp_shader_and_cpu_reference_use_complete_visual_group_domain() {
+        let canonical_client = rect(400.0, 100.0, 800.0, 600.0);
+        let canonical_visual = rect(384.0, 60.0, 832.0, 640.0);
+        let source_client = rect(200.0, 160.0, 960.0, 720.0);
+        let anchor = rect(1500.0, 500.0, 64.0, 64.0);
+        let group = LifecycleVisualGroup::from_bounds(
+            canonical_client,
+            canonical_visual,
+            source_client,
+            anchor,
+            1920,
+            1080,
+        )
+        .expect("valid visual group with SSD outside the client");
+        let points = [
+            [500.0, 60.0],   // SSD top edge
+            [384.0, 300.0],  // SSD left edge
+            [400.0, 100.0],  // client top-left
+            [800.0, 400.0],  // client center
+            [1200.0, 700.0], // client bottom-right
+        ];
+
+        assert!(group.presented_source_visual_rect.y() < group.presented_source_client_rect.y());
+        assert!(group.presented_source_visual_rect.x() < group.presented_source_client_rect.x());
+        for canonical_point in points {
+            let source_point = map_canonical_visual_point(
+                group.canonical_visual_rect,
+                group.presented_source_visual_rect,
+                canonical_point,
+            );
+            assert_eq!(
+                lamp_warp_visual_point(group, source_point, 0.0),
+                source_point
+            );
+
+            let near_start = lamp_warp_visual_point(group, source_point, 1.0e-9);
+            assert!((near_start[0] - source_point[0]).abs() < 0.01);
+            assert!((near_start[1] - source_point[1]).abs() < 0.01);
+
+            let normalized = [
+                (source_point[0] - group.presented_source_visual_rect.x())
+                    / group.presented_source_visual_rect.width(),
+                (source_point[1] - group.presented_source_visual_rect.y())
+                    / group.presented_source_visual_rect.height(),
+            ];
+            let endpoint = lamp_warp_visual_point(group, source_point, 1.0);
+            let expected_endpoint = [
+                group.anchor_rect.x() + normalized[0] * group.anchor_rect.width(),
+                group.anchor_rect.y() + normalized[1] * group.anchor_rect.height(),
+            ];
+            assert_eq!(endpoint, expected_endpoint);
+        }
+
+        assert!(LAMP_VERTEX_SHADER.contains(
+            "u_source_visual_rect.xy\n        + ((a_position - u_canonical_visual_rect.xy)"
+        ));
+        assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_canonical_visual_rect;"));
+        assert!(LAMP_VERTEX_SHADER.contains("movement_extent(u_source_visual_rect)"));
+        assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_source_visual_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_source_visual_rect"));
+        assert!(!LAMP_VERTEX_SHADER.contains("u_source_rect"));
+        assert!(!LAMP_VERTEX_SHADER.contains("u_full_window_rect"));
+    }
+}
 
 const CAPTURE_VERTEX_SHADER: &str = r#"#version 300 es
 layout(location = 0) in vec2 a_position;

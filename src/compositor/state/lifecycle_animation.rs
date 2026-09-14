@@ -72,11 +72,123 @@ impl CompositorState {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::compositor::DecorationRenderInstance;
+    use crate::compositor::decoration::types::DecorationPreference;
+    use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
     use crate::window_lifecycle_animation::{
-        LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
-        LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleTransitionId,
-        LifecycleTransitionRequest,
+        LampWindowSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
+        LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
+        LifecycleTransitionId, LifecycleTransitionRequest,
     };
+
+    fn lifecycle_decoration(
+        window_id: WindowId,
+        root_surface_id: u32,
+        visual_signature: u8,
+    ) -> DecorationRenderInstance {
+        DecorationRenderInstance::test_solid(
+            window_id,
+            root_surface_id,
+            0,
+            0,
+            832,
+            640,
+            [visual_signature, 0, 0, 255],
+        )
+    }
+
+    fn visual_group(visual_rect: PresentationRect) -> LifecycleVisualGroup {
+        LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            visual_rect,
+            rect(200.0, 160.0, 960.0, 720.0),
+            rect(1500.0, 500.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid test visual group")
+    }
+
+    fn ssd_test_surface(surface_id: u32) -> RenderableSurface {
+        let buffer_id = BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+            placement: SurfacePlacement::root(),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                buffer_id,
+                BufferSize::new(300, 200).expect("test buffer size"),
+                vec![0xff12_3456; 300 * 200],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
+
+    fn ssd_test_state(surface_id: u32) -> (CompositorState, WindowId) {
+        let mut state = CompositorState::new(None);
+        let window_id = state.allocate_window_id().expect("test window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .expect("test XDG window");
+        let mut decoration_state = WindowDecorationState::new();
+        decoration_state.set_preference(DecorationPreference::ServerSide);
+        state
+            .xdg_decoration_states
+            .insert(surface_id, decoration_state);
+        state.append_renderable_surface(ssd_test_surface(surface_id));
+        state.rebuild_active_scene_view();
+        (state, window_id)
+    }
+
+    fn lifecycle_decoration_signature(
+        state: &CompositorState,
+        root_surface_id: u32,
+        surfaces: &[RenderableSurface],
+        at: AnimationTime,
+    ) -> Option<u64> {
+        let sample = state.lifecycle_scene_sample_at(at);
+        state
+            .lifecycle_decoration_render_instances(&sample, surfaces)
+            .into_iter()
+            .find(|decoration| decoration.root_surface_id() == root_surface_id)
+            .map(|decoration| decoration.scene_snapshot().visual_signature())
+    }
+
+    fn settle_lifecycle_transition(state: &mut CompositorState, window_id: WindowId) {
+        let now = AnimationTime::monotonic_now().expect("monotonic test time");
+        let active = state
+            .window_lifecycle_animator
+            .sample(window_id, now)
+            .expect("active lifecycle transition");
+        assert!(state.window_lifecycle_animator.snap_to_endpoint(
+            window_id,
+            active.transition_id,
+            now,
+        ));
+        let sample = state.lifecycle_scene_sample_at(now);
+        let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+            window_id,
+            root_surface_id: active.root_surface_id,
+            transition_id: active.transition_id,
+        }]);
+        let snapshot = LifecycleFrameSnapshot::qualified_from_sample(&sample, &evidence);
+        state.publish_presented_lifecycle(1, &snapshot);
+    }
 
     fn lifecycle_request(
         window_id: WindowId,
@@ -564,6 +676,187 @@ mod tests {
             new_id
         );
     }
+
+    #[test]
+    fn fresh_restore_freezes_ssd_until_physical_settlement() {
+        let (mut state, window_id) = ssd_test_state(401);
+        state.lifecycle_animation_renderer_available = Some(true);
+        let root_surface_id = 401;
+        let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+        let decoration_a = state
+            .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
+            .into_iter()
+            .next()
+            .expect("authoritative SSD snapshot A");
+
+        state.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            Some(group),
+            ResolvedEffectScene::default(),
+            vec![decoration_a.clone()],
+        );
+
+        assert_eq!(
+            lifecycle_decoration_signature(
+                &state,
+                root_surface_id,
+                &state.renderable_surfaces,
+                AnimationTime::monotonic_now().unwrap(),
+            ),
+            Some(decoration_a.scene_snapshot().visual_signature())
+        );
+
+        state.focused_window_id = Some(window_id);
+        let decoration_b = state
+            .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
+            .into_iter()
+            .next()
+            .expect("live SSD snapshot B");
+        assert_ne!(
+            decoration_a.scene_snapshot().visual_signature(),
+            decoration_b.scene_snapshot().visual_signature()
+        );
+        assert_eq!(
+            lifecycle_decoration_signature(
+                &state,
+                root_surface_id,
+                &state.renderable_surfaces,
+                AnimationTime::monotonic_now().unwrap(),
+            ),
+            Some(decoration_a.scene_snapshot().visual_signature())
+        );
+
+        settle_lifecycle_transition(&mut state, window_id);
+        assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
+    }
+
+    #[test]
+    fn reversal_preserves_existing_frozen_ssd_snapshot() {
+        let window_id = WindowId::from_raw(402).expect("window id");
+        let root_surface_id = window_id.get() as u32;
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let group_a = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+        let group_b = visual_group(rect(384.0, 20.0, 832.0, 680.0));
+        let decoration_a = lifecycle_decoration(window_id, root_surface_id, 0x31);
+        let decoration_b = lifecycle_decoration(window_id, root_surface_id, 0x32);
+
+        state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                LifecycleTransitionRequest {
+                    window_id,
+                    root_surface_id,
+                    visual_group: group_a,
+                    direction: LifecycleDirection::Minimize,
+                    resolved_effect_scene: ResolvedEffectScene::default(),
+                },
+                AnimationTime::monotonic_now().unwrap(),
+                1.0,
+            )
+            .expect("minimize starts");
+        state
+            .lifecycle_decorations
+            .insert(root_surface_id, decoration_a.clone());
+        state.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            Some(group_b),
+            ResolvedEffectScene::default(),
+            vec![decoration_b],
+        );
+
+        assert_eq!(
+            lifecycle_decoration_signature(
+                &state,
+                root_surface_id,
+                &[],
+                AnimationTime::monotonic_now().unwrap(),
+            ),
+            Some(decoration_a.scene_snapshot().visual_signature())
+        );
+        assert_eq!(
+            state
+                .window_lifecycle_animator
+                .visual_group(window_id)
+                .expect("reversed transition")
+                .canonical_visual_rect,
+            group_a.canonical_visual_rect
+        );
+    }
+
+    #[test]
+    fn later_independent_restore_replaces_settled_ssd_snapshot() {
+        let window_id = WindowId::from_raw(403).expect("window id");
+        let root_surface_id = window_id.get() as u32;
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+        let decoration_a = lifecycle_decoration(window_id, root_surface_id, 0x41);
+        let decoration_b = lifecycle_decoration(window_id, root_surface_id, 0x42);
+
+        state.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            Some(group),
+            ResolvedEffectScene::default(),
+            vec![decoration_a],
+        );
+        settle_lifecycle_transition(&mut state, window_id);
+        assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
+
+        state.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            Some(group),
+            ResolvedEffectScene::default(),
+            vec![decoration_b.clone()],
+        );
+        assert_eq!(
+            lifecycle_decoration_signature(
+                &state,
+                root_surface_id,
+                &[],
+                AnimationTime::monotonic_now().unwrap(),
+            ),
+            Some(decoration_b.scene_snapshot().visual_signature())
+        );
+    }
+
+    #[test]
+    fn fresh_csd_restore_does_not_synthesize_frozen_ssd() {
+        let window_id = WindowId::from_raw(404).expect("window id");
+        let root_surface_id = window_id.get() as u32;
+        let mut state = CompositorState {
+            lifecycle_animation_renderer_available: Some(true),
+            ..Default::default()
+        };
+        let stale_ssd = lifecycle_decoration(window_id, root_surface_id, 0x51);
+        state
+            .lifecycle_decorations
+            .insert(root_surface_id, stale_ssd);
+
+        state.begin_lifecycle_restore(
+            window_id,
+            root_surface_id,
+            Some(visual_group(rect(400.0, 100.0, 800.0, 600.0))),
+            ResolvedEffectScene::default(),
+            Vec::new(),
+        );
+
+        assert!(!state.lifecycle_decorations.contains_key(&root_surface_id));
+        let sample = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().unwrap());
+        assert!(
+            state
+                .lifecycle_decoration_render_instances(&sample, &[])
+                .is_empty()
+        );
+    }
 }
 
 impl CompositorState {
@@ -619,6 +912,7 @@ impl CompositorState {
         self.presentation_rect_for_geometry(root_surface_id, geometry)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::compositor) fn begin_lifecycle_minimize(
         &mut self,
         window_id: WindowId,
@@ -697,18 +991,17 @@ impl CompositorState {
             return;
         };
         let speed = self.animation_control.configuration().speed;
+        let has_active_transition = self
+            .window_lifecycle_animator
+            .visual_group(window_id)
+            .is_some();
         // Lamp takes over the root's presentation pixels, but the last
         // pageflip-confirmed geometry remains authoritative for source
         // continuity and direct-scanout safety.
         self.presentation_animator.cancel(root_surface_id);
         self.lifecycle_render_suppressed_roots
             .remove(&root_surface_id);
-        for decoration in lifecycle_decorations {
-            self.lifecycle_decorations
-                .entry(decoration.root_surface_id())
-                .or_insert(decoration);
-        }
-        let _ = self.window_lifecycle_animator.start_or_reverse(
+        let started = self.window_lifecycle_animator.start_or_reverse(
             LifecycleTransitionRequest {
                 window_id,
                 root_surface_id,
@@ -719,6 +1012,28 @@ impl CompositorState {
             now,
             speed,
         );
+        if started.is_some() {
+            if !has_active_transition {
+                self.replace_lifecycle_decoration_snapshot(root_surface_id, lifecycle_decorations);
+            }
+        } else {
+            self.lifecycle_decorations.remove(&root_surface_id);
+        }
+    }
+
+    fn replace_lifecycle_decoration_snapshot(
+        &mut self,
+        root_surface_id: u32,
+        decorations: Vec<DecorationRenderInstance>,
+    ) {
+        self.lifecycle_decorations.remove(&root_surface_id);
+        if let Some(decoration) = decorations
+            .into_iter()
+            .find(|decoration| decoration.root_surface_id() == root_surface_id)
+        {
+            self.lifecycle_decorations
+                .insert(root_surface_id, decoration);
+        }
     }
 
     pub(in crate::compositor) fn begin_lifecycle_restore(
@@ -727,6 +1042,7 @@ impl CompositorState {
         root_surface_id: u32,
         visual_group: Option<LifecycleVisualGroup>,
         resolved_effect_scene: ResolvedEffectScene,
+        lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
         if self.lifecycle_effect(LifecycleDirection::Restore) != AnimationEffect::MinimizeLamp {
             self.window_lifecycle_animator.cancel(window_id);
@@ -777,6 +1093,10 @@ impl CompositorState {
             return;
         };
         let speed = self.animation_control.configuration().speed;
+        let has_active_transition = self
+            .window_lifecycle_animator
+            .visual_group(window_id)
+            .is_some();
         if self
             .window_lifecycle_animator
             .start_or_reverse(
@@ -792,11 +1112,15 @@ impl CompositorState {
             )
             .is_some()
         {
+            if !has_active_transition {
+                self.replace_lifecycle_decoration_snapshot(root_surface_id, lifecycle_decorations);
+            }
             self.lifecycle_render_suppressed_roots
                 .insert(root_surface_id);
         } else {
             self.lifecycle_render_suppressed_roots
                 .remove(&root_surface_id);
+            self.lifecycle_decorations.remove(&root_surface_id);
         }
     }
 

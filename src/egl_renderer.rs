@@ -549,9 +549,8 @@ struct LifecycleResolvedVisualResource {
 #[derive(Debug, Clone, Copy)]
 struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
-    source_rect: Option<glow::UniformLocation>,
+    canonical_visual_rect: Option<glow::UniformLocation>,
     source_visual_rect: Option<glow::UniformLocation>,
-    full_window_rect: Option<glow::UniformLocation>,
     anchor_rect: Option<glow::UniformLocation>,
     progress: Option<glow::UniformLocation>,
     opacity: Option<glow::UniformLocation>,
@@ -1150,9 +1149,8 @@ impl GlesSceneRenderer {
         let lamp_uniform_locations = lamp_program.map(|program| unsafe {
             LampUniformLocations {
                 output_size: gl.get_uniform_location(program, "u_output_size"),
-                source_rect: gl.get_uniform_location(program, "u_source_rect"),
+                canonical_visual_rect: gl.get_uniform_location(program, "u_canonical_visual_rect"),
                 source_visual_rect: gl.get_uniform_location(program, "u_source_visual_rect"),
-                full_window_rect: gl.get_uniform_location(program, "u_full_window_rect"),
                 anchor_rect: gl.get_uniform_location(program, "u_anchor_rect"),
                 progress: gl.get_uniform_location(program, "u_progress"),
                 opacity: gl.get_uniform_location(program, "u_opacity"),
@@ -3736,14 +3734,8 @@ impl GlesSceneRenderer {
                 }
                 set_lamp_uniform_rect(
                     &self.gl,
-                    uniforms.source_rect.as_ref(),
-                    sample.visual_group.presented_source_client_rect,
-                    output_scale,
-                );
-                set_lamp_uniform_rect(
-                    &self.gl,
-                    uniforms.full_window_rect.as_ref(),
-                    sample.visual_group.canonical_client_rect,
+                    uniforms.canonical_visual_rect.as_ref(),
+                    sample.visual_group.canonical_visual_rect,
                     output_scale,
                 );
                 set_lamp_uniform_rect(
@@ -8448,6 +8440,61 @@ mod tests {
             opaque_region: SurfaceOpaqueRegion::None,
             damage,
         }
+    }
+
+    #[test]
+    #[ignore = "gate failure: live subsurface placement changes the Lamp geometry key; surface snapshot ownership is a separate design"]
+    fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
+        let window_id = oblivion_one::compositor::WindowId::from_raw(501).expect("window id");
+        let group = LifecycleVisualGroup::from_bounds(
+            PresentationRect::new(400.0, 100.0, 800.0, 600.0).expect("client rect"),
+            PresentationRect::new(384.0, 60.0, 832.0, 640.0).expect("visual rect"),
+            PresentationRect::new(400.0, 100.0, 800.0, 600.0).expect("source rect"),
+            PresentationRect::new(1500.0, 500.0, 64.0, 64.0).expect("anchor rect"),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let lifecycle = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id: 42,
+                transition_id: LifecycleTransitionId::new(1),
+                visual_group: group,
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+            visual_sources: Vec::new(),
+        };
+        let mut subsurface = test_shm_surface(RenderableSurfaceDamage::full());
+        subsurface.surface_id = 43;
+        subsurface.width = 64;
+        subsurface.height = 64;
+        subsurface.placement = SurfacePlacement::subsurface(42, 16, 24);
+        let before = lamp_geometry_key(
+            &lifecycle,
+            &[subsurface.clone()],
+            &[],
+            1.0,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        subsurface.placement = SurfacePlacement::subsurface(42, -48, 72);
+        let after = lamp_geometry_key(
+            &lifecycle,
+            &[subsurface],
+            &[],
+            1.0,
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(
+            before, after,
+            "active Lamp geometry changed when live root-owned subsurface placement changed"
+        );
     }
 
     fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> EglSurfaceResource {

@@ -150,6 +150,40 @@ impl DecorationRenderInstance {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_solid(
+        window_id: WindowId,
+        root_surface_id: u32,
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+        color: [u8; 4],
+    ) -> Self {
+        let outer = DecorationRect::new(0, 0, width, height);
+        let layout = super::decoration::layout::DecorationLayout {
+            outer,
+            client: outer,
+            titlebar: outer,
+            title_safe: outer,
+            resize_input: outer,
+            visible_border: Vec::new(),
+            buttons: Vec::new(),
+            extents: Default::default(),
+        };
+        Self {
+            plan: DecorationRenderPlan {
+                layout,
+                primitives: vec![DecorationRenderPrimitive::SolidRect { rect: outer, color }],
+                theme_generation: 1,
+            },
+            origin_x,
+            origin_y,
+            window_id,
+            root_surface_id,
+        }
+    }
+
     /// Return a frame-local decoration projection without mutating the
     /// canonical decoration plan. The same group transform used for client
     /// surfaces is applied to every SSD primitive and its scene bounds.
