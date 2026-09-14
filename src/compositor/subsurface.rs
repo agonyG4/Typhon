@@ -1356,6 +1356,39 @@ impl SubsurfaceTransactionState {
         true
     }
 
+    pub(super) fn remove_cached_parent_dependencies_to_child_commits(
+        &mut self,
+        parent_id: u32,
+        child_id: u32,
+        promoted_refs: &[ContentUpdateRef],
+    ) -> usize {
+        debug_assert!(
+            promoted_refs
+                .iter()
+                .all(|reference| reference.surface_id == child_id)
+        );
+        let Some(parent) = self.roles.get_mut(&parent_id) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        for commit in &mut parent.cached_commits {
+            commit.lineage.child_dependencies.retain(|dependency| {
+                let remove =
+                    dependency.surface_id == child_id && promoted_refs.contains(dependency);
+                if remove {
+                    removed = removed.saturating_add(1);
+                }
+                !remove
+            });
+        }
+        debug_assert!(parent.cached_commits.iter().all(|commit| {
+            commit.lineage.child_dependencies.iter().all(|dependency| {
+                dependency.surface_id != child_id || !promoted_refs.contains(dependency)
+            })
+        }));
+        removed
+    }
+
     pub(super) fn detach_role(&mut self, surface_id: u32) -> Option<DetachedSubsurfaceRole> {
         let role = self.roles.remove(&surface_id)?;
         let relationship = CapturedSubsurfaceRelationship {
