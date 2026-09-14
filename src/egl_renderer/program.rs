@@ -89,7 +89,7 @@ out vec2 v_uv;
 uniform vec2 u_output_size;
 uniform vec4 u_canonical_visual_rect;
 uniform vec4 u_source_visual_rect;
-uniform vec4 u_portal_rect;
+uniform vec4 u_sink_rect;
 uniform float u_progress;
 uniform int u_direction;
 uniform float u_shape_factor;
@@ -103,8 +103,10 @@ uniform int u_framebuffer_origin_bottom_left;
 const float LAMP_SHAPE_MIN = 0.20;
 const float LAMP_SHAPE_MAX = 0.80;
 const float LAMP_STRETCH_POWER = 2.0;
-const float LAMP_SPATIAL_EXPONENT_MIN = 2.0;
-const float LAMP_SPATIAL_EXPONENT_MAX = 3.0;
+const float LAMP_RAIL_C1_LOW_SHAPE = 0.14;
+const float LAMP_RAIL_C1_HIGH_SHAPE = 0.04;
+const float LAMP_RAIL_C2_LOW_SHAPE = 0.55;
+const float LAMP_RAIL_C2_HIGH_SHAPE = 0.24;
 
 float axis_position(vec4 rectangle, float normalized) {
     if (u_direction == 0) {
@@ -130,11 +132,21 @@ float movement_extent(vec4 rectangle) {
     return max((u_direction == 0 || u_direction == 2) ? rectangle.w : rectangle.z, 1.0);
 }
 
-float spatial_funnel_exponent(float shape_factor) {
+float cubic_funnel_profile(float t, float shape_factor) {
+    t = clamp(t, 0.0, 1.0);
     float normalized = (
         clamp(shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX) - LAMP_SHAPE_MIN
     ) / (LAMP_SHAPE_MAX - LAMP_SHAPE_MIN);
-    return mix(LAMP_SPATIAL_EXPONENT_MIN, LAMP_SPATIAL_EXPONENT_MAX, normalized);
+    float c1 = mix(LAMP_RAIL_C1_LOW_SHAPE, LAMP_RAIL_C1_HIGH_SHAPE, normalized);
+    float c2 = mix(LAMP_RAIL_C2_LOW_SHAPE, LAMP_RAIL_C2_HIGH_SHAPE, normalized);
+    float u = 1.0 - t;
+    return clamp(
+        3.0 * u * u * t * c1
+        + 3.0 * u * t * t * c2
+        + t * t * t,
+        0.0,
+        1.0
+    );
 }
 
 void main() {
@@ -147,7 +159,7 @@ void main() {
         0.0,
         1.0
     );
-    vec2 target = u_portal_rect.xy + group_uv * u_portal_rect.zw;
+    vec2 target = u_sink_rect.xy + group_uv * u_sink_rect.zw;
     vec2 warped = source_point;
     if (progress >= 1.0) {
         warped = target;
@@ -159,9 +171,9 @@ void main() {
         float cross_normalized = (u_direction == 0 || u_direction == 2)
             ? group_uv.x
             : group_uv.y;
-        float funnel_weight = pow(
+        float funnel_weight = cubic_funnel_profile(
             movement_normalized,
-            spatial_funnel_exponent(u_shape_factor)
+            u_shape_factor
         );
         float early_contraction = clamp(
             clamp(u_contraction_progress, 0.0, 1.0) * funnel_weight,
@@ -183,10 +195,10 @@ void main() {
         float retreat_sign = (u_direction == 0 || u_direction == 3) ? 1.0 : -1.0;
         float source_axis = axis_position(u_source_visual_rect, movement_normalized)
             + retreat_sign * retreat_distance;
-        float target_axis = axis_position(u_portal_rect, movement_normalized);
+        float target_axis = axis_position(u_sink_rect, movement_normalized);
         float axis = mix(source_axis, target_axis, row_translation);
         float source_cross = cross_position(u_source_visual_rect, cross_normalized);
-        float target_cross = cross_position(u_portal_rect, cross_normalized);
+        float target_cross = cross_position(u_sink_rect, cross_normalized);
         float cross_completion = clamp(
             1.0 - (1.0 - early_contraction) * (1.0 - row_translation),
             0.0,
@@ -222,7 +234,9 @@ void main() {
 mod tests {
     use super::LAMP_VERTEX_SHADER;
     use oblivion_one::presentation_animation::PresentationRect;
-    use oblivion_one::window_lifecycle_animation::{LifecycleVisualGroup, lamp_warp_visual_point};
+    use oblivion_one::window_lifecycle_animation::{
+        LifecycleVisualGroup, cubic_funnel_profile, lamp_warp_visual_point,
+    };
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
         PresentationRect::new(x, y, width, height).expect("valid test rectangle")
@@ -291,8 +305,8 @@ mod tests {
             ];
             let endpoint = lamp_warp_visual_point(group, source_point, 1.0);
             let expected_endpoint = [
-                group.portal_rect.x() + normalized[0] * group.portal_rect.width(),
-                group.portal_rect.y() + normalized[1] * group.portal_rect.height(),
+                group.sink_rect.x() + normalized[0] * group.sink_rect.width(),
+                group.sink_rect.y() + normalized[1] * group.sink_rect.height(),
             ];
             assert_eq!(endpoint, expected_endpoint);
         }
@@ -301,12 +315,18 @@ mod tests {
             "u_source_visual_rect.xy\n        + ((a_position - u_canonical_visual_rect.xy)"
         ));
         assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_canonical_visual_rect;"));
-        assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_portal_rect;"));
+        assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_sink_rect;"));
         assert!(LAMP_VERTEX_SHADER.contains("movement_extent(u_source_visual_rect)"));
         assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_source_visual_rect"));
         assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_source_visual_rect"));
-        assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_portal_rect"));
-        assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_portal_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_sink_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_sink_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("float cubic_funnel_profile"));
+        assert!(LAMP_VERTEX_SHADER.contains("3.0 * u * u * t * c1"));
+        assert!(LAMP_VERTEX_SHADER.contains("LAMP_RAIL_C1_LOW_SHAPE = 0.14"));
+        assert!(LAMP_VERTEX_SHADER.contains("LAMP_RAIL_C1_HIGH_SHAPE = 0.04"));
+        assert!(LAMP_VERTEX_SHADER.contains("LAMP_RAIL_C2_LOW_SHAPE = 0.55"));
+        assert!(LAMP_VERTEX_SHADER.contains("LAMP_RAIL_C2_HIGH_SHAPE = 0.24"));
         for uniform in [
             "uniform float u_progress;",
             "uniform float u_contraction_progress;",
@@ -329,6 +349,20 @@ mod tests {
         assert!(!LAMP_VERTEX_SHADER.contains("u_source_rect"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_full_window_rect"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_anchor_rect"));
+        assert!(!LAMP_VERTEX_SHADER.contains("u_portal_rect"));
+        assert!(!LAMP_VERTEX_SHADER.contains("spatial_funnel_exponent"));
+        assert!(!LAMP_VERTEX_SHADER.contains("LAMP_SPATIAL_EXPONENT"));
+
+        let expected_rails = [
+            (0.00, 0.0, 0.0, 0.0),
+            (0.50, 0.38375, 0.306875, 0.23),
+            (1.00, 1.0, 1.0, 1.0),
+        ];
+        for (t, expected_min, expected_middle, expected_max) in expected_rails {
+            assert!((cubic_funnel_profile(t, 0.20) - expected_min).abs() < 1.0e-12);
+            assert!((cubic_funnel_profile(t, 0.50) - expected_middle).abs() < 1.0e-12);
+            assert!((cubic_funnel_profile(t, 0.80) - expected_max).abs() < 1.0e-12);
+        }
     }
 }
 

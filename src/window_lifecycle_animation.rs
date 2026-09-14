@@ -22,8 +22,17 @@ pub const ASTREA_LAMP_TRANSLATION_BLEND: f64 = 0.25;
 pub const ASTREA_LAMP_RETREAT_END: f64 = 0.30;
 /// Spatial delay power applied to rows away from the destination edge.
 pub const ASTREA_LAMP_STRETCH_POWER: f64 = 2.0;
-pub const ASTREA_LAMP_SPATIAL_EXPONENT_MIN: f64 = 2.0;
-pub const ASTREA_LAMP_SPATIAL_EXPONENT_MAX: f64 = 3.0;
+/// Absorption depth measured from the Dock-facing anchor edge toward its far
+/// edge. This is a spatial starting point, not an Apple implementation value.
+pub const ASTREA_LAMP_ABSORB_DEPTH: f64 = 0.60;
+/// Keep the sink non-degenerate while the terminal opacity interval hides it.
+pub const ASTREA_LAMP_SINK_THICKNESS: f64 = 1.0;
+/// Cubic rail control ordinates for the least pronounced frozen shape.
+pub const ASTREA_LAMP_RAIL_C1_LOW_SHAPE: f64 = 0.14;
+pub const ASTREA_LAMP_RAIL_C2_LOW_SHAPE: f64 = 0.55;
+/// Cubic rail control ordinates for the most pronounced frozen shape.
+pub const ASTREA_LAMP_RAIL_C1_HIGH_SHAPE: f64 = 0.04;
+pub const ASTREA_LAMP_RAIL_C2_HIGH_SHAPE: f64 = 0.24;
 /// Keep the Genie opaque until its final endpoint cleanup interval.
 pub const ASTREA_LAMP_FINAL_OPACITY_START: f64 = 0.98;
 const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
@@ -79,6 +88,7 @@ pub struct LifecycleVisualGroup {
     pub presented_source_visual_rect: PresentationRect,
     pub anchor_rect: PresentationRect,
     pub portal_rect: PresentationRect,
+    pub sink_rect: PresentationRect,
     pub lamp_direction: LampDirection,
     pub shape_factor: f64,
     pub bump_distance: f64,
@@ -114,6 +124,13 @@ impl LifecycleVisualGroup {
         );
         let portal_rect =
             lamp_portal_rect(presented_source_visual_rect, anchor_rect, lamp_direction)?;
+        let sink_rect = lamp_sink_rect(
+            anchor_rect,
+            portal_rect,
+            lamp_direction,
+            ASTREA_LAMP_ABSORB_DEPTH,
+            ASTREA_LAMP_SINK_THICKNESS,
+        )?;
         let shape_factor =
             lamp_shape_factor(presented_source_visual_rect, anchor_rect, lamp_direction);
         let bump_distance =
@@ -125,6 +142,7 @@ impl LifecycleVisualGroup {
             presented_source_visual_rect,
             anchor_rect,
             portal_rect,
+            sink_rect,
             lamp_direction,
             shape_factor,
             bump_distance,
@@ -434,6 +452,10 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             lamp.visual_group.portal_rect.y().to_bits(),
             lamp.visual_group.portal_rect.width().to_bits(),
             lamp.visual_group.portal_rect.height().to_bits(),
+            lamp.visual_group.sink_rect.x().to_bits(),
+            lamp.visual_group.sink_rect.y().to_bits(),
+            lamp.visual_group.sink_rect.width().to_bits(),
+            lamp.visual_group.sink_rect.height().to_bits(),
             lamp.visual_group.shape_factor.to_bits(),
             lamp.visual_group.bump_distance.to_bits(),
             lamp.progress.to_bits(),
@@ -830,6 +852,51 @@ pub fn lamp_portal_rect(
     (valid_rect(portal) && rect_contains_rect(anchor_rect, portal)).then_some(portal)
 }
 
+/// Place a thin terminal sink at a fixed depth inside the Dock anchor.
+///
+/// The portal supplies the aspect-preserved aperture on the cross axis. The
+/// sink's main-axis center is measured from the edge facing the Dock, so its
+/// depth is independent of the source aspect ratio. All directions use the
+/// same axis construction with only the near-edge sign rotated.
+pub fn lamp_sink_rect(
+    anchor_rect: PresentationRect,
+    portal_rect: PresentationRect,
+    direction: LampDirection,
+    absorb_depth: f64,
+    sink_thickness: f64,
+) -> Option<PresentationRect> {
+    if !valid_rect(anchor_rect)
+        || !valid_rect(portal_rect)
+        || !rect_contains_rect(anchor_rect, portal_rect)
+        || !absorb_depth.is_finite()
+        || !sink_thickness.is_finite()
+    {
+        return None;
+    }
+    let absorb_depth = absorb_depth.clamp(0.0, 1.0);
+    let (anchor_start, anchor_end) = axis_bounds(anchor_rect, direction);
+    let axis_extent = anchor_end - anchor_start;
+    let thickness = sink_thickness.max(f64::MIN_POSITIVE).min(axis_extent);
+    let mut axis_start = match direction {
+        LampDirection::Bottom | LampDirection::Right => {
+            anchor_start + axis_extent * absorb_depth - thickness * 0.5
+        }
+        LampDirection::Top | LampDirection::Left => {
+            anchor_end - axis_extent * absorb_depth - thickness * 0.5
+        }
+    };
+    axis_start = axis_start.clamp(anchor_start, anchor_end - thickness);
+    let sink = match direction {
+        LampDirection::Top | LampDirection::Bottom => {
+            PresentationRect::new(portal_rect.x(), axis_start, portal_rect.width(), thickness)?
+        }
+        LampDirection::Left | LampDirection::Right => {
+            PresentationRect::new(axis_start, portal_rect.y(), thickness, portal_rect.height())?
+        }
+    };
+    (valid_rect(sink) && rect_contains_rect(anchor_rect, sink)).then_some(sink)
+}
+
 fn rect_contains_rect(outer: PresentationRect, inner: PresentationRect) -> bool {
     inner.x() >= outer.x()
         && inner.y() >= outer.y()
@@ -853,7 +920,9 @@ fn valid_visual_group(group: LifecycleVisualGroup) -> bool {
         && valid_rect(group.presented_source_visual_rect)
         && valid_rect(group.anchor_rect)
         && valid_rect(group.portal_rect)
+        && valid_rect(group.sink_rect)
         && rect_contains_rect(group.anchor_rect, group.portal_rect)
+        && rect_contains_rect(group.anchor_rect, group.sink_rect)
         && group.shape_factor.is_finite()
         && group.shape_factor >= 0.0
         && group.bump_distance.is_finite()
@@ -1048,7 +1117,7 @@ pub fn lamp_motion_channels(progress: f64, bump_distance: f64) -> LampMotionChan
     }
 }
 
-fn spatial_funnel_exponent(shape_factor: f64) -> f64 {
+fn normalized_shape_factor(shape_factor: f64) -> f64 {
     let shape_factor = if shape_factor.is_finite() {
         shape_factor.clamp(
             ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
@@ -1057,10 +1126,27 @@ fn spatial_funnel_exponent(shape_factor: f64) -> f64 {
     } else {
         ASTREA_LAMP_INITIAL_SHAPE_FACTOR
     };
-    let normalized = (shape_factor - ASTREA_LAMP_INITIAL_SHAPE_FACTOR)
-        / (ASTREA_LAMP_MAX_SHAPE_FACTOR - ASTREA_LAMP_INITIAL_SHAPE_FACTOR);
-    ASTREA_LAMP_SPATIAL_EXPONENT_MIN
-        + normalized * (ASTREA_LAMP_SPATIAL_EXPONENT_MAX - ASTREA_LAMP_SPATIAL_EXPONENT_MIN)
+    (shape_factor - ASTREA_LAMP_INITIAL_SHAPE_FACTOR)
+        / (ASTREA_LAMP_MAX_SHAPE_FACTOR - ASTREA_LAMP_INITIAL_SHAPE_FACTOR)
+}
+
+/// Evaluate the monotonic cubic rail that bounds the spatial funnel.
+///
+/// The control ordinates gather the high-shape rail later and more strongly;
+/// they are derived from the frozen v2.2 shape factor rather than settings.
+pub fn cubic_funnel_profile(t: f64, shape_factor: f64) -> f64 {
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let normalized_shape = normalized_shape_factor(shape_factor);
+    let c1 = ASTREA_LAMP_RAIL_C1_LOW_SHAPE
+        + normalized_shape * (ASTREA_LAMP_RAIL_C1_HIGH_SHAPE - ASTREA_LAMP_RAIL_C1_LOW_SHAPE);
+    let c2 = ASTREA_LAMP_RAIL_C2_LOW_SHAPE
+        + normalized_shape * (ASTREA_LAMP_RAIL_C2_HIGH_SHAPE - ASTREA_LAMP_RAIL_C2_LOW_SHAPE);
+    let u = 1.0 - t;
+    (3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t).clamp(0.0, 1.0)
 }
 
 fn retreat_source_axis(source_axis: f64, direction: LampDirection, retreat_distance: f64) -> f64 {
@@ -1120,9 +1206,18 @@ pub fn lamp_warp_point_directional(
     let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
         return [0.0, 0.0];
     };
+    let Some(sink) = lamp_sink_rect(
+        anchor,
+        portal,
+        direction,
+        ASTREA_LAMP_ABSORB_DEPTH,
+        ASTREA_LAMP_SINK_THICKNESS,
+    ) else {
+        return [0.0, 0.0];
+    };
     lamp_warp_point_directional_to_target(
         source,
-        portal,
+        sink,
         direction,
         shape_factor,
         bump_distance,
@@ -1155,9 +1250,7 @@ fn lamp_warp_point_directional_to_target(
         LampDirection::Top | LampDirection::Bottom => u,
         LampDirection::Left | LampDirection::Right => v,
     };
-    let funnel_weight = movement_normalized
-        .powf(spatial_funnel_exponent(shape_factor))
-        .clamp(0.0, 1.0);
+    let funnel_weight = cubic_funnel_profile(movement_normalized, shape_factor);
     let early_contraction =
         (channels.contraction_progress.clamp(0.0, 1.0) * funnel_weight).clamp(0.0, 1.0);
     let row_translation = lamp_row_translation(channels, movement_normalized);
@@ -1207,19 +1300,25 @@ pub fn lamp_warp_point(
     let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
         return [0.0, 0.0];
     };
+    let Some(sink) = lamp_sink_rect(
+        anchor,
+        portal,
+        direction,
+        ASTREA_LAMP_ABSORB_DEPTH,
+        ASTREA_LAMP_SINK_THICKNESS,
+    ) else {
+        return [0.0, 0.0];
+    };
     if progress >= 1.0 {
         let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
         let v = ((point[1] - source.y()) / source.height()).clamp(0.0, 1.0);
-        return [
-            portal.x() + u * portal.width(),
-            portal.y() + v * portal.height(),
-        ];
+        return [sink.x() + u * sink.width(), sink.y() + v * sink.height()];
     }
     let shape_factor = lamp_shape_factor(source, anchor, direction);
     let bump_distance = lamp_bump_distance(source, anchor, direction);
     lamp_warp_point_directional_to_target(
         source,
-        portal,
+        sink,
         direction,
         shape_factor,
         bump_distance,
@@ -1259,13 +1358,13 @@ pub fn lamp_warp_visual_point(
         let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
         let v = ((point[1] - source.y()) / source.height()).clamp(0.0, 1.0);
         return [
-            visual_group.portal_rect.x() + u * visual_group.portal_rect.width(),
-            visual_group.portal_rect.y() + v * visual_group.portal_rect.height(),
+            visual_group.sink_rect.x() + u * visual_group.sink_rect.width(),
+            visual_group.sink_rect.y() + v * visual_group.sink_rect.height(),
         ];
     }
     lamp_warp_point_directional_to_target(
         source,
-        visual_group.portal_rect,
+        visual_group.sink_rect,
         visual_group.lamp_direction,
         visual_group.shape_factor,
         visual_group.bump_distance,
@@ -1410,6 +1509,171 @@ mod tests {
     }
 
     #[test]
+    fn sink_terminal_depth_is_source_aspect_independent() {
+        let anchor = rect(900.0, 900.0, 64.0, 64.0);
+        let sources = [
+            rect(100.0, 100.0, 1600.0, 900.0), // wide
+            rect(600.0, 100.0, 900.0, 1600.0), // portrait
+            rect(600.0, 100.0, 800.0, 800.0),  // square
+        ];
+        let terminal_depths = |source: PresentationRect| {
+            let group =
+                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                    .expect("valid visual group");
+            let center_x = source.x() + source.width() * 0.5;
+            let leading = lamp_warp_visual_point(group, [center_x, source.y()], 1.0);
+            let trailing =
+                lamp_warp_visual_point(group, [center_x, source.y() + source.height()], 1.0);
+            ((trailing[1] - leading[1]).abs(), group.portal_rect.height())
+        };
+
+        let depths = sources.map(terminal_depths);
+        let sink_depths = depths.map(|(sink_depth, _)| sink_depth);
+        let v23_portal_depths = depths.map(|(_, portal_depth)| portal_depth);
+        assert_eq!(v23_portal_depths, [36.0, 64.0, 64.0]);
+        assert!((v23_portal_depths[0] - v23_portal_depths[1]).abs() > 1.0e-12);
+        assert!(
+            sink_depths
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-12),
+            "sink depth must be source-aspect independent; measured depths were {sink_depths:?}"
+        );
+        assert_eq!(sink_depths, [ASTREA_LAMP_SINK_THICKNESS; 3]);
+    }
+
+    #[test]
+    fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
+        let anchor = rect(-32.0, 900.0, 64.0, 64.0);
+        let sources = [
+            rect(-960.0, 120.0, 1600.0, 900.0),
+            rect(80.0, -400.0, 400.0, 900.0),
+            rect(120.0, 120.0, 600.0, 600.0),
+        ];
+        let mut bottom_depths = Vec::new();
+        for source in sources {
+            let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom)
+                .expect("valid aspect-fit portal");
+            let sink = lamp_sink_rect(
+                anchor,
+                portal,
+                LampDirection::Bottom,
+                ASTREA_LAMP_ABSORB_DEPTH,
+                ASTREA_LAMP_SINK_THICKNESS,
+            )
+            .expect("valid sink");
+            assert!(rect_contains_rect(anchor, sink));
+            assert!(sink.x().is_finite() && sink.y().is_finite());
+            assert!(
+                (sink.y() + sink.height() * 0.5 - (anchor.y() + 0.6 * anchor.height())).abs()
+                    < 1.0e-12
+            );
+            assert_eq!(sink.x(), portal.x());
+            assert_eq!(sink.width(), portal.width());
+            assert_eq!(sink.height(), ASTREA_LAMP_SINK_THICKNESS);
+            bottom_depths.push(sink.height());
+        }
+        assert!(bottom_depths.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let cases = [
+            (LampDirection::Bottom, rect(900.0, 900.0, 64.0, 64.0)),
+            (LampDirection::Top, rect(900.0, 12.0, 64.0, 64.0)),
+            (LampDirection::Right, rect(1840.0, 500.0, 64.0, 64.0)),
+            (LampDirection::Left, rect(12.0, 500.0, 64.0, 64.0)),
+        ];
+        let source = rect(400.0, 300.0, 800.0, 600.0);
+        for (direction, directional_anchor) in cases {
+            let portal = lamp_portal_rect(source, directional_anchor, direction)
+                .expect("valid directional portal");
+            let sink = lamp_sink_rect(
+                directional_anchor,
+                portal,
+                direction,
+                ASTREA_LAMP_ABSORB_DEPTH,
+                ASTREA_LAMP_SINK_THICKNESS,
+            )
+            .expect("valid directional sink");
+            assert!(rect_contains_rect(directional_anchor, sink));
+            assert_eq!(
+                match direction {
+                    LampDirection::Top | LampDirection::Bottom => sink.width(),
+                    LampDirection::Left | LampDirection::Right => sink.height(),
+                },
+                match direction {
+                    LampDirection::Top | LampDirection::Bottom => portal.width(),
+                    LampDirection::Left | LampDirection::Right => portal.height(),
+                }
+            );
+            let (anchor_start, anchor_end) = axis_bounds(directional_anchor, direction);
+            let center = match direction {
+                LampDirection::Top | LampDirection::Bottom => sink.y() + sink.height() * 0.5,
+                LampDirection::Left | LampDirection::Right => sink.x() + sink.width() * 0.5,
+            };
+            let expected_depth = match direction {
+                LampDirection::Bottom | LampDirection::Right => {
+                    (center - anchor_start) / (anchor_end - anchor_start)
+                }
+                LampDirection::Top | LampDirection::Left => {
+                    (anchor_end - center) / (anchor_end - anchor_start)
+                }
+            };
+            assert!((expected_depth - ASTREA_LAMP_ABSORB_DEPTH).abs() < 1.0e-12);
+        }
+
+        let tiny_anchor = rect(-0.003, -0.004, 0.003, 0.004);
+        let tiny_portal = lamp_portal_rect(source, tiny_anchor, LampDirection::Bottom)
+            .expect("valid tiny portal");
+        let tiny_sink = lamp_sink_rect(
+            tiny_anchor,
+            tiny_portal,
+            LampDirection::Bottom,
+            ASTREA_LAMP_ABSORB_DEPTH,
+            ASTREA_LAMP_SINK_THICKNESS,
+        )
+        .expect("valid tiny sink");
+        assert!(rect_contains_rect(tiny_anchor, tiny_sink));
+        assert!(tiny_sink.width() > 0.0 && tiny_sink.height() > 0.0);
+    }
+
+    #[test]
+    fn cubic_funnel_profile_is_bounded_monotonic_and_wider_than_linear_mid_funnel() {
+        let samples = [0.00, 0.10, 0.25, 0.50, 0.75, 0.90, 1.00];
+        let expected = [
+            [0.0, 0.04987, 0.15203125, 0.38375, 0.67359375, 0.86643, 1.0],
+            [
+                0.0,
+                0.033535,
+                0.109140625,
+                0.306875,
+                0.601171875,
+                0.827415,
+                1.0,
+            ],
+            [0.0, 0.0172, 0.06625, 0.23, 0.52875, 0.7884, 1.0],
+        ];
+        for (shape, expected_values) in [
+            (ASTREA_LAMP_INITIAL_SHAPE_FACTOR, expected[0]),
+            (0.50, expected[1]),
+            (ASTREA_LAMP_MAX_SHAPE_FACTOR, expected[2]),
+        ] {
+            let values = samples.map(|t| cubic_funnel_profile(t, shape));
+            assert_eq!(values[0], 0.0);
+            assert_eq!(values[6], 1.0);
+            assert!(
+                values
+                    .into_iter()
+                    .zip(expected_values)
+                    .all(|(value, expected)| {
+                        value.is_finite()
+                            && (0.0..=1.0).contains(&value)
+                            && (value - expected).abs() < 1.0e-12
+                    })
+            );
+            assert!(values.windows(2).all(|pair| pair[1] >= pair[0]));
+            assert!(cubic_funnel_profile(0.50, shape) < 0.50);
+        }
+    }
+
+    #[test]
     fn lamp_footprint_covers_ssd_above_client_after_visual_group_fix() {
         let client = rect(400.0, 100.0, 800.0, 600.0);
         let ssd_outer = rect(384.0, 60.0, 832.0, 640.0);
@@ -1546,6 +1810,45 @@ mod tests {
             .sample(window, AnimationTime::from_nanos(300_000_000))
             .expect("new transition sample");
         assert_eq!(sample.visual_group.canonical_visual_rect.y(), 20.0);
+    }
+
+    #[test]
+    fn lifecycle_snapshot_signature_includes_sink_geometry() {
+        let window_id = WindowId::from_raw(20).expect("valid window id");
+        let visual_group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 60.0, 832.0, 640.0),
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(900.0, 900.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid visual group");
+        let sample = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(1),
+            lamps: vec![LampWindowSample {
+                window_id,
+                root_surface_id: 20,
+                transition_id: LifecycleTransitionId::new(1),
+                visual_group,
+                progress: 0.5,
+                opacity: 1.0,
+                direction: LifecycleDirection::Minimize,
+                mathematically_settled: false,
+            }],
+            visual_sources: Vec::new(),
+        };
+        let mut snapshot = LifecycleFrameSnapshot::from_sample(&sample);
+        let original_signature = snapshot.signature;
+        snapshot.lamps[0].visual_group.sink_rect = PresentationRect::new(
+            visual_group.sink_rect.x(),
+            visual_group.sink_rect.y() + 1.0,
+            visual_group.sink_rect.width(),
+            visual_group.sink_rect.height(),
+        )
+        .expect("valid changed sink rectangle");
+        snapshot.refresh_signature();
+        assert_ne!(snapshot.signature, original_signature);
     }
 
     #[test]
@@ -1914,8 +2217,8 @@ mod tests {
             assert_eq!(
                 endpoint,
                 [
-                    group.portal_rect.x() + 0.3 * group.portal_rect.width(),
-                    group.portal_rect.y() + 0.6 * group.portal_rect.height(),
+                    group.sink_rect.x() + 0.3 * group.sink_rect.width(),
+                    group.sink_rect.y() + 0.6 * group.sink_rect.height(),
                 ]
             );
         }
@@ -1958,11 +2261,19 @@ mod tests {
         assert!(intermediate.into_iter().all(f64::is_finite));
         assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
         let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
+        let sink = lamp_sink_rect(
+            anchor,
+            portal,
+            LampDirection::Bottom,
+            ASTREA_LAMP_ABSORB_DEPTH,
+            ASTREA_LAMP_SINK_THICKNESS,
+        )
+        .expect("sink");
         assert_eq!(
             lamp_warp_point(source, anchor, point, 1.0),
             [
-                portal.x() + 0.5 * portal.width(),
-                portal.y() + 0.5 * portal.height()
+                sink.x() + 0.5 * sink.width(),
+                sink.y() + 0.5 * sink.height()
             ]
         );
     }
@@ -2023,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn lamp_is_identity_at_zero_and_reaches_portal_at_one() {
+    fn lamp_is_identity_at_zero_and_reaches_sink_at_one() {
         let source = rect(100.0, 80.0, 800.0, 600.0);
         let anchor = rect(1200.0, 900.0, 64.0, 64.0);
         let point = [500.0, 320.0];
@@ -2031,9 +2342,17 @@ mod tests {
         assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
         let warped = lamp_warp_point(source, anchor, point, 1.0);
         let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
+        let sink = lamp_sink_rect(
+            anchor,
+            portal,
+            LampDirection::Bottom,
+            ASTREA_LAMP_ABSORB_DEPTH,
+            ASTREA_LAMP_SINK_THICKNESS,
+        )
+        .expect("sink");
         let expected = [
-            portal.x() + 0.5 * portal.width(),
-            portal.y() + 0.4 * portal.height(),
+            sink.x() + 0.5 * sink.width(),
+            sink.y() + 0.4 * sink.height(),
         ];
         assert_eq!(warped, expected);
         assert_eq!(lamp_opacity(0.0), 1.0);
@@ -2052,7 +2371,7 @@ mod tests {
         );
         assert_eq!(
             lamp_warp_window_point(full, source, anchor, point, 1.0),
-            [1232.0, 924.0]
+            [1232.0, 938.4]
         );
     }
 
