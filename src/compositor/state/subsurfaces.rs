@@ -170,11 +170,13 @@ mod tests {
     fn cached_same_surface_prefix_is_emitted_in_predecessor_order() {
         let mut state = CompositorState::default();
         assert!(state.subsurface_transactions.register(2, 1));
+        let mut predecessor = None;
         for sequence in 30..=32 {
+            let mut commit = test_cached_commit(sequence);
+            commit.lineage.predecessor = predecessor;
+            predecessor = Some(commit.content_update_ref(2));
             assert!(matches!(
-                state
-                    .subsurface_transactions
-                    .cache_commit(2, test_cached_commit(sequence)),
+                state.subsurface_transactions.cache_commit(2, commit),
                 CacheCommitOutcome::Inserted
             ));
         }
@@ -240,6 +242,53 @@ mod tests {
             2,
             SurfacePublicationState {
                 latest_published: Some(SurfaceCommitSequence(40)),
+                ..SurfacePublicationState::default()
+            },
+        );
+        assert!(state.content_update_dependencies_ready(&waiting));
+    }
+
+    #[test]
+    fn standalone_later_same_surface_node_does_not_cover_its_predecessor() {
+        let mut state = CompositorState::default();
+        let predecessor = test_mergeable_commit(1);
+        let predecessor_ref = predecessor.content_update_ref(2);
+        let mut newer = test_mergeable_commit(2);
+        newer.lineage.predecessor = Some(predecessor_ref);
+
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(8),
+                root_surface_id: 1,
+                nodes: vec![(2, predecessor)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+                dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+        let waiting = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(9),
+            root_surface_id: 2,
+            nodes: vec![(2, newer)],
+            publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+            dependencies: Vec::new(),
+            external_content_update_dependencies: vec![predecessor_ref],
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+
+        assert!(state.content_update_ref_is_pending(predecessor_ref));
+        assert!(!transaction_covers_content_update_ref(
+            &waiting,
+            predecessor_ref
+        ));
+        assert!(!state.content_update_dependencies_ready(&waiting));
+        state.surface_publications.insert(
+            2,
+            SurfacePublicationState {
+                latest_published: Some(predecessor_ref.commit_sequence),
                 ..SurfacePublicationState::default()
             },
         );
@@ -504,19 +553,38 @@ mod tests {
             commit_id: SurfaceCommitId::for_tests(1),
             commit_sequence: SurfaceCommitSequence(1),
         };
-        let covering_commit = test_mergeable_commit(2);
-        state
-            .pending_surface_tree_transactions
-            .push(PendingSurfaceTreeTransaction {
-                id: SurfaceTreeTransactionId::new(14),
-                root_surface_id: surface_id,
-                nodes: vec![(surface_id, covering_commit)],
-                publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
-                dependencies: Vec::new(),
-                external_content_update_dependencies: Vec::new(),
-                commit_timing_readiness: None,
-                received_at: Instant::now(),
-            });
+        let predecessor = test_mergeable_commit(1);
+        let mut newer = test_mergeable_commit(2);
+        newer.lineage.predecessor = Some(predecessor_ref);
+        let mut owner = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(14),
+            root_surface_id: surface_id,
+            nodes: vec![(surface_id, predecessor)],
+            publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+        state.merge_surface_tree_nodes_into_transaction(
+            surface_id,
+            &mut owner,
+            vec![(surface_id, newer)],
+            test_captured_lifetimes(&client.id(), &[surface_id]),
+            Vec::new(),
+            Vec::new(),
+        );
+        state.pending_surface_tree_transactions.push(owner);
+        assert_eq!(
+            state.pending_surface_tree_transactions[0].nodes[0]
+                .1
+                .commit_sequence,
+            SurfaceCommitSequence(2)
+        );
+        assert!(transaction_covers_content_update_ref(
+            &state.pending_surface_tree_transactions[0],
+            predecessor_ref
+        ));
         let waiting = PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(15),
             root_surface_id: observer_surface_id,
@@ -605,17 +673,54 @@ impl ContentUpdateCandidateExtractor<'_> {
     }
 }
 
+fn content_update_node_covers_ref(
+    node_surface_id: u32,
+    commit: &CachedSubsurfaceCommit,
+    reference: ContentUpdateRef,
+) -> bool {
+    if let Some(predecessor) = commit.lineage.predecessor {
+        debug_assert_eq!(predecessor.surface_id, node_surface_id);
+        debug_assert!(predecessor.commit_sequence < commit.commit_sequence);
+    }
+    if reference.surface_id != node_surface_id || reference.commit_sequence > commit.commit_sequence
+    {
+        return false;
+    }
+    if let Some(predecessor) = commit.lineage.predecessor
+        && reference.commit_sequence <= predecessor.commit_sequence
+    {
+        return false;
+    }
+    if reference.commit_sequence == commit.commit_sequence {
+        debug_assert_eq!(reference.commit_id, commit.commit_id);
+        return reference.commit_id == commit.commit_id;
+    }
+    true
+}
+
+fn node_index_covering_content_update_ref(
+    nodes: &[(u32, CachedSubsurfaceCommit)],
+    reference: ContentUpdateRef,
+) -> Option<usize> {
+    let mut covering_index = None;
+    for (index, (surface_id, commit)) in nodes.iter().enumerate() {
+        if !content_update_node_covers_ref(*surface_id, commit, reference) {
+            continue;
+        }
+        debug_assert!(
+            covering_index.is_none(),
+            "overlapping represented Content Update ranges"
+        );
+        covering_index.get_or_insert(index);
+    }
+    covering_index
+}
+
 fn transaction_node_index_covering_content_update_ref(
     transaction: &PendingSurfaceTreeTransaction,
     reference: ContentUpdateRef,
 ) -> Option<usize> {
-    let index = transaction
-        .nodes
-        .iter()
-        .position(|(surface_id, _)| *surface_id == reference.surface_id)?;
-    let commit = &transaction.nodes[index].1;
-    debug_assert!(commit.commit_sequence >= reference.commit_sequence);
-    (commit.commit_sequence >= reference.commit_sequence).then_some(index)
+    node_index_covering_content_update_ref(&transaction.nodes, reference)
 }
 
 fn transaction_covers_content_update_ref(
