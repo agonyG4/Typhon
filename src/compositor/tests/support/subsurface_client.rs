@@ -771,10 +771,6 @@ pub(in crate::compositor::tests) fn capture_detached_inherited_desync_subsurface
     let grandchild_subsurface = subcompositor.get_subsurface(&grandchild, &child, &qh, ());
     grandchild_subsurface.set_desync();
     commit_test_buffered_surface(&grandchild, &shm, &qh, 3, 3)?;
-    child.commit();
-    parent.commit();
-    connection.flush()?;
-    queue.roundtrip(&mut RegistryTestState::default())?;
 
     let child_id = child.id().protocol_id();
     let grandchild_id = grandchild.id().protocol_id();
@@ -785,6 +781,10 @@ pub(in crate::compositor::tests) fn capture_detached_inherited_desync_subsurface
     let grandchild_after_destroy = capture_xdg_role_snapshot(commands, grandchild_id);
 
     let _recreated = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    child.commit();
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;

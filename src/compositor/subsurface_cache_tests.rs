@@ -1,9 +1,9 @@
 use super::*;
-use crate::compositor::{
-    client_pacing_now_ns, compositor_surface_id, empty_cached_subsurface_commit,
-    CommitTimingConstraint, CompositorState, SurfacePublicationState,
-};
 use crate::compositor::subsurface::ContentUpdateRef;
+use crate::compositor::{
+    CommitTimingConstraint, CompositorState, SurfacePublicationState, client_pacing_now_ns,
+    compositor_surface_id, empty_cached_subsurface_commit,
+};
 use std::{os::unix::net::UnixStream, sync::Arc};
 
 use wayland_server::{Display, protocol::wl_callback};
@@ -247,47 +247,39 @@ fn desync_transition_does_not_create_a_synthetic_parent_content_update() {
     let display = Display::<CompositorState>::new().expect("test display");
     let mut display_handle = display.handle();
     let (client, _peer) = test_client(&mut display_handle);
-    let parent = state.test_create_unmapped_surface_resource_at_version(
-        &client,
-        &display_handle,
-        1,
-    );
-    let child = state.test_create_unmapped_surface_resource_at_version(
-        &client,
-        &display_handle,
-        1,
-    );
-    let grandchild = state.test_create_unmapped_surface_resource_at_version(
-        &client,
-        &display_handle,
-        1,
-    );
+    let parent =
+        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+    let child = state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+    let grandchild =
+        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
     let parent_id = compositor_surface_id(&parent);
     let child_id = compositor_surface_id(&child);
     let grandchild_id = compositor_surface_id(&grandchild);
     for surface_id in [parent_id, child_id, grandchild_id] {
         state.surface_presentation_generations.insert(surface_id, 1);
     }
-    assert!(state
-        .subsurface_transactions
-        .register_with_client(child_id, parent_id, Some(client.id())));
-    assert!(state
-        .subsurface_transactions
-        .register_with_client(grandchild_id, child_id, Some(client.id())));
-    assert!(state.subsurface_transactions.set_mode(
-        grandchild_id,
-        SubsurfaceSyncMode::Desynchronized,
+    assert!(state.subsurface_transactions.register_with_client(
+        child_id,
+        parent_id,
+        Some(client.id())
     ));
+    assert!(state.subsurface_transactions.register_with_client(
+        grandchild_id,
+        child_id,
+        Some(client.id())
+    ));
+    assert!(
+        state
+            .subsurface_transactions
+            .set_mode(grandchild_id, SubsurfaceSyncMode::Desynchronized,)
+    );
 
     let mut grandchild_commit = empty_cached_subsurface_commit();
     grandchild_commit.commit_id = SurfaceCommitId::for_tests(7);
     grandchild_commit.commit_sequence = SurfaceCommitSequence(7);
     grandchild_commit.pacing.commit_timing = Some(
-        CommitTimingConstraint::from_protocol(
-            client_pacing_now_ns() / 1_000_000_000 + 60,
-            0,
-        )
-        .expect("future commit timing"),
+        CommitTimingConstraint::from_protocol(client_pacing_now_ns() / 1_000_000_000 + 60, 0)
+            .expect("future commit timing"),
     );
     assert!(matches!(
         state
@@ -315,24 +307,19 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
     let display = Display::<CompositorState>::new().expect("test display");
     let mut display_handle = display.handle();
     let (client, _peer) = test_client(&mut display_handle);
-    let parent = state.test_create_unmapped_surface_resource_at_version(
-        &client,
-        &display_handle,
-        1,
-    );
-    let child = state.test_create_unmapped_surface_resource_at_version(
-        &client,
-        &display_handle,
-        1,
-    );
+    let parent =
+        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+    let child = state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
     let parent_id = compositor_surface_id(&parent);
     let child_id = compositor_surface_id(&child);
     for surface_id in [parent_id, child_id] {
         state.surface_presentation_generations.insert(surface_id, 1);
     }
-    assert!(state
-        .subsurface_transactions
-        .register_with_client(child_id, parent_id, Some(client.id())));
+    assert!(state.subsurface_transactions.register_with_client(
+        child_id,
+        parent_id,
+        Some(client.id())
+    ));
 
     let mut first = empty_cached_subsurface_commit();
     first.commit_id = SurfaceCommitId::for_tests(11);
@@ -348,11 +335,8 @@ fn converted_content_updates_keep_distinct_pacing_candidates() {
     second.commit_sequence = SurfaceCommitSequence(12);
     second.pacing.fifo_set_barrier = true;
     second.pacing.commit_timing = Some(
-        CommitTimingConstraint::from_protocol(
-            client_pacing_now_ns() / 1_000_000_000 + 60,
-            0,
-        )
-        .expect("future commit timing"),
+        CommitTimingConstraint::from_protocol(client_pacing_now_ns() / 1_000_000_000 + 60, 0)
+            .expect("future commit timing"),
     );
     assert!(matches!(
         state.subsurface_transactions.cache_commit(child_id, second),

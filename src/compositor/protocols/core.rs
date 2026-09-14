@@ -124,11 +124,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     buffer.commit_sequence = commit_sequence;
                 }
                 let has_attachment_change = attachment.is_some();
-                let lineage = state.capture_content_update_lineage(
-                    surface_id,
-                    commit_id,
-                    commit_sequence,
-                );
+                let lineage =
+                    state.capture_content_update_lineage(surface_id, commit_id, commit_sequence);
                 state.record_surface_commit_received(
                     surface_id,
                     commit_sequence,

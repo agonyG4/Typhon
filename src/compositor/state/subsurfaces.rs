@@ -14,6 +14,7 @@ struct PreparedContentUpdateCandidate {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -101,6 +102,28 @@ mod tests {
     }
 
     #[test]
+    fn relationship_detach_does_not_create_a_fake_parent_update_for_a_sync_grandchild() {
+        let mut state = CompositorState::default();
+        assert!(state.subsurface_transactions.register(2, 1));
+        assert!(state.subsurface_transactions.register(3, 2));
+        assert!(matches!(
+            state
+                .subsurface_transactions
+                .cache_commit(3, test_cached_commit(25)),
+            CacheCommitOutcome::Inserted
+        ));
+
+        state.destroy_subsurface_role(2);
+
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        let retained = state
+            .subsurface_transactions
+            .take_cached_commits_for_surface(3);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].commit_sequence, SurfaceCommitSequence(25));
+    }
+
+    #[test]
     fn cached_same_surface_prefix_is_emitted_in_predecessor_order() {
         let mut state = CompositorState::default();
         assert!(state.subsurface_transactions.register(2, 1));
@@ -145,8 +168,9 @@ mod tests {
             commit_id: SurfaceCommitId::for_tests(40),
             commit_sequence: SurfaceCommitSequence(40),
         };
-        state.pending_surface_tree_transactions.push(
-            PendingSurfaceTreeTransaction {
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
                 id: SurfaceTreeTransactionId::new(1),
                 root_surface_id: 1,
                 nodes: vec![(2, test_cached_commit(40))],
@@ -155,8 +179,7 @@ mod tests {
                 external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
-            },
-        );
+            });
         let waiting = PendingSurfaceTreeTransaction {
             id: SurfaceTreeTransactionId::new(2),
             root_surface_id: 3,
@@ -257,9 +280,10 @@ impl CompositorState {
         self.pending_surface_tree_transactions
             .iter()
             .any(|transaction| {
-                transaction.nodes.iter().any(|(surface_id, commit)| {
-                    commit.content_update_ref(*surface_id) == reference
-                })
+                transaction
+                    .nodes
+                    .iter()
+                    .any(|(surface_id, commit)| commit.content_update_ref(*surface_id) == reference)
             })
     }
 
@@ -303,8 +327,7 @@ impl CompositorState {
         PreparedContentUpdateCandidate {
             root_surface_id,
             nodes: extractor.nodes,
-            external_content_update_dependencies: extractor
-                .external_content_update_dependencies,
+            external_content_update_dependencies: extractor.external_content_update_dependencies,
         }
     }
 
@@ -328,8 +351,7 @@ impl CompositorState {
             .subsurface_transactions
             .capture_direct_child_dependencies(surface_id);
         debug_assert!(child_dependencies.iter().all(|dependency| {
-            dependency.commit_sequence < commit_sequence
-                && dependency.commit_id != commit_id
+            dependency.commit_sequence < commit_sequence && dependency.commit_id != commit_id
         }));
         CapturedContentUpdateLineage {
             predecessor,
@@ -477,9 +499,7 @@ impl CompositorState {
                 .get(surface_id)
                 .copied()
                 .unwrap_or(false);
-            if !was_synchronized
-                || self.is_effectively_synchronized_subsurface(*surface_id)
-            {
+            if !was_synchronized || self.is_effectively_synchronized_subsurface(*surface_id) {
                 continue;
             }
             let commits = detached_root_commits
@@ -2031,9 +2051,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
-        let affected_surfaces = self
-            .subsurface_transactions
-            .subsurface_tree_ids(surface_id);
+        let affected_surfaces = self.subsurface_transactions.subsurface_tree_ids(surface_id);
         let was_effectively_synchronized = affected_surfaces
             .iter()
             .map(|surface_id| {

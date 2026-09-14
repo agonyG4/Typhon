@@ -1615,12 +1615,10 @@ impl SubsurfaceTransactionState {
         commit: CachedSubsurfaceCommit,
     ) -> CacheCommitOutcome {
         debug_assert!(self.debug_accounting_is_consistent());
-        debug_assert!(
-            commit.lineage.predecessor.is_none_or(|predecessor| {
-                predecessor.surface_id == surface_id
-                    && predecessor.commit_sequence < commit.commit_sequence
-            })
-        );
+        debug_assert!(commit.lineage.predecessor.is_none_or(|predecessor| {
+            predecessor.surface_id == surface_id
+                && predecessor.commit_sequence < commit.commit_sequence
+        }));
         debug_assert!(commit.lineage.child_dependencies.iter().all(|dependency| {
             dependency.commit_sequence < commit.commit_sequence
                 && dependency.commit_sequence != commit.commit_sequence
@@ -1637,14 +1635,9 @@ impl SubsurfaceTransactionState {
             .get(&surface_id)
             .copied()
             .unwrap_or_default();
-        let can_merge = role
-            .cached_commits
-            .back()
-            .is_some_and(|tail| {
-                !tail.lineage.merge_frozen
-                    && !tail.pacing.is_boundary()
-                    && !commit.pacing.is_boundary()
-            });
+        let can_merge = role.cached_commits.back().is_some_and(|tail| {
+            !tail.lineage.merge_frozen && !tail.pacing.is_boundary() && !commit.pacing.is_boundary()
+        });
         let new_entries = if can_merge {
             old_entries
         } else {
@@ -1968,7 +1961,9 @@ impl SubsurfaceTransactionState {
                 .get(&reference.surface_id)
                 .copied()
                 .unwrap_or_default();
-            let remaining = role.cached_commits.split_off(target_index.saturating_add(1));
+            let remaining = role
+                .cached_commits
+                .split_off(target_index.saturating_add(1));
             let client_id = role.client_id.clone();
             let selected = std::mem::replace(&mut role.cached_commits, remaining);
             let new_entries = role.cached_commits.len();
@@ -2152,7 +2147,6 @@ impl SubsurfaceTransactionState {
             && entries_per_client == self.cached_entries_per_client
             && obligations_per_client == self.cached_obligations_per_client
     }
-
 }
 
 #[cfg(test)]

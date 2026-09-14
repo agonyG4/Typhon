@@ -60,7 +60,6 @@ impl SurfaceTreeNodeLifetimes {
             Self::Synthetic => None,
         }
     }
-
 }
 
 #[derive(Debug)]

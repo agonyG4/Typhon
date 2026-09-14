@@ -1117,7 +1117,7 @@ fn destroying_latched_subsurface_keeps_its_existing_parent_candidate() {
 }
 
 #[test]
-fn destroying_sync_ancestor_releases_inherited_desync_cache() {
+fn destroying_sync_ancestor_promotes_inherited_desync_cache() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -1134,7 +1134,7 @@ fn destroying_sync_ancestor_releases_inherited_desync_cache() {
         snapshots
             .grandchild_after_destroy
             .subsurface_relationship_phase,
-        Some(SubsurfaceRelationshipPhase::Applied)
+        Some(SubsurfaceRelationshipPhase::PendingParentCommit)
     );
 
     assert!(snapshots.child_after_recreate.renderable_surface);
