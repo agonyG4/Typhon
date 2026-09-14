@@ -84,6 +84,12 @@ pub(in crate::compositor) struct SurfacePublicationState {
     pub(in crate::compositor) latest_attachment_received: Option<SurfaceCommitSequence>,
     pub(in crate::compositor) latest_published: Option<SurfaceCommitSequence>,
     pub(in crate::compositor) latest_published_buffer_id: Option<BufferId>,
+    /// The latest Content Update explicitly settled without publication.
+    ///
+    /// This is a surface-local high-water mark for teardown paths which
+    /// retire all unpublished work for the surface. It is not publication
+    /// state and must not be used as a published sequence.
+    pub(in crate::compositor) latest_terminal: Option<SurfaceCommitSequence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

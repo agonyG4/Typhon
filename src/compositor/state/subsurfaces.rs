@@ -611,6 +611,43 @@ mod tests {
     }
 
     #[test]
+    fn retired_role_content_update_is_a_terminal_dependency() {
+        let mut state = CompositorState::default();
+        let (_display, _client, surface_id) = test_surface_and_client(&mut state);
+        let mut commit = empty_cached_subsurface_commit();
+        commit.commit_id = SurfaceCommitId::for_tests(7);
+        commit.commit_sequence = SurfaceCommitSequence(7);
+        let reference = commit.content_update_ref(surface_id);
+        state.surface_publications.insert(
+            surface_id,
+            SurfacePublicationState {
+                latest_received: commit.commit_sequence,
+                ..SurfacePublicationState::default()
+            },
+        );
+        state
+            .pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(18),
+                root_surface_id: surface_id,
+                nodes: vec![(surface_id, commit)],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+                dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            });
+
+        assert!(!state.content_update_ref_is_terminal(reference));
+        state.retire_unpublished_work_for_xdg_role(
+            surface_id,
+            AcquireWatchCancelReason::RoleDestroyed,
+        );
+        assert!(state.content_update_ref_is_terminal(reference));
+        assert!(state.pending_surface_tree_transactions.is_empty());
+    }
+
+    #[test]
     fn unpaced_same_surface_candidate_prefix_is_canonicalized_before_acquires() {
         let mut state = CompositorState::default();
         let (display, client, _root_surface_id) = test_surface_and_client(&mut state);
@@ -1292,11 +1329,21 @@ impl CompositorState {
     }
 
     fn content_update_ref_is_terminal(&self, reference: ContentUpdateRef) -> bool {
-        !self.surface_resources.contains_key(&reference.surface_id)
+        if !self.surface_resources.contains_key(&reference.surface_id)
             || self
                 .surface_client_ids
                 .get(&reference.surface_id)
                 .is_some_and(|client_id| self.terminal_client_ids.contains(client_id))
+        {
+            return true;
+        }
+        self.surface_publications
+            .get(&reference.surface_id)
+            .and_then(|publication| publication.latest_terminal)
+            .is_some_and(|terminal| {
+                debug_assert!(reference.commit_sequence <= terminal);
+                reference.commit_sequence <= terminal
+            })
     }
 
     pub(in crate::compositor) fn content_update_dependencies_ready(

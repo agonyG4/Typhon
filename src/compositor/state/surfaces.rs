@@ -283,6 +283,20 @@ impl CompositorState {
             None,
         );
     }
+
+    pub(in crate::compositor) fn record_surface_content_update_terminal(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+    ) {
+        let state = self.surface_publications.entry(surface_id).or_default();
+        state.latest_terminal = Some(
+            state
+                .latest_terminal
+                .map_or(commit_sequence, |latest| latest.max(commit_sequence)),
+        );
+    }
+
     pub(in crate::compositor) fn surface_publication_decision(
         &self,
         surface_id: u32,

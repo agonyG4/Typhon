@@ -226,6 +226,17 @@ impl CompositorState {
         self.compliance_metrics
             .note_xdg_role_destroyed_acquire_watches_cancelled(acquire_watches_cancelled);
 
+        if pending_commits_retired > 0 || pending_trees_retired > 0 {
+            let latest_received = self
+                .surface_publications
+                .get(&surface_id)
+                .map(|publication| publication.latest_received);
+            if let Some(latest_received) = latest_received {
+                self.record_surface_content_update_terminal(surface_id, latest_received);
+            }
+            debug_assert!(!self.has_unpublished_surface_work(surface_id));
+        }
+
         if surface_tree_debug_enabled()
             && (pending_commits_retired > 0 || pending_trees_retired > 0)
         {
