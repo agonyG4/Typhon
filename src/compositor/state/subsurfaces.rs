@@ -49,7 +49,7 @@ mod tests {
         u32,
     ) {
         let display = wayland_server::Display::<CompositorState>::new().expect("test display");
-        let display_handle = display.handle();
+        let mut display_handle = display.handle();
         let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
         let client = display_handle
             .insert_client(server_end, std::sync::Arc::new(()))
