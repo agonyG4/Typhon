@@ -51,6 +51,7 @@ pub(crate) struct EffectGraphMetrics {
     pub textures: usize,
     pub peak_live_textures: usize,
     pub peak_live_bytes: u64,
+    /// Allocated physical pixels across capture textures in the compiled graph.
     pub capture_pixels: u64,
     pub output_pixels: u64,
 }

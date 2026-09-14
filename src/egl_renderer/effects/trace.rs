@@ -85,6 +85,7 @@ pub(crate) struct PassTraceSummary {
     pub(crate) read_framebuffer: Option<String>,
     pub(crate) draw_framebuffer: Option<String>,
     pub(crate) scratch_fbo_present: Option<bool>,
+    pub(crate) conservative_pass_demand: bool,
 }
 
 #[cfg(test)]
@@ -234,7 +235,7 @@ impl EffectExecutionTrace {
     ) {
         self.event(|| {
             format!(
-                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} conservative_full={}",
+                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} conservative_full={} pass_count_selected={} partial_pass_count={} full_domain_pass_count={} pass_dependency_propagations={} max_pass_region_rect_count={} pass_conservative_fallbacks={}",
                 optional_u64(self.frame_id),
                 optional_u64(summary.render_generation.or(self.render_generation)),
                 optional_u64(summary.scene_generation.or(self.scene_generation)),
@@ -267,6 +268,30 @@ impl EffectExecutionTrace {
                     || "unknown".to_owned(),
                     |stats| stats.conservative_full.to_string(),
                 ),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.pass_count_selected)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.partial_pass_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.full_domain_pass_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.pass_dependency_propagations)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.max_pass_region_rect_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.pass_conservative_fallbacks)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             )
         });
     }
@@ -303,7 +328,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} conservative_pass_demand={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -321,6 +346,7 @@ impl EffectExecutionTrace {
                 bbox,
                 pass.checkpoint_dependencies.len(),
                 summary.capture_mode.unwrap_or("none"),
+                summary.conservative_pass_demand,
                 summary
                     .capture_command_count
                     .map_or_else(|| "none".to_owned(), |count| count.to_string()),
@@ -529,6 +555,7 @@ mod tests {
             dependency_propagations: 6,
             max_instance_region_rect_count: 72,
             conservative_full: false,
+            ..Default::default()
         });
 
         clear_test_events();

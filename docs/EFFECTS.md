@@ -28,6 +28,16 @@ decrease geometrically, and its upsample levels reverse that topology. Radius,
 scale, and pass count affect both the physical shader sampling and the derived
 damage footprint.
 
+After instance selection, the graph derives a bounded per-pass execution
+demand by walking producer edges once in reverse pass order. Composite and
+post-process sinks seed the walk; local stages propagate pointwise regions,
+custom fragments use their declared footprint, and each Dual Kawase pass maps
+its demanded output through the output/input texture dimensions, shader offset,
+linear-filter support, and outward integer rounding. Regions are clipped to the
+already allocated graph domains. A precise pass runs only its demanded output
+rectangles, while invalid producer metadata or an unrepresentable region falls
+back to full-domain execution for that effect instance.
+
 The graph also lowers these built-in stages:
 
 `ColorMatrix`, `Tint`, `Noise`, `Mask`, and `Blend`.
@@ -172,11 +182,14 @@ at a safe GL boundary. Context teardown clears shader programs, effect
 textures, scratch FBOs, and effect quad objects.
 
 Per-frame native performance fields include visible/executed/failed effect
-instances, graph pass and peak-live counts, capture/output pixels, blur pass
-counts, resource allocation/reuse/eviction counts, GPU-cache bytes, and a
-stable effect failure reason. `CompiledFrameGraph::explain()` provides a
-deterministic compact graph description without shader source or uniform
-values.
+instances, graph pass and peak-live counts, allocated capture-texture pixels,
+executed capture-region pixels, capture/output pixels, blur pass counts,
+resource allocation/reuse/eviction counts, GPU-cache bytes, and a stable
+effect failure reason. Allocated capture pixels are physical texture area;
+executed capture pixels are the physical target area covered by the demanded
+capture rectangles. GPU pass timing pixel fields remain bounded effect-space
+region areas. `CompiledFrameGraph::explain()` provides a deterministic compact
+graph description without shader source or uniform values.
 
 ## Capability and qualification status
 

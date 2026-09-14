@@ -1934,6 +1934,7 @@ impl GlesSceneRenderer {
                 dependency_propagations: 0,
                 max_instance_region_rect_count: 0,
                 conservative_full: plan.mode == RepaintMode::Full,
+                ..oblivion_one::effects::EffectDemandPlanStats::default()
             })
         } else {
             None
@@ -2061,7 +2062,7 @@ impl GlesSceneRenderer {
                         self.frame_stats.blur_downsample_passes = execution_stats.blur_downsamples;
                         self.frame_stats.blur_upsample_passes = execution_stats.blur_upsamples;
                         self.frame_stats.effect_capture_pixels_executed =
-                            execution_stats.capture_pixels;
+                            execution_stats.capture_execution_pixels;
                         self.frame_stats.effect_resource_acquisitions =
                             execution_stats.resource_acquisitions;
                         Ok(())

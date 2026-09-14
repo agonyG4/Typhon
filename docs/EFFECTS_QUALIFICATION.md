@@ -70,8 +70,10 @@ older than the frame in which the record is logged, and a monotonic `scope`
 that distinguishes multiple graph executions associated with one frame.
 
 When a graph-total query resolves, one aggregate record is emitted for that
-scope. Durations are integer nanoseconds and pixels are integer execution
-region pixel counts:
+scope. Durations are integer nanoseconds. The `*_pixels` fields are bounded
+effect-space demanded-region areas, not literal fragment counts and not
+allocated texture area; scaled pyramid passes therefore do not report their
+physical target-FBO fragment count:
 
 ```text
 typhon effect: event=effect_gpu_timing frame_id=<u64|unknown> scope=<u64> total_ns=<u64> capture_ns=<u64> normalize_ns=<u64> blur_downsample_ns=<u64> blur_upsample_ns=<u64> fragment_ns=<u64> blend_ns=<u64> mask_ns=<u64> composite_ns=<u64> postprocess_ns=<u64> timed_passes=<usize> dropped_passes=<usize> capture_pixels=<u64> normalize_pixels=<u64> blur_downsample_pixels=<u64> blur_upsample_pixels=<u64> fragment_pixels=<u64> blend_pixels=<u64> mask_pixels=<u64> composite_pixels=<u64> postprocess_pixels=<u64> query_pool_capacity=<usize> query_pool_high_water=<usize> dropped_spans=<usize> disjoint_invalidated_spans=<usize>

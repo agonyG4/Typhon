@@ -285,6 +285,12 @@ pub struct EffectDemandPlanStats {
     pub dependency_propagations: usize,
     pub max_instance_region_rect_count: usize,
     pub conservative_full: bool,
+    pub pass_count_selected: usize,
+    pub partial_pass_count: usize,
+    pub full_domain_pass_count: usize,
+    pub pass_dependency_propagations: usize,
+    pub max_pass_region_rect_count: usize,
+    pub pass_conservative_fallbacks: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,10 +300,18 @@ pub struct EffectInstanceExecutionDemand {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct EffectPassExecutionDemand {
+    pub id: GraphPassId,
+    pub output_region: EffectRegion,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct EffectExecutionDemand {
     pub instances: Vec<EffectInstanceExecutionDemand>,
     pub execution_region: EffectRegion,
+    pub passes: Vec<EffectPassExecutionDemand>,
     pub(crate) conservative_full: bool,
+    conservative_instances: Vec<EffectInstanceId>,
     plan_stats: EffectDemandPlanStats,
 }
 
@@ -309,7 +323,9 @@ impl EffectExecutionDemand {
         Self {
             instances,
             execution_region,
+            passes: Vec::new(),
             conservative_full: false,
+            conservative_instances: Vec::new(),
             plan_stats: EffectDemandPlanStats::default(),
         }
     }
@@ -327,6 +343,21 @@ impl EffectExecutionDemand {
             .iter()
             .find(|instance| instance.id == id)
             .map(|instance| &instance.output_region)
+    }
+
+    pub fn pass_output_region(&self, id: GraphPassId) -> Option<&EffectRegion> {
+        self.passes
+            .iter()
+            .find(|pass| pass.id == id)
+            .map(|pass| &pass.output_region)
+    }
+
+    pub fn has_pass_plan(&self) -> bool {
+        !self.passes.is_empty()
+    }
+
+    pub fn instance_is_conservative_full(&self, id: EffectInstanceId) -> bool {
+        self.conservative_instances.contains(&id)
     }
 
     pub fn plan_stats(&self) -> EffectDemandPlanStats {
@@ -356,18 +387,30 @@ fn all_visible_instances_with_output_regions(
             }
         })
         .collect();
-    EffectExecutionDemand {
+    let mut demand = EffectExecutionDemand {
         instances,
         execution_region,
+        passes: full_pass_demands(graph),
         conservative_full: true,
+        conservative_instances: Vec::new(),
         plan_stats: EffectDemandPlanStats {
             repair_rect_count,
             dependency_edge_count: dependency_edge_count(graph),
             dependency_propagations: 0,
             max_instance_region_rect_count,
             conservative_full: true,
+            ..EffectDemandPlanStats::default()
         },
-    }
+    };
+    update_pass_plan_stats(
+        graph,
+        &demand.passes,
+        &demand.conservative_instances,
+        &mut demand.plan_stats,
+    );
+    demand.plan_stats.full_domain_pass_count = demand.plan_stats.pass_count_selected;
+    demand.plan_stats.partial_pass_count = 0;
+    demand
 }
 
 fn unique_instance_index(graph: &CompiledFrameGraph, id: EffectInstanceId) -> Option<usize> {
@@ -462,18 +505,519 @@ pub fn plan_effect_execution_demand(
             })
         })
         .collect();
-    EffectExecutionDemand {
+    let mut demand = EffectExecutionDemand {
         instances,
         execution_region,
+        passes: Vec::new(),
         conservative_full: false,
+        conservative_instances: Vec::new(),
         plan_stats: EffectDemandPlanStats {
             repair_rect_count,
             dependency_edge_count: dependency_edge_count(graph),
             dependency_propagations,
             max_instance_region_rect_count,
             conservative_full: false,
+            ..EffectDemandPlanStats::default()
         },
+    };
+    plan_effect_pass_execution_demand(graph, &mut demand);
+    demand
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TextureProducer {
+    pass_index: Option<usize>,
+    valid: bool,
+}
+
+fn full_pass_region(graph: &CompiledFrameGraph, pass: &CompiledRenderPass) -> EffectRegion {
+    pass.output
+        .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+        .map_or_else(EffectRegion::empty, |texture| {
+            EffectRegion::from_rect(texture.domain)
+        })
+}
+
+fn full_pass_demands(graph: &CompiledFrameGraph) -> Vec<EffectPassExecutionDemand> {
+    graph
+        .passes
+        .iter()
+        .map(|pass| EffectPassExecutionDemand {
+            id: pass.id,
+            output_region: full_pass_region(graph, pass),
+        })
+        .collect()
+}
+
+fn graph_texture_index(graph: &CompiledFrameGraph, id: GraphTextureId) -> Option<usize> {
+    let mut found = None;
+    for (index, texture) in graph.textures.iter().enumerate() {
+        if texture.id != id {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
     }
+    found
+}
+
+fn texture_producers(graph: &CompiledFrameGraph) -> Vec<TextureProducer> {
+    graph
+        .textures
+        .iter()
+        .map(|texture| {
+            if matches!(
+                texture.source,
+                GraphTextureSource::Output | GraphTextureSource::Static(_)
+            ) {
+                return TextureProducer {
+                    pass_index: None,
+                    valid: true,
+                };
+            }
+            let mut producer = None;
+            let mut valid = true;
+            for (pass_index, pass) in graph.passes.iter().enumerate() {
+                if pass.output != Some(texture.id) {
+                    continue;
+                }
+                if producer.replace(pass_index).is_some() {
+                    valid = false;
+                }
+            }
+            if producer.is_none() {
+                valid = false;
+            }
+            TextureProducer {
+                pass_index: producer,
+                valid,
+            }
+        })
+        .collect()
+}
+
+fn instance_is_selected(demand: &EffectExecutionDemand, instance: EffectInstanceId) -> bool {
+    demand.contains(instance)
+}
+
+fn mark_instance_conservative(
+    demand: &EffectExecutionDemand,
+    fallbacks: &mut Vec<EffectInstanceId>,
+    instance: EffectInstanceId,
+) {
+    if instance_is_selected(demand, instance) && !fallbacks.contains(&instance) {
+        fallbacks.push(instance);
+    }
+}
+
+fn pass_input_sampling_radius(pass: &CompiledRenderPass) -> Option<(f64, f64, bool, bool)> {
+    match pass.kind {
+        RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => {
+            let radius = pass.blur_radius?;
+            if !radius.is_finite() || radius.is_sign_negative() {
+                return None;
+            }
+            Some((f64::from(radius), f64::from(radius), false, true))
+        }
+        RenderPassKind::NormalizeInput => Some((0.0, 0.0, true, true)),
+        RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
+            Some((0.0, 0.0, true, false))
+        }
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
+            Some((0.0, 0.0, false, false))
+        }
+        RenderPassKind::Fragment | RenderPassKind::Blend | RenderPassKind::Mask => {
+            let (radius_x, radius_y) = match pass.stage.as_ref() {
+                Some(EffectNodeKind::CustomFragment(spec)) => (
+                    spec.declared_footprint.sample_radius_x,
+                    spec.declared_footprint.sample_radius_y,
+                ),
+                _ => (0, 0),
+            };
+            Some((f64::from(radius_x), f64::from(radius_y), false, false))
+        }
+    }
+}
+
+fn map_region_to_input_texture(
+    demanded_output: &EffectRegion,
+    output: &GraphTexturePlan,
+    input: &GraphTexturePlan,
+    radius_x: f64,
+    radius_y: f64,
+    logical_mapping: bool,
+    linear_filter_support: bool,
+) -> Option<EffectRegion> {
+    if output.width == 0
+        || output.height == 0
+        || input.width == 0
+        || input.height == 0
+        || output.domain.width == 0
+        || output.domain.height == 0
+        || input.domain.width == 0
+        || input.domain.height == 0
+        || demanded_output.bounding_rect().is_none()
+    {
+        return None;
+    }
+
+    const LINEAR_FILTER_SUPPORT: f64 = 1.0;
+    let filter_support = if linear_filter_support {
+        LINEAR_FILTER_SUPPORT
+    } else {
+        0.0
+    };
+    let output_domain = output.domain;
+    let input_domain = input.domain;
+    let output_width = f64::from(output.width);
+    let output_height = f64::from(output.height);
+    let input_width = f64::from(input.width);
+    let input_height = f64::from(input.height);
+    let output_domain_width = f64::from(output_domain.width);
+    let output_domain_height = f64::from(output_domain.height);
+    let input_domain_width = f64::from(input_domain.width);
+    let input_domain_height = f64::from(input_domain.height);
+    let mut result = EffectRegion::empty();
+
+    for requested in demanded_output.rects() {
+        let Some(requested) = requested.intersect(output_domain) else {
+            continue;
+        };
+        let output_local_left = (f64::from(requested.x) - f64::from(output_domain.x))
+            * output_width
+            / output_domain_width;
+        let output_local_right = (f64::from(requested.right()) - f64::from(output_domain.x))
+            * output_width
+            / output_domain_width;
+        let output_local_top = (f64::from(requested.y) - f64::from(output_domain.y))
+            * output_height
+            / output_domain_height;
+        let output_local_bottom = (f64::from(requested.bottom()) - f64::from(output_domain.y))
+            * output_height
+            / output_domain_height;
+
+        let input_local_left = if logical_mapping {
+            (f64::from(output_domain.x) + output_local_left * output_domain_width / output_width
+                - f64::from(input_domain.x))
+                * input_width
+                / input_domain_width
+        } else {
+            output_local_left * input_width / output_width
+        };
+        let input_local_right = if logical_mapping {
+            (f64::from(output_domain.x) + output_local_right * output_domain_width / output_width
+                - f64::from(input_domain.x))
+                * input_width
+                / input_domain_width
+        } else {
+            output_local_right * input_width / output_width
+        };
+        let input_local_top = if logical_mapping {
+            (f64::from(output_domain.y) + output_local_top * output_domain_height / output_height
+                - f64::from(input_domain.y))
+                * input_height
+                / input_domain_height
+        } else {
+            output_local_top * input_height / output_height
+        };
+        let input_local_bottom = if logical_mapping {
+            (f64::from(output_domain.y)
+                + output_local_bottom * output_domain_height / output_height
+                - f64::from(input_domain.y))
+                * input_height
+                / input_domain_height
+        } else {
+            output_local_bottom * input_height / output_height
+        };
+
+        let physical_left = (input_local_left - radius_x - filter_support)
+            .floor()
+            .max(0.0)
+            .min(input_width);
+        let physical_right = (input_local_right + radius_x + filter_support)
+            .ceil()
+            .max(0.0)
+            .min(input_width);
+        let physical_top = (input_local_top - radius_y - filter_support)
+            .floor()
+            .max(0.0)
+            .min(input_height);
+        let physical_bottom = (input_local_bottom + radius_y + filter_support)
+            .ceil()
+            .max(0.0)
+            .min(input_height);
+        if physical_right <= physical_left || physical_bottom <= physical_top {
+            continue;
+        }
+
+        let left = (f64::from(input_domain.x) + physical_left * input_domain_width / input_width)
+            .floor()
+            .max(f64::from(input_domain.x)) as i64;
+        let right = (f64::from(input_domain.x) + physical_right * input_domain_width / input_width)
+            .ceil()
+            .min(f64::from(input_domain.right())) as i64;
+        let top = (f64::from(input_domain.y) + physical_top * input_domain_height / input_height)
+            .floor()
+            .max(f64::from(input_domain.y)) as i64;
+        let bottom = (f64::from(input_domain.y)
+            + physical_bottom * input_domain_height / input_height)
+            .ceil()
+            .min(f64::from(input_domain.bottom())) as i64;
+        let width = right.saturating_sub(left);
+        let height = bottom.saturating_sub(top);
+        if width <= 0 || height <= 0 {
+            continue;
+        }
+        let rect = EffectRect::new(
+            i32::try_from(left).ok()?,
+            i32::try_from(top).ok()?,
+            u32::try_from(width).ok()?,
+            u32::try_from(height).ok()?,
+        )?;
+        result.push(rect);
+        result.bounding_rect()?;
+    }
+    Some(result)
+}
+
+fn required_input_region(
+    pass: &CompiledRenderPass,
+    demanded_output: &EffectRegion,
+    output: &GraphTexturePlan,
+    input: &GraphTexturePlan,
+) -> Option<EffectRegion> {
+    let (mut radius_x, mut radius_y, logical_mapping, linear_filter_support) =
+        pass_input_sampling_radius(pass)?;
+    if let Some(EffectNodeKind::CustomFragment(_)) = pass.stage.as_ref() {
+        radius_x *= f64::from(input.width) / f64::from(input.domain.width.max(1));
+        radius_y *= f64::from(input.height) / f64::from(input.domain.height.max(1));
+    }
+    map_region_to_input_texture(
+        demanded_output,
+        output,
+        input,
+        radius_x,
+        radius_y,
+        logical_mapping,
+        linear_filter_support,
+    )
+}
+
+fn full_region_is_demanded(region: &EffectRegion, domain: EffectRect) -> bool {
+    region.bounding_rect().is_none() || (region.rects().len() == 1 && region.rects()[0] == domain)
+}
+
+fn update_pass_plan_stats(
+    graph: &CompiledFrameGraph,
+    pass_regions: &[EffectPassExecutionDemand],
+    conservative_instances: &[EffectInstanceId],
+    stats: &mut EffectDemandPlanStats,
+) {
+    stats.pass_count_selected = 0;
+    stats.partial_pass_count = 0;
+    stats.full_domain_pass_count = 0;
+    stats.max_pass_region_rect_count = 0;
+    stats.pass_conservative_fallbacks = 0;
+    for pass_demand in pass_regions {
+        if pass_demand.output_region.is_empty() {
+            continue;
+        }
+        stats.pass_count_selected = stats.pass_count_selected.saturating_add(1);
+        stats.max_pass_region_rect_count = stats
+            .max_pass_region_rect_count
+            .max(pass_demand.output_region.rects().len());
+        let full_domain = graph
+            .passes
+            .iter()
+            .find(|pass| pass.id == pass_demand.id)
+            .and_then(|pass| pass.output)
+            .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+            .is_some_and(|texture| {
+                full_region_is_demanded(&pass_demand.output_region, texture.domain)
+            });
+        if full_domain {
+            stats.full_domain_pass_count = stats.full_domain_pass_count.saturating_add(1);
+        } else {
+            stats.partial_pass_count = stats.partial_pass_count.saturating_add(1);
+        }
+        if graph
+            .passes
+            .iter()
+            .find(|pass| pass.id == pass_demand.id)
+            .is_some_and(|pass| conservative_instances.contains(&pass.instance))
+        {
+            stats.pass_conservative_fallbacks = stats.pass_conservative_fallbacks.saturating_add(1);
+        }
+    }
+}
+
+fn plan_effect_pass_execution_demand(
+    graph: &CompiledFrameGraph,
+    demand: &mut EffectExecutionDemand,
+) {
+    if demand.is_conservative_full() {
+        demand.passes = full_pass_demands(graph);
+        update_pass_plan_stats(
+            graph,
+            &demand.passes,
+            &demand.conservative_instances,
+            &mut demand.plan_stats,
+        );
+        demand.plan_stats.full_domain_pass_count = demand.plan_stats.pass_count_selected;
+        demand.plan_stats.partial_pass_count = 0;
+        return;
+    }
+
+    let producers = texture_producers(graph);
+    let mut pass_regions = vec![EffectRegion::empty(); graph.passes.len()];
+    let mut conservative_instances = Vec::new();
+    for instance_demand in &demand.instances {
+        let final_pass = graph.passes.iter().enumerate().rev().find(|(_, pass)| {
+            pass.instance == instance_demand.id
+                && matches!(
+                    pass.kind,
+                    RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+                )
+        });
+        let Some((pass_index, pass)) = final_pass else {
+            mark_instance_conservative(demand, &mut conservative_instances, instance_demand.id);
+            continue;
+        };
+        let Some(output) = pass.output.and_then(|id| graph_texture_index(graph, id)) else {
+            mark_instance_conservative(demand, &mut conservative_instances, instance_demand.id);
+            continue;
+        };
+        let output_plan = &graph.textures[output];
+        let seed = pass
+            .damage
+            .union(&instance_demand.output_region)
+            .intersect_rect(output_plan.domain);
+        if seed.bounding_rect().is_none() {
+            mark_instance_conservative(demand, &mut conservative_instances, instance_demand.id);
+        } else {
+            pass_regions[pass_index] = seed;
+        }
+    }
+
+    let selected_passes = graph
+        .passes
+        .iter()
+        .map(|pass| instance_is_selected(demand, pass.instance))
+        .collect::<Vec<_>>();
+    let mut pass_dependency_propagations = 0usize;
+    let mut visited_edges = Vec::new();
+    for pass_index in (0..graph.passes.len()).rev() {
+        if !selected_passes[pass_index] || pass_regions[pass_index].is_empty() {
+            continue;
+        }
+        let pass = &graph.passes[pass_index];
+        let Some(output_id) = pass.output else {
+            mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+            continue;
+        };
+        let Some(output_index) = graph_texture_index(graph, output_id) else {
+            mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+            continue;
+        };
+        let output_plan = &graph.textures[output_index];
+        if matches!(
+            pass.kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        ) {
+            continue;
+        }
+        for input_id in &pass.inputs {
+            let Some(input_index) = graph_texture_index(graph, *input_id) else {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                continue;
+            };
+            let input_plan = &graph.textures[input_index];
+            if matches!(input_plan.source, GraphTextureSource::Static(_)) {
+                continue;
+            }
+            let Some(producer) = producers.get(input_index).copied() else {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                continue;
+            };
+            if !producer.valid {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                continue;
+            }
+            let Some(producer_index) = producer.pass_index else {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                continue;
+            };
+            if graph.passes[producer_index].instance != pass.instance {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                mark_instance_conservative(
+                    demand,
+                    &mut conservative_instances,
+                    graph.passes[producer_index].instance,
+                );
+                continue;
+            }
+            if producer_index >= pass_index {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                mark_instance_conservative(
+                    demand,
+                    &mut conservative_instances,
+                    graph.passes[producer_index].instance,
+                );
+                continue;
+            }
+            if visited_edges.contains(&(pass_index, producer_index)) {
+                continue;
+            }
+            visited_edges.push((pass_index, producer_index));
+            let Some(required) =
+                required_input_region(pass, &pass_regions[pass_index], output_plan, input_plan)
+            else {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                continue;
+            };
+            if required.is_empty() {
+                continue;
+            }
+            pass_dependency_propagations = pass_dependency_propagations.saturating_add(1);
+            let next = pass_regions[producer_index].union(&required);
+            if next.bounding_rect().is_none() {
+                mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
+                mark_instance_conservative(
+                    demand,
+                    &mut conservative_instances,
+                    graph.passes[producer_index].instance,
+                );
+            } else {
+                pass_regions[producer_index] = next;
+            }
+        }
+    }
+
+    for (pass_index, pass) in graph.passes.iter().enumerate() {
+        if conservative_instances.contains(&pass.instance) {
+            pass_regions[pass_index] = full_pass_region(graph, pass);
+        }
+    }
+    demand.conservative_instances = conservative_instances;
+    demand.passes = graph
+        .passes
+        .iter()
+        .enumerate()
+        .filter(|(_, pass)| instance_is_selected(demand, pass.instance))
+        .map(|(pass_index, pass)| EffectPassExecutionDemand {
+            id: pass.id,
+            output_region: pass_regions[pass_index].clone(),
+        })
+        .collect();
+    demand.plan_stats.pass_dependency_propagations = pass_dependency_propagations;
+    update_pass_plan_stats(
+        graph,
+        &demand.passes,
+        &demand.conservative_instances,
+        &mut demand.plan_stats,
+    );
 }
 
 fn graph_execution_metadata_is_complete(graph: &CompiledFrameGraph) -> bool {
@@ -1404,6 +1948,12 @@ mod tests {
     use crate::effects::*;
 
     fn blur_scene() -> (ResolvedEffectScene, EffectRegistry) {
+        blur_scene_with_region(EffectRegion::from_rect(
+            EffectRect::new(100, 80, 320, 180).unwrap(),
+        ))
+    }
+
+    fn blur_scene_with_region(region: EffectRegion) -> (ResolvedEffectScene, EffectRegistry) {
         let source = EffectNodeId::new(1).unwrap();
         let blur = EffectNodeId::new(2).unwrap();
         let program = EffectProgram {
@@ -1426,7 +1976,6 @@ mod tests {
         let validated = validate_effect_program(program).unwrap();
         let mut registry = EffectRegistry::empty();
         registry.insert(validated).unwrap();
-        let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
         let instance = ResolvedEffectInstance {
             id: EffectInstanceId::new(1).unwrap(),
             program: EffectProgramId::new(1).unwrap(),
@@ -2105,6 +2654,34 @@ mod tests {
             region.push(rect);
         }
         region
+    }
+
+    fn region_area(region: &EffectRegion) -> u64 {
+        region.rects().iter().fold(0_u64, |total, rect| {
+            total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+        })
+    }
+
+    fn translated_region(region: &EffectRegion, dx: i32, dy: i32) -> EffectRegion {
+        let mut translated = EffectRegion::empty();
+        for rect in region.rects() {
+            translated.push(
+                EffectRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height)
+                    .expect("translated test rectangle is valid"),
+            );
+        }
+        translated
+    }
+
+    fn relative_rects(region: &EffectRegion, dx: i32, dy: i32) -> Vec<EffectRect> {
+        region
+            .rects()
+            .iter()
+            .map(|rect| {
+                EffectRect::new(rect.x - dx, rect.y - dy, rect.width, rect.height)
+                    .expect("relative test rectangle is valid")
+            })
+            .collect()
     }
 
     fn demand_test_instance(
@@ -2944,6 +3521,83 @@ mod tests {
                 .find(|texture| texture.id == *input)
                 .is_some_and(|texture| texture.working_space == EffectWorkingSpace::LinearSrgb)
         }));
+        let demand = plan_effect_execution_demand(&graph, &region, false);
+        assert!(blend_pass.inputs.iter().all(|input| {
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.output == Some(*input))
+                .all(|pass| {
+                    demand
+                        .pass_output_region(pass.id)
+                        .is_some_and(|required| !required.is_empty())
+                })
+        }));
+        assert!(demand.plan_stats().pass_dependency_propagations >= 3);
+    }
+
+    #[test]
+    fn mask_demand_propagates_to_its_content_input() {
+        let source = EffectNodeId::new(1).unwrap();
+        let mask = EffectNodeId::new(2).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(20).unwrap(),
+            nodes: vec![
+                EffectNode::source(source, EffectSource::Backdrop),
+                EffectNode::mask(
+                    mask,
+                    source,
+                    MaskSpec {
+                        mode: MaskMode::Alpha,
+                    },
+                ),
+            ],
+            output: mask,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let region = EffectRegion::from_rect(EffectRect::new(20, 30, 40, 25).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(20).unwrap(),
+                1,
+                region.clone(),
+            )],
+        );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("mask effect must compile to an effect graph");
+        };
+        let demand = plan_effect_execution_demand(&graph, &region, false);
+        let mask_pass = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Mask)
+            .expect("mask pass");
+        let input = mask_pass.inputs[0];
+        let producer = graph
+            .passes
+            .iter()
+            .find(|pass| pass.output == Some(input))
+            .expect("mask content producer");
+        assert!(
+            !demand
+                .pass_output_region(producer.id)
+                .expect("content demand")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3546,6 +4200,304 @@ mod tests {
         assert!(graph.final_damage.contains_point(100, 80));
         let demand = plan_effect_execution_demand(&graph, &graph.final_damage, false);
         assert!(demand.contains(EffectInstanceId::new(1).unwrap()));
+    }
+
+    #[test]
+    fn small_blur_repair_plans_partial_pass_demand() {
+        let (scene, registry) = blur_scene();
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("visible blur must compile to an effect graph");
+        };
+        let repair = EffectRegion::from_rect(EffectRect::new(220, 140, 12, 10).unwrap());
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+        let instance = EffectInstanceId::new(1).unwrap();
+        let area = |region: &EffectRegion| {
+            region.rects().iter().fold(0_u64, |total, rect| {
+                total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+            })
+        };
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .expect("blur has a capture pass");
+        let composite = graph
+            .passes
+            .iter()
+            .find(|pass| pass.instance == instance && pass.kind == RenderPassKind::Composite)
+            .expect("blur has a composite pass");
+        let capture_demand = demand
+            .pass_output_region(capture.id)
+            .expect("capture demand is planned");
+        let composite_demand = demand
+            .pass_output_region(composite.id)
+            .expect("composite demand is planned");
+        let capture_texture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .expect("blur has a captured scene texture");
+
+        assert!(!composite_demand.is_empty());
+        assert!(capture_demand.is_empty() || area(capture_demand) > area(composite_demand));
+        assert!(
+            area(capture_demand)
+                < u64::from(capture_texture.width) * u64::from(capture_texture.height)
+        );
+        assert!(
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.instance == instance)
+                .all(|pass| demand.pass_output_region(pass.id).is_some())
+        );
+    }
+
+    #[test]
+    fn full_repair_keeps_complete_pass_domains() {
+        let (scene, registry) = blur_scene();
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("visible blur must compile to an effect graph");
+        };
+
+        let demand = plan_effect_execution_demand(&graph, &EffectRegion::empty(), true);
+
+        assert_eq!(demand.plan_stats().pass_count_selected, graph.passes.len());
+        assert_eq!(demand.plan_stats().partial_pass_count, 0);
+        assert_eq!(
+            demand.plan_stats().full_domain_pass_count,
+            graph.passes.len()
+        );
+        for pass in &graph.passes {
+            let output = pass.output.expect("compiled pass output");
+            let texture = graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == output)
+                .expect("compiled pass output texture");
+            assert_eq!(
+                demand.pass_output_region(pass.id),
+                Some(&EffectRegion::from_rect(texture.domain))
+            );
+        }
+    }
+
+    #[test]
+    fn zero_footprint_local_stage_propagates_unchanged() {
+        let (scene, registry) = fused_local_stage_scene(1);
+        let region = EffectRegion::from_rect(EffectRect::new(10, 10, 20, 20).unwrap());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 100, 100).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("local stage must compile to an effect graph");
+        };
+        let demand = plan_effect_execution_demand(&graph, &region, false);
+        let local_passes = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::Fragment)
+            .collect::<Vec<_>>();
+        assert!(!local_passes.is_empty());
+        let first = demand
+            .pass_output_region(local_passes[0].id)
+            .expect("local stage demand");
+        for pass in local_passes {
+            assert_eq!(demand.pass_output_region(pass.id), Some(first));
+        }
+    }
+
+    #[test]
+    fn custom_fragment_declared_footprint_expands_upstream() {
+        let backdrop = EffectNodeId::new(1).unwrap();
+        let custom = EffectNodeId::new(2).unwrap();
+        let program = validate_effect_program(EffectProgram {
+            id: EffectProgramId::new(19).unwrap(),
+            nodes: vec![
+                EffectNode::source(backdrop, EffectSource::Backdrop),
+                EffectNode::custom_fragment(
+                    custom,
+                    backdrop,
+                    CustomFragmentSpec {
+                        shader: ShaderModuleId::new(19).unwrap(),
+                        declared_footprint: EffectFootprint::symmetric(6),
+                        uniforms: Vec::new(),
+                        auxiliary_inputs: Vec::new(),
+                    },
+                )
+                .unwrap(),
+            ],
+            output: custom,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Preserve,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        })
+        .unwrap();
+        let mut registry = EffectRegistry::empty();
+        registry.insert(program).unwrap();
+        let visible = EffectRegion::from_rect(EffectRect::new(300, 200, 80, 60).unwrap());
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![test_instance(
+                EffectProgramId::new(19).unwrap(),
+                1,
+                visible.clone(),
+            )],
+        );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &visible,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("custom fragment must compile to an effect graph");
+        };
+        let demand = plan_effect_execution_demand(&graph, &visible, false);
+        let custom_pass = graph
+            .passes
+            .iter()
+            .find(|pass| {
+                pass.kind == RenderPassKind::Fragment
+                    && matches!(pass.stage, Some(EffectNodeKind::CustomFragment(_)))
+            })
+            .expect("custom fragment pass");
+        let capture_pass = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .expect("custom fragment capture pass");
+        assert!(
+            region_area(
+                demand
+                    .pass_output_region(capture_pass.id)
+                    .expect("capture demand")
+            ) > region_area(
+                demand
+                    .pass_output_region(custom_pass.id)
+                    .expect("custom demand")
+            )
+        );
+    }
+
+    #[test]
+    fn odd_blur_dimensions_round_outward_and_clip_to_capture_domain() {
+        let visible = EffectRegion::from_rect(EffectRect::new(101, 79, 321, 181).unwrap());
+        let (scene, registry) = blur_scene_with_region(visible.clone());
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &visible,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("odd-sized blur must compile to an effect graph");
+        };
+        let repair = EffectRegion::from_rect(EffectRect::new(180, 120, 9, 7).unwrap());
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+        let capture_pass = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .expect("blur capture pass");
+        let capture_texture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == capture_pass.output.unwrap())
+            .expect("blur capture texture");
+        let capture_demand = demand
+            .pass_output_region(capture_pass.id)
+            .expect("capture demand");
+        assert!(capture_demand.rects().iter().all(|rect| {
+            rect.x >= capture_texture.domain.x
+                && rect.y >= capture_texture.domain.y
+                && rect.right() <= capture_texture.domain.right()
+                && rect.bottom() <= capture_texture.domain.bottom()
+        }));
+        assert!(demand.plan_stats().max_pass_region_rect_count <= MAX_EFFECT_REGION_RECTS);
+    }
+
+    #[test]
+    fn translated_domains_preserve_relative_pass_demand() {
+        let first_visible = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
+        let second_visible = translated_region(&first_visible, 400, 220);
+        let (first_scene, registry) = blur_scene_with_region(first_visible.clone());
+        let (second_scene, _) = blur_scene_with_region(second_visible.clone());
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(first_graph) =
+            compile_frame_execution_plan(&first_scene, &first_visible, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("first blur must compile to an effect graph");
+        };
+        let FrameExecutionPlan::EffectGraph(second_graph) =
+            compile_frame_execution_plan(&second_scene, &second_visible, output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("translated blur must compile to an effect graph");
+        };
+        let first_repair = EffectRegion::from_rect(EffectRect::new(120, 100, 12, 10).unwrap());
+        let second_repair = translated_region(&first_repair, 400, 220);
+        let first_demand = plan_effect_execution_demand(&first_graph, &first_repair, false);
+        let second_demand = plan_effect_execution_demand(&second_graph, &second_repair, false);
+        assert_eq!(first_graph.passes.len(), second_graph.passes.len());
+        for (first_pass, second_pass) in first_graph.passes.iter().zip(&second_graph.passes) {
+            let first_region = first_demand.pass_output_region(first_pass.id).unwrap();
+            let second_region = second_demand.pass_output_region(second_pass.id).unwrap();
+            assert_eq!(
+                relative_rects(first_region, 0, 0),
+                relative_rects(second_region, 400, 220)
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_pass_demand_stays_within_effect_region_bound() {
+        let (scene, registry) = blur_scene();
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible blur must compile to an effect graph");
+        };
+        let mut repair = EffectRegion::empty();
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            repair.push(
+                EffectRect::new(
+                    110 + (index as i32 % 16) * 12,
+                    90 + (index as i32 / 16) * 12,
+                    4,
+                    4,
+                )
+                .unwrap(),
+            );
+        }
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+
+        assert!(
+            demand
+                .passes
+                .iter()
+                .all(|pass| pass.output_region.rects().len() <= MAX_EFFECT_REGION_RECTS)
+        );
+        assert!(demand.plan_stats().max_pass_region_rect_count <= MAX_EFFECT_REGION_RECTS);
+        assert!(demand.plan_stats().pass_dependency_propagations <= graph.passes.len() * 2);
     }
 
     #[test]

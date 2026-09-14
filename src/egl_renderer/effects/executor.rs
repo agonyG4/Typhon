@@ -388,7 +388,9 @@ pub(crate) struct EffectExecutionStats {
     pub instances: usize,
     pub passes: usize,
     pub scene_captures: usize,
-    pub capture_pixels: u64,
+    /// Physical target-texture pixels covered by executed capture regions.
+    /// This is execution work, not the allocated texture area.
+    pub capture_execution_pixels: u64,
     pub blur_downsamples: usize,
     pub blur_upsamples: usize,
     pub composites: usize,
@@ -432,6 +434,13 @@ pub(crate) fn select_effect_execution(
     let mut selection = EffectExecutionSelection::default();
     for pass in &graph.passes {
         if !demand.is_conservative_full() && !demand.contains(pass.instance) {
+            continue;
+        }
+        if demand.has_pass_plan()
+            && demand
+                .pass_output_region(pass.id)
+                .is_none_or(EffectRegion::is_empty)
+        {
             continue;
         }
         selection.executed_passes.push(pass.id);
@@ -521,7 +530,7 @@ pub(crate) fn plan_effect_surface_consumers(
                 pass.visual_group,
                 pass.anchor_scope,
             );
-            let execution_damage = effective_pass_damage(graph, demand, pass);
+            let execution_damage = capture_execution_damage(graph, demand, pass, false);
             let target_domain = pass
                 .output
                 .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
@@ -731,7 +740,7 @@ fn execute_graph_passes_inner(
         if !selection.executed_passes.contains(&pass.id) {
             continue;
         }
-        let execution_damage = effective_pass_damage(graph, demand, pass);
+        let execution_damage = capture_execution_damage(graph, demand, pass, lifecycle_backdrop);
         if renderer.effect_trace.enabled() {
             renderer.effect_trace.pass_boundary(
                 "begin",
@@ -1030,11 +1039,31 @@ fn effect_region_pixels(region: &EffectRegion) -> u64 {
     })
 }
 
+fn output_rect_pixels(rects: &[OutputRect]) -> u64 {
+    rects.iter().fold(0u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
+    })
+}
+
 fn effective_pass_damage(
     graph: &CompiledFrameGraph,
     demand: &EffectExecutionDemand,
     pass: &CompiledRenderPass,
 ) -> EffectRegion {
+    if demand.has_pass_plan() {
+        return demand
+            .pass_output_region(pass.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                if demand.is_conservative_full()
+                    || demand.instance_is_conservative_full(pass.instance)
+                {
+                    pass_output_texture_domain(graph, pass)
+                } else {
+                    EffectRegion::empty()
+                }
+            });
+    }
     let Some(output_region) = demand.output_region(pass.instance) else {
         return if demand.is_conservative_full() {
             pass.output
@@ -1058,6 +1087,38 @@ fn effective_pass_damage(
             || output_region.clone(),
             |texture| EffectRegion::from_rect(texture.domain),
         )
+}
+
+fn pass_output_texture_domain(
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+) -> EffectRegion {
+    pass.output
+        .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+        .map_or_else(EffectRegion::empty, |texture| {
+            EffectRegion::from_rect(texture.domain)
+        })
+}
+
+fn is_direct_framebuffer_capture(pass: &CompiledRenderPass, lifecycle_backdrop: bool) -> bool {
+    matches!(
+        pass.kind,
+        RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+    ) && ((lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture)
+        || !pass.checkpoint_dependencies.is_empty())
+}
+
+fn capture_execution_damage(
+    graph: &CompiledFrameGraph,
+    demand: &EffectExecutionDemand,
+    pass: &CompiledRenderPass,
+    lifecycle_backdrop: bool,
+) -> EffectRegion {
+    if is_direct_framebuffer_capture(pass, lifecycle_backdrop) {
+        pass_output_texture_domain(graph, pass)
+    } else {
+        effective_pass_damage(graph, demand, pass)
+    }
 }
 
 fn validate_effect_pass_resources(
@@ -1368,6 +1429,7 @@ fn pass_trace_summary(
                 .scratch_framebuffer_identity()
                 .is_some()
         }),
+        conservative_pass_demand: direct_capture,
     }
 }
 
@@ -2171,14 +2233,16 @@ fn execute_capture(
         .get(&output)
         .ok_or_else(|| io::Error::other("capture output texture is not allocated"))?;
     let target_plan = graph_texture(graph, output)?;
-    stats.capture_pixels = stats
-        .capture_pixels
-        .saturating_add(u64::from(target_plan.width).saturating_mul(u64::from(target_plan.height)));
-    if lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture {
-        capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
-        return Ok(());
-    }
-    if !pass.checkpoint_dependencies.is_empty() {
+    let direct_capture = is_direct_framebuffer_capture(pass, lifecycle_backdrop);
+    let capture_rects = if direct_capture {
+        vec![full_output_rect((target_plan.width, target_plan.height))]
+    } else {
+        capture_clear_rects(execution_damage, target_plan)
+    };
+    stats.capture_execution_pixels = stats
+        .capture_execution_pixels
+        .saturating_add(output_rect_pixels(&capture_rects));
+    if direct_capture {
         capture_output_region_to_graph_texture(renderer, target, target_plan, framebuffer_origin)?;
         return Ok(());
     }
@@ -2190,6 +2254,16 @@ fn execute_capture(
             .gl
             .viewport(0, 0, target_plan.width as i32, target_plan.height as i32);
         renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.disable(glow::BLEND);
+        renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        for rect in &capture_rects {
+            renderer.gl.enable(glow::SCISSOR_TEST);
+            renderer
+                .gl
+                .scissor(rect.x, rect.y, rect.width as i32, rect.height as i32);
+            renderer.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        renderer.gl.disable(glow::SCISSOR_TEST);
         renderer.gl.enable(glow::BLEND);
         renderer.gl.blend_func_separate(
             glow::ONE,
@@ -2197,8 +2271,6 @@ fn execute_capture(
             glow::ONE,
             glow::ONE_MINUS_SRC_ALPHA,
         );
-        renderer.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-        renderer.gl.clear(glow::COLOR_BUFFER_BIT);
         renderer.gl.use_program(Some(renderer.capture_program));
         if let Some(location) = renderer.capture_uniform_location("u_capture_output_size") {
             renderer.gl.uniform_2_f32(
@@ -2247,15 +2319,11 @@ fn execute_capture(
         pass.visual_group,
         pass.anchor_scope,
     );
-    let scissors = if execution_damage.is_empty() {
-        vec![full_output_rect(renderer.current_size)]
-    } else {
-        execution_damage
-            .rects()
-            .iter()
-            .map(|rect| effect_rect_to_output_rect(*rect))
-            .collect::<Vec<_>>()
-    };
+    let scissors = effect_capture_output_rects(
+        execution_damage,
+        Some(target_plan.domain),
+        renderer.current_size,
+    );
     renderer.draw_capture_commands_for_regions(
         &indices,
         &scissors,
@@ -2713,7 +2781,7 @@ fn effect_capture_output_rects(
 ) -> Vec<OutputRect> {
     let full_output = oblivion_one::effects::EffectRect::new(0, 0, output_size.0, output_size.1)
         .expect("renderer dimensions are valid");
-    let rects = if damage.is_empty() {
+    let rects = if damage.is_empty() || damage.bounding_rect().is_none() {
         std::slice::from_ref(&full_output)
     } else {
         damage.rects()
@@ -2761,6 +2829,13 @@ fn effect_damage_to_texture_rects(
         .iter()
         .filter_map(|rect| effect_rect_to_texture_rect(*rect, target, framebuffer_origin))
         .collect()
+}
+
+fn capture_clear_rects(
+    damage: &EffectRegion,
+    target: &oblivion_one::effects::GraphTexturePlan,
+) -> Vec<OutputRect> {
+    effect_damage_to_texture_rects(damage, target, OutputFramebufferOrigin::BottomLeft)
 }
 
 fn effect_rect_to_texture_rect(
@@ -3269,6 +3344,77 @@ mod tests {
     use super::*;
     use crate::egl_renderer::{EglRect, SurfaceSampling};
 
+    fn test_texture(
+        id: u16,
+        source: GraphTextureSource,
+        domain: oblivion_one::effects::EffectRect,
+    ) -> oblivion_one::effects::GraphTexturePlan {
+        oblivion_one::effects::GraphTexturePlan {
+            id: GraphTextureId::new(id).unwrap(),
+            source,
+            width: domain.width,
+            height: domain.height,
+            domain,
+            working_space: oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            first_use: None,
+            last_use: None,
+        }
+    }
+
+    fn test_pass(
+        id: u16,
+        kind: RenderPassKind,
+        instance: oblivion_one::effects::EffectInstanceId,
+        inputs: Vec<GraphTextureId>,
+        output: GraphTextureId,
+        checkpoint_dependencies: Vec<GraphPassId>,
+    ) -> CompiledRenderPass {
+        CompiledRenderPass {
+            id: GraphPassId::new(id).unwrap(),
+            kind,
+            inputs,
+            output: Some(output),
+            damage: EffectRegion::empty(),
+            instance,
+            anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: oblivion_one::effects::EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies,
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+        }
+    }
+
+    fn planned_demand(
+        instance: oblivion_one::effects::EffectInstanceId,
+        output_region: EffectRegion,
+        passes: Vec<(GraphPassId, EffectRegion)>,
+    ) -> EffectExecutionDemand {
+        let mut demand = EffectExecutionDemand::new(
+            vec![oblivion_one::effects::EffectInstanceExecutionDemand {
+                id: instance,
+                output_region: output_region.clone(),
+            }],
+            output_region,
+        );
+        demand.passes = passes
+            .into_iter()
+            .map(
+                |(id, output_region)| oblivion_one::effects::EffectPassExecutionDemand {
+                    id,
+                    output_region,
+                },
+            )
+            .collect();
+        demand
+    }
+
     #[test]
     fn trusted_output_size_uses_the_compositor_output_not_the_stage_texture() {
         assert_eq!(
@@ -3426,6 +3572,214 @@ mod tests {
     }
 
     #[test]
+    fn precise_pass_demand_replaces_full_texture_domain_damage() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 80).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Fragment,
+            instance,
+            vec![input],
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demanded =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(12, 14, 9, 7).unwrap());
+        let demand = planned_demand(
+            instance,
+            demanded.clone(),
+            vec![(pass.id, demanded.clone())],
+        );
+
+        assert_eq!(effective_pass_damage(&graph, &demand, &pass), demanded);
+    }
+
+    #[test]
+    fn empty_pass_demand_skips_execution_and_resource_acquisition() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let first_input = GraphTextureId::new(1).unwrap();
+        let first_output = GraphTextureId::new(2).unwrap();
+        let second_input = GraphTextureId::new(3).unwrap();
+        let second_output = GraphTextureId::new(4).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 80).unwrap();
+        let first = test_pass(
+            1,
+            RenderPassKind::Fragment,
+            instance,
+            vec![first_input],
+            first_output,
+            Vec::new(),
+        );
+        let second = test_pass(
+            2,
+            RenderPassKind::Fragment,
+            instance,
+            vec![second_input],
+            second_output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![first.clone(), second.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+                test_texture(3, GraphTextureSource::Intermediate, domain),
+                test_texture(4, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demanded =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(12, 14, 9, 7).unwrap());
+        let demand = planned_demand(
+            instance,
+            demanded.clone(),
+            vec![(first.id, EffectRegion::empty()), (second.id, demanded)],
+        );
+
+        let selection = select_effect_execution(&graph, &demand);
+
+        assert_eq!(selection.executed_passes, vec![second.id]);
+        assert_eq!(
+            selection.acquired_texture_ids,
+            vec![second_input, second_output]
+        );
+    }
+
+    #[test]
+    fn malformed_producer_metadata_uses_full_domain_for_affected_instance() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 80).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Composite,
+            instance,
+            vec![input],
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let repair =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(12, 14, 9, 7).unwrap());
+        let demand = oblivion_one::effects::plan_effect_execution_demand(&graph, &repair, false);
+
+        assert!(demand.instance_is_conservative_full(instance));
+        assert_eq!(
+            effective_pass_damage(&graph, &demand, &pass),
+            EffectRegion::from_rect(domain)
+        );
+        assert_eq!(demand.plan_stats().pass_conservative_fallbacks, 1);
+    }
+
+    #[test]
+    fn direct_framebuffer_capture_is_intentionally_conservative() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(1).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(20, 30, 100, 80).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            vec![GraphPassId::new(9).unwrap()],
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demanded =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(40, 45, 8, 6).unwrap());
+        let demand = planned_demand(instance, demanded.clone(), vec![(pass.id, demanded)]);
+
+        assert_eq!(
+            capture_execution_damage(&graph, &demand, &pass, false),
+            EffectRegion::from_rect(domain)
+        );
+    }
+
+    #[test]
+    fn replay_capture_clear_plan_covers_only_demanded_target_rectangles() {
+        let target = test_texture(
+            1,
+            GraphTextureSource::CapturedScene,
+            oblivion_one::effects::EffectRect::new(100, 50, 100, 100).unwrap(),
+        );
+        let damage = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(110, 60, 20, 20).unwrap(),
+        );
+
+        assert_eq!(
+            capture_clear_rects(&damage, &target),
+            vec![OutputRect::new(10, 70, 20, 20)]
+        );
+    }
+
+    #[test]
+    fn capture_execution_pixels_are_physical_demanded_area() {
+        let target = test_texture(
+            1,
+            GraphTextureSource::CapturedScene,
+            oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap(),
+        );
+        let damage = EffectRegion::from_rect(
+            oblivion_one::effects::EffectRect::new(10, 20, 30, 40).unwrap(),
+        );
+        let rects = capture_clear_rects(&damage, &target);
+
+        assert_eq!(output_rect_pixels(&rects), 1200);
+        assert_ne!(output_rect_pixels(&rects), 10000);
+    }
+
+    #[test]
     fn effect_surface_consumer_plan_keeps_capture_only_source() {
         let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
         let pass_id = GraphPassId::new(1).unwrap();
@@ -3507,6 +3861,62 @@ mod tests {
         );
 
         assert!(plan.surface_ids().contains(&1));
+    }
+
+    #[test]
+    fn effect_surface_consumer_plan_uses_precise_capture_demand() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let output = GraphTextureId::new(1).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::SceneCapture,
+            instance,
+            Vec::new(),
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![test_texture(1, GraphTextureSource::CapturedScene, domain)],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demanded =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 20, 20).unwrap());
+        let demand = planned_demand(instance, demanded.clone(), vec![(pass.id, demanded)]);
+        let selection = select_effect_execution(&graph, &demand);
+        let command = |layer, x| EglDrawCommand {
+            layer,
+            visual_group: None,
+            bounds: EglRect::new(x, 0.0, 20.0, 20.0),
+            opaque_regions: Vec::new(),
+            vertex_start: 0,
+            vertex_count: 6,
+            sampling: SurfaceSampling::ExactNearest,
+        };
+        let commands = vec![
+            command(EglDrawLayer::Surface(1), 0.0),
+            command(EglDrawLayer::Surface(2), 60.0),
+        ];
+
+        let plan = plan_effect_surface_consumers(
+            &graph,
+            &demand,
+            &selection,
+            &commands,
+            &[OutputRect::new(0, 0, 20, 20)],
+            (100, 100),
+        );
+
+        assert!(plan.surface_ids().contains(&1));
+        assert!(!plan.surface_ids().contains(&2));
     }
 
     #[test]
