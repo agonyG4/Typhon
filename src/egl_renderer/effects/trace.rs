@@ -86,6 +86,7 @@ pub(crate) struct PassTraceSummary {
     pub(crate) draw_framebuffer: Option<String>,
     pub(crate) scratch_fbo_present: Option<bool>,
     pub(crate) conservative_pass_demand: bool,
+    pub(crate) conservative_pass_demand_kind: &'static str,
 }
 
 #[cfg(test)]
@@ -328,7 +329,7 @@ impl EffectExecutionTrace {
                 |(x, y, width, height)| format!("{x},{y},{width},{height}"),
             );
             format!(
-                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} conservative_pass_demand={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
+                "event=effect_pass_{boundary} frame_id={} pass={} instance={} kind={} anchor={:?} anchor_scope={:?} visual_group={} inputs={} input_details={} output={} framebuffer_origin={} target_flip_y={} input_flip_y={} damage_rects={} damage_bbox={} checkpoints={} capture_mode={} conservative_pass_demand={} conservative_pass_demand_kind={} capture_commands={} read_fbo={} draw_fbo={} scratch_fbo_present={}",
                 optional_u64(self.frame_id),
                 pass.id.get(),
                 pass.instance.get(),
@@ -347,6 +348,7 @@ impl EffectExecutionTrace {
                 pass.checkpoint_dependencies.len(),
                 summary.capture_mode.unwrap_or("none"),
                 summary.conservative_pass_demand,
+                summary.conservative_pass_demand_kind,
                 summary
                     .capture_command_count
                     .map_or_else(|| "none".to_owned(), |count| count.to_string()),

@@ -36,7 +36,12 @@ its demanded output through the output/input texture dimensions, shader offset,
 linear-filter support, and outward integer rounding. Regions are clipped to the
 already allocated graph domains. A precise pass runs only its demanded output
 rectangles, while invalid producer metadata or an unrepresentable region falls
-back to full-domain execution for that effect instance.
+back to full-domain execution for that effect instance's internal passes. Its
+Composite or post-process sink remains constrained to `pass.damage` union the
+validated output-influence region, so capture padding cannot become visible.
+Pass traces distinguish precise demand, full internal conservative demand,
+output-constrained conservative sinks, and conservative direct framebuffer
+capture.
 
 The graph also lowers these built-in stages:
 

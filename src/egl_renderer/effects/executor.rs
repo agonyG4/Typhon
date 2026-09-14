@@ -751,6 +751,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -767,6 +768,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -784,6 +786,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -876,6 +879,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -900,6 +904,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -920,6 +925,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -962,6 +968,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -984,6 +991,7 @@ fn execute_graph_passes_inner(
                     renderer,
                     graph,
                     pass,
+                    demand,
                     &execution_damage,
                     framebuffer_origin,
                     lifecycle_backdrop,
@@ -1338,6 +1346,7 @@ fn pass_trace_summary(
     renderer: &GlesSceneRenderer,
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,
+    demand: &EffectExecutionDemand,
     execution_damage: &EffectRegion,
     framebuffer_origin: OutputFramebufferOrigin,
     lifecycle_backdrop: bool,
@@ -1363,6 +1372,23 @@ fn pass_trace_summary(
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
     ) && ((lifecycle_backdrop && pass.kind == RenderPassKind::SceneCapture)
         || !pass.checkpoint_dependencies.is_empty());
+    let conservative_pass_demand = direct_capture
+        || demand.is_conservative_full()
+        || demand.instance_is_conservative_full(pass.instance);
+    let conservative_pass_demand_kind = if direct_capture {
+        "direct_framebuffer_capture"
+    } else if conservative_pass_demand
+        && matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        )
+    {
+        "final_output_constrained"
+    } else if conservative_pass_demand {
+        "internal_full_domain"
+    } else {
+        "precise"
+    };
     let capture_mode = matches!(
         pass.kind,
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
@@ -1429,7 +1455,8 @@ fn pass_trace_summary(
                 .scratch_framebuffer_identity()
                 .is_some()
         }),
-        conservative_pass_demand: direct_capture,
+        conservative_pass_demand,
+        conservative_pass_demand_kind,
     }
 }
 
@@ -3612,6 +3639,56 @@ mod tests {
     }
 
     #[test]
+    fn conservative_composite_scissor_excludes_capture_padding() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let output_domain = oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let visible = oblivion_one::effects::EffectRect::new(500, 250, 800, 500).unwrap();
+        let capture_domain = oblivion_one::effects::EffectRect::new(476, 226, 848, 548).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Composite,
+            instance,
+            vec![input],
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, capture_domain),
+                test_texture(2, GraphTextureSource::Output, output_domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(visible),
+                capture_region: EffectRegion::from_rect(capture_domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demand = oblivion_one::effects::plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::empty(),
+            true,
+        );
+
+        let execution_damage = effective_pass_damage(&graph, &demand, &pass);
+
+        assert_eq!(
+            execution_damage,
+            EffectRegion::from_rect(
+                oblivion_one::effects::EffectRect::new(500, 250, 800, 500).unwrap()
+            )
+        );
+        assert!(!execution_damage.contains_point(476, 226));
+        assert!(!execution_damage.contains_point(499, 400));
+        assert!(!execution_damage.contains_point(1300, 400));
+    }
+
+    #[test]
     fn empty_pass_demand_skips_execution_and_resource_acquisition() {
         let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
         let first_input = GraphTextureId::new(1).unwrap();
@@ -3674,7 +3751,8 @@ mod tests {
         let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
         let input = GraphTextureId::new(1).unwrap();
         let output = GraphTextureId::new(2).unwrap();
-        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 80).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let visible = oblivion_one::effects::EffectRect::new(500, 250, 800, 500).unwrap();
         let pass = test_pass(
             1,
             RenderPassKind::Composite,
@@ -3692,21 +3770,20 @@ mod tests {
             ],
             instances: vec![oblivion_one::effects::CompiledEffectInstance {
                 id: instance,
-                output_influence_region: EffectRegion::from_rect(domain),
+                output_influence_region: EffectRegion::from_rect(visible),
                 capture_region: EffectRegion::from_rect(domain),
                 dependencies: Vec::new(),
             }],
             final_damage: EffectRegion::empty(),
             stats: Default::default(),
         };
-        let repair =
-            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(12, 14, 9, 7).unwrap());
+        let repair = EffectRegion::from_rect(visible);
         let demand = oblivion_one::effects::plan_effect_execution_demand(&graph, &repair, false);
 
         assert!(demand.instance_is_conservative_full(instance));
         assert_eq!(
             effective_pass_damage(&graph, &demand, &pass),
-            EffectRegion::from_rect(domain)
+            EffectRegion::from_rect(visible)
         );
         assert_eq!(demand.plan_stats().pass_conservative_fallbacks, 1);
     }
