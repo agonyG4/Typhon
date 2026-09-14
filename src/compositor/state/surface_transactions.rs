@@ -50,16 +50,6 @@ impl SurfaceTreeNodeLifetimes {
             Self::Synthetic => None,
         }
     }
-
-    pub(in crate::compositor) fn captured_mut(
-        &mut self,
-    ) -> Option<&mut Vec<SurfaceTreeNodeLifetime>> {
-        match self {
-            Self::Captured(lifetimes) => Some(lifetimes),
-            #[cfg(test)]
-            Self::Synthetic => None,
-        }
-    }
 }
 
 #[derive(Debug)]
