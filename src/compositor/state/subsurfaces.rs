@@ -49,7 +49,7 @@ mod tests {
         u32,
     ) {
         let display = wayland_server::Display::<CompositorState>::new().expect("test display");
-        let mut display_handle = display.handle();
+        let display_handle = display.handle();
         let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
         let client = display_handle
             .insert_client(server_end, std::sync::Arc::new(()))
@@ -247,9 +247,21 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_predecessor_is_internalized_and_remains_pending() {
+    fn coalesced_predecessor_is_internalized_and_publishes_after_other_readiness_clears() {
         let mut state = CompositorState::default();
-        let (_display, client, surface_id) = test_surface_and_client(&mut state);
+        let (display, client, surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let blocker_surface =
+            state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+        let blocker_surface_id = compositor_surface_id(&blocker_surface);
+        state
+            .surface_presentation_generations
+            .insert(blocker_surface_id, 1);
+        let remaining_dependency = ContentUpdateRef {
+            surface_id: blocker_surface_id,
+            commit_id: SurfaceCommitId::for_tests(3),
+            commit_sequence: SurfaceCommitSequence(3),
+        };
         let predecessor = test_mergeable_commit(1);
         let predecessor_ref = predecessor.content_update_ref(surface_id);
         let mut newer = test_mergeable_commit(2);
@@ -271,7 +283,7 @@ mod tests {
             vec![(surface_id, newer)],
             test_captured_lifetimes(&client.id(), &[surface_id]),
             Vec::new(),
-            vec![predecessor_ref],
+            vec![predecessor_ref, remaining_dependency],
         );
         state.pending_surface_tree_transactions.push(transaction);
 
@@ -287,8 +299,26 @@ mod tests {
                 .contains(&predecessor_ref)
         );
         assert!(state.content_update_ref_is_pending(predecessor_ref));
+        assert_eq!(
+            state.pending_surface_tree_transactions[0].external_content_update_dependencies,
+            vec![remaining_dependency]
+        );
         assert!(
-            state.content_update_dependencies_ready(&state.pending_surface_tree_transactions[0])
+            !state.content_update_dependencies_ready(&state.pending_surface_tree_transactions[0])
+        );
+
+        state.surface_publications.insert(
+            blocker_surface_id,
+            SurfacePublicationState {
+                latest_published: Some(remaining_dependency.commit_sequence),
+                ..SurfacePublicationState::default()
+            },
+        );
+        state.commit_ready_surface_tree_transactions();
+        assert!(state.pending_surface_tree_transactions.is_empty());
+        assert_eq!(
+            state.surface_publications[&surface_id].latest_published,
+            Some(SurfaceCommitSequence(2))
         );
     }
 
