@@ -44,6 +44,7 @@ impl CompositorState {
         &mut self,
         output: &wl_output::WlOutput,
     ) {
+        self.fail_astrea_screen_captures_for_output(output, "output_gone");
         let output_id = output.id().protocol_id();
         self.publish_workspace_output_leave(output);
         let affected_surfaces = self

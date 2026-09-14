@@ -150,6 +150,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
         scale_factor: f64,
     },
     SetOutputPreferredTransform(u32),
+    CapturePendingAstreaScreenCapture(Sender<bool>),
+    UnregisterOutputResources,
     MinimizeFocused,
     RestoreNextMinimized,
     FocusRootWindow(u32),
@@ -554,6 +556,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             _ => continue,
                         };
                         server.set_output_preferred_transform(transform);
+                    }
+                    ServerCommand::CapturePendingAstreaScreenCapture(reply) => {
+                        let _ = reply.send(server.has_pending_astrea_screen_capture());
+                    }
+                    ServerCommand::UnregisterOutputResources => {
+                        let outputs = server.state.output_resources.clone();
+                        for output in outputs {
+                            server.state.unregister_output_resource(&output);
+                        }
                     }
                     ServerCommand::MinimizeFocused => {
                         server.minimize_focused_window();

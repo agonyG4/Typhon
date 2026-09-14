@@ -451,6 +451,7 @@ mod tests {
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             });
@@ -469,6 +470,7 @@ mod tests {
                 nodes: vec![(7, empty_cached_subsurface_commit())],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
@@ -478,6 +480,7 @@ mod tests {
                 nodes: vec![(8, empty_cached_subsurface_commit())],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },

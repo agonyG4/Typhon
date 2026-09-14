@@ -53,6 +53,7 @@ mod presentation_transactions;
 mod presentation_worker;
 mod resource_efficiency;
 mod scene_history;
+mod scene_liveness;
 mod session;
 mod session_io;
 mod shutdown;
@@ -732,6 +733,7 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.shutdown();
         self.slow_cycle_trace.dump();
         let _ = self

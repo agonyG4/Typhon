@@ -390,6 +390,15 @@ impl NativeScanoutBackend {
         matches!(self, Self::AtomicEglGbm(_) | Self::NativeEglGbm(_))
     }
 
+    pub(crate) const fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.dimensions(),
+            Self::NativeEglGbm(scanout) => (scanout.width, scanout.height),
+            Self::Gbm(scanout) => (scanout.width, scanout.height),
+            Self::Dumb(framebuffer) => (framebuffer.width, framebuffer.height),
+        }
+    }
+
     pub(crate) fn paint_server_frame(
         &mut self,
         renderer: &mut NativeFrameRenderer,
@@ -439,6 +448,27 @@ impl NativeScanoutBackend {
                     lifecycle:
                         oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::default(),
                 }),
+        }
+    }
+
+    pub(crate) fn capture_scene(
+        &mut self,
+        renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> io::Result<Vec<u8>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.capture_scene(renderer, resolved_scene, server, input_state, cursor_mode)
+            }
+            Self::NativeEglGbm(scanout) => {
+                scanout.capture_scene(renderer, resolved_scene, server, input_state, cursor_mode)
+            }
+            Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "screen capture requires a GLES native scanout backend",
+            )),
         }
     }
 

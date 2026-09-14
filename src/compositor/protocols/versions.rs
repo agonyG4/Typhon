@@ -554,6 +554,7 @@ pub(crate) const WL_DRM: u32 = 2;
 pub(crate) const XDG_ACTIVATION_V1: u32 = 1;
 pub(crate) const ASTREA_SHORTCUTS_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_AUTH_MANAGER_V1: u32 = 1;
+pub(crate) const ASTREA_SCREEN_CAPTURE_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_EFFECTS_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 3;
@@ -617,6 +618,10 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("xdg_activation_v1", XDG_ACTIVATION_V1),
     GlobalAdvertisement::new("astrea_shortcuts_manager_v1", ASTREA_SHORTCUTS_MANAGER_V1),
     GlobalAdvertisement::new("astrea_shell_auth_manager_v1", ASTREA_SHELL_AUTH_MANAGER_V1),
+    GlobalAdvertisement::new(
+        "astrea_screen_capture_manager_v1",
+        ASTREA_SCREEN_CAPTURE_MANAGER_V1,
+    ),
     GlobalAdvertisement::new(
         "astrea_shell_control_manager_v1",
         ASTREA_SHELL_CONTROL_MANAGER_V1,

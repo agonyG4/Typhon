@@ -677,9 +677,13 @@ pub(crate) fn execute_graph_passes(
     lifecycle_backdrop: bool,
     draw_overlays: bool,
 ) -> RendererResult<EffectExecutionStats> {
-    let graph_scope = renderer
-        .effect_gpu_profiler
-        .begin_graph(&renderer.gl, renderer.effect_trace.frame_id());
+    let graph_scope = (!renderer.capture_in_progress)
+        .then(|| {
+            renderer
+                .effect_gpu_profiler
+                .begin_graph(&renderer.gl, renderer.effect_trace.frame_id())
+        })
+        .flatten();
     let result = execute_graph_passes_inner(
         renderer,
         graph,
@@ -914,6 +918,9 @@ fn execute_graph_passes_inner(
             );
         }
         let pass_timing = graph_scope.and_then(|scope| {
+            if renderer.capture_in_progress {
+                return None;
+            }
             renderer.effect_gpu_profiler.begin_pass(
                 &renderer.gl,
                 scope,

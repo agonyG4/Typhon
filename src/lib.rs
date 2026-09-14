@@ -1,6 +1,7 @@
 pub mod animation_control;
 pub mod application_scope;
 pub mod astrea_effects;
+pub mod astrea_screen_capture;
 pub mod astrea_shell_auth;
 pub mod astrea_shell_control;
 pub mod astrea_shortcuts;

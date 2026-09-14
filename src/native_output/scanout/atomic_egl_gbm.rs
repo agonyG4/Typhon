@@ -645,6 +645,10 @@ impl AtomicEglGbmScanout {
         OutputSlotId::new(0).expect("slot zero is valid")
     }
 
+    pub(crate) const fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub(crate) fn framebuffer(&self, slot: OutputSlotId) -> io::Result<FramebufferId> {
         Ok(self.slot(slot)?.framebuffer)
     }
@@ -758,6 +762,39 @@ impl AtomicEglGbmScanout {
                 })
             }
         }
+    }
+
+    /// Capture the published scene without acquiring a physical output slot.
+    /// The normal Atomic context is made current, but no KMS or swapchain
+    /// state participates in this operation.
+    pub(crate) fn capture_scene(
+        &mut self,
+        renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> io::Result<Vec<u8>> {
+        self.egl
+            .make_current(self.egl_display, None, None, Some(self.egl_context))
+            .map_err(native_egl_io_error)?;
+        let request = renderer.egl_scene_draw_request(
+            self.width,
+            self.height,
+            resolved_scene,
+            server,
+            input_state,
+            cursor_mode,
+            Some(OutputDamage::Full),
+        );
+        self.scene
+            .capture_scene(
+                &self.egl,
+                self.egl_display,
+                request,
+                OutputFramebufferOrigin::TopLeftScanout,
+            )
+            .map_err(native_egl_io_error)
     }
 
     #[allow(clippy::too_many_arguments)]

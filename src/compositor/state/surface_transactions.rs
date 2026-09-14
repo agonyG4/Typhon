@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::subsurface::ContentUpdateRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SurfaceTreeTransactionId(u64);
@@ -60,18 +61,6 @@ impl SurfaceTreeNodeLifetimes {
         }
     }
 
-    fn partition(&self, node_indices: &[usize]) -> Self {
-        match self {
-            Self::Captured(lifetimes) => Self::Captured(
-                node_indices
-                    .iter()
-                    .filter_map(|index| lifetimes.get(*index).cloned())
-                    .collect(),
-            ),
-            #[cfg(test)]
-            Self::Synthetic => Self::Synthetic,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -81,16 +70,8 @@ pub(in crate::compositor) struct PendingSurfaceTreeTransaction {
     pub(in crate::compositor) nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     pub(in crate::compositor) publication_lifetimes: SurfaceTreeNodeLifetimes,
     pub(in crate::compositor) dependencies: Vec<SurfaceTreeAcquireDependency>,
+    pub(in crate::compositor) external_content_update_dependencies: Vec<ContentUpdateRef>,
     pub(in crate::compositor) commit_timing_readiness: Option<CommitTimingReadiness>,
-    pub(in crate::compositor) received_at: Instant,
-}
-
-#[derive(Debug)]
-pub(in crate::compositor) struct PreparedSurfaceTreeTransactionPartition {
-    pub(in crate::compositor) root_surface_id: u32,
-    pub(in crate::compositor) nodes: Vec<(u32, CachedSubsurfaceCommit)>,
-    pub(in crate::compositor) publication_lifetimes: SurfaceTreeNodeLifetimes,
-    pub(in crate::compositor) dependencies: Vec<SurfaceTreeAcquireDependency>,
     pub(in crate::compositor) received_at: Instant,
 }
 
@@ -104,7 +85,7 @@ pub(in crate::compositor) enum TransactionOrdering {
 pub(in crate::compositor) enum SurfaceTreeSubmissionKind {
     /// A new client Content Update subject to normal admission bounds.
     ClientAdmission,
-    /// Already-admitted work reclassified after a relationship detach.
+    /// Already-admitted work materialized after a synchronization transition.
     InternalMigration,
 }
 
@@ -202,74 +183,6 @@ pub(in crate::compositor) struct BufferlessSurfaceCommitState {
 }
 
 impl PendingSurfaceTreeTransaction {
-    pub(in crate::compositor) fn partition_by_component_root(
-        self,
-        component_root_for: impl Fn(u32) -> u32,
-    ) -> Vec<PreparedSurfaceTreeTransactionPartition> {
-        struct WorkingPartition {
-            root_surface_id: u32,
-            nodes: Vec<(usize, u32, CachedSubsurfaceCommit)>,
-            dependencies: Vec<SurfaceTreeAcquireDependency>,
-        }
-
-        let PendingSurfaceTreeTransaction {
-            nodes,
-            publication_lifetimes,
-            dependencies,
-            received_at,
-            ..
-        } = self;
-        let mut partitions = Vec::new();
-        for (node_index, (surface_id, commit)) in nodes.into_iter().enumerate() {
-            let root_surface_id = component_root_for(surface_id);
-            let Some(partition) =
-                partitions
-                    .iter_mut()
-                    .find(|partition: &&mut WorkingPartition| {
-                        partition.root_surface_id == root_surface_id
-                    })
-            else {
-                partitions.push(WorkingPartition {
-                    root_surface_id,
-                    nodes: vec![(node_index, surface_id, commit)],
-                    dependencies: Vec::new(),
-                });
-                continue;
-            };
-            partition.nodes.push((node_index, surface_id, commit));
-        }
-        for dependency in dependencies {
-            let root_surface_id = component_root_for(dependency.surface_id);
-            if let Some(partition) = partitions
-                .iter_mut()
-                .find(|partition| partition.root_surface_id == root_surface_id)
-            {
-                partition.dependencies.push(dependency);
-            }
-        }
-        partitions
-            .into_iter()
-            .map(|partition| {
-                let node_indices = partition
-                    .nodes
-                    .iter()
-                    .map(|(node_index, _, _)| *node_index)
-                    .collect::<Vec<_>>();
-                PreparedSurfaceTreeTransactionPartition {
-                    root_surface_id: partition.root_surface_id,
-                    nodes: partition
-                        .nodes
-                        .into_iter()
-                        .map(|(_, surface_id, commit)| (surface_id, commit))
-                        .collect(),
-                    publication_lifetimes: publication_lifetimes.partition(&node_indices),
-                    dependencies: partition.dependencies,
-                    received_at,
-                }
-            })
-            .collect()
-    }
-
     pub(in crate::compositor) fn commit_timing_request(&self) -> Option<CommitTimingConstraint> {
         self.nodes
             .iter()
@@ -376,6 +289,7 @@ impl CompositorState {
         let CachedSubsurfaceCommit {
             commit_id,
             commit_sequence,
+            lineage: _,
             attachment,
             damage,
             frame_callbacks,
@@ -520,7 +434,23 @@ impl CompositorState {
                     },
                     commit_context.layer_surface,
                 );
-                self.note_explicit_commit_published(commit_id);
+                if activated {
+                    let current = self.current_surface_buffers.get(&surface_id);
+                    self.record_surface_publication(
+                        surface_id,
+                        self.root_surface_id_for_surface(surface_id),
+                        commit_sequence,
+                        current.map(CurrentSurfaceBuffer::buffer_id),
+                        SurfacePublicationSource::SurfaceTree,
+                        current.and_then(|buffer| {
+                            buffer
+                                .width()
+                                .ok()
+                                .zip(buffer.height().ok())
+                                .and_then(|(width, height)| BufferSize::new(width, height))
+                        }),
+                    );
+                }
                 if renderable_index.is_some() {
                     self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
                 } else {
@@ -555,114 +485,5 @@ impl CompositorState {
             );
             self.refresh_effect_scene_summary();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn partition_moves_nodes_in_order_and_preserves_component_dependencies() {
-        let transaction = PendingSurfaceTreeTransaction {
-            id: SurfaceTreeTransactionId::new(7),
-            root_surface_id: 1,
-            nodes: vec![
-                (
-                    1,
-                    crate::compositor::state::empty_cached_subsurface_commit(),
-                ),
-                (
-                    2,
-                    crate::compositor::state::empty_cached_subsurface_commit(),
-                ),
-                (
-                    3,
-                    crate::compositor::state::empty_cached_subsurface_commit(),
-                ),
-                (
-                    4,
-                    crate::compositor::state::empty_cached_subsurface_commit(),
-                ),
-            ],
-            publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
-            dependencies: vec![
-                SurfaceTreeAcquireDependency {
-                    surface_commit_id: SurfaceCommitId::for_tests(8),
-                    commit_id: AcquireCommitId::for_tests(9),
-                    surface_id: 2,
-                    owner_client_id: None,
-                    surface_presentation_generation: None,
-                    buffer_id: 10,
-                    acquire: ExplicitSyncPoint::for_tests(11, 12),
-                    state: PendingAcquireState::Ready,
-                },
-                SurfaceTreeAcquireDependency {
-                    surface_commit_id: SurfaceCommitId::for_tests(13),
-                    commit_id: AcquireCommitId::for_tests(14),
-                    surface_id: 4,
-                    owner_client_id: None,
-                    surface_presentation_generation: None,
-                    buffer_id: 15,
-                    acquire: ExplicitSyncPoint::for_tests(16, 17),
-                    state: PendingAcquireState::Ready,
-                },
-            ],
-            commit_timing_readiness: None,
-            received_at: Instant::now(),
-        };
-
-        let partitions = transaction.partition_by_component_root(|surface_id| match surface_id {
-            2 | 3 => 2,
-            _ => 1,
-        });
-
-        assert_eq!(
-            partitions
-                .iter()
-                .map(|partition| partition.root_surface_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(
-            partitions[0]
-                .nodes
-                .iter()
-                .map(|(surface_id, _)| *surface_id)
-                .collect::<Vec<_>>(),
-            vec![1, 4]
-        );
-        assert_eq!(
-            partitions[1]
-                .nodes
-                .iter()
-                .map(|(surface_id, _)| *surface_id)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        assert!(matches!(
-            partitions[0].publication_lifetimes,
-            SurfaceTreeNodeLifetimes::Synthetic
-        ));
-        assert!(matches!(
-            partitions[1].publication_lifetimes,
-            SurfaceTreeNodeLifetimes::Synthetic
-        ));
-        assert_eq!(
-            partitions[0]
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.surface_id)
-                .collect::<Vec<_>>(),
-            vec![4]
-        );
-        assert_eq!(
-            partitions[1]
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.surface_id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
     }
 }

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="astrea_screen_capture_v1">
+  <copyright>
+    Copyright 2026 AstreaOS contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+  </copyright>
+
+  <interface name="astrea_screen_capture_manager_v1" version="1">
+    <description summary="authenticated one-shot compositor screen capture">
+      Captures the latest compositor-published, acquire-ready scene for one
+      output. The only version 1 format is RGBA8888. Capture has no physical
+      presentation authority and does not include the cursor.
+    </description>
+
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="invalid_output" value="1"/>
+    </enum>
+
+    <request name="capture_output">
+      <arg name="capture" type="new_id" interface="astrea_screen_capture_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="astrea_screen_capture_v1" version="1">
+    <description summary="one-shot RGBA8888 screen capture result">
+      The fd is a sealed memfd containing exactly stride times height bytes in
+      top-left RGBA8888 order. The client owns the received fd after the event.
+    </description>
+
+    <event name="ready">
+      <arg name="fd" type="fd"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="stride" type="uint"/>
+      <arg name="format" type="uint"/>
+    </event>
+
+    <event name="failed">
+      <arg name="reason" type="string"/>
+    </event>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>

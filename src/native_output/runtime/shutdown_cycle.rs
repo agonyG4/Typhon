@@ -3,6 +3,7 @@ use super::*;
 
 impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
+        self.fail_pending_screen_captures("session_inactive");
         let now_ns = monotonic_now_ns()?;
         let first_request = self.shutdown.is_running();
         if first_request {

@@ -15,6 +15,7 @@ pub use clipboard_bridge::{
     NoopClipboardBridge,
 };
 use gpu_protocol_capabilities::GpuProtocolCapabilities;
+use screen_capture::AstreaScreenCapturePending;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
@@ -99,6 +100,7 @@ mod surface_pipeline_trace;
 pub(crate) use protocols::cursor_shape::ProtocolCursorShape;
 mod render;
 mod runtime_files;
+mod screen_capture;
 mod selection;
 mod server;
 mod server_backend;
@@ -904,6 +906,7 @@ pub struct CompositorState {
     pub(in crate::compositor) workspace_presence_dirty: bool,
     astrea_toplevel_authorized_clients: HashSet<ClientId>,
     astrea_shell_authenticated_clients: HashSet<ClientId>,
+    astrea_screen_captures: HashMap<ClientId, AstreaScreenCapturePending>,
     astrea_shell_client_pids: HashSet<u32>,
     astrea_shell_capability_verifier:
         Option<astrea_shell_capability::AstreaShellCapabilityVerifier>,

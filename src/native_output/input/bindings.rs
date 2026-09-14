@@ -304,6 +304,18 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             reserved: false,
         },
         Binding {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_SYSRQ),
+            action: BindingAction::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "screenshot_capture".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: true,
+        },
+        Binding {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::PointerPress,
             input: BindingInput::PointerButton(u32::from(BTN_LEFT)),

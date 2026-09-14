@@ -708,7 +708,7 @@ fn set_desync_publishes_cached_state_when_no_ancestor_remains_synchronized() {
 }
 
 #[test]
-fn desynchronized_grandchild_under_synchronized_ancestor_latches_with_root() {
+fn orphan_grandchild_update_is_not_latched_by_root_without_child_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -731,7 +731,7 @@ fn desynchronized_grandchild_under_synchronized_ancestor_latches_with_root() {
     };
 
     assert_eq!(deepest_size(&before_root), Some((3, 3)));
-    assert_eq!(deepest_size(&after_root), Some((9, 5)));
+    assert_eq!(deepest_size(&after_root), Some((3, 3)));
 }
 
 #[test]
@@ -1089,7 +1089,7 @@ fn destroying_synchronized_subsurface_promotes_cached_content_for_recreation() {
 }
 
 #[test]
-fn destroying_latched_subsurface_detaches_it_from_parent_timing() {
+fn destroying_latched_subsurface_keeps_its_existing_parent_candidate() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
     server.set_presentation_clock(PresentationClock::Monotonic);
@@ -1099,17 +1099,17 @@ fn destroying_latched_subsurface_detaches_it_from_parent_timing() {
     let snapshots = capture_detached_latched_subsurface(&socket_path, &commands).unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(snapshots.child_after_destroy.current_surface_buffer);
+    assert!(!snapshots.child_after_destroy.current_surface_buffer);
     assert!(!snapshots.child_after_destroy.renderable_surface);
     assert_eq!(
         snapshots.child_after_destroy.subsurface_relationship_phase,
         None
     );
-    assert_eq!(
+    assert!(
         snapshots
             .child_after_destroy
-            .pending_surface_tree_transactions,
-        0
+            .pending_surface_tree_transactions
+            >= 1
     );
     assert!(snapshots.parent.pending_surface_tree_transactions >= 1);
     assert!(snapshots.child_after_parent_release.current_surface_buffer);

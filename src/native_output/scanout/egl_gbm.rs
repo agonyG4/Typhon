@@ -1,4 +1,5 @@
 use super::*;
+use crate::egl_renderer::OutputFramebufferOrigin;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,6 +650,43 @@ impl NativeEglGbmScanout {
                 &lifecycle_evidence,
             ),
         })
+    }
+
+    /// Capture using the compatibility backend's normal EGL context without
+    /// swapping, locking a front buffer, or changing page-flip state.
+    pub(crate) fn capture_scene(
+        &mut self,
+        renderer: &mut NativeFrameRenderer,
+        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> io::Result<Vec<u8>> {
+        self.egl
+            .make_current(
+                self.egl_display,
+                Some(self.egl_surface),
+                Some(self.egl_surface),
+                Some(self.egl_context),
+            )
+            .map_err(native_egl_io_error)?;
+        let request = renderer.egl_scene_draw_request(
+            self.width,
+            self.height,
+            resolved_scene,
+            server,
+            input_state,
+            cursor_mode,
+            Some(OutputDamage::Full),
+        );
+        self.scene
+            .capture_scene(
+                &self.egl,
+                self.egl_display,
+                request,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+            .map_err(native_egl_io_error)
     }
 
     pub(crate) fn fb_id(&self) -> u32 {

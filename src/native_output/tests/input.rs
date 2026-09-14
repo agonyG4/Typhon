@@ -294,6 +294,25 @@ fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
 }
 
 #[test]
+fn native_input_sysrq_emits_one_reserved_screenshot_press_only() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let pressed = input.handle_key_event(KEY_SYSRQ, 1);
+    let repeated = input.handle_key_event(KEY_SYSRQ, 2);
+    let released = input.handle_key_event(KEY_SYSRQ, 0);
+
+    assert_eq!(
+        pressed.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "screenshot_capture"
+        )]
+    );
+    assert!(repeated.shortcut_events.is_empty());
+    assert!(released.shortcut_events.is_empty());
+}
+
+#[test]
 fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
     let mut input = NativeInputState::new(320, 200);
     input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {

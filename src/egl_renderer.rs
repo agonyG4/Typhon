@@ -632,6 +632,74 @@ pub(crate) struct GlesSceneRenderer {
     effect_time_seconds: f32,
     effect_delta_seconds: f32,
     effect_output_scale: f32,
+    pub(crate) capture_in_progress: bool,
+}
+
+struct CaptureRendererState {
+    current_framebuffer_origin: OutputFramebufferOrigin,
+    current_size: (u32, u32),
+    presented_scene_key: Option<EglSceneCacheKey>,
+    damage_tracker: EglOutputDamageTracker,
+    repaint_planner: PartialRepaintPlanner,
+    failed_effect_generation: Option<u64>,
+    effect_trace: EffectExecutionTrace,
+    frame_stats: GlesSceneFrameStats,
+    effect_time_seconds: f32,
+    effect_delta_seconds: f32,
+    effect_output_scale: f32,
+    lifecycle_render_evidence: LifecycleRenderEvidence,
+    lifecycle_render_fallbacks: LifecycleRenderFallbacks,
+    lamp_samples: Vec<LampWindowSample>,
+    lifecycle_visual_sources: HashMap<compositor::WindowId, LifecycleVisualSource>,
+    failed_surface_generations: HashMap<u32, u64>,
+    active_output_framebuffer: Option<glow::Framebuffer>,
+    capture_in_progress: bool,
+}
+
+impl CaptureRendererState {
+    fn take(renderer: &GlesSceneRenderer) -> Self {
+        Self {
+            current_framebuffer_origin: renderer.current_framebuffer_origin,
+            current_size: renderer.current_size,
+            presented_scene_key: renderer.presented_scene_key,
+            damage_tracker: renderer.damage_tracker.clone(),
+            repaint_planner: renderer.repaint_planner.clone(),
+            failed_effect_generation: renderer.failed_effect_generation,
+            effect_trace: renderer.effect_trace,
+            frame_stats: renderer.frame_stats,
+            effect_time_seconds: renderer.effect_time_seconds,
+            effect_delta_seconds: renderer.effect_delta_seconds,
+            effect_output_scale: renderer.effect_output_scale,
+            lifecycle_render_evidence: renderer.lifecycle_render_evidence.clone(),
+            lifecycle_render_fallbacks: renderer.lifecycle_render_fallbacks.clone(),
+            lamp_samples: renderer.lamp_samples.clone(),
+            lifecycle_visual_sources: renderer.lifecycle_visual_sources.clone(),
+            failed_surface_generations: renderer.failed_surface_generations.clone(),
+            active_output_framebuffer: renderer.active_output_framebuffer,
+            capture_in_progress: renderer.capture_in_progress,
+        }
+    }
+
+    fn restore(self, renderer: &mut GlesSceneRenderer) {
+        renderer.current_framebuffer_origin = self.current_framebuffer_origin;
+        renderer.current_size = self.current_size;
+        renderer.presented_scene_key = self.presented_scene_key;
+        renderer.damage_tracker = self.damage_tracker;
+        renderer.repaint_planner = self.repaint_planner;
+        renderer.failed_effect_generation = self.failed_effect_generation;
+        renderer.effect_trace = self.effect_trace;
+        renderer.frame_stats = self.frame_stats;
+        renderer.effect_time_seconds = self.effect_time_seconds;
+        renderer.effect_delta_seconds = self.effect_delta_seconds;
+        renderer.effect_output_scale = self.effect_output_scale;
+        renderer.lifecycle_render_evidence = self.lifecycle_render_evidence;
+        renderer.lifecycle_render_fallbacks = self.lifecycle_render_fallbacks;
+        renderer.lamp_samples = self.lamp_samples;
+        renderer.lifecycle_visual_sources = self.lifecycle_visual_sources;
+        renderer.failed_surface_generations = self.failed_surface_generations;
+        renderer.active_output_framebuffer = self.active_output_framebuffer;
+        renderer.capture_in_progress = self.capture_in_progress;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1177,6 +1245,7 @@ impl GlesSceneRenderer {
             effect_time_seconds: 0.0,
             effect_delta_seconds: 0.0,
             effect_output_scale: 1.0,
+            capture_in_progress: false,
         })
     }
 
@@ -1345,6 +1414,164 @@ impl GlesSceneRenderer {
         Ok((vertex_array, vertex_buffer))
     }
 
+    /// Render the current compositor scene into a private GLES target and
+    /// return normalized top-left RGBA bytes. This operation deliberately
+    /// never creates or touches a physical output buffer.
+    pub(crate) fn capture_scene(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        mut request: EglSceneDrawRequest<'_>,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<Vec<u8>> {
+        let dimensions = crate::native_output::screen_capture::CaptureDimensions::checked(
+            request.width,
+            request.height,
+        )?;
+        let snapshot = CaptureRendererState::take(self);
+        self.capture_in_progress = true;
+
+        request.current_damage = Some(OutputDamage::Full);
+        request.client_cursor = None;
+        request.visual_state.cursor = None;
+
+        let result = (|| {
+            let texture = unsafe { self.gl.create_texture().map_err(io::Error::other)? };
+            let framebuffer = match unsafe { self.gl.create_framebuffer() } {
+                Ok(framebuffer) => framebuffer,
+                Err(error) => {
+                    unsafe { self.gl.delete_texture(texture) };
+                    return Err(io::Error::other(error).into());
+                }
+            };
+            let setup_result = (|| {
+                unsafe {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    self.gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA8 as i32,
+                        dimensions.width as i32,
+                        dimensions.height as i32,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    self.gl
+                        .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                    self.gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(texture),
+                        0,
+                    );
+                }
+                let status = unsafe { self.gl.check_framebuffer_status(glow::FRAMEBUFFER) };
+                if status != glow::FRAMEBUFFER_COMPLETE {
+                    return Err(io::Error::other(format!(
+                        "screenshot framebuffer is incomplete: 0x{status:04x}"
+                    ))
+                    .into());
+                }
+                Ok::<(), Box<dyn Error>>(())
+            })();
+
+            let draw_result = setup_result.and_then(|()| {
+                self.draw_scene_to_target(
+                    egl,
+                    egl_display,
+                    EglOutputRenderTarget {
+                        framebuffer,
+                        width: dimensions.width,
+                        height: dimensions.height,
+                        buffer_age: BufferAge::Value(0),
+                        framebuffer_origin,
+                    },
+                    request,
+                )
+                .and_then(|outcome| match outcome {
+                    EglFrameOutcome::Rendered { commit, stats, .. } => {
+                        self.discard_rendered(commit);
+                        if stats.dmabuf_import_failures > 0 {
+                            return Err(io::Error::other(
+                                "screenshot scene contains a GLES-incompatible dmabuf",
+                            )
+                            .into());
+                        }
+                        if stats.missing_required_decoration_resources > 0 {
+                            return Err(io::Error::other(
+                                "screenshot scene is missing a required decoration resource",
+                            )
+                            .into());
+                        }
+                        let mut readback = vec![0_u8; dimensions.payload_len];
+                        unsafe {
+                            self.gl
+                                .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                            self.gl.flush();
+                            self.gl.read_pixels(
+                                0,
+                                0,
+                                dimensions.width as i32,
+                                dimensions.height as i32,
+                                glow::RGBA,
+                                glow::UNSIGNED_BYTE,
+                                glow::PixelPackData::Slice(Some(&mut readback)),
+                            );
+                        }
+                        crate::native_output::screen_capture::normalize_rgba_readback(
+                            readback,
+                            dimensions.width,
+                            dimensions.height,
+                            framebuffer_origin,
+                        )
+                        .map_err(Into::into)
+                    }
+                    EglFrameOutcome::Skipped { .. } => {
+                        Err(io::Error::other("screenshot scene render produced no frame").into())
+                    }
+                    EglFrameOutcome::LifecycleFallback { .. } => Err(io::Error::other(
+                        "screenshot scene render fell back during lifecycle rendering",
+                    )
+                    .into()),
+                })
+            });
+
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.gl.delete_framebuffer(framebuffer);
+                self.gl.delete_texture(texture);
+            }
+            draw_result
+        })();
+
+        snapshot.restore(self);
+        result
+    }
+
     pub(crate) fn draw_scene(
         &mut self,
         egl: &EglInstance,
@@ -1435,7 +1662,9 @@ impl GlesSceneRenderer {
             Some(scene_generation),
             Some(scene_signature),
         );
-        self.effect_gpu_profiler.collect(&self.gl);
+        if !self.capture_in_progress {
+            self.effect_gpu_profiler.collect(&self.gl);
+        }
         self.effect_trace.frame_boundary(
             "effect_scene_resolve",
             "begin",

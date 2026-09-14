@@ -29,6 +29,7 @@ pub(crate) const KEY_Z: u16 = 44;
 pub(crate) const KEY_C: u16 = 46;
 pub(crate) const KEY_RIGHTSHIFT: u16 = 54;
 pub(crate) const KEY_LEFTALT: u16 = 56;
+pub(crate) const KEY_SYSRQ: u16 = 99;
 pub(crate) const KEY_SPACE: u16 = 57;
 pub(crate) const KEY_F1: u16 = 59;
 pub(crate) const KEY_F2: u16 = 60;

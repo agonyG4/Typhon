@@ -13,6 +13,7 @@ pub(crate) struct NativeRuntimeState {
     pub(super) visual_scene_debt: bool,
     pub(super) visual_work_deadline_due: bool,
     pub(super) cursor_only_due: bool,
+    pub(super) screen_capture_pending: bool,
     pub(super) explicit_sync_service_due: bool,
     pub(super) astrea_publication_due: bool,
     pub(super) commit_timing_planning_due: bool,
@@ -34,6 +35,7 @@ pub(crate) struct NativeWorkDomains {
     pub(super) wayland_dispatch: bool,
     pub(super) scene: bool,
     pub(super) cursor: bool,
+    pub(super) screen_capture: bool,
     pub(super) presentation: bool,
     pub(super) explicit_sync: bool,
     pub(super) surface_pacing: bool,
@@ -48,6 +50,7 @@ pub(crate) struct NativeWorkDomains {
 pub(crate) struct NativeCycleOperationPlan {
     pub(super) service_input: bool,
     pub(super) dispatch_wayland_read_side: bool,
+    pub(super) service_screen_capture: bool,
     pub(super) service_acquire_and_prepare: bool,
     pub(super) explicit_sync_service: bool,
     pub(super) presentation_due: bool,
@@ -92,6 +95,9 @@ impl NativeWorkDomains {
         }
         if self.cursor {
             bits |= 1 << 6;
+        }
+        if self.screen_capture {
+            bits |= 1 << 15;
         }
         if self.presentation {
             bits |= 1 << 7;
@@ -145,7 +151,8 @@ impl NativeWorkDomains {
         NativeCycleOperationPlan {
             service_input: self.input,
             dispatch_wayland_read_side: self.wayland_dispatch,
-            service_acquire_and_prepare: self.scene || self.explicit_sync,
+            service_screen_capture: self.screen_capture,
+            service_acquire_and_prepare: self.scene || self.explicit_sync || self.screen_capture,
             explicit_sync_service: self.explicit_sync,
             presentation_due: self.presentation,
             visual_scene_debt: self.presentation && self.scene,
@@ -199,6 +206,7 @@ impl NativeWorkDomains {
             || !wakeup.cursor_io_events.is_empty()
             || !wakeup.keyboard_persistence_events.is_empty()
             || state.cursor_only_due;
+        let screen_capture = state.screen_capture_pending;
         let wayland_dispatch = wayland_protocol;
         let surface_pacing = state.pacing_due;
         let scene = state.scene_dirty
@@ -221,6 +229,7 @@ impl NativeWorkDomains {
             wayland_dispatch,
             scene,
             cursor,
+            screen_capture,
             presentation,
             explicit_sync,
             surface_pacing,
@@ -238,6 +247,7 @@ impl NativeWorkDomains {
             || self.commit_timing_planning
             || self.xwayland
             || self.explicit_sync
+            || self.screen_capture
             || self.surface_pacing
             || self.control
             || self.children
@@ -426,6 +436,38 @@ mod tests {
 
         assert!(plan.service_acquire_and_prepare);
         assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn pending_capture_requires_acquire_prepare_but_not_presentation() {
+        let domains = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        );
+        let plan = domains.operation_plan();
+
+        assert!(domains.screen_capture);
+        assert!(plan.service_screen_capture);
+        assert!(plan.service_acquire_and_prepare);
+        assert!(!plan.presentation_due);
+        assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn pending_capture_is_protocol_only_work() {
+        let decision = NativeWorkDomains::from_wakeup(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        );
+
+        assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
+        assert!(!decision.service_primary_scene);
     }
 
     #[test]

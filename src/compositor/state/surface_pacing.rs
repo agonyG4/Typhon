@@ -368,6 +368,9 @@ impl CompositorState {
         &self,
         transaction: &PendingSurfaceTreeTransaction,
     ) -> bool {
+        if !self.content_update_dependencies_ready(transaction) {
+            return false;
+        }
         if let Some(requested) = transaction.commit_timing_request() {
             if transaction
                 .commit_timing_readiness
@@ -597,6 +600,7 @@ mod tests {
                 nodes: vec![(10, commit)],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             });
@@ -907,6 +911,7 @@ mod tests {
                 nodes: vec![(1, first)],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
@@ -916,6 +921,7 @@ mod tests {
                 nodes: vec![(2, second)],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
@@ -975,6 +981,7 @@ mod tests {
                 nodes: vec![(4, first)],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
@@ -984,6 +991,7 @@ mod tests {
                 nodes: vec![(4, second)],
                 publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                 dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
                 commit_timing_readiness: None,
                 received_at: Instant::now(),
             },
@@ -1272,6 +1280,7 @@ mod tests {
                     nodes: vec![(surface_id, commit)],
                     publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
                     dependencies: Vec::new(),
+                    external_content_update_dependencies: Vec::new(),
                     commit_timing_readiness: None,
                     received_at: Instant::now(),
                 });
@@ -1328,6 +1337,7 @@ mod tests {
                         ),
                         state: PendingAcquireState::EventfdBacked,
                     }],
+                    external_content_update_dependencies: Vec::new(),
                     commit_timing_readiness: None,
                     received_at: Instant::now(),
                 });

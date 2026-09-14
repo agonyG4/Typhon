@@ -1,4 +1,9 @@
 use super::*;
+use crate::compositor::{
+    client_pacing_now_ns, compositor_surface_id, empty_cached_subsurface_commit,
+    CommitTimingConstraint, CompositorState, SurfacePublicationState,
+};
+use crate::compositor::subsurface::ContentUpdateRef;
 use std::{os::unix::net::UnixStream, sync::Arc};
 
 use wayland_server::{Display, protocol::wl_callback};
@@ -237,7 +242,263 @@ fn ordinary_and_boundary_commits_remain_ordered_at_the_tail() {
 }
 
 #[test]
-fn latch_desync_and_teardown_settle_cache_accounting() {
+fn desync_transition_does_not_create_a_synthetic_parent_content_update() {
+    let mut state = CompositorState::default();
+    let display = Display::<CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (client, _peer) = test_client(&mut display_handle);
+    let parent = state.test_create_unmapped_surface_resource_at_version(
+        &client,
+        &display_handle,
+        1,
+    );
+    let child = state.test_create_unmapped_surface_resource_at_version(
+        &client,
+        &display_handle,
+        1,
+    );
+    let grandchild = state.test_create_unmapped_surface_resource_at_version(
+        &client,
+        &display_handle,
+        1,
+    );
+    let parent_id = compositor_surface_id(&parent);
+    let child_id = compositor_surface_id(&child);
+    let grandchild_id = compositor_surface_id(&grandchild);
+    for surface_id in [parent_id, child_id, grandchild_id] {
+        state.surface_presentation_generations.insert(surface_id, 1);
+    }
+    assert!(state
+        .subsurface_transactions
+        .register_with_client(child_id, parent_id, Some(client.id())));
+    assert!(state
+        .subsurface_transactions
+        .register_with_client(grandchild_id, child_id, Some(client.id())));
+    assert!(state.subsurface_transactions.set_mode(
+        grandchild_id,
+        SubsurfaceSyncMode::Desynchronized,
+    ));
+
+    let mut grandchild_commit = empty_cached_subsurface_commit();
+    grandchild_commit.commit_id = SurfaceCommitId::for_tests(7);
+    grandchild_commit.commit_sequence = SurfaceCommitSequence(7);
+    grandchild_commit.pacing.commit_timing = Some(
+        CommitTimingConstraint::from_protocol(
+            client_pacing_now_ns() / 1_000_000_000 + 60,
+            0,
+        )
+        .expect("future commit timing"),
+    );
+    assert!(matches!(
+        state
+            .subsurface_transactions
+            .cache_commit(grandchild_id, grandchild_commit),
+        CacheCommitOutcome::Inserted
+    ));
+
+    state.set_subsurface_sync_mode(child_id, SubsurfaceSyncMode::Desynchronized);
+
+    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(
+        state.pending_surface_tree_transactions[0]
+            .nodes
+            .iter()
+            .map(|(surface_id, _)| *surface_id)
+            .collect::<Vec<_>>(),
+        vec![grandchild_id],
+    );
+}
+
+#[test]
+fn converted_content_updates_keep_distinct_pacing_candidates() {
+    let mut state = CompositorState::default();
+    let display = Display::<CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (client, _peer) = test_client(&mut display_handle);
+    let parent = state.test_create_unmapped_surface_resource_at_version(
+        &client,
+        &display_handle,
+        1,
+    );
+    let child = state.test_create_unmapped_surface_resource_at_version(
+        &client,
+        &display_handle,
+        1,
+    );
+    let parent_id = compositor_surface_id(&parent);
+    let child_id = compositor_surface_id(&child);
+    for surface_id in [parent_id, child_id] {
+        state.surface_presentation_generations.insert(surface_id, 1);
+    }
+    assert!(state
+        .subsurface_transactions
+        .register_with_client(child_id, parent_id, Some(client.id())));
+
+    let mut first = empty_cached_subsurface_commit();
+    first.commit_id = SurfaceCommitId::for_tests(11);
+    first.commit_sequence = SurfaceCommitSequence(11);
+    first.pacing.fifo_set_barrier = true;
+    assert!(matches!(
+        state.subsurface_transactions.cache_commit(child_id, first),
+        CacheCommitOutcome::Inserted
+    ));
+
+    let mut second = empty_cached_subsurface_commit();
+    second.commit_id = SurfaceCommitId::for_tests(12);
+    second.commit_sequence = SurfaceCommitSequence(12);
+    second.pacing.fifo_set_barrier = true;
+    second.pacing.commit_timing = Some(
+        CommitTimingConstraint::from_protocol(
+            client_pacing_now_ns() / 1_000_000_000 + 60,
+            0,
+        )
+        .expect("future commit timing"),
+    );
+    assert!(matches!(
+        state.subsurface_transactions.cache_commit(child_id, second),
+        CacheCommitOutcome::Inserted
+    ));
+
+    state.set_subsurface_sync_mode(child_id, SubsurfaceSyncMode::Desynchronized);
+
+    assert_eq!(
+        state
+            .surface_publications
+            .get(&child_id)
+            .and_then(|publication| publication.latest_published),
+        Some(SurfaceCommitSequence(11)),
+    );
+    assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+    assert_eq!(state.pending_surface_tree_transactions[0].nodes.len(), 1);
+    assert_eq!(
+        state.pending_surface_tree_transactions[0].nodes[0]
+            .1
+            .commit_sequence,
+        SurfaceCommitSequence(12),
+    );
+}
+
+#[test]
+fn cached_child_content_update_is_not_merged_after_parent_dependency_capture() {
+    let mut state = SubsurfaceTransactionState::default();
+    assert!(state.register(2, 1));
+    assert!(state.register(3, 2));
+
+    let mut first = crate::compositor::state::empty_cached_subsurface_commit();
+    first.commit_id = SurfaceCommitId::for_tests(21);
+    first.commit_sequence = SurfaceCommitSequence(21);
+    assert!(matches!(
+        state.cache_commit(3, first),
+        CacheCommitOutcome::Inserted
+    ));
+
+    let mut parent_commit = crate::compositor::state::empty_cached_subsurface_commit();
+    parent_commit.commit_id = SurfaceCommitId::for_tests(22);
+    parent_commit.commit_sequence = SurfaceCommitSequence(22);
+    assert!(matches!(
+        state.cache_commit(2, parent_commit),
+        CacheCommitOutcome::Inserted
+    ));
+    assert_eq!(
+        state.capture_direct_child_dependencies(2),
+        vec![ContentUpdateRef {
+            surface_id: 3,
+            commit_id: SurfaceCommitId::for_tests(21),
+            commit_sequence: SurfaceCommitSequence(21),
+        }],
+    );
+
+    let mut later = crate::compositor::state::empty_cached_subsurface_commit();
+    later.commit_id = SurfaceCommitId::for_tests(23);
+    later.commit_sequence = SurfaceCommitSequence(23);
+    assert!(matches!(
+        state.cache_commit(3, later),
+        CacheCommitOutcome::Inserted
+    ));
+
+    assert_eq!(state.roles[&3].cached_commits.len(), 2);
+    assert_eq!(
+        state.roles[&3]
+            .cached_commits
+            .iter()
+            .map(|commit| commit.commit_sequence)
+            .collect::<Vec<_>>(),
+        vec![SurfaceCommitSequence(21), SurfaceCommitSequence(23)],
+    );
+}
+
+#[test]
+fn content_update_lineage_captures_the_previous_surface_commit() {
+    let mut state = CompositorState::default();
+    state.surface_publications.insert(
+        2,
+        SurfacePublicationState {
+            latest_received: SurfaceCommitSequence(30),
+            ..SurfacePublicationState::default()
+        },
+    );
+
+    let lineage = state.capture_content_update_lineage(
+        2,
+        SurfaceCommitId::for_tests(31),
+        SurfaceCommitSequence(31),
+    );
+
+    assert_eq!(
+        lineage.predecessor,
+        Some(ContentUpdateRef {
+            surface_id: 2,
+            commit_id: SurfaceCommitId::for_tests(30),
+            commit_sequence: SurfaceCommitSequence(30),
+        }),
+    );
+}
+
+#[test]
+fn merging_content_updates_preserves_lineage_and_union_dependencies() {
+    let predecessor = ContentUpdateRef {
+        surface_id: 2,
+        commit_id: SurfaceCommitId::for_tests(40),
+        commit_sequence: SurfaceCommitSequence(40),
+    };
+    let first_dependency = ContentUpdateRef {
+        surface_id: 3,
+        commit_id: SurfaceCommitId::for_tests(41),
+        commit_sequence: SurfaceCommitSequence(41),
+    };
+    let second_dependency = ContentUpdateRef {
+        surface_id: 4,
+        commit_id: SurfaceCommitId::for_tests(42),
+        commit_sequence: SurfaceCommitSequence(42),
+    };
+    let mut older = empty_cached_subsurface_commit();
+    older.commit_id = SurfaceCommitId::for_tests(43);
+    older.commit_sequence = SurfaceCommitSequence(43);
+    older.lineage.predecessor = Some(predecessor);
+    older.lineage.child_dependencies = vec![first_dependency];
+    let mut newer = empty_cached_subsurface_commit();
+    newer.commit_id = SurfaceCommitId::for_tests(44);
+    newer.commit_sequence = SurfaceCommitSequence(44);
+    newer.lineage.predecessor = Some(ContentUpdateRef {
+        surface_id: 2,
+        commit_id: SurfaceCommitId::for_tests(43),
+        commit_sequence: SurfaceCommitSequence(43),
+    });
+    newer.lineage.child_dependencies = vec![first_dependency, second_dependency];
+
+    older.merge(newer);
+
+    assert_eq!(older.commit_id, SurfaceCommitId::for_tests(44));
+    assert_eq!(older.commit_sequence, SurfaceCommitSequence(44));
+    assert_eq!(older.lineage.predecessor, Some(predecessor));
+    assert_eq!(
+        older.lineage.child_dependencies,
+        vec![first_dependency, second_dependency],
+    );
+}
+
+#[test]
+fn cache_transitions_and_teardown_settle_accounting() {
     let mut state = SubsurfaceTransactionState::default();
     assert!(state.register(2, 1));
     assert!(state.register(3, 2));
@@ -250,7 +511,7 @@ fn latch_desync_and_teardown_settle_cache_accounting() {
         CacheCommitOutcome::Inserted
     ));
     assert_eq!(state.cached_entry_count(), 1);
-    assert_eq!(state.take_latched_commits(1).len(), 1);
+    assert_eq!(state.take_cached_commits_for_surface(2).len(), 1);
     assert_eq!(state.cached_entry_count(), 0);
     assert_eq!(state.cached_node_count(), 0);
     assert!(state.debug_accounting_is_consistent());
@@ -264,7 +525,7 @@ fn latch_desync_and_teardown_settle_cache_accounting() {
     ));
     assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
     assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
-    assert_eq!(state.take_desynchronized_subtree_commits(2).len(), 1);
+    assert_eq!(state.take_cached_commits_for_surface(3).len(), 1);
     assert_eq!(state.cached_entry_count(), 0);
     assert!(state.debug_accounting_is_consistent());
 

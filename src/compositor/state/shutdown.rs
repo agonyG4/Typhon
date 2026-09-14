@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::subsurface::CapturedContentUpdateLineage;
 
 impl CompositorState {
     pub(in crate::compositor) fn release_cached_resources_for_shutdown(
@@ -50,6 +51,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
     CachedSubsurfaceCommit {
         commit_id: SurfaceCommitId::for_tests(1),
         commit_sequence: SurfaceCommitSequence::initial(),
+        lineage: CapturedContentUpdateLineage::default(),
         attachment: None,
         damage: None,
         frame_callbacks: Vec::new(),

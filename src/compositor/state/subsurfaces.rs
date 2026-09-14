@@ -2,12 +2,169 @@
 
 use super::*;
 use crate::compositor::subsurface::{
-    CapturedSubsurfaceParentState, CapturedSubsurfaceStackEntry, CapturedSurfaceCommitContext,
-    DetachedSubsurfaceRole,
+    CapturedContentUpdateLineage, CapturedSubsurfaceParentState, CapturedSubsurfaceStackEntry,
+    CapturedSurfaceCommitContext, ContentUpdateRef,
 };
+
+#[derive(Debug)]
+struct PreparedContentUpdateCandidate {
+    root_surface_id: u32,
+    nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    external_content_update_dependencies: Vec<ContentUpdateRef>,
+}
+
+struct ContentUpdateCandidateExtractor<'a> {
+    state: &'a mut CompositorState,
+    nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    external_content_update_dependencies: Vec<ContentUpdateRef>,
+    seen: HashSet<ContentUpdateRef>,
+    visiting: HashSet<ContentUpdateRef>,
+}
+
+impl ContentUpdateCandidateExtractor<'_> {
+    fn visit_commit(&mut self, surface_id: u32, commit: CachedSubsurfaceCommit) {
+        let reference = commit.content_update_ref(surface_id);
+        if !self.seen.insert(reference) {
+            return;
+        }
+        if !self.visiting.insert(reference) {
+            debug_assert!(false, "content update dependency cycle detected");
+            return;
+        }
+        let lineage = commit.lineage.clone();
+        if let Some(predecessor) = lineage.predecessor {
+            self.visit_reference(predecessor);
+        }
+        for dependency in lineage.child_dependencies {
+            self.visit_reference(dependency);
+        }
+        self.visiting.remove(&reference);
+        self.nodes.push((surface_id, commit));
+    }
+
+    fn visit_reference(&mut self, reference: ContentUpdateRef) {
+        if self.seen.contains(&reference) {
+            return;
+        }
+        if let Some(commits) = self
+            .state
+            .subsurface_transactions
+            .take_cached_commits_through(reference)
+        {
+            for commit in commits {
+                self.visit_commit(reference.surface_id, commit);
+            }
+            return;
+        }
+        if self.state.content_update_ref_is_published(reference) {
+            return;
+        }
+        if self.state.content_update_ref_is_terminal(reference) {
+            return;
+        }
+        if !self
+            .external_content_update_dependencies
+            .contains(&reference)
+        {
+            self.external_content_update_dependencies.push(reference);
+        }
+    }
+}
 
 impl CompositorState {
     const MAX_SURFACE_TREE_TRANSACTIONS_PER_ROOT: usize = 8;
+
+    fn content_update_ref_is_published(&self, reference: ContentUpdateRef) -> bool {
+        self.surface_publications
+            .get(&reference.surface_id)
+            .and_then(|publication| publication.latest_published)
+            .is_some_and(|published| published >= reference.commit_sequence)
+    }
+
+    fn content_update_ref_is_pending(&self, reference: ContentUpdateRef) -> bool {
+        self.pending_surface_tree_transactions
+            .iter()
+            .any(|transaction| {
+                transaction.nodes.iter().any(|(surface_id, commit)| {
+                    commit.content_update_ref(*surface_id) == reference
+                })
+            })
+    }
+
+    fn content_update_ref_is_terminal(&self, reference: ContentUpdateRef) -> bool {
+        !self.surface_resources.contains_key(&reference.surface_id)
+            || self
+                .surface_client_ids
+                .get(&reference.surface_id)
+                .is_some_and(|client_id| self.terminal_client_ids.contains(client_id))
+    }
+
+    pub(in crate::compositor) fn content_update_dependencies_ready(
+        &self,
+        transaction: &PendingSurfaceTreeTransaction,
+    ) -> bool {
+        transaction
+            .external_content_update_dependencies
+            .iter()
+            .all(|dependency| {
+                transaction.nodes.iter().any(|(surface_id, commit)| {
+                    commit.content_update_ref(*surface_id) == *dependency
+                }) || self.content_update_ref_is_published(*dependency)
+                    || (!self.content_update_ref_is_pending(*dependency)
+                        && self.content_update_ref_is_terminal(*dependency))
+            })
+    }
+
+    fn extract_content_update_candidate(
+        &mut self,
+        root_surface_id: u32,
+        root_commit: CachedSubsurfaceCommit,
+    ) -> PreparedContentUpdateCandidate {
+        let mut extractor = ContentUpdateCandidateExtractor {
+            state: self,
+            nodes: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            seen: HashSet::new(),
+            visiting: HashSet::new(),
+        };
+        extractor.visit_commit(root_surface_id, root_commit);
+        PreparedContentUpdateCandidate {
+            root_surface_id,
+            nodes: extractor.nodes,
+            external_content_update_dependencies: extractor
+                .external_content_update_dependencies,
+        }
+    }
+
+    pub(in crate::compositor) fn capture_content_update_lineage(
+        &mut self,
+        surface_id: u32,
+        commit_id: SurfaceCommitId,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> CapturedContentUpdateLineage {
+        let predecessor = self
+            .surface_publications
+            .get(&surface_id)
+            .map(|publication| publication.latest_received)
+            .filter(|sequence| *sequence != SurfaceCommitSequence::initial())
+            .map(|previous_sequence| ContentUpdateRef {
+                surface_id,
+                commit_id: SurfaceCommitId::from_sequence(previous_sequence),
+                commit_sequence: previous_sequence,
+            });
+        let child_dependencies = self
+            .subsurface_transactions
+            .capture_direct_child_dependencies(surface_id);
+        debug_assert!(child_dependencies.iter().all(|dependency| {
+            dependency.commit_sequence < commit_sequence
+                && dependency.commit_id != commit_id
+        }));
+        CapturedContentUpdateLineage {
+            predecessor,
+            child_dependencies,
+            merge_frozen: false,
+        }
+    }
 
     fn normalize_explicit_sync_commit(&mut self, commit: &mut CachedSubsurfaceCommit) -> bool {
         let has_buffer = matches!(
@@ -113,24 +270,94 @@ impl CompositorState {
         surface_id: u32,
         mode: SubsurfaceSyncMode,
     ) {
+        if self.subsurface_transactions.requested_mode(surface_id) == Some(mode) {
+            return;
+        }
+        let affected_surfaces = self.subsurface_transactions.subsurface_tree_ids(surface_id);
+        let was_effectively_synchronized = affected_surfaces
+            .iter()
+            .map(|surface_id| {
+                (
+                    *surface_id,
+                    self.is_effectively_synchronized_subsurface(*surface_id),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         if !self.subsurface_transactions.set_mode(surface_id, mode) {
             return;
         }
-        if mode == SubsurfaceSyncMode::Desynchronized {
-            let mut commits = self
-                .subsurface_transactions
-                .take_desynchronized_subtree_commits(surface_id);
-            self.update_synchronized_cache_metrics();
+        self.reclassify_unreachable_synchronized_commits(
+            &affected_surfaces,
+            &was_effectively_synchronized,
+            None,
+        );
+    }
+
+    fn reclassify_unreachable_synchronized_commits(
+        &mut self,
+        affected_surfaces: &[u32],
+        was_effectively_synchronized: &HashMap<u32, bool>,
+        detached_root_commits: Option<(u32, Vec<CachedSubsurfaceCommit>)>,
+    ) {
+        let mut detached_root_commits = detached_root_commits;
+        for surface_id in affected_surfaces {
+            let was_synchronized = was_effectively_synchronized
+                .get(surface_id)
+                .copied()
+                .unwrap_or(false);
+            if !was_synchronized
+                || self.is_effectively_synchronized_subsurface(*surface_id)
+            {
+                continue;
+            }
+            let commits = detached_root_commits
+                .take()
+                .filter(|(detached_surface_id, _)| detached_surface_id == surface_id)
+                .map(|(_, commits)| commits)
+                .unwrap_or_default();
             if !commits.is_empty() {
-                if !commits
-                    .iter()
-                    .any(|(commit_surface_id, _)| *commit_surface_id == surface_id)
-                {
-                    commits.insert(0, (surface_id, empty_cached_subsurface_commit()));
+                for commit in commits {
+                    let candidate = self.extract_content_update_candidate(*surface_id, commit);
+                    self.submit_content_update_candidate(
+                        candidate,
+                        SurfaceTreeSubmissionKind::InternalMigration,
+                    );
                 }
-                self.submit_surface_tree_nodes(surface_id, commits);
+            }
+            while let Some(reference) = self
+                .subsurface_transactions
+                .oldest_cached_content_update_ref(*surface_id)
+            {
+                let Some(mut commits) = self
+                    .subsurface_transactions
+                    .take_cached_commits_through(reference)
+                else {
+                    break;
+                };
+                for commit in commits.drain(..) {
+                    let candidate = self.extract_content_update_candidate(*surface_id, commit);
+                    self.submit_content_update_candidate(
+                        candidate,
+                        SurfaceTreeSubmissionKind::InternalMigration,
+                    );
+                }
             }
         }
+        self.update_synchronized_cache_metrics();
+        self.commit_ready_surface_tree_transactions();
+    }
+
+    fn submit_content_update_candidate(
+        &mut self,
+        candidate: PreparedContentUpdateCandidate,
+        submission_kind: SurfaceTreeSubmissionKind,
+    ) {
+        self.submit_surface_tree_nodes_with_kind(
+            candidate.root_surface_id,
+            candidate.nodes,
+            candidate.external_content_update_dependencies,
+            submission_kind,
+        );
     }
 
     pub(in crate::compositor) fn set_pending_subsurface_position(
@@ -279,24 +506,12 @@ impl CompositorState {
                 commit.resize_capture_finalized = true;
             }
         }
-        let descendants = self
-            .subsurface_transactions
-            .take_latched_commits(surface_id);
+        let candidate = self.extract_content_update_candidate(surface_id, commit);
         self.update_synchronized_cache_metrics();
-        let mut nodes = Vec::with_capacity(descendants.len().saturating_add(1));
-        nodes.push((surface_id, commit));
-        nodes.extend(descendants);
-        self.submit_surface_tree_nodes(surface_id, nodes);
-    }
-
-    pub(in crate::compositor) fn submit_surface_tree_nodes(
-        &mut self,
-        surface_id: u32,
-        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
-    ) {
         self.submit_surface_tree_nodes_with_kind(
-            surface_id,
-            nodes,
+            candidate.root_surface_id,
+            candidate.nodes,
+            candidate.external_content_update_dependencies,
             SurfaceTreeSubmissionKind::ClientAdmission,
         );
     }
@@ -305,6 +520,7 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
         if !self.prepare_surface_tree_surface_state(&mut nodes) {
@@ -339,101 +555,9 @@ impl CompositorState {
             surface_id,
             nodes,
             dependencies,
+            external_content_update_dependencies,
             submission_kind,
         );
-    }
-
-    fn reclassify_surface_tree_transactions_after_subsurface_detach(
-        &mut self,
-        detached_surface_id: u32,
-    ) {
-        let transactions = std::mem::take(&mut self.pending_surface_tree_transactions);
-        let mut reclassified = Vec::new();
-        for transaction in transactions {
-            let affected = transaction.nodes.iter().any(|(surface_id, _)| {
-                self.subsurface_transactions
-                    .is_in_detached_subtree(*surface_id, detached_surface_id)
-            });
-            if !affected {
-                reclassified.push(transaction);
-                continue;
-            }
-            let original_root_surface_id = transaction.root_surface_id;
-            let partitions = transaction.partition_by_component_root(|surface_id| {
-                if self
-                    .subsurface_transactions
-                    .is_in_detached_subtree(surface_id, detached_surface_id)
-                {
-                    self.subsurface_transactions
-                        .component_root_after_detach(surface_id, detached_surface_id)
-                } else {
-                    original_root_surface_id
-                }
-            });
-            for partition in partitions {
-                reclassified.push(PendingSurfaceTreeTransaction {
-                    id: self.allocate_surface_tree_transaction_id(),
-                    root_surface_id: partition.root_surface_id,
-                    nodes: partition.nodes,
-                    publication_lifetimes: partition.publication_lifetimes,
-                    dependencies: partition.dependencies,
-                    commit_timing_readiness: None,
-                    received_at: partition.received_at,
-                });
-            }
-        }
-        self.pending_surface_tree_transactions = reclassified;
-        self.invalidate_surface_pacing_deadline_cache();
-        self.rebuild_scene_work_index();
-    }
-
-    fn submit_detached_subsurface_commits(&mut self, detached: DetachedSubsurfaceRole) {
-        let detached_surface_id = detached.relationship.surface_id;
-        let mut commits = detached
-            .cached_commits
-            .into_iter()
-            .map(|commit| (detached_surface_id, commit))
-            .collect::<Vec<_>>();
-        commits.extend(
-            self.subsurface_transactions
-                .take_latched_commits(detached_surface_id),
-        );
-        commits.extend(
-            self.subsurface_transactions
-                .take_desynchronized_subtree_commits(detached_surface_id),
-        );
-        self.update_synchronized_cache_metrics();
-        if commits.is_empty() {
-            return;
-        }
-
-        let mut partitions = Vec::<(u32, Vec<(u32, CachedSubsurfaceCommit)>)>::new();
-        for (surface_id, commit) in commits {
-            let root_surface_id = self
-                .subsurface_transactions
-                .component_root_after_detach(surface_id, detached_surface_id);
-            let Some((_, partition)) = partitions
-                .iter_mut()
-                .find(|(root, _)| *root == root_surface_id)
-            else {
-                partitions.push((root_surface_id, vec![(surface_id, commit)]));
-                continue;
-            };
-            partition.push((surface_id, commit));
-        }
-        for (root_surface_id, mut nodes) in partitions {
-            if !nodes
-                .iter()
-                .any(|(surface_id, _)| *surface_id == root_surface_id)
-            {
-                nodes.insert(0, (root_surface_id, empty_cached_subsurface_commit()));
-            }
-            self.submit_surface_tree_nodes_with_kind(
-                root_surface_id,
-                nodes,
-                SurfaceTreeSubmissionKind::InternalMigration,
-            );
-        }
     }
 
     fn capture_surface_tree_node_lifetimes(
@@ -458,6 +582,7 @@ impl CompositorState {
         root_surface_id: u32,
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
         let Some(publication_lifetimes) = self.capture_surface_tree_node_lifetimes(&nodes) else {
@@ -483,6 +608,7 @@ impl CompositorState {
                 nodes,
                 publication_lifetimes,
                 dependencies,
+                external_content_update_dependencies,
             );
             if self.transaction_is_ready(&transaction) {
                 self.publish_surface_tree_nodes(transaction);
@@ -502,6 +628,7 @@ impl CompositorState {
                     nodes,
                     publication_lifetimes.clone(),
                     dependencies,
+                    external_content_update_dependencies.clone(),
                     submission_kind,
                 );
                 self.commit_ready_surface_tree_transactions();
@@ -513,6 +640,7 @@ impl CompositorState {
                     nodes,
                     publication_lifetimes.clone(),
                     dependencies,
+                    external_content_update_dependencies.clone(),
                     submission_kind,
                 );
                 self.commit_ready_surface_tree_transactions();
@@ -524,6 +652,7 @@ impl CompositorState {
                     nodes,
                     publication_lifetimes.clone(),
                     dependencies,
+                    external_content_update_dependencies.clone(),
                     submission_kind,
                 );
                 self.commit_ready_surface_tree_transactions();
@@ -549,6 +678,7 @@ impl CompositorState {
                 nodes,
                 publication_lifetimes.clone(),
                 dependencies,
+                external_content_update_dependencies.clone(),
                 submission_kind,
             );
             self.commit_ready_surface_tree_transactions();
@@ -563,6 +693,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            external_content_update_dependencies,
         );
         let ready_after_merge = self.transaction_is_ready(&transaction);
         self.record_surface_tree_merge_metrics(&stats);
@@ -609,6 +740,7 @@ impl CompositorState {
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         publication_lifetimes: SurfaceTreeNodeLifetimes,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
     ) -> SurfaceTreeMergeStats {
         let Some(publication_lifetimes) = publication_lifetimes.captured() else {
             return SurfaceTreeMergeStats::default();
@@ -736,6 +868,16 @@ impl CompositorState {
             }
         }
         transaction.dependencies.extend(dependencies);
+        for dependency in external_content_update_dependencies {
+            if !transaction
+                .external_content_update_dependencies
+                .contains(&dependency)
+            {
+                transaction
+                    .external_content_update_dependencies
+                    .push(dependency);
+            }
+        }
         stats
     }
 
@@ -933,6 +1075,7 @@ impl CompositorState {
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         publication_lifetimes: SurfaceTreeNodeLifetimes,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
     ) -> PendingSurfaceTreeTransaction {
         PendingSurfaceTreeTransaction {
             id: self.allocate_surface_tree_transaction_id(),
@@ -940,6 +1083,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            external_content_update_dependencies,
             commit_timing_readiness: None,
             received_at: Instant::now(),
         }
@@ -956,6 +1100,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            external_content_update_dependencies,
             commit_timing_readiness,
             received_at,
         } = transaction;
@@ -965,6 +1110,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            external_content_update_dependencies,
             commit_timing_readiness,
             received_at,
             submission_kind,
@@ -979,6 +1125,7 @@ impl CompositorState {
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         publication_lifetimes: SurfaceTreeNodeLifetimes,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
         commit_timing_readiness: Option<CommitTimingReadiness>,
         received_at: Instant,
         submission_kind: SurfaceTreeSubmissionKind,
@@ -989,6 +1136,7 @@ impl CompositorState {
             nodes: Vec::new(),
             publication_lifetimes,
             dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness,
             received_at,
         };
@@ -1100,6 +1248,7 @@ impl CompositorState {
         }
         transaction.nodes = nodes;
         transaction.dependencies = dependencies;
+        transaction.external_content_update_dependencies = external_content_update_dependencies;
         self.pending_surface_tree_transactions.push(transaction);
         self.rebuild_scene_work_index();
         if submission_kind == SurfaceTreeSubmissionKind::ClientAdmission {
@@ -1140,6 +1289,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            Vec::new(),
             SurfaceTreeSubmissionKind::ClientAdmission,
         );
     }
@@ -1150,6 +1300,7 @@ impl CompositorState {
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         publication_lifetimes: SurfaceTreeNodeLifetimes,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
+        external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
         let transaction = self.build_surface_tree_transaction(
@@ -1157,6 +1308,7 @@ impl CompositorState {
             nodes,
             publication_lifetimes,
             dependencies,
+            external_content_update_dependencies,
         );
         self.queue_waiting_surface_tree_transaction(transaction, submission_kind);
     }
@@ -1224,7 +1376,7 @@ impl CompositorState {
         }
         let PendingSurfaceTreeTransaction {
             root_surface_id,
-            mut nodes,
+            nodes,
             ..
         } = transaction;
         let stale_node = nodes.iter().find_map(|(surface_id, commit)| {
@@ -1260,15 +1412,14 @@ impl CompositorState {
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         }
-        let Some(root_index) = nodes
+        if !nodes
             .iter()
-            .position(|(surface_id, _)| *surface_id == root_surface_id)
-        else {
+            .any(|(surface_id, _)| *surface_id == root_surface_id)
+        {
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
-        };
-        let (_, root_commit) = nodes.remove(root_index);
-        self.publish_surface_tree(root_surface_id, root_commit, nodes);
+        }
+        self.publish_surface_tree(root_surface_id, nodes);
     }
 
     pub(in crate::compositor) fn discard_surface_tree_transaction_with_decision(
@@ -1521,12 +1672,12 @@ impl CompositorState {
     pub(in crate::compositor) fn publish_surface_tree(
         &mut self,
         root_id: u32,
-        root_commit: CachedSubsurfaceCommit,
         commits: Vec<(u32, CachedSubsurfaceCommit)>,
     ) {
-        let changed_nodes = commits.len().saturating_add(1);
-        let maximum_wait_ms = std::iter::once(&root_commit)
-            .chain(commits.iter().map(|(_, commit)| commit))
+        let changed_nodes = commits.len();
+        let maximum_wait_ms = commits
+            .iter()
+            .map(|(_, commit)| commit)
             .map(|commit| u64::try_from(commit.cached_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .max()
             .unwrap_or(0);
@@ -1541,7 +1692,6 @@ impl CompositorState {
             );
         }
         self.begin_surface_tree_publication();
-        self.apply_cached_subsurface_commit(root_id, root_commit);
         for (surface_id, commit) in commits {
             self.apply_cached_subsurface_commit(surface_id, commit);
         }
@@ -1709,20 +1859,34 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
+        let affected_surfaces = self
+            .subsurface_transactions
+            .subsurface_tree_ids(surface_id);
+        let was_effectively_synchronized = affected_surfaces
+            .iter()
+            .map(|surface_id| {
+                (
+                    *surface_id,
+                    self.is_effectively_synchronized_subsurface(*surface_id),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let Some(detached) = self.subsurface_transactions.detach_role(surface_id) else {
             return;
         };
         let parent_id = detached.relationship.parent_id;
         let client_id = detached.client_id.clone();
         self.update_synchronized_cache_metrics();
-        self.reclassify_surface_tree_transactions_after_subsurface_detach(surface_id);
         self.hide_renderable_surface_subtree(surface_id);
         self.deactivate_role_instance(surface_id);
         self.set_surface_placement(surface_id, SurfacePlacement::root());
         self.detach_subsurface_from_parent_stack_lineage(parent_id, surface_id);
         self.reorder_renderable_surfaces_by_committed_stack();
-        self.submit_detached_subsurface_commits(detached);
-        self.commit_ready_surface_tree_transactions();
+        self.reclassify_unreachable_synchronized_commits(
+            &affected_surfaces,
+            &was_effectively_synchronized,
+            Some((surface_id, detached.cached_commits)),
+        );
         self.debug_assert_surface_tree_invariants();
         if compositor_debug_surface_logging_enabled() {
             eprintln!(

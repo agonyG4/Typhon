@@ -554,7 +554,7 @@ impl RepaintPlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PartialRepaintPlanner {
     output_size: (u32, u32),
     history: VecDeque<OutputDamage>,
@@ -842,7 +842,7 @@ impl EglDamageRects {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct EglOutputDamageTracker {
     cursor_image: Arc<CompositorCursorImage>,
     output_size: (u32, u32),

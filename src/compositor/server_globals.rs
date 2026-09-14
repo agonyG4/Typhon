@@ -1,5 +1,6 @@
 use super::*;
 use crate::astrea_effects::server::astrea_effects_manager_v1;
+use crate::astrea_screen_capture::server::astrea_screen_capture_manager_v1;
 use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
 use wayland_protocols::ext::background_effect::v1::server::ext_background_effect_manager_v1;
 use wayland_protocols::ext::workspace::v1::server::ext_workspace_manager_v1;
@@ -174,6 +175,11 @@ pub(super) fn register_minimum_globals(
         astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1,
         _,
     >(versions::ASTREA_SHELL_AUTH_MANAGER_V1, ());
+    display.create_global::<
+        CompositorState,
+        astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1,
+        _,
+    >(versions::ASTREA_SCREEN_CAPTURE_MANAGER_V1, ());
     display.create_global::<
         CompositorState,
         astrea_shell_control_manager_v1::AstreaShellControlManagerV1,

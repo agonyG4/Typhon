@@ -55,6 +55,7 @@ fn terminal_surface_tree_transaction_is_discarded_without_watcher_cancel() {
                 acquire: ExplicitSyncPoint::for_tests_with_signal_script(104, 105, [true]),
                 state: PendingAcquireState::Ready,
             }],
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness: None,
             received_at: Instant::now(),
         });
@@ -169,6 +170,7 @@ fn terminal_buffer_surface_tree_transaction_releases_owned_buffer_once() {
                 acquire: acquire.clone(),
                 state: PendingAcquireState::EventfdBacked,
             }],
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness: None,
             received_at: Instant::now(),
         });
@@ -411,6 +413,7 @@ fn commit_timing_only_surface_tree_is_rejected_after_terminal_owner_before_relea
                 },
             ]),
             dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness: None,
             received_at: Instant::now(),
         });
@@ -472,6 +475,7 @@ fn fifo_only_surface_tree_is_rejected_after_terminal_owner_before_barrier_releas
                 },
             ]),
             dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness: None,
             received_at: Instant::now(),
         });
@@ -551,6 +555,7 @@ fn mixed_surface_tree_lifetimes_reject_unrelated_stale_node_when_acquire_is_read
                 acquire: acquire.clone(),
                 state: PendingAcquireState::EventfdBacked,
             }],
+            external_content_update_dependencies: Vec::new(),
             commit_timing_readiness: None,
             received_at: Instant::now(),
         });

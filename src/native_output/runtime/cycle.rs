@@ -1,4 +1,7 @@
 use super::*;
+use crate::native_output::screen_capture::{
+    CaptureDimensions, RGBA8888_FORMAT, create_sealed_memfd,
+};
 use std::io::Write as _;
 
 #[path = "cycle_direct.rs"]
@@ -112,6 +115,7 @@ impl NativeRuntime {
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
+            screen_capture_pending: self.server.has_pending_astrea_screen_capture(),
             explicit_sync_service_due: cycle.wakeup.reasons.explicit_sync_acquire()
                 || !cycle.wakeup.explicit_sync_acquire_tokens.is_empty()
                 || self.server.has_pending_acquire_watch_changes()
@@ -278,6 +282,7 @@ impl NativeRuntime {
                 || work_domains.presentation
                 || work_domains.surface_pacing
                 || work_domains.explicit_sync
+                || work_domains.screen_capture
             {
                 self.dispatch_suspended_sources(&cycle)?;
             }
@@ -289,6 +294,7 @@ impl NativeRuntime {
                     .map_err(Into::into)
             })?;
             if !self.shutdown.is_running() {
+                self.fail_pending_screen_captures("session_inactive");
                 self.quiesce_control_server()?;
                 self.finish_slow_cycle(&cycle, render_attempted)?;
                 return Ok(());
@@ -302,6 +308,7 @@ impl NativeRuntime {
             self.service_keyboard_persistence_completions(&cycle.wakeup)?;
             self.reconcile_dmem_foreground();
             self.arm_suspended_deadline()?;
+            self.fail_pending_screen_captures("session_inactive");
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
@@ -328,6 +335,7 @@ impl NativeRuntime {
         if let Some(vt) = dispatch_outcome.vt_switch_requested {
             self.request_native_vt_switch(vt)?;
             if !self.session.permits_output() {
+                self.fail_pending_screen_captures("session_inactive");
                 self.quiesce_control_server()?;
                 self.finish_slow_cycle(&cycle, render_attempted)?;
                 return Ok(());
@@ -554,8 +562,16 @@ impl NativeRuntime {
             self.plan_pending_commit_timing(monotonic_now_ns()?);
         }
         if !self.shutdown.is_running() || !self.session.permits_output() {
+            if !self.session.permits_output() {
+                self.fail_pending_screen_captures("session_inactive");
+            }
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
+        }
+        if prepare_operation_plan.service_screen_capture {
+            while self.server.has_pending_astrea_screen_capture() {
+                self.service_pending_screen_capture()?;
+            }
         }
         let presentation_operation_plan = NativeWorkDomains::classify(
             &cycle.wakeup,
@@ -1025,6 +1041,7 @@ impl NativeRuntime {
     }
 
     fn suspend_native_session(&mut self, seat: &NativeSeatSession) -> NativeResult<()> {
+        self.fail_pending_screen_captures("session_inactive");
         self.dmem_foreground.submit(None);
         self.log_session_transition("active", "suspending", "seat_disable");
         self.perf.log("native.session_suspend", || {
@@ -1167,6 +1184,73 @@ impl NativeRuntime {
             ]
         });
     }
+    pub(super) fn fail_pending_screen_captures(&mut self, reason: &str) {
+        while let Some(pending) = self.server.take_pending_astrea_screen_capture() {
+            pending.capture.failed(reason.to_owned());
+        }
+    }
+
+    fn service_pending_screen_capture(&mut self) -> NativeResult<()> {
+        let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
+            return Ok(());
+        };
+        if !self.session.permits_output() {
+            pending.capture.failed("session_inactive".to_owned());
+            return Ok(());
+        }
+        if !self
+            .server
+            .astrea_screen_capture_output_is_current(&pending.output)
+        {
+            pending.capture.failed("output_gone".to_owned());
+            return Ok(());
+        }
+        if !self.scanout.supports_gpu_buffer_protocols() {
+            pending.capture.failed("unsupported".to_owned());
+            return Ok(());
+        }
+
+        let (width, height) = self.scanout.dimensions();
+        let dimensions = match CaptureDimensions::checked(width, height) {
+            Ok(dimensions) => dimensions,
+            Err(_) => {
+                pending.capture.failed("allocation_failed".to_owned());
+                return Ok(());
+            }
+        };
+        let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
+        let payload = match self.scanout.capture_scene(
+            &mut self.frame_renderer,
+            &resolved_scene,
+            &self.server,
+            &self.input_state,
+            self.cursor_render_mode,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("native screen capture render failed: {error}");
+                pending.capture.failed("render_failed".to_owned());
+                return Ok(());
+            }
+        };
+        let memfd = match create_sealed_memfd(&payload) {
+            Ok(memfd) => memfd,
+            Err(error) => {
+                eprintln!("native screen capture allocation failed: {error}");
+                pending.capture.failed("allocation_failed".to_owned());
+                return Ok(());
+            }
+        };
+        pending.capture.ready(
+            memfd.as_fd(),
+            dimensions.width,
+            dimensions.height,
+            dimensions.stride,
+            RGBA8888_FORMAT,
+        );
+        Ok(())
+    }
+
     #[allow(unused_variables)]
     fn process_acquire_and_prepare(
         &mut self,

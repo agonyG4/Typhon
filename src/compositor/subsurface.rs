@@ -49,6 +49,20 @@ pub(super) enum SubsurfaceRelationshipPhase {
 pub(super) struct SubsurfaceRelationshipId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ContentUpdateRef {
+    pub(super) surface_id: u32,
+    pub(super) commit_id: SurfaceCommitId,
+    pub(super) commit_sequence: SurfaceCommitSequence,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CapturedContentUpdateLineage {
+    pub(super) predecessor: Option<ContentUpdateRef>,
+    pub(super) child_dependencies: Vec<ContentUpdateRef>,
+    pub(super) merge_frozen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct CapturedSubsurfaceRelationship {
     pub(super) surface_id: u32,
     pub(super) parent_id: u32,
@@ -366,6 +380,7 @@ impl CapturedSurfaceCommitContext {
 pub(super) struct CachedSubsurfaceCommit {
     pub(super) commit_id: SurfaceCommitId,
     pub(super) commit_sequence: SurfaceCommitSequence,
+    pub(super) lineage: CapturedContentUpdateLineage,
     pub(super) attachment: Option<PendingSurfaceAttachment>,
     pub(super) damage: Option<RenderableSurfaceDamage>,
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
@@ -389,6 +404,14 @@ pub(super) struct CachedSubsurfaceCommit {
 }
 
 impl CachedSubsurfaceCommit {
+    pub(super) fn content_update_ref(&self, surface_id: u32) -> ContentUpdateRef {
+        ContentUpdateRef {
+            surface_id,
+            commit_id: self.commit_id,
+            commit_sequence: self.commit_sequence,
+        }
+    }
+
     pub(super) fn cached_obligation_count(&self) -> usize {
         self.frame_callbacks
             .len()
@@ -427,6 +450,7 @@ impl CachedSubsurfaceCommit {
         let Self {
             commit_id,
             commit_sequence,
+            lineage: newer_lineage,
             attachment,
             damage,
             frame_callbacks,
@@ -453,6 +477,14 @@ impl CachedSubsurfaceCommit {
         debug_assert!(!pacing.is_boundary());
         self.commit_id = commit_id;
         self.commit_sequence = commit_sequence;
+        let mut lineage = std::mem::take(&mut self.lineage);
+        for dependency in newer_lineage.child_dependencies {
+            if !lineage.child_dependencies.contains(&dependency) {
+                lineage.child_dependencies.push(dependency);
+            }
+        }
+        lineage.merge_frozen |= newer_lineage.merge_frozen;
+        self.lineage = lineage;
         let attachment_changed = attachment.is_some();
         let superseded = attachment.and_then(|attachment| {
             self.attachment
@@ -910,6 +942,7 @@ mod window_geometry_tests {
         CachedSubsurfaceCommit {
             commit_id: SurfaceCommitId::for_tests(sequence),
             commit_sequence: SurfaceCommitSequence(sequence),
+            lineage: CapturedContentUpdateLineage::default(),
             attachment: None,
             damage: None,
             frame_callbacks: Vec::new(),
@@ -1464,53 +1497,6 @@ impl SubsurfaceTransactionState {
         })
     }
 
-    pub(super) fn is_in_detached_subtree(&self, surface_id: u32, detached_surface_id: u32) -> bool {
-        let mut current = surface_id;
-        let mut visited = std::collections::HashSet::new();
-        loop {
-            if current == detached_surface_id {
-                return true;
-            }
-            if !visited.insert(current) {
-                return false;
-            }
-            let Some(role) = self.roles.get(&current) else {
-                return false;
-            };
-            current = role.parent_id;
-        }
-    }
-
-    pub(super) fn component_root_after_detach(
-        &self,
-        surface_id: u32,
-        detached_surface_id: u32,
-    ) -> u32 {
-        if !self.is_in_detached_subtree(surface_id, detached_surface_id) {
-            return surface_id;
-        }
-        let mut current = surface_id;
-        let mut visited = std::collections::HashSet::new();
-        loop {
-            if current == detached_surface_id {
-                return detached_surface_id;
-            }
-            if !visited.insert(current) {
-                return current;
-            }
-            if !self.is_effectively_synchronized(current) {
-                return current;
-            }
-            let Some(role) = self.roles.get(&current) else {
-                return current;
-            };
-            if role.parent_id == detached_surface_id {
-                return detached_surface_id;
-            }
-            current = role.parent_id;
-        }
-    }
-
     pub(super) fn take_pending_relationship_activations_for_parent(
         &mut self,
         parent_id: u32,
@@ -1581,6 +1567,31 @@ impl SubsurfaceTransactionState {
             .and_then(|role| role.client_id.as_ref())
     }
 
+    pub(super) fn capture_direct_child_dependencies(
+        &mut self,
+        parent_id: u32,
+    ) -> Vec<ContentUpdateRef> {
+        let mut child_ids = self
+            .roles
+            .iter()
+            .filter_map(|(surface_id, role)| (role.parent_id == parent_id).then_some(*surface_id))
+            .collect::<Vec<_>>();
+        child_ids.sort_unstable();
+
+        child_ids
+            .into_iter()
+            .filter_map(|child_id| {
+                let role = self.roles.get_mut(&child_id)?;
+                let commit = role.cached_commits.back_mut()?;
+                if commit.lineage.merge_frozen {
+                    return None;
+                }
+                commit.lineage.merge_frozen = true;
+                Some(commit.content_update_ref(child_id))
+            })
+            .collect()
+    }
+
     pub(super) fn is_effectively_synchronized(&self, surface_id: u32) -> bool {
         let mut current = Some(surface_id);
         while let Some(id) = current {
@@ -1619,7 +1630,11 @@ impl SubsurfaceTransactionState {
         let can_merge = role
             .cached_commits
             .back()
-            .is_some_and(|tail| !tail.pacing.is_boundary() && !commit.pacing.is_boundary());
+            .is_some_and(|tail| {
+                !tail.lineage.merge_frozen
+                    && !tail.pacing.is_boundary()
+                    && !commit.pacing.is_boundary()
+            });
         let new_entries = if can_merge {
             old_entries
         } else {
@@ -1898,46 +1913,6 @@ impl SubsurfaceTransactionState {
             .collect()
     }
 
-    pub(super) fn take_latched_commits(
-        &mut self,
-        parent_id: u32,
-    ) -> Vec<(u32, CachedSubsurfaceCommit)> {
-        let mut surface_ids = Vec::new();
-        self.collect_effectively_synchronized_descendants(parent_id, &mut surface_ids);
-        let mut commits = Vec::new();
-        for surface_id in surface_ids {
-            commits.extend(
-                self.take_cached_commits_for_surface(surface_id)
-                    .into_iter()
-                    .map(|commit| (surface_id, commit)),
-            );
-        }
-        debug_assert!(self.debug_accounting_is_consistent());
-        commits
-    }
-
-    pub(super) fn take_desynchronized_subtree_commits(
-        &mut self,
-        surface_id: u32,
-    ) -> Vec<(u32, CachedSubsurfaceCommit)> {
-        let mut surface_ids = vec![surface_id];
-        self.collect_all_descendants(surface_id, &mut surface_ids);
-        let eligible = surface_ids
-            .into_iter()
-            .filter(|surface_id| !self.is_effectively_synchronized(*surface_id))
-            .collect::<Vec<_>>();
-        let mut commits = Vec::new();
-        for surface_id in eligible {
-            commits.extend(
-                self.take_cached_commits_for_surface(surface_id)
-                    .into_iter()
-                    .map(|commit| (surface_id, commit)),
-            );
-        }
-        debug_assert!(self.debug_accounting_is_consistent());
-        commits
-    }
-
     pub(super) fn take_cached_commits_for_surface(
         &mut self,
         surface_id: u32,
@@ -1965,6 +1940,80 @@ impl SubsurfaceTransactionState {
             0,
         );
         commits
+    }
+
+    pub(super) fn take_cached_commits_through(
+        &mut self,
+        reference: ContentUpdateRef,
+    ) -> Option<Vec<CachedSubsurfaceCommit>> {
+        let (client_id, old_entries, old_obligations, selected, new_entries, new_obligations) = {
+            let role = self.roles.get_mut(&reference.surface_id)?;
+            let target_index = role
+                .cached_commits
+                .iter()
+                .position(|commit| commit.content_update_ref(reference.surface_id) == reference)?;
+            let old_entries = role.cached_commits.len();
+            let old_obligations = self
+                .cached_obligations_per_surface
+                .get(&reference.surface_id)
+                .copied()
+                .unwrap_or_default();
+            let remaining = role.cached_commits.split_off(target_index.saturating_add(1));
+            let client_id = role.client_id.clone();
+            let selected = std::mem::replace(&mut role.cached_commits, remaining);
+            let new_entries = role.cached_commits.len();
+            let new_obligations = role
+                .cached_commits
+                .iter()
+                .map(CachedSubsurfaceCommit::cached_obligation_count)
+                .sum();
+            (
+                client_id,
+                old_entries,
+                old_obligations,
+                selected.into_iter().collect::<Vec<_>>(),
+                new_entries,
+                new_obligations,
+            )
+        };
+        self.replace_cached_accounting(
+            reference.surface_id,
+            client_id.as_ref(),
+            old_entries,
+            new_entries,
+            old_obligations,
+            new_obligations,
+        );
+        debug_assert!(self.debug_accounting_is_consistent());
+        Some(selected)
+    }
+
+    pub(super) fn oldest_cached_content_update_ref(
+        &self,
+        surface_id: u32,
+    ) -> Option<ContentUpdateRef> {
+        self.roles
+            .get(&surface_id)
+            .and_then(|role| role.cached_commits.front())
+            .map(|commit| commit.content_update_ref(surface_id))
+    }
+
+    pub(super) fn subsurface_tree_ids(&self, root_surface_id: u32) -> Vec<u32> {
+        let mut tree = vec![root_surface_id];
+        let mut index = 0;
+        while let Some(parent_id) = tree.get(index).copied() {
+            let mut children = self
+                .roles
+                .iter()
+                .filter_map(|(surface_id, role)| {
+                    (role.parent_id == parent_id).then_some(*surface_id)
+                })
+                .collect::<Vec<_>>();
+            children.sort_unstable();
+            tree.extend(children);
+            index = index.saturating_add(1);
+        }
+        tree
     }
 
     fn replace_cached_accounting(
@@ -2094,31 +2143,6 @@ impl SubsurfaceTransactionState {
             && obligations_per_client == self.cached_obligations_per_client
     }
 
-    fn collect_effectively_synchronized_descendants(&self, parent_id: u32, output: &mut Vec<u32>) {
-        let children = self
-            .roles
-            .iter()
-            .filter_map(|(surface_id, role)| (role.parent_id == parent_id).then_some(*surface_id))
-            .collect::<Vec<_>>();
-        for child_id in children {
-            if self.is_effectively_synchronized(child_id) {
-                output.push(child_id);
-                self.collect_effectively_synchronized_descendants(child_id, output);
-            }
-        }
-    }
-
-    fn collect_all_descendants(&self, parent_id: u32, output: &mut Vec<u32>) {
-        let children = self
-            .roles
-            .iter()
-            .filter_map(|(surface_id, role)| (role.parent_id == parent_id).then_some(*surface_id))
-            .collect::<Vec<_>>();
-        for child_id in children {
-            output.push(child_id);
-            self.collect_all_descendants(child_id, output);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2161,25 +2185,6 @@ mod tests {
         assert!(state.is_effectively_synchronized(3));
         assert!(state.set_mode(2, SubsurfaceSyncMode::Desynchronized));
         assert!(!state.is_effectively_synchronized(3));
-    }
-
-    #[test]
-    fn detached_component_roots_follow_post_detach_effective_sync() {
-        let mut state = SubsurfaceTransactionState::default();
-        assert!(state.register(2, 1));
-        assert!(state.register(3, 2));
-        assert!(state.register(4, 3));
-        assert!(state.set_mode(4, SubsurfaceSyncMode::Desynchronized));
-        assert!(state.detach_role(2).is_some());
-
-        assert_eq!(state.component_root_after_detach(2, 2), 2);
-        assert_eq!(state.component_root_after_detach(3, 2), 2);
-        assert_eq!(state.component_root_after_detach(4, 2), 2);
-
-        assert!(state.set_mode(3, SubsurfaceSyncMode::Desynchronized));
-        assert!(state.set_mode(4, SubsurfaceSyncMode::Synchronized));
-        assert_eq!(state.component_root_after_detach(3, 2), 3);
-        assert_eq!(state.component_root_after_detach(4, 2), 3);
     }
 
     #[test]

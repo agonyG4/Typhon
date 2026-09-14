@@ -57,6 +57,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `astrea_shortcuts_manager_v1` | 1 | Partial |
 | `astrea_shell_auth_manager_v1` | 1 | Partial |
 | `astrea_shell_control_manager_v1` | 1 | Partial |
+| `astrea_screen_capture_manager_v1` | 1 | Implemented (authenticated native screenshot capability) |
 | `astrea_toplevel_manager_v1` | 3 | Partial |
 | `ext_workspace_manager_v1` | 1 | Partial |
 | `xdg_wm_base` | 6 | Implemented |

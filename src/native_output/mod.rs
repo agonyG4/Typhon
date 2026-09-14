@@ -120,6 +120,7 @@ mod perf;
 mod presentation;
 mod runtime;
 mod scanout;
+pub(crate) mod screen_capture;
 
 pub(crate) use input::*;
 pub(crate) use kms_worker::kms_worker_doctor_severity;
