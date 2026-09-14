@@ -2,10 +2,11 @@ use std::io;
 
 use glow::HasContext;
 use oblivion_one::effects::{
-    CompiledFrameGraph, CompiledRenderPass, EffectColorConversion, EffectExecutionDemand,
-    EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId, GraphTextureSource,
-    INTERNAL_EFFECT_SHADER_MODULE_BLEND, INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
-    INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind, ShaderModuleId,
+    CompiledFrameGraph, CompiledRenderPass, EffectAlphaMode, EffectColorConversion,
+    EffectExecutionDemand, EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId,
+    GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
+    INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind,
+    ShaderModuleId,
 };
 
 use super::super::geometry::{
@@ -398,6 +399,60 @@ pub(crate) struct EffectExecutionStats {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectPassBlendMode {
+    Replace,
+    PremultipliedSourceOver,
+}
+
+fn effect_pass_blend_mode(
+    kind: RenderPassKind,
+    output_is_framebuffer: bool,
+    alpha_mode: EffectAlphaMode,
+) -> EffectPassBlendMode {
+    if output_is_framebuffer
+        && matches!(
+            kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        )
+        && alpha_mode == EffectAlphaMode::Preserve
+    {
+        EffectPassBlendMode::PremultipliedSourceOver
+    } else {
+        EffectPassBlendMode::Replace
+    }
+}
+
+pub(crate) fn establish_effect_pass_blend_state(gl: &glow::Context, mode: EffectPassBlendMode) {
+    unsafe {
+        match mode {
+            EffectPassBlendMode::Replace => gl.disable(glow::BLEND),
+            EffectPassBlendMode::PremultipliedSourceOver => {
+                gl.enable(glow::BLEND);
+                gl.blend_func_separate(
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
+            }
+        }
+    }
+}
+
+fn capture_blend_mode() -> EffectPassBlendMode {
+    EffectPassBlendMode::PremultipliedSourceOver
+}
+
+#[derive(Debug)]
+struct PreparedEffectRegion {
+    region: EffectRegion,
+    input_rect_count: usize,
+    duplicate_rects_removed: usize,
+    overlap_fragments_generated: usize,
+    fallback: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EffectExecutionInvariantError {
     MissingPassOutput(GraphPassId),
     UnknownTexture(GraphTextureId),
@@ -530,13 +585,17 @@ pub(crate) fn plan_effect_surface_consumers(
                 pass.visual_group,
                 pass.anchor_scope,
             );
-            let execution_damage = capture_execution_damage(graph, demand, pass, false);
+            let execution_damage = prepare_effect_execution_region(
+                graph,
+                pass,
+                capture_execution_damage(graph, demand, pass, false),
+            );
             let target_domain = pass
                 .output
                 .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
                 .map(|texture| texture.domain);
             let capture_rects =
-                effect_capture_output_rects(&execution_damage, target_domain, output_size);
+                effect_capture_output_rects(&execution_damage.region, target_domain, output_size);
             add_surface_consumers_for_capture_indices(
                 &mut plan,
                 commands,
@@ -740,8 +799,20 @@ fn execute_graph_passes_inner(
         if !selection.executed_passes.contains(&pass.id) {
             continue;
         }
-        let execution_damage = capture_execution_damage(graph, demand, pass, lifecycle_backdrop);
+        let execution_damage = prepare_effect_execution_region(
+            graph,
+            pass,
+            capture_execution_damage(graph, demand, pass, lifecycle_backdrop),
+        );
         if renderer.effect_trace.enabled() {
+            renderer.effect_trace.execution_region(
+                pass,
+                execution_damage.input_rect_count,
+                execution_damage.region.rects().len(),
+                execution_damage.duplicate_rects_removed,
+                execution_damage.overlap_fragments_generated,
+                execution_damage.fallback,
+            );
             if let Some((input_rect_count, clip_rect_count)) = pass.visible_clip_fallback {
                 renderer.effect_trace.visible_clip_fallback(
                     pass,
@@ -774,7 +845,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -791,7 +862,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -809,7 +880,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -902,7 +973,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -913,7 +984,7 @@ fn execute_graph_passes_inner(
             graph,
             pass,
             textures,
-            &execution_damage,
+            &execution_damage.region,
             framebuffer_origin,
         );
         if renderer.effect_trace.enabled() {
@@ -927,7 +998,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -948,7 +1019,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -964,7 +1035,7 @@ fn execute_graph_passes_inner(
                 u64::from(pass.id.get()),
                 pass.instance.get(),
                 pass.kind,
-                effect_region_pixels(&execution_damage),
+                effect_region_pixels(&execution_damage.region),
             )
         });
         let execute_result = execute_pass(
@@ -973,7 +1044,7 @@ fn execute_graph_passes_inner(
             textures,
             pass,
             framebuffer_origin,
-            &execution_damage,
+            &execution_damage.region,
             lifecycle_backdrop,
             &mut stats,
         );
@@ -991,7 +1062,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1014,7 +1085,7 @@ fn execute_graph_passes_inner(
                     graph,
                     pass,
                     demand,
-                    &execution_damage,
+                    &execution_damage.region,
                     framebuffer_origin,
                     lifecycle_backdrop,
                 ),
@@ -1067,6 +1138,69 @@ fn effect_region_pixels(region: &EffectRegion) -> u64 {
     region.rects().iter().fold(0u64, |total, rect| {
         total.saturating_add(u64::from(rect.width).saturating_mul(u64::from(rect.height)))
     })
+}
+
+fn prepare_effect_execution_region(
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+    input: EffectRegion,
+) -> PreparedEffectRegion {
+    let input_rect_count = input.rects().len();
+    let final_output = matches!(
+        pass.kind,
+        RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+    );
+    let authoritative_clip = final_output.then(|| {
+        graph
+            .instances
+            .iter()
+            .find(|instance| instance.id == pass.instance)
+            .map(|instance| instance.output_influence_region.clone())
+    });
+    let mut duplicate_rects_removed = 0;
+
+    let (candidate, mut fallback) = if let Some(Some(clip)) = authoritative_clip.as_ref() {
+        let bounded = input.intersect_bounded_within_result(clip);
+        duplicate_rects_removed = bounded.duplicate_rects_removed;
+        if bounded.overflowed {
+            (clip.clone(), Some("output_influence"))
+        } else {
+            (bounded.region, None)
+        }
+    } else if final_output {
+        (EffectRegion::empty(), None)
+    } else {
+        (input, None)
+    };
+    let disjoint = candidate.disjoint_bounded();
+    let region = if disjoint.overflowed {
+        fallback = Some(if final_output {
+            "output_influence"
+        } else {
+            "work_region_bbox_coalesce"
+        });
+        if final_output {
+            authoritative_clip
+                .flatten()
+                .unwrap_or_else(EffectRegion::empty)
+        } else {
+            candidate
+                .bounding_rect()
+                .map(EffectRegion::from_rect)
+                .unwrap_or_else(|| pass_output_texture_domain(graph, pass))
+        }
+    } else {
+        disjoint.region
+    };
+
+    PreparedEffectRegion {
+        region,
+        input_rect_count,
+        duplicate_rects_removed: duplicate_rects_removed
+            .saturating_add(disjoint.duplicate_rects_removed),
+        overlap_fragments_generated: disjoint.overlap_fragments_generated,
+        fallback,
+    }
 }
 
 fn output_rect_pixels(rects: &[OutputRect]) -> u64 {
@@ -1774,11 +1908,11 @@ fn execute_fullscreen_stage(
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
     let target_flip_y = effect_target_requires_logical_y_flip(false, framebuffer_origin);
     let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
+    establish_effect_pass_blend_state(&renderer.gl, EffectPassBlendMode::Replace);
     unsafe {
         renderer
             .gl
             .viewport(0, 0, output_plan.width as i32, output_plan.height as i32);
-        renderer.gl.disable(glow::BLEND);
         renderer.gl.use_program(Some(program));
         if let Some(location) = uniform_location(
             &mut renderer.effect_shaders,
@@ -2339,13 +2473,7 @@ fn execute_capture(
             renderer.gl.clear(glow::COLOR_BUFFER_BIT);
         }
         renderer.gl.disable(glow::SCISSOR_TEST);
-        renderer.gl.enable(glow::BLEND);
-        renderer.gl.blend_func_separate(
-            glow::ONE,
-            glow::ONE_MINUS_SRC_ALPHA,
-            glow::ONE,
-            glow::ONE_MINUS_SRC_ALPHA,
-        );
+        establish_effect_pass_blend_state(&renderer.gl, capture_blend_mode());
         renderer.gl.use_program(Some(renderer.capture_program));
         if let Some(location) = renderer.capture_uniform_location("u_capture_output_size") {
             renderer.gl.uniform_2_f32(
@@ -2408,6 +2536,7 @@ fn execute_capture(
     renderer.effect_resources.unbind_render_target(&renderer.gl);
     renderer.bind_active_output_framebuffer();
     restore_output_viewport(renderer);
+    establish_effect_pass_blend_state(&renderer.gl, EffectPassBlendMode::Replace);
     Ok(())
 }
 
@@ -2604,6 +2733,8 @@ fn execute_fullscreen_pass(
             .effect_resources
             .bind_render_target(&renderer.gl, texture)?;
     }
+    let blend_mode = effect_pass_blend_mode(pass.kind, output_is_framebuffer, pass.alpha_mode);
+    establish_effect_pass_blend_state(&renderer.gl, blend_mode);
     unsafe {
         renderer
             .gl
@@ -3492,6 +3623,250 @@ mod tests {
     }
 
     #[test]
+    fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
+        for kind in [
+            RenderPassKind::NormalizeInput,
+            RenderPassKind::DualKawaseDownsample,
+            RenderPassKind::DualKawaseUpsample,
+            RenderPassKind::Fragment,
+            RenderPassKind::Blend,
+            RenderPassKind::Mask,
+        ] {
+            assert_eq!(
+                effect_pass_blend_mode(
+                    kind,
+                    false,
+                    oblivion_one::effects::EffectAlphaMode::Preserve,
+                ),
+                EffectPassBlendMode::Replace,
+                "internal pass {kind:?} must replace its target"
+            );
+        }
+        assert_eq!(
+            capture_blend_mode(),
+            EffectPassBlendMode::PremultipliedSourceOver
+        );
+        assert_eq!(
+            effect_pass_blend_mode(
+                RenderPassKind::Composite,
+                true,
+                oblivion_one::effects::EffectAlphaMode::Opaque,
+            ),
+            EffectPassBlendMode::Replace
+        );
+        assert_eq!(
+            effect_pass_blend_mode(
+                RenderPassKind::OutputPostProcess,
+                true,
+                oblivion_one::effects::EffectAlphaMode::Preserve,
+            ),
+            EffectPassBlendMode::PremultipliedSourceOver
+        );
+    }
+
+    #[test]
+    fn blend_sensitive_execution_regions_have_single_coverage() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Fragment,
+            instance,
+            vec![input],
+            output,
+            vec![],
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let mut requested =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap());
+        requested.push(oblivion_one::effects::EffectRect::new(5, 0, 10, 10).unwrap());
+
+        let prepared = prepare_effect_execution_region(&graph, &pass, requested);
+        let rects = effect_capture_output_rects(&prepared.region, Some(domain), (100, 100));
+
+        assert_eq!(prepared.fallback, None);
+        assert_eq!(output_rect_pixels(&rects), 150);
+        for (index, first) in prepared.region.rects().iter().enumerate() {
+            for second in prepared.region.rects().iter().skip(index + 1) {
+                assert!(first.intersect(*second).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_composite_execution_regions_have_single_coverage() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
+        let mut pass = test_pass(
+            1,
+            RenderPassKind::Composite,
+            instance,
+            vec![input],
+            output,
+            vec![],
+        );
+        pass.alpha_mode = oblivion_one::effects::EffectAlphaMode::Preserve;
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Output, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let mut requested =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 10, 10).unwrap());
+        requested.push(oblivion_one::effects::EffectRect::new(5, 0, 10, 10).unwrap());
+
+        let prepared = prepare_effect_execution_region(&graph, &pass, requested);
+
+        assert_eq!(
+            effect_pass_blend_mode(
+                RenderPassKind::Composite,
+                true,
+                oblivion_one::effects::EffectAlphaMode::Preserve,
+            ),
+            EffectPassBlendMode::PremultipliedSourceOver
+        );
+        assert_eq!(prepared.fallback, None);
+        assert_eq!(effect_region_pixels(&prepared.region), 150);
+        for (index, first) in prepared.region.rects().iter().enumerate() {
+            for second in prepared.region.rects().iter().skip(index + 1) {
+                assert!(first.intersect(*second).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn internal_single_coverage_overflow_uses_bounded_work_fallback() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 128, 128).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Fragment,
+            instance,
+            vec![input],
+            output,
+            vec![],
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Intermediate, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: EffectRegion::from_rect(domain),
+                capture_region: EffectRegion::from_rect(domain),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let mut requested = EffectRegion::empty();
+        for index in 0..64 {
+            requested.push(oblivion_one::effects::EffectRect::new(index * 2, 0, 1, 128).unwrap());
+        }
+        for index in 0..64 {
+            requested
+                .push(oblivion_one::effects::EffectRect::new(0, index * 2 + 1, 128, 1).unwrap());
+        }
+
+        let prepared = prepare_effect_execution_region(&graph, &pass, requested);
+
+        assert_eq!(prepared.fallback, Some("work_region_bbox_coalesce"));
+        assert_eq!(prepared.region, EffectRegion::from_rect(domain));
+    }
+
+    #[test]
+    fn final_composite_overflow_uses_the_authoritative_disconnected_clip() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let domain = oblivion_one::effects::EffectRect::new(0, 0, 128, 128).unwrap();
+        let pass = test_pass(
+            1,
+            RenderPassKind::Composite,
+            instance,
+            vec![input],
+            output,
+            vec![],
+        );
+        let mut visible =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 1, 128).unwrap());
+        visible.push(oblivion_one::effects::EffectRect::new(127, 0, 1, 128).unwrap());
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, domain),
+                test_texture(2, GraphTextureSource::Output, domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: visible.clone(),
+                capture_region: visible.clone(),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let mut requested = EffectRegion::empty();
+        for index in 0..64 {
+            requested.push(oblivion_one::effects::EffectRect::new(index * 2, 0, 1, 128).unwrap());
+        }
+        for index in 0..64 {
+            requested
+                .push(oblivion_one::effects::EffectRect::new(0, index * 2 + 1, 128, 1).unwrap());
+        }
+
+        let prepared = prepare_effect_execution_region(&graph, &pass, requested);
+        let scissors = effect_damage_to_texture_rects(
+            &prepared.region,
+            &graph.textures[1],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(prepared.fallback, Some("output_influence"));
+        assert_eq!(prepared.region, visible);
+        assert_eq!(
+            scissors,
+            vec![
+                OutputRect::new(0, 0, 1, 128),
+                OutputRect::new(127, 0, 1, 128)
+            ]
+        );
+        assert!(!prepared.region.contains_point(64, 64));
+    }
+
+    #[test]
     fn trusted_output_size_uses_the_compositor_output_not_the_stage_texture() {
         assert_eq!(
             trusted_effect_output_size((1920, 1080), (300, 200)),
@@ -3745,11 +4120,13 @@ mod tests {
         let output = GraphTextureId::new(2).unwrap();
         let output_domain = oblivion_one::effects::EffectRect::new(0, 0, 500, 10).unwrap();
         let mut visible =
-            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 1, 1).unwrap());
-        visible.push(oblivion_one::effects::EffectRect::new(400, 0, 1, 1).unwrap());
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 200, 10).unwrap());
+        visible.push(oblivion_one::effects::EffectRect::new(300, 0, 200, 10).unwrap());
         let mut repair = EffectRegion::empty();
-        for _ in 0..128 {
-            repair.push(oblivion_one::effects::EffectRect::new(0, 0, 500, 1).unwrap());
+        for index in 0..128 {
+            repair.push(
+                oblivion_one::effects::EffectRect::new(index, 0, 500 - index as u32, 10).unwrap(),
+            );
         }
         let pass = test_pass(
             1,
@@ -3786,7 +4163,10 @@ mod tests {
 
         assert_eq!(
             scissors,
-            vec![OutputRect::new(0, 0, 1, 1), OutputRect::new(400, 0, 1, 1)]
+            vec![
+                OutputRect::new(0, 0, 200, 10),
+                OutputRect::new(300, 0, 200, 10)
+            ]
         );
         assert!(scissors.iter().all(|rect| {
             (rect.x..rect.x + rect.width as i32).all(|x| {
@@ -3966,6 +4346,22 @@ mod tests {
 
         assert_eq!(output_rect_pixels(&rects), 1200);
         assert_ne!(output_rect_pixels(&rects), 10000);
+    }
+
+    #[test]
+    fn capture_execution_pixels_do_not_double_count_duplicate_demand() {
+        let target = test_texture(
+            1,
+            GraphTextureSource::CapturedScene,
+            oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap(),
+        );
+        let rect = oblivion_one::effects::EffectRect::new(10, 20, 30, 40).unwrap();
+        let demand = EffectRegion::from_rect(rect).union(&EffectRegion::from_rect(rect));
+        let prepared = demand.disjoint_bounded();
+        let rects = capture_clear_rects(&prepared.region, &target);
+
+        assert_eq!(demand.rects().len(), 1);
+        assert_eq!(output_rect_pixels(&rects), 1200);
     }
 
     #[test]

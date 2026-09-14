@@ -91,11 +91,20 @@ pub struct EffectRegion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundedRegionIntersection {
-    pub(crate) region: EffectRegion,
-    pub(crate) overflowed: bool,
-    pub(crate) input_rect_count: usize,
-    pub(crate) clip_rect_count: usize,
+pub struct BoundedRegionIntersection {
+    pub region: EffectRegion,
+    pub overflowed: bool,
+    pub input_rect_count: usize,
+    pub clip_rect_count: usize,
+    pub duplicate_rects_removed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedRegionDisjointification {
+    pub region: EffectRegion,
+    pub overflowed: bool,
+    pub duplicate_rects_removed: usize,
+    pub overlap_fragments_generated: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +174,9 @@ impl EffectRegion {
         if self.conservative_full {
             return;
         }
+        if self.rects.contains(&rect) {
+            return;
+        }
         if self.rects.len() < MAX_EFFECT_REGION_RECTS {
             self.rects.push(rect);
             return;
@@ -218,7 +230,7 @@ impl EffectRegion {
         let mut result = self.clone();
         let mut coalesced = false;
         for rect in &other.rects {
-            if result.rects.len() >= MAX_EFFECT_REGION_RECTS {
+            if result.rects.len() >= MAX_EFFECT_REGION_RECTS && !result.rects.contains(rect) {
                 coalesced = true;
             }
             result.push(*rect);
@@ -266,7 +278,7 @@ impl EffectRegion {
         self.intersect_bounded_within_result(clip).region
     }
 
-    pub(crate) fn intersect_bounded_within_result(&self, clip: &Self) -> BoundedRegionIntersection {
+    pub fn intersect_bounded_within_result(&self, clip: &Self) -> BoundedRegionIntersection {
         let input_rect_count = self.rects.len();
         let clip_rect_count = clip.rects.len();
         if self.conservative_full {
@@ -275,6 +287,7 @@ impl EffectRegion {
                 overflowed: false,
                 input_rect_count,
                 clip_rect_count,
+                duplicate_rects_removed: 0,
             };
         }
         if clip.conservative_full {
@@ -283,20 +296,27 @@ impl EffectRegion {
                 overflowed: false,
                 input_rect_count,
                 clip_rect_count,
+                duplicate_rects_removed: 0,
             };
         }
         let mut rects = Vec::new();
+        let mut duplicate_rects_removed: usize = 0;
         for left in &self.rects {
             for right in &clip.rects {
                 let Some(intersection) = left.intersect(*right) else {
                     continue;
                 };
+                if rects.contains(&intersection) {
+                    duplicate_rects_removed += 1;
+                    continue;
+                }
                 if rects.len() == MAX_EFFECT_REGION_RECTS {
                     return BoundedRegionIntersection {
                         region: clip.clone(),
                         overflowed: true,
                         input_rect_count,
                         clip_rect_count,
+                        duplicate_rects_removed,
                     };
                 }
                 rects.push(intersection);
@@ -310,6 +330,85 @@ impl EffectRegion {
             overflowed: false,
             input_rect_count,
             clip_rect_count,
+            duplicate_rects_removed,
+        }
+    }
+
+    /// Convert this bounded geometric region to single-coverage rectangles.
+    ///
+    /// The returned rectangles have exactly the same coverage while the
+    /// decomposition fits the region bound. If it would not fit, callers must
+    /// choose a conservative fallback appropriate to the region's semantics;
+    /// the returned region is empty in that case so an overflow cannot be used
+    /// accidentally as a partial result.
+    pub fn disjoint_bounded(&self) -> BoundedRegionDisjointification {
+        if self.conservative_full || self.rects.len() <= 1 {
+            return BoundedRegionDisjointification {
+                region: self.clone(),
+                overflowed: false,
+                duplicate_rects_removed: 0,
+                overlap_fragments_generated: 0,
+            };
+        }
+
+        let mut disjoint = Vec::with_capacity(self.rects.len());
+        let mut duplicate_rects_removed: usize = 0;
+        let mut overlap_fragments_generated: usize = 0;
+
+        for source in &self.rects {
+            if disjoint.contains(source) {
+                duplicate_rects_removed += 1;
+                continue;
+            }
+
+            let mut fragments = vec![*source];
+            for represented in &disjoint {
+                if fragments.is_empty() {
+                    break;
+                }
+                let mut next = Vec::with_capacity(fragments.len().min(4));
+                for fragment in fragments {
+                    let pieces = subtract_effect_rect(fragment, *represented);
+                    if pieces.len() != 1 || pieces.first() != Some(&fragment) {
+                        overlap_fragments_generated =
+                            overlap_fragments_generated.saturating_add(pieces.len());
+                    }
+                    for piece in pieces {
+                        if next.len() == MAX_EFFECT_REGION_RECTS {
+                            return BoundedRegionDisjointification {
+                                region: Self::empty(),
+                                overflowed: true,
+                                duplicate_rects_removed,
+                                overlap_fragments_generated,
+                            };
+                        }
+                        next.push(piece);
+                    }
+                }
+                fragments = next;
+            }
+
+            for fragment in fragments {
+                if disjoint.len() == MAX_EFFECT_REGION_RECTS {
+                    return BoundedRegionDisjointification {
+                        region: Self::empty(),
+                        overflowed: true,
+                        duplicate_rects_removed,
+                        overlap_fragments_generated,
+                    };
+                }
+                disjoint.push(fragment);
+            }
+        }
+
+        BoundedRegionDisjointification {
+            region: Self {
+                rects: disjoint,
+                conservative_full: false,
+            },
+            overflowed: false,
+            duplicate_rects_removed,
+            overlap_fragments_generated,
         }
     }
 
@@ -742,6 +841,63 @@ mod tests {
     }
 
     #[test]
+    fn union_treats_effect_regions_as_geometric_sets() {
+        let first = EffectRect::new(10, 20, 30, 40).unwrap();
+        let second = EffectRect::new(80, 20, 30, 40).unwrap();
+        let region = EffectRegion::from_rect(first);
+
+        assert_eq!(region.union(&region).rects(), &[first]);
+
+        let repeated = region
+            .union(&EffectRegion::from_rect(second))
+            .union(&region);
+        assert_eq!(repeated.rects(), &[first, second]);
+    }
+
+    #[test]
+    fn bounded_disjointification_preserves_overlapping_region_coverage_once() {
+        let first = EffectRect::new(0, 0, 10, 10).unwrap();
+        let second = EffectRect::new(5, 0, 10, 10).unwrap();
+        let mut region = EffectRegion::from_rect(first);
+        region.push(second);
+
+        let result = region.disjoint_bounded();
+
+        assert!(!result.overflowed);
+        assert_eq!(result.duplicate_rects_removed, 0);
+        assert!(result.overlap_fragments_generated > 0);
+        assert_eq!(
+            result.region.rects(),
+            &[first, EffectRect::new(10, 0, 5, 10).unwrap()]
+        );
+        assert!(result.region.contains_point(5, 5));
+        assert!(result.region.contains_point(14, 5));
+        assert!(
+            result.region.rects()[0]
+                .intersect(result.region.rects()[1])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_rectangles_do_not_consume_the_region_bound() {
+        let mut region = EffectRegion::empty();
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            region.push(EffectRect::new(index as i32 * 2, 0, 1, 1).unwrap());
+        }
+        let repeated = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
+
+        let (result, coalesced) = region.union_with_diagnostics(&repeated);
+
+        assert!(!coalesced);
+        assert_eq!(result.rects().len(), MAX_EFFECT_REGION_RECTS);
+        assert_eq!(
+            result.rects().first(),
+            Some(&EffectRect::new(0, 0, 1, 1).unwrap())
+        );
+    }
+
+    #[test]
     fn rounded_hover_transition_never_leaks_a_corner() {
         let bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
         let old = rounded_test_region(500, 100, 500, 80, 20, 16);
@@ -780,11 +936,11 @@ mod tests {
     #[test]
     fn bounded_intersection_overflow_returns_authoritative_clip() {
         let mut fragmented = EffectRegion::empty();
-        for _ in 0..MAX_EFFECT_REGION_RECTS {
-            fragmented.push(EffectRect::new(0, 0, 500, 1).unwrap());
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented.push(EffectRect::new(0, index as i32, 500 + index as u32, 200).unwrap());
         }
-        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
-        clip.push(EffectRect::new(400, 0, 1, 1).unwrap());
+        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 200).unwrap());
+        clip.push(EffectRect::new(400, 0, 1, 200).unwrap());
 
         let result = fragmented.intersect_bounded_within(&clip);
 
@@ -795,11 +951,11 @@ mod tests {
     #[test]
     fn bounded_intersection_reports_overflow_without_bbox_coalescing() {
         let mut fragmented = EffectRegion::empty();
-        for _ in 0..MAX_EFFECT_REGION_RECTS {
-            fragmented.push(EffectRect::new(0, 0, 500, 1).unwrap());
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented.push(EffectRect::new(0, index as i32, 500 + index as u32, 200).unwrap());
         }
-        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
-        clip.push(EffectRect::new(400, 0, 1, 1).unwrap());
+        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 200).unwrap());
+        clip.push(EffectRect::new(400, 0, 1, 200).unwrap());
 
         let result = fragmented.intersect_bounded_within_result(&clip);
 
@@ -906,12 +1062,14 @@ mod tests {
     #[test]
     fn near_protocol_budget_fragmented_repair_falls_back_to_disconnected_clip() {
         let mut visible = EffectRegion::empty();
-        for index in 0..96 {
-            visible.push(EffectRect::new(index * 2, 50, 1, 1).unwrap());
+        for index in 0..48 {
+            visible.push(EffectRect::new(0, index * 2, 80, 1).unwrap());
+            visible.push(EffectRect::new(200, index * 2, 80, 1).unwrap());
         }
         let mut fragmented_repair = EffectRegion::empty();
-        for _ in 0..MAX_EFFECT_REGION_RECTS {
-            fragmented_repair.push(EffectRect::new(0, 0, 200, 100).unwrap());
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented_repair
+                .push(EffectRect::new(index as i32, 0, 300 - index as u32, 96).unwrap());
         }
         let plan = plan_effect_damage(
             EffectFootprint::ZERO,
@@ -922,8 +1080,8 @@ mod tests {
 
         assert_eq!(plan.output_damage, visible);
         assert!(!plan.output_damage.contains_point(100, 50));
-        assert!(plan.output_damage.contains_point(0, 50));
-        assert!(plan.output_damage.contains_point(190, 50));
+        assert!(plan.output_damage.contains_point(0, 0));
+        assert!(plan.output_damage.contains_point(200, 0));
     }
 
     #[test]

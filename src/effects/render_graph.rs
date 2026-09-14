@@ -2942,15 +2942,18 @@ mod tests {
     #[test]
     fn fragmented_visible_repair_falls_back_to_output_influence_without_bbox() {
         let instance = EffectInstanceId::new(1).unwrap();
-        let mut output = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
-        output.push(EffectRect::new(400, 0, 1, 1).unwrap());
+        let mut output = EffectRegion::from_rect(EffectRect::new(0, 0, 200, 10).unwrap());
+        output.push(EffectRect::new(300, 0, 200, 10).unwrap());
         let graph = demand_test_graph(vec![demand_test_instance(
             1,
             output.clone(),
             output.clone(),
             Vec::new(),
         )]);
-        let repair = repeated_region(EffectRect::new(0, 0, 500, 1).unwrap(), 128);
+        let mut repair = EffectRegion::empty();
+        for index in 0..128 {
+            repair.push(EffectRect::new(index, 0, 500 - index as u32, 10).unwrap());
+        }
 
         let demand = plan_effect_execution_demand(&graph, &repair, false);
 
@@ -2981,10 +2984,13 @@ mod tests {
     #[test]
     fn fragmented_backdrop_dependency_falls_back_within_dependency_output() {
         let lower = EffectInstanceId::new(1).unwrap();
-        let mut lower_output = EffectRegion::from_rect(EffectRect::new(1000, 0, 1, 1).unwrap());
-        lower_output.push(EffectRect::new(1400, 0, 1, 1).unwrap());
+        let mut lower_output = EffectRegion::from_rect(EffectRect::new(1000, 0, 200, 1).unwrap());
+        lower_output.push(EffectRect::new(1400, 0, 100, 1).unwrap());
         let consumer_output = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 1).unwrap());
-        let consumer_capture = repeated_region(EffectRect::new(900, 0, 501, 1).unwrap(), 128);
+        let mut consumer_capture = EffectRegion::empty();
+        for index in 0..128 {
+            consumer_capture.push(EffectRect::new(1000 + index, 0, 500 - index as u32, 1).unwrap());
+        }
         let graph = demand_test_graph(vec![
             demand_test_instance(1, lower_output.clone(), lower_output.clone(), Vec::new()),
             demand_test_instance(2, consumer_output.clone(), consumer_capture, vec![lower]),
@@ -3203,9 +3209,9 @@ mod tests {
                 for dependency_id in &consumer.dependencies {
                     let dependency_index = unique_instance_index(&graph, *dependency_id)
                         .expect("validated dependency index");
-                    let required = graph.instances[dependency_index]
-                        .output_influence_region
-                        .intersect(&consumer.capture_region);
+                    let required = consumer.capture_region.intersect_bounded_within(
+                        &graph.instances[dependency_index].output_influence_region,
+                    );
                     if !required.is_empty() {
                         let dependency_demand = fragmented_demand
                             .output_region(*dependency_id)
@@ -3427,7 +3433,7 @@ mod tests {
         let explanation = graph.explain();
         assert_eq!(explanation, graph.explain());
         assert!(explanation.starts_with(
-            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=115200\n"
+            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=57600\n"
         ));
         assert!(explanation.contains("capture_scene"));
         assert!(explanation.contains("kawase_down"));

@@ -4288,7 +4288,32 @@ impl GlesSceneRenderer {
         target_domain: EffectRect,
         target_size: (u32, u32),
     ) -> RendererResult<()> {
-        for &output_rect in output_rects {
+        let mut requested = EffectRegion::empty();
+        for output_rect in output_rects {
+            if let Some(rect) = EffectRect::new(
+                output_rect.x,
+                output_rect.y,
+                output_rect.width,
+                output_rect.height,
+            ) {
+                requested.push(rect);
+            }
+        }
+        let disjoint = requested.disjoint_bounded();
+        let execution_region = if disjoint.overflowed {
+            requested
+                .bounding_rect()
+                .map(EffectRegion::from_rect)
+                .unwrap_or_else(EffectRegion::empty)
+        } else {
+            disjoint.region
+        };
+        for output_rect in execution_region
+            .rects()
+            .iter()
+            .copied()
+            .map(|rect| OutputRect::new(rect.x, rect.y, rect.width, rect.height))
+        {
             self.draw_capture_commands(command_indices, output_rect, target_domain, target_size)?;
         }
         Ok(())
@@ -7583,6 +7608,155 @@ mod tests {
 
         unsafe {
             harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn internal_fullscreen_pass_is_independent_of_stale_target_contents() {
+        let mut harness = GlesEffectTestHarness::new(1, 1);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                void main() { gl_Position = vec4(a_position, 0.0, 1.0); }
+            "#,
+            r#"#version 300 es
+                precision highp float;
+                uniform vec4 u_color;
+                out vec4 out_color;
+                void main() { out_color = u_color; }
+            "#,
+        )
+        .expect("internal pass stale-target regression shader compiles");
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("internal pass stale-target regression quad creates")
+            .0;
+        let color = unsafe {
+            harness
+                .gl
+                .get_uniform_location(program, "u_color")
+                .expect("internal pass color uniform is active")
+        };
+
+        let render_with_stale_destination = |stale: [f32; 4]| {
+            unsafe {
+                harness.gl.viewport(0, 0, 1, 1);
+                harness.gl.disable(glow::SCISSOR_TEST);
+                harness
+                    .gl
+                    .clear_color(stale[0], stale[1], stale[2], stale[3]);
+                harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                effects::establish_effect_pass_blend_state(
+                    &harness.gl,
+                    effects::EffectPassBlendMode::Replace,
+                );
+                assert!(!harness.gl.is_enabled(glow::BLEND));
+                harness.gl.use_program(Some(program));
+                harness.gl.uniform_4_f32(Some(&color), 0.2, 0.1, 0.05, 0.5);
+                harness.gl.bind_vertex_array(Some(quad));
+                harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                harness.gl.bind_vertex_array(None);
+                harness.gl.flush();
+            }
+            read_effect_test_pixels(&harness.gl, 1, 1)
+        };
+
+        let first = render_with_stale_destination([0.05, 0.1, 0.15, 0.25]);
+        let second = render_with_stale_destination([0.75, 0.6, 0.45, 0.9]);
+
+        assert_eq!(first, second);
+
+        unsafe {
+            harness.gl.use_program(None);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_effect_pass_modes_establish_their_fixed_function_state() {
+        let harness = GlesEffectTestHarness::new(1, 1);
+
+        effects::establish_effect_pass_blend_state(
+            &harness.gl,
+            effects::EffectPassBlendMode::PremultipliedSourceOver,
+        );
+        unsafe {
+            assert!(harness.gl.is_enabled(glow::BLEND));
+            assert_eq!(
+                harness.gl.get_parameter_i32(glow::BLEND_SRC_RGB),
+                glow::ONE as i32
+            );
+            assert_eq!(
+                harness.gl.get_parameter_i32(glow::BLEND_DST_RGB),
+                glow::ONE_MINUS_SRC_ALPHA as i32
+            );
+        }
+
+        effects::establish_effect_pass_blend_state(
+            &harness.gl,
+            effects::EffectPassBlendMode::Replace,
+        );
+        unsafe { assert!(!harness.gl.is_enabled(glow::BLEND)) };
+    }
+
+    #[test]
+    fn real_gles_capture_regions_source_over_each_pixel_once() {
+        let mut harness = GlesEffectTestHarness::new(3, 1);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            r#"#version 300 es
+                layout(location = 0) in vec2 a_position;
+                void main() { gl_Position = vec4(a_position, 0.0, 1.0); }
+            "#,
+            r#"#version 300 es
+                precision highp float;
+                out vec4 out_color;
+                void main() { out_color = vec4(0.2, 0.1, 0.05, 0.5); }
+            "#,
+        )
+        .expect("capture overlap regression shader compiles");
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("capture overlap regression quad creates")
+            .0;
+        let mut requested =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 2, 1).unwrap());
+        requested.push(oblivion_one::effects::EffectRect::new(1, 0, 2, 1).unwrap());
+        let execution = requested.disjoint_bounded();
+
+        unsafe {
+            harness.gl.viewport(0, 0, 3, 1);
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+            effects::establish_effect_pass_blend_state(
+                &harness.gl,
+                effects::EffectPassBlendMode::PremultipliedSourceOver,
+            );
+            harness.gl.use_program(Some(program));
+            harness.gl.bind_vertex_array(Some(quad));
+            for rect in execution.region.rects() {
+                harness.gl.enable(glow::SCISSOR_TEST);
+                harness
+                    .gl
+                    .scissor(rect.x, rect.y, rect.width as i32, rect.height as i32);
+                harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            }
+            harness.gl.bind_vertex_array(None);
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.flush();
+        }
+        let pixels = read_effect_test_pixels(&harness.gl, 3, 1);
+        for x in 0..3 {
+            assert_effect_test_pixel(&pixels, 3, x, 0, [51, 25, 13, 127]);
+        }
+
+        unsafe {
+            harness.gl.use_program(None);
             harness.gl.delete_program(program);
         }
     }

@@ -11,7 +11,8 @@ mod trace;
 pub(crate) use blur::DUAL_KAWASE_VERTEX_SHADER;
 #[cfg(test)]
 pub(crate) use executor::{
-    BLEND_STAGE_FRAGMENT_SHADER, MASK_STAGE_FRAGMENT_SHADER, NORMALIZE_FRAGMENT_SHADER,
+    BLEND_STAGE_FRAGMENT_SHADER, EffectPassBlendMode, MASK_STAGE_FRAGMENT_SHADER,
+    NORMALIZE_FRAGMENT_SHADER, establish_effect_pass_blend_state,
 };
 #[cfg(test)]
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;

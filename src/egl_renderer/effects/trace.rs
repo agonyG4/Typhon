@@ -327,6 +327,30 @@ impl EffectExecutionTrace {
         });
     }
 
+    pub(crate) fn execution_region(
+        &self,
+        pass: &CompiledRenderPass,
+        input_rect_count: usize,
+        execution_region_rect_count: usize,
+        duplicate_rects_removed: usize,
+        overlap_fragments_generated: usize,
+        fallback: Option<&'static str>,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_execution_region frame_id={} instance={} pass={} input_rect_count={} execution_region_rect_count={} duplicate_rects_removed={} overlap_fragments_generated={} fallback={}",
+                optional_u64(self.frame_id),
+                pass.instance.get(),
+                pass.id.get(),
+                input_rect_count,
+                execution_region_rect_count,
+                duplicate_rects_removed,
+                overlap_fragments_generated,
+                fallback.unwrap_or("none"),
+            )
+        });
+    }
+
     pub(crate) fn pass_boundary(
         &self,
         boundary: &'static str,
@@ -646,5 +670,45 @@ mod tests {
         assert!(line.contains("clip_rect_count=33"));
         assert!(line.contains("fallback=output_influence"));
         assert!(line.contains("visible_clip_fallback=true"));
+    }
+
+    #[test]
+    fn execution_region_trace_reports_single_coverage_diagnostics() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let pass = CompiledRenderPass {
+            id: oblivion_one::effects::GraphPassId::new(10).unwrap(),
+            kind: RenderPassKind::DualKawaseDownsample,
+            inputs: Vec::new(),
+            output: None,
+            damage: EffectRegion::empty(),
+            instance: EffectInstanceId::new(5).unwrap(),
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
+        };
+
+        clear_test_events();
+        trace.execution_region(&pass, 130, 2, 1, 4, Some("work_region_bbox_coalesce"));
+        let line = take_test_events()
+            .pop()
+            .expect("execution region diagnostic event");
+
+        assert!(line.contains("event=effect_execution_region"));
+        assert!(line.contains("instance=5"));
+        assert!(line.contains("pass=10"));
+        assert!(line.contains("input_rect_count=130"));
+        assert!(line.contains("execution_region_rect_count=2"));
+        assert!(line.contains("duplicate_rects_removed=1"));
+        assert!(line.contains("overlap_fragments_generated=4"));
+        assert!(line.contains("fallback=work_region_bbox_coalesce"));
     }
 }
