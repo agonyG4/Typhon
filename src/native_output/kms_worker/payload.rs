@@ -219,6 +219,7 @@ pub(crate) enum KmsCommitPayloadError {
     OwnerGenerationMismatch,
     OwnerTargetMismatch,
     ValidationBaseMismatch,
+    PacingReadySubmitMismatch,
 }
 
 impl KmsCommitJob {
@@ -271,6 +272,16 @@ impl KmsCommitJob {
         self.validate_against_mode(transaction, false)
     }
 
+    pub(crate) fn validate_pacing_ownership(&self) -> Result<(), KmsCommitPayloadError> {
+        if self
+            .pacing_ticket
+            .is_some_and(|ticket| self.ready_submit != ticket.ready_submit())
+        {
+            return Err(KmsCommitPayloadError::PacingReadySubmitMismatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_submitted_against(
         &self,
         transaction: &OutputTransaction,
@@ -283,6 +294,7 @@ impl KmsCommitJob {
         transaction: &OutputTransaction,
         submitted: bool,
     ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_pacing_ownership()?;
         if self.transaction_id != transaction.id()
             || kind_transaction_id(self.kind) != self.transaction_id
         {

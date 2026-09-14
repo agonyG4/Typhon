@@ -134,6 +134,28 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
     }
 }
 
+#[test]
+fn paced_job_rejects_ready_submit_ticket_mismatch() {
+    let mut pacing = crate::native_output::pacing::NativeFramePacing::from_env();
+    pacing.queue_visual(1, 1);
+    let ticket = pacing
+        .reserve_worker_submission(false)
+        .unwrap()
+        .expect("worker pacing ticket");
+
+    let mut job = test_job(7_004);
+    job.pacing_ticket = Some(ticket);
+    job.ready_submit = true;
+
+    assert_eq!(
+        job.validate_pacing_ownership(),
+        Err(KmsCommitPayloadError::PacingReadySubmitMismatch)
+    );
+
+    job.ready_submit = false;
+    assert_eq!(job.validate_pacing_ownership(), Ok(()));
+}
+
 fn test_job_with_input_fence(token: u64, fence: OwnedFd) -> KmsCommitJob {
     let mut job = test_job(token);
     job.primary = KmsPrimaryUpdate::Framebuffer {
