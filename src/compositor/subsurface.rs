@@ -1615,6 +1615,16 @@ impl SubsurfaceTransactionState {
         commit: CachedSubsurfaceCommit,
     ) -> CacheCommitOutcome {
         debug_assert!(self.debug_accounting_is_consistent());
+        debug_assert!(
+            commit.lineage.predecessor.is_none_or(|predecessor| {
+                predecessor.surface_id == surface_id
+                    && predecessor.commit_sequence < commit.commit_sequence
+            })
+        );
+        debug_assert!(commit.lineage.child_dependencies.iter().all(|dependency| {
+            dependency.commit_sequence < commit.commit_sequence
+                && dependency.commit_sequence != commit.commit_sequence
+        }));
         let Some(role) = self.roles.get(&surface_id) else {
             return CacheCommitOutcome::Rejected {
                 commit: Box::new(commit),
