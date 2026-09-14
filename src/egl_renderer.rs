@@ -552,7 +552,7 @@ struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
     canonical_visual_rect: Option<glow::UniformLocation>,
     source_visual_rect: Option<glow::UniformLocation>,
-    portal_rect: Option<glow::UniformLocation>,
+    sink_rect: Option<glow::UniformLocation>,
     progress: Option<glow::UniformLocation>,
     opacity: Option<glow::UniformLocation>,
     direction: Option<glow::UniformLocation>,
@@ -958,6 +958,10 @@ fn lamp_geometry_key(
             lamp.visual_group.portal_rect.y().to_bits(),
             lamp.visual_group.portal_rect.width().to_bits(),
             lamp.visual_group.portal_rect.height().to_bits(),
+            lamp.visual_group.sink_rect.x().to_bits(),
+            lamp.visual_group.sink_rect.y().to_bits(),
+            lamp.visual_group.sink_rect.width().to_bits(),
+            lamp.visual_group.sink_rect.height().to_bits(),
             lamp.visual_group.shape_factor.to_bits(),
             lamp.visual_group.bump_distance.to_bits(),
             match lamp.visual_group.lamp_direction {
@@ -1156,7 +1160,7 @@ impl GlesSceneRenderer {
                 output_size: gl.get_uniform_location(program, "u_output_size"),
                 canonical_visual_rect: gl.get_uniform_location(program, "u_canonical_visual_rect"),
                 source_visual_rect: gl.get_uniform_location(program, "u_source_visual_rect"),
-                portal_rect: gl.get_uniform_location(program, "u_portal_rect"),
+                sink_rect: gl.get_uniform_location(program, "u_sink_rect"),
                 progress: gl.get_uniform_location(program, "u_progress"),
                 opacity: gl.get_uniform_location(program, "u_opacity"),
                 direction: gl.get_uniform_location(program, "u_direction"),
@@ -3761,8 +3765,8 @@ impl GlesSceneRenderer {
                 );
                 set_lamp_uniform_rect(
                     &self.gl,
-                    uniforms.portal_rect.as_ref(),
-                    sample.visual_group.portal_rect,
+                    uniforms.sink_rect.as_ref(),
+                    sample.visual_group.sink_rect,
                     output_scale,
                 );
                 if let Some(location) = &uniforms.direction {
@@ -8138,6 +8142,29 @@ mod tests {
                 1.0,
                 OutputFramebufferOrigin::BottomLeft,
             )
+        );
+    }
+
+    #[test]
+    fn lamp_mesh_identity_includes_sink_geometry() {
+        let baseline = lamp_test_sample(0.5);
+        let mut changed = baseline.clone();
+        changed.lamps[0].visual_group.sink_rect = PresentationRect::new(
+            changed.lamps[0].visual_group.sink_rect.x(),
+            changed.lamps[0].visual_group.sink_rect.y() + 1.0,
+            changed.lamps[0].visual_group.sink_rect.width(),
+            changed.lamps[0].visual_group.sink_rect.height(),
+        )
+        .expect("valid changed sink rectangle");
+        assert_ne!(
+            lamp_geometry_key(
+                &baseline,
+                &[],
+                &[],
+                1.0,
+                OutputFramebufferOrigin::BottomLeft,
+            ),
+            lamp_geometry_key(&changed, &[], &[], 1.0, OutputFramebufferOrigin::BottomLeft,)
         );
     }
 
