@@ -95,7 +95,8 @@ impl CompositorState {
                 let (commit_sequence, buffer_id) = transaction
                     .nodes
                     .iter()
-                    .find(|(node_surface_id, _)| *node_surface_id == surface_id)
+                    .filter(|(node_surface_id, _)| *node_surface_id == surface_id)
+                    .max_by_key(|(_, commit)| commit.commit_sequence)
                     .map_or((SurfaceCommitSequence::initial(), None), |(_, commit)| {
                         (
                             commit.commit_sequence,

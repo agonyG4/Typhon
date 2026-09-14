@@ -609,6 +609,359 @@ mod tests {
         assert!(!state.content_update_ref_is_pending(predecessor_ref));
         assert!(state.content_update_dependencies_ready(&waiting));
     }
+
+    #[test]
+    fn unpaced_same_surface_candidate_prefix_is_canonicalized_before_acquires() {
+        let mut state = CompositorState::default();
+        let (display, client, _root_surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = |state: &mut CompositorState| {
+            let resource =
+                state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+            let surface_id = compositor_surface_id(&resource);
+            state.surface_presentation_generations.insert(surface_id, 1);
+            surface_id
+        };
+        let grandchild_id = surface(&mut state);
+        let child_id = surface(&mut state);
+        let blocker_id = surface(&mut state);
+        let blocker = ContentUpdateRef {
+            surface_id: blocker_id,
+            commit_id: SurfaceCommitId::for_tests(99),
+            commit_sequence: SurfaceCommitSequence(99),
+        };
+
+        let grandchild_one = test_mergeable_commit(1);
+        let grandchild_one_ref = grandchild_one.content_update_ref(grandchild_id);
+        let mut grandchild_two = test_mergeable_commit(2);
+        grandchild_two.lineage.predecessor = Some(grandchild_one_ref);
+        let grandchild_two_ref = grandchild_two.content_update_ref(grandchild_id);
+        let mut child = test_mergeable_commit(3);
+        child.lineage.child_dependencies = vec![grandchild_one_ref, grandchild_two_ref];
+
+        state.submit_surface_tree_nodes_with_kind(
+            child_id,
+            vec![
+                (grandchild_id, grandchild_one),
+                (grandchild_id, grandchild_two),
+                (child_id, child),
+            ],
+            vec![blocker],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        assert_eq!(state.pending_surface_tree_transactions.len(), 1);
+        let transaction = &state.pending_surface_tree_transactions[0];
+        assert_eq!(
+            transaction
+                .nodes
+                .iter()
+                .map(|(surface_id, _)| *surface_id)
+                .collect::<Vec<_>>(),
+            vec![grandchild_id, child_id]
+        );
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            grandchild_one_ref
+        ));
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            grandchild_two_ref
+        ));
+        assert_eq!(
+            transaction
+                .publication_lifetimes
+                .captured()
+                .expect("captured publication lifetimes")
+                .iter()
+                .map(|lifetime| lifetime.surface_id)
+                .collect::<Vec<_>>(),
+            vec![grandchild_id, child_id]
+        );
+    }
+
+    #[test]
+    fn coalesced_range_covers_absorbed_updates_but_not_oldest_predecessor() {
+        let mut state = CompositorState::default();
+        let (_display, client, surface_id) = test_surface_and_client(&mut state);
+        let predecessor = ContentUpdateRef {
+            surface_id,
+            commit_id: SurfaceCommitId::for_tests(1),
+            commit_sequence: SurfaceCommitSequence(1),
+        };
+        let mut first = test_mergeable_commit(2);
+        first.lineage.predecessor = Some(predecessor);
+        let first_ref = first.content_update_ref(surface_id);
+        let mut second = test_mergeable_commit(3);
+        second.lineage.predecessor = Some(first_ref);
+        let second_ref = second.content_update_ref(surface_id);
+        let mut transaction = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(16),
+            root_surface_id: surface_id,
+            nodes: vec![(surface_id, first)],
+            publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+
+        state.merge_surface_tree_nodes_into_transaction(
+            surface_id,
+            &mut transaction,
+            vec![(surface_id, second)],
+            test_captured_lifetimes(&client.id(), &[surface_id]),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(transaction_covers_content_update_ref(
+            &transaction,
+            first_ref
+        ));
+        assert!(transaction_covers_content_update_ref(
+            &transaction,
+            second_ref
+        ));
+        assert!(!transaction_covers_content_update_ref(
+            &transaction,
+            predecessor
+        ));
+    }
+
+    #[test]
+    fn repeated_same_surface_coalescence_covers_every_absorbed_update() {
+        let mut state = CompositorState::default();
+        let (_display, client, surface_id) = test_surface_and_client(&mut state);
+        let first = test_mergeable_commit(1);
+        let mut transaction = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(17),
+            root_surface_id: surface_id,
+            nodes: vec![(surface_id, first)],
+            publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+        let mut refs = vec![transaction.nodes[0].1.content_update_ref(surface_id)];
+        for sequence in 2..=4 {
+            let mut newer = test_mergeable_commit(sequence);
+            newer.lineage.predecessor = refs.last().copied();
+            refs.push(newer.content_update_ref(surface_id));
+            state.merge_surface_tree_nodes_into_transaction(
+                surface_id,
+                &mut transaction,
+                vec![(surface_id, newer)],
+                test_captured_lifetimes(&client.id(), &[surface_id]),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+
+        assert_eq!(transaction.nodes.len(), 1);
+        assert_eq!(
+            transaction.nodes[0].1.commit_sequence,
+            SurfaceCommitSequence(4)
+        );
+        for reference in refs {
+            assert!(transaction_covers_content_update_ref(
+                &transaction,
+                reference
+            ));
+        }
+    }
+
+    #[test]
+    fn pacing_protected_same_surface_prefix_remains_exact() {
+        let mut state = CompositorState::default();
+        let (display, client, _root_surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = |state: &mut CompositorState| {
+            let resource =
+                state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+            let surface_id = compositor_surface_id(&resource);
+            state.surface_presentation_generations.insert(surface_id, 1);
+            surface_id
+        };
+        let grandchild_id = surface(&mut state);
+        let child_id = surface(&mut state);
+        let blocker_id = surface(&mut state);
+        let blocker = ContentUpdateRef {
+            surface_id: blocker_id,
+            commit_id: SurfaceCommitId::for_tests(99),
+            commit_sequence: SurfaceCommitSequence(99),
+        };
+        let mut grandchild_one = test_cached_commit(1);
+        grandchild_one.pacing.fifo_set_barrier = true;
+        let grandchild_one_ref = grandchild_one.content_update_ref(grandchild_id);
+        let mut grandchild_two = test_mergeable_commit(2);
+        grandchild_two.lineage.predecessor = Some(grandchild_one_ref);
+        let grandchild_two_ref = grandchild_two.content_update_ref(grandchild_id);
+        let mut child = test_mergeable_commit(3);
+        child.lineage.child_dependencies = vec![grandchild_one_ref, grandchild_two_ref];
+
+        state.submit_surface_tree_nodes_with_kind(
+            child_id,
+            vec![
+                (grandchild_id, grandchild_one),
+                (grandchild_id, grandchild_two),
+                (child_id, child),
+            ],
+            vec![blocker],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let transaction = &state.pending_surface_tree_transactions[0];
+        assert_eq!(transaction.ordering(), TransactionOrdering::PacingProtected);
+        assert_eq!(
+            transaction
+                .nodes
+                .iter()
+                .map(|(_, commit)| commit.commit_sequence)
+                .collect::<Vec<_>>(),
+            vec![
+                SurfaceCommitSequence(1),
+                SurfaceCommitSequence(2),
+                SurfaceCommitSequence(3)
+            ]
+        );
+        assert_eq!(
+            transaction_node_index_covering_content_update_ref(transaction, grandchild_one_ref),
+            Some(0)
+        );
+        assert_eq!(
+            transaction_node_index_covering_content_update_ref(transaction, grandchild_two_ref),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn coalescible_mixed_dag_reduces_each_surface_and_keeps_dependencies_before_dependents() {
+        let mut state = CompositorState::default();
+        let (display, client, _root_surface_id) = test_surface_and_client(&mut state);
+        let display_handle = display.handle();
+        let surface = |state: &mut CompositorState| {
+            let resource =
+                state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+            let surface_id = compositor_surface_id(&resource);
+            state.surface_presentation_generations.insert(surface_id, 1);
+            surface_id
+        };
+        let grandchild_id = surface(&mut state);
+        let child_id = surface(&mut state);
+        let blocker_id = surface(&mut state);
+        let blocker = ContentUpdateRef {
+            surface_id: blocker_id,
+            commit_id: SurfaceCommitId::for_tests(99),
+            commit_sequence: SurfaceCommitSequence(99),
+        };
+        let grandchild_one = test_mergeable_commit(1);
+        let grandchild_one_ref = grandchild_one.content_update_ref(grandchild_id);
+        let mut child_one = test_mergeable_commit(2);
+        child_one.lineage.child_dependencies = vec![grandchild_one_ref];
+        let child_one_ref = child_one.content_update_ref(child_id);
+        let mut grandchild_two = test_mergeable_commit(3);
+        grandchild_two.lineage.predecessor = Some(grandchild_one_ref);
+        let grandchild_two_ref = grandchild_two.content_update_ref(grandchild_id);
+        let mut child_two = test_mergeable_commit(4);
+        child_two.lineage.predecessor = Some(child_one_ref);
+        child_two.lineage.child_dependencies = vec![grandchild_two_ref];
+        let child_two_ref = child_two.content_update_ref(child_id);
+
+        state.submit_surface_tree_nodes_with_kind(
+            child_id,
+            vec![
+                (grandchild_id, grandchild_one),
+                (child_id, child_one),
+                (grandchild_id, grandchild_two),
+                (child_id, child_two),
+            ],
+            vec![blocker],
+            SurfaceTreeSubmissionKind::ClientAdmission,
+        );
+
+        let transaction = &state.pending_surface_tree_transactions[0];
+        assert_eq!(
+            transaction
+                .nodes
+                .iter()
+                .map(|(surface_id, _)| *surface_id)
+                .collect::<Vec<_>>(),
+            vec![grandchild_id, child_id]
+        );
+        let grandchild = &transaction.nodes[0].1;
+        let child = &transaction.nodes[1].1;
+        assert_eq!(grandchild.commit_sequence, SurfaceCommitSequence(3));
+        assert_eq!(child.commit_sequence, SurfaceCommitSequence(4));
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            grandchild_one_ref
+        ));
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            grandchild_two_ref
+        ));
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            child_one_ref
+        ));
+        assert!(transaction_covers_content_update_ref(
+            transaction,
+            child_two_ref
+        ));
+        assert_eq!(
+            child.lineage.child_dependencies,
+            vec![grandchild_one_ref, grandchild_two_ref]
+        );
+    }
+
+    #[test]
+    fn canceled_transaction_selects_the_latest_root_resize_snapshot() {
+        let root_surface_id = 70;
+        let older_snapshot = ResizeCommitSnapshot {
+            serial: 1,
+            sequence: 1,
+            commit_sequence: 1,
+            width: 100,
+            height: 100,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            emitted_at: Instant::now(),
+            committed_size: Some((100, 100)),
+            committed_window_geometry: None,
+            buffer_id: None,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        let newer_snapshot = ResizeCommitSnapshot {
+            sequence: 2,
+            commit_sequence: 2,
+            width: 200,
+            height: 200,
+            committed_size: Some((200, 200)),
+            interaction_id: ResizeInteractionId::new(2),
+            ..older_snapshot
+        };
+        let mut older = test_mergeable_commit(1);
+        older.resize_commit = Some(older_snapshot);
+        let older_ref = older.content_update_ref(root_surface_id);
+        let mut newer = test_mergeable_commit(2);
+        newer.lineage.predecessor = Some(older_ref);
+        newer.resize_commit = Some(newer_snapshot);
+        let mut nodes = vec![
+            (root_surface_id, older),
+            (71, test_mergeable_commit(3)),
+            (root_surface_id, newer),
+        ];
+
+        let selected = take_tree_resize_commit(root_surface_id, &mut nodes)
+            .expect("latest root resize snapshot");
+
+        assert_eq!(selected.commit_sequence, 2);
+        assert!(nodes[0].1.resize_commit.is_some());
+        assert!(nodes[2].1.resize_commit.is_none());
+    }
 }
 
 struct ContentUpdateCandidateExtractor<'a> {
@@ -730,6 +1083,26 @@ fn transaction_covers_content_update_ref(
     transaction_node_index_covering_content_update_ref(transaction, reference).is_some()
 }
 
+fn normalize_external_content_dependencies_for_nodes(
+    nodes: &[(u32, CachedSubsurfaceCommit)],
+    dependencies: &mut Vec<ContentUpdateRef>,
+) {
+    let input = std::mem::take(dependencies);
+    let normalized = input
+        .into_iter()
+        .filter(|dependency| node_index_covering_content_update_ref(nodes, *dependency).is_none())
+        .fold(Vec::new(), |mut normalized, dependency| {
+            if !normalized.contains(&dependency) {
+                normalized.push(dependency);
+            }
+            normalized
+        });
+    *dependencies = normalized;
+    debug_assert!(dependencies.iter().all(|dependency| {
+        node_index_covering_content_update_ref(nodes, *dependency).is_none()
+    }));
+}
+
 fn normalize_transaction_external_content_dependencies(
     transaction: &mut PendingSurfaceTreeTransaction,
 ) {
@@ -848,11 +1221,8 @@ fn debug_assert_surface_tree_content_update_invariants(
         .captured()
         .expect("surface-tree transactions use captured publication lifetimes");
     debug_assert_eq!(lifetimes.len(), transaction.nodes.len());
-    let mut surfaces = Vec::with_capacity(transaction.nodes.len());
     for (node_index, (surface_id, commit)) in transaction.nodes.iter().enumerate() {
         debug_assert_eq!(lifetimes[node_index].surface_id, *surface_id);
-        debug_assert!(!surfaces.contains(surface_id));
-        surfaces.push(*surface_id);
         if let Some(predecessor) = commit.lineage.predecessor {
             debug_assert_eq!(predecessor.surface_id, *surface_id);
             debug_assert!(predecessor.commit_sequence < commit.commit_sequence);
@@ -864,6 +1234,30 @@ fn debug_assert_surface_tree_content_update_invariants(
             {
                 debug_assert!(dependency_index <= node_index);
             }
+        }
+    }
+    for (first_index, (first_surface_id, first)) in transaction.nodes.iter().enumerate() {
+        for (later_surface_id, later) in transaction.nodes.iter().skip(first_index + 1) {
+            if first_surface_id != later_surface_id {
+                continue;
+            }
+            if transaction.ordering() == TransactionOrdering::Coalescible {
+                debug_assert!(
+                    false,
+                    "coalescible transaction retains multiple ranges for one surface"
+                );
+            }
+            debug_assert!(first.commit_sequence < later.commit_sequence);
+            debug_assert!(!content_update_node_covers_ref(
+                *later_surface_id,
+                later,
+                first.content_update_ref(*first_surface_id),
+            ));
+            debug_assert!(!content_update_node_covers_ref(
+                *first_surface_id,
+                first,
+                later.content_update_ref(*later_surface_id),
+            ));
         }
     }
     debug_assert!(
@@ -1343,6 +1737,14 @@ impl CompositorState {
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         }
+        if nodes.iter().all(|(_, commit)| !commit.pacing.is_boundary()) {
+            nodes = self.canonicalize_coalescible_surface_tree_nodes(nodes);
+        }
+        let mut external_content_update_dependencies = external_content_update_dependencies;
+        normalize_external_content_dependencies_for_nodes(
+            &nodes,
+            &mut external_content_update_dependencies,
+        );
         let Some(dependencies) = self.prepare_surface_tree_acquires(&mut nodes) else {
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
@@ -1359,6 +1761,54 @@ impl CompositorState {
             external_content_update_dependencies,
             submission_kind,
         );
+    }
+
+    fn canonicalize_coalescible_surface_tree_nodes(
+        &mut self,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) -> Vec<(u32, CachedSubsurfaceCommit)> {
+        debug_assert!(nodes.iter().all(|(_, commit)| !commit.pacing.is_boundary()));
+        let mut canonical = Vec::with_capacity(nodes.len());
+        for (surface_id, newer) in nodes {
+            let Some(existing_index) = canonical
+                .iter()
+                .position(|(existing_surface_id, _)| *existing_surface_id == surface_id)
+            else {
+                canonical.push((surface_id, newer));
+                continue;
+            };
+            let existing = &mut canonical[existing_index].1;
+            debug_assert!(existing.commit_sequence < newer.commit_sequence);
+            if let Some(predecessor) = newer.lineage.predecessor {
+                debug_assert_eq!(predecessor.surface_id, surface_id);
+                debug_assert!(content_update_node_covers_ref(
+                    surface_id,
+                    existing,
+                    predecessor
+                ));
+            }
+            let attachment_changed = newer.attachment.is_some();
+            let old_resize_commit = attachment_changed
+                .then(|| pending_node_resize_commit(existing))
+                .flatten();
+            let previous_commit_id = existing.commit_id;
+            let previous_callback_count = existing.frame_callbacks.len();
+            let replacement_commit_id = newer.commit_id;
+            if let Some(release) = existing.merge(newer) {
+                self.release_pending_surface_buffer(release);
+            }
+            if previous_commit_id != replacement_commit_id {
+                self.note_explicit_commit_merged(
+                    previous_commit_id,
+                    replacement_commit_id,
+                    previous_callback_count,
+                );
+            }
+            if let Some(resize_commit) = old_resize_commit {
+                self.release_detached_resize_capture(surface_id, resize_commit);
+            }
+        }
+        canonical
     }
 
     fn capture_surface_tree_node_lifetimes(
@@ -1546,6 +1996,8 @@ impl CompositorState {
         let Some(publication_lifetimes) = publication_lifetimes.captured() else {
             return SurfaceTreeMergeStats::default();
         };
+        debug_assert_eq!(transaction.ordering(), TransactionOrdering::Coalescible);
+        debug_assert!(nodes.iter().all(|(_, commit)| !commit.pacing.is_boundary()));
         if publication_lifetimes.len() != nodes.len() {
             return SurfaceTreeMergeStats::default();
         }
@@ -1918,7 +2370,7 @@ impl CompositorState {
         dependencies: Vec<SurfaceTreeAcquireDependency>,
         external_content_update_dependencies: Vec<ContentUpdateRef>,
     ) -> PendingSurfaceTreeTransaction {
-        PendingSurfaceTreeTransaction {
+        let mut transaction = PendingSurfaceTreeTransaction {
             id: self.allocate_surface_tree_transaction_id(),
             root_surface_id,
             nodes,
@@ -1927,7 +2379,11 @@ impl CompositorState {
             external_content_update_dependencies,
             commit_timing_readiness: None,
             received_at: Instant::now(),
-        }
+        };
+        normalize_transaction_external_content_dependencies(&mut transaction);
+        normalize_surface_tree_node_order(&mut transaction);
+        debug_assert_surface_tree_content_update_invariants(&transaction);
+        transaction
     }
 
     fn queue_waiting_surface_tree_transaction(
@@ -2090,6 +2546,9 @@ impl CompositorState {
         transaction.nodes = nodes;
         transaction.dependencies = dependencies;
         transaction.external_content_update_dependencies = external_content_update_dependencies;
+        normalize_transaction_external_content_dependencies(&mut transaction);
+        normalize_surface_tree_node_order(&mut transaction);
+        debug_assert_surface_tree_content_update_invariants(&transaction);
         self.pending_surface_tree_transactions.push(transaction);
         self.rebuild_scene_work_index();
         if submission_kind == SurfaceTreeSubmissionKind::ClientAdmission {
@@ -2164,7 +2623,8 @@ impl CompositorState {
             let (commit_sequence, buffer_id) = transaction
                 .nodes
                 .iter()
-                .find(|(node_surface_id, _)| *node_surface_id == surface_id)
+                .filter(|(node_surface_id, _)| *node_surface_id == surface_id)
+                .max_by_key(|(_, commit)| commit.commit_sequence)
                 .map_or((SurfaceCommitSequence::initial(), None), |(_, commit)| {
                     (
                         commit.commit_sequence,

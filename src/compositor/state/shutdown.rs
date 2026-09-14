@@ -79,9 +79,13 @@ pub(in crate::compositor) fn take_tree_resize_commit(
     root_surface_id: u32,
     nodes: &mut [(u32, CachedSubsurfaceCommit)],
 ) -> Option<ResizeCommitSnapshot> {
-    let (_, root) = nodes
-        .iter_mut()
-        .find(|(surface_id, _)| *surface_id == root_surface_id)?;
+    let root_index = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, (surface_id, _))| *surface_id == root_surface_id)
+        .max_by_key(|(_, (_, commit))| commit.commit_sequence)
+        .map(|(index, _)| index)?;
+    let root = &mut nodes[root_index].1;
     match root.attachment.as_mut() {
         Some(PendingSurfaceAttachment::Buffer(buffer)) => {
             buffer.resize_commit.take().map(|resize| *resize)
