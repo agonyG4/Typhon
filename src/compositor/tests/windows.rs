@@ -654,6 +654,34 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
 }
 
 #[test]
+fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleFullscreenFocused,
+        false,
+    )
+    .unwrap();
+    let (_panel_connection, _panel_queue, _panel_surface, _panel) =
+        map_exclusive_top_panel(&socket_path);
+    raise_root_window(&commands, surface_ids[1]);
+
+    let metrics = capture_fullscreen_render_plan_metrics(&commands);
+    let presented = capture_native_frame_surface_ids(&commands);
+    assert_eq!(metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(metrics.solitary_tree_active);
+    assert_eq!(presented, vec![surface_ids[2]]);
+    assert!(!presented.contains(&surface_ids[1]));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn fullscreen_client_request_uses_absolute_output_origin() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
