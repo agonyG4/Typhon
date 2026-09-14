@@ -13,6 +13,174 @@ struct PreparedContentUpdateCandidate {
     external_content_update_dependencies: Vec<ContentUpdateRef>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cached_commit(sequence: u64) -> CachedSubsurfaceCommit {
+        let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
+        commit.commit_id = SurfaceCommitId::for_tests(sequence);
+        commit.commit_sequence = SurfaceCommitSequence(sequence);
+        commit.pacing.fifo_set_barrier = true;
+        commit
+    }
+
+    #[test]
+    fn candidate_extraction_follows_exact_direct_child_edges() {
+        let mut state = CompositorState::default();
+        assert!(state.subsurface_transactions.register(2, 1));
+        assert!(state.subsurface_transactions.register(3, 2));
+
+        let grandchild = test_cached_commit(10);
+        let grandchild_ref = grandchild.content_update_ref(3);
+        assert!(matches!(
+            state.subsurface_transactions.cache_commit(3, grandchild),
+            CacheCommitOutcome::Inserted
+        ));
+        let dependencies = state
+            .subsurface_transactions
+            .capture_direct_child_dependencies(2);
+        assert_eq!(dependencies, vec![grandchild_ref]);
+
+        let later_grandchild = test_cached_commit(11);
+        assert!(matches!(
+            state
+                .subsurface_transactions
+                .cache_commit(3, later_grandchild),
+            CacheCommitOutcome::Inserted
+        ));
+
+        let mut child = test_cached_commit(12);
+        child.lineage.child_dependencies = dependencies;
+        let candidate = state.extract_content_update_candidate(2, child);
+
+        assert_eq!(
+            candidate
+                .nodes
+                .iter()
+                .map(|(_, commit)| commit.commit_sequence)
+                .collect::<Vec<_>>(),
+            vec![SurfaceCommitSequence(10), SurfaceCommitSequence(12)]
+        );
+        assert!(candidate.external_content_update_dependencies.is_empty());
+        let remaining = state
+            .subsurface_transactions
+            .take_cached_commits_for_surface(3);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|commit| commit.commit_sequence)
+                .collect::<Vec<_>>(),
+            vec![SurfaceCommitSequence(11)]
+        );
+    }
+
+    #[test]
+    fn candidate_extraction_does_not_drain_orphan_grandchildren() {
+        let mut state = CompositorState::default();
+        assert!(state.subsurface_transactions.register(2, 1));
+        assert!(state.subsurface_transactions.register(3, 2));
+        assert!(matches!(
+            state
+                .subsurface_transactions
+                .cache_commit(3, test_cached_commit(20)),
+            CacheCommitOutcome::Inserted
+        ));
+
+        let candidate = state.extract_content_update_candidate(1, test_cached_commit(21));
+
+        assert_eq!(candidate.nodes.len(), 1);
+        assert_eq!(candidate.nodes[0].0, 1);
+        assert_eq!(
+            state
+                .subsurface_transactions
+                .take_cached_commits_for_surface(3)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cached_same_surface_prefix_is_emitted_in_predecessor_order() {
+        let mut state = CompositorState::default();
+        assert!(state.subsurface_transactions.register(2, 1));
+        for sequence in 30..=32 {
+            assert!(matches!(
+                state
+                    .subsurface_transactions
+                    .cache_commit(2, test_cached_commit(sequence)),
+                CacheCommitOutcome::Inserted
+            ));
+        }
+        let reference = ContentUpdateRef {
+            surface_id: 2,
+            commit_id: SurfaceCommitId::for_tests(32),
+            commit_sequence: SurfaceCommitSequence(32),
+        };
+        let mut dependent = test_cached_commit(33);
+        dependent.lineage.child_dependencies = vec![reference];
+
+        let candidate = state.extract_content_update_candidate(1, dependent);
+
+        assert_eq!(
+            candidate
+                .nodes
+                .iter()
+                .map(|(_, commit)| commit.commit_sequence)
+                .collect::<Vec<_>>(),
+            vec![
+                SurfaceCommitSequence(30),
+                SurfaceCommitSequence(31),
+                SurfaceCommitSequence(32),
+                SurfaceCommitSequence(33),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_content_update_dependencies_wait_for_their_owner() {
+        let mut state = CompositorState::default();
+        let dependency = ContentUpdateRef {
+            surface_id: 2,
+            commit_id: SurfaceCommitId::for_tests(40),
+            commit_sequence: SurfaceCommitSequence(40),
+        };
+        state.pending_surface_tree_transactions.push(
+            PendingSurfaceTreeTransaction {
+                id: SurfaceTreeTransactionId::new(1),
+                root_surface_id: 1,
+                nodes: vec![(2, test_cached_commit(40))],
+                publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+                dependencies: Vec::new(),
+                external_content_update_dependencies: Vec::new(),
+                commit_timing_readiness: None,
+                received_at: Instant::now(),
+            },
+        );
+        let waiting = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(2),
+            root_surface_id: 3,
+            nodes: vec![(3, test_cached_commit(41))],
+            publication_lifetimes: SurfaceTreeNodeLifetimes::Synthetic,
+            dependencies: Vec::new(),
+            external_content_update_dependencies: vec![dependency],
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+
+        assert!(!state.content_update_dependencies_ready(&waiting));
+        state.pending_surface_tree_transactions.clear();
+        state.surface_publications.insert(
+            2,
+            SurfacePublicationState {
+                latest_published: Some(SurfaceCommitSequence(40)),
+                ..SurfacePublicationState::default()
+            },
+        );
+        assert!(state.content_update_dependencies_ready(&waiting));
+    }
+}
+
 struct ContentUpdateCandidateExtractor<'a> {
     state: &'a mut CompositorState,
     nodes: Vec<(u32, CachedSubsurfaceCommit)>,
@@ -43,6 +211,10 @@ impl ContentUpdateCandidateExtractor<'_> {
     }
 
     fn visit_reference(&mut self, reference: ContentUpdateRef) {
+        if self.visiting.contains(&reference) {
+            debug_assert!(false, "content update dependency cycle detected");
+            return;
+        }
         if self.seen.contains(&reference) {
             return;
         }
