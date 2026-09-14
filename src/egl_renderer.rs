@@ -31,7 +31,7 @@ use oblivion_one::{
         LampWindowSample, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
         LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleRenderFallbacks,
         LifecycleSceneSample, LifecycleVisualSource, LifecycleVisualSourceKind, lamp_footprint,
-        lamp_stage_channels,
+        lamp_motion_channels,
     },
 };
 
@@ -557,9 +557,9 @@ struct LampUniformLocations {
     direction: Option<glow::UniformLocation>,
     shape_factor: Option<glow::UniformLocation>,
     bump_distance: Option<glow::UniformLocation>,
-    bump_progress: Option<glow::UniformLocation>,
-    stretch_progress: Option<glow::UniformLocation>,
-    squash_progress: Option<glow::UniformLocation>,
+    contraction_progress: Option<glow::UniformLocation>,
+    translation_progress: Option<glow::UniformLocation>,
+    retreat_progress: Option<glow::UniformLocation>,
     framebuffer_origin_bottom_left: Option<glow::UniformLocation>,
     texture: Option<glow::UniformLocation>,
 }
@@ -1157,9 +1157,9 @@ impl GlesSceneRenderer {
                 direction: gl.get_uniform_location(program, "u_direction"),
                 shape_factor: gl.get_uniform_location(program, "u_shape_factor"),
                 bump_distance: gl.get_uniform_location(program, "u_bump_distance"),
-                bump_progress: gl.get_uniform_location(program, "u_bump_progress"),
-                stretch_progress: gl.get_uniform_location(program, "u_stretch_progress"),
-                squash_progress: gl.get_uniform_location(program, "u_squash_progress"),
+                contraction_progress: gl.get_uniform_location(program, "u_contraction_progress"),
+                translation_progress: gl.get_uniform_location(program, "u_translation_progress"),
+                retreat_progress: gl.get_uniform_location(program, "u_retreat_progress"),
                 framebuffer_origin_bottom_left: gl
                     .get_uniform_location(program, "u_framebuffer_origin_bottom_left"),
                 texture: gl.get_uniform_location(program, "u_texture"),
@@ -3770,26 +3770,23 @@ impl GlesSceneRenderer {
                         (sample.visual_group.bump_distance * output_scale) as f32,
                     );
                 }
-                let channels = lamp_stage_channels(
-                    sample.progress,
-                    sample.visual_group.shape_factor,
-                    sample.visual_group.bump_distance,
-                );
-                if let Some(location) = &uniforms.bump_progress {
+                let channels =
+                    lamp_motion_channels(sample.progress, sample.visual_group.bump_distance);
+                if let Some(location) = &uniforms.contraction_progress {
                     self.gl
-                        .uniform_1_f32(Some(location), channels.bump_progress as f32);
+                        .uniform_1_f32(Some(location), channels.contraction_progress as f32);
                 }
-                if let Some(location) = &uniforms.stretch_progress {
+                if let Some(location) = &uniforms.translation_progress {
                     self.gl
-                        .uniform_1_f32(Some(location), channels.stretch_progress as f32);
+                        .uniform_1_f32(Some(location), channels.translation_progress as f32);
                 }
-                if let Some(location) = &uniforms.squash_progress {
+                if let Some(location) = &uniforms.retreat_progress {
                     self.gl
-                        .uniform_1_f32(Some(location), channels.squash_progress as f32);
+                        .uniform_1_f32(Some(location), channels.retreat_progress as f32);
                 }
                 if let Some(location) = &uniforms.progress {
                     self.gl
-                        .uniform_1_f32(Some(location), sample.progress as f32);
+                        .uniform_1_f32(Some(location), channels.temporal_progress as f32);
                 }
                 if let Some(location) = &uniforms.opacity {
                     self.gl.uniform_1_f32(Some(location), sample.opacity as f32);
@@ -6562,6 +6559,19 @@ mod tests {
             let _ = self.egl.destroy_context(self.display, self.context);
             let _ = self.egl.terminate(self.display);
         }
+    }
+
+    #[test]
+    fn lamp_renderer_locates_continuous_motion_uniforms() {
+        let harness = GlesEffectTestHarness::new(320, 200);
+        let uniforms = harness
+            .renderer
+            .lamp_uniform_locations
+            .expect("Lamp shader is available in the GLES test harness");
+        assert!(uniforms.progress.is_some());
+        assert!(uniforms.contraction_progress.is_some());
+        assert!(uniforms.translation_progress.is_some());
+        assert!(uniforms.retreat_progress.is_some());
     }
 
     fn moving_blur_scene(rect: EffectRect) -> (ResolvedEffectScene, EffectRegistry) {

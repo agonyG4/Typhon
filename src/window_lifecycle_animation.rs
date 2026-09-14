@@ -5,20 +5,25 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-/// Keep the default in the existing short desktop-animation class; the
-/// staged geometry supplies the visual richness rather than extra duration.
+/// Keep the default in the existing short desktop-animation class; spatial
+/// deformation supplies the visual richness rather than extra duration.
 pub const ASTREA_LAMP_BASE_DURATION_MS: u64 = 280;
-/// The shape starts gently and grows toward a compact neck as the Dock gets
-/// closer to the moving visual group.
+/// The frozen shape factor starts gently and grows toward a compact funnel as
+/// the Dock gets closer to the moving visual group.
 pub const ASTREA_LAMP_INITIAL_SHAPE_FACTOR: f64 = 0.20;
 pub const ASTREA_LAMP_MAX_SHAPE_FACTOR: f64 = 0.80;
-/// Relative stage weights for the directional bump/stretch/squash timeline.
-pub const ASTREA_LAMP_BUMP_WEIGHT: f64 = 0.12;
-pub const ASTREA_LAMP_STRETCH_WEIGHT: f64 = 0.70;
-pub const ASTREA_LAMP_SQUASH_WEIGHT: f64 = 1.0;
-pub const ASTREA_LAMP_NEAR_EDGE_BIAS: f64 = 0.18;
-pub const ASTREA_LAMP_NECK_BASE: f64 = 0.20;
-pub const ASTREA_LAMP_NECK_RANGE: f64 = 0.80;
+/// The contraction channel completes in globally eased-time space.
+pub const ASTREA_LAMP_CONTRACTION_END: f64 = 0.42;
+/// Translation begins while contraction is still active.
+pub const ASTREA_LAMP_TRANSLATION_START: f64 = 0.15;
+/// Fraction of normalized translation time spent in the quadratic soft start.
+pub const ASTREA_LAMP_TRANSLATION_BLEND: f64 = 0.25;
+/// Overlap retreat completes in raw lifecycle-progress space.
+pub const ASTREA_LAMP_RETREAT_END: f64 = 0.30;
+/// Spatial delay power applied to rows away from the destination edge.
+pub const ASTREA_LAMP_STRETCH_POWER: f64 = 2.0;
+pub const ASTREA_LAMP_SPATIAL_EXPONENT_MIN: f64 = 2.0;
+pub const ASTREA_LAMP_SPATIAL_EXPONENT_MAX: f64 = 3.0;
 /// Keep the Genie opaque until its final endpoint cleanup interval.
 pub const ASTREA_LAMP_FINAL_OPACITY_START: f64 = 0.98;
 const MAX_LIFECYCLE_RENDER_EVIDENCE_ENTRIES: usize = 65_536;
@@ -930,13 +935,7 @@ fn valid_lamp_rects(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LampStageChannels {
-    pub bump_progress: f64,
-    pub stretch_progress: f64,
-    pub squash_progress: f64,
-}
-
+/// The single global Lamp temporal curve; all other channels derive from it.
 fn in_out_cubic(value: f64) -> f64 {
     let value = value.clamp(0.0, 1.0);
     if value < 0.5 {
@@ -946,54 +945,93 @@ fn in_out_cubic(value: f64) -> f64 {
     }
 }
 
-fn stage_progress(progress: f64, start: f64, end: f64) -> f64 {
-    if end <= start {
-        return 0.0;
-    }
-    in_out_cubic(((progress - start) / (end - start)).clamp(0.0, 1.0))
-}
-
-fn stage_fractions(shape_factor: f64, bump_distance: f64) -> (f64, f64, f64) {
-    let bump_weight = if bump_distance.is_finite() && bump_distance > f64::EPSILON {
-        ASTREA_LAMP_BUMP_WEIGHT
+fn smoothstep01(value: f64) -> f64 {
+    let value = if value.is_finite() {
+        value.clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let stretch_weight = (ASTREA_LAMP_STRETCH_WEIGHT
-        * if shape_factor.is_finite() {
-            shape_factor.clamp(
-                ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
-                ASTREA_LAMP_MAX_SHAPE_FACTOR,
-            )
-        } else {
-            ASTREA_LAMP_INITIAL_SHAPE_FACTOR
-        })
-    .max(f64::EPSILON);
-    let total = bump_weight + stretch_weight + ASTREA_LAMP_SQUASH_WEIGHT;
-    (
-        bump_weight / total,
-        stretch_weight / total,
-        ASTREA_LAMP_SQUASH_WEIGHT / total,
-    )
+    value * value * (3.0 - 2.0 * value)
 }
 
-pub fn lamp_stage_channels(
-    progress: f64,
-    shape_factor: f64,
-    bump_distance: f64,
-) -> LampStageChannels {
+/// Blend a short zero-slope quadratic into a linear translation ramp.
+///
+/// For normalized `t` and blend width `b`, the unnormalized function is
+/// `t^2/(2b)` before the join and `t-b/2` after it. Both branches equal `b/2`
+/// and have derivative one at `t=b`. Dividing by `1-b/2` normalizes the final
+/// value to one without changing that derivative equality.
+fn translation_soft_start(temporal_progress: f64) -> f64 {
+    let temporal_progress = if temporal_progress.is_finite() {
+        temporal_progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let normalized = ((temporal_progress - ASTREA_LAMP_TRANSLATION_START)
+        / (1.0 - ASTREA_LAMP_TRANSLATION_START))
+        .clamp(0.0, 1.0);
+    let blend = ASTREA_LAMP_TRANSLATION_BLEND;
+    let raw = if normalized < blend {
+        normalized * normalized / (2.0 * blend)
+    } else {
+        normalized - blend * 0.5
+    };
+    (raw / (1.0 - blend * 0.5)).clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LampMotionChannels {
+    pub temporal_progress: f64,
+    pub contraction_progress: f64,
+    pub translation_progress: f64,
+    pub retreat_progress: f64,
+}
+
+pub fn lamp_motion_channels(progress: f64, bump_distance: f64) -> LampMotionChannels {
     let progress = normalized_progress(progress);
-    let (bump_fraction, stretch_fraction, _) = stage_fractions(shape_factor, bump_distance);
-    let bump_end = bump_fraction;
-    let stretch_end = bump_fraction + stretch_fraction;
-    LampStageChannels {
-        bump_progress: if bump_fraction > 0.0 {
-            stage_progress(progress, 0.0, bump_end)
+    let temporal_progress = in_out_cubic(progress);
+    LampMotionChannels {
+        temporal_progress,
+        contraction_progress: smoothstep01(temporal_progress / ASTREA_LAMP_CONTRACTION_END),
+        translation_progress: translation_soft_start(temporal_progress),
+        retreat_progress: if bump_distance.is_finite() && bump_distance > f64::EPSILON {
+            smoothstep01(progress / ASTREA_LAMP_RETREAT_END)
         } else {
             0.0
         },
-        stretch_progress: stage_progress(progress, bump_end, stretch_end),
-        squash_progress: stage_progress(progress, stretch_end, 1.0),
+    }
+}
+
+fn spatial_funnel_exponent(shape_factor: f64) -> f64 {
+    let shape_factor = if shape_factor.is_finite() {
+        shape_factor.clamp(
+            ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
+            ASTREA_LAMP_MAX_SHAPE_FACTOR,
+        )
+    } else {
+        ASTREA_LAMP_INITIAL_SHAPE_FACTOR
+    };
+    let normalized = (shape_factor - ASTREA_LAMP_INITIAL_SHAPE_FACTOR)
+        / (ASTREA_LAMP_MAX_SHAPE_FACTOR - ASTREA_LAMP_INITIAL_SHAPE_FACTOR);
+    ASTREA_LAMP_SPATIAL_EXPONENT_MIN
+        + normalized * (ASTREA_LAMP_SPATIAL_EXPONENT_MAX - ASTREA_LAMP_SPATIAL_EXPONENT_MIN)
+}
+
+fn retreat_source_axis(source_axis: f64, direction: LampDirection, retreat_distance: f64) -> f64 {
+    match direction {
+        LampDirection::Top | LampDirection::Left => source_axis + retreat_distance,
+        LampDirection::Bottom | LampDirection::Right => source_axis - retreat_distance,
+    }
+}
+
+fn lamp_row_translation(channels: LampMotionChannels, movement_normalized: f64) -> f64 {
+    let movement_normalized = movement_normalized.clamp(0.0, 1.0);
+    let contraction_progress = channels.contraction_progress.clamp(0.0, 1.0);
+    let stretch = ASTREA_LAMP_STRETCH_POWER * contraction_progress * (1.0 - movement_normalized);
+    let translation_progress = channels.translation_progress.clamp(0.0, 1.0);
+    if translation_progress >= 1.0 {
+        1.0
+    } else {
+        translation_progress.powf(1.0 + stretch)
     }
 }
 
@@ -1029,7 +1067,7 @@ pub fn lamp_warp_point_directional(
     direction: LampDirection,
     shape_factor: f64,
     bump_distance: f64,
-    channels: LampStageChannels,
+    channels: LampMotionChannels,
     point: [f64; 2],
 ) -> [f64; 2] {
     if !valid_lamp_rects(source, source, anchor) || !point.into_iter().all(f64::is_finite) {
@@ -1047,46 +1085,32 @@ pub fn lamp_warp_point_directional(
         LampDirection::Top | LampDirection::Bottom => u,
         LampDirection::Left | LampDirection::Right => v,
     };
-    let (bump_fraction, stretch_fraction, _) = stage_fractions(shape_factor, bump_distance);
-    let base_motion = (bump_fraction * channels.bump_progress
-        + stretch_fraction * channels.stretch_progress)
+    let funnel_weight = movement_normalized
+        .powf(spatial_funnel_exponent(shape_factor))
         .clamp(0.0, 1.0);
-    let bump_ratio = (bump_distance.max(0.0) / movement_extent(source, direction)).clamp(0.0, 1.0);
-    let near_edge_bias = bump_ratio * ASTREA_LAMP_NEAR_EDGE_BIAS * channels.bump_progress;
-    let biased_motion = (base_motion
-        + (movement_normalized - 0.5) * near_edge_bias * (1.0 - base_motion))
-        .clamp(0.0, 1.0);
-    let source_axis = axis_position(source, direction, movement_normalized);
+    let early_contraction =
+        (channels.contraction_progress.clamp(0.0, 1.0) * funnel_weight).clamp(0.0, 1.0);
+    let row_translation = lamp_row_translation(channels, movement_normalized);
+    let retreat_distance = if bump_distance.is_finite() {
+        bump_distance
+            .max(0.0)
+            .min(movement_extent(source, direction))
+            * channels.retreat_progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let source_axis = retreat_source_axis(
+        axis_position(source, direction, movement_normalized),
+        direction,
+        retreat_distance,
+    );
     let target_axis = axis_position(anchor, direction, movement_normalized);
-    let pre_squash_axis = source_axis + (target_axis - source_axis) * biased_motion;
-    let axis = pre_squash_axis
-        + (target_axis - pre_squash_axis) * channels.squash_progress.clamp(0.0, 1.0);
+    let axis = source_axis + (target_axis - source_axis) * row_translation;
 
     let source_cross = cross_position(source, direction, cross_normalized);
     let target_cross = cross_position(anchor, direction, cross_normalized);
-    let source_cross_center = cross_position(source, direction, 0.5);
-    let shape_factor = if shape_factor.is_finite() {
-        shape_factor.clamp(
-            ASTREA_LAMP_INITIAL_SHAPE_FACTOR,
-            ASTREA_LAMP_MAX_SHAPE_FACTOR,
-        )
-    } else {
-        ASTREA_LAMP_INITIAL_SHAPE_FACTOR
-    };
-    let neck_scale = (1.0
-        - shape_factor
-            * channels.stretch_progress.clamp(0.0, 1.0)
-            * (ASTREA_LAMP_NECK_BASE + ASTREA_LAMP_NECK_RANGE * movement_normalized))
-        .clamp(0.05, 1.0);
-    let neck_candidate = source_cross_center + (source_cross - source_cross_center) * neck_scale;
-    let stretched_cross =
-        if (target_cross - neck_candidate).abs() <= (target_cross - source_cross).abs() {
-            neck_candidate
-        } else {
-            source_cross
-        };
-    let cross_motion = (biased_motion + channels.squash_progress).clamp(0.0, 1.0);
-    let cross = stretched_cross + (target_cross - stretched_cross) * cross_motion;
+    let cross_completion = 1.0 - (1.0 - early_contraction) * (1.0 - row_translation);
+    let cross = source_cross + (target_cross - source_cross) * cross_completion.clamp(0.0, 1.0);
 
     let warped = match direction {
         LampDirection::Top | LampDirection::Bottom => [cross, axis],
@@ -1126,7 +1150,7 @@ pub fn lamp_warp_point(
         direction,
         shape_factor,
         bump_distance,
-        lamp_stage_channels(progress, shape_factor, bump_distance),
+        lamp_motion_channels(progress, bump_distance),
         point,
     )
 }
@@ -1172,11 +1196,7 @@ pub fn lamp_warp_visual_point(
         visual_group.lamp_direction,
         visual_group.shape_factor,
         visual_group.bump_distance,
-        lamp_stage_channels(
-            progress,
-            visual_group.shape_factor,
-            visual_group.bump_distance,
-        ),
+        lamp_motion_channels(progress, visual_group.bump_distance),
         point,
     )
 }
@@ -1472,26 +1492,298 @@ mod tests {
     }
 
     #[test]
-    fn lamp_stage_channels_are_continuous_and_bump_is_optional() {
-        let without_bump = lamp_stage_channels(0.0, 0.2, 0.0);
-        assert_eq!(without_bump.bump_progress, 0.0);
-        assert_eq!(without_bump.stretch_progress, 0.0);
-        assert_eq!(without_bump.squash_progress, 0.0);
-        let with_bump = lamp_stage_channels(0.5, 0.6, 32.0);
-        assert!(with_bump.bump_progress >= 0.0 && with_bump.bump_progress <= 1.0);
-        assert!(with_bump.stretch_progress >= 0.0 && with_bump.stretch_progress <= 1.0);
-        assert!(with_bump.squash_progress >= 0.0 && with_bump.squash_progress <= 1.0);
-        let before = lamp_stage_channels(0.24, 0.6, 32.0);
-        let after = lamp_stage_channels(0.26, 0.6, 32.0);
-        assert!((before.bump_progress - after.bump_progress).abs() < 0.2);
-        assert!((before.stretch_progress - after.stretch_progress).abs() < 0.2);
-        let (bump_fraction, stretch_fraction, _) = stage_fractions(0.6, 32.0);
-        for boundary in [bump_fraction, bump_fraction + stretch_fraction] {
-            let before = lamp_stage_channels(boundary - 1.0e-6, 0.6, 32.0);
-            let after = lamp_stage_channels(boundary + 1.0e-6, 0.6, 32.0);
-            assert!((before.bump_progress - after.bump_progress).abs() < 1.0e-3);
-            assert!((before.stretch_progress - after.stretch_progress).abs() < 1.0e-3);
-            assert!((before.squash_progress - after.squash_progress).abs() < 1.0e-3);
+    fn lamp_continuous_funnel_has_no_internal_aggregate_stop() {
+        let source = rect(300.0, 200.0, 640.0, 480.0);
+        let anchor = rect(700.0, 900.0, 64.0, 64.0);
+        let direction = LampDirection::Bottom;
+        let shape_factor = 0.60;
+        let points = [
+            [620.0, 680.0], // near-edge center
+            [620.0, 440.0], // window center
+            [620.0, 200.0], // trailing-edge center
+            [300.0, 440.0], // left visual edge
+            [940.0, 440.0], // right visual edge
+        ];
+        let aggregate_velocity = |progress: f64, bump_distance: f64| {
+            let half_step = 1.0e-4;
+            let sum_squared_displacement = points
+                .into_iter()
+                .map(|point| {
+                    let before = lamp_warp_point_directional(
+                        source,
+                        anchor,
+                        direction,
+                        shape_factor,
+                        bump_distance,
+                        lamp_motion_channels(progress - half_step, bump_distance),
+                        point,
+                    );
+                    let after = lamp_warp_point_directional(
+                        source,
+                        anchor,
+                        direction,
+                        shape_factor,
+                        bump_distance,
+                        lamp_motion_channels(progress + half_step, bump_distance),
+                        point,
+                    );
+                    (after[0] - before[0]).powi(2) + (after[1] - before[1]).powi(2)
+                })
+                .sum::<f64>();
+            (sum_squared_displacement / points.len() as f64).sqrt() / (2.0 * half_step)
+        };
+
+        let sample_count = 512;
+        let velocities = (1..sample_count)
+            .map(|step| {
+                let progress = 0.08 + 0.84 * f64::from(step) / f64::from(sample_count);
+                aggregate_velocity(progress, 0.0)
+            })
+            .collect::<Vec<_>>();
+        let maximum = velocities.iter().copied().fold(0.0, f64::max);
+        let minimum = velocities.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(maximum > 1.0);
+        assert!(
+            minimum > 0.01,
+            "aggregate mesh velocity stopped internally: minimum={minimum}, maximum={maximum}"
+        );
+
+        for boundary in [0.29577464788732394, 0.07792207792207792] {
+            let bump_distance = if boundary < 0.1 { 48.0 } else { 0.0 };
+            let before = aggregate_velocity(boundary - 0.01, bump_distance);
+            let at_boundary = aggregate_velocity(boundary, bump_distance);
+            let after = aggregate_velocity(boundary + 0.01, bump_distance);
+            assert!(before > 1.0);
+            assert!(after > 1.0);
+            assert!(at_boundary > before.min(after) * 0.10);
+        }
+    }
+
+    #[test]
+    fn lamp_motion_channels_use_one_overlapping_timeline() {
+        let at_zero = lamp_motion_channels(0.0, 0.0);
+        assert_eq!(at_zero.temporal_progress, 0.0);
+        assert_eq!(at_zero.contraction_progress, 0.0);
+        assert_eq!(at_zero.translation_progress, 0.0);
+        assert_eq!(at_zero.retreat_progress, 0.0);
+
+        let representative = lamp_motion_channels(0.4, 0.0);
+        assert!((representative.temporal_progress - 0.256).abs() < 1.0e-12);
+        assert!(representative.contraction_progress > 0.0);
+        assert!(representative.translation_progress > 0.0);
+        assert_eq!(representative.retreat_progress, 0.0);
+
+        let overlap = lamp_motion_channels(0.4, 48.0);
+        assert!(overlap.contraction_progress > 0.0);
+        assert!(overlap.translation_progress > 0.0);
+        assert!(overlap.retreat_progress > 0.0);
+        assert!(overlap.retreat_progress <= 1.0);
+        assert_eq!(lamp_motion_channels(0.5, 0.0).retreat_progress, 0.0);
+        assert_eq!(lamp_motion_channels(1.0, 48.0).temporal_progress, 1.0);
+        assert_eq!(lamp_motion_channels(1.0, 48.0).translation_progress, 1.0);
+    }
+
+    #[test]
+    fn lamp_translation_soft_start_is_c1_at_its_internal_join() {
+        let start = ASTREA_LAMP_TRANSLATION_START;
+        let blend = ASTREA_LAMP_TRANSLATION_BLEND;
+        let join = start + (1.0 - start) * blend;
+        let step = 1.0e-6;
+        let left_slope =
+            (translation_soft_start(join) - translation_soft_start(join - step)) / step;
+        let right_slope =
+            (translation_soft_start(join + step) - translation_soft_start(join)) / step;
+        assert!((left_slope - right_slope).abs() < 1.0e-4);
+        assert_eq!(translation_soft_start(start), 0.0);
+        assert_eq!(translation_soft_start(1.0), 1.0);
+    }
+
+    #[test]
+    fn lamp_motion_channels_have_c1_boundaries_without_hidden_stages() {
+        let finite_difference_slope = |function: &dyn Fn(f64) -> f64, value: f64| {
+            let step = 1.0e-6;
+            (function(value + step) - function(value - step)) / (2.0 * step)
+        };
+
+        let translation_start = |value| translation_soft_start(value);
+        let translation_start_slope =
+            finite_difference_slope(&translation_start, ASTREA_LAMP_TRANSLATION_START);
+        assert!(translation_start_slope.abs() < 1.0e-4);
+
+        let translation_join = ASTREA_LAMP_TRANSLATION_START
+            + (1.0 - ASTREA_LAMP_TRANSLATION_START) * ASTREA_LAMP_TRANSLATION_BLEND;
+        let translation_join_left = {
+            let step = 1.0e-6;
+            (translation_soft_start(translation_join)
+                - translation_soft_start(translation_join - step))
+                / step
+        };
+        let translation_join_right = {
+            let step = 1.0e-6;
+            (translation_soft_start(translation_join + step)
+                - translation_soft_start(translation_join))
+                / step
+        };
+        assert!((translation_join_left - translation_join_right).abs() < 1.0e-4);
+
+        let contraction = |value| smoothstep01(value / ASTREA_LAMP_CONTRACTION_END);
+        let contraction_slope = finite_difference_slope(&contraction, ASTREA_LAMP_CONTRACTION_END);
+        assert!(contraction_slope.abs() < 1.0e-4);
+
+        let retreat = |value| smoothstep01(value / ASTREA_LAMP_RETREAT_END);
+        let retreat_slope = finite_difference_slope(&retreat, ASTREA_LAMP_RETREAT_END);
+        assert!(retreat_slope.abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn lamp_reversal_samples_the_same_frozen_geometry_function() {
+        let group = LifecycleVisualGroup::from_bounds(
+            rect(400.0, 100.0, 800.0, 600.0),
+            rect(384.0, 60.0, 832.0, 640.0),
+            rect(440.0, 140.0, 720.0, 540.0),
+            rect(1500.0, 500.0, 64.0, 64.0),
+            1920,
+            1080,
+        )
+        .expect("valid frozen Lamp visual group");
+        let points = [
+            [
+                group.presented_source_visual_rect.x(),
+                group.presented_source_visual_rect.y(),
+            ],
+            [
+                group.presented_source_visual_rect.x()
+                    + group.presented_source_visual_rect.width() * 0.37,
+                group.presented_source_visual_rect.y()
+                    + group.presented_source_visual_rect.height() * 0.61,
+            ],
+            [
+                group.presented_source_visual_rect.x() + group.presented_source_visual_rect.width(),
+                group.presented_source_visual_rect.y()
+                    + group.presented_source_visual_rect.height(),
+            ],
+        ];
+        for progress in [0.01, 0.17, 0.37, 0.73, 0.99] {
+            for point in points {
+                let minimize_sample = lamp_warp_visual_point(group, point, progress);
+                let restore_sample = lamp_warp_visual_point(group, point, progress);
+                assert_eq!(minimize_sample, restore_sample);
+            }
+        }
+    }
+
+    #[test]
+    fn lamp_funnel_moves_near_edge_before_trailing_edge() {
+        let source = rect(300.0, 200.0, 640.0, 480.0);
+        let anchor = rect(700.0, 900.0, 64.0, 64.0);
+        let channels = lamp_motion_channels(0.4, 0.0);
+        let near_edge = lamp_warp_point_directional(
+            source,
+            anchor,
+            LampDirection::Bottom,
+            0.6,
+            0.0,
+            channels,
+            [620.0, 680.0],
+        );
+        let trailing_edge = lamp_warp_point_directional(
+            source,
+            anchor,
+            LampDirection::Bottom,
+            0.6,
+            0.0,
+            channels,
+            [620.0, 200.0],
+        );
+        let near_axis_fraction = (near_edge[1] - 680.0) / (964.0 - 680.0);
+        let trailing_axis_fraction = (trailing_edge[1] - 200.0) / (900.0 - 200.0);
+        assert!(near_axis_fraction > trailing_axis_fraction);
+
+        let near_cross_fraction = (near_edge[0] - 620.0) / (732.0 - 620.0);
+        let trailing_cross_fraction = (trailing_edge[0] - 620.0) / (732.0 - 620.0);
+        assert!(near_cross_fraction > trailing_cross_fraction);
+    }
+
+    #[test]
+    fn lamp_retreat_is_bounded_overlapping_and_disabled_without_overlap() {
+        let source = rect(100.0, 100.0, 200.0, 200.0);
+        let overlapping_anchor = rect(100.0, 250.0, 64.0, 64.0);
+        let bump_distance = lamp_bump_distance(source, overlapping_anchor, LampDirection::Bottom);
+        assert_eq!(bump_distance, 50.0);
+
+        let progress = 0.15;
+        let channels = lamp_motion_channels(progress, bump_distance);
+        assert!(channels.retreat_progress > 0.0 && channels.retreat_progress < 1.0);
+        let retreated = lamp_warp_point_directional(
+            source,
+            overlapping_anchor,
+            LampDirection::Bottom,
+            0.6,
+            bump_distance,
+            channels,
+            [200.0, 300.0],
+        );
+        let without_retreat = lamp_warp_point_directional(
+            source,
+            overlapping_anchor,
+            LampDirection::Bottom,
+            0.6,
+            0.0,
+            lamp_motion_channels(progress, 0.0),
+            [200.0, 300.0],
+        );
+        assert!(retreated[1] < without_retreat[1]);
+        assert!((without_retreat[1] - retreated[1]) <= bump_distance);
+
+        let separated_anchor = rect(100.0, 500.0, 64.0, 64.0);
+        assert_eq!(
+            lamp_bump_distance(source, separated_anchor, LampDirection::Bottom),
+            0.0
+        );
+        assert_eq!(lamp_motion_channels(progress, 0.0).retreat_progress, 0.0);
+    }
+
+    #[test]
+    fn lamp_no_retreat_main_axis_motion_is_monotonic() {
+        let source = rect(300.0, 200.0, 640.0, 480.0);
+        let anchor = rect(700.0, 900.0, 64.0, 64.0);
+        for point in [[300.0, 200.0], [620.0, 440.0], [940.0, 680.0]] {
+            let mut previous = lamp_warp_point(source, anchor, point, 0.0)[1];
+            for step in 1..=100 {
+                let progress = f64::from(step) / 100.0;
+                let current = lamp_warp_point(source, anchor, point, progress)[1];
+                assert!(
+                    current + 1.0e-9 >= previous,
+                    "point {point:?} moved away from the Bottom anchor at progress {progress}"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn lamp_directional_endpoints_are_exact_for_all_output_edges() {
+        let source = rect(700.0, 400.0, 200.0, 200.0);
+        let point = [760.0, 520.0];
+        for (anchor, expected_direction) in [
+            (rect(760.0, 12.0, 64.0, 32.0), LampDirection::Top),
+            (rect(1840.0, 520.0, 64.0, 64.0), LampDirection::Right),
+            (rect(760.0, 1036.0, 64.0, 32.0), LampDirection::Bottom),
+            (rect(12.0, 520.0, 64.0, 64.0), LampDirection::Left),
+        ] {
+            let group =
+                LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+                    .expect("valid directional visual group");
+            assert_eq!(group.lamp_direction, expected_direction);
+            assert_eq!(lamp_warp_visual_point(group, point, 0.0), point);
+            let endpoint = lamp_warp_visual_point(group, point, 1.0);
+            assert_eq!(
+                endpoint,
+                [
+                    anchor.x() + 0.3 * anchor.width(),
+                    anchor.y() + 0.6 * anchor.height(),
+                ]
+            );
         }
     }
 
@@ -1519,7 +1811,7 @@ mod tests {
         let point = [620.0, 440.0];
         let shape = 0.4;
         let bump = 0.0;
-        let channels = lamp_stage_channels(0.5, shape, bump);
+        let channels = lamp_motion_channels(0.5, bump);
         let intermediate = lamp_warp_point_directional(
             source,
             anchor,
@@ -1550,7 +1842,7 @@ mod tests {
         let rotated_point = [40.0, 70.0];
         let shape = lamp_shape_factor(bottom_source, bottom_anchor, LampDirection::Bottom);
         let bump = lamp_bump_distance(bottom_source, bottom_anchor, LampDirection::Bottom);
-        let channels = lamp_stage_channels(0.55, shape, bump);
+        let channels = lamp_motion_channels(0.55, bump);
         let bottom = lamp_warp_point_directional(
             bottom_source,
             bottom_anchor,

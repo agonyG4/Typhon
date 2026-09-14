@@ -94,21 +94,17 @@ uniform float u_progress;
 uniform int u_direction;
 uniform float u_shape_factor;
 uniform float u_bump_distance;
-uniform float u_bump_progress;
-uniform float u_stretch_progress;
-uniform float u_squash_progress;
+uniform float u_contraction_progress;
+uniform float u_translation_progress;
+uniform float u_retreat_progress;
 uniform int u_framebuffer_origin_bottom_left;
 
-// Keep these values in lockstep with the documented Astrea Lamp constants in
-// window_lifecycle_animation.rs; the shader mirrors the CPU reference math.
-const float LAMP_BUMP_WEIGHT = 0.12;
-const float LAMP_STRETCH_WEIGHT = 0.70;
-const float LAMP_SQUASH_WEIGHT = 1.0;
+// These are spatial constants. All temporal channels arrive from the CPU.
 const float LAMP_SHAPE_MIN = 0.20;
 const float LAMP_SHAPE_MAX = 0.80;
-const float LAMP_NEAR_EDGE_BIAS = 0.18;
-const float LAMP_NECK_BASE = 0.20;
-const float LAMP_NECK_RANGE = 0.80;
+const float LAMP_STRETCH_POWER = 2.0;
+const float LAMP_SPATIAL_EXPONENT_MIN = 2.0;
+const float LAMP_SPATIAL_EXPONENT_MAX = 3.0;
 
 float axis_position(vec4 rectangle, float normalized) {
     if (u_direction == 0) {
@@ -134,6 +130,13 @@ float movement_extent(vec4 rectangle) {
     return max((u_direction == 0 || u_direction == 2) ? rectangle.w : rectangle.z, 1.0);
 }
 
+float spatial_funnel_exponent(float shape_factor) {
+    float normalized = (
+        clamp(shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX) - LAMP_SHAPE_MIN
+    ) / (LAMP_SHAPE_MAX - LAMP_SHAPE_MIN);
+    return mix(LAMP_SPATIAL_EXPONENT_MIN, LAMP_SPATIAL_EXPONENT_MAX, normalized);
+}
+
 void main() {
     vec2 source_point = u_source_visual_rect.xy
         + ((a_position - u_canonical_visual_rect.xy) / u_canonical_visual_rect.zw)
@@ -156,57 +159,40 @@ void main() {
         float cross_normalized = (u_direction == 0 || u_direction == 2)
             ? group_uv.x
             : group_uv.y;
-        float bump_fraction = u_bump_distance > 0.000001 ? LAMP_BUMP_WEIGHT / (
-            LAMP_BUMP_WEIGHT + LAMP_STRETCH_WEIGHT
-                * clamp(u_shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX)
-                + LAMP_SQUASH_WEIGHT
-        ) : 0.0;
-        float stretch_weight = LAMP_STRETCH_WEIGHT
-            * clamp(u_shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX);
-        float total_weight = (u_bump_distance > 0.000001 ? LAMP_BUMP_WEIGHT : 0.0)
-            + stretch_weight + LAMP_SQUASH_WEIGHT;
-        float stretch_fraction = stretch_weight / total_weight;
-        float base_motion = clamp(
-            bump_fraction * u_bump_progress
-                + stretch_fraction * u_stretch_progress,
+        float funnel_weight = pow(
+            movement_normalized,
+            spatial_funnel_exponent(u_shape_factor)
+        );
+        float early_contraction = clamp(
+            clamp(u_contraction_progress, 0.0, 1.0) * funnel_weight,
             0.0,
             1.0
         );
-        float bump_ratio = clamp(u_bump_distance / movement_extent(u_source_visual_rect), 0.0, 1.0);
-        float biased_motion = clamp(
-            base_motion
-                + (movement_normalized - 0.5)
-                    * bump_ratio * LAMP_NEAR_EDGE_BIAS * u_bump_progress
-                    * (1.0 - base_motion),
+        float stretch = LAMP_STRETCH_POWER
+            * clamp(u_contraction_progress, 0.0, 1.0)
+            * (1.0 - movement_normalized);
+        float translation_progress = clamp(u_translation_progress, 0.0, 1.0);
+        float row_translation = translation_progress >= 1.0
+            ? 1.0
+            : pow(translation_progress, 1.0 + stretch);
+        float retreat_distance = clamp(
+            u_bump_distance,
             0.0,
-            1.0
-        );
-        float source_axis = axis_position(u_source_visual_rect, movement_normalized);
+            movement_extent(u_source_visual_rect)
+        ) * clamp(u_retreat_progress, 0.0, 1.0);
+        float retreat_sign = (u_direction == 0 || u_direction == 3) ? 1.0 : -1.0;
+        float source_axis = axis_position(u_source_visual_rect, movement_normalized)
+            + retreat_sign * retreat_distance;
         float target_axis = axis_position(u_anchor_rect, movement_normalized);
-        float pre_squash_axis = mix(source_axis, target_axis, biased_motion);
-        float axis = mix(pre_squash_axis, target_axis, clamp(u_squash_progress, 0.0, 1.0));
+        float axis = mix(source_axis, target_axis, row_translation);
         float source_cross = cross_position(u_source_visual_rect, cross_normalized);
         float target_cross = cross_position(u_anchor_rect, cross_normalized);
-        float source_cross_center = cross_position(u_source_visual_rect, 0.5);
-        float neck_scale = clamp(
-            1.0 - clamp(u_shape_factor, LAMP_SHAPE_MIN, LAMP_SHAPE_MAX)
-                * clamp(u_stretch_progress, 0.0, 1.0)
-                * (LAMP_NECK_BASE + LAMP_NECK_RANGE * movement_normalized),
-            0.05,
-            1.0
-        );
-        float neck_candidate = source_cross_center
-            + (source_cross - source_cross_center) * neck_scale;
-        float stretched_cross = abs(target_cross - neck_candidate)
-                <= abs(target_cross - source_cross)
-            ? neck_candidate
-            : source_cross;
-        float cross_motion = clamp(
-            biased_motion + u_squash_progress,
+        float cross_completion = clamp(
+            1.0 - (1.0 - early_contraction) * (1.0 - row_translation),
             0.0,
             1.0
         );
-        float cross = mix(stretched_cross, target_cross, cross_motion);
+        float cross = mix(source_cross, target_cross, cross_completion);
         warped = (u_direction == 0 || u_direction == 2)
             ? vec2(cross, axis)
             : vec2(axis, cross);
@@ -318,6 +304,25 @@ mod tests {
         assert!(LAMP_VERTEX_SHADER.contains("movement_extent(u_source_visual_rect)"));
         assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_source_visual_rect"));
         assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_source_visual_rect"));
+        for uniform in [
+            "uniform float u_progress;",
+            "uniform float u_contraction_progress;",
+            "uniform float u_translation_progress;",
+            "uniform float u_retreat_progress;",
+        ] {
+            assert!(
+                LAMP_VERTEX_SHADER.contains(uniform),
+                "missing Lamp uniform {uniform}"
+            );
+        }
+        for obsolete_uniform in ["u_bump_progress", "u_stretch_progress", "u_squash_progress"] {
+            assert!(
+                !LAMP_VERTEX_SHADER.contains(obsolete_uniform),
+                "obsolete sequential uniform remains: {obsolete_uniform}"
+            );
+        }
+        assert!(!LAMP_VERTEX_SHADER.contains("smoothstep"));
+        assert!(!LAMP_VERTEX_SHADER.contains("in_out_cubic"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_source_rect"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_full_window_rect"));
     }
