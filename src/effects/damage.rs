@@ -91,6 +91,14 @@ pub struct EffectRegion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedRegionIntersection {
+    pub(crate) region: EffectRegion,
+    pub(crate) overflowed: bool,
+    pub(crate) input_rect_count: usize,
+    pub(crate) clip_rect_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectDamageSnapshot {
     pub identity: u64,
     pub region: EffectRegion,
@@ -226,6 +234,65 @@ impl EffectRegion {
             }
         }
         result
+    }
+
+    /// Intersect this region while preserving the authoritative `clip`.
+    ///
+    /// The exact intersection is returned while it fits the bounded region
+    /// representation. If it would overflow, the authoritative clip is a
+    /// conservative result that cannot expose pixels outside the clip.
+    pub fn intersect_bounded_within(&self, clip: &Self) -> Self {
+        self.intersect_bounded_within_result(clip).region
+    }
+
+    pub(crate) fn intersect_bounded_within_result(
+        &self,
+        clip: &Self,
+    ) -> BoundedRegionIntersection {
+        let input_rect_count = self.rects.len();
+        let clip_rect_count = clip.rects.len();
+        if self.conservative_full {
+            return BoundedRegionIntersection {
+                region: clip.clone(),
+                overflowed: false,
+                input_rect_count,
+                clip_rect_count,
+            };
+        }
+        if clip.conservative_full {
+            return BoundedRegionIntersection {
+                region: self.clone(),
+                overflowed: false,
+                input_rect_count,
+                clip_rect_count,
+            };
+        }
+        let mut rects = Vec::new();
+        for left in &self.rects {
+            for right in &clip.rects {
+                let Some(intersection) = left.intersect(*right) else {
+                    continue;
+                };
+                if rects.len() == MAX_EFFECT_REGION_RECTS {
+                    return BoundedRegionIntersection {
+                        region: clip.clone(),
+                        overflowed: true,
+                        input_rect_count,
+                        clip_rect_count,
+                    };
+                }
+                rects.push(intersection);
+            }
+        }
+        BoundedRegionIntersection {
+            region: Self {
+                rects,
+                conservative_full: false,
+            },
+            overflowed: false,
+            input_rect_count,
+            clip_rect_count,
+        }
     }
 
     pub fn subtract(&self, excluded: &Self) -> Self {
@@ -389,7 +456,7 @@ pub fn plan_effect_damage(
             footprint.sample_radius_y,
             output_bounds,
         )
-        .intersect(&output_influence_region);
+        .intersect_bounded_within(&output_influence_region);
     EffectDamagePlan {
         output_damage,
         source_query_region: capture_region.clone(),
@@ -647,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn rounded_hover_transition_currently_leaks_a_corner() {
+    fn rounded_hover_transition_never_leaks_a_corner() {
         let bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
         let old = rounded_test_region(500, 100, 500, 80, 20, 16);
         let new = rounded_test_region(500, 100, 650, 80, 20, 16);
@@ -676,6 +743,21 @@ mod tests {
         let corner = (500, 100);
         assert!(!new.contains_point(corner.0, corner.1));
         assert!(!plan.output_damage.contains_point(corner.0, corner.1));
+    }
+
+    #[test]
+    fn bounded_intersection_overflow_returns_authoritative_clip() {
+        let mut fragmented = EffectRegion::empty();
+        for _ in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented.push(EffectRect::new(0, 0, 500, 1).unwrap());
+        }
+        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
+        clip.push(EffectRect::new(400, 0, 1, 1).unwrap());
+
+        let result = fragmented.intersect_bounded_within(&clip);
+
+        assert_eq!(result, clip);
+        assert!(!result.contains_point(200, 0));
     }
 
     #[test]
