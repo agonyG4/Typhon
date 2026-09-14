@@ -623,8 +623,12 @@ fn normalize_surface_tree_node_order(transaction: &mut PendingSurfaceTreeTransac
     }
     let mut indegree = vec![0usize; node_count];
     let mut successors = vec![Vec::<usize>::new(); node_count];
-    for dependent_index in 0..node_count {
-        let commit = &transaction.nodes[dependent_index].1;
+    for (dependent_index, ((_, commit), indegree_entry)) in transaction
+        .nodes
+        .iter()
+        .zip(indegree.iter_mut())
+        .enumerate()
+    {
         let mut dependencies = Vec::with_capacity(
             commit.lineage.child_dependencies.len()
                 + usize::from(commit.lineage.predecessor.is_some()),
@@ -645,7 +649,7 @@ fn normalize_surface_tree_node_order(transaction: &mut PendingSurfaceTreeTransac
                 continue;
             }
             successors[dependency_index].push(dependent_index);
-            indegree[dependent_index] = indegree[dependent_index].saturating_add(1);
+            *indegree_entry = indegree_entry.saturating_add(1);
         }
     }
 
@@ -679,15 +683,10 @@ fn normalize_surface_tree_node_order(transaction: &mut PendingSurfaceTreeTransac
         &mut transaction.publication_lifetimes,
         SurfaceTreeNodeLifetimes::Captured(Vec::new()),
     );
-    let lifetimes = match old_lifetimes {
-        SurfaceTreeNodeLifetimes::Captured(lifetimes) => lifetimes,
-        #[cfg(test)]
-        SurfaceTreeNodeLifetimes::Synthetic => {
-            transaction.publication_lifetimes = SurfaceTreeNodeLifetimes::Synthetic;
-            transaction.nodes = old_nodes;
-            return;
-        }
-    };
+    let lifetimes = old_lifetimes
+        .captured()
+        .expect("surface-tree transactions use captured publication lifetimes")
+        .to_vec();
     debug_assert_eq!(old_nodes.len(), lifetimes.len());
     let mut node_slots = old_nodes.into_iter().map(Some).collect::<Vec<_>>();
     let mut lifetime_slots = lifetimes.into_iter().map(Some).collect::<Vec<_>>();
@@ -728,7 +727,7 @@ fn debug_assert_surface_tree_content_update_invariants(
             if let Some(dependency_index) =
                 transaction_node_index_covering_content_update_ref(transaction, *dependency)
             {
-                debug_assert!(dependency_index == node_index || dependency_index < node_index);
+                debug_assert!(dependency_index <= node_index);
             }
         }
     }
