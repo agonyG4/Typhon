@@ -236,7 +236,7 @@ impl EffectExecutionTrace {
     ) {
         self.event(|| {
             format!(
-                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} conservative_full={} pass_count_selected={} partial_pass_count={} full_domain_pass_count={} pass_dependency_propagations={} max_pass_region_rect_count={} pass_conservative_fallbacks={}",
+                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} region_representation_overflows={} visible_clip_fallbacks={} work_region_bbox_coalesces={} conservative_full={} pass_count_selected={} partial_pass_count={} full_domain_pass_count={} pass_dependency_propagations={} max_pass_region_rect_count={} pass_conservative_fallbacks={}",
                 optional_u64(self.frame_id),
                 optional_u64(summary.render_generation.or(self.render_generation)),
                 optional_u64(summary.scene_generation.or(self.scene_generation)),
@@ -264,6 +264,18 @@ impl EffectExecutionTrace {
                 summary
                     .demand_plan
                     .map(|stats| stats.max_instance_region_rect_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.region_representation_overflows)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.visible_clip_fallbacks)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.work_region_bbox_coalesces)
                     .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
                 summary.demand_plan.map_or_else(
                     || "unknown".to_owned(),
@@ -293,6 +305,24 @@ impl EffectExecutionTrace {
                     .demand_plan
                     .map(|stats| stats.pass_conservative_fallbacks)
                     .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+            )
+        });
+    }
+
+    pub(crate) fn visible_clip_fallback(
+        &self,
+        pass: &CompiledRenderPass,
+        input_rect_count: usize,
+        clip_rect_count: usize,
+    ) {
+        self.event(|| {
+            format!(
+                "event=region_representation_overflow frame_id={} instance={} pass={} input_rect_count={} clip_rect_count={} fallback=output_influence visible_clip_fallback=true",
+                optional_u64(self.frame_id),
+                pass.instance.get(),
+                pass.id.get(),
+                input_rect_count,
+                clip_rect_count,
             )
         });
     }
@@ -444,9 +474,10 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use oblivion_one::compositor::{EffectAnchor, EffectAnchorScope};
     use oblivion_one::effects::{
-        EffectRegion, EffectWorkingSpace, GraphTextureOrigin, GraphTexturePlan,
-        RenderGraphCompileStats,
+        EffectAlphaMode, EffectColorConversion, EffectInstanceId, EffectRegion, EffectWorkingSpace,
+        GraphTextureOrigin, GraphTexturePlan, RenderGraphCompileStats, RenderPassKind,
     };
 
     #[test]
@@ -556,6 +587,9 @@ mod tests {
             dependency_edge_count: 6,
             dependency_propagations: 6,
             max_instance_region_rect_count: 72,
+            region_representation_overflows: 3,
+            visible_clip_fallbacks: 2,
+            work_region_bbox_coalesces: 1,
             conservative_full: false,
             ..Default::default()
         });
@@ -568,6 +602,49 @@ mod tests {
         assert!(line.contains("dependency_edge_count=6"));
         assert!(line.contains("dependency_propagations=6"));
         assert!(line.contains("max_instance_region_rect_count=72"));
+        assert!(line.contains("region_representation_overflows=3"));
+        assert!(line.contains("visible_clip_fallbacks=2"));
+        assert!(line.contains("work_region_bbox_coalesces=1"));
         assert!(line.contains("conservative_full=false"));
+    }
+
+    #[test]
+    fn visible_clip_fallback_trace_identifies_authoritative_output() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let pass = CompiledRenderPass {
+            id: oblivion_one::effects::GraphPassId::new(9).unwrap(),
+            kind: RenderPassKind::Composite,
+            inputs: Vec::new(),
+            output: None,
+            damage: EffectRegion::empty(),
+            instance: EffectInstanceId::new(4).unwrap(),
+            anchor: EffectAnchor::OutputPostProcess,
+            blur_radius: None,
+            stage: None,
+            fused_stages: Vec::new(),
+            parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+            alpha_mode: EffectAlphaMode::Preserve,
+            encode_output: false,
+            color_conversion: EffectColorConversion::None,
+            checkpoint_dependencies: Vec::new(),
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
+        };
+
+        clear_test_events();
+        trace.visible_clip_fallback(&pass, 970, 33);
+        let line = take_test_events()
+            .pop()
+            .expect("visible clip fallback event");
+
+        assert!(line.contains("event=region_representation_overflow"));
+        assert!(line.contains("frame_id=unknown"));
+        assert!(line.contains("instance=4"));
+        assert!(line.contains("pass=9"));
+        assert!(line.contains("input_rect_count=970"));
+        assert!(line.contains("clip_rect_count=33"));
+        assert!(line.contains("fallback=output_influence"));
+        assert!(line.contains("visible_clip_fallback=true"));
     }
 }

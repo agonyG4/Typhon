@@ -8,9 +8,9 @@ use super::registry::EffectRegistry;
 use super::{
     BUILTIN_EFFECT_PROGRAM_ID, DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy,
     EffectFrameDemand, EffectInstanceId, EffectNode, EffectNodeId, EffectNodeKind, EffectOutsets,
-    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectSource, EffectValidationError,
-    EffectWorkingSpace, MAX_EFFECT_PROGRAM_NODES, ValidatedEffectProgram, plan_effect_damage,
-    validate_effect_program,
+    EffectProgram, EffectProgramId, EffectRect, EffectRegion, EffectRegionClipFallback,
+    EffectSource, EffectValidationError, EffectWorkingSpace, MAX_EFFECT_PROGRAM_NODES,
+    ValidatedEffectProgram, plan_effect_damage, validate_effect_program,
 };
 
 pub const MAX_GRAPH_TEXTURES: usize = 4096;
@@ -250,6 +250,7 @@ pub struct CompiledRenderPass {
     pub checkpoint_dependencies: Vec<GraphPassId>,
     pub visual_group: Option<VisualGroupId>,
     pub anchor_scope: EffectAnchorScope,
+    pub visible_clip_fallback: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -259,6 +260,9 @@ pub struct RenderGraphCompileStats {
     pub textures: usize,
     pub intermediate_textures: usize,
     pub peak_live_intermediates: usize,
+    pub region_representation_overflows: usize,
+    pub visible_clip_fallbacks: usize,
+    pub work_region_bbox_coalesces: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -284,6 +288,9 @@ pub struct EffectDemandPlanStats {
     pub dependency_edge_count: usize,
     pub dependency_propagations: usize,
     pub max_instance_region_rect_count: usize,
+    pub region_representation_overflows: usize,
+    pub visible_clip_fallbacks: usize,
+    pub work_region_bbox_coalesces: usize,
     pub conservative_full: bool,
     pub pass_count_selected: usize,
     pub partial_pass_count: usize,
@@ -299,6 +306,14 @@ pub struct EffectInstanceExecutionDemand {
     pub output_region: EffectRegion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectVisibleClipFallback {
+    pub instance: EffectInstanceId,
+    pub pass: Option<GraphPassId>,
+    pub input_rect_count: usize,
+    pub clip_rect_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectPassExecutionDemand {
     pub id: GraphPassId,
@@ -310,6 +325,7 @@ pub struct EffectExecutionDemand {
     pub instances: Vec<EffectInstanceExecutionDemand>,
     pub execution_region: EffectRegion,
     pub passes: Vec<EffectPassExecutionDemand>,
+    pub visible_clip_fallbacks: Vec<EffectVisibleClipFallback>,
     pub(crate) conservative_full: bool,
     conservative_instances: Vec<EffectInstanceId>,
     plan_stats: EffectDemandPlanStats,
@@ -324,6 +340,7 @@ impl EffectExecutionDemand {
             instances,
             execution_region,
             passes: Vec::new(),
+            visible_clip_fallbacks: Vec::new(),
             conservative_full: false,
             conservative_instances: Vec::new(),
             plan_stats: EffectDemandPlanStats::default(),
@@ -363,6 +380,10 @@ impl EffectExecutionDemand {
     pub fn plan_stats(&self) -> EffectDemandPlanStats {
         self.plan_stats
     }
+
+    pub fn visible_clip_fallbacks(&self) -> &[EffectVisibleClipFallback] {
+        &self.visible_clip_fallbacks
+    }
 }
 
 fn all_visible_instances_with_output_regions(
@@ -371,15 +392,26 @@ fn all_visible_instances_with_output_regions(
 ) -> EffectExecutionDemand {
     let mut execution_region = EffectRegion::empty();
     let mut max_instance_region_rect_count = 0;
+    let mut work_region_bbox_coalesces = graph.stats.work_region_bbox_coalesces;
     let instances = graph
         .instances
         .iter()
         .map(|instance| {
             max_instance_region_rect_count =
                 max_instance_region_rect_count.max(instance.output_influence_region.rects().len());
-            execution_region = execution_region.union(&instance.output_influence_region);
+            let (next_execution_region, coalesced) =
+                execution_region.union_with_diagnostics(&instance.output_influence_region);
+            execution_region = next_execution_region;
+            if coalesced {
+                work_region_bbox_coalesces = work_region_bbox_coalesces.saturating_add(1);
+            }
             if !instance.dependencies.is_empty() {
-                execution_region = execution_region.union(&instance.capture_region);
+                let (next_execution_region, coalesced) =
+                    execution_region.union_with_diagnostics(&instance.capture_region);
+                execution_region = next_execution_region;
+                if coalesced {
+                    work_region_bbox_coalesces = work_region_bbox_coalesces.saturating_add(1);
+                }
             }
             EffectInstanceExecutionDemand {
                 id: instance.id,
@@ -392,6 +424,7 @@ fn all_visible_instances_with_output_regions(
         instances,
         execution_region,
         passes,
+        visible_clip_fallbacks: Vec::new(),
         conservative_full: true,
         conservative_instances: Vec::new(),
         plan_stats: EffectDemandPlanStats {
@@ -399,6 +432,9 @@ fn all_visible_instances_with_output_regions(
             dependency_edge_count: dependency_edge_count(graph),
             dependency_propagations: 0,
             max_instance_region_rect_count,
+            region_representation_overflows: graph.stats.region_representation_overflows,
+            visible_clip_fallbacks: graph.stats.visible_clip_fallbacks,
+            work_region_bbox_coalesces,
             conservative_full: true,
             ..EffectDemandPlanStats::default()
         },
@@ -447,8 +483,24 @@ pub fn plan_effect_execution_demand(
 
     let mut output_regions = vec![None; graph.instances.len()];
     let mut max_instance_region_rect_count = 0;
+    let mut region_representation_overflows = graph.stats.region_representation_overflows;
+    let mut visible_clip_fallback_count = graph.stats.visible_clip_fallbacks;
+    let mut work_region_bbox_coalesces = graph.stats.work_region_bbox_coalesces;
+    let mut visible_clip_fallback_details = Vec::new();
     for (index, instance) in graph.instances.iter().enumerate() {
-        let direct = repair_region.intersect(&instance.output_influence_region);
+        let direct_result =
+            repair_region.intersect_bounded_within_result(&instance.output_influence_region);
+        if direct_result.overflowed {
+            region_representation_overflows = region_representation_overflows.saturating_add(1);
+            visible_clip_fallback_count = visible_clip_fallback_count.saturating_add(1);
+            visible_clip_fallback_details.push(EffectVisibleClipFallback {
+                instance: instance.id,
+                pass: None,
+                input_rect_count: direct_result.input_rect_count,
+                clip_rect_count: direct_result.clip_rect_count,
+            });
+        }
+        let direct = direct_result.region;
         if !direct.is_empty() {
             max_instance_region_rect_count =
                 max_instance_region_rect_count.max(direct.rects().len());
@@ -471,16 +523,40 @@ pub fn plan_effect_execution_demand(
                 return all_visible_instances_with_output_regions(graph, repair_rect_count);
             };
             let dependency = &graph.instances[dependency_index];
-            let required = dependency
-                .output_influence_region
-                .intersect(&consumer.capture_region);
+            let required_result = consumer
+                .capture_region
+                .intersect_bounded_within_result(&dependency.output_influence_region);
+            if required_result.overflowed {
+                region_representation_overflows = region_representation_overflows.saturating_add(1);
+                visible_clip_fallback_count = visible_clip_fallback_count.saturating_add(1);
+                visible_clip_fallback_details.push(EffectVisibleClipFallback {
+                    instance: dependency.id,
+                    pass: None,
+                    input_rect_count: required_result.input_rect_count,
+                    clip_rect_count: required_result.clip_rect_count,
+                });
+            }
+            let required = required_result.region;
             if required.is_empty() {
                 continue;
             }
             dependency_propagations = dependency_propagations.saturating_add(1);
-            let next = output_regions[dependency_index]
+            let next_candidate = output_regions[dependency_index]
                 .as_ref()
                 .map_or_else(|| required.clone(), |existing| existing.union(&required));
+            let next_result =
+                next_candidate.intersect_bounded_within_result(&dependency.output_influence_region);
+            if next_result.overflowed {
+                region_representation_overflows = region_representation_overflows.saturating_add(1);
+                visible_clip_fallback_count = visible_clip_fallback_count.saturating_add(1);
+                visible_clip_fallback_details.push(EffectVisibleClipFallback {
+                    instance: dependency.id,
+                    pass: None,
+                    input_rect_count: next_result.input_rect_count,
+                    clip_rect_count: next_result.clip_rect_count,
+                });
+            }
+            let next = next_result.region;
             max_instance_region_rect_count = max_instance_region_rect_count.max(next.rects().len());
             output_regions[dependency_index] = Some(next);
         }
@@ -493,9 +569,19 @@ pub fn plan_effect_execution_demand(
         .filter_map(|(index, output_region)| {
             output_region.map(|output_region| {
                 let instance = &graph.instances[index];
-                execution_region = execution_region.union(&output_region);
+                let (next_execution_region, coalesced) =
+                    execution_region.union_with_diagnostics(&output_region);
+                execution_region = next_execution_region;
+                if coalesced {
+                    work_region_bbox_coalesces = work_region_bbox_coalesces.saturating_add(1);
+                }
                 if !instance.dependencies.is_empty() {
-                    execution_region = execution_region.union(&instance.capture_region);
+                    let (next_execution_region, coalesced) =
+                        execution_region.union_with_diagnostics(&instance.capture_region);
+                    execution_region = next_execution_region;
+                    if coalesced {
+                        work_region_bbox_coalesces = work_region_bbox_coalesces.saturating_add(1);
+                    }
                 }
                 EffectInstanceExecutionDemand {
                     id: graph.instances[index].id,
@@ -508,6 +594,7 @@ pub fn plan_effect_execution_demand(
         instances,
         execution_region,
         passes: Vec::new(),
+        visible_clip_fallbacks: visible_clip_fallback_details,
         conservative_full: false,
         conservative_instances: Vec::new(),
         plan_stats: EffectDemandPlanStats {
@@ -515,6 +602,9 @@ pub fn plan_effect_execution_demand(
             dependency_edge_count: dependency_edge_count(graph),
             dependency_propagations,
             max_instance_region_rect_count,
+            region_representation_overflows,
+            visible_clip_fallbacks: visible_clip_fallback_count,
+            work_region_bbox_coalesces,
             conservative_full: false,
             ..EffectDemandPlanStats::default()
         },
@@ -549,13 +639,22 @@ fn conservative_pass_region(
         let Some(output_region) = output_region else {
             return full_pass_region(graph, pass);
         };
+        let authoritative = graph
+            .instances
+            .iter()
+            .find(|instance| instance.id == pass.instance)
+            .map_or(output_region, |instance| &instance.output_influence_region);
         let constrained = pass.damage.union(output_region);
         return pass
             .output
             .and_then(|output| graph_texture_index(graph, output))
             .map_or_else(
-                || constrained.clone(),
-                |output_index| constrained.intersect_rect(graph.textures[output_index].domain),
+                || constrained.intersect_bounded_within(authoritative),
+                |output_index| {
+                    constrained
+                        .intersect_bounded_within(authoritative)
+                        .intersect_rect(graph.textures[output_index].domain)
+                },
             );
     }
     full_pass_region(graph, pass)
@@ -921,10 +1020,26 @@ fn plan_effect_pass_execution_demand(
             continue;
         };
         let output_plan = &graph.textures[output];
-        let seed = pass
-            .damage
-            .union(&instance_demand.output_region)
-            .intersect_rect(output_plan.domain);
+        let Some(instance) = graph
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_demand.id)
+        else {
+            mark_instance_conservative(demand, &mut conservative_instances, instance_demand.id);
+            continue;
+        };
+        let seed_candidate = pass.damage.union(&instance_demand.output_region);
+        let seed_result =
+            seed_candidate.intersect_bounded_within_result(&instance.output_influence_region);
+        if seed_result.overflowed {
+            demand.plan_stats.region_representation_overflows = demand
+                .plan_stats
+                .region_representation_overflows
+                .saturating_add(1);
+            demand.plan_stats.visible_clip_fallbacks =
+                demand.plan_stats.visible_clip_fallbacks.saturating_add(1);
+        }
+        let seed = seed_result.region.intersect_rect(output_plan.domain);
         if seed.bounding_rect().is_none() {
             mark_instance_conservative(demand, &mut conservative_instances, instance_demand.id);
         } else {
@@ -1012,7 +1127,13 @@ fn plan_effect_pass_execution_demand(
                 continue;
             }
             pass_dependency_propagations = pass_dependency_propagations.saturating_add(1);
-            let next = pass_regions[producer_index].union(&required);
+            let (next, coalesced) = pass_regions[producer_index].union_with_diagnostics(&required);
+            if coalesced {
+                demand.plan_stats.work_region_bbox_coalesces = demand
+                    .plan_stats
+                    .work_region_bbox_coalesces
+                    .saturating_add(1);
+            }
             if next.bounding_rect().is_none() {
                 mark_instance_conservative(demand, &mut conservative_instances, pass.instance);
                 mark_instance_conservative(
@@ -1310,6 +1431,7 @@ impl GraphBuilder {
             checkpoint_dependencies: Vec::new(),
             visual_group: None,
             anchor_scope,
+            visible_clip_fallback: None,
         });
         Ok(id)
     }
@@ -1369,6 +1491,8 @@ pub fn compile_frame_execution_plan(
     let mut final_damage = source_damage.clone();
     let mut checkpoints = Vec::<(GraphPassId, EffectRegion, EffectInstanceId)>::new();
     let mut compiled_instances = Vec::with_capacity(visible_instance_count);
+    let mut region_representation_overflows = 0usize;
+    let mut visible_clip_fallbacks = 0usize;
 
     for instance in scene
         .instances
@@ -1384,6 +1508,10 @@ pub fn compile_frame_execution_plan(
             source_damage,
             output_bounds,
         );
+        if effect_damage.output_clip_fallback.is_some() {
+            region_representation_overflows = region_representation_overflows.saturating_add(1);
+            visible_clip_fallbacks = visible_clip_fallbacks.saturating_add(1);
+        }
         final_damage = final_damage.union(&effect_damage.output_damage);
         let (dependencies, dependency_instances) = if program.lowering.uses_backdrop {
             let mut dependencies = Vec::new();
@@ -1410,6 +1538,7 @@ pub fn compile_frame_execution_plan(
                 output_damage: &effect_damage.output_damage,
                 output_bounds,
                 checkpoint_dependencies: &dependencies,
+                output_clip_fallback: effect_damage.output_clip_fallback,
             },
         )?;
         compiled_instances.push(CompiledEffectInstance {
@@ -1434,6 +1563,9 @@ pub fn compile_frame_execution_plan(
         textures: builder.textures.len(),
         intermediate_textures,
         peak_live_intermediates,
+        region_representation_overflows,
+        visible_clip_fallbacks,
+        work_region_bbox_coalesces: 0,
     };
     Ok(FrameExecutionPlan::EffectGraph(CompiledFrameGraph {
         passes: builder.passes,
@@ -1614,6 +1746,7 @@ struct InstanceCompilePlan<'a> {
     output_damage: &'a EffectRegion,
     output_bounds: EffectRect,
     checkpoint_dependencies: &'a [GraphPassId],
+    output_clip_fallback: Option<EffectRegionClipFallback>,
 }
 
 fn resolve_output(
@@ -1658,6 +1791,7 @@ fn compile_instance(
         output_damage,
         output_bounds,
         checkpoint_dependencies,
+        output_clip_fallback,
     } = plan;
     let visual_group = instance.visual_group;
     let mut outputs = [None; MAX_EFFECT_PROGRAM_NODES];
@@ -1944,6 +2078,8 @@ fn compile_instance(
     final_pass.encode_output =
         encode_output || final_pass.color_conversion == EffectColorConversion::EncodeLinearToSrgb;
     final_pass.visual_group = visual_group;
+    final_pass.visible_clip_fallback =
+        output_clip_fallback.map(|fallback| (fallback.input_rect_count, fallback.clip_rect_count));
     Ok(composite)
 }
 
@@ -2187,6 +2323,7 @@ mod tests {
             checkpoint_dependencies: Vec::new(),
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
         }
     }
 
@@ -2761,6 +2898,13 @@ mod tests {
         })
     }
 
+    fn region_is_subset_of(region: &EffectRegion, clip: &EffectRegion) -> bool {
+        region.rects().iter().all(|rect| {
+            (rect.y..rect.bottom())
+                .all(|y| (rect.x..rect.right()).all(|x| clip.contains_point(x, y)))
+        })
+    }
+
     fn semantically_equal_regions(left: &EffectRegion, right: &EffectRegion) -> bool {
         left.subtract(right).is_empty() && right.subtract(left).is_empty()
     }
@@ -2793,6 +2937,78 @@ mod tests {
         assert_eq!(demand.plan_stats().dependency_edge_count, 1);
         assert_eq!(demand.plan_stats().dependency_propagations, 1);
         assert!(demand.plan_stats().max_instance_region_rect_count <= 128);
+    }
+
+    #[test]
+    fn fragmented_visible_repair_falls_back_to_output_influence_without_bbox() {
+        let instance = EffectInstanceId::new(1).unwrap();
+        let mut output = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
+        output.push(EffectRect::new(400, 0, 1, 1).unwrap());
+        let graph = demand_test_graph(vec![demand_test_instance(
+            1,
+            output.clone(),
+            output.clone(),
+            Vec::new(),
+        )]);
+        let repair = repeated_region(EffectRect::new(0, 0, 500, 1).unwrap(), 128);
+
+        let demand = plan_effect_execution_demand(&graph, &repair, false);
+
+        assert_eq!(demand.output_region(instance), Some(&output));
+        assert!(region_is_subset_of(
+            demand.output_region(instance).unwrap(),
+            &output
+        ));
+        assert!(
+            !demand
+                .output_region(instance)
+                .unwrap()
+                .contains_point(200, 0)
+        );
+        assert_eq!(demand.plan_stats().region_representation_overflows, 1);
+        assert_eq!(demand.plan_stats().visible_clip_fallbacks, 1);
+        assert_eq!(
+            demand.visible_clip_fallbacks(),
+            &[EffectVisibleClipFallback {
+                instance,
+                pass: None,
+                input_rect_count: 128,
+                clip_rect_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn fragmented_backdrop_dependency_falls_back_within_dependency_output() {
+        let lower = EffectInstanceId::new(1).unwrap();
+        let mut lower_output = EffectRegion::from_rect(EffectRect::new(1000, 0, 1, 1).unwrap());
+        lower_output.push(EffectRect::new(1400, 0, 1, 1).unwrap());
+        let consumer_output = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 1).unwrap());
+        let consumer_capture = repeated_region(EffectRect::new(900, 0, 501, 1).unwrap(), 128);
+        let graph = demand_test_graph(vec![
+            demand_test_instance(1, lower_output.clone(), lower_output.clone(), Vec::new()),
+            demand_test_instance(2, consumer_output.clone(), consumer_capture, vec![lower]),
+        ]);
+
+        let demand = plan_effect_execution_demand(&graph, &consumer_output, false);
+
+        assert_eq!(demand.output_region(lower), Some(&lower_output));
+        assert!(region_is_subset_of(
+            demand.output_region(lower).unwrap(),
+            &lower_output
+        ));
+        assert!(!demand.output_region(lower).unwrap().contains_point(1200, 0));
+        assert_eq!(demand.plan_stats().region_representation_overflows, 1);
+        assert_eq!(demand.plan_stats().visible_clip_fallbacks, 1);
+        assert_eq!(
+            demand.visible_clip_fallbacks(),
+            &[EffectVisibleClipFallback {
+                instance: lower,
+                pass: None,
+                input_rect_count: 128,
+                clip_rect_count: 2,
+            }]
+        );
     }
 
     #[test]
@@ -4287,6 +4503,54 @@ mod tests {
                 .filter(|pass| pass.instance == instance)
                 .all(|pass| demand.pass_output_region(pass.id).is_some())
         );
+    }
+
+    #[test]
+    fn precise_final_seed_stays_within_disconnected_output_influence() {
+        let output_texture = GraphTextureId::new(1).unwrap();
+        let output_domain = EffectRect::new(0, 0, 500, 10).unwrap();
+        let mut output = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
+        output.push(EffectRect::new(400, 0, 1, 1).unwrap());
+        let mut pass = test_pass(1);
+        pass.kind = RenderPassKind::Composite;
+        pass.output = Some(output_texture);
+        pass.damage = repeated_region(EffectRect::new(0, 0, 500, 1).unwrap(), 128);
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![GraphTexturePlan {
+                id: output_texture,
+                source: GraphTextureSource::Output,
+                width: output_domain.width,
+                height: output_domain.height,
+                domain: output_domain,
+                working_space: EffectWorkingSpace::OutputEncodedSrgb,
+                origin: GraphTextureOrigin::BottomLeft,
+                first_use: None,
+                last_use: None,
+            }],
+            instances: vec![demand_test_instance(
+                1,
+                output.clone(),
+                output.clone(),
+                Vec::new(),
+            )],
+            final_damage: EffectRegion::empty(),
+            stats: RenderGraphCompileStats::default(),
+        };
+
+        let demand = plan_effect_execution_demand(
+            &graph,
+            &EffectRegion::from_rect(EffectRect::new(0, 0, 500, 1).unwrap()),
+            false,
+        );
+        let final_demand = demand
+            .pass_output_region(pass.id)
+            .expect("final pass demand");
+
+        assert!(region_is_subset_of(final_demand, &output));
+        assert!(final_demand.contains_point(0, 0));
+        assert!(final_demand.contains_point(400, 0));
+        assert!(!final_demand.contains_point(200, 0));
     }
 
     #[test]

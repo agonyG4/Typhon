@@ -742,6 +742,28 @@ fn execute_graph_passes_inner(
         }
         let execution_damage = capture_execution_damage(graph, demand, pass, lifecycle_backdrop);
         if renderer.effect_trace.enabled() {
+            if let Some((input_rect_count, clip_rect_count)) = pass.visible_clip_fallback {
+                renderer.effect_trace.visible_clip_fallback(
+                    pass,
+                    input_rect_count,
+                    clip_rect_count,
+                );
+            }
+            let is_final_output_pass = matches!(
+                pass.kind,
+                RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+            );
+            for fallback in demand.visible_clip_fallbacks().iter().filter(|fallback| {
+                fallback.instance == pass.instance
+                    && (fallback.pass == Some(pass.id)
+                        || (fallback.pass.is_none() && is_final_output_pass))
+            }) {
+                renderer.effect_trace.visible_clip_fallback(
+                    pass,
+                    fallback.input_rect_count,
+                    fallback.clip_rect_count,
+                );
+            }
             renderer.effect_trace.pass_boundary(
                 "begin",
                 pass,
@@ -1058,8 +1080,13 @@ fn effective_pass_damage(
     demand: &EffectExecutionDemand,
     pass: &CompiledRenderPass,
 ) -> EffectRegion {
+    let authoritative_output = graph
+        .instances
+        .iter()
+        .find(|instance| instance.id == pass.instance)
+        .map(|instance| &instance.output_influence_region);
     if demand.has_pass_plan() {
-        return demand
+        let planned = demand
             .pass_output_region(pass.id)
             .cloned()
             .unwrap_or_else(|| {
@@ -1071,9 +1098,26 @@ fn effective_pass_damage(
                     EffectRegion::empty()
                 }
             });
+        return if matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) {
+            authoritative_output.map_or_else(EffectRegion::empty, |clip| {
+                planned.intersect_bounded_within(clip)
+            })
+        } else {
+            planned
+        };
     }
     let Some(output_region) = demand.output_region(pass.instance) else {
-        return if demand.is_conservative_full() {
+        return if matches!(
+            pass.kind,
+            RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+        ) {
+            authoritative_output
+                .cloned()
+                .unwrap_or_else(EffectRegion::empty)
+        } else if demand.is_conservative_full() {
             pass.output
                 .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
                 .map_or_else(EffectRegion::empty, |texture| {
@@ -1087,7 +1131,11 @@ fn effective_pass_damage(
         pass.kind,
         RenderPassKind::Composite | RenderPassKind::OutputPostProcess
     ) {
-        return pass.damage.union(output_region);
+        return authoritative_output.map_or_else(EffectRegion::empty, |clip| {
+            pass.damage
+                .union(output_region)
+                .intersect_bounded_within(clip)
+        });
     }
     pass.output
         .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
@@ -3415,6 +3463,7 @@ mod tests {
             checkpoint_dependencies,
             visual_group: None,
             anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
         }
     }
 
@@ -3543,6 +3592,7 @@ mod tests {
             checkpoint_dependencies: Vec::new(),
             visual_group: None,
             anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
         };
         let graph = CompiledFrameGraph {
             passes: vec![
@@ -3686,6 +3736,68 @@ mod tests {
         assert!(!execution_damage.contains_point(476, 226));
         assert!(!execution_damage.contains_point(499, 400));
         assert!(!execution_damage.contains_point(1300, 400));
+    }
+
+    #[test]
+    fn final_composite_scissors_stay_within_fragmented_output_clip() {
+        let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+        let input = GraphTextureId::new(1).unwrap();
+        let output = GraphTextureId::new(2).unwrap();
+        let output_domain = oblivion_one::effects::EffectRect::new(0, 0, 500, 10).unwrap();
+        let mut visible =
+            EffectRegion::from_rect(oblivion_one::effects::EffectRect::new(0, 0, 1, 1).unwrap());
+        visible.push(oblivion_one::effects::EffectRect::new(400, 0, 1, 1).unwrap());
+        let mut repair = EffectRegion::empty();
+        for _ in 0..128 {
+            repair.push(oblivion_one::effects::EffectRect::new(0, 0, 500, 1).unwrap());
+        }
+        let pass = test_pass(
+            1,
+            RenderPassKind::Composite,
+            instance,
+            vec![input],
+            output,
+            Vec::new(),
+        );
+        let graph = CompiledFrameGraph {
+            passes: vec![pass.clone()],
+            textures: vec![
+                test_texture(1, GraphTextureSource::Intermediate, output_domain),
+                test_texture(2, GraphTextureSource::Output, output_domain),
+            ],
+            instances: vec![oblivion_one::effects::CompiledEffectInstance {
+                id: instance,
+                output_influence_region: visible.clone(),
+                capture_region: visible.clone(),
+                dependencies: Vec::new(),
+            }],
+            final_damage: EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let demand = oblivion_one::effects::plan_effect_execution_demand(&graph, &repair, false);
+        assert_eq!(demand.plan_stats().visible_clip_fallbacks, 1);
+
+        let execution_damage = effective_pass_damage(&graph, &demand, &pass);
+        let scissors = effect_damage_to_texture_rects(
+            &execution_damage,
+            &graph.textures[1],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert_eq!(
+            scissors,
+            vec![OutputRect::new(0, 0, 1, 1), OutputRect::new(400, 0, 1, 1)]
+        );
+        assert!(scissors.iter().all(|rect| {
+            (rect.x..rect.x + rect.width as i32).all(|x| {
+                (rect.y..rect.y + rect.height as i32).all(|y| visible.contains_point(x, y))
+            })
+        }));
+        assert!(
+            !scissors
+                .iter()
+                .any(|rect| rect.x <= 200 && 200 < rect.x + rect.width as i32)
+        );
     }
 
     #[test]
@@ -3880,6 +3992,7 @@ mod tests {
             checkpoint_dependencies: vec![pass_id],
             visual_group: None,
             anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
+            visible_clip_fallback: None,
         };
         let graph = CompiledFrameGraph {
             passes: vec![pass],
@@ -4025,6 +4138,7 @@ mod tests {
             checkpoint_dependencies: Vec::new(),
             visual_group: None,
             anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            visible_clip_fallback: None,
         };
         let texture = |id| oblivion_one::effects::GraphTexturePlan {
             id: GraphTextureId::new(id).unwrap(),

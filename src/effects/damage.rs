@@ -98,6 +98,12 @@ pub(crate) struct BoundedRegionIntersection {
     pub(crate) clip_rect_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EffectRegionClipFallback {
+    pub(crate) input_rect_count: usize,
+    pub(crate) clip_rect_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectDamageSnapshot {
     pub identity: u64,
@@ -205,6 +211,21 @@ impl EffectRegion {
         result
     }
 
+    pub(crate) fn union_with_diagnostics(&self, other: &Self) -> (Self, bool) {
+        if self.conservative_full || other.conservative_full {
+            return (self.union(other), false);
+        }
+        let mut result = self.clone();
+        let mut coalesced = false;
+        for rect in &other.rects {
+            if result.rects.len() >= MAX_EFFECT_REGION_RECTS {
+                coalesced = true;
+            }
+            result.push(*rect);
+        }
+        (result, coalesced)
+    }
+
     pub fn intersect_rect(&self, bounds: EffectRect) -> Self {
         if self.conservative_full {
             return Self::from_rect(bounds);
@@ -245,10 +266,7 @@ impl EffectRegion {
         self.intersect_bounded_within_result(clip).region
     }
 
-    pub(crate) fn intersect_bounded_within_result(
-        &self,
-        clip: &Self,
-    ) -> BoundedRegionIntersection {
+    pub(crate) fn intersect_bounded_within_result(&self, clip: &Self) -> BoundedRegionIntersection {
         let input_rect_count = self.rects.len();
         let clip_rect_count = clip.rects.len();
         if self.conservative_full {
@@ -416,6 +434,7 @@ pub struct EffectDamagePlan {
     pub source_query_region: EffectRegion,
     pub dependency_region: EffectRegion,
     pub capture_region: EffectRegion,
+    pub(crate) output_clip_fallback: Option<EffectRegionClipFallback>,
 }
 
 pub fn plan_effect_damage(
@@ -450,18 +469,27 @@ pub fn plan_effect_damage(
             .max(footprint.output_outsets.bottom),
         output_bounds,
     );
-    let output_damage = source_damage
+    let output_damage_result = source_damage
         .expand_clamped_xy(
             footprint.sample_radius_x,
             footprint.sample_radius_y,
             output_bounds,
         )
-        .intersect_bounded_within(&output_influence_region);
+        .intersect_bounded_within_result(&output_influence_region);
+    let output_clip_fallback =
+        output_damage_result
+            .overflowed
+            .then_some(EffectRegionClipFallback {
+                input_rect_count: output_damage_result.input_rect_count,
+                clip_rect_count: output_damage_result.clip_rect_count,
+            });
+    let output_damage = output_damage_result.region;
     EffectDamagePlan {
         output_damage,
         source_query_region: capture_region.clone(),
         dependency_region: output_influence_region,
         capture_region,
+        output_clip_fallback,
     }
 }
 
@@ -730,19 +758,23 @@ mod tests {
             .collect::<Vec<_>>();
         let pairwise_intersections = expanded_source
             .iter()
-            .flat_map(|left| new.rects().iter().filter_map(|right| left.intersect(*right)))
+            .flat_map(|left| {
+                new.rects()
+                    .iter()
+                    .filter_map(|right| left.intersect(*right))
+            })
             .count();
         assert!(pairwise_intersections > MAX_EFFECT_REGION_RECTS);
 
-        let plan = plan_effect_damage(
-            EffectFootprint::symmetric(12),
-            &new,
-            &source_damage,
-            bounds,
-        );
+        let plan = plan_effect_damage(EffectFootprint::symmetric(12), &new, &source_damage, bounds);
         let corner = (500, 100);
         assert!(!new.contains_point(corner.0, corner.1));
         assert!(!plan.output_damage.contains_point(corner.0, corner.1));
+        let fallback = plan
+            .output_clip_fallback
+            .expect("rounded transition should exercise the bounded clip fallback");
+        assert_eq!(fallback.input_rect_count, 66);
+        assert_eq!(fallback.clip_rect_count, 33);
     }
 
     #[test]
@@ -761,6 +793,41 @@ mod tests {
     }
 
     #[test]
+    fn bounded_intersection_reports_overflow_without_bbox_coalescing() {
+        let mut fragmented = EffectRegion::empty();
+        for _ in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented.push(EffectRect::new(0, 0, 500, 1).unwrap());
+        }
+        let mut clip = EffectRegion::from_rect(EffectRect::new(0, 0, 1, 1).unwrap());
+        clip.push(EffectRect::new(400, 0, 1, 1).unwrap());
+
+        let result = fragmented.intersect_bounded_within_result(&clip);
+
+        assert!(result.overflowed);
+        assert_eq!(result.input_rect_count, MAX_EFFECT_REGION_RECTS);
+        assert_eq!(result.clip_rect_count, 2);
+        assert_eq!(result.region, clip);
+    }
+
+    #[test]
+    fn internal_work_union_may_coalesce_but_stays_bounded() {
+        let mut work = EffectRegion::empty();
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            work.push(EffectRect::new(index as i32 * 2, 0, 1, 1).unwrap());
+        }
+        let additional = EffectRegion::from_rect(
+            EffectRect::new(MAX_EFFECT_REGION_RECTS as i32 * 2, 0, 1, 1).unwrap(),
+        );
+
+        let (result, coalesced) = work.union_with_diagnostics(&additional);
+
+        assert!(coalesced);
+        assert!(result.rects().len() <= MAX_EFFECT_REGION_RECTS);
+        assert!(result.contains_point(0, 0));
+        assert!(result.contains_point(MAX_EFFECT_REGION_RECTS as i32 * 2, 0));
+    }
+
+    #[test]
     fn exact_intersection_preserves_disjoint_region_holes() {
         let mut visible = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 4).unwrap());
         visible.push(EffectRect::new(20, 0, 10, 4).unwrap());
@@ -774,6 +841,89 @@ mod tests {
         assert!(plan.output_damage.contains_point(5, 2));
         assert!(!plan.output_damage.contains_point(15, 2));
         assert!(plan.output_damage.contains_point(25, 2));
+    }
+
+    fn assert_region_is_subset_of(region: &EffectRegion, clip: &EffectRegion) {
+        assert!(
+            region.bounding_rect().is_some(),
+            "test region must be bounded"
+        );
+        for rect in region.rects() {
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    assert!(
+                        clip.contains_point(x, y),
+                        "({x}, {y}) escaped the authoritative clip"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_region_variants_keep_final_damage_inside_authoritative_shape() {
+        let bounds = EffectRect::new(0, 0, 800, 300).unwrap();
+        let cases = [
+            (
+                rounded_test_region(100, 60, 500, 80, 20, 16),
+                rounded_test_region(100, 60, 500, 80, 20, 16),
+            ),
+            (
+                rounded_test_region(100, 60, 650, 80, 20, 16),
+                rounded_test_region(100, 60, 500, 80, 20, 16)
+                    .union(&rounded_test_region(100, 60, 650, 80, 20, 16)),
+            ),
+            (
+                rounded_test_region(100, 60, 500, 80, 20, 16),
+                rounded_test_region(100, 60, 650, 80, 20, 16)
+                    .union(&rounded_test_region(100, 60, 500, 80, 20, 16)),
+            ),
+            (
+                rounded_test_region(100, 60, 500, 80, 28, 16),
+                rounded_test_region(100, 60, 500, 80, 20, 16),
+            ),
+            (
+                rounded_test_region(220, 100, 500, 80, 20, 16),
+                rounded_test_region(100, 60, 500, 80, 20, 16),
+            ),
+            (
+                rounded_test_region(-10, 60, 500, 80, 20, 16),
+                rounded_test_region(-10, 60, 500, 80, 20, 16),
+            ),
+        ];
+
+        for (visible, source_damage) in cases {
+            let plan = plan_effect_damage(
+                EffectFootprint::symmetric(12),
+                &visible,
+                &source_damage,
+                bounds,
+            );
+            assert_region_is_subset_of(&plan.output_damage, &plan.dependency_region);
+        }
+    }
+
+    #[test]
+    fn near_protocol_budget_fragmented_repair_falls_back_to_disconnected_clip() {
+        let mut visible = EffectRegion::empty();
+        for index in 0..96 {
+            visible.push(EffectRect::new(index * 2, 50, 1, 1).unwrap());
+        }
+        let mut fragmented_repair = EffectRegion::empty();
+        for _ in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented_repair.push(EffectRect::new(0, 0, 200, 100).unwrap());
+        }
+        let plan = plan_effect_damage(
+            EffectFootprint::ZERO,
+            &visible,
+            &fragmented_repair,
+            EffectRect::new(0, 0, 300, 100).unwrap(),
+        );
+
+        assert_eq!(plan.output_damage, visible);
+        assert!(!plan.output_damage.contains_point(100, 50));
+        assert!(plan.output_damage.contains_point(0, 50));
+        assert!(plan.output_damage.contains_point(190, 50));
     }
 
     #[test]

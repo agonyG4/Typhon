@@ -996,6 +996,7 @@ mod tests {
                 checkpoint_dependencies: Vec::new(),
                 visual_group: None,
                 anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+                visible_clip_fallback: None,
             })
             .collect();
         CompiledFrameGraph {
@@ -1134,6 +1135,7 @@ mod tests {
                 checkpoint_dependencies: Vec::new(),
                 visual_group: None,
                 anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+                visible_clip_fallback: None,
             })
             .collect();
         let graph = CompiledFrameGraph {
