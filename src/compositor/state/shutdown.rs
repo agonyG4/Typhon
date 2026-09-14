@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(test)]
 use crate::compositor::subsurface::CapturedContentUpdateLineage;
 
 impl CompositorState {
@@ -47,6 +48,7 @@ impl CompositorState {
     }
 }
 
+#[cfg(test)]
 pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
     CachedSubsurfaceCommit {
         commit_id: SurfaceCommitId::for_tests(1),

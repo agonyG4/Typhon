@@ -2094,6 +2094,7 @@ impl PredictiveO1LifecycleLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     fn physical_identity_for_attempt(
         &self,
         attempt_id: PredictiveO1AttemptId,

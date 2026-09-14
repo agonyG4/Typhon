@@ -17,6 +17,7 @@ impl SurfaceCommitId {
     pub(crate) const fn get(self) -> u64 {
         self.0.get()
     }
+    #[cfg(test)]
     pub(crate) fn for_tests(value: u64) -> Self {
         Self(NonZeroU64::new(value).unwrap())
     }
