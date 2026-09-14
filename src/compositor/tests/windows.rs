@@ -581,6 +581,8 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
         false,
     )
     .unwrap();
+    let (_panel_connection, _panel_queue, _panel_surface, _panel) =
+        map_exclusive_top_panel(&socket_path);
 
     focus_root_window(&commands, surface_ids[1]);
     commands
@@ -597,6 +599,7 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
 
     let hidden_metrics = capture_fullscreen_render_plan_metrics(&commands);
     assert_eq!(hidden_metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(hidden_metrics.fullscreen_composition_active);
     assert!(hidden_metrics.solitary_tree_active);
     assert_eq!(
         capture_native_frame_surface_ids(&commands),
@@ -617,9 +620,14 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
     let opened_metrics = capture_fullscreen_render_plan_metrics(&commands);
     let opened_native_ids = capture_native_frame_surface_ids(&commands);
     assert_eq!(opened_metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(opened_metrics.fullscreen_composition_active);
     assert!(!opened_metrics.solitary_tree_active);
     assert!(opened_native_ids.contains(&surface_ids[1]));
     assert!(opened_native_ids.contains(&surface_ids[2]));
+    assert!(!opened_native_ids.contains(&surface_ids[0]));
+    assert_eq!(opened_metrics.fullscreen_allowed_application_roots, 1);
+    assert_eq!(opened_metrics.fullscreen_culled_application_roots, 1);
+    assert_eq!(opened_metrics.fullscreen_culled_layer_roots, 1);
     assert_eq!(
         capture_configure_serial(&commands),
         configure_serial_before_open
@@ -639,7 +647,9 @@ fn special_workspace_visibility_controls_fullscreen_native_frame_solitude() {
         .send(ServerCommand::ToggleDefaultSpecialWorkspace)
         .unwrap();
     wait_for_server_commands(&commands);
-    assert!(capture_fullscreen_render_plan_metrics(&commands).solitary_tree_active);
+    let closed_metrics = capture_fullscreen_render_plan_metrics(&commands);
+    assert!(closed_metrics.fullscreen_composition_active);
+    assert!(closed_metrics.solitary_tree_active);
     assert_eq!(
         capture_native_frame_surface_ids(&commands),
         vec![surface_ids[2]]
@@ -669,14 +679,51 @@ fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
     .unwrap();
     let (_panel_connection, _panel_queue, _panel_surface, _panel) =
         map_exclusive_top_panel(&socket_path);
+    let panel_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| {
+            surface.parent_surface_id.is_none() && surface.width == 1280 && surface.height == 32
+        })
+        .expect("Top shell surface should be renderable")
+        .surface_id;
     raise_root_window(&commands, surface_ids[1]);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 1,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
 
     let metrics = capture_fullscreen_render_plan_metrics(&commands);
     let presented = capture_native_frame_surface_ids(&commands);
+    assert!(
+        capture_renderable_surface_snapshot(&commands)
+            .iter()
+            .any(|surface| surface.surface_id == panel_surface_id)
+    );
     assert_eq!(metrics.owner_root_surface_id, Some(surface_ids[2]));
+    assert!(metrics.fullscreen_composition_active);
     assert!(metrics.solitary_tree_active);
     assert_eq!(presented, vec![surface_ids[2]]);
     assert!(!presented.contains(&surface_ids[1]));
+    commands
+        .send(ServerCommand::PointerMotion { x: 100.0, y: 16.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_ids[2])
+    );
+
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let restored = capture_native_frame_surface_ids(&commands);
+    assert!(restored.contains(&surface_ids[1]));
+    assert!(restored.contains(&surface_ids[2]));
+    assert!(restored.contains(&panel_surface_id));
 
     let _server = stop_controllable_test_server(commands, server_thread);
 }

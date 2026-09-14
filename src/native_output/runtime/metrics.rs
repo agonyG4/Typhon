@@ -796,6 +796,14 @@ impl NativeRuntime {
                         .map(|owner| owner.to_string())
                         .unwrap_or_else(|| "none".to_string()),
                 ),
+                NativePerfField::bool(
+                    "fullscreen_composition_active",
+                    fullscreen.fullscreen_composition_active,
+                ),
+                NativePerfField::bool(
+                    "fullscreen_transition_pending",
+                    fullscreen.fullscreen_transition_pending,
+                ),
                 NativePerfField::bool("solitary_tree_active", fullscreen.solitary_tree_active),
                 NativePerfField::usize(
                     "fullscreen_culled_surfaces",
@@ -805,6 +813,29 @@ impl NativeRuntime {
                 NativePerfField::usize(
                     "fullscreen_visible_overlays",
                     fullscreen.visible_overlay_count,
+                ),
+                NativePerfField::usize(
+                    "fullscreen_allowed_application_roots",
+                    fullscreen.fullscreen_allowed_application_roots,
+                ),
+                NativePerfField::usize(
+                    "fullscreen_allowed_layer_roots",
+                    fullscreen.fullscreen_allowed_layer_roots,
+                ),
+                NativePerfField::usize(
+                    "fullscreen_culled_application_roots",
+                    fullscreen.fullscreen_culled_application_roots,
+                ),
+                NativePerfField::usize(
+                    "fullscreen_culled_layer_roots",
+                    fullscreen.fullscreen_culled_layer_roots,
+                ),
+                NativePerfField::str(
+                    "fullscreen_above_reason",
+                    fullscreen
+                        .fullscreen_above_reason
+                        .map(|reason| reason.as_str())
+                        .unwrap_or("none"),
                 ),
                 NativePerfField::str(
                     "fullscreen_rejection",

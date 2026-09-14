@@ -552,57 +552,214 @@ impl CompositorState {
         blockers
     }
 
+    pub(in crate::compositor) fn fullscreen_composition_plan(&self) -> FullscreenCompositionPlan {
+        let eligibility = self.fullscreen_presentation_eligibility();
+        self.fullscreen_composition_plan_for_eligibility(eligibility)
+    }
+
+    fn fullscreen_composition_plan_for_eligibility(
+        &self,
+        eligibility: FullscreenPresentationEligibility,
+    ) -> FullscreenCompositionPlan {
+        let Some(owner) = eligibility.owner else {
+            return FullscreenCompositionPlan::default();
+        };
+        let owner_root_surface_id = owner.owner_root_surface_id;
+        let owner_present = self
+            .active_scene_surfaces()
+            .iter()
+            .any(|surface| surface.surface_id == owner_root_surface_id);
+        let owner_visible = self.surface_is_visible_in_active_scene(owner_root_surface_id)
+            && !self
+                .toplevel_window_state(owner_root_surface_id)
+                .is_some_and(WindowState::is_minimized);
+        let transition_pending =
+            self.presentation_animation_pending_for_root(owner_root_surface_id);
+        let mode = if owner_present
+            && owner_visible
+            && eligibility.exactly_covers_output
+            && !transition_pending
+        {
+            FullscreenCompositionMode::Dominant
+        } else {
+            FullscreenCompositionMode::Transitioning
+        };
+        let mut plan = FullscreenCompositionPlan {
+            owner_root_surface_id: Some(owner_root_surface_id),
+            mode,
+            ..FullscreenCompositionPlan::default()
+        };
+        if !mode.is_dominant() {
+            return plan;
+        }
+
+        let mut seen_roots = HashSet::new();
+        for surface in self.active_scene_surfaces() {
+            let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+            if !seen_roots.insert(root_surface_id) {
+                continue;
+            }
+            match self.fullscreen_root_classification(owner_root_surface_id, root_surface_id) {
+                FullscreenRootClassification::OwnerFamily => {
+                    plan.owner_family_roots.push(root_surface_id);
+                }
+                FullscreenRootClassification::AllowedAboveFullscreen(reason) => {
+                    if self.layer_surfaces.contains_key(&root_surface_id) {
+                        plan.allowed_layer_roots.push(root_surface_id);
+                    } else {
+                        plan.allowed_application_roots.push(root_surface_id);
+                    }
+                    plan.above_fullscreen_reason.get_or_insert(reason);
+                }
+                FullscreenRootClassification::CulledByFullscreen(_) => {
+                    if self.layer_surfaces.contains_key(&root_surface_id) {
+                        plan.culled_layer_roots = plan.culled_layer_roots.saturating_add(1);
+                    } else if self.window_id_for_surface(root_surface_id).is_some() {
+                        plan.culled_application_roots =
+                            plan.culled_application_roots.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        plan.culled_surface_count = self
+            .active_scene_surfaces()
+            .iter()
+            .filter(|surface| {
+                !plan.allows_presentation_root(
+                    self.presentation_owner_root_for_surface(surface.surface_id),
+                )
+            })
+            .count();
+        let has_additional_owner_family = self.active_scene_surfaces().iter().any(|surface| {
+            let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
+            root_surface_id != owner_root_surface_id
+                && plan.owner_family_roots.contains(&root_surface_id)
+        });
+        let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
+        plan.solitary_owner_only = !has_additional_owner_family
+            && !popup_visible
+            && plan.allowed_application_roots.is_empty()
+            && plan.allowed_layer_roots.is_empty();
+        plan
+    }
+
+    fn fullscreen_root_classification(
+        &self,
+        owner_root_surface_id: u32,
+        root_surface_id: u32,
+    ) -> FullscreenRootClassification {
+        if self.root_belongs_to_fullscreen_owner_family(owner_root_surface_id, root_surface_id) {
+            return FullscreenRootClassification::OwnerFamily;
+        }
+        if let Some(role) = self.layer_surfaces.get(&root_surface_id) {
+            return match role.committed.layer {
+                Layer::Overlay => FullscreenRootClassification::AllowedAboveFullscreen(
+                    FullscreenAboveFullscreenReason::LayerOverlay,
+                ),
+                Layer::Background => FullscreenRootClassification::CulledByFullscreen(
+                    FullscreenCulledRootReason::LayerBackground,
+                ),
+                Layer::Bottom => FullscreenRootClassification::CulledByFullscreen(
+                    FullscreenCulledRootReason::LayerBottom,
+                ),
+                Layer::Top => FullscreenRootClassification::CulledByFullscreen(
+                    FullscreenCulledRootReason::LayerTop,
+                ),
+            };
+        }
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return FullscreenRootClassification::CulledByFullscreen(
+                FullscreenCulledRootReason::GlobalContent,
+            );
+        };
+        if matches!(
+            self.scene_work_owner_for_window(window_id),
+            SceneWorkOwner::Location(crate::wm::WorkspaceLocation::Special(_))
+        ) {
+            return FullscreenRootClassification::AllowedAboveFullscreen(
+                FullscreenAboveFullscreenReason::SpecialWorkspaceApplication,
+            );
+        }
+        let stack_layer = self
+            .window(window_id)
+            .map(|window| window.stack_layer)
+            .unwrap_or(DesktopStackLayer::Normal);
+        match stack_layer {
+            DesktopStackLayer::Notification => {
+                FullscreenRootClassification::AllowedAboveFullscreen(
+                    FullscreenAboveFullscreenReason::ApplicationNotification,
+                )
+            }
+            DesktopStackLayer::Overlay => FullscreenRootClassification::AllowedAboveFullscreen(
+                FullscreenAboveFullscreenReason::ApplicationOverlay,
+            ),
+            DesktopStackLayer::Above => FullscreenRootClassification::AllowedAboveFullscreen(
+                FullscreenAboveFullscreenReason::ApplicationAbove,
+            ),
+            DesktopStackLayer::Popup => FullscreenRootClassification::CulledByFullscreen(
+                FullscreenCulledRootReason::OrdinaryApplicationPopup,
+            ),
+            DesktopStackLayer::Normal => FullscreenRootClassification::CulledByFullscreen(
+                FullscreenCulledRootReason::RegularApplication,
+            ),
+        }
+    }
+
+    fn root_belongs_to_fullscreen_owner_family(
+        &self,
+        owner_root_surface_id: u32,
+        root_surface_id: u32,
+    ) -> bool {
+        if owner_root_surface_id == root_surface_id {
+            return true;
+        }
+        let Some(owner_window_id) = self.window_id_for_surface(owner_root_surface_id) else {
+            return false;
+        };
+        let Some(candidate_window_id) = self.window_id_for_surface(root_surface_id) else {
+            return false;
+        };
+        let owner_id = self
+            .canonical_scene_owner_window_id(owner_window_id)
+            .unwrap_or(owner_window_id);
+        let candidate_id = self
+            .canonical_scene_owner_window_id(candidate_window_id)
+            .unwrap_or(candidate_window_id);
+        owner_id == candidate_id
+    }
+
+    fn fullscreen_render_plan_metrics_for_plan(
+        &self,
+        plan: &FullscreenCompositionPlan,
+        eligibility: FullscreenPresentationEligibility,
+    ) -> FullscreenRenderPlanMetrics {
+        FullscreenRenderPlanMetrics {
+            fullscreen_active: plan.owner_root_surface_id.is_some(),
+            owner_root_surface_id: plan.owner_root_surface_id,
+            fullscreen_composition_active: plan.mode.is_dominant(),
+            fullscreen_transition_pending: plan
+                .owner_root_surface_id
+                .is_some_and(|owner| self.presentation_animation_pending_for_root(owner)),
+            solitary_tree_active: plan.solitary_owner_only,
+            culled_surface_count: plan.culled_surface_count,
+            wallpaper_culled: plan.mode.is_dominant(),
+            visible_overlay_count: self.visible_fullscreen_overlay_count(),
+            fullscreen_allowed_application_roots: plan.allowed_application_roots.len(),
+            fullscreen_allowed_layer_roots: plan.allowed_layer_roots.len(),
+            fullscreen_culled_application_roots: plan.culled_application_roots,
+            fullscreen_culled_layer_roots: plan.culled_layer_roots,
+            fullscreen_above_reason: plan.above_fullscreen_reason,
+            rejection: eligibility.rejection,
+        }
+    }
+
     pub(in crate::compositor) fn fullscreen_render_plan_metrics(
         &self,
     ) -> FullscreenRenderPlanMetrics {
         let eligibility = self.fullscreen_presentation_eligibility();
-        let owner_root_surface_id = eligibility.owner.map(|owner| owner.owner_root_surface_id);
-        let visible_overlay_count = self.visible_fullscreen_overlay_count();
-        let popup_visible = !self.active_scene_popup_surface_ids().is_empty();
-        // This is the composited visibility policy, not Direct Scanout
-        // admission.  A fullscreen owner with a non-scanout buffer still
-        // owns the fullscreen composition tree; visible popups or application
-        // content ordered above that tree make it non-solitary.
-        let owner_not_minimized = owner_root_surface_id.is_some_and(|owner| {
-            self.surface_is_visible_in_active_scene(owner)
-                && !self
-                    .toplevel_window_state(owner)
-                    .is_some_and(WindowState::is_minimized)
-        });
-        let owner_transition_pending = owner_root_surface_id
-            .is_some_and(|owner| self.presentation_animation_pending_for_root(owner));
-        let solitary_tree_active = owner_root_surface_id.is_some()
-            && eligibility.exactly_covers_output
-            && owner_not_minimized
-            && !owner_transition_pending
-            && !popup_visible
-            && owner_root_surface_id.is_none_or(|owner| {
-                !self.has_visible_application_content_outside_fullscreen_owner(owner)
-            });
-        let culled_surface_count = if solitary_tree_active {
-            owner_root_surface_id
-                .map(|owner| {
-                    self.active_scene_surfaces()
-                        .iter()
-                        .filter(|surface| {
-                            self.root_surface_id_for_surface(surface.surface_id) != owner
-                        })
-                        .count()
-                        .saturating_sub(visible_overlay_count)
-                })
-                .unwrap_or_default()
-        } else {
-            0
-        };
-        FullscreenRenderPlanMetrics {
-            fullscreen_active: owner_root_surface_id.is_some(),
-            owner_root_surface_id,
-            solitary_tree_active,
-            culled_surface_count,
-            wallpaper_culled: solitary_tree_active,
-            visible_overlay_count,
-            rejection: eligibility.rejection,
-        }
+        let plan = self.fullscreen_composition_plan_for_eligibility(eligibility);
+        self.fullscreen_render_plan_metrics_for_plan(&plan, eligibility)
     }
 
     fn has_visible_special_application_content(&self) -> bool {
@@ -628,22 +785,20 @@ impl CompositorState {
         &self,
     ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {
         let surfaces: Cow<'_, [RenderableSurface]> = Cow::Borrowed(self.active_scene_surfaces());
-        let metrics = self.fullscreen_render_plan_metrics();
-        if !metrics.solitary_tree_active {
+        let eligibility = self.fullscreen_presentation_eligibility();
+        let plan = self.fullscreen_composition_plan_for_eligibility(eligibility);
+        let metrics = self.fullscreen_render_plan_metrics_for_plan(&plan, eligibility);
+        if !plan.mode.is_dominant() {
             return (surfaces, metrics);
         }
-        let Some(owner_root_surface_id) = metrics.owner_root_surface_id else {
-            return (surfaces, metrics);
-        };
-        let overlay_tree_root_ids = self.fullscreen_overlay_tree_root_ids();
         (
             Cow::Owned(
                 surfaces
                     .iter()
                     .filter(|surface| {
-                        let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-                        root_surface_id == owner_root_surface_id
-                            || overlay_tree_root_ids.contains(&root_surface_id)
+                        plan.allows_presentation_root(
+                            self.presentation_owner_root_for_surface(surface.surface_id),
+                        )
                     })
                     .cloned()
                     .collect(),
@@ -742,26 +897,6 @@ impl CompositorState {
             .is_some_and(|transform| !transform.is_identity())
     }
 
-    pub(in crate::compositor) fn has_visible_application_content_outside_fullscreen_owner(
-        &self,
-        owner_root_surface_id: u32,
-    ) -> bool {
-        let surfaces = self.active_scene_surfaces();
-        let Some(owner_position) = surfaces.iter().position(|surface| {
-            self.root_surface_id_for_surface(surface.surface_id) == owner_root_surface_id
-        }) else {
-            return false;
-        };
-        surfaces
-            .iter()
-            .skip(owner_position.saturating_add(1))
-            .any(|surface| {
-                let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-                !self.layer_surfaces.contains_key(&root_surface_id)
-                    && self.window_id_for_surface(root_surface_id).is_some()
-            })
-    }
-
     fn visible_fullscreen_overlay_count(&self) -> usize {
         self.layer_surfaces
             .values()
@@ -774,15 +909,6 @@ impl CompositorState {
             .values()
             .filter(|role| role.mapped && role.committed.layer.scene_rank() > 2)
             .count()
-    }
-
-    fn fullscreen_overlay_tree_root_ids(&self) -> Vec<u32> {
-        self.layer_surfaces
-            .iter()
-            .filter_map(|(surface_id, role)| {
-                (role.mapped && role.committed.layer == Layer::Overlay).then_some(*surface_id)
-            })
-            .collect()
     }
 }
 

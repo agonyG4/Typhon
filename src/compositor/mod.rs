@@ -213,8 +213,10 @@ pub use effects::{
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub use fullscreen::{
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,
-    FullscreenPresentationRejection, FullscreenPresentationState, FullscreenRenderPlanMetrics,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenAboveFullscreenReason,
+    FullscreenCompositionMode, FullscreenCompositionPlan, FullscreenCulledRootReason,
+    FullscreenPresentationEligibility, FullscreenPresentationRejection,
+    FullscreenPresentationState, FullscreenRenderPlanMetrics, FullscreenRootClassification,
 };
 pub(crate) use fullscreen::{
     direct_scanout_scene_rejection_for_effects, direct_scanout_scene_rejection_for_flags,

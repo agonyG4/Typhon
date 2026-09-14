@@ -2,6 +2,81 @@ use super::state_data::ViewportSourceRect;
 use super::{BufferIdentity, BufferSize, DmabufBufferHandle, SurfaceCommitSequence};
 use wayland_server::protocol::wl_output;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FullscreenCompositionMode {
+    #[default]
+    Inactive,
+    Transitioning,
+    Dominant,
+}
+
+impl FullscreenCompositionMode {
+    pub const fn is_dominant(self) -> bool {
+        matches!(self, Self::Dominant)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullscreenAboveFullscreenReason {
+    SpecialWorkspaceApplication,
+    ApplicationNotification,
+    ApplicationOverlay,
+    ApplicationAbove,
+    LayerOverlay,
+}
+
+impl FullscreenAboveFullscreenReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpecialWorkspaceApplication => "special_workspace_application",
+            Self::ApplicationNotification => "application_notification",
+            Self::ApplicationOverlay => "application_overlay",
+            Self::ApplicationAbove => "application_above",
+            Self::LayerOverlay => "layer_overlay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullscreenCulledRootReason {
+    RegularApplication,
+    OrdinaryApplicationPopup,
+    LayerBackground,
+    LayerBottom,
+    LayerTop,
+    GlobalContent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullscreenRootClassification {
+    OwnerFamily,
+    AllowedAboveFullscreen(FullscreenAboveFullscreenReason),
+    CulledByFullscreen(FullscreenCulledRootReason),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullscreenCompositionPlan {
+    pub owner_root_surface_id: Option<u32>,
+    pub mode: FullscreenCompositionMode,
+    pub owner_family_roots: Vec<u32>,
+    pub allowed_application_roots: Vec<u32>,
+    pub allowed_layer_roots: Vec<u32>,
+    pub culled_application_roots: usize,
+    pub culled_layer_roots: usize,
+    pub culled_surface_count: usize,
+    pub solitary_owner_only: bool,
+    pub above_fullscreen_reason: Option<FullscreenAboveFullscreenReason>,
+}
+
+impl FullscreenCompositionPlan {
+    pub fn allows_presentation_root(&self, root_surface_id: u32) -> bool {
+        !self.mode.is_dominant()
+            || self.owner_family_roots.contains(&root_surface_id)
+            || self.allowed_application_roots.contains(&root_surface_id)
+            || self.allowed_layer_roots.contains(&root_surface_id)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullscreenPresentationState {
     pub owner_root_surface_id: u32,
@@ -234,10 +309,17 @@ pub struct FullscreenPresentationEligibility {
 pub struct FullscreenRenderPlanMetrics {
     pub fullscreen_active: bool,
     pub owner_root_surface_id: Option<u32>,
+    pub fullscreen_composition_active: bool,
+    pub fullscreen_transition_pending: bool,
     pub solitary_tree_active: bool,
     pub culled_surface_count: usize,
     pub wallpaper_culled: bool,
     pub visible_overlay_count: usize,
+    pub fullscreen_allowed_application_roots: usize,
+    pub fullscreen_allowed_layer_roots: usize,
+    pub fullscreen_culled_application_roots: usize,
+    pub fullscreen_culled_layer_roots: usize,
+    pub fullscreen_above_reason: Option<FullscreenAboveFullscreenReason>,
     pub rejection: Option<FullscreenPresentationRejection>,
 }
 

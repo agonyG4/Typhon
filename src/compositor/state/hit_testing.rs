@@ -84,14 +84,17 @@ impl CompositorState {
         y: f64,
     ) -> Option<RootSurfaceHit> {
         self.refresh_surface_origin_cache();
+        let fullscreen_plan = self.fullscreen_composition_plan();
         let surfaces = self.active_scene_surfaces();
         let origins = self.active_scene_surface_origins();
         for (index, renderable) in surfaces.iter().enumerate().rev() {
             let Some(origin) = origins.get(index).copied() else {
                 continue;
             };
-
             let root_surface_id = self.visual_stack_root_for_surface(renderable.surface_id);
+            if !self.fullscreen_plan_allows_root(&fullscreen_plan, root_surface_id) {
+                continue;
+            }
             if self.window_id_for_surface(root_surface_id).is_none() {
                 continue;
             }
@@ -277,6 +280,7 @@ impl CompositorState {
         y: f64,
     ) -> PointerSceneHit {
         let instrumentation_enabled = self.pointer_hit_instrumentation_enabled;
+        let fullscreen_plan = self.fullscreen_composition_plan();
         let started_at = instrumentation_enabled.then(Instant::now);
         if instrumentation_enabled {
             self.pointer_hit_metrics.pointer_scene_hit_calls += 1;
@@ -285,6 +289,16 @@ impl CompositorState {
             && cache.pointer_hit_generation == self.pointer_hit_generation
             && cache.x == x
             && cache.y == y
+            && match &cache.hit {
+                PointerSceneHit::Client { target } => self.fullscreen_plan_allows_root(
+                    &fullscreen_plan,
+                    compositor_surface_id(&target.surface),
+                ),
+                PointerSceneHit::Decoration {
+                    root_surface_id, ..
+                } => self.fullscreen_plan_allows_root(&fullscreen_plan, *root_surface_id),
+                PointerSceneHit::None => true,
+            }
         {
             if instrumentation_enabled {
                 self.pointer_hit_metrics.pointer_scene_hit_cache_hits += 1;
@@ -297,8 +311,7 @@ impl CompositorState {
             }
             return cache.hit.clone();
         }
-
-        if let Some(hit) = self.pointer_scene_hit_locality_at(x, y) {
+        if let Some(hit) = self.pointer_scene_hit_locality_at(x, y, &fullscreen_plan) {
             if instrumentation_enabled {
                 self.pointer_hit_metrics.owner_locality_fast_hits = self
                     .pointer_hit_metrics
@@ -330,7 +343,7 @@ impl CompositorState {
             .saturating_add(1);
         self.refresh_visual_stack_groups_cache();
         let (hit, groups_inspected, surfaces_inspected) =
-            self.pointer_scene_hit_uncached(x, y, instrumentation_enabled);
+            self.pointer_scene_hit_uncached(x, y, instrumentation_enabled, &fullscreen_plan);
         if instrumentation_enabled {
             self.pointer_hit_metrics.pointer_scene_hit_groups_inspected += groups_inspected;
             self.pointer_hit_metrics
@@ -408,6 +421,7 @@ impl CompositorState {
         x: f64,
         y: f64,
         collect_metrics: bool,
+        fullscreen_plan: &FullscreenCompositionPlan,
     ) -> (PointerSceneHit, u64, u64) {
         let surfaces = self.active_scene_surfaces();
         let origins = self.active_scene_surface_origins();
@@ -422,6 +436,9 @@ impl CompositorState {
                 continue;
             };
             if root_surface.surface_id != group.root_surface_id() {
+                continue;
+            }
+            if !self.fullscreen_plan_allows_root(fullscreen_plan, group.root_surface_id()) {
                 continue;
             }
             if self.lifecycle_surface_is_suppressed(group.root_surface_id()) {
@@ -505,7 +522,12 @@ impl CompositorState {
         (PointerSceneHit::None, groups_inspected, surfaces_inspected)
     }
 
-    fn pointer_scene_hit_locality_at(&mut self, x: f64, y: f64) -> Option<PointerSceneHit> {
+    fn pointer_scene_hit_locality_at(
+        &mut self,
+        x: f64,
+        y: f64,
+        fullscreen_plan: &FullscreenCompositionPlan,
+    ) -> Option<PointerSceneHit> {
         let cache = self.pointer_scene_hit_cache.as_ref()?;
         if cache.pointer_hit_generation != self.pointer_hit_generation {
             return None;
@@ -514,6 +536,9 @@ impl CompositorState {
             PointerSceneHit::Client { target } => {
                 let surface_id = compositor_surface_id(&target.surface);
                 let root_surface_id = self.visual_stack_root_for_surface(surface_id);
+                if !self.fullscreen_plan_allows_root(fullscreen_plan, root_surface_id) {
+                    return None;
+                }
                 if self.lifecycle_surface_is_suppressed(root_surface_id) {
                     return None;
                 }
@@ -523,6 +548,7 @@ impl CompositorState {
                     None,
                     x,
                     y,
+                    fullscreen_plan,
                 ) {
                     return None;
                 }
@@ -554,11 +580,20 @@ impl CompositorState {
                 root_surface_id,
                 hit,
             } => {
+                if !self.fullscreen_plan_allows_root(fullscreen_plan, *root_surface_id) {
+                    return None;
+                }
                 if self.lifecycle_surface_is_suppressed(*root_surface_id) {
                     return None;
                 }
-                if !self.pointer_scene_owner_is_frontmost(*root_surface_id, None, Some(*hit), x, y)
-                {
+                if !self.pointer_scene_owner_is_frontmost(
+                    *root_surface_id,
+                    None,
+                    Some(*hit),
+                    x,
+                    y,
+                    fullscreen_plan,
+                ) {
                     return None;
                 }
                 let index = self.active_scene_surface_index(*root_surface_id)?;
@@ -588,8 +623,12 @@ impl CompositorState {
         owner_decoration: Option<DecorationHit>,
         x: f64,
         y: f64,
+        fullscreen_plan: &FullscreenCompositionPlan,
     ) -> bool {
         for group in self.visual_stack_groups_cache.iter().rev() {
+            if !self.fullscreen_plan_allows_root(fullscreen_plan, group.root_surface_id()) {
+                continue;
+            }
             let Some(root_index) = self.active_scene_surface_index(group.root_surface_id()) else {
                 continue;
             };
@@ -696,6 +735,10 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<PointerTarget> {
+        let fullscreen_plan = self.fullscreen_composition_plan();
+        if !self.fullscreen_plan_allows_root(&fullscreen_plan, root_surface_id) {
+            return None;
+        }
         self.refresh_surface_origin_cache();
         let surfaces = self.active_scene_surfaces();
         let origins = self.active_scene_surface_origins();
@@ -721,6 +764,15 @@ impl CompositorState {
             surface_x,
             surface_y,
         })
+    }
+
+    fn fullscreen_plan_allows_root(
+        &self,
+        fullscreen_plan: &FullscreenCompositionPlan,
+        root_surface_id: u32,
+    ) -> bool {
+        fullscreen_plan
+            .allows_presentation_root(self.presentation_owner_root_for_surface(root_surface_id))
     }
 
     pub(in crate::compositor) fn pointer_target_for_surface_at_output(

@@ -579,6 +579,16 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
             .current_visual_root_window_geometry(fixture.surface_id),
         Some(fullscreen)
     );
+    let fullscreen_plan = fixture.server.state.fullscreen_composition_plan();
+    assert_eq!(
+        fullscreen_plan.owner_root_surface_id,
+        Some(fixture.surface_id)
+    );
+    assert!(matches!(
+        fullscreen_plan.mode,
+        crate::compositor::FullscreenCompositionMode::Dominant
+            | crate::compositor::FullscreenCompositionMode::Transitioning
+    ));
     let root = fixture
         .server
         .renderable_surfaces()

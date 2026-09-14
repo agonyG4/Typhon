@@ -159,7 +159,10 @@ impl CompositorState {
         (2, 0, 0, original_position)
     }
 
-    fn canonical_scene_owner_window_id(&self, window_id: WindowId) -> Option<WindowId> {
+    pub(in crate::compositor) fn canonical_scene_owner_window_id(
+        &self,
+        window_id: WindowId,
+    ) -> Option<WindowId> {
         let mut current = window_id;
         for _ in 0..=self.desktop_windows.len() {
             let window = self.window(current)?;

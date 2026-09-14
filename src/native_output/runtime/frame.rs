@@ -932,10 +932,17 @@ mod tests {
         let visibility = FullscreenRenderPlanMetrics {
             fullscreen_active: true,
             owner_root_surface_id: Some(701),
+            fullscreen_composition_active: true,
+            fullscreen_transition_pending: false,
             solitary_tree_active: false,
             culled_surface_count: 3,
             wallpaper_culled: true,
             visible_overlay_count: 2,
+            fullscreen_allowed_application_roots: 1,
+            fullscreen_allowed_layer_roots: 1,
+            fullscreen_culled_application_roots: 1,
+            fullscreen_culled_layer_roots: 1,
+            fullscreen_above_reason: None,
             rejection: None,
         };
 

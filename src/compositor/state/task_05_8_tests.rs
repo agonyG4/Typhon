@@ -232,38 +232,62 @@ mod task_05_8_tests {
     }
 
     #[test]
-    fn visible_special_application_blocks_solitary_fullscreen_culling() {
+    fn visible_special_application_is_allowed_without_disabling_fullscreen_culling() {
         let mut state = CompositorState::new(None);
         let regular = state.allocate_window_id().expect("regular window id");
         let special = state.allocate_window_id().expect("special window id");
-        state
-            .insert_desktop_window(DesktopWindow::new_xdg(regular, 903))
-            .expect("regular window");
-        state
-            .insert_desktop_window(DesktopWindow::new_xdg(special, 904))
-            .expect("special window");
+        let fullscreen = state.allocate_window_id().expect("fullscreen window id");
+        let mut fullscreen_surface =
+            test_surface(905, state.output_size.width, state.output_size.height);
+        fullscreen_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![
+                test_surface(903, 16, 16),
+                test_surface(904, 16, 16),
+                fullscreen_surface,
+            ],
+            &[(903, regular), (904, special), (905, fullscreen)],
+            Some(905),
+        );
         state
             .window_mut(special)
             .expect("special window")
             .management = Some(WindowManagementState::new(
             crate::wm::WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT),
         ));
-        state.append_renderable_surface(test_surface(903, 16, 16));
-        state.append_renderable_surface(test_surface(904, 16, 16));
+        state.toggle_default_special_workspace();
+        let opened_metrics = state.fullscreen_render_plan_metrics();
+        assert!(opened_metrics.fullscreen_composition_active);
+        assert!(!opened_metrics.solitary_tree_active);
+        let opened_presented = state
+            .native_frame_renderable_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        assert!(opened_presented.contains(&904));
+        assert!(opened_presented.contains(&905));
+        assert!(!opened_presented.contains(&903));
+        let active_scene = state
+            .active_scene_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        assert!(active_scene.contains(&903));
+        assert!(active_scene.contains(&904));
+        assert!(active_scene.contains(&905));
 
         state.toggle_default_special_workspace();
-        assert!(state.has_visible_application_content_outside_fullscreen_owner(903));
+        let closed_metrics = state.fullscreen_render_plan_metrics();
+        assert!(closed_metrics.fullscreen_composition_active);
+        assert!(closed_metrics.solitary_tree_active);
         assert_eq!(
             state
-                .active_scene_surfaces()
+                .native_frame_renderable_surfaces()
                 .iter()
                 .map(|surface| surface.surface_id)
                 .collect::<Vec<_>>(),
-            [903, 904]
+            [905]
         );
-
-        state.toggle_default_special_workspace();
-        assert!(!state.has_visible_application_content_outside_fullscreen_owner(903));
     }
 
     #[test]
@@ -276,6 +300,8 @@ mod task_05_8_tests {
 
         let metrics = state.fullscreen_render_plan_metrics();
         assert!(!metrics.fullscreen_active);
+        assert!(!metrics.fullscreen_composition_active);
+        assert!(!metrics.fullscreen_transition_pending);
         assert!(!metrics.solitary_tree_active);
         assert_eq!(metrics.owner_root_surface_id, None);
         assert_eq!(
@@ -285,6 +311,148 @@ mod task_05_8_tests {
                 .map(|surface| surface.surface_id)
                 .collect::<Vec<_>>(),
             [905]
+        );
+    }
+
+    #[test]
+    fn fullscreen_owner_transient_family_survives_unrelated_application_culling() {
+        let mut state = CompositorState::default();
+        let unrelated = WindowId::from_raw(21).expect("unrelated window id");
+        let owner = WindowId::from_raw(22).expect("owner window id");
+        let transient = WindowId::from_raw(23).expect("transient window id");
+        let mut owner_surface =
+            test_surface(907, state.output_size.width, state.output_size.height);
+        owner_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![
+                test_surface(906, 16, 16),
+                owner_surface,
+                test_surface(908, 16, 16),
+            ],
+            &[(906, unrelated), (907, owner), (908, transient)],
+            Some(907),
+        );
+        state
+            .window_mut(transient)
+            .expect("transient window")
+            .relationships
+            .parent = Some(owner);
+        let regular_location = crate::wm::WorkspaceLocation::Regular(state.active_workspace());
+        state.window_mut(owner).expect("owner window").management =
+            Some(WindowManagementState::new(regular_location));
+        state
+            .window_mut(transient)
+            .expect("transient window")
+            .management = Some(WindowManagementState::new(regular_location));
+        state.rebuild_active_scene_view();
+
+        let metrics = state.fullscreen_render_plan_metrics();
+        let presented = state
+            .native_frame_renderable_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        assert!(metrics.fullscreen_composition_active);
+        assert!(!metrics.solitary_tree_active);
+        assert_eq!(presented, [907, 908]);
+        assert!(!presented.contains(&906));
+    }
+
+    #[test]
+    fn fullscreen_application_policy_allows_explicit_above_categories_only() {
+        let mut state = CompositorState::default();
+        let owner = WindowId::from_raw(31).expect("owner window id");
+        let normal = WindowId::from_raw(32).expect("normal window id");
+        let above = WindowId::from_raw(33).expect("above window id");
+        let notification = WindowId::from_raw(34).expect("notification window id");
+        let overlay = WindowId::from_raw(35).expect("overlay window id");
+        let popup = WindowId::from_raw(36).expect("popup window id");
+        let mut owner_surface =
+            test_surface(909, state.output_size.width, state.output_size.height);
+        owner_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![
+                owner_surface,
+                test_surface(910, 16, 16),
+                test_surface(911, 16, 16),
+                test_surface(912, 16, 16),
+                test_surface(913, 16, 16),
+                test_surface(914, 16, 16),
+            ],
+            &[
+                (909, owner),
+                (910, normal),
+                (911, above),
+                (912, notification),
+                (913, overlay),
+                (914, popup),
+            ],
+            Some(909),
+        );
+        state.window_mut(above).expect("above window").stack_layer = DesktopStackLayer::Above;
+        state
+            .window_mut(notification)
+            .expect("notification window")
+            .stack_layer = DesktopStackLayer::Notification;
+        state
+            .window_mut(overlay)
+            .expect("overlay window")
+            .stack_layer = DesktopStackLayer::Overlay;
+        state.window_mut(popup).expect("popup window").stack_layer = DesktopStackLayer::Popup;
+        state.rebuild_active_scene_view();
+
+        let metrics = state.fullscreen_render_plan_metrics();
+        let presented = state
+            .native_frame_renderable_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        assert!(metrics.fullscreen_composition_active);
+        assert!(!metrics.solitary_tree_active);
+        assert_eq!(metrics.fullscreen_allowed_application_roots, 3);
+        assert_eq!(metrics.fullscreen_culled_application_roots, 2);
+        assert!(presented.contains(&909));
+        assert!(presented.contains(&911));
+        assert!(presented.contains(&912));
+        assert!(presented.contains(&913));
+        assert!(!presented.contains(&910));
+        assert!(!presented.contains(&914));
+    }
+
+    #[test]
+    fn ordinary_restack_after_fullscreen_activation_does_not_reopen_culled_scene() {
+        let mut state = CompositorState::default();
+        let owner = WindowId::from_raw(41).expect("owner window id");
+        let unrelated = WindowId::from_raw(42).expect("unrelated window id");
+        let mut owner_surface =
+            test_surface(915, state.output_size.width, state.output_size.height);
+        owner_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        state.install_native_frame_test_scene(
+            vec![owner_surface, test_surface(916, 16, 16)],
+            &[(915, owner), (916, unrelated)],
+            Some(915),
+        );
+        state.window_stacking = vec![owner, unrelated];
+        state.rebuild_active_scene_view();
+        assert!(state.raise_root_window(916));
+        assert_eq!(state.window_stacking.last(), Some(&unrelated));
+        assert_eq!(
+            state
+                .native_frame_renderable_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [915]
+        );
+
+        state.clear_fullscreen_presentation_owner(915);
+        assert_eq!(
+            state
+                .native_frame_renderable_surfaces()
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            [915, 916]
         );
     }
 
@@ -723,6 +891,8 @@ mod task_05_8_tests {
 
         assert!(state.presentation_animation_pending_for_root(512));
         let metrics = state.fullscreen_render_plan_metrics();
+        assert!(!metrics.fullscreen_composition_active);
+        assert!(metrics.fullscreen_transition_pending);
         assert!(!metrics.solitary_tree_active);
         assert_eq!(
             state
@@ -745,6 +915,11 @@ mod task_05_8_tests {
                 .any(|window| window.key == 512 && window.mathematically_settled)
         );
         assert!(state.presentation_animation_pending_for_root(512));
+        assert!(
+            !state
+                .fullscreen_render_plan_metrics()
+                .fullscreen_composition_active
+        );
         assert!(!state.fullscreen_render_plan_metrics().solitary_tree_active);
 
         let snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
@@ -753,6 +928,11 @@ mod task_05_8_tests {
         );
         state.publish_presented_presentation(1, &snapshot);
         assert!(!state.presentation_animation_pending_for_root(512));
+        assert!(
+            state
+                .fullscreen_render_plan_metrics()
+                .fullscreen_composition_active
+        );
         assert!(state.fullscreen_render_plan_metrics().solitary_tree_active);
         assert_eq!(
             state
