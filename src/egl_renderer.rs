@@ -509,6 +509,7 @@ impl EglSceneFrameCommit {
                 surface_signature_hash: 0,
                 decoration_signature_hash: 0,
                 popup_surface_signature_hash: 0,
+                external_overlay_surface_signature_hash: 0,
                 presentation_geometry_signature: 0,
                 framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
@@ -551,7 +552,7 @@ struct LampUniformLocations {
     output_size: Option<glow::UniformLocation>,
     canonical_visual_rect: Option<glow::UniformLocation>,
     source_visual_rect: Option<glow::UniformLocation>,
-    anchor_rect: Option<glow::UniformLocation>,
+    portal_rect: Option<glow::UniformLocation>,
     progress: Option<glow::UniformLocation>,
     opacity: Option<glow::UniformLocation>,
     direction: Option<glow::UniformLocation>,
@@ -953,6 +954,10 @@ fn lamp_geometry_key(
             lamp.visual_group.anchor_rect.y().to_bits(),
             lamp.visual_group.anchor_rect.width().to_bits(),
             lamp.visual_group.anchor_rect.height().to_bits(),
+            lamp.visual_group.portal_rect.x().to_bits(),
+            lamp.visual_group.portal_rect.y().to_bits(),
+            lamp.visual_group.portal_rect.width().to_bits(),
+            lamp.visual_group.portal_rect.height().to_bits(),
             lamp.visual_group.shape_factor.to_bits(),
             lamp.visual_group.bump_distance.to_bits(),
             match lamp.visual_group.lamp_direction {
@@ -1151,7 +1156,7 @@ impl GlesSceneRenderer {
                 output_size: gl.get_uniform_location(program, "u_output_size"),
                 canonical_visual_rect: gl.get_uniform_location(program, "u_canonical_visual_rect"),
                 source_visual_rect: gl.get_uniform_location(program, "u_source_visual_rect"),
-                anchor_rect: gl.get_uniform_location(program, "u_anchor_rect"),
+                portal_rect: gl.get_uniform_location(program, "u_portal_rect"),
                 progress: gl.get_uniform_location(program, "u_progress"),
                 opacity: gl.get_uniform_location(program, "u_opacity"),
                 direction: gl.get_uniform_location(program, "u_direction"),
@@ -1760,15 +1765,16 @@ impl GlesSceneRenderer {
             base_surfaces.as_slice()
         };
         let surface_signatures = egl_scene_surface_signatures(surfaces);
-        let candidate_scene_key = EglSceneCacheKey::new_with_decorations(
+        let candidate_scene_key = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
             width,
             height,
             content_generation,
             output_scale_key,
             &surface_signatures,
+            presentation_geometry_signature,
+            external_overlay_surface_ids,
             decoration_instances,
             popup_surface_ids,
-            presentation_geometry_signature,
             framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
@@ -1778,6 +1784,7 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
+            external_overlay_surface_ids,
             decoration_instances,
             popup_surface_ids,
             presentation_geometry_signature,
@@ -1840,6 +1847,7 @@ impl GlesSceneRenderer {
                 output_scale,
                 output_scale_key,
                 &surface_signatures,
+                external_overlay_surface_ids,
                 presentation_geometry_signature,
                 framebuffer_origin,
             );
@@ -2849,18 +2857,20 @@ impl GlesSceneRenderer {
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
         decoration_instances: &[DecorationRenderInstance],
         popup_surface_ids: &[u32],
         presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.scene_cache_key.is_some_and(|key| {
-            key.is_current_with_decorations(
+            key.is_current_with_decorations_and_external_overlay_ids(
                 width,
                 height,
                 content_generation,
                 output_scale_key,
                 surface_signatures,
+                external_overlay_surface_ids,
                 decoration_instances,
                 popup_surface_ids,
                 presentation_geometry_signature,
@@ -2884,6 +2894,7 @@ impl GlesSceneRenderer {
         output_scale: f64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
         presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
@@ -2952,17 +2963,20 @@ impl GlesSceneRenderer {
             }
         }
 
-        self.scene_cache_key = Some(EglSceneCacheKey::new_with_decorations(
-            width,
-            height,
-            content_generation,
-            output_scale_key,
-            surface_signatures,
-            decoration_instances,
-            popup_surface_ids,
-            presentation_geometry_signature,
-            framebuffer_origin,
-        ));
+        self.scene_cache_key = Some(
+            EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
+                width,
+                height,
+                content_generation,
+                output_scale_key,
+                surface_signatures,
+                presentation_geometry_signature,
+                external_overlay_surface_ids,
+                decoration_instances,
+                popup_surface_ids,
+                framebuffer_origin,
+            ),
+        );
     }
 
     #[expect(
@@ -3747,8 +3761,8 @@ impl GlesSceneRenderer {
                 );
                 set_lamp_uniform_rect(
                     &self.gl,
-                    uniforms.anchor_rect.as_ref(),
-                    sample.visual_group.anchor_rect,
+                    uniforms.portal_rect.as_ref(),
+                    sample.visual_group.portal_rect,
                     output_scale,
                 );
                 if let Some(location) = &uniforms.direction {
@@ -4827,6 +4841,7 @@ struct EglSceneCacheKey {
     surface_signature_hash: u64,
     decoration_signature_hash: u64,
     popup_surface_signature_hash: u64,
+    external_overlay_surface_signature_hash: u64,
     presentation_geometry_signature: u64,
     framebuffer_origin: OutputFramebufferOrigin,
 }
@@ -4861,6 +4876,32 @@ impl EglSceneCacheKey {
         presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
+        Self::new_with_presentation_and_external_overlay_ids(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            surface_signatures,
+            &[],
+            presentation_geometry_signature,
+            framebuffer_origin,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache-key construction keeps the explicit overlay partition authority alongside scene state"
+    )]
+    fn new_with_presentation_and_external_overlay_ids(
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
         Self {
             width,
             height,
@@ -4869,6 +4910,9 @@ impl EglSceneCacheKey {
             surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
             decoration_signature_hash: egl_decoration_signature_hash(&[]),
             popup_surface_signature_hash: 0,
+            external_overlay_surface_signature_hash: egl_external_overlay_surface_signature_hash(
+                external_overlay_surface_ids,
+            ),
             presentation_geometry_signature,
             framebuffer_origin,
         }
@@ -4876,25 +4920,27 @@ impl EglSceneCacheKey {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "cache-key construction keeps each render-state component explicit"
+        reason = "cache-key construction keeps each render-state component and overlay partition explicit"
     )]
-    fn new_with_decorations(
+    fn new_with_decorations_and_external_overlay_ids(
         width: u32,
         height: u32,
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        presentation_geometry_signature: u64,
+        external_overlay_surface_ids: &[u32],
         decoration_instances: &[DecorationRenderInstance],
         popup_surface_ids: &[u32],
-        presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
-        let mut key = Self::new_with_presentation(
+        let mut key = Self::new_with_presentation_and_external_overlay_ids(
             width,
             height,
             content_generation,
             output_scale_key,
             surface_signatures,
+            external_overlay_surface_ids,
             presentation_geometry_signature,
             framebuffer_origin,
         );
@@ -4949,6 +4995,7 @@ impl EglSceneCacheKey {
         )
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "cache-key validation keeps each render-state component explicit"
@@ -4965,6 +5012,37 @@ impl EglSceneCacheKey {
         presentation_geometry_signature: u64,
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
+        self.is_current_with_decorations_and_external_overlay_ids(
+            width,
+            height,
+            _content_generation,
+            output_scale_key,
+            surface_signatures,
+            &[],
+            decoration_instances,
+            popup_surface_ids,
+            presentation_geometry_signature,
+            framebuffer_origin,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cache-key validation keeps each render-state component and overlay partition explicit"
+    )]
+    fn is_current_with_decorations_and_external_overlay_ids(
+        self,
+        width: u32,
+        height: u32,
+        _content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+        external_overlay_surface_ids: &[u32],
+        decoration_instances: &[DecorationRenderInstance],
+        popup_surface_ids: &[u32],
+        presentation_geometry_signature: u64,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> bool {
         self.width == width
             && self.height == height
             && self.output_scale_key == output_scale_key
@@ -4972,6 +5050,8 @@ impl EglSceneCacheKey {
             && self.decoration_signature_hash == egl_decoration_signature_hash(decoration_instances)
             && self.popup_surface_signature_hash
                 == egl_popup_surface_signature_hash(popup_surface_ids)
+            && self.external_overlay_surface_signature_hash
+                == egl_external_overlay_surface_signature_hash(external_overlay_surface_ids)
             && self.presentation_geometry_signature == presentation_geometry_signature
             && self.framebuffer_origin == framebuffer_origin
     }
@@ -5006,6 +5086,17 @@ fn egl_popup_surface_signature_hash(popup_surface_ids: &[u32]) -> u64 {
         return 0;
     }
     popup_surface_ids
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, id| {
+            (hash ^ u64::from(*id)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn egl_external_overlay_surface_signature_hash(external_overlay_surface_ids: &[u32]) -> u64 {
+    if external_overlay_surface_ids.is_empty() {
+        return 0;
+    }
+    external_overlay_surface_ids
         .iter()
         .fold(0xcbf2_9ce4_8422_2325, |hash, id| {
             (hash ^ u64::from(*id)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -6568,6 +6659,9 @@ mod tests {
             .renderer
             .lamp_uniform_locations
             .expect("Lamp shader is available in the GLES test harness");
+        assert!(uniforms.canonical_visual_rect.is_some());
+        assert!(uniforms.source_visual_rect.is_some());
+        assert!(uniforms.portal_rect.is_some());
         assert!(uniforms.progress.is_some());
         assert!(uniforms.contraction_progress.is_some());
         assert!(uniforms.translation_progress.is_some());
@@ -10122,6 +10216,122 @@ mod tests {
             12,
             OutputFramebufferOrigin::BottomLeft,
         ));
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_dock_overlay_partition_changes() {
+        let surface = EglSceneSurfaceSignature {
+            surface_id: 703,
+            commit_sequence: 1,
+            buffer_id: 11,
+            buffer_width: 64,
+            buffer_height: 64,
+            buffer_scale: 1,
+            buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+            x: 608,
+            y: 368,
+            width: 64,
+            height: 64,
+            render_x: 608,
+            render_y: 368,
+            clip_x: 0,
+            clip_y: 0,
+            clip_width: 0,
+            clip_height: 0,
+            generation: 1,
+        };
+        let surfaces = std::slice::from_ref(&surface);
+        let base = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
+            1280,
+            800,
+            9,
+            120,
+            surfaces,
+            11,
+            &[],
+            &[],
+            &[],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        let promoted = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
+            1280,
+            800,
+            9,
+            120,
+            surfaces,
+            11,
+            &[703],
+            &[],
+            &[],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        let restored = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
+            1280,
+            800,
+            9,
+            120,
+            surfaces,
+            11,
+            &[],
+            &[],
+            &[],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(!base.is_current_with_decorations_and_external_overlay_ids(
+            1280,
+            800,
+            9,
+            120,
+            surfaces,
+            &[703],
+            &[],
+            &[],
+            11,
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(
+            promoted.is_current_with_decorations_and_external_overlay_ids(
+                1280,
+                800,
+                9,
+                120,
+                surfaces,
+                &[703],
+                &[],
+                &[],
+                11,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+        );
+        assert!(
+            !promoted.is_current_with_decorations_and_external_overlay_ids(
+                1280,
+                800,
+                9,
+                120,
+                surfaces,
+                &[],
+                &[],
+                &[],
+                11,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+        );
+        assert!(
+            restored.is_current_with_decorations_and_external_overlay_ids(
+                1280,
+                800,
+                9,
+                120,
+                surfaces,
+                &[],
+                &[],
+                &[],
+                11,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+        );
     }
 
     #[test]

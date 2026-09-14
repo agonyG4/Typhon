@@ -1351,8 +1351,11 @@ impl OwnCompositorServer {
             .lifecycle_decoration_render_instances(sample, surfaces)
     }
 
-    pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
-        self.state.external_overlay_surface_ids()
+    pub fn external_overlay_surface_ids(
+        &self,
+        lifecycle: &crate::window_lifecycle_animation::LifecycleSceneSample,
+    ) -> Vec<u32> {
+        self.state.external_overlay_surface_ids(lifecycle)
     }
 
     pub fn active_workspace(&self) -> WorkspaceId {

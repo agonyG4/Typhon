@@ -128,7 +128,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         );
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
-        let external_overlay_surface_ids = server.external_overlay_surface_ids();
+        let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let render_generation = server.scene_render_generation();
         let effects = server.resolved_effect_scene_for_presentation(&presentation);
         let snapshot = NativeSceneSnapshot::from_surfaces_with_popup_ids(

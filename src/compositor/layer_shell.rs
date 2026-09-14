@@ -1,4 +1,6 @@
 use super::*;
+use crate::window_lifecycle_animation::LifecycleSceneSample;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Layer {
@@ -1152,7 +1154,11 @@ impl CompositorState {
         self.activate_ondemand_layer_surface(root_surface_id)
     }
 
-    pub(in crate::compositor) fn external_overlay_surface_ids(&self) -> Vec<u32> {
+    pub(in crate::compositor) fn external_overlay_surface_ids(
+        &self,
+        lifecycle: &LifecycleSceneSample,
+    ) -> Vec<u32> {
+        let lifecycle_dock_roots = self.lifecycle_dock_root_ids(lifecycle);
         self.renderable_surfaces
             .iter()
             .filter(|surface| self.surface_is_visible_in_active_scene(surface.surface_id))
@@ -1160,11 +1166,73 @@ impl CompositorState {
                 let root_id = self.root_surface_id_for_surface(surface.surface_id);
                 self.layer_surfaces
                     .get(&root_id)
-                    .is_some_and(|role| role.committed.layer == Layer::Overlay)
+                    .is_some_and(|role| {
+                        role.committed.layer == Layer::Overlay
+                            || lifecycle_dock_roots.contains(&root_id)
+                    })
                     .then_some(surface.surface_id)
             })
             .collect()
     }
+
+    fn lifecycle_dock_root_ids(&self, lifecycle: &LifecycleSceneSample) -> HashSet<u32> {
+        if lifecycle.lamps.is_empty() {
+            return HashSet::new();
+        }
+
+        let origins = render::surface_origins(&self.renderable_surfaces);
+        self.layer_surfaces
+            .iter()
+            .filter(|(root_id, role)| {
+                role.mapped
+                    && role.namespace == "astrea-dock"
+                    && role.committed.layer == Layer::Top
+                    && self.surface_is_visible_in_active_scene(**root_id)
+            })
+            .filter_map(|(root_id, _)| {
+                let bounds = self
+                    .renderable_surfaces
+                    .iter()
+                    .zip(origins.iter().copied())
+                    .filter(|(surface, _)| {
+                        self.root_surface_id_for_surface(surface.surface_id) == *root_id
+                    })
+                    .filter_map(|(surface, (x, y))| {
+                        PresentationRect::new(
+                            f64::from(x),
+                            f64::from(y),
+                            f64::from(surface.width),
+                            f64::from(surface.height),
+                        )
+                    })
+                    .reduce(|bounds, surface| {
+                        let right =
+                            (bounds.x() + bounds.width()).max(surface.x() + surface.width());
+                        let bottom =
+                            (bounds.y() + bounds.height()).max(surface.y() + surface.height());
+                        PresentationRect::new(
+                            bounds.x().min(surface.x()),
+                            bounds.y().min(surface.y()),
+                            right - bounds.x().min(surface.x()),
+                            bottom - bounds.y().min(surface.y()),
+                        )
+                        .expect("union of valid renderable surface bounds must be valid")
+                    })?;
+                lifecycle
+                    .lamps
+                    .iter()
+                    .any(|lamp| presentation_rects_intersect(bounds, lamp.visual_group.anchor_rect))
+                    .then_some(*root_id)
+            })
+            .collect()
+    }
+}
+
+fn presentation_rects_intersect(left: PresentationRect, right: PresentationRect) -> bool {
+    left.x() < right.x() + right.width()
+        && right.x() < left.x() + left.width()
+        && left.y() < right.y() + right.height()
+        && right.y() < left.y() + left.height()
 }
 
 pub(super) fn layer_from_protocol(

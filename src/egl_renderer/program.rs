@@ -89,7 +89,7 @@ out vec2 v_uv;
 uniform vec2 u_output_size;
 uniform vec4 u_canonical_visual_rect;
 uniform vec4 u_source_visual_rect;
-uniform vec4 u_anchor_rect;
+uniform vec4 u_portal_rect;
 uniform float u_progress;
 uniform int u_direction;
 uniform float u_shape_factor;
@@ -147,7 +147,7 @@ void main() {
         0.0,
         1.0
     );
-    vec2 target = u_anchor_rect.xy + group_uv * u_anchor_rect.zw;
+    vec2 target = u_portal_rect.xy + group_uv * u_portal_rect.zw;
     vec2 warped = source_point;
     if (progress >= 1.0) {
         warped = target;
@@ -183,10 +183,10 @@ void main() {
         float retreat_sign = (u_direction == 0 || u_direction == 3) ? 1.0 : -1.0;
         float source_axis = axis_position(u_source_visual_rect, movement_normalized)
             + retreat_sign * retreat_distance;
-        float target_axis = axis_position(u_anchor_rect, movement_normalized);
+        float target_axis = axis_position(u_portal_rect, movement_normalized);
         float axis = mix(source_axis, target_axis, row_translation);
         float source_cross = cross_position(u_source_visual_rect, cross_normalized);
-        float target_cross = cross_position(u_anchor_rect, cross_normalized);
+        float target_cross = cross_position(u_portal_rect, cross_normalized);
         float cross_completion = clamp(
             1.0 - (1.0 - early_contraction) * (1.0 - row_translation),
             0.0,
@@ -291,8 +291,8 @@ mod tests {
             ];
             let endpoint = lamp_warp_visual_point(group, source_point, 1.0);
             let expected_endpoint = [
-                group.anchor_rect.x() + normalized[0] * group.anchor_rect.width(),
-                group.anchor_rect.y() + normalized[1] * group.anchor_rect.height(),
+                group.portal_rect.x() + normalized[0] * group.portal_rect.width(),
+                group.portal_rect.y() + normalized[1] * group.portal_rect.height(),
             ];
             assert_eq!(endpoint, expected_endpoint);
         }
@@ -301,9 +301,12 @@ mod tests {
             "u_source_visual_rect.xy\n        + ((a_position - u_canonical_visual_rect.xy)"
         ));
         assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_canonical_visual_rect;"));
+        assert!(LAMP_VERTEX_SHADER.contains("uniform vec4 u_portal_rect;"));
         assert!(LAMP_VERTEX_SHADER.contains("movement_extent(u_source_visual_rect)"));
         assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_source_visual_rect"));
         assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_source_visual_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("axis_position(u_portal_rect"));
+        assert!(LAMP_VERTEX_SHADER.contains("cross_position(u_portal_rect"));
         for uniform in [
             "uniform float u_progress;",
             "uniform float u_contraction_progress;",
@@ -325,6 +328,7 @@ mod tests {
         assert!(!LAMP_VERTEX_SHADER.contains("in_out_cubic"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_source_rect"));
         assert!(!LAMP_VERTEX_SHADER.contains("u_full_window_rect"));
+        assert!(!LAMP_VERTEX_SHADER.contains("u_anchor_rect"));
     }
 }
 

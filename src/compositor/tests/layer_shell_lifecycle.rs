@@ -1,4 +1,292 @@
 use super::*;
+use crate::window_lifecycle_animation::{
+    LampWindowSample, LifecycleDirection, LifecycleSceneSample, LifecycleTransitionId,
+    LifecycleVisualGroup,
+};
+
+fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
+    let visual_group = LifecycleVisualGroup::from_bounds(
+        PresentationRect::new(100.0, 100.0, 400.0, 300.0).unwrap(),
+        PresentationRect::new(100.0, 100.0, 400.0, 300.0).unwrap(),
+        PresentationRect::new(100.0, 100.0, 400.0, 300.0).unwrap(),
+        anchor_rect,
+        1280,
+        800,
+    )
+    .unwrap();
+    LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(1),
+        lamps: vec![LampWindowSample {
+            window_id: WindowId::from_raw(1).unwrap(),
+            root_surface_id: 901,
+            transition_id: LifecycleTransitionId::new(1),
+            visual_group,
+            progress: 0.4,
+            opacity: 1.0,
+            direction: LifecycleDirection::Minimize,
+            mathematically_settled: false,
+        }],
+        visual_sources: Vec::new(),
+    }
+}
+
+#[test]
+fn active_lamp_promotes_matching_astrea_dock_top_surface() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+
+    let (dock_surface, _dock_layer) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "astrea-dock",
+        64,
+        64,
+    );
+    let dock_child = compositor.create_surface(&qh, ());
+    let dock_subsurface = subcompositor.get_subsurface(&dock_child, &dock_surface, &qh, ());
+    dock_subsurface.set_position(12, 12);
+    commit_test_buffered_surface(&dock_child, &shm, &qh, 16, 16).unwrap();
+    dock_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let active_lamp = active_lamp(PresentationRect::new(608.0, 368.0, 64.0, 64.0).unwrap());
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let dock_surface_id = server
+        .renderable_surfaces()
+        .first()
+        .expect("mapped Dock surface")
+        .surface_id;
+    let external_overlay_surface_ids = server.external_overlay_surface_ids(&active_lamp);
+
+    assert!(external_overlay_surface_ids.contains(&dock_surface_id));
+    let dock_tree_ids = server
+        .renderable_surfaces()
+        .iter()
+        .filter(|surface| {
+            server.state.root_surface_id_for_surface(surface.surface_id) == dock_surface_id
+        })
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dock_tree_ids.len(),
+        2,
+        "Dock root and its subsurface must remain renderable"
+    );
+    assert!(
+        dock_tree_ids
+            .iter()
+            .all(|surface_id| external_overlay_surface_ids.contains(surface_id))
+    );
+}
+
+#[test]
+fn dock_promotion_is_lifecycle_scoped_and_keeps_true_overlays_ordered_after_it() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+
+    let (_ordinary_surface, _ordinary) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "ordinary-top",
+        64,
+        64,
+    );
+    let (_dock_surface, _dock) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "astrea-dock",
+        64,
+        64,
+    );
+    let (other_dock_surface, other_dock) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "astrea-dock",
+    );
+    other_dock.set_anchor(
+        client_zwlr_layer_surface_v1::Anchor::Top | client_zwlr_layer_surface_v1::Anchor::Left,
+    );
+    other_dock.set_size(64, 64);
+    other_dock_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&other_dock_surface, &shm, &qh, 64, 64).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let (_overlay_surface, _overlay) = create_mapped_layer_surface(
+        &connection,
+        &mut queue,
+        &mut state,
+        &compositor,
+        &shm,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Overlay,
+        "true-overlay",
+        32,
+        32,
+    );
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let all_surface_ids = server
+        .renderable_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let origins = crate::compositor::surface_origins(server.renderable_surfaces());
+    let matching_dock_root = server
+        .state
+        .layer_surfaces
+        .iter()
+        .filter(|(_, role)| role.namespace == "astrea-dock")
+        .find_map(|(root_id, _)| {
+            server
+                .renderable_surfaces()
+                .iter()
+                .zip(origins.iter().copied())
+                .find(|(surface, origin)| surface.surface_id == *root_id && *origin == (608, 368))
+                .map(|_| *root_id)
+        })
+        .expect("centered Dock root");
+    let dock_bounds = server
+        .renderable_surfaces()
+        .iter()
+        .find(|surface| surface.surface_id == matching_dock_root)
+        .expect("matching Dock root")
+        .clone();
+    let dock_origin = origins[server
+        .renderable_surfaces()
+        .iter()
+        .position(|surface| surface.surface_id == matching_dock_root)
+        .expect("matching Dock origin")];
+    let dock_anchor = PresentationRect::new(
+        f64::from(dock_origin.0),
+        f64::from(dock_origin.1),
+        f64::from(dock_bounds.width),
+        f64::from(dock_bounds.height),
+    )
+    .unwrap();
+    let active_lamp = active_lamp(dock_anchor);
+    let ordinary = server.external_overlay_surface_ids(&LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(1),
+        lamps: Vec::new(),
+        visual_sources: Vec::new(),
+    });
+    let promoted = server.external_overlay_surface_ids(&active_lamp);
+    let ordinary_root = server
+        .state
+        .layer_surfaces
+        .iter()
+        .find(|(_, role)| role.namespace == "ordinary-top")
+        .map(|(root_id, _)| *root_id)
+        .expect("ordinary Top root");
+    let other_dock_root = server
+        .state
+        .layer_surfaces
+        .iter()
+        .filter(|(root_id, role)| {
+            role.namespace == "astrea-dock" && **root_id != matching_dock_root
+        })
+        .map(|(root_id, _)| *root_id)
+        .next()
+        .expect("unmatched Dock root");
+    let overlay_root = server
+        .state
+        .layer_surfaces
+        .iter()
+        .find(|(_, role)| role.committed.layer == Layer::Overlay)
+        .map(|(root_id, _)| *root_id)
+        .expect("true Overlay root");
+
+    let overlay_ids = ordinary
+        .iter()
+        .copied()
+        .filter(|id| server.state.root_surface_id_for_surface(*id) == overlay_root)
+        .collect::<Vec<_>>();
+    assert!(!overlay_ids.is_empty(), "true Overlay must remain external");
+    assert!(!ordinary.contains(&ordinary_root));
+    assert!(!ordinary.contains(&matching_dock_root));
+    assert!(!ordinary.contains(&other_dock_root));
+    assert!(
+        !ordinary
+            .iter()
+            .any(|id| server.state.root_surface_id_for_surface(*id) == matching_dock_root)
+    );
+    assert!(promoted.contains(&matching_dock_root));
+    assert!(!promoted.contains(&ordinary_root));
+    assert!(!promoted.contains(&other_dock_root));
+    assert!(promoted.iter().any(|id| overlay_ids.contains(id)));
+    let promoted_dock_index = promoted
+        .iter()
+        .position(|id| server.state.root_surface_id_for_surface(*id) == matching_dock_root)
+        .expect("promoted Dock index");
+    let promoted_overlay_index = promoted
+        .iter()
+        .position(|id| overlay_ids.contains(id))
+        .expect("promoted Overlay index");
+    assert!(promoted_dock_index < promoted_overlay_index);
+    assert!(promoted.iter().all(|id| all_surface_ids.contains(id)));
+    let base_ids = all_surface_ids
+        .iter()
+        .copied()
+        .filter(|id| !promoted.contains(id))
+        .collect::<Vec<_>>();
+    assert!(promoted.iter().all(|id| !base_ids.contains(id)));
+
+    let settled = server.external_overlay_surface_ids(&LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(2),
+        lamps: Vec::new(),
+        visual_sources: Vec::new(),
+    });
+    assert_eq!(settled, ordinary);
+    assert!(!settled.contains(&matching_dock_root));
+    assert!(overlay_ids.iter().all(|id| settled.contains(id)));
+}
 
 #[test]
 fn layer_popup_renders_above_top_parent_and_gets_input_first() {

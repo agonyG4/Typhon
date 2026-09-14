@@ -78,6 +78,7 @@ pub struct LifecycleVisualGroup {
     pub presented_source_client_rect: PresentationRect,
     pub presented_source_visual_rect: PresentationRect,
     pub anchor_rect: PresentationRect,
+    pub portal_rect: PresentationRect,
     pub lamp_direction: LampDirection,
     pub shape_factor: f64,
     pub bump_distance: f64,
@@ -111,6 +112,8 @@ impl LifecycleVisualGroup {
             output_width,
             output_height,
         );
+        let portal_rect =
+            lamp_portal_rect(presented_source_visual_rect, anchor_rect, lamp_direction)?;
         let shape_factor =
             lamp_shape_factor(presented_source_visual_rect, anchor_rect, lamp_direction);
         let bump_distance =
@@ -121,6 +124,7 @@ impl LifecycleVisualGroup {
             presented_source_client_rect,
             presented_source_visual_rect,
             anchor_rect,
+            portal_rect,
             lamp_direction,
             shape_factor,
             bump_distance,
@@ -426,6 +430,10 @@ fn lifecycle_snapshot_signature(lamps: &[LifecycleFrameLamp]) -> u64 {
             lamp.visual_group.anchor_rect.y().to_bits(),
             lamp.visual_group.anchor_rect.width().to_bits(),
             lamp.visual_group.anchor_rect.height().to_bits(),
+            lamp.visual_group.portal_rect.x().to_bits(),
+            lamp.visual_group.portal_rect.y().to_bits(),
+            lamp.visual_group.portal_rect.width().to_bits(),
+            lamp.visual_group.portal_rect.height().to_bits(),
             lamp.visual_group.shape_factor.to_bits(),
             lamp.visual_group.bump_distance.to_bits(),
             lamp.progress.to_bits(),
@@ -792,6 +800,43 @@ pub fn presented_visual_rect(
     )
 }
 
+/// Fit the complete visual group inside the Dock anchor while preserving its
+/// aspect ratio. The edge facing the Dock is flush with the corresponding
+/// edge of the anchor; the perpendicular axis is centered.
+pub fn lamp_portal_rect(
+    source_rect: PresentationRect,
+    anchor_rect: PresentationRect,
+    direction: LampDirection,
+) -> Option<PresentationRect> {
+    if !valid_rect(source_rect) || !valid_rect(anchor_rect) {
+        return None;
+    }
+    let scale = (anchor_rect.width() / source_rect.width())
+        .min(anchor_rect.height() / source_rect.height());
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let width = source_rect.width() * scale;
+    let height = source_rect.height() * scale;
+    let cross_x = anchor_rect.x() + (anchor_rect.width() - width) * 0.5;
+    let cross_y = anchor_rect.y() + (anchor_rect.height() - height) * 0.5;
+    let (x, y) = match direction {
+        LampDirection::Bottom => (cross_x, anchor_rect.y()),
+        LampDirection::Top => (cross_x, anchor_rect.y() + anchor_rect.height() - height),
+        LampDirection::Right => (anchor_rect.x(), cross_y),
+        LampDirection::Left => (anchor_rect.x() + anchor_rect.width() - width, cross_y),
+    };
+    let portal = PresentationRect::new(x, y, width, height)?;
+    (valid_rect(portal) && rect_contains_rect(anchor_rect, portal)).then_some(portal)
+}
+
+fn rect_contains_rect(outer: PresentationRect, inner: PresentationRect) -> bool {
+    inner.x() >= outer.x()
+        && inner.y() >= outer.y()
+        && inner.x() + inner.width() <= outer.x() + outer.width()
+        && inner.y() + inner.height() <= outer.y() + outer.height()
+}
+
 fn valid_rect(rect: PresentationRect) -> bool {
     rect.x().is_finite()
         && rect.y().is_finite()
@@ -807,6 +852,8 @@ fn valid_visual_group(group: LifecycleVisualGroup) -> bool {
         && valid_rect(group.presented_source_client_rect)
         && valid_rect(group.presented_source_visual_rect)
         && valid_rect(group.anchor_rect)
+        && valid_rect(group.portal_rect)
+        && rect_contains_rect(group.anchor_rect, group.portal_rect)
         && group.shape_factor.is_finite()
         && group.shape_factor >= 0.0
         && group.bump_distance.is_finite()
@@ -1070,7 +1117,30 @@ pub fn lamp_warp_point_directional(
     channels: LampMotionChannels,
     point: [f64; 2],
 ) -> [f64; 2] {
-    if !valid_lamp_rects(source, source, anchor) || !point.into_iter().all(f64::is_finite) {
+    let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
+        return [0.0, 0.0];
+    };
+    lamp_warp_point_directional_to_target(
+        source,
+        portal,
+        direction,
+        shape_factor,
+        bump_distance,
+        channels,
+        point,
+    )
+}
+
+fn lamp_warp_point_directional_to_target(
+    source: PresentationRect,
+    target: PresentationRect,
+    direction: LampDirection,
+    shape_factor: f64,
+    bump_distance: f64,
+    channels: LampMotionChannels,
+    point: [f64; 2],
+) -> [f64; 2] {
+    if !valid_rect(source) || !valid_rect(target) || !point.into_iter().all(f64::is_finite) {
         return [0.0, 0.0];
     }
     let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
@@ -1104,11 +1174,11 @@ pub fn lamp_warp_point_directional(
         direction,
         retreat_distance,
     );
-    let target_axis = axis_position(anchor, direction, movement_normalized);
+    let target_axis = axis_position(target, direction, movement_normalized);
     let axis = source_axis + (target_axis - source_axis) * row_translation;
 
     let source_cross = cross_position(source, direction, cross_normalized);
-    let target_cross = cross_position(anchor, direction, cross_normalized);
+    let target_cross = cross_position(target, direction, cross_normalized);
     let cross_completion = 1.0 - (1.0 - early_contraction) * (1.0 - row_translation);
     let cross = source_cross + (target_cross - source_cross) * cross_completion.clamp(0.0, 1.0);
 
@@ -1133,20 +1203,23 @@ pub fn lamp_warp_point(
     if progress <= 0.0 {
         return point;
     }
+    let direction = infer_lamp_direction(source, anchor, 1920, 1080);
+    let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
+        return [0.0, 0.0];
+    };
     if progress >= 1.0 {
         let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
         let v = ((point[1] - source.y()) / source.height()).clamp(0.0, 1.0);
         return [
-            anchor.x() + u * anchor.width(),
-            anchor.y() + v * anchor.height(),
+            portal.x() + u * portal.width(),
+            portal.y() + v * portal.height(),
         ];
     }
-    let direction = infer_lamp_direction(source, anchor, 1920, 1080);
     let shape_factor = lamp_shape_factor(source, anchor, direction);
     let bump_distance = lamp_bump_distance(source, anchor, direction);
-    lamp_warp_point_directional(
+    lamp_warp_point_directional_to_target(
         source,
-        anchor,
+        portal,
         direction,
         shape_factor,
         bump_distance,
@@ -1186,13 +1259,13 @@ pub fn lamp_warp_visual_point(
         let u = ((point[0] - source.x()) / source.width()).clamp(0.0, 1.0);
         let v = ((point[1] - source.y()) / source.height()).clamp(0.0, 1.0);
         return [
-            visual_group.anchor_rect.x() + u * visual_group.anchor_rect.width(),
-            visual_group.anchor_rect.y() + v * visual_group.anchor_rect.height(),
+            visual_group.portal_rect.x() + u * visual_group.portal_rect.width(),
+            visual_group.portal_rect.y() + v * visual_group.portal_rect.height(),
         ];
     }
-    lamp_warp_point_directional(
+    lamp_warp_point_directional_to_target(
         source,
-        visual_group.anchor_rect,
+        visual_group.portal_rect,
         visual_group.lamp_direction,
         visual_group.shape_factor,
         visual_group.bump_distance,
@@ -1273,6 +1346,67 @@ mod tests {
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
         PresentationRect::new(x, y, width, height).expect("valid rectangle")
+    }
+
+    #[test]
+    fn portal_rect_is_aspect_fit_centered_and_direction_aligned() {
+        let fixtures = [
+            rect(-960.0, 120.0, 1600.0, 900.0), // 16:9, negative global x
+            rect(80.0, -400.0, 400.0, 900.0),   // portrait, negative global y
+            rect(120.0, 120.0, 600.0, 600.0),   // square
+            rect(-0.01, -0.02, 0.01, 0.02),     // extremely small valid source
+        ];
+        for anchor in [
+            rect(-32.0, 900.0, 64.0, 64.0),
+            rect(0.001, 0.002, 0.003, 0.004), // extremely small valid anchor
+        ] {
+            for source in fixtures {
+                for direction in [
+                    LampDirection::Bottom,
+                    LampDirection::Top,
+                    LampDirection::Left,
+                    LampDirection::Right,
+                ] {
+                    let portal = lamp_portal_rect(source, anchor, direction).expect("valid portal");
+                    assert!(valid_rect(portal));
+                    assert!(rect_contains_rect(anchor, portal));
+                    assert!(
+                        (portal.width() / portal.height() - source.width() / source.height()).abs()
+                            < 1.0e-12
+                    );
+                    match direction {
+                        LampDirection::Bottom => {
+                            assert_eq!(portal.y(), anchor.y());
+                            assert_eq!(
+                                portal.x() + portal.width() * 0.5,
+                                anchor.x() + anchor.width() * 0.5
+                            );
+                        }
+                        LampDirection::Top => {
+                            assert_eq!(portal.y() + portal.height(), anchor.y() + anchor.height());
+                            assert_eq!(
+                                portal.x() + portal.width() * 0.5,
+                                anchor.x() + anchor.width() * 0.5
+                            );
+                        }
+                        LampDirection::Left => {
+                            assert_eq!(portal.x() + portal.width(), anchor.x() + anchor.width());
+                            assert_eq!(
+                                portal.y() + portal.height() * 0.5,
+                                anchor.y() + anchor.height() * 0.5
+                            );
+                        }
+                        LampDirection::Right => {
+                            assert_eq!(portal.x(), anchor.x());
+                            assert_eq!(
+                                portal.y() + portal.height() * 0.5,
+                                anchor.y() + anchor.height() * 0.5
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1780,8 +1914,8 @@ mod tests {
             assert_eq!(
                 endpoint,
                 [
-                    anchor.x() + 0.3 * anchor.width(),
-                    anchor.y() + 0.6 * anchor.height(),
+                    group.portal_rect.x() + 0.3 * group.portal_rect.width(),
+                    group.portal_rect.y() + 0.6 * group.portal_rect.height(),
                 ]
             );
         }
@@ -1823,11 +1957,12 @@ mod tests {
         );
         assert!(intermediate.into_iter().all(f64::is_finite));
         assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
+        let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
         assert_eq!(
             lamp_warp_point(source, anchor, point, 1.0),
             [
-                anchor.x() + 0.5 * anchor.width(),
-                anchor.y() + 0.5 * anchor.height()
+                portal.x() + 0.5 * portal.width(),
+                portal.y() + 0.5 * portal.height()
             ]
         );
     }
@@ -1888,16 +2023,17 @@ mod tests {
     }
 
     #[test]
-    fn lamp_is_identity_at_zero_and_reaches_anchor_at_one() {
+    fn lamp_is_identity_at_zero_and_reaches_portal_at_one() {
         let source = rect(100.0, 80.0, 800.0, 600.0);
         let anchor = rect(1200.0, 900.0, 64.0, 64.0);
         let point = [500.0, 320.0];
 
         assert_eq!(lamp_warp_point(source, anchor, point, 0.0), point);
         let warped = lamp_warp_point(source, anchor, point, 1.0);
+        let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom).expect("portal");
         let expected = [
-            anchor.x() + 0.5 * anchor.width(),
-            anchor.y() + 0.4 * anchor.height(),
+            portal.x() + 0.5 * portal.width(),
+            portal.y() + 0.4 * portal.height(),
         ];
         assert_eq!(warped, expected);
         assert_eq!(lamp_opacity(0.0), 1.0);
@@ -1916,7 +2052,7 @@ mod tests {
         );
         assert_eq!(
             lamp_warp_window_point(full, source, anchor, point, 1.0),
-            [1232.0, 932.0]
+            [1232.0, 924.0]
         );
     }
 
