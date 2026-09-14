@@ -232,6 +232,140 @@ mod tests {
     }
 
     #[test]
+    fn worker_success_does_not_clear_same_logical_id_predictive_successor() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let predecessor = pacing.active.expect("normal predecessor");
+        let predecessor_reservation = pacing
+            .reserve_worker_submission(false)
+            .expect("predecessor worker reservation")
+            .expect("predecessor frame ID");
+
+        pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("same-logical-ID predictive successor");
+        let successor_attempt = pacing
+            .active_predictive_attempt
+            .expect("successor predictive attempt");
+        let successor_physical = OutputFrameIdentitySnapshot {
+            frame_id: 5_263,
+            protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
+                std::num::NonZeroU64::new(5_263).unwrap(),
+            ),
+            transaction_id: crate::native_output::OutputTransactionId::new(
+                std::num::NonZeroU64::new(5_263).unwrap(),
+            ),
+            slot: super::super::scanout::OutputSlotId::new(1).unwrap(),
+            framebuffer_id: oblivion_one::native::kms::FramebufferId::new(5_263).unwrap(),
+            render_generation: 2,
+            pool_generation: 1,
+            target: None,
+        };
+        pacing
+            .bind_predictive_o1(successor_physical)
+            .expect("bind successor physical frame");
+        pacing.note_render_ready();
+        pacing.note_ready_frame(2, true);
+
+        assert_eq!(pacing.ready, Some(predecessor));
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(
+            pacing.ready_physical_key,
+            Some(OutputFrameKey::from(&successor_physical))
+        );
+
+        pacing
+            .note_worker_submit_exact(
+                Some(predecessor_reservation),
+                None,
+                41,
+                3,
+                false,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
+            .expect("predecessor worker success");
+
+        assert_eq!(pacing.pending, Some(predecessor));
+        assert!(pacing.pending_predictive_attempt.is_none());
+        assert_eq!(pacing.ready, Some(predecessor));
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(
+            pacing.ready_physical_key,
+            Some(OutputFrameKey::from(&successor_physical))
+        );
+
+        pacing.note_pageflip_exact(None, 4, 3, 41, 6_060);
+        let successor_reservation = pacing
+            .reserve_worker_submission(true)
+            .expect("successor worker reservation")
+            .expect("successor frame ID");
+        pacing
+            .note_worker_submit_exact(
+                Some(successor_reservation),
+                Some(successor_physical),
+                42,
+                5,
+                true,
+                NativeOutputPacingMode::PredictiveTriple,
+            )
+            .expect("successor worker success");
+        pacing.note_pageflip_exact(Some(successor_physical), 6, 5, 42, 6_060);
+
+        assert_eq!(pacing.predictive_o1_presented, 1);
+        assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 0);
+    }
+
+    #[test]
+    fn worker_cancel_does_not_clear_same_logical_id_predictive_successor() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let predecessor = pacing.active.expect("normal predecessor");
+        let predecessor_reservation = pacing
+            .reserve_worker_submission(false)
+            .expect("predecessor worker reservation")
+            .expect("predecessor frame ID");
+
+        pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("same-logical-ID predictive successor");
+        let successor_attempt = pacing
+            .active_predictive_attempt
+            .expect("successor predictive attempt");
+        let successor_physical = OutputFrameIdentitySnapshot {
+            frame_id: 5_263,
+            protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
+                std::num::NonZeroU64::new(5_263).unwrap(),
+            ),
+            transaction_id: crate::native_output::OutputTransactionId::new(
+                std::num::NonZeroU64::new(5_263).unwrap(),
+            ),
+            slot: super::super::scanout::OutputSlotId::new(1).unwrap(),
+            framebuffer_id: oblivion_one::native::kms::FramebufferId::new(5_263).unwrap(),
+            render_generation: 2,
+            pool_generation: 1,
+            target: None,
+        };
+        pacing
+            .bind_predictive_o1(successor_physical)
+            .expect("bind successor physical frame");
+        pacing.note_render_ready();
+        pacing.note_ready_frame(2, true);
+
+        assert!(pacing.cancel_worker_submission(Some(predecessor_reservation), false));
+
+        assert_eq!(pacing.ready, Some(predecessor));
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(
+            pacing.ready_physical_key,
+            Some(OutputFrameKey::from(&successor_physical))
+        );
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    }
+
+    #[test]
     fn worker_cancel_settles_reserved_frame_after_active_becomes_ready() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
