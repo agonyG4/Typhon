@@ -425,6 +425,55 @@ where
 mod tests {
     use super::*;
 
+    fn rounded_test_region(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        radius: u32,
+        segments: u32,
+    ) -> EffectRegion {
+        let mut region = EffectRegion::empty();
+        for band in 0..segments {
+            let top = radius * band / segments;
+            let bottom = radius * (band + 1) / segments;
+            let distance_from_center = radius - top;
+            let remaining = radius * radius - distance_from_center * distance_from_center;
+            let inset = radius - (f64::from(remaining).sqrt().floor() as u32);
+            region.push(
+                EffectRect::new(
+                    x + inset as i32,
+                    y + top as i32,
+                    width - 2 * inset,
+                    bottom - top,
+                )
+                .unwrap(),
+            );
+        }
+        region.push(EffectRect::new(x, y + radius as i32, width, height - 2 * radius).unwrap());
+        for band in (0..segments).rev() {
+            let top = radius * band / segments;
+            let bottom = radius * (band + 1) / segments;
+            let distance_from_center = radius - top;
+            let remaining = radius * radius - distance_from_center * distance_from_center;
+            let inset = radius - (f64::from(remaining).sqrt().floor() as u32);
+            region.push(
+                EffectRect::new(
+                    x + inset as i32,
+                    y + height as i32 - bottom as i32,
+                    width - 2 * inset,
+                    bottom - top,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            region.rects().len(),
+            usize::try_from(segments * 2 + 1).unwrap()
+        );
+        region
+    }
+
     #[test]
     fn local_tint_does_not_expand_damage() {
         let visible = EffectRegion::from_rect(EffectRect::new(0, 0, 200, 100).unwrap());
@@ -595,6 +644,38 @@ mod tests {
         assert!(region.rects().len() <= MAX_EFFECT_REGION_RECTS);
         assert!(region.contains_point(0, 0));
         assert!(region.contains_point(MAX_EFFECT_REGION_RECTS as i32, 0));
+    }
+
+    #[test]
+    fn rounded_hover_transition_currently_leaks_a_corner() {
+        let bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let old = rounded_test_region(500, 100, 500, 80, 20, 16);
+        let new = rounded_test_region(500, 100, 650, 80, 20, 16);
+        let source_damage = old.union(&new);
+        assert_eq!(old.rects().len(), 33);
+        assert_eq!(new.rects().len(), 33);
+        assert_eq!(source_damage.rects().len(), 66);
+
+        let expanded_source = source_damage
+            .rects()
+            .iter()
+            .filter_map(|rect| rect.expanded(12, 12, bounds))
+            .collect::<Vec<_>>();
+        let pairwise_intersections = expanded_source
+            .iter()
+            .flat_map(|left| new.rects().iter().filter_map(|right| left.intersect(*right)))
+            .count();
+        assert!(pairwise_intersections > MAX_EFFECT_REGION_RECTS);
+
+        let plan = plan_effect_damage(
+            EffectFootprint::symmetric(12),
+            &new,
+            &source_damage,
+            bounds,
+        );
+        let corner = (500, 100);
+        assert!(!new.contains_point(corner.0, corner.1));
+        assert!(!plan.output_damage.contains_point(corner.0, corner.1));
     }
 
     #[test]
