@@ -294,22 +294,61 @@ fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
 }
 
 #[test]
-fn native_input_sysrq_emits_one_reserved_screenshot_press_only() {
-    let mut input = NativeInputState::new(320, 200);
+fn native_input_screenshot_bindings_are_exact_press_only_reserved_actions() {
+    let cases = [
+        ("quick", ModifierMask::EMPTY, &[][..], "screenshot_quick"),
+        (
+            "frozen",
+            ModifierMask::SUPER,
+            &[KEY_LEFTMETA][..],
+            "screenshot_region_frozen",
+        ),
+        (
+            "live",
+            ModifierMask::SUPER | ModifierMask::SHIFT,
+            &[KEY_LEFTMETA, KEY_LEFTSHIFT][..],
+            "screenshot_region_live",
+        ),
+    ];
 
-    let pressed = input.handle_key_event(KEY_SYSRQ, 1);
-    let repeated = input.handle_key_event(KEY_SYSRQ, 2);
-    let released = input.handle_key_event(KEY_SYSRQ, 0);
+    for (_, modifiers, modifier_keys, name) in cases {
+        let mut input = NativeInputState::new(320, 200);
+        for key in modifier_keys {
+            input.handle_key_event(*key, 1);
+        }
 
-    assert_eq!(
-        pressed.shortcut_events,
-        vec![AstreaShortcutEvent::pressed(
-            "astrea-shell",
-            "screenshot_capture"
-        )]
-    );
-    assert!(repeated.shortcut_events.is_empty());
-    assert!(released.shortcut_events.is_empty());
+        let pressed = input.handle_key_event(KEY_SYSRQ, 1);
+        let repeated = input.handle_key_event(KEY_SYSRQ, 2);
+        let released = input.handle_key_event(KEY_SYSRQ, 0);
+
+        assert_eq!(input.active_modifier_mask(), modifiers);
+        assert_eq!(
+            pressed.shortcut_events,
+            vec![AstreaShortcutEvent::pressed("astrea-shell", name)]
+        );
+        assert!(repeated.shortcut_events.is_empty());
+        assert!(released.shortcut_events.is_empty());
+    }
+}
+
+#[test]
+fn native_input_screenshot_bindings_reject_extra_modifiers() {
+    for modifier_keys in [
+        vec![KEY_LEFTCTRL],
+        vec![KEY_LEFTMETA, KEY_LEFTCTRL],
+        vec![KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_LEFTCTRL],
+    ] {
+        let mut input = NativeInputState::new(320, 200);
+        for key in modifier_keys {
+            input.handle_key_event(key, 1);
+        }
+        assert!(
+            input
+                .handle_key_event(KEY_SYSRQ, 1)
+                .shortcut_events
+                .is_empty()
+        );
+    }
 }
 
 #[test]

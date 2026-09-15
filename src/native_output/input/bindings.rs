@@ -309,7 +309,31 @@ pub(crate) fn default_astrea_bindings() -> Vec<Binding> {
             input: BindingInput::Key(KEY_SYSRQ),
             action: BindingAction::EmitShortcut {
                 namespace: "astrea-shell".to_string(),
-                name: "screenshot_capture".to_string(),
+                name: "screenshot_quick".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: true,
+        },
+        Binding {
+            modifiers: ModifierMask::SUPER,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_SYSRQ),
+            action: BindingAction::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "screenshot_region_frozen".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: true,
+        },
+        Binding {
+            modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::Key(KEY_SYSRQ),
+            action: BindingAction::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "screenshot_region_live".to_string(),
             },
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Bypass,
