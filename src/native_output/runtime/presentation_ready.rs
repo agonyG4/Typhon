@@ -42,9 +42,6 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
     }
 
     let swapchain = explicit.swapchain()?;
-    if swapchain.worker_queued_identity().is_some() {
-        return Ok(ReadyPullInResult::RejectedIdentity);
-    }
     let Some(ready_identity) = swapchain.ready_identity() else {
         return Ok(ReadyPullInResult::RejectedIdentity);
     };
