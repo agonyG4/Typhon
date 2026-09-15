@@ -3,8 +3,8 @@ use super::fullscreen::{
     direct_scanout_viewport_compatibility,
 };
 use super::presentation_coverage::{
-    PresentationCoverageAnalysis, PresentationCoverageContentKind,
-    PresentationCoverageOpacity, analyze_presentation_coverage,
+    PresentationCoverageAnalysis, PresentationCoverageContentKind, PresentationCoverageOpacity,
+    analyze_presentation_coverage,
 };
 use super::{
     CompositorState, SceneWorkOwner, SurfaceData, SurfacePlacement, SurfacePresentationMetadata,
@@ -187,34 +187,42 @@ impl CompositorState {
         let candidate = if blockers.is_empty() {
             let presented_window_rect = self
                 .current_visual_root_window_geometry(root_surface_id)
-                .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry));
-            match (buffer, surface_presentation_generation, presented_window_rect) {
-                (Some(buffer), Some(surface_presentation_generation), Some(presented_window_rect)) => {
-                    Some(DirectScanoutSceneCandidate {
-                        surface_id: root.surface_id,
-                        root_surface_id,
-                        presented_window_rect,
-                        content_epoch: self
-                            .surface_content_epoch(root.surface_id)
-                            .map_or(root.commit_sequence.get(), |sequence| sequence.get()),
-                        generation: root.generation,
-                        surface_presentation_generation,
-                        commit_sequence: root.commit_sequence,
-                        buffer_identity: root.buffer_identity().clone(),
-                        buffer,
-                        buffer_size: output_size,
-                        output_size,
-                        viewport_identity_metadata_present: root.viewport_source.is_some()
-                            || root.viewport_destination.is_some(),
-                        presentation: self
-                            .surface_resources
-                            .get(&root.surface_id)
-                            .and_then(|surface| surface.data::<SurfaceData>())
-                            .map_or(SurfacePresentationMetadata::default(), |data| {
-                                data.current_presentation()
-                            }),
-                    })
-                }
+                .and_then(|geometry| {
+                    self.presentation_rect_for_geometry(root_surface_id, geometry)
+                });
+            match (
+                buffer,
+                surface_presentation_generation,
+                presented_window_rect,
+            ) {
+                (
+                    Some(buffer),
+                    Some(surface_presentation_generation),
+                    Some(presented_window_rect),
+                ) => Some(DirectScanoutSceneCandidate {
+                    surface_id: root.surface_id,
+                    root_surface_id,
+                    presented_window_rect,
+                    content_epoch: self
+                        .surface_content_epoch(root.surface_id)
+                        .map_or(root.commit_sequence.get(), |sequence| sequence.get()),
+                    generation: root.generation,
+                    surface_presentation_generation,
+                    commit_sequence: root.commit_sequence,
+                    buffer_identity: root.buffer_identity().clone(),
+                    buffer,
+                    buffer_size: output_size,
+                    output_size,
+                    viewport_identity_metadata_present: root.viewport_source.is_some()
+                        || root.viewport_destination.is_some(),
+                    presentation: self
+                        .surface_resources
+                        .get(&root.surface_id)
+                        .and_then(|surface| surface.data::<SurfaceData>())
+                        .map_or(SurfacePresentationMetadata::default(), |data| {
+                            data.current_presentation()
+                        }),
+                }),
                 _ => {
                     blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
                     None
@@ -253,12 +261,13 @@ impl CompositorState {
     }
 
     fn application_root_is_special(&self, root_surface_id: u32) -> bool {
-        self.window_id_for_surface(root_surface_id).is_some_and(|window_id| {
-            matches!(
-                self.scene_work_owner_for_window(window_id),
-                SceneWorkOwner::Location(WorkspaceLocation::Special(_))
-            )
-        })
+        self.window_id_for_surface(root_surface_id)
+            .is_some_and(|window_id| {
+                matches!(
+                    self.scene_work_owner_for_window(window_id),
+                    SceneWorkOwner::Location(WorkspaceLocation::Special(_))
+                )
+            })
     }
 
     fn presentation_coverage_opacity(

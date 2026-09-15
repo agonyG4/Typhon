@@ -18,10 +18,9 @@ use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
     AnimationTime, DirectScanoutSceneAnalysis, EffectFrameDemandSnapshot,
-    NativeFramePresentationTargets,
-    PresentationAnimationMetrics, PresentationFrameSnapshot, PresentationGroupTransform,
-    PresentationRect, PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
-    ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
+    NativeFramePresentationTargets, PresentationAnimationMetrics, PresentationFrameSnapshot,
+    PresentationGroupTransform, PresentationRect, PresentationSceneSample, PresentedWindowGeometry,
+    ResolvedEffectScene, ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,
     SurfaceResourceSyncState, compositor_surface_id,
 };
 #[cfg(test)]

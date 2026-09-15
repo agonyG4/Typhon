@@ -61,11 +61,8 @@ pub(crate) fn analyze_presentation_coverage(
     covers_output: impl Fn(u32) -> bool,
     group_opacity: impl Fn(u32) -> PresentationCoverageOpacity,
 ) -> PresentationCoverageAnalysis {
-    let groups = WindowVisualGroup::stack_order_with_popups(
-        surfaces,
-        decorations,
-        popup_surface_ids,
-    );
+    let groups =
+        WindowVisualGroup::stack_order_with_popups(surfaces, decorations, popup_surface_ids);
     let origins = super::render::surface_origins(surfaces);
     let covering_group_index = groups.iter().enumerate().rev().find_map(|(index, group)| {
         (is_application_group(group.root_surface_id())
@@ -124,10 +121,12 @@ pub(crate) fn analyze_presentation_coverage(
         };
         if intersects_output {
             if let Some(kind) = kind {
-                analysis.visible_content_above.push(PresentationCoverageContent {
-                    root_surface_id: group.root_surface_id(),
-                    kind,
-                });
+                analysis
+                    .visible_content_above
+                    .push(PresentationCoverageContent {
+                        root_surface_id: group.root_surface_id(),
+                        kind,
+                    });
             }
         }
         record_visible_decoration(
@@ -230,7 +229,11 @@ mod tests {
         }
     }
 
-    fn analyze(surfaces: &[RenderableSurface], apps: &[u32], layers: &[u32]) -> PresentationCoverageAnalysis {
+    fn analyze(
+        surfaces: &[RenderableSurface],
+        apps: &[u32],
+        layers: &[u32],
+    ) -> PresentationCoverageAnalysis {
         analyze_presentation_coverage(
             surfaces,
             &[],

@@ -609,7 +609,6 @@ impl CompositorState {
             .filter(|role| role.mapped && role.committed.layer == Layer::Overlay)
             .count()
     }
-
 }
 
 fn saturating_i32_from_f64(value: f64) -> i32 {

@@ -76,8 +76,8 @@ mod clipboard_bridge;
 mod color;
 mod commit_debug;
 mod decoration;
-mod direct_scanout_scene;
 mod desktop_window;
+mod direct_scanout_scene;
 mod dmabuf;
 mod effects;
 mod explicit_sync;
@@ -207,6 +207,7 @@ pub use decoration::render_plan::DecorationRenderPrimitive;
 use decoration::theme::DecorationThemeSnapshot;
 use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
+pub use direct_scanout_scene::DirectScanoutSceneAnalysis;
 pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,
@@ -214,19 +215,14 @@ pub use effects::{
 };
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::DirectScanoutSceneBlockers;
+#[cfg(test)]
+pub(crate) use fullscreen::direct_scanout_scene_rejection_for_effects;
 pub use fullscreen::{
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenAboveFullscreenReason,
     FullscreenCompositionMode, FullscreenCompositionPlan, FullscreenCulledRootReason,
     FullscreenPresentationEligibility, FullscreenPresentationRejection,
     FullscreenPresentationState, FullscreenRenderPlanMetrics, FullscreenRootClassification,
 };
-pub use direct_scanout_scene::DirectScanoutSceneAnalysis;
-pub use presentation_coverage::{
-    PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
-    PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
-};
-#[cfg(test)]
-pub(crate) use fullscreen::direct_scanout_scene_rejection_for_effects;
 pub use idle::{IdleManager, IdleState};
 pub use input::{
     CursorRevealAuthority, OutputPosition, OutputRect, OutputRegion, PointerAxisComponent,
@@ -257,6 +253,10 @@ pub use interaction::{
 };
 pub use keyboard::{KeyboardConfig, KeyboardConfigurationPreparation};
 use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
+pub use presentation_coverage::{
+    PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
+    PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardLayoutControlError {
