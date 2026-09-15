@@ -823,6 +823,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let Some(ExecutingKmsJob {
             mut job,
             direct_candidate,
+            dequeued_at,
         }) = take_next_job(&shared)
         else {
             return;
@@ -1009,9 +1010,10 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     let dispatch_duration_ns =
                         submit_returned_at.saturating_sub(actual_worker_wait_returned_at);
                     // Queue residency remains upstream/readiness evidence. Only a job
-                    // available by its planned worker wake gives the worker a fair chance
-                    // to meet the dispatch deadline and may train the adaptive tail guard.
-                    let fair_dispatch_chance = job.queued_at.get() <= planned_worker_wake_at;
+                    // that acquired executable worker ownership by its planned wake gives
+                    // the worker a fair chance to meet the dispatch deadline and may train
+                    // the adaptive tail guard.
+                    let fair_dispatch_chance = dequeued_at.get() <= planned_worker_wake_at;
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
@@ -1209,6 +1211,7 @@ pub(super) fn worker_wait_is_armed(
 struct ExecutingKmsJob {
     job: KmsCommitJob,
     direct_candidate: Option<DirectScanoutCandidateKey>,
+    dequeued_at: MonotonicTimestampNs,
 }
 
 fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
@@ -1286,6 +1289,7 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
                 ValidationBaseDisposition::Ready => {}
             }
             let job = state.queued.pop_front().expect("front job still queued");
+            let dequeued_at = MonotonicTimestampNs::new(monotonic_now_ns());
             let direct_candidate = job.direct_primary_lease.as_ref().map(|lease| lease.key());
             debug_assert!(!state.executing);
             state.executing = true;
@@ -1310,6 +1314,7 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             return Some(ExecutingKmsJob {
                 job,
                 direct_candidate,
+                dequeued_at,
             });
         }
         state = shared
