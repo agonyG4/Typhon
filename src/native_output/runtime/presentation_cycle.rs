@@ -539,6 +539,7 @@ impl NativeRuntime {
                 .primary
                 .is_some_and(|assignment| assignment.is_direct())
                 && !pending_interactive_visual_work,
+            direct_scanout_preference: *direct_scanout_preference,
             plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
         });
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
