@@ -1616,6 +1616,10 @@ impl OwnCompositorServer {
         self.state.direct_scanout_scene_blockers()
     }
 
+    pub fn direct_scanout_scene_analysis(&self) -> DirectScanoutSceneAnalysis {
+        self.state.direct_scanout_scene_analysis()
+    }
+
     pub fn fullscreen_tree_presentation_metadata(&self) -> Option<SurfacePresentationMetadata> {
         self.state.fullscreen_tree_presentation_metadata()
     }
