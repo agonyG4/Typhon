@@ -2775,6 +2775,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ready_target_replacement_orders_after_a_worker_queued_predecessor() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let frontier = test_target(1, 10, PresentationTargetReason::ReactiveDouble);
+        swapchain
+            .note_physical_primary_presentation(frontier.physical_claim())
+            .expect("frontier is the first physical presentation");
+
+        let predecessor_slot = swapchain.acquire_render_slot().expect("predecessor slot");
+        swapchain
+            .finish_render_owned(test_frame(
+                &swapchain,
+                predecessor_slot,
+                test_target(2, 20, PresentationTargetReason::Normal),
+            ))
+            .expect("predecessor becomes ready");
+        let (submission_fence, _) = swapchain
+            .take_ready_for_worker(PageFlipToken::new(21).expect("worker token"), now(21))
+            .expect("predecessor enters the worker queue");
+        drop(submission_fence);
+
+        let ready_slot = swapchain.acquire_render_slot().expect("ready slot");
+        let old_target = test_target(4, 40, PresentationTargetReason::Normal);
+        let frame = test_frame(&swapchain, ready_slot, old_target);
+        let transaction_id = frame.transaction_id;
+        swapchain
+            .finish_render_owned(frame)
+            .expect("later frame becomes ready");
+        let mut new_target = test_target(3, 30, PresentationTargetReason::Normal);
+        new_target.submit_not_before = MonotonicTimestampNs::new(25);
+        new_target.render_start_deadline = new_target.submit_not_before;
+        let submit_window = KmsSubmitWindow::try_new(30, 25, 1, 1)
+            .expect("replacement target has a reachable KMS window");
+
+        swapchain
+            .replace_ready_target(transaction_id, old_target, new_target, submit_window)
+            .expect("replacement remains ordered after the worker predecessor");
+        assert_eq!(
+            swapchain
+                .ready_identity()
+                .and_then(|identity| identity.target),
+            Some(new_target)
+        );
+    }
+
     fn test_target(
         sequence: u64,
         presentation_time: u64,
