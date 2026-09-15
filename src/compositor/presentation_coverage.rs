@@ -182,3 +182,152 @@ fn rect_intersects_output(
         && i64::from(x) < i64::from(output_size.width)
         && i64::from(y) < i64::from(output_size.height)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compositor::{
+        RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement, SurfaceRenderBackend,
+    };
+    use crate::render_backend::buffer::{
+        BufferIdAllocator, BufferIdentity, CommittedSurfaceBuffer,
+    };
+    use std::sync::{Mutex, OnceLock};
+    use wayland_server::protocol::wl_output;
+
+    fn test_surface(surface_id: u32, x: i32, y: i32, width: u32, height: u32) -> RenderableSurface {
+        static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
+        let identity: BufferIdentity = IDS
+            .get_or_init(|| Mutex::new(BufferIdAllocator::default()))
+            .lock()
+            .expect("test buffer identity allocator")
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement: SurfacePlacement::absolute_root_at(x, y),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(width, height).expect("test surface size"),
+                vec![0; (width * height) as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::full(),
+        }
+    }
+
+    fn analyze(surfaces: &[RenderableSurface], apps: &[u32], layers: &[u32]) -> PresentationCoverageAnalysis {
+        analyze_presentation_coverage(
+            surfaces,
+            &[],
+            &[],
+            BufferSize::new(1280, 800).expect("test output size"),
+            |root| apps.contains(&root),
+            |root| layers.contains(&root),
+            |root| root == 10,
+            |root| {
+                (root == 10)
+                    .then_some(PresentationCoverageOpacity::OpaqueXrgb8888)
+                    .unwrap_or(PresentationCoverageOpacity::Unknown)
+            },
+        )
+    }
+
+    #[test]
+    fn selects_covering_group_and_ignores_behind_or_outside_content() {
+        let surfaces = vec![
+            test_surface(1, 0, 0, 40, 40),
+            test_surface(10, 0, 0, 1280, 800),
+            test_surface(20, 100, 100, 40, 40),
+            test_surface(30, 2000, 0, 40, 40),
+        ];
+        let analysis = analyze(&surfaces, &[1, 10, 20, 30], &[]);
+
+        assert_eq!(
+            analysis.covering_application_group,
+            Some(PresentationCoverageApplicationGroup {
+                root_surface_id: 10,
+                surface_ids: vec![10],
+            })
+        );
+        assert!(analysis.can_occlude_behind_content());
+        assert_eq!(
+            analysis.visible_content_above,
+            vec![PresentationCoverageContent {
+                root_surface_id: 20,
+                kind: PresentationCoverageContentKind::Application,
+            }]
+        );
+    }
+
+    #[test]
+    fn popup_and_layer_content_above_are_recorded_separately() {
+        let surfaces = vec![
+            test_surface(10, 0, 0, 1280, 800),
+            test_surface(40, 1, 1, 20, 20),
+            test_surface(50, 2, 2, 20, 20),
+        ];
+        let analysis = analyze_presentation_coverage(
+            &surfaces,
+            &[],
+            &[40],
+            BufferSize::new(1280, 800).expect("test output size"),
+            |root| root == 10 || root == 40,
+            |root| root == 50,
+            |root| root == 10,
+            |root| {
+                (root == 10)
+                    .then_some(PresentationCoverageOpacity::OpaqueXrgb8888)
+                    .unwrap_or(PresentationCoverageOpacity::Unknown)
+            },
+        );
+
+        assert_eq!(
+            analysis.visible_content_above,
+            vec![
+                PresentationCoverageContent {
+                    root_surface_id: 40,
+                    kind: PresentationCoverageContentKind::Popup,
+                },
+                PresentationCoverageContent {
+                    root_surface_id: 50,
+                    kind: PresentationCoverageContentKind::LayerShell,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_opacity_cannot_occlude_behind_content() {
+        let surfaces = vec![
+            test_surface(1, 0, 0, 40, 40),
+            test_surface(10, 0, 0, 1280, 800),
+        ];
+        let analysis = analyze_presentation_coverage(
+            &surfaces,
+            &[],
+            &[],
+            BufferSize::new(1280, 800).expect("test output size"),
+            |root| root == 1 || root == 10,
+            |_| false,
+            |root| root == 10,
+            |_| PresentationCoverageOpacity::Unknown,
+        );
+
+        assert!(analysis.geometrically_covers_output());
+        assert!(!analysis.can_occlude_behind_content());
+    }
+}
