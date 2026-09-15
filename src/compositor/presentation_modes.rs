@@ -473,6 +473,64 @@ mod tests {
     }
 
     #[test]
+    fn borderless_scanout_candidate_remains_vsync_only_under_auto_tearing() {
+        let result = EffectivePresentation::decide(
+            TearingPolicy::Auto,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::None,
+            },
+            AsyncEligibility {
+                solitary_fullscreen: false,
+                async_hint: true,
+                backend_capable: true,
+                output_generation_qualified: true,
+                explicit_sync_ready: true,
+                commit_timing_safe: true,
+                kms_lane_free: true,
+                async_test_only_accepted: true,
+                async_format_supported: true,
+                ..AsyncEligibility::default()
+            },
+        );
+
+        assert_eq!(result.mode, OutputPresentationMode::Vsync);
+        assert_eq!(result.blocker, Some(AsyncBlocker::NotSolitaryFullscreen));
+    }
+
+    #[test]
+    fn solitary_fullscreen_scanout_candidate_remains_async_eligible() {
+        let result = EffectivePresentation::decide(
+            TearingPolicy::Auto,
+            SurfacePresentationMetadata {
+                hint: SurfacePresentationHint::Async,
+                content_type: SurfaceContentType::None,
+            },
+            AsyncEligibility {
+                solitary_fullscreen: true,
+                async_hint: true,
+                backend_capable: true,
+                output_generation_qualified: true,
+                explicit_sync_ready: true,
+                commit_timing_safe: true,
+                kms_lane_free: true,
+                async_test_only_accepted: true,
+                async_format_supported: true,
+                ..AsyncEligibility::default()
+            },
+        );
+
+        assert_eq!(result.mode, OutputPresentationMode::Async);
+        assert_eq!(result.blocker, None);
+    }
+
+    #[test]
+    fn atomic_async_authority_requires_semantic_solitary_fullscreen() {
+        assert!(!async_eligibility_solitary_fullscreen(false));
+        assert!(async_eligibility_solitary_fullscreen(true));
+    }
+
+    #[test]
     fn async_format_compatibility_is_an_explicit_blocker() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,

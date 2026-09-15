@@ -305,4 +305,20 @@ mod tests {
             NativePresentationPath::PlaneDelta,
         ));
     }
+
+    #[test]
+    fn direct_scanout_preference_controls_candidate_inspection() {
+        assert!(!should_inspect_direct_scanout(
+            NativeDirectScanoutPreference::Off,
+            false,
+        ));
+        assert!(should_inspect_direct_scanout(
+            NativeDirectScanoutPreference::ExperimentalAuto,
+            false,
+        ));
+        assert!(should_inspect_direct_scanout(
+            NativeDirectScanoutPreference::Off,
+            true,
+        ));
+    }
 }
