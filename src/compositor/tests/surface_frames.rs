@@ -1656,13 +1656,23 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
         .unwrap();
     commands
         .send(ServerCommand::UpdateInteraction {
-            x: f64::from(initial[0].origin_x) + 118.0,
-            y: f64::from(initial[0].origin_y) + 88.0,
+            x: f64::from(initial[0].origin_x) + 198.0,
+            y: f64::from(initial[0].origin_y) + 148.0,
         })
         .unwrap();
-    commands.send(ServerCommand::PresentFrame).unwrap();
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    commands
+        .send(ServerCommand::AdmitInteractiveVisualState {
+            render_ahead: false,
+        })
+        .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    let resize_interaction = capture_window_interaction_debug_snapshot(&commands);
+    assert!(
+        resize_interaction.is_some(),
+        "interactive resize should start"
+    );
 
     surface.offset(5, 7);
     surface.commit();
@@ -1677,7 +1687,7 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     commands.send(ServerCommand::EndInteraction).unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    commit_test_buffered_surface(&surface, &shm, &qh, 120, 90).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 200, 150).unwrap();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -1697,26 +1707,29 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
         (intermediate[0].content_x, intermediate[0].content_y),
         (5, 7)
     );
-    assert!(intermediate_visual.is_some_and(|visual| {
-        visual.active_resize && (visual.width, visual.height) == (120, 90)
-    }));
+    assert!(
+        intermediate_visual.is_some_and(|visual| {
+            visual.active_resize && (visual.width, visual.height) == (200, 150)
+        }),
+        "intermediate visual geometry: {intermediate_visual:?}, interaction: {resize_interaction:?}"
+    );
     assert_eq!(
         intermediate_root.map(|geometry| (geometry.width, geometry.height)),
-        Some((64, 48))
+        Some((200, 150))
     );
     assert_eq!(intermediate_hit.0, Some(surface_id));
-    assert_eq!(intermediate_hit.1, Some((15.0, 13.0)));
+    assert_eq!(intermediate_hit.1, Some((20.0, 20.0)));
     assert_eq!(final_snapshot.len(), 1);
     assert_eq!(
         (final_snapshot[0].width, final_snapshot[0].height),
-        (120, 90)
+        (200, 150)
     );
     assert!(final_visual.is_some_and(|visual| {
-        !visual.active_resize && (visual.width, visual.height) == (120, 90)
+        !visual.active_resize && (visual.width, visual.height) == (200, 150)
     }));
     assert_eq!(
         final_root.map(|geometry| (geometry.width, geometry.height)),
-        Some((120, 90))
+        Some((200, 150))
     );
     assert_eq!(final_hit.0, Some(surface_id));
     assert_eq!(final_hit.1, Some((15.0, 13.0)));
