@@ -69,6 +69,7 @@ pub(crate) fn analyze_presentation_coverage(
     let origins = super::render::surface_origins(surfaces);
     let covering_group_index = groups.iter().enumerate().rev().find_map(|(index, group)| {
         (is_application_group(group.root_surface_id())
+            && !popup_surface_ids.contains(&group.root_surface_id())
             && covers_output(group.root_surface_id()))
         .then_some(index)
     });
