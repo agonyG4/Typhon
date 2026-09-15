@@ -374,16 +374,12 @@ impl WorkerTimingMetrics {
             test_only_duration: self.test_only_duration.snapshot(),
             dispatch_budget_ns: self.dispatch_budget_ns.load(Ordering::Relaxed),
             dispatch_tail_guard_ns: self.dispatch_tail_guard_ns.load(Ordering::Relaxed),
-            dispatch_deadline_overrun_ns: self
-                .dispatch_deadline_overrun_ns
-                .load(Ordering::Relaxed),
+            dispatch_deadline_overrun_ns: self.dispatch_deadline_overrun_ns.load(Ordering::Relaxed),
             dispatch_tail_guard_increases: self
                 .dispatch_tail_guard_increases
                 .load(Ordering::Relaxed),
             dispatch_tail_guard_decays: self.dispatch_tail_guard_decays.load(Ordering::Relaxed),
-            dispatch_tail_guard_cap_hits: self
-                .dispatch_tail_guard_cap_hits
-                .load(Ordering::Relaxed),
+            dispatch_tail_guard_cap_hits: self.dispatch_tail_guard_cap_hits.load(Ordering::Relaxed),
             late_before_ioctl: self.late_before_ioctl.load(Ordering::Relaxed),
             late_after_ioctl: self.late_after_ioctl.load(Ordering::Relaxed),
             test_only_count: self.test_only_count.load(Ordering::Relaxed),
