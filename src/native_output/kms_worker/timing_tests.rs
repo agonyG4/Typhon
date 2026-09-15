@@ -74,6 +74,21 @@ fn dispatch_tail_deadline_hole_is_not_render_readiness_miss() {
 }
 
 #[test]
+fn late_payload_dispatch_overrun_does_not_update_tail_metrics() {
+    let mut model = KmsWorkerDispatchModel::default();
+    model.record(0, 0, 100_000, 100_000);
+    let metrics = WorkerTimingMetrics::default();
+
+    let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false);
+    metrics.record_dispatch_tail(observation);
+    let snapshot = metrics.snapshot();
+
+    assert_eq!(snapshot.dispatch_tail_guard_ns, 0);
+    assert_eq!(snapshot.dispatch_tail_guard_increases, 0);
+    assert_eq!(snapshot.dispatch_deadline_overrun_ns, 12_230);
+}
+
+#[test]
 fn reactive_double_does_not_wait_for_a_late_planned_worker_wake() {
     assert!(!worker_wait_is_armed(
         PresentationTargetReason::ReactiveDouble,

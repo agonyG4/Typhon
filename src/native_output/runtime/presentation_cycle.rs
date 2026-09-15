@@ -1574,9 +1574,11 @@ impl NativeRuntime {
                                         MonotonicTimestampNs::new(ready_at_ns),
                                     )?;
                                     deferred_o1_safely_abandoned = true;
-                                } else if waits_for_target {
-                                    server.note_frame_callbacks_deferred_ready(protocol_batch_id);
-                                    frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                } else {
+                                    if waits_for_target {
+                                        server.note_frame_callbacks_deferred_ready(protocol_batch_id);
+                                        frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                    }
                                     match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
                                         explicit,
                                         output_transactions,
@@ -1598,10 +1600,10 @@ impl NativeRuntime {
                                             frame_pacing.note_ready_pull_in_rejected_identity();
                                         }
                                     }
-                                    if render_ahead {
+                                    if waits_for_target && render_ahead {
                                         frame_pacing.note_predictive_unbound_ready();
                                     }
-                                } else {
+                                    if !waits_for_target {
                                     #[rustfmt::skip] let async_render_fence_ready = super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)?;
                                     if !async_render_fence_ready {
                                         server.note_frame_callback_admission_failure(protocol_batch_id);
@@ -1702,6 +1704,7 @@ impl NativeRuntime {
                                     );
                                     frame_submitted = true;
                                     *frame_index = frame_index.saturating_add(1);
+                                    }
                                 }
                                 frame_pacing.log(
                                     "render_complete",

@@ -34,6 +34,29 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
     output_generation: u64,
     dispatch_budget_ns: u64,
 ) -> NativeResult<ReadyPullInResult> {
+    pull_ready_frame_into_reachable_opportunity_on_swapchain(
+        explicit.swapchain_mut()?,
+        output_transactions,
+        presentation_deadline,
+        presentation_timing,
+        frame_pacing,
+        now,
+        output_generation,
+        dispatch_budget_ns,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pull_ready_frame_into_reachable_opportunity_on_swapchain(
+    swapchain: &mut AtomicOutputSwapchain,
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_deadline: &PresentationDeadlinePlanner,
+    presentation_timing: &KmsPresentationTimingModel,
+    frame_pacing: &mut NativeFramePacing,
+    now: MonotonicTimestampNs,
+    output_generation: u64,
+    dispatch_budget_ns: u64,
+) -> NativeResult<ReadyPullInResult> {
     frame_pacing.note_ready_pull_in_attempt();
     if frame_pacing.ready_predictive_attempt_id().is_some()
         || frame_pacing.ready_worker_submission_reserved()
@@ -41,7 +64,6 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
         return Ok(ReadyPullInResult::RejectedIdentity);
     }
 
-    let swapchain = explicit.swapchain()?;
     let Some(ready_identity) = swapchain.ready_identity() else {
         return Ok(ReadyPullInResult::RejectedIdentity);
     };
@@ -106,7 +128,7 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
     {
         return Ok(ReadyPullInResult::RejectedIdentity);
     }
-    if let Err(error) = explicit.swapchain_mut()?.replace_ready_target(
+    if let Err(error) = swapchain.replace_ready_target(
         ready_identity.transaction_id,
         old_target,
         new_target,
@@ -575,4 +597,240 @@ pub(super) fn submit_ready_frame(
         }
     }
     Ok(ReadySubmissionResult::Submitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
+        PresentedCursorDelivery,
+    };
+    use drm_sys::drm_mode_modeinfo;
+    use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    fn test_render_fence() -> NativeRenderFence {
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { libc::close(pipe[1]) };
+        NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) })
+    }
+
+    fn test_mode() -> drm_mode_modeinfo {
+        drm_mode_modeinfo {
+            clock: 325_000,
+            hdisplay: 1920,
+            hsync_start: 2008,
+            hsync_end: 2052,
+            htotal: 2080,
+            vdisplay: 1080,
+            vsync_start: 1084,
+            vsync_end: 1089,
+            vtotal: 1111,
+            ..drm_mode_modeinfo::default()
+        }
+    }
+
+    #[test]
+    fn lane_free_ready_pull_in_precedes_worker_reservation() {
+        let render_ahead = false;
+        let atomic_commit_pending = false;
+        let can_queue_worker_next = true;
+        assert!(
+            !oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane(
+                render_ahead,
+                atomic_commit_pending,
+                can_queue_worker_next,
+            )
+        );
+
+        let refresh = Duration::from_nanos(6_060_606);
+        let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+        let mut presentation_deadline = PresentationDeadlinePlanner::new(refresh);
+        presentation_deadline.note_presented(presented_at);
+        let old_target = presentation_deadline
+            .plan_normal(
+                MonotonicTimestampNs::new(1_001_000_000),
+                Duration::from_nanos(5_807_000),
+            )
+            .expect("conservative pre-render target");
+        assert_eq!(old_target.sequence, 3);
+
+        let presentation_timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&test_mode(), refresh.as_nanos() as u64),
+            1,
+        );
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            OutputSlotSet::new([
+                OutputSlotId::new(0).unwrap(),
+                OutputSlotId::new(1).unwrap(),
+                OutputSlotId::new(2).unwrap(),
+            ])
+            .unwrap(),
+            OutputSlotId::new(0).unwrap(),
+            1,
+        )
+        .unwrap();
+        let frontier = oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: presented_at,
+            clock_generation: 1,
+        };
+        swapchain
+            .note_physical_primary_presentation(frontier)
+            .unwrap();
+
+        let slot = swapchain.acquire_render_slot().unwrap();
+        let frame_id = swapchain.next_frame_id();
+        let transaction_id = OutputTransactionId::new(
+            std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),
+        );
+        let protocol_batch_id = CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(frame_id).expect("test batch ID is nonzero"),
+        );
+        let frame_now = MonotonicTimestampNs::new(frame_id);
+        swapchain
+            .finish_render_owned(RenderedOutputFrame {
+                id: frame_id,
+                transaction_id,
+                slot,
+                framebuffer_id: FramebufferId::new(42).unwrap(),
+                render_generation: 1,
+                pool_generation: 1,
+                reservation: FramePresentationReservation::Bound(old_target),
+                submit_window: KmsSubmitWindow::try_new(
+                    old_target.presentation_time.get(),
+                    old_target.submit_not_before().get(),
+                    0,
+                    0,
+                )
+                .unwrap(),
+                render_fence: test_render_fence(),
+                fence_timing_evidence: None,
+                scene_commit: EglSceneFrameCommit::empty_for_test(),
+                surface_damage: SurfaceDamagePresentation::default(),
+                protocol_batch_id,
+                composite_started_at: frame_now,
+                fence_exported_at: frame_now,
+                rendered_at: frame_now,
+                client_commit_ns: None,
+                callback_reaction_ns: None,
+                callback_admission_ns: None,
+                callback_surface_id: None,
+                hardware_cursor_surface_id: None,
+                cpu_prepass_duration_ns: 0,
+                cpu_encode_duration_ns: 0,
+                frozen_cursor_plan: FrozenPrimaryCursorPlan {
+                    delivery: PresentedCursorDelivery::Hidden,
+                    primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+                    cursor_test_policy: FrozenCursorTestPolicy::Skip,
+                },
+                frozen_cursor_plane_owner: None,
+                frozen_cursor_trace_reveal: None,
+                o1_admission: None,
+            })
+            .unwrap();
+
+        let transaction = OutputTransaction::composited(
+            transaction_id,
+            1,
+            frame_now,
+            old_target,
+            NativeOutputPacingMode::PredictiveTriple,
+            frame_id,
+            1,
+            1,
+            slot,
+            42,
+            None,
+            protocol_batch_id,
+        )
+        .unwrap();
+        let mut output_transactions = OutputTransactionLedger::with_capacities(8, 8);
+        output_transactions.insert(transaction).unwrap();
+        output_transactions
+            .mark_ready(transaction_id, frame_now)
+            .unwrap();
+        assert_eq!(
+            swapchain
+                .ready_identity()
+                .and_then(|identity| identity.target),
+            Some(old_target)
+        );
+
+        let mut frame_pacing = NativeFramePacing::from_env();
+        frame_pacing.queue_visual(frame_id, 1);
+        frame_pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, false)
+            .unwrap();
+
+        let pull_in = pull_ready_frame_into_reachable_opportunity_on_swapchain(
+            &mut swapchain,
+            &mut output_transactions,
+            &presentation_deadline,
+            &presentation_timing,
+            &mut frame_pacing,
+            MonotonicTimestampNs::new(1_005_500_000),
+            1,
+            300_000,
+        )
+        .unwrap();
+        assert!(matches!(pull_in, ReadyPullInResult::PulledIn));
+
+        let expected_target = presentation_deadline
+            .ready_target_pull_in(
+                MonotonicTimestampNs::new(1_005_500_000),
+                ReadyPresentationServiceEstimate::new(
+                    300_000,
+                    presentation_timing.apply_guard_ns(),
+                ),
+                frontier,
+                old_target,
+            )
+            .unwrap()
+            .replacement_target();
+        assert_eq!(
+            swapchain
+                .ready_identity()
+                .and_then(|identity| identity.target),
+            Some(expected_target)
+        );
+        assert_eq!(
+            output_transactions
+                .transaction(transaction_id)
+                .unwrap()
+                .descriptor()
+                .bound_target(),
+            Some(expected_target)
+        );
+        let ready_window = swapchain.ready_submit_window().expect("N+1 ready window");
+        assert_eq!(
+            ready_window.target_presentation_ns(),
+            expected_target.presentation_time.get()
+        );
+        assert_eq!(ready_window.earliest_submit_ns(), 1_005_500_000);
+
+        // This is the lane-free handoff: the active pacing identity is
+        // reserved only after the READY target has been replaced.
+        let ticket = frame_pacing
+            .reserve_worker_submission(false)
+            .unwrap()
+            .expect("lane-free frame reaches worker reservation");
+        assert_eq!(ticket.frame_id().get(), frame_id);
+        assert!(!ticket.ready_submit());
+        assert_eq!(
+            output_transactions
+                .transaction(transaction_id)
+                .unwrap()
+                .descriptor()
+                .bound_target(),
+            Some(expected_target)
+        );
+    }
 }

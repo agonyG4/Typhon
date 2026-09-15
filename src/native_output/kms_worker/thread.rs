@@ -1003,6 +1003,10 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         pre_submit_completed_at.saturating_sub(pre_submit_started_at);
                     let dispatch_duration_ns =
                         submit_returned_at.saturating_sub(actual_worker_wait_returned_at);
+                    // Queue residency remains upstream/readiness evidence. Only a job
+                    // available by its planned worker wake gives the worker a fair chance
+                    // to meet the dispatch deadline and may train the adaptive tail guard.
+                    let fair_dispatch_chance = job.queued_at.get() <= planned_worker_wake_at;
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
@@ -1012,6 +1016,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     let dispatch_tail = dispatch_model.observe_submission_deadline(
                         job.submit_window.commit_complete_deadline_ns(),
                         submit_returned_at,
+                        fair_dispatch_chance,
                     );
                     shared.metrics.timing.record_dispatch_tail(dispatch_tail);
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
