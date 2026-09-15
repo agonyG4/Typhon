@@ -1,9 +1,6 @@
 use super::*;
-use crate::compositor::fullscreen::{
-    direct_scanout_scene_blockers_for_visibility, direct_scanout_viewport_compatibility,
-};
+use crate::compositor::fullscreen::direct_scanout_viewport_compatibility;
 use crate::compositor::{SurfaceContentType, SurfacePresentationMetadata};
-use crate::render_backend::buffer::SurfaceBufferSource;
 use std::borrow::Cow;
 
 fn select_fullscreen_root_content_type(
@@ -484,19 +481,6 @@ impl CompositorState {
         self.fullscreen_render_plan_metrics_for_plan(&plan, eligibility)
     }
 
-    fn has_visible_special_application_content(&self) -> bool {
-        self.active_scene_surfaces().iter().any(|surface| {
-            let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-            self.window_id_for_surface(root_surface_id)
-                .is_some_and(|window_id| {
-                    matches!(
-                        self.scene_work_owner_for_window(window_id),
-                        SceneWorkOwner::Location(crate::wm::WorkspaceLocation::Special(_))
-                    )
-                })
-        })
-    }
-
     pub(in crate::compositor) fn native_frame_renderable_surfaces(
         &self,
     ) -> Cow<'_, [RenderableSurface]> {
@@ -626,12 +610,6 @@ impl CompositorState {
             .count()
     }
 
-    fn visible_layer_surface_above_content_count(&self) -> usize {
-        self.layer_surfaces
-            .values()
-            .filter(|role| role.mapped && role.committed.layer.scene_rank() > 2)
-            .count()
-    }
 }
 
 fn saturating_i32_from_f64(value: f64) -> i32 {
@@ -678,25 +656,6 @@ mod root_content_type_tests {
         assert_eq!(
             select(SurfaceContentType::Game, SurfaceContentType::None),
             SurfaceContentType::Game
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn diagnostics_collect_simultaneous_visibility_blockers_in_candidate_order() {
-        let blockers = direct_scanout_scene_blockers_for_visibility(true, true, true);
-
-        assert_eq!(
-            blockers.reasons(),
-            &[
-                DirectScanoutSceneRejection::OverlayVisible,
-                DirectScanoutSceneRejection::PopupVisible,
-                DirectScanoutSceneRejection::ResizePreviewActive,
-            ]
         );
     }
 }

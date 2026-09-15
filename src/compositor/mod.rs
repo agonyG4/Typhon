@@ -226,7 +226,7 @@ pub use presentation_coverage::{
     PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
 };
 pub(crate) use fullscreen::{
-    direct_scanout_scene_rejection_for_effects, direct_scanout_scene_rejection_for_flags,
+    direct_scanout_scene_rejection_for_effects,
 };
 pub use idle::{IdleManager, IdleState};
 pub use input::{

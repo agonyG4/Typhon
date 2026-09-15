@@ -259,24 +259,6 @@ pub(crate) const fn direct_scanout_scene_rejection_for_effects(
     }
 }
 
-pub(crate) fn direct_scanout_scene_blockers_for_visibility(
-    overlays_visible: bool,
-    popup_visible: bool,
-    resize_preview_active: bool,
-) -> DirectScanoutSceneBlockers {
-    let mut blockers = DirectScanoutSceneBlockers::default();
-    if overlays_visible {
-        blockers.push(DirectScanoutSceneRejection::OverlayVisible);
-    }
-    if popup_visible {
-        blockers.push(DirectScanoutSceneRejection::PopupVisible);
-    }
-    if resize_preview_active {
-        blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
-    }
-    blockers
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullscreenPresentationRejection {
     NoFullscreenOwner,
