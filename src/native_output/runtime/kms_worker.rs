@@ -865,6 +865,23 @@ impl NativeRuntime {
     }
 
     pub(super) fn process_kms_worker_event(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
+        let KmsWorkerEvent::Submitted { ownership } = event else {
+            return self.process_kms_worker_event_inner(event);
+        };
+        let pacing = match self.acknowledge_submitted_worker_pacing(&ownership) {
+            Ok(pacing) => pacing,
+            Err(error) => {
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_result_mismatch();
+                }
+                return self.quarantine_submitted_after_pacing_error(ownership, error);
+            }
+        };
+        let result = self.process_kms_worker_event_inner(KmsWorkerEvent::Submitted { ownership });
+        Self::finish_submitted_worker_pacing(&mut self.frame_pacing, pacing, result)
+    }
+
+    fn process_kms_worker_event_inner(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
                 if let Err(error) = self.validate_submitted_ownership(&ownership) {
@@ -874,6 +891,11 @@ impl NativeRuntime {
                     self.quarantine_submitted_ownership(ownership)?;
                     return Err(error);
                 }
+                self.submitted_worker_ownership.push(ownership);
+                let ownership = self
+                    .submitted_worker_ownership
+                    .last_mut()
+                    .expect("submitted ownership was just retained");
                 if let Some(worker) = self.kms_commit_worker.as_ref() {
                     worker.record_submit_ack_delay(
                         monotonic_now_ns()?.saturating_sub(ownership.submit_returned_at.get()),
@@ -896,16 +918,11 @@ impl NativeRuntime {
                     crtc_id: ownership.job.crtc_id,
                     token: ownership.job.token,
                 };
-                self.submitted_worker_ownership.push(ownership);
                 if let Some(snapshot) = trace_snapshot
                     && let Some(ledger) = self.cursor_reveal_trace.as_mut()
                 {
                     ledger.bind(trace_identity, snapshot);
                 }
-                let ownership = self
-                    .submitted_worker_ownership
-                    .last_mut()
-                    .expect("submitted ownership was just retained");
                 let transaction_id = ownership.job.transaction_id;
                 let token = ownership.job.token;
                 let kind = ownership.job.kind;
@@ -1270,25 +1287,6 @@ impl NativeRuntime {
                     self.frame_scheduler
                         .confirm_kernel_submission(token.get(), submit_returned_at)
                         .map_err(io::Error::other)?;
-                }
-                if !matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
-                    let pacing_mode = self
-                        .output_transactions
-                        .transaction(transaction_id)
-                        .ok_or_else(|| io::Error::other("worker pacing transaction disappeared"))?
-                        .descriptor()
-                        .pacing_mode();
-                    self.frame_pacing
-                        .note_worker_submit_exact(
-                            ownership.job.pacing_ticket,
-                            token.get(),
-                            submit_returned_at,
-                            pacing_mode,
-                        )
-                        .map_err(io::Error::other)?;
-                    if let Some(worker) = self.kms_commit_worker.as_ref() {
-                        worker.record_worker_pacing_submit_confirmed();
-                    }
                 }
                 let deferred_pageflip = self.atomic_commit_arbiter.deferred_pageflip();
                 let deferred_completion = self.atomic_commit_arbiter.replay_deferred_pageflip();

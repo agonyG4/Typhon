@@ -3,12 +3,14 @@ use super::kms_worker::{
     handle_fatal_worker_jobs, retain_complete_submitted_ownership,
     retain_uncertain_job_with_suspension,
 };
+use super::kms_worker_teardown::SubmittedWorkerPacingState;
 use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
     KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
     KmsWorkerFatalJob,
 };
+use crate::native_output::pacing::NativeFramePacing;
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
@@ -18,6 +20,7 @@ use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
 };
+use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -271,6 +274,74 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     emergency.clear();
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+}
+
+#[test]
+fn submitted_worker_integration_failure_abandons_exact_pending_token() {
+    let mut pacing = NativeFramePacing::from_env();
+    pacing.queue_visual(1, 1);
+    let predecessor = pacing
+        .reserve_worker_submission(false)
+        .unwrap()
+        .expect("predecessor worker ticket");
+    pacing
+        .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+        .unwrap();
+    let successor = pacing.active;
+
+    pacing
+        .note_worker_submit_exact(
+            Some(predecessor),
+            41,
+            3,
+            NativeOutputPacingMode::PredictiveTriple,
+        )
+        .unwrap();
+    let result = super::NativeRuntime::finish_submitted_worker_pacing(
+        &mut pacing,
+        Some(SubmittedWorkerPacingState::new(
+            PageFlipToken::new(41).unwrap(),
+        )),
+        Err(std::io::Error::other("integration failure").into()),
+    );
+
+    assert!(result.is_err());
+    assert!(pacing.pending.is_none());
+    assert!(!pacing.abandon_pending_submission(41));
+    assert_eq!(pacing.active, successor);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(
+        pacing
+            .reserve_worker_submission(false)
+            .unwrap()
+            .map(|ticket| ticket.frame_id()),
+        successor
+    );
+}
+
+#[test]
+fn submitted_worker_integration_success_keeps_exact_pending_token_for_pageflip() {
+    let mut pacing = NativeFramePacing::from_env();
+    pacing.queue_visual(1, 1);
+    let ticket = pacing
+        .reserve_worker_submission(false)
+        .unwrap()
+        .expect("worker ticket");
+    pacing
+        .note_worker_submit_exact(Some(ticket), 42, 3, NativeOutputPacingMode::ReactiveDouble)
+        .unwrap();
+
+    super::NativeRuntime::finish_submitted_worker_pacing(
+        &mut pacing,
+        Some(SubmittedWorkerPacingState::new(
+            PageFlipToken::new(42).unwrap(),
+        )),
+        Ok(()),
+    )
+    .unwrap();
+    assert_eq!(pacing.pending, Some(ticket.frame_id()));
+    pacing.note_pageflip_exact(None, 43, 3, 42, 6_060);
+    assert!(pacing.pending.is_none());
 }
 
 #[test]

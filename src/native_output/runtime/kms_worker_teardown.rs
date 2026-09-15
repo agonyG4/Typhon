@@ -6,6 +6,18 @@ use super::kms_worker::{FatalWorkerJobHandler, UncertainJobRetention};
 use super::*;
 use oblivion_one::native::kms::RestorationOutcome;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SubmittedWorkerPacingState {
+    token: PageFlipToken,
+}
+
+impl SubmittedWorkerPacingState {
+    #[cfg(test)]
+    pub(super) const fn new(token: PageFlipToken) -> Self {
+        Self { token }
+    }
+}
+
 pub(super) fn retain_complete_submitted_ownership(
     ownership: KmsSubmittedOwnership,
     emergency_ownership: &mut Vec<KmsSubmittedOwnership>,
@@ -125,6 +137,100 @@ pub(crate) fn settle_submitted_worker_pacing(
 }
 
 impl NativeRuntime {
+    pub(super) fn acknowledge_submitted_worker_pacing(
+        &mut self,
+        ownership: &KmsSubmittedOwnership,
+    ) -> NativeResult<Option<SubmittedWorkerPacingState>> {
+        if matches!(ownership.job.kind, AtomicCommitKind::PlaneDelta { .. }) {
+            if ownership.job.pacing_ticket.is_some() {
+                let error = io::Error::other(
+                    "cursor-only worker submission unexpectedly carried pacing ownership",
+                );
+                if let Some(ticket) = ownership.job.pacing_ticket
+                    && !self.frame_pacing.abandon_worker_submission(Some(ticket))
+                {
+                    return Err(io::Error::other(format!(
+                        "{error}; exact worker pacing reservation {} could not be abandoned",
+                        ticket.reservation_id().get()
+                    ))
+                    .into());
+                }
+                return Err(error.into());
+            }
+            return Ok(None);
+        }
+        let Some(ticket) = ownership.job.pacing_ticket else {
+            return Ok(None);
+        };
+        let pacing_mode = match ownership
+            .job
+            .owners
+            .primary()
+            .map(|owner| owner.transaction.pacing_mode())
+        {
+            Some(pacing_mode) => pacing_mode,
+            None => {
+                let error = io::Error::other("submitted worker job has no primary pacing owner");
+                if !self.frame_pacing.abandon_worker_submission(Some(ticket)) {
+                    return Err(io::Error::other(format!(
+                        "{error}; exact worker pacing reservation {} could not be abandoned",
+                        ticket.reservation_id().get()
+                    ))
+                    .into());
+                }
+                return Err(error.into());
+            }
+        };
+        let token = ownership.job.token;
+        self.frame_pacing
+            .note_worker_submit_exact(
+                Some(ticket),
+                token.get(),
+                ownership.submit_returned_at.get(),
+                pacing_mode,
+            )
+            .map_err(io::Error::other)?;
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.record_worker_pacing_submit_confirmed();
+        }
+        Ok(Some(SubmittedWorkerPacingState { token }))
+    }
+
+    pub(super) fn finish_submitted_worker_pacing(
+        frame_pacing: &mut NativeFramePacing,
+        pacing: Option<SubmittedWorkerPacingState>,
+        result: NativeResult<()>,
+    ) -> NativeResult<()> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        let Some(pacing) = pacing else {
+            return Err(error);
+        };
+        if frame_pacing.abandon_pending_submission(pacing.token.get()) {
+            return Err(error);
+        }
+        Err(io::Error::other(format!(
+            "submitted worker integration failed ({error}); exact pacing pending token {} could not be abandoned",
+            pacing.token.get()
+        ))
+        .into())
+    }
+
+    pub(super) fn quarantine_submitted_after_pacing_error(
+        &mut self,
+        ownership: KmsSubmittedOwnership,
+        error: Box<dyn std::error::Error>,
+    ) -> NativeResult<()> {
+        match self.quarantine_submitted_ownership(ownership) {
+            Ok(()) => Err(error),
+            Err(quarantine_error) => Err(io::Error::other(format!(
+                "submitted worker pacing acknowledgement failed ({error}); physical ownership quarantine failed: {quarantine_error}"
+            ))
+            .into()),
+        }
+    }
+
     fn restore_pre_submit_worker_fence(&mut self, job: &mut KmsCommitJob) -> NativeResult<()> {
         if !matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
             return Ok(());
