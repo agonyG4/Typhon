@@ -57,6 +57,12 @@ fn output_sized_normal_window_is_not_fullscreen_but_is_scene_candidate() {
 
     let state = create_normal_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(0, 0),
+        1280,
+        800,
+    );
     let eligibility = capture_fullscreen_presentation_eligibility(&commands);
     assert_eq!(
         eligibility.rejection,
