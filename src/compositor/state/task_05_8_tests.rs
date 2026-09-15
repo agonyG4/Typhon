@@ -375,7 +375,7 @@ mod task_05_8_tests {
             state
                 .direct_scanout_scene_candidate()
                 .expect_err("an empty scene cannot scan out"),
-            DirectScanoutSceneRejection::NoCoveringApplication
+            DirectScanoutSceneRejection::NoOutputCoveringApplication
         );
         assert_eq!(
             state
@@ -384,10 +384,10 @@ mod task_05_8_tests {
                 .first()
                 .copied()
                 .expect("empty scene blocker"),
-            DirectScanoutSceneRejection::NoCoveringApplication
+            DirectScanoutSceneRejection::NoOutputCoveringApplication
         );
         assert_eq!(
-            DirectScanoutSceneRejection::NoCoveringApplication.as_str(),
+            DirectScanoutSceneRejection::NoOutputCoveringApplication.as_str(),
             "no_output_covering_application"
         );
     }

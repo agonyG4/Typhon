@@ -61,7 +61,7 @@ impl CompositorState {
         }
 
         let Some(covering_group) = coverage.covering_application_group.as_ref() else {
-            blockers.push(DirectScanoutSceneRejection::NoCoveringApplication);
+            blockers.push(DirectScanoutSceneRejection::NoOutputCoveringApplication);
             return DirectScanoutSceneAnalysis {
                 coverage,
                 candidate: None,
@@ -247,10 +247,8 @@ impl CompositorState {
         analysis.candidate.ok_or_else(|| {
             analysis
                 .blockers
-                .reasons()
-                .first()
-                .copied()
-                .unwrap_or(DirectScanoutSceneRejection::NoCoveringApplication)
+                .primary()
+                .expect("rejected scene must expose a primary blocker")
         })
     }
 
