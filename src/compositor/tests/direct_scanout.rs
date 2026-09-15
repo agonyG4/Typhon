@@ -74,6 +74,28 @@ fn output_sized_normal_window_is_not_fullscreen_but_is_scene_candidate() {
 }
 
 #[test]
+fn output_sized_argb_dmabuf_is_not_an_opaque_scanout_candidate() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _state = create_normal_identity_viewport_argb_dmabuf(&socket_path, &commands).unwrap();
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(0, 0),
+        1280,
+        800,
+    );
+    assert_eq!(
+        capture_direct_scanout_candidate(&commands),
+        Err(DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888)
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn fullscreen_cropped_viewport_is_rejected_before_direct_scanout_import() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

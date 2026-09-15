@@ -921,11 +921,12 @@ pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dma
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    create_viewport_xrgb_dmabuf(
+    create_viewport_dmabuf(
         socket_path,
         commands,
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
+        true,
         true,
     )
 }
@@ -934,11 +935,26 @@ pub(in crate::compositor::tests) fn create_normal_identity_viewport_xrgb_dmabuf(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    create_viewport_xrgb_dmabuf(
+    create_viewport_dmabuf(
         socket_path,
         commands,
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
+        false,
+        true,
+    )
+}
+
+pub(in crate::compositor::tests) fn create_normal_identity_viewport_argb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_viewport_dmabuf(
+        socket_path,
+        commands,
+        Some((0.0, 0.0, 1280.0, 800.0)),
+        Some((1280, 800)),
+        false,
         false,
     )
 }
@@ -949,15 +965,16 @@ pub(in crate::compositor::tests) fn create_fullscreen_viewport_xrgb_dmabuf(
     source: Option<(f64, f64, f64, f64)>,
     destination: Option<(i32, i32)>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    create_viewport_xrgb_dmabuf(socket_path, commands, source, destination, true)
+    create_viewport_dmabuf(socket_path, commands, source, destination, true, true)
 }
 
-fn create_viewport_xrgb_dmabuf(
+fn create_viewport_dmabuf(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     source: Option<(f64, f64, f64, f64)>,
     destination: Option<(i32, i32)>,
     fullscreen: bool,
+    xrgb: bool,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
@@ -988,8 +1005,11 @@ fn create_viewport_xrgb_dmabuf(
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
-    let buffer =
-        create_test_xrgb_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?;
+    let buffer = if xrgb {
+        create_test_xrgb_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?
+    } else {
+        create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?
+    };
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width, height);
     surface.commit();
