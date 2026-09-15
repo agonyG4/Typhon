@@ -368,6 +368,31 @@ mod task_05_8_tests {
     }
 
     #[test]
+    fn empty_scene_reports_no_output_covering_application() {
+        let state = CompositorState::default();
+
+        assert_eq!(
+            state
+                .direct_scanout_scene_candidate()
+                .expect_err("an empty scene cannot scan out"),
+            DirectScanoutSceneRejection::NoCoveringApplication
+        );
+        assert_eq!(
+            state
+                .direct_scanout_scene_blockers()
+                .reasons()
+                .first()
+                .copied()
+                .expect("empty scene blocker"),
+            DirectScanoutSceneRejection::NoCoveringApplication
+        );
+        assert_eq!(
+            DirectScanoutSceneRejection::NoCoveringApplication.as_str(),
+            "no_output_covering_application"
+        );
+    }
+
+    #[test]
     fn fullscreen_owner_transient_family_survives_unrelated_application_culling() {
         let mut state = CompositorState::default();
         let unrelated = WindowId::from_raw(21).expect("unrelated window id");
