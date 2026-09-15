@@ -209,6 +209,81 @@ pub struct GraphTexturePlan {
     pub last_use: Option<GraphPassId>,
 }
 
+/// Physical texel coverage in logical-top texture coordinates.
+///
+/// The rectangle is half-open: `[left, right) x [top, bottom)`. It deliberately
+/// does not encode framebuffer origin or OpenGL's Y direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphTexturePhysicalRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl GraphTexturePhysicalRect {
+    pub const fn width(self) -> u32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    pub const fn height(self) -> u32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    pub const fn contains(self, x: u32, y: u32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+}
+
+fn div_round_up(numerator: u128, denominator: u128) -> u128 {
+    numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+}
+
+fn logical_edge_to_physical(
+    local: u32,
+    physical_size: u32,
+    logical_size: u32,
+    round_up: bool,
+) -> u32 {
+    let numerator = u128::from(local) * u128::from(physical_size);
+    let denominator = u128::from(logical_size);
+    let value = if round_up {
+        div_round_up(numerator, denominator)
+    } else {
+        numerator / denominator
+    };
+    u32::try_from(value).expect("graph texture coverage fits its physical dimension")
+}
+
+/// Converts a logical damage rectangle to the physical texels the fullscreen
+/// executor rasterizes before any framebuffer-origin Y conversion.
+pub fn logical_rect_to_physical_coverage(
+    rect: EffectRect,
+    texture: &GraphTexturePlan,
+) -> Option<GraphTexturePhysicalRect> {
+    if texture.width == 0
+        || texture.height == 0
+        || texture.domain.width == 0
+        || texture.domain.height == 0
+    {
+        return None;
+    }
+    let clipped = rect.intersect(texture.domain)?;
+    let local_left = u32::try_from(i64::from(clipped.x) - i64::from(texture.domain.x)).ok()?;
+    let local_top = u32::try_from(i64::from(clipped.y) - i64::from(texture.domain.y)).ok()?;
+    let local_right =
+        u32::try_from(i64::from(clipped.right()) - i64::from(texture.domain.x)).ok()?;
+    let local_bottom =
+        u32::try_from(i64::from(clipped.bottom()) - i64::from(texture.domain.y)).ok()?;
+    let coverage = GraphTexturePhysicalRect {
+        left: logical_edge_to_physical(local_left, texture.width, texture.domain.width, false),
+        top: logical_edge_to_physical(local_top, texture.height, texture.domain.height, false),
+        right: logical_edge_to_physical(local_right, texture.width, texture.domain.width, true),
+        bottom: logical_edge_to_physical(local_bottom, texture.height, texture.domain.height, true),
+    };
+    (coverage.width() > 0 && coverage.height() > 0).then_some(coverage)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderPassKind {
     SceneCapture,
@@ -773,6 +848,138 @@ fn pass_input_sampling_radius(pass: &CompiledRenderPass) -> Option<(f64, f64, bo
     }
 }
 
+fn physical_edge_to_logical(
+    local: u32,
+    logical_size: u32,
+    physical_size: u32,
+    round_up: bool,
+) -> u32 {
+    let numerator = u128::from(local) * u128::from(logical_size);
+    let denominator = u128::from(physical_size);
+    let value = if round_up {
+        div_round_up(numerator, denominator)
+    } else {
+        numerator / denominator
+    };
+    u32::try_from(value).expect("logical texture coverage fits its domain dimension")
+}
+
+fn physical_coverage_to_logical_rect(
+    coverage: GraphTexturePhysicalRect,
+    texture: &GraphTexturePlan,
+) -> Option<EffectRect> {
+    if coverage.width() == 0
+        || coverage.height() == 0
+        || texture.width == 0
+        || texture.height == 0
+        || texture.domain.width == 0
+        || texture.domain.height == 0
+    {
+        return None;
+    }
+    let left = physical_edge_to_logical(
+        coverage.left.min(texture.width),
+        texture.domain.width,
+        texture.width,
+        false,
+    );
+    let top = physical_edge_to_logical(
+        coverage.top.min(texture.height),
+        texture.domain.height,
+        texture.height,
+        false,
+    );
+    let right = physical_edge_to_logical(
+        coverage.right.min(texture.width),
+        texture.domain.width,
+        texture.width,
+        true,
+    );
+    let bottom = physical_edge_to_logical(
+        coverage.bottom.min(texture.height),
+        texture.domain.height,
+        texture.height,
+        true,
+    );
+    let x = i64::from(texture.domain.x) + i64::from(left);
+    let y = i64::from(texture.domain.y) + i64::from(top);
+    let width = right.saturating_sub(left);
+    let height = bottom.saturating_sub(top);
+    EffectRect::new(
+        i32::try_from(x).ok()?,
+        i32::try_from(y).ok()?,
+        width,
+        height,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TextureAxisMapping {
+    output_size: u32,
+    output_domain_origin: i32,
+    output_domain_size: u32,
+    input_size: u32,
+    input_domain_origin: i32,
+    input_domain_size: u32,
+}
+
+fn output_center_to_input_texel(
+    output_center: f64,
+    mapping: TextureAxisMapping,
+    logical_mapping: bool,
+) -> f64 {
+    if logical_mapping {
+        let logical_position = f64::from(mapping.output_domain_origin)
+            + output_center * f64::from(mapping.output_domain_size)
+                / f64::from(mapping.output_size);
+        (logical_position - f64::from(mapping.input_domain_origin)) * f64::from(mapping.input_size)
+            / f64::from(mapping.input_domain_size)
+            - 0.5
+    } else {
+        output_center * f64::from(mapping.input_size) / f64::from(mapping.output_size) - 0.5
+    }
+}
+
+fn sampled_input_axis_bounds(
+    output_start: u32,
+    output_end: u32,
+    mapping: TextureAxisMapping,
+    radius: f64,
+    logical_mapping: bool,
+    linear_filter_support: bool,
+) -> Option<(u32, u32)> {
+    if output_start >= output_end || mapping.output_size == 0 || mapping.input_size == 0 {
+        return None;
+    }
+    let first_sample =
+        output_center_to_input_texel(f64::from(output_start) + 0.5, mapping, logical_mapping)
+            - radius;
+    let last_sample = output_center_to_input_texel(
+        f64::from(output_end.saturating_sub(1)) + 0.5,
+        mapping,
+        logical_mapping,
+    ) + radius;
+    if !first_sample.is_finite() || !last_sample.is_finite() {
+        return None;
+    }
+    if last_sample < 0.0 {
+        return Some((0, 1));
+    }
+    if first_sample >= f64::from(mapping.input_size) {
+        return Some((mapping.input_size - 1, mapping.input_size));
+    }
+    let left = first_sample
+        .floor()
+        .clamp(0.0, f64::from(mapping.input_size)) as u32;
+    let right_unclipped = if linear_filter_support {
+        last_sample.floor() + 2.0
+    } else {
+        last_sample.ceil() + 1.0
+    };
+    let right = right_unclipped.clamp(0.0, f64::from(mapping.input_size)) as u32;
+    (right > left).then_some((left, right))
+}
+
 fn map_region_to_input_texture(
     demanded_output: &EffectRegion,
     output: &GraphTexturePlan,
@@ -795,120 +1002,48 @@ fn map_region_to_input_texture(
         return None;
     }
 
-    const LINEAR_FILTER_SUPPORT: f64 = 1.0;
-    let filter_support = if linear_filter_support {
-        LINEAR_FILTER_SUPPORT
-    } else {
-        0.0
-    };
-    let output_domain = output.domain;
-    let input_domain = input.domain;
-    let output_width = f64::from(output.width);
-    let output_height = f64::from(output.height);
-    let input_width = f64::from(input.width);
-    let input_height = f64::from(input.height);
-    let output_domain_width = f64::from(output_domain.width);
-    let output_domain_height = f64::from(output_domain.height);
-    let input_domain_width = f64::from(input_domain.width);
-    let input_domain_height = f64::from(input_domain.height);
     let mut result = EffectRegion::empty();
-
     for requested in demanded_output.rects() {
-        let Some(requested) = requested.intersect(output_domain) else {
+        let Some(output_coverage) = logical_rect_to_physical_coverage(*requested, output) else {
             continue;
         };
-        let output_local_left = (f64::from(requested.x) - f64::from(output_domain.x))
-            * output_width
-            / output_domain_width;
-        let output_local_right = (f64::from(requested.right()) - f64::from(output_domain.x))
-            * output_width
-            / output_domain_width;
-        let output_local_top = (f64::from(requested.y) - f64::from(output_domain.y))
-            * output_height
-            / output_domain_height;
-        let output_local_bottom = (f64::from(requested.bottom()) - f64::from(output_domain.y))
-            * output_height
-            / output_domain_height;
-
-        let input_local_left = if logical_mapping {
-            (f64::from(output_domain.x) + output_local_left * output_domain_width / output_width
-                - f64::from(input_domain.x))
-                * input_width
-                / input_domain_width
-        } else {
-            output_local_left * input_width / output_width
-        };
-        let input_local_right = if logical_mapping {
-            (f64::from(output_domain.x) + output_local_right * output_domain_width / output_width
-                - f64::from(input_domain.x))
-                * input_width
-                / input_domain_width
-        } else {
-            output_local_right * input_width / output_width
-        };
-        let input_local_top = if logical_mapping {
-            (f64::from(output_domain.y) + output_local_top * output_domain_height / output_height
-                - f64::from(input_domain.y))
-                * input_height
-                / input_domain_height
-        } else {
-            output_local_top * input_height / output_height
-        };
-        let input_local_bottom = if logical_mapping {
-            (f64::from(output_domain.y)
-                + output_local_bottom * output_domain_height / output_height
-                - f64::from(input_domain.y))
-                * input_height
-                / input_domain_height
-        } else {
-            output_local_bottom * input_height / output_height
-        };
-
-        let physical_left = (input_local_left - radius_x - filter_support)
-            .floor()
-            .max(0.0)
-            .min(input_width);
-        let physical_right = (input_local_right + radius_x + filter_support)
-            .ceil()
-            .max(0.0)
-            .min(input_width);
-        let physical_top = (input_local_top - radius_y - filter_support)
-            .floor()
-            .max(0.0)
-            .min(input_height);
-        let physical_bottom = (input_local_bottom + radius_y + filter_support)
-            .ceil()
-            .max(0.0)
-            .min(input_height);
-        if physical_right <= physical_left || physical_bottom <= physical_top {
-            continue;
-        }
-
-        let left = (f64::from(input_domain.x) + physical_left * input_domain_width / input_width)
-            .floor()
-            .max(f64::from(input_domain.x)) as i64;
-        let right = (f64::from(input_domain.x) + physical_right * input_domain_width / input_width)
-            .ceil()
-            .min(f64::from(input_domain.right())) as i64;
-        let top = (f64::from(input_domain.y) + physical_top * input_domain_height / input_height)
-            .floor()
-            .max(f64::from(input_domain.y)) as i64;
-        let bottom = (f64::from(input_domain.y)
-            + physical_bottom * input_domain_height / input_height)
-            .ceil()
-            .min(f64::from(input_domain.bottom())) as i64;
-        let width = right.saturating_sub(left);
-        let height = bottom.saturating_sub(top);
-        if width <= 0 || height <= 0 {
-            continue;
-        }
-        let rect = EffectRect::new(
-            i32::try_from(left).ok()?,
-            i32::try_from(top).ok()?,
-            u32::try_from(width).ok()?,
-            u32::try_from(height).ok()?,
+        let (left, right) = sampled_input_axis_bounds(
+            output_coverage.left,
+            output_coverage.right,
+            TextureAxisMapping {
+                output_size: output.width,
+                output_domain_origin: output.domain.x,
+                output_domain_size: output.domain.width,
+                input_size: input.width,
+                input_domain_origin: input.domain.x,
+                input_domain_size: input.domain.width,
+            },
+            radius_x,
+            logical_mapping,
+            linear_filter_support,
         )?;
-        result.push(rect);
+        let (top, bottom) = sampled_input_axis_bounds(
+            output_coverage.top,
+            output_coverage.bottom,
+            TextureAxisMapping {
+                output_size: output.height,
+                output_domain_origin: output.domain.y,
+                output_domain_size: output.domain.height,
+                input_size: input.height,
+                input_domain_origin: input.domain.y,
+                input_domain_size: input.domain.height,
+            },
+            radius_y,
+            logical_mapping,
+            linear_filter_support,
+        )?;
+        let required = GraphTexturePhysicalRect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        result.push(physical_coverage_to_logical_rect(required, input)?);
         result.bounding_rect()?;
     }
     Some(result)
@@ -2108,6 +2243,8 @@ fn ceil_div(value: u32, divisor: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::compositor::{
         EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
@@ -2122,6 +2259,13 @@ mod tests {
     }
 
     fn blur_scene_with_region(region: EffectRegion) -> (ResolvedEffectScene, EffectRegistry) {
+        blur_scene_with_region_and_scale(region, 1.0)
+    }
+
+    fn blur_scene_with_region_and_scale(
+        region: EffectRegion,
+        scale: f32,
+    ) -> (ResolvedEffectScene, EffectRegistry) {
         let source = EffectNodeId::new(1).unwrap();
         let blur = EffectNodeId::new(2).unwrap();
         let program = EffectProgram {
@@ -2131,7 +2275,7 @@ mod tests {
                 EffectNode::dual_kawase(
                     blur,
                     source,
-                    DualKawaseBlurSpec::new(4.0, 2, 1.0).unwrap(),
+                    DualKawaseBlurSpec::new(4.0, 2, scale).unwrap(),
                 ),
             ],
             output: blur,
@@ -2324,6 +2468,244 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+        }
+    }
+
+    fn sampling_texture(
+        id: u16,
+        source: GraphTextureSource,
+        domain: EffectRect,
+        width: u32,
+        height: u32,
+    ) -> GraphTexturePlan {
+        GraphTexturePlan {
+            id: GraphTextureId::new(id).expect("test texture id must be non-zero"),
+            source,
+            width,
+            height,
+            domain,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            origin: GraphTextureOrigin::BottomLeft,
+            first_use: None,
+            last_use: None,
+        }
+    }
+
+    fn sampling_pass(
+        id: u16,
+        kind: RenderPassKind,
+        input: GraphTextureId,
+        output: GraphTextureId,
+        radius: f32,
+    ) -> CompiledRenderPass {
+        let mut pass = test_pass(id);
+        pass.kind = kind;
+        pass.inputs = vec![input];
+        pass.output = Some(output);
+        pass.blur_radius = Some(radius);
+        pass
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the independent oracle spells out each coordinate-space input"
+    )]
+    fn reference_output_center_to_input_texel(
+        output_center: f64,
+        output_origin: i32,
+        output_domain_size: u32,
+        output_size: u32,
+        input_origin: i32,
+        input_domain_size: u32,
+        input_size: u32,
+        logical_mapping: bool,
+    ) -> f64 {
+        if logical_mapping {
+            let logical_position = f64::from(output_origin)
+                + output_center * f64::from(output_domain_size) / f64::from(output_size);
+            (logical_position - f64::from(input_origin)) * f64::from(input_size)
+                / f64::from(input_domain_size)
+                - 0.5
+        } else {
+            output_center * f64::from(input_size) / f64::from(output_size) - 0.5
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the independent oracle spells out each sampling-space input"
+    )]
+    fn reference_sampled_texels(
+        kind: RenderPassKind,
+        output_coverage: GraphTexturePhysicalRect,
+        output: &GraphTexturePlan,
+        input: &GraphTexturePlan,
+        radius_x: f64,
+        radius_y: f64,
+        logical_mapping: bool,
+        linear_filter_support: bool,
+    ) -> BTreeSet<(u32, u32)> {
+        let offsets = match kind {
+            RenderPassKind::DualKawaseDownsample => vec![
+                (radius_x, radius_y),
+                (-radius_x, -radius_y),
+                (radius_x, -radius_y),
+                (-radius_x, radius_y),
+            ],
+            RenderPassKind::DualKawaseUpsample => vec![
+                (0.0, 0.0),
+                (radius_x, 0.0),
+                (-radius_x, 0.0),
+                (0.0, radius_y),
+                (0.0, -radius_y),
+            ],
+            _ => vec![(0.0, 0.0)],
+        };
+        let mut sampled = BTreeSet::new();
+        for output_y in output_coverage.top..output_coverage.bottom {
+            for output_x in output_coverage.left..output_coverage.right {
+                let center_x = reference_output_center_to_input_texel(
+                    f64::from(output_x) + 0.5,
+                    output.domain.x,
+                    output.domain.width,
+                    output.width,
+                    input.domain.x,
+                    input.domain.width,
+                    input.width,
+                    logical_mapping,
+                );
+                let center_y = reference_output_center_to_input_texel(
+                    f64::from(output_y) + 0.5,
+                    output.domain.y,
+                    output.domain.height,
+                    output.height,
+                    input.domain.y,
+                    input.domain.height,
+                    input.height,
+                    logical_mapping,
+                );
+                for (offset_x, offset_y) in &offsets {
+                    let sample_x = center_x + offset_x;
+                    let sample_y = center_y + offset_y;
+                    let base_x = sample_x.floor() as i64;
+                    let base_y = sample_y.floor() as i64;
+                    let extra = if linear_filter_support { 1 } else { 0 };
+                    for x_offset in 0..=extra {
+                        for y_offset in 0..=extra {
+                            let texel_x = base_x
+                                .saturating_add(i64::from(x_offset))
+                                .clamp(0, i64::from(input.width - 1))
+                                as u32;
+                            let texel_y = base_y
+                                .saturating_add(i64::from(y_offset))
+                                .clamp(0, i64::from(input.height - 1))
+                                as u32;
+                            sampled.insert((texel_x, texel_y));
+                        }
+                    }
+                }
+            }
+        }
+        sampled
+    }
+
+    fn physical_region_contains(
+        region: &EffectRegion,
+        texture: &GraphTexturePlan,
+        x: u32,
+        y: u32,
+    ) -> bool {
+        region.rects().iter().any(|rect| {
+            logical_rect_to_physical_coverage(*rect, texture)
+                .is_some_and(|coverage| coverage.contains(x, y))
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "coverage sweeps keep dimensions, origins, and mapping explicit"
+    )]
+    fn assert_sample_coverage(
+        kind: RenderPassKind,
+        input_width: u32,
+        input_height: u32,
+        output_width: u32,
+        output_height: u32,
+        output_origin: (i32, i32),
+        input_origin: (i32, i32),
+        logical_mapping: bool,
+    ) {
+        let input = sampling_texture(
+            1,
+            GraphTextureSource::CapturedScene,
+            EffectRect::new(input_origin.0, input_origin.1, input_width, input_height)
+                .expect("input domain"),
+            input_width,
+            input_height,
+        );
+        let output = sampling_texture(
+            2,
+            GraphTextureSource::Intermediate,
+            EffectRect::new(output_origin.0, output_origin.1, input_width, input_height)
+                .expect("output domain"),
+            output_width,
+            output_height,
+        );
+        let radius: f64 = match kind {
+            RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample => 4.0,
+            _ => 0.0,
+        };
+        let pass = sampling_pass(1, kind, input.id, output.id, radius as f32);
+        let mut xs = if output_width <= 16 {
+            (0..output_width).collect()
+        } else {
+            vec![0, output_width - 1, 1, output_width - 2]
+        };
+        let mut ys = if output_height <= 16 {
+            (0..output_height).collect()
+        } else {
+            vec![0, output_height - 1, 1, output_height - 2]
+        };
+        xs.sort_unstable();
+        xs.dedup();
+        ys.sort_unstable();
+        ys.dedup();
+
+        for output_x in xs {
+            for output_y in &ys {
+                let demanded = physical_coverage_to_logical_rect(
+                    GraphTexturePhysicalRect {
+                        left: output_x,
+                        top: *output_y,
+                        right: output_x + 1,
+                        bottom: *output_y + 1,
+                    },
+                    &output,
+                )
+                .map(EffectRegion::from_rect)
+                .expect("edge output pixel has a logical cover");
+                let output_coverage =
+                    logical_rect_to_physical_coverage(demanded.rects()[0], &output)
+                        .expect("logical output demand rasterizes");
+                let expected = reference_sampled_texels(
+                    kind,
+                    output_coverage,
+                    &output,
+                    &input,
+                    radius,
+                    radius,
+                    logical_mapping,
+                    true,
+                );
+                let required = required_input_region(&pass, &demanded, &output, &input)
+                    .expect("sampled edge maps to input demand");
+                for (sampled_x, sampled_y) in expected {
+                    assert!(
+                        physical_region_contains(&required, &input, sampled_x, sampled_y),
+                        "{kind:?} {input_width}x{input_height}->{output_width}x{output_height} at output ({output_x},{output_y}) misses input ({sampled_x},{sampled_y})"
+                    );
+                }
+            }
         }
     }
 
@@ -4934,6 +5316,186 @@ mod tests {
         assert!(required.contains_point(1303, 752));
         assert!(required.rects().iter().any(|rect| rect.x < 500));
         assert!(required.rects().iter().any(|rect| rect.right() > 1301));
+    }
+
+    #[test]
+    fn frame_1721_rasterized_downsample_output_requires_produced_row_747() {
+        let input = sampling_texture(
+            1,
+            GraphTextureSource::CapturedScene,
+            EffectRect::new(145, 148, 1112, 873).unwrap(),
+            1112,
+            873,
+        );
+        let output = sampling_texture(
+            2,
+            GraphTextureSource::Intermediate,
+            EffectRect::new(145, 148, 1112, 873).unwrap(),
+            556,
+            437,
+        );
+        let pass = sampling_pass(
+            2,
+            RenderPassKind::DualKawaseDownsample,
+            input.id,
+            output.id,
+            4.0,
+        );
+        let demanded_output = EffectRegion::from_rect(EffectRect::new(647, 901, 610, 120).unwrap());
+        let output_coverage =
+            logical_rect_to_physical_coverage(demanded_output.rects()[0], &output)
+                .expect("frame-1721 demand rasterizes");
+
+        assert_eq!(
+            output_coverage,
+            GraphTexturePhysicalRect {
+                left: 251,
+                top: 376,
+                right: 556,
+                bottom: 437,
+            }
+        );
+        let sampled_row = (((f64::from(output_coverage.top) + 0.5) * f64::from(input.height)
+            / f64::from(output.height))
+            - 0.5
+            - 4.0)
+            .floor() as u32;
+        assert_eq!(
+            sampled_row, 747,
+            "row 376's negative Kawase tap reaches row 747"
+        );
+
+        let planned = required_input_region(&pass, &demanded_output, &output, &input)
+            .expect("frame-1721 demand maps to a producer region");
+        let planned_physical_top = planned
+            .rects()
+            .iter()
+            .filter_map(|rect| logical_rect_to_physical_coverage(*rect, &input))
+            .map(|coverage| coverage.top)
+            .min()
+            .expect("planned producer region is non-empty");
+        let planned_physical_left = planned
+            .rects()
+            .iter()
+            .filter_map(|rect| logical_rect_to_physical_coverage(*rect, &input))
+            .map(|coverage| coverage.left)
+            .min()
+            .expect("planned producer region is non-empty");
+        assert_eq!(planned_physical_top, 747);
+        assert!(
+            physical_region_contains(&planned, &input, planned_physical_left, sampled_row),
+            "every texel sampled by rasterized row {} must be produced; planned producer coverage starts at physical row {planned_physical_top}, leaving row {sampled_row} undefined",
+            output_coverage.top
+        );
+    }
+
+    #[test]
+    fn raster_aware_kawase_demand_covers_exhaustive_edge_oracle() {
+        for input_width in 1..=16 {
+            for input_height in 1..=16 {
+                assert_sample_coverage(
+                    RenderPassKind::DualKawaseDownsample,
+                    input_width,
+                    input_height,
+                    input_width.div_ceil(2),
+                    input_height.div_ceil(2),
+                    (145, 148),
+                    (145, 148),
+                    false,
+                );
+            }
+        }
+
+        for (input_width, input_height, output_width, output_height) in [
+            (1112, 873, 556, 437),
+            (1112, 873, 278, 219),
+            (873, 437, 437, 219),
+            (437, 321, 219, 161),
+            (321, 181, 161, 91),
+            (321, 181, 81, 46),
+            (181, 91, 91, 46),
+        ] {
+            assert_sample_coverage(
+                RenderPassKind::DualKawaseDownsample,
+                input_width,
+                input_height,
+                output_width,
+                output_height,
+                (145, 148),
+                (145, 148),
+                false,
+            );
+        }
+
+        for (input_width, input_height, output_width, output_height) in [
+            (1, 1, 2, 2),
+            (2, 3, 4, 6),
+            (81, 46, 161, 91),
+            (219, 161, 437, 321),
+            (437, 219, 873, 437),
+        ] {
+            assert_sample_coverage(
+                RenderPassKind::DualKawaseUpsample,
+                input_width,
+                input_height,
+                output_width,
+                output_height,
+                (145, 148),
+                (145, 148),
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_blur_graph_uses_raster_aware_dimensions_for_odd_domains() {
+        let domain = EffectRect::new(145, 148, 321, 181).unwrap();
+        let (scene, registry) =
+            blur_scene_with_region_and_scale(EffectRegion::from_rect(domain), 0.5);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::from_rect(domain),
+            domain,
+            &registry,
+        )
+        .unwrap() else {
+            panic!("scaled blur must compile to an effect graph");
+        };
+        let blur_dimensions = graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                matches!(
+                    pass.kind,
+                    RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+                )
+            })
+            .map(|pass| {
+                let output = graph
+                    .textures
+                    .iter()
+                    .find(|texture| texture.id == pass.output.unwrap())
+                    .expect("scaled blur pass output texture");
+                (pass.kind, output.width, output.height)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blur_dimensions,
+            vec![
+                (RenderPassKind::DualKawaseDownsample, 81, 46),
+                (RenderPassKind::DualKawaseDownsample, 41, 23),
+                (RenderPassKind::DualKawaseUpsample, 81, 46),
+                (RenderPassKind::DualKawaseUpsample, 161, 91),
+            ]
+        );
+    }
+
+    #[test]
+    fn raster_aware_logical_mapping_covers_translated_non_unit_scale_oracle() {
+        for kind in [RenderPassKind::NormalizeInput, RenderPassKind::Composite] {
+            assert_sample_coverage(kind, 5, 4, 8, 6, (0, 0), (13, 17), true);
+            assert_sample_coverage(kind, 7, 5, 11, 9, (0, 0), (145, 148), true);
+        }
     }
 
     #[test]

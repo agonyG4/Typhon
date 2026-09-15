@@ -6,7 +6,7 @@ use oblivion_one::effects::{
     EffectExecutionDemand, EffectNodeKind, EffectRegion, GraphPassId, GraphTextureId,
     GraphTextureSource, INTERNAL_EFFECT_SHADER_MODULE_BLEND,
     INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT, INTERNAL_EFFECT_SHADER_MODULE_MASK, RenderPassKind,
-    ShaderModuleId,
+    ShaderModuleId, logical_rect_to_physical_coverage,
 };
 
 use super::super::geometry::{
@@ -3049,38 +3049,23 @@ fn effect_rect_to_texture_rect(
     target: &oblivion_one::effects::GraphTexturePlan,
     framebuffer_origin: OutputFramebufferOrigin,
 ) -> Option<OutputRect> {
-    let domain = target.domain;
-    let left = i64::from(rect.x).max(i64::from(domain.x));
-    let top = i64::from(rect.y).max(i64::from(domain.y));
-    let right = i64::from(rect.right()).min(i64::from(domain.right()));
-    let bottom = i64::from(rect.bottom()).min(i64::from(domain.bottom()));
-    if right <= left || bottom <= top {
-        return None;
-    }
-    let domain_width = i64::from(domain.width).max(1);
-    let domain_height = i64::from(domain.height).max(1);
-    let physical_width = i64::from(target.width.max(1));
-    let physical_height = i64::from(target.height.max(1));
-    let local_left = ((left - i64::from(domain.x)) * physical_width) / domain_width;
-    let local_top = ((top - i64::from(domain.y)) * physical_height) / domain_height;
-    let local_right =
-        ((right - i64::from(domain.x)) * physical_width + domain_width - 1) / domain_width;
-    let local_bottom =
-        ((bottom - i64::from(domain.y)) * physical_height + domain_height - 1) / domain_height;
-    let width = local_right.saturating_sub(local_left).max(1);
-    let height = local_bottom.saturating_sub(local_top).max(1);
+    let coverage = logical_rect_to_physical_coverage(rect, target)?;
+    let width = coverage.width();
+    let height = coverage.height();
     let y = match target.origin {
         oblivion_one::effects::GraphTextureOrigin::BottomLeft => match target.source {
             GraphTextureSource::Output => match framebuffer_origin {
-                OutputFramebufferOrigin::BottomLeft => physical_height.saturating_sub(local_bottom),
-                OutputFramebufferOrigin::TopLeftScanout => local_top,
+                OutputFramebufferOrigin::BottomLeft => {
+                    target.height.saturating_sub(coverage.bottom)
+                }
+                OutputFramebufferOrigin::TopLeftScanout => coverage.top,
             },
-            _ => physical_height.saturating_sub(local_bottom),
+            _ => target.height.saturating_sub(coverage.bottom),
         },
     };
     Some(OutputRect::new(
-        local_left as i32,
-        y as i32,
+        i32::try_from(coverage.left).ok()?,
+        i32::try_from(y).ok()?,
         width as u32,
         height as u32,
     ))
@@ -3136,13 +3121,63 @@ mod coordinate_tests {
             50,
             50,
         );
+        let logical_rect = oblivion_one::effects::EffectRect::new(110, 60, 20, 20).unwrap();
+        let coverage = logical_rect_to_physical_coverage(logical_rect, &target).unwrap();
+        assert_eq!(
+            coverage,
+            oblivion_one::effects::GraphTexturePhysicalRect {
+                left: 5,
+                top: 5,
+                right: 15,
+                bottom: 15,
+            }
+        );
         let rect = effect_rect_to_texture_rect(
-            oblivion_one::effects::EffectRect::new(110, 60, 20, 20).unwrap(),
+            logical_rect,
             &target,
             OutputFramebufferOrigin::TopLeftScanout,
         )
         .unwrap();
         assert_eq!(rect, OutputRect::new(5, 35, 10, 10));
+    }
+
+    #[test]
+    fn executor_scissor_preserves_shared_coverage_for_framebuffer_y_origins() {
+        let target = target(
+            GraphTextureSource::Output,
+            oblivion_one::effects::EffectRect::new(145, 148, 1112, 873).unwrap(),
+            556,
+            437,
+        );
+        let logical_rect = oblivion_one::effects::EffectRect::new(647, 901, 610, 120).unwrap();
+        let coverage = logical_rect_to_physical_coverage(logical_rect, &target).unwrap();
+        assert_eq!(
+            coverage,
+            oblivion_one::effects::GraphTexturePhysicalRect {
+                left: 251,
+                top: 376,
+                right: 556,
+                bottom: 437,
+            }
+        );
+        assert_eq!(
+            effect_rect_to_texture_rect(
+                logical_rect,
+                &target,
+                OutputFramebufferOrigin::BottomLeft,
+            )
+            .unwrap(),
+            OutputRect::new(251, 0, 305, 61)
+        );
+        assert_eq!(
+            effect_rect_to_texture_rect(
+                logical_rect,
+                &target,
+                OutputFramebufferOrigin::TopLeftScanout,
+            )
+            .unwrap(),
+            OutputRect::new(251, 376, 305, 61)
+        );
     }
 
     #[test]

@@ -6542,7 +6542,7 @@ mod tests {
     use oblivion_one::effects::{
         DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode,
         EffectNodeId, EffectParameterBlock, EffectProgram, EffectProgramId, EffectSource,
-        EffectWorkingSpace, GraphTextureSource, validate_effect_program,
+        EffectWorkingSpace, GraphTexturePhysicalRect, GraphTextureSource, validate_effect_program,
     };
     use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
     use oblivion_one::render_backend::buffer::{
@@ -7439,6 +7439,15 @@ mod tests {
         texture
     }
 
+    fn set_effect_test_texture_filter(gl: &glow::Context, texture: glow::Texture, filter: u32) {
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+    }
+
     fn read_effect_test_pixels(gl: &glow::Context, width: u32, height: u32) -> Vec<u8> {
         let mut pixels = vec![0_u8; width as usize * height as usize * 4];
         unsafe {
@@ -7608,6 +7617,152 @@ mod tests {
 
         unsafe {
             harness.gl.delete_texture(input_texture);
+            harness.gl.delete_program(program);
+        }
+    }
+
+    #[test]
+    fn real_gles_partial_kawase_is_independent_of_unproduced_sentinels() {
+        let mut harness = GlesEffectTestHarness::new(556, 437);
+        let program = program::create_program_from_sources(
+            &harness.gl,
+            effects::DUAL_KAWASE_VERTEX_SHADER,
+            effects::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+        )
+        .expect("sentinel regression downsample program compiles");
+        let quad = harness
+            .renderer
+            .ensure_effect_quad()
+            .expect("sentinel regression effect quad creates")
+            .0;
+        let output_coverage = GraphTexturePhysicalRect {
+            left: 251,
+            top: 376,
+            right: 556,
+            bottom: 437,
+        };
+        let produced_input = GraphTexturePhysicalRect {
+            left: 497,
+            top: 747,
+            right: 1112,
+            bottom: 873,
+        };
+        let scissor = [
+            output_coverage.left as i32,
+            {
+                let output_height = 437_u32;
+                let output_bottom = output_coverage.bottom;
+                output_height.saturating_sub(output_bottom) as i32
+            },
+            output_coverage.width() as i32,
+            output_coverage.height() as i32,
+        ];
+        let mut gradient = vec![0_u8; 1112 * 873 * 4];
+        for logical_y in 0..873_u32 {
+            let texture_y = 872 - logical_y;
+            for x in 0..1112_u32 {
+                let offset = ((texture_y * 1112 + x) * 4) as usize;
+                gradient[offset..offset + 4].copy_from_slice(&[
+                    (x & 0xff) as u8,
+                    (logical_y & 0xff) as u8,
+                    ((x.wrapping_add(logical_y)) & 0xff) as u8,
+                    255,
+                ]);
+            }
+        }
+        let sentinel_texture_pixels = |sentinel: [u8; 4]| {
+            let mut pixels = gradient.clone();
+            for logical_y in 0..873_u32 {
+                let texture_y = 872 - logical_y;
+                for x in 0..1112_u32 {
+                    if !produced_input.contains(x, logical_y) {
+                        let offset = ((texture_y * 1112 + x) * 4) as usize;
+                        pixels[offset..offset + 4].copy_from_slice(&sentinel);
+                    }
+                }
+            }
+            pixels
+        };
+        let configure = |gl: &glow::Context, program: glow::Program| {
+            set_effect_test_uniform_i32(gl, program, "u_effect_input", 0);
+            set_effect_test_uniform_2_f32(
+                gl,
+                program,
+                "u_effect_texel_size",
+                1.0 / 1112.0,
+                1.0 / 873.0,
+            );
+            let radius = unsafe {
+                gl.get_uniform_location(program, "u_effect_blur_radius")
+                    .expect("sentinel blur radius is active")
+            };
+            unsafe { gl.uniform_1_f32(Some(&radius), 4.0) };
+        };
+        let render = |input_texture: glow::Texture, scissor: Option<[i32; 4]>| {
+            unsafe {
+                harness.gl.viewport(0, 0, 556, 437);
+                harness.gl.disable(glow::SCISSOR_TEST);
+                harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                harness.gl.clear(glow::COLOR_BUFFER_BIT);
+                harness.gl.use_program(Some(program));
+                set_effect_test_uniform_i32(&harness.gl, program, "u_effect_target_flip_y", 0);
+                set_effect_test_uniform_i32(&harness.gl, program, "u_effect_input_flip_y", 1);
+                configure(&harness.gl, program);
+                harness
+                    .gl
+                    .bind_texture(glow::TEXTURE_2D, Some(input_texture));
+                harness.gl.bind_vertex_array(Some(quad));
+                if let Some([x, y, width, height]) = scissor {
+                    harness.gl.enable(glow::SCISSOR_TEST);
+                    harness.gl.scissor(x, y, width, height);
+                }
+                harness.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                harness.gl.bind_vertex_array(None);
+                harness.gl.disable(glow::SCISSOR_TEST);
+                harness.gl.bind_texture(glow::TEXTURE_2D, None);
+                harness.gl.use_program(None);
+            }
+            read_effect_test_pixels(&harness.gl, 556, 437)
+        };
+
+        let full_input = create_effect_test_texture(&harness.gl, 1112, 873, &gradient);
+        set_effect_test_texture_filter(&harness.gl, full_input, glow::LINEAR);
+        let full_reference = render(full_input, None);
+        let sentinel_a = sentinel_texture_pixels([255, 0, 255, 255]);
+        let input_a = create_effect_test_texture(&harness.gl, 1112, 873, &sentinel_a);
+        set_effect_test_texture_filter(&harness.gl, input_a, glow::LINEAR);
+        let partial_a = render(input_a, Some(scissor));
+        let sentinel_b = sentinel_texture_pixels([0, 0, 0, 0]);
+        let input_b = create_effect_test_texture(&harness.gl, 1112, 873, &sentinel_b);
+        set_effect_test_texture_filter(&harness.gl, input_b, glow::LINEAR);
+        let partial_b = render(input_b, Some(scissor));
+
+        for logical_y in output_coverage.top..output_coverage.bottom {
+            let framebuffer_y = output_coverage.bottom - logical_y - 1;
+            for x in output_coverage.left..output_coverage.right {
+                let output_pixel = ((framebuffer_y * 556 + x) * 4) as usize;
+                assert_eq!(
+                    &partial_a[output_pixel..output_pixel + 4],
+                    &full_reference[output_pixel..output_pixel + 4],
+                    "partial Kawase output samples only producer texels for sentinel A at logical ({x},{logical_y})"
+                );
+                assert_eq!(
+                    &partial_b[output_pixel..output_pixel + 4],
+                    &full_reference[output_pixel..output_pixel + 4],
+                    "partial Kawase output samples only producer texels for sentinel B at logical ({x},{logical_y})"
+                );
+                assert_eq!(
+                    &partial_a[output_pixel..output_pixel + 4],
+                    &partial_b[output_pixel..output_pixel + 4],
+                    "partial Kawase output is sentinel-independent at logical ({x},{logical_y})"
+                );
+            }
+        }
+
+        unsafe {
+            harness.gl.delete_texture(full_input);
+            harness.gl.delete_texture(input_a);
+            harness.gl.delete_texture(input_b);
             harness.gl.delete_program(program);
         }
     }

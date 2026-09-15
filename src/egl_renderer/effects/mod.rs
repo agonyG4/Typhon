@@ -8,7 +8,7 @@ mod shader_cache;
 mod trace;
 
 #[cfg(test)]
-pub(crate) use blur::DUAL_KAWASE_VERTEX_SHADER;
+pub(crate) use blur::{DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER, DUAL_KAWASE_VERTEX_SHADER};
 #[cfg(test)]
 pub(crate) use executor::{
     BLEND_STAGE_FRAGMENT_SHADER, EffectPassBlendMode, MASK_STAGE_FRAGMENT_SHADER,
