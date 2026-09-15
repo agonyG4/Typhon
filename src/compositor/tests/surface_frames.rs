@@ -1649,11 +1649,18 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     let initial_hit = capture_pointer_scene_hit(&commands, pointer_x, pointer_y);
 
     commands
-        .send(ServerCommand::ResizeFocusedTo {
-            width: 120,
-            height: 90,
+        .send(ServerCommand::BeginResize {
+            x: f64::from(initial[0].origin_x) + 62.0,
+            y: f64::from(initial[0].origin_y) + 46.0,
         })
         .unwrap();
+    commands
+        .send(ServerCommand::UpdateInteraction {
+            x: f64::from(initial[0].origin_x) + 118.0,
+            y: f64::from(initial[0].origin_y) + 88.0,
+        })
+        .unwrap();
+    commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
 
@@ -1667,6 +1674,9 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     let intermediate_root = capture_root_window_geometry(&commands, surface_id);
     let intermediate_hit = capture_pointer_scene_hit(&commands, pointer_x, pointer_y);
 
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
     commit_test_buffered_surface(&surface, &shm, &qh, 120, 90).unwrap();
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
@@ -1701,10 +1711,9 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
         (final_snapshot[0].width, final_snapshot[0].height),
         (120, 90)
     );
-    assert_eq!(
-        final_visual.map(|visual| (visual.width, visual.height)),
-        Some((120, 90))
-    );
+    assert!(final_visual.is_some_and(|visual| {
+        !visual.active_resize && (visual.width, visual.height) == (120, 90)
+    }));
     assert_eq!(
         final_root.map(|geometry| (geometry.width, geometry.height)),
         Some((120, 90))
