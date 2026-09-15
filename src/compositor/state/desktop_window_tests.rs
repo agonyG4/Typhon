@@ -189,7 +189,7 @@ fn managed_x11_toplevel_joins_the_active_workspace_as_floating() {
 
 #[test]
 fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscreen() {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(3).expect("generation"));
@@ -214,7 +214,7 @@ fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscr
 
 #[test]
 fn xwayland_visible_ssd_blocks_direct_scanout() {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(4).expect("generation"));
@@ -253,7 +253,7 @@ fn xwayland_visible_ssd_blocks_direct_scanout() {
 
 #[test]
 fn xwayland_render_target_content_above_blocks_direct_scanout() {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(5).expect("generation"));
@@ -309,7 +309,7 @@ fn xwayland_render_target_content_above_blocks_direct_scanout() {
 
 #[test]
 fn xwayland_non_xrgb_dmabuf_does_not_qualify_for_direct_scanout() {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(6).expect("generation"));
@@ -337,7 +337,7 @@ fn xwayland_non_xrgb_dmabuf_does_not_qualify_for_direct_scanout() {
 
 #[test]
 fn xwayland_unknown_dmabuf_format_has_unknown_opacity() {
-    let mut state = CompositorState::default();
+    let mut state = CompositorState::new(None);
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(7).expect("generation"));
