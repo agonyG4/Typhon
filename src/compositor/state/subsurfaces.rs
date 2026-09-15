@@ -17,6 +17,8 @@ struct PreparedContentUpdateCandidate {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::compositor::state_data::{PendingViewportChange, ViewportSourceRect};
+    use crate::render_backend::buffer::BufferSize;
 
     fn test_mergeable_commit(sequence: u64) -> CachedSubsurfaceCommit {
         let mut commit = crate::compositor::state::empty_cached_subsurface_commit();
@@ -567,6 +569,99 @@ mod tests {
             vec![SurfaceCommitSequence(1), SurfaceCommitSequence(3)]
         );
         assert!(transaction.external_content_update_dependencies.is_empty());
+    }
+
+    #[test]
+    fn surface_tree_merge_preserves_independent_viewport_fields() {
+        let mut state = CompositorState::default();
+        let (_display, client, surface_id) = test_surface_and_client(&mut state);
+        let source = ViewportSourceRect::new(1.0, 2.0, 3.0, 4.0).expect("valid source");
+        let destination = BufferSize::new(5, 6).expect("valid destination");
+        let mut target = test_mergeable_commit(1);
+        target.viewport_destination = PendingViewportChange {
+            source: Some(Some(source)),
+            destination: None,
+        };
+        let target_ref = target.content_update_ref(surface_id);
+        let mut incoming = test_mergeable_commit(2);
+        incoming.lineage.predecessor = Some(target_ref);
+        incoming.viewport_destination = PendingViewportChange {
+            source: None,
+            destination: Some(Some(destination)),
+        };
+        let mut transaction = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(11),
+            root_surface_id: surface_id,
+            nodes: vec![(surface_id, target)],
+            publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+
+        state.merge_surface_tree_nodes_into_transaction(
+            surface_id,
+            &mut transaction,
+            vec![(surface_id, incoming)],
+            test_captured_lifetimes(&client.id(), &[surface_id]),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            transaction.nodes[0].1.viewport_destination,
+            PendingViewportChange {
+                source: Some(Some(source)),
+                destination: Some(Some(destination)),
+            }
+        );
+    }
+
+    #[test]
+    fn surface_tree_merge_preserves_viewport_reset_with_unrelated_field() {
+        let mut state = CompositorState::default();
+        let (_display, client, surface_id) = test_surface_and_client(&mut state);
+        let source = ViewportSourceRect::new(1.0, 2.0, 3.0, 4.0).expect("valid source");
+        let mut target = test_mergeable_commit(1);
+        target.viewport_destination = PendingViewportChange {
+            source: Some(Some(source)),
+            destination: None,
+        };
+        let target_ref = target.content_update_ref(surface_id);
+        let mut incoming = test_mergeable_commit(2);
+        incoming.lineage.predecessor = Some(target_ref);
+        incoming.viewport_destination = PendingViewportChange {
+            source: None,
+            destination: Some(None),
+        };
+        let mut transaction = PendingSurfaceTreeTransaction {
+            id: SurfaceTreeTransactionId::new(12),
+            root_surface_id: surface_id,
+            nodes: vec![(surface_id, target)],
+            publication_lifetimes: test_captured_lifetimes(&client.id(), &[surface_id]),
+            dependencies: Vec::new(),
+            external_content_update_dependencies: Vec::new(),
+            commit_timing_readiness: None,
+            received_at: Instant::now(),
+        };
+
+        state.merge_surface_tree_nodes_into_transaction(
+            surface_id,
+            &mut transaction,
+            vec![(surface_id, incoming)],
+            test_captured_lifetimes(&client.id(), &[surface_id]),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            transaction.nodes[0].1.viewport_destination,
+            PendingViewportChange {
+                source: Some(Some(source)),
+                destination: Some(None),
+            }
+        );
     }
 
     #[test]

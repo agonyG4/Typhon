@@ -502,9 +502,7 @@ impl CachedSubsurfaceCommit {
         if offset.is_some() {
             self.offset = offset;
         }
-        if viewport_destination.source.is_some() || viewport_destination.destination.is_some() {
-            self.viewport_destination = viewport_destination;
-        }
+        self.viewport_destination.merge(viewport_destination);
         if buffer_scale.is_some() {
             self.buffer_scale = buffer_scale;
         }
@@ -797,6 +795,215 @@ mod commit_context_tests {
                 CapturedSubsurfaceStackEntry::Parent,
                 CapturedSubsurfaceStackEntry::Child(relationship(10, 2)),
             ])
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_viewport_change_tests {
+    use super::*;
+    use crate::compositor::state_data::ViewportSourceRect;
+    use crate::render_backend::buffer::BufferSize;
+
+    fn source(x: f64, y: f64, width: f64, height: f64) -> ViewportSourceRect {
+        ViewportSourceRect::new(x, y, width, height).expect("valid viewport source")
+    }
+
+    fn destination(width: u32, height: u32) -> BufferSize {
+        BufferSize::new(width, height).expect("valid viewport destination")
+    }
+
+    fn merge_viewport_changes(
+        mut older: PendingViewportChange,
+        newer: PendingViewportChange,
+    ) -> PendingViewportChange {
+        older.merge(newer);
+        older
+    }
+
+    #[test]
+    fn older_source_and_newer_destination_preserve_both_changes() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: None,
+        };
+        let newer = PendingViewportChange {
+            source: None,
+            destination: Some(Some(destination(5, 6))),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+                destination: Some(Some(destination(5, 6))),
+            }
+        );
+    }
+
+    #[test]
+    fn older_destination_and_newer_source_preserve_both_changes() {
+        let older = PendingViewportChange {
+            source: None,
+            destination: Some(Some(destination(5, 6))),
+        };
+        let newer = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: None,
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+                destination: Some(Some(destination(5, 6))),
+            }
+        );
+    }
+
+    #[test]
+    fn newer_source_replaces_older_source_only() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+        let newer = PendingViewportChange {
+            source: Some(Some(source(7.0, 8.0, 9.0, 10.0))),
+            destination: None,
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(7.0, 8.0, 9.0, 10.0))),
+                destination: Some(Some(destination(5, 6))),
+            }
+        );
+    }
+
+    #[test]
+    fn newer_destination_replaces_older_destination_only() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+        let newer = PendingViewportChange {
+            source: None,
+            destination: Some(Some(destination(7, 8))),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+                destination: Some(Some(destination(7, 8))),
+            }
+        );
+    }
+
+    #[test]
+    fn newer_source_reset_replaces_older_source_only() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+        let newer = PendingViewportChange {
+            source: Some(None),
+            destination: None,
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(None),
+                destination: Some(Some(destination(5, 6))),
+            }
+        );
+    }
+
+    #[test]
+    fn newer_destination_reset_replaces_older_destination_only() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+        let newer = PendingViewportChange {
+            source: None,
+            destination: Some(None),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+                destination: Some(None),
+            }
+        );
+    }
+
+    #[test]
+    fn older_source_reset_survives_newer_destination_change() {
+        let older = PendingViewportChange {
+            source: Some(None),
+            destination: None,
+        };
+        let newer = PendingViewportChange {
+            source: None,
+            destination: Some(Some(destination(5, 6))),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(None),
+                destination: Some(Some(destination(5, 6))),
+            }
+        );
+    }
+
+    #[test]
+    fn older_destination_reset_survives_newer_source_change() {
+        let older = PendingViewportChange {
+            source: None,
+            destination: Some(None),
+        };
+        let newer = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: None,
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, newer),
+            PendingViewportChange {
+                source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+                destination: Some(None),
+            }
+        );
+    }
+
+    #[test]
+    fn newer_unchanged_viewport_preserves_older_changes() {
+        let older = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(older, PendingViewportChange::default()),
+            older
+        );
+    }
+
+    #[test]
+    fn older_unchanged_viewport_accepts_newer_changes() {
+        let newer = PendingViewportChange {
+            source: Some(Some(source(1.0, 2.0, 3.0, 4.0))),
+            destination: Some(Some(destination(5, 6))),
+        };
+
+        assert_eq!(
+            merge_viewport_changes(PendingViewportChange::default(), newer),
+            newer
         );
     }
 }

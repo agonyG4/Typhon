@@ -1963,6 +1963,184 @@ fn wayland_bufferless_offset_commit_updates_retained_mapping_without_damage() {
     assert!(updated[0].generation > initial[0].generation);
 }
 
+#[derive(Clone, Copy)]
+enum SynchronizedViewportUpdate {
+    SetSource,
+    SetDestination,
+    ResetSource,
+    ResetDestination,
+    DestroyViewport,
+    CreateViewportAndSetSource,
+}
+
+fn run_synchronized_viewport_updates(
+    updates: &[SynchronizedViewportUpdate],
+) -> (RenderableSurfaceSnapshot, RenderableSurfaceSnapshot) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    let mut viewport = Some(viewporter.get_viewport(&child, &qh, ()));
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 2).unwrap();
+
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    viewport.as_ref().unwrap().set_source(0.0, 0.0, 4.0, 2.0);
+    viewport.as_ref().unwrap().set_destination(4, 2);
+    buffer.attach(&child, 4, 2);
+    child.commit();
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("synchronized child should be mapped");
+
+    for update in updates {
+        match update {
+            SynchronizedViewportUpdate::SetSource => viewport
+                .as_ref()
+                .expect("viewport should be alive")
+                .set_source(1.0, 0.0, 2.0, 2.0),
+            SynchronizedViewportUpdate::SetDestination => viewport
+                .as_ref()
+                .expect("viewport should be alive")
+                .set_destination(3, 4),
+            SynchronizedViewportUpdate::ResetSource => viewport
+                .as_ref()
+                .expect("viewport should be alive")
+                .set_source(-1.0, -1.0, -1.0, -1.0),
+            SynchronizedViewportUpdate::ResetDestination => viewport
+                .as_ref()
+                .expect("viewport should be alive")
+                .set_destination(-1, -1),
+            SynchronizedViewportUpdate::DestroyViewport => {
+                viewport.take().expect("viewport should be alive").destroy();
+            }
+            SynchronizedViewportUpdate::CreateViewportAndSetSource => {
+                let replacement = viewporter.get_viewport(&child, &qh, ());
+                replacement.set_source(2.0, 0.0, 2.0, 2.0);
+                viewport = Some(replacement);
+            }
+        }
+        child.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    }
+
+    parent.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let final_snapshot = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_some())
+        .expect("synchronized child should remain mapped");
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+    (initial, final_snapshot)
+}
+
+#[test]
+fn synchronized_viewport_source_then_destination_preserves_both_fields() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::SetSource,
+        SynchronizedViewportUpdate::SetDestination,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, Some((256, 0, 512, 512)));
+    assert_eq!(final_snapshot.viewport_destination, Some((3, 4)));
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_destination_then_source_preserves_both_fields() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::SetDestination,
+        SynchronizedViewportUpdate::SetSource,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, Some((256, 0, 512, 512)));
+    assert_eq!(final_snapshot.viewport_destination, Some((3, 4)));
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_destination_reset_preserves_newer_source() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::SetSource,
+        SynchronizedViewportUpdate::ResetDestination,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, Some((256, 0, 512, 512)));
+    assert_eq!(final_snapshot.viewport_destination, None);
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_source_reset_preserves_newer_destination() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::SetDestination,
+        SynchronizedViewportUpdate::ResetSource,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, None);
+    assert_eq!(final_snapshot.viewport_destination, Some((3, 4)));
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_destroy_resets_both_fields_after_cached_destination_update() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::SetDestination,
+        SynchronizedViewportUpdate::DestroyViewport,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, None);
+    assert_eq!(final_snapshot.viewport_destination, None);
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_new_source_after_destroy_preserves_destination_reset() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::DestroyViewport,
+        SynchronizedViewportUpdate::CreateViewportAndSetSource,
+    ]);
+
+    assert_eq!(final_snapshot.viewport_source, Some((512, 0, 512, 512)));
+    assert_eq!(final_snapshot.viewport_destination, None);
+    assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
+    assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
 #[test]
 fn synchronized_bufferless_mapping_is_captured_before_delayed_publication() {
     let socket_name = unique_socket_name();

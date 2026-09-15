@@ -1023,6 +1023,17 @@ pub(super) struct PendingViewportChange {
     pub(super) destination: Option<Option<BufferSize>>,
 }
 
+impl PendingViewportChange {
+    pub(super) fn merge(&mut self, newer: Self) {
+        if newer.source.is_some() {
+            self.source = newer.source;
+        }
+        if newer.destination.is_some() {
+            self.destination = newer.destination;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SurfaceBufferScaleState {
     committed: u32,
