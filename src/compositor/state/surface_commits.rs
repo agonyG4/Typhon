@@ -23,6 +23,7 @@ impl CompositorState {
             SurfaceCommitId::from_sequence(commit_sequence),
             generation,
         );
+        let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         let previous_placement = self.surface_placement(surface_id);
         let window_geometry_changed =
             self.apply_committed_window_geometry(surface_id, window_geometry);
@@ -369,10 +370,16 @@ impl CompositorState {
         if let Some(resize_commit) = resize_commit {
             self.complete_applied_resize_transaction(surface_id, resize_commit);
         }
+        let pointer_focus_refreshed = self.refresh_pointer_focus_after_geometry_change(
+            window_geometry_changed,
+            pointer_hit_generation_before_publication,
+        );
         if committed_popup && (popup_mapping_changed || placement_changed || visual_state_changed) {
             self.compliance_metrics
                 .note_surface_commit_popup_pointer_refresh();
-            self.refresh_pointer_focus_at_last_position();
+            if !pointer_focus_refreshed {
+                self.refresh_pointer_focus_at_last_position();
+            }
         }
         if visual_state_changed && let Some(surface) = self.surface_resource_by_id(surface_id) {
             self.reconcile_surface_output_membership(&surface);
@@ -459,6 +466,7 @@ impl CompositorState {
             .map_or(true, |previous| previous != mapping);
         let window_geometry_changed =
             self.committed_window_geometry_changed(surface_id, window_geometry);
+        let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         if damage.is_none() && !mapping_changed && !window_geometry_changed {
             if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
                 current.update_content_mapping(mapping, commit_sequence);
@@ -535,7 +543,8 @@ impl CompositorState {
             || existing.y != mapping.y
             || existing.width != surface_size.width
             || existing.height != surface_size.height
-            || existing.placement != placement;
+            || existing.placement != placement
+            || window_geometry_changed;
         let output_geometry_changed = pointer_geometry_changed;
         let visual_mapping_changed = existing.x != mapping.x
             || existing.y != mapping.y
@@ -603,14 +612,12 @@ impl CompositorState {
             generation,
             RenderGenerationCause::SurfaceDamage,
         );
-        if pointer_geometry_changed {
-            self.advance_pointer_hit_generation();
-            self.refresh_pointer_focus_at_last_position();
-        }
+        self.refresh_pointer_focus_after_geometry_change(
+            pointer_geometry_changed,
+            pointer_hit_generation_before_publication,
+        );
         if output_geometry_changed && !visual_assignment_updated {
-            if let Some(surface) = self.surface_resource_by_id(surface_id) {
-                self.reconcile_surface_output_membership(&surface);
-            }
+            self.reconcile_surface_tree_output_memberships(root_surface_id);
         }
         if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
             self.note_xwayland_commit_observed(
@@ -673,6 +680,21 @@ impl CompositorState {
         window_geometry.is_some_and(|geometry| {
             self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
         })
+    }
+
+    fn refresh_pointer_focus_after_geometry_change(
+        &mut self,
+        geometry_changed: bool,
+        pointer_hit_generation_before_publication: u64,
+    ) -> bool {
+        if !geometry_changed {
+            return false;
+        }
+        if self.pointer_hit_generation == pointer_hit_generation_before_publication {
+            self.advance_pointer_hit_generation();
+        }
+        self.refresh_pointer_focus_at_last_position();
+        true
     }
 
     pub(in crate::compositor) fn commit_surface_request_with_captured_sync(

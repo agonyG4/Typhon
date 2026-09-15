@@ -113,6 +113,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) shortcut_inhibitor_inactive_count: usize,
     pub(in crate::compositor::tests) surface_enter_count: usize,
     pub(in crate::compositor::tests) surface_leave_count: usize,
+    pub(in crate::compositor::tests) surface_enter_surface_ids: Vec<u32>,
+    pub(in crate::compositor::tests) surface_leave_surface_ids: Vec<u32>,
     pub(in crate::compositor::tests) preferred_buffer_scales: Vec<i32>,
     pub(in crate::compositor::tests) preferred_buffer_transforms: Vec<client_wl_output::Transform>,
     pub(in crate::compositor::tests) surface_event_log: Vec<&'static str>,
@@ -662,7 +664,7 @@ impl Dispatch<client_astrea_shortcut_v1::AstreaShortcutV1, ()> for RegistryTestS
 impl Dispatch<client_wl_surface::WlSurface, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
-        _proxy: &client_wl_surface::WlSurface,
+        proxy: &client_wl_surface::WlSurface,
         event: client_wl_surface::Event,
         _data: &(),
         _conn: &Connection,
@@ -671,10 +673,16 @@ impl Dispatch<client_wl_surface::WlSurface, ()> for RegistryTestState {
         match event {
             client_wl_surface::Event::Enter { .. } => {
                 state.surface_enter_count += 1;
+                state
+                    .surface_enter_surface_ids
+                    .push(proxy.id().protocol_id());
                 state.surface_event_log.push("enter");
             }
             client_wl_surface::Event::Leave { .. } => {
                 state.surface_leave_count += 1;
+                state
+                    .surface_leave_surface_ids
+                    .push(proxy.id().protocol_id());
                 state.surface_event_log.push("leave");
             }
             client_wl_surface::Event::PreferredBufferScale { factor } => {

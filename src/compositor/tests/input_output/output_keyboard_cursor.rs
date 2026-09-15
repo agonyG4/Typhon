@@ -477,6 +477,55 @@ fn output_membership_reconciles_retained_mapping_boundary_and_reentry() {
 }
 
 #[test]
+fn output_membership_reconciles_retained_layer_parent_mapping_tree_boundary_and_reentry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let state =
+        create_layer_parent_then_cross_output_with_retained_mapping(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let state = state.unwrap();
+    let parent_surface_id = state.parent_surface_id.unwrap();
+    let child_surface_id = state.child_surface_id.unwrap();
+
+    assert_eq!(state.surface_enter_count, 4);
+    assert_eq!(state.surface_leave_count, 2);
+    assert_eq!(
+        state
+            .surface_enter_surface_ids
+            .iter()
+            .filter(|surface_id| **surface_id == parent_surface_id)
+            .count(),
+        2
+    );
+    assert_eq!(
+        state
+            .surface_enter_surface_ids
+            .iter()
+            .filter(|surface_id| **surface_id == child_surface_id)
+            .count(),
+        2
+    );
+    assert_eq!(
+        state
+            .surface_leave_surface_ids
+            .iter()
+            .filter(|surface_id| **surface_id == parent_surface_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .surface_leave_surface_ids
+            .iter()
+            .filter(|surface_id| **surface_id == child_surface_id)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn wayland_surface_offset_request_updates_rendered_surface_offset() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

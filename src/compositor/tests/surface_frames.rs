@@ -1611,6 +1611,188 @@ fn wayland_bufferless_mapping_refreshes_pointer_hit_cache_without_pointer_motion
 }
 
 #[test]
+fn wayland_bufferless_window_geometry_refreshes_pointer_hit_cache_after_derived_origin_change() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+
+    let mut state = RegistryTestState::default();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    xdg_surface.set_window_geometry(0, 0, 100, 80);
+    buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let surface_id = initial[0].surface_id;
+    let point_x = f64::from(initial[0].origin_x) + 40.0;
+    let point_y = f64::from(initial[0].origin_y) + 30.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: point_x,
+            y: point_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let primed = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_before = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_before = capture_pointer_input_metrics(&commands);
+    let last_position_before = capture_last_pointer_position(&commands);
+    let pointer_focus_before = capture_pointer_focus_surface_id(&commands);
+
+    xdg_surface.set_window_geometry(10, 0, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let updated = capture_renderable_surface_snapshot(&commands);
+    let pointer_metrics_after_publication = capture_pointer_input_metrics(&commands);
+    let hit_after_geometry = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_after = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_after = capture_pointer_input_metrics(&commands);
+    let last_position_after = capture_last_pointer_position(&commands);
+    let pointer_focus_after = capture_pointer_focus_surface_id(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(primed, (Some(surface_id), Some((40.0, 30.0))));
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].surface_id, surface_id);
+    assert_eq!(updated[0].origin_x, initial[0].origin_x - 10);
+    assert_eq!(updated[0].origin_y, initial[0].origin_y);
+    assert_eq!(updated[0].buffer_id, initial[0].buffer_id);
+    assert_eq!(updated[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(hit_after_geometry, (Some(surface_id), Some((50.0, 30.0))));
+    assert_ne!(generation_after, generation_before);
+    assert!(
+        pointer_metrics_after_publication.full_scene_hit_scans
+            > pointer_metrics_before.full_scene_hit_scans
+    );
+    assert!(
+        pointer_metrics_after.pointer_hit_generation_invalidations
+            > pointer_metrics_before.pointer_hit_generation_invalidations
+    );
+    assert_eq!(
+        pointer_metrics_after.full_scene_hit_scans,
+        pointer_metrics_after_publication.full_scene_hit_scans
+    );
+    assert_eq!(last_position_after, last_position_before);
+    assert_eq!(pointer_focus_after, pointer_focus_before);
+}
+
+#[test]
+fn wayland_buffer_window_geometry_refreshes_pointer_hit_cache_after_derived_origin_change() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let initial_buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+
+    let mut state = RegistryTestState::default();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    xdg_surface.set_window_geometry(0, 0, 100, 80);
+    initial_buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let surface_id = initial[0].surface_id;
+    let point_x = f64::from(initial[0].origin_x) + 40.0;
+    let point_y = f64::from(initial[0].origin_y) + 30.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: point_x,
+            y: point_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let primed = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_before = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_before = capture_pointer_input_metrics(&commands);
+    let last_position_before = capture_last_pointer_position(&commands);
+    let pointer_focus_before = capture_pointer_focus_surface_id(&commands);
+
+    xdg_surface.set_window_geometry(10, 0, 100, 80);
+    let geometry_buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+    geometry_buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let updated = capture_renderable_surface_snapshot(&commands);
+    let pointer_metrics_after_publication = capture_pointer_input_metrics(&commands);
+    let hit_after_geometry = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_after = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_after = capture_pointer_input_metrics(&commands);
+    let last_position_after = capture_last_pointer_position(&commands);
+    let pointer_focus_after = capture_pointer_focus_surface_id(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(primed, (Some(surface_id), Some((40.0, 30.0))));
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].surface_id, surface_id);
+    assert_eq!(updated[0].origin_x, initial[0].origin_x - 10);
+    assert_eq!(updated[0].origin_y, initial[0].origin_y);
+    assert_eq!(hit_after_geometry, (Some(surface_id), Some((50.0, 30.0))));
+    assert_ne!(generation_after, generation_before);
+    assert!(
+        pointer_metrics_after_publication.full_scene_hit_scans
+            > pointer_metrics_before.full_scene_hit_scans
+    );
+    assert!(
+        pointer_metrics_after.pointer_hit_generation_invalidations
+            > pointer_metrics_before.pointer_hit_generation_invalidations
+    );
+    assert_eq!(
+        pointer_metrics_after.full_scene_hit_scans,
+        pointer_metrics_after_publication.full_scene_hit_scans
+    );
+    assert_eq!(last_position_after, last_position_before);
+    assert_eq!(pointer_focus_after, pointer_focus_before);
+}
+
+#[test]
 fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

@@ -281,6 +281,66 @@ pub(in crate::compositor::tests) fn create_surface_then_cross_output_with_retain
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn create_layer_parent_then_cross_output_with_retained_mapping(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 = globals.bind(&qh, 4..=4, ())?;
+    let parent = compositor.create_surface(&qh, ());
+    let layer_surface = layer_shell.get_layer_surface(
+        &parent,
+        None,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "retained-tree-output-membership".to_string(),
+        &qh,
+        (),
+    );
+    layer_surface.set_size(40, 30);
+    let child = compositor.create_surface(&qh, ());
+    let child_subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    child_subsurface.set_position(10, 10);
+    child_subsurface.set_desync();
+
+    let mut state = RegistryTestState {
+        parent_surface_id: Some(parent.id().protocol_id()),
+        child_surface_id: Some(child.id().protocol_id()),
+        ..RegistryTestState::default()
+    };
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 40, 30)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&child, &shm, &qh, 20, 20)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    parent.offset(-2_000, -2_000);
+    parent.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    parent.offset(0, 0);
+    parent.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_mapped_surface_then_unmap_and_remap(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
