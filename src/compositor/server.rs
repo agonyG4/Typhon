@@ -1606,6 +1606,13 @@ impl OwnCompositorServer {
         self.state.fullscreen_render_plan_metrics()
     }
 
+    pub fn direct_scanout_solitary_fullscreen(&self, root_surface_id: u32) -> bool {
+        let metrics = self.state.fullscreen_render_plan_metrics();
+        metrics.fullscreen_composition_active
+            && metrics.owner_root_surface_id == Some(root_surface_id)
+            && metrics.solitary_tree_active
+    }
+
     pub fn direct_scanout_scene_candidate(
         &self,
     ) -> Result<DirectScanoutSceneCandidate, DirectScanoutSceneRejection> {

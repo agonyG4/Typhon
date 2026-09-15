@@ -185,7 +185,9 @@ impl AtomicEglGbmScanout {
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
             candidate.presentation,
             AsyncEligibility {
-                solitary_fullscreen: candidate.root_surface_id == candidate.surface_id,
+                solitary_fullscreen: server
+                    .direct_scanout_solitary_fullscreen(candidate.root_surface_id)
+                    && candidate.root_surface_id == candidate.surface_id,
                 async_hint: candidate.presentation.hint.is_async(),
                 backend_capable: kms
                     .atomic()

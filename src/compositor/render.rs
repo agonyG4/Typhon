@@ -366,6 +366,10 @@ impl WindowVisualGroup {
 /// Return the shared back-to-front visual ownership groups used by rendering
 /// and input. Ordinary client subsurfaces stay with their root window; popup
 /// roots split into their own group so they remain above the parent SSD.
+/// Group-index materialization is linear after root resolution. The existing
+/// parent-chain walk resolves each surface independently, so a degenerate
+/// deeply nested scene can still make that helper O(N²); this change does not
+/// claim to remove that pre-existing ownership cost.
 pub fn visual_stack_groups(
     surfaces: &[RenderableSurface],
     popup_surface_ids: &[u32],
@@ -397,16 +401,21 @@ pub fn visual_stack_groups(
             group_roots.push(root_index);
         }
     }
+    let mut surface_indices_by_root = HashMap::<usize, Vec<usize>>::new();
+    for (index, root_index) in visual_roots.iter().copied().enumerate() {
+        surface_indices_by_root
+            .entry(root_index)
+            .or_default()
+            .push(index);
+    }
     group_roots
         .into_iter()
         .map(|root_index| VisualStackGroup {
             root_surface_id: surfaces[root_index].surface_id,
             root_surface_index: root_index,
-            surface_indices: visual_roots
-                .iter()
-                .enumerate()
-                .filter_map(|(index, root)| (*root == root_index).then_some(index))
-                .collect(),
+            surface_indices: surface_indices_by_root
+                .remove(&root_index)
+                .unwrap_or_default(),
             popup: popup_surface_ids.contains(&surfaces[root_index].surface_id),
         })
         .collect()
@@ -433,15 +442,16 @@ fn window_visual_stack_order_with_popups(
     decorations: &[DecorationRenderInstance],
     popup_surface_ids: &[u32],
 ) -> Vec<WindowVisualGroup> {
+    let decoration_indices = decorations
+        .iter()
+        .enumerate()
+        .map(|(index, decoration)| (decoration.root_surface_id, index))
+        .collect::<HashMap<_, _>>();
     visual_stack_groups(surfaces, popup_surface_ids)
         .into_iter()
         .map(|visual| WindowVisualGroup {
             decoration_index: (!visual.is_popup())
-                .then(|| {
-                    decorations.iter().position(|decoration| {
-                        decoration.root_surface_id == visual.root_surface_id()
-                    })
-                })
+                .then(|| decoration_indices.get(&visual.root_surface_id()).copied())
                 .flatten(),
             visual,
         })
@@ -1802,18 +1812,52 @@ pub struct SurfaceRenderSpaceAssignment {
     pub visual_clip: Option<SurfaceVisualAperture>,
 }
 
+/// Compute the same target rectangles consumed by the renderer for a set of
+/// already-resolved scene origins. Coverage analysis must use these bounds so
+/// retained-buffer/client-driven geometry cannot be mistaken for the pixels
+/// actually rendered.
+pub fn surface_render_space_targets(
+    surfaces: &[RenderableSurface],
+    origins: &[(i32, i32)],
+    output_scale: f64,
+) -> Vec<SurfaceTargetRect> {
+    let output_scale = normalized_output_scale(output_scale);
+    surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| {
+            let (origin_x, origin_y) = origins
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| surface_origin(index, surface));
+            let (target_width, target_height) = surface
+                .render_target_size
+                .map(|size| (size.width, size.height))
+                .unwrap_or((surface.width, surface.height));
+            render_space_rect_from_logical(
+                (origin_x, origin_y),
+                target_width,
+                target_height,
+                output_scale,
+            )
+        })
+        .collect()
+}
+
 pub fn surface_render_space_assignments(
     surfaces: &[RenderableSurface],
     output_scale: f64,
 ) -> Vec<SurfaceRenderSpaceAssignment> {
     let output_scale = normalized_output_scale(output_scale);
     let origins = surface_origins(surfaces);
+    let targets = surface_render_space_targets(surfaces, &origins, output_scale);
     let root_indices = surface_root_indices(surfaces);
     surfaces
         .iter()
         .enumerate()
         .zip(origins.iter().copied())
-        .map(|((index, surface), (origin_x, origin_y))| {
+        .zip(targets)
+        .map(|(((index, surface), (origin_x, origin_y)), target)| {
             let root_index = root_indices.get(index).copied().unwrap_or(index);
             let root = &surfaces[root_index];
             let root_origin = origins
@@ -1825,21 +1869,8 @@ pub fn surface_render_space_assignments(
                 root_origin.0.saturating_sub(root_placement.local_x),
                 root_origin.1.saturating_sub(root_placement.local_y),
             );
-            // An explicit target is a compositor policy override used by
-            // ordinary client-driven X11 geometry. Interactive XWayland
-            // previews clear it so stale content remains at its committed
-            // extent and the backing rectangle supplies only uncovered space.
-            let (target_width, target_height) = surface
-                .render_target_size
-                .map(|size| (size.width, size.height))
-                .unwrap_or((surface.width, surface.height));
             SurfaceRenderSpaceAssignment {
-                target: render_space_rect_from_logical(
-                    (origin_x, origin_y),
-                    target_width,
-                    target_height,
-                    output_scale,
-                ),
+                target,
                 visual_clip: surface
                     .visual_clip
                     .clone()

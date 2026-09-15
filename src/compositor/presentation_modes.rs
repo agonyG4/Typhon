@@ -525,12 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_async_authority_requires_semantic_solitary_fullscreen() {
-        assert!(!async_eligibility_solitary_fullscreen(false));
-        assert!(async_eligibility_solitary_fullscreen(true));
-    }
-
-    #[test]
     fn async_format_compatibility_is_an_explicit_blocker() {
         let result = EffectivePresentation::decide(
             TearingPolicy::Auto,

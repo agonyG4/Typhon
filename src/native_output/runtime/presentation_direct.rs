@@ -5,6 +5,13 @@ use super::planner::NativePresentationPath;
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
 
+fn should_inspect_direct_scanout(
+    preference: NativeDirectScanoutPreference,
+    direct_active: bool,
+) -> bool {
+    preference.enabled() || direct_active
+}
+
 pub(super) struct DirectPresentationInspection {
     pub(super) cursor_direct_compatible: bool,
     pub(super) atomic_primary_commit_pending: bool,
@@ -34,6 +41,7 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) pending_interactive_visual_work: bool,
     pub(super) primary_redraw_requested: bool,
     pub(super) direct_active: bool,
+    pub(super) direct_scanout_preference: NativeDirectScanoutPreference,
     pub(super) plane_decision: Option<&'a PlaneSchedulingDecision>,
 }
 
@@ -89,9 +97,14 @@ pub(super) fn inspect_direct_presentation(
         true
     };
     let atomic_primary_commit_pending = inputs.page_flip_pending || inputs.atomic_commit_pending;
-    let direct_candidate = inputs.server.direct_scanout_scene_candidate().ok();
-    let direct_candidate_eligible =
-        direct_candidate.is_some() && !inputs.pending_interactive_visual_work;
+    let inspect_candidate =
+        should_inspect_direct_scanout(inputs.direct_scanout_preference, inputs.direct_active);
+    let direct_candidate = inspect_candidate
+        .then(|| inputs.server.direct_scanout_scene_candidate().ok())
+        .flatten();
+    let direct_candidate_eligible = inputs.direct_scanout_preference.enabled()
+        && direct_candidate.is_some()
+        && !inputs.pending_interactive_visual_work;
     let direct_candidate_key = direct_candidate
         .as_ref()
         .and_then(|candidate| {
@@ -108,14 +121,15 @@ pub(super) fn inspect_direct_presentation(
             })
         })
         .flatten();
-    let direct_candidate_changed = direct_candidate_changed(
-        direct_candidate_key,
-        *inputs.last_direct_candidate_key,
-        inputs.scene_changed,
-        inputs.primary_redraw_requested,
-        inputs.direct_active,
-        inputs.pending_frame_work,
-    );
+    let direct_candidate_changed = inspect_candidate
+        && direct_candidate_changed(
+            direct_candidate_key,
+            *inputs.last_direct_candidate_key,
+            inputs.scene_changed,
+            inputs.primary_redraw_requested,
+            inputs.direct_active,
+            inputs.pending_frame_work,
+        );
     *inputs.last_direct_candidate_key = direct_candidate_key;
     let primary_visual_work_pending =
         inputs.scene_changed || inputs.pending_frame_work || inputs.primary_redraw_requested;
@@ -134,6 +148,7 @@ pub(super) fn inspect_direct_presentation(
         })
         || !cursor_direct_compatible
         || inputs.pending_interactive_visual_work
+        || !inputs.direct_scanout_preference.enabled()
         || (inputs.direct_active && !direct_candidate_eligible);
     DirectPresentationInspection {
         cursor_direct_compatible,

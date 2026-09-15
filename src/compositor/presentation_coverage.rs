@@ -1,4 +1,4 @@
-use super::{DecorationRenderInstance, RenderableSurface, WindowVisualGroup};
+use super::{DecorationRenderInstance, RenderableSurface, SurfaceTargetRect, WindowVisualGroup};
 use crate::render_backend::buffer::BufferSize;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +55,7 @@ impl PresentationCoverageAnalysis {
 pub(crate) fn analyze_presentation_coverage(
     surfaces: &[RenderableSurface],
     decorations: &[DecorationRenderInstance],
+    render_targets: &[SurfaceTargetRect],
     popup_surface_ids: &[u32],
     output_size: BufferSize,
     is_application_group: impl Fn(u32) -> bool,
@@ -64,7 +65,6 @@ pub(crate) fn analyze_presentation_coverage(
 ) -> PresentationCoverageAnalysis {
     let groups =
         WindowVisualGroup::stack_order_with_popups(surfaces, decorations, popup_surface_ids);
-    let origins = super::render::surface_origins(surfaces);
     let covering_group_index = groups.iter().enumerate().rev().find_map(|(index, group)| {
         (is_application_group(group.root_surface_id())
             && !popup_surface_ids.contains(&group.root_surface_id())
@@ -98,18 +98,14 @@ pub(crate) fn analyze_presentation_coverage(
     );
     for group in groups.iter().skip(covering_group_index + 1) {
         let intersects_output = group.surface_indices().iter().any(|index| {
-            surfaces
-                .get(*index)
-                .and_then(|surface| origins.get(*index).map(|origin| (surface, *origin)))
-                .is_some_and(|(surface, origin)| {
-                    rect_intersects_output(
-                        origin.0,
-                        origin.1,
-                        surface.width,
-                        surface.height,
-                        output_size,
-                    )
-                })
+            render_targets.get(*index).is_some_and(|target| {
+                target.intersects(SurfaceTargetRect::new(
+                    0,
+                    0,
+                    output_size.width,
+                    output_size.height,
+                ))
+            })
         });
         let kind = if popup_surface_ids.contains(&group.root_surface_id()) {
             Some(PresentationCoverageContentKind::Popup)
@@ -184,6 +180,7 @@ fn rect_intersects_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::render;
     use crate::compositor::{
         DecorationRenderInstance, RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement,
         SurfaceRenderBackend, WindowId,
@@ -233,9 +230,12 @@ mod tests {
         apps: &[u32],
         layers: &[u32],
     ) -> PresentationCoverageAnalysis {
+        let origins = render::surface_origins(surfaces);
+        let render_targets = render::surface_render_space_targets(surfaces, &origins, 1.0);
         analyze_presentation_coverage(
             surfaces,
             &[],
+            &render_targets,
             &[],
             BufferSize::new(1280, 800).expect("test output size"),
             |root| apps.contains(&root),
@@ -279,6 +279,24 @@ mod tests {
     }
 
     #[test]
+    fn rendered_target_bounds_keep_intersecting_content_above_visible() {
+        let mut above = test_surface(20, -40, 0, 40, 40);
+        above.render_target_size = Some(BufferSize::new(200, 40).expect("render target size"));
+        let surfaces = vec![test_surface(10, 0, 0, 1280, 800), above];
+
+        let analysis = analyze(&surfaces, &[10, 20], &[]);
+
+        assert!(
+            analysis
+                .visible_content_above
+                .contains(&PresentationCoverageContent {
+                    root_surface_id: 20,
+                    kind: PresentationCoverageContentKind::Application,
+                })
+        );
+    }
+
+    #[test]
     fn popup_and_layer_content_above_are_recorded_separately() {
         let surfaces = vec![
             test_surface(10, 0, 0, 1280, 800),
@@ -288,6 +306,11 @@ mod tests {
         let analysis = analyze_presentation_coverage(
             &surfaces,
             &[],
+            &render::surface_render_space_targets(
+                &surfaces,
+                &render::surface_origins(&surfaces),
+                1.0,
+            ),
             &[40],
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10 || root == 40,
@@ -326,6 +349,11 @@ mod tests {
         let analysis = analyze_presentation_coverage(
             &surfaces,
             &[],
+            &render::surface_render_space_targets(
+                &surfaces,
+                &render::surface_origins(&surfaces),
+                1.0,
+            ),
             &[],
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 1 || root == 10,
@@ -353,6 +381,11 @@ mod tests {
         let analysis = analyze_presentation_coverage(
             &surfaces,
             &[decoration],
+            &render::surface_render_space_targets(
+                &surfaces,
+                &render::surface_origins(&surfaces),
+                1.0,
+            ),
             &[],
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10,

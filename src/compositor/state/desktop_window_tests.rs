@@ -1,4 +1,8 @@
 use super::*;
+use crate::render_backend::buffer::{
+    BufferIdAllocator, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, DmabufPlane,
+    DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+};
 use crate::wm::{
     LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation, WorkspaceSwitchOutcome,
 };
@@ -7,6 +11,7 @@ use crate::xwayland::xwm::{
     X11PublishedState, X11StackMode, X11WindowSnapshot, X11WindowType, X11WindowTypes,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
+use std::fs::File;
 use std::num::NonZeroU64;
 
 fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X11WindowSnapshot {
@@ -49,6 +54,87 @@ fn insert_x11(state: &mut CompositorState, snapshot: X11WindowSnapshot) -> Windo
         .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))
         .expect("X11 window");
     id
+}
+
+fn x11_scanout_surface(
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    placement: SurfacePlacement,
+    format: DrmFormat,
+) -> RenderableSurface {
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("XWayland test buffer identity");
+    let size = BufferSize::new(width, height).expect("XWayland test buffer size");
+    let buffer = CommittedSurfaceBuffer::dmabuf_handle(
+        identity,
+        DmabufBufferHandle::new(
+            size,
+            format,
+            vec![DmabufPlane::new(
+                File::open("/dev/null").expect("dmabuf test fd").into(),
+                DmabufPlaneDescriptor {
+                    plane_index: 0,
+                    offset: 0,
+                    stride: width.saturating_mul(4),
+                    modifier: DrmModifier::LINEAR,
+                },
+            )],
+        )
+        .expect("XWayland test dmabuf"),
+    );
+    RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        placement,
+        render_backend: SurfaceRenderBackend::Xwayland,
+        render_placement: None,
+        visual_clip: None,
+        render_target_size: None,
+        generation: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
+        buffer,
+        viewport_source: Some(
+            ViewportSourceRect::new(0.0, 0.0, f64::from(width), f64::from(height))
+                .expect("identity viewport source"),
+        ),
+        viewport_destination: Some(size),
+        buffer_scale: 1,
+        buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
+        damage: RenderableSurfaceDamage::full(),
+    }
+}
+
+fn x11_output_snapshot(
+    generation: XwaylandGeneration,
+    xid: u32,
+    surface_id: u32,
+) -> X11WindowSnapshot {
+    let mut snapshot = x11_snapshot(generation, xid, surface_id);
+    snapshot.geometry = X11Geometry {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+    };
+    snapshot.decoration_hints.motif = X11MotifDecorationHint::Undecorated;
+    snapshot
+}
+
+fn install_x11_scanout_surface(
+    state: &mut CompositorState,
+    surface: RenderableSurface,
+    snapshot: X11WindowSnapshot,
+) {
+    let surface_id = surface.surface_id;
+    insert_x11(state, snapshot);
+    state.append_renderable_surface(surface);
+    state.surface_presentation_generations.insert(surface_id, 1);
+    state.rebuild_active_scene_view();
 }
 
 #[test]
@@ -99,6 +185,180 @@ fn managed_x11_toplevel_joins_the_active_workspace_as_floating() {
         .expect("managed X11 window has management state");
     assert_eq!(management.regular_workspace().unwrap().get(), 1);
     assert_eq!(management.layout(), LayoutMembership::Floating);
+}
+
+#[test]
+fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscreen() {
+    let mut state = CompositorState::default();
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(3).expect("generation"));
+    let surface = x11_scanout_surface(
+        301,
+        output_width,
+        output_height,
+        SurfacePlacement::absolute_root_at(0, 0),
+        DrmFormat::Xrgb8888,
+    );
+    install_x11_scanout_surface(
+        &mut state,
+        surface,
+        x11_output_snapshot(generation, 301, 301),
+    );
+
+    assert!(!state.fullscreen_render_plan_metrics().fullscreen_active);
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.blockers.is_empty(), "{:#?}", analysis.blockers);
+    assert!(analysis.candidate.is_some());
+}
+
+#[test]
+fn xwayland_visible_ssd_blocks_direct_scanout() {
+    let mut state = CompositorState::default();
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(4).expect("generation"));
+    let mut snapshot = x11_output_snapshot(generation, 302, 302);
+    snapshot.decoration_hints.motif = X11MotifDecorationHint::Unspecified;
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            302,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        snapshot,
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(
+        analysis
+            .coverage
+            .visible_content_above
+            .contains(&PresentationCoverageContent {
+                root_surface_id: 302,
+                kind: PresentationCoverageContentKind::ServerSideDecoration,
+            })
+    );
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::ServerSideDecorationVisible)
+    );
+    assert!(analysis.candidate.is_none());
+}
+
+#[test]
+fn xwayland_render_target_content_above_blocks_direct_scanout() {
+    let mut state = CompositorState::default();
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(5).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            303,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Xrgb8888,
+        ),
+        x11_output_snapshot(generation, 303, 303),
+    );
+    let mut above = x11_scanout_surface(
+        304,
+        40,
+        40,
+        SurfacePlacement::absolute_root_at(-40, 0),
+        DrmFormat::Xrgb8888,
+    );
+    above.render_target_size = Some(BufferSize::new(200, 40).expect("render target size"));
+    install_x11_scanout_surface(&mut state, above, {
+        let mut snapshot = x11_snapshot(generation, 304, 304);
+        snapshot.geometry = X11Geometry {
+            x: -40,
+            y: 0,
+            width: 40,
+            height: 40,
+        };
+        snapshot.decoration_hints.motif = X11MotifDecorationHint::Undecorated;
+        snapshot
+    });
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(
+        analysis
+            .coverage
+            .visible_content_above
+            .contains(&PresentationCoverageContent {
+                root_surface_id: 304,
+                kind: PresentationCoverageContentKind::Application,
+            })
+    );
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::ApplicationContentAbove)
+    );
+    assert!(analysis.candidate.is_none());
+}
+
+#[test]
+fn xwayland_non_xrgb_dmabuf_does_not_qualify_for_direct_scanout() {
+    let mut state = CompositorState::default();
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(6).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            305,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Argb8888,
+        ),
+        x11_output_snapshot(generation, 305, 305),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888)
+    );
+    assert!(analysis.candidate.is_none());
+}
+
+#[test]
+fn xwayland_unknown_dmabuf_format_has_unknown_opacity() {
+    let mut state = CompositorState::default();
+    let output_width = state.output_size.width;
+    let output_height = state.output_size.height;
+    let generation = XwaylandGeneration::new(NonZeroU64::new(7).expect("generation"));
+    install_x11_scanout_surface(
+        &mut state,
+        x11_scanout_surface(
+            306,
+            output_width,
+            output_height,
+            SurfacePlacement::absolute_root_at(0, 0),
+            DrmFormat::Other(0xfeed_beef),
+        ),
+        x11_output_snapshot(generation, 306, 306),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert_eq!(
+        analysis.coverage.opacity,
+        PresentationCoverageOpacity::Unknown
+    );
+    assert!(analysis.candidate.is_none());
 }
 
 #[test]

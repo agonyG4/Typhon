@@ -477,8 +477,21 @@ impl super::super::CompositorState {
         surfaces: &[RenderableSurface],
         output_scale: f64,
     ) -> Vec<DecorationRenderInstance> {
-        let metrics = self.decoration_theme.metrics();
         let origins = render::surface_origins(surfaces);
+        self.native_decoration_render_instances_for_scale_with_origins(
+            surfaces,
+            &origins,
+            output_scale,
+        )
+    }
+
+    pub(in crate::compositor) fn native_decoration_render_instances_for_scale_with_origins(
+        &self,
+        surfaces: &[RenderableSurface],
+        origins: &[(i32, i32)],
+        output_scale: f64,
+    ) -> Vec<DecorationRenderInstance> {
+        let metrics = self.decoration_theme.metrics();
         surfaces
             .iter()
             .enumerate()

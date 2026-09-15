@@ -11,11 +11,19 @@ impl CompositorState {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
         let active_surfaces = self.active_scene_surfaces();
-        let decorations = self.native_decoration_render_instances(active_surfaces);
+        let origins = self.active_scene_surface_origins();
+        let render_targets =
+            crate::compositor::render::surface_render_space_targets(active_surfaces, origins, 1.0);
+        let decorations = self.native_decoration_render_instances_for_scale_with_origins(
+            active_surfaces,
+            origins,
+            1.0,
+        );
 
         analyze_presentation_coverage(
             active_surfaces,
             &decorations,
+            &render_targets,
             self.active_scene_popup_surface_ids(),
             output_size,
             |root_surface_id| self.window_id_for_surface(root_surface_id).is_some(),

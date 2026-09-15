@@ -325,7 +325,10 @@ mod task_05_8_tests {
             test_surface(912, state.output_size.width, state.output_size.height);
         covering_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
         let mut above_surface = test_surface(913, 40, 40);
-        above_surface.placement = SurfacePlacement::absolute_root_at(40, 40);
+        above_surface.placement = SurfacePlacement::absolute_root_at(-40, 0);
+        above_surface.render_target_size = Some(
+            crate::render_backend::buffer::BufferSize::new(200, 40).expect("render target size"),
+        );
         let mut outside_surface = test_surface(914, 40, 40);
         outside_surface.placement = SurfacePlacement::absolute_root_at(2000, 0);
         let mut behind_surface = test_surface(911, 40, 40);
