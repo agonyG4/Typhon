@@ -1,4 +1,6 @@
-use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
+use super::tests::{
+    ScriptedExecutor, reserve_for_test, test_job, wait_for_fence_event, wait_for_inflight,
+};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy, KmsWorkerEvent};
 use crate::native_output::pacing::NativeFramePacing;
@@ -6,7 +8,9 @@ use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::{OutputFrameIdentitySnapshot, OutputFrameKey, OutputSlotId};
 use oblivion_one::native::kms::AtomicKmsErrorKind;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
     OutputFrameIdentitySnapshot {
@@ -89,6 +93,65 @@ fn worker_payload_preserves_exact_pacing_ticket_through_submit_event() {
     assert!(pacing.reserve_worker_submission(false).unwrap().is_none());
 
     handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_admission_waits_for_inflight_publication_after_submit_returns() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = Arc::new(KmsCommitWorkerHandle::start(executor).unwrap());
+    let post_submit = handle.pause_after_submit_for_test();
+    let job = test_job(44);
+    let transaction_id = job.transaction_id;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    post_submit.wait_until_selected();
+
+    let (started_sender, started_receiver) = std::sync::mpsc::channel();
+    let (done_sender, done_receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let handle = Arc::clone(&handle);
+        scope.spawn(move || {
+            started_sender.send(()).unwrap();
+            done_sender
+                .send(handle.begin_shutdown_quiesce().unwrap())
+                .unwrap();
+        });
+        started_receiver.recv().unwrap();
+        let early_snapshot = match done_receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(snapshot) => Some(snapshot),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(error) => panic!("shutdown thread exited before returning: {error}"),
+        };
+        let shutdown_returned_while_paused = early_snapshot.is_some();
+
+        post_submit.release();
+        let snapshot = early_snapshot.unwrap_or_else(|| {
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown should complete after in-flight publication")
+        });
+        assert!(
+            !shutdown_returned_while_paused,
+            "shutdown must wait for exact in-flight publication"
+        );
+        assert!(snapshot.queued_job.is_none());
+        assert_eq!(
+            snapshot.inflight.map(|inflight| inflight.token.get()),
+            Some(44)
+        );
+        assert_eq!(
+            snapshot.inflight.map(|inflight| inflight.transaction_id),
+            Some(transaction_id)
+        );
+    });
+
+    wait_for_inflight(&handle);
+    handle
+        .ack_pageflip(test_job(44).token, transaction_id, 1)
+        .unwrap();
     handle.join().unwrap();
 }
 

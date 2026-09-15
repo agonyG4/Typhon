@@ -436,7 +436,7 @@ fn submit_rejection_releases_input_fence_once() {
 }
 
 #[derive(Debug)]
-struct BarrierExecutor {
+pub(super) struct BarrierExecutor {
     started: Barrier,
     release: Barrier,
     submitted: Mutex<Vec<u64>>,
@@ -452,9 +452,9 @@ impl KmsCommitExecutor for BarrierExecutor {
 }
 
 #[derive(Debug)]
-struct ScriptedExecutor {
-    outcomes: Mutex<VecDeque<Result<(), oblivion_one::native::kms::AtomicKmsErrorKind>>>,
-    submitted: Mutex<Vec<u64>>,
+pub(super) struct ScriptedExecutor {
+    pub(super) outcomes: Mutex<VecDeque<Result<(), oblivion_one::native::kms::AtomicKmsErrorKind>>>,
+    pub(super) submitted: Mutex<Vec<u64>>,
 }
 
 impl KmsCommitExecutor for ScriptedExecutor {
@@ -494,7 +494,7 @@ impl KmsCommitExecutor for FatalAfterSuccessExecutor {
     }
 }
 
-fn wait_for_inflight(handle: &KmsCommitWorkerHandle) {
+pub(super) fn wait_for_inflight(handle: &KmsCommitWorkerHandle) {
     for _ in 0..10_000 {
         if handle.inflight() {
             return;

@@ -327,6 +327,8 @@ pub(crate) struct KmsWorkerForcedShutdown {
 #[derive(Debug)]
 pub(crate) struct WorkerShared {
     pub(crate) state: Mutex<WorkerState>,
+    // Serializes shutdown admission with the complete submit ownership
+    // transition: successful ioctl return through WorkerInFlight publication.
     pub(crate) submit_gate: Mutex<()>,
     pub(crate) work_wakeup: Condvar,
     pub(crate) results: Mutex<VecDeque<KmsWorkerEvent>>,
@@ -340,6 +342,8 @@ pub(crate) struct WorkerShared {
     pub(crate) collecting_pause: Mutex<Option<Arc<DequeuePause>>>,
     #[cfg(test)]
     pub(crate) frozen_pause: Mutex<Option<Arc<DequeuePause>>>,
+    #[cfg(test)]
+    pub(crate) post_submit_pause: Mutex<Option<Arc<DequeuePause>>>,
 }
 
 #[cfg(test)]
@@ -579,6 +583,8 @@ impl WorkerShared {
             collecting_pause: Mutex::new(None),
             #[cfg(test)]
             frozen_pause: Mutex::new(None),
+            #[cfg(test)]
+            post_submit_pause: Mutex::new(None),
         }
     }
 
@@ -680,6 +686,24 @@ impl WorkerShared {
     #[cfg(test)]
     pub(crate) fn take_frozen_pause_for_test(&self) -> Option<Arc<DequeuePause>> {
         self.frozen_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_submit_for_test(self: &Arc<Self>) -> Arc<DequeuePause> {
+        let pause = Arc::new(DequeuePause::default());
+        *self
+            .post_submit_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_post_submit_pause_for_test(&self) -> Option<Arc<DequeuePause>> {
+        self.post_submit_pause
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
@@ -889,10 +913,11 @@ impl WorkerShared {
         &self,
     ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
         let started = Instant::now();
-        // Serializing admission-stop with the ioctl boundary means that once
-        // this method returns, no worker ioctl can still begin.  The gate is
-        // deliberately distinct from the queue mutex and is held only across
-        // the kernel call itself.
+        // Serializing admission-stop with the submit boundary means that once
+        // this method acquires the gate, every successful ioctl that returned
+        // before that acquisition has already published its exact
+        // WorkerInFlight identity. The gate remains distinct from the queue
+        // mutex and covers only submit plus that ownership publication.
         let _submit_gate = self
             .submit_gate
             .lock()
@@ -939,8 +964,9 @@ impl WorkerShared {
     ) -> Result<KmsWorkerForcedShutdown, KmsWorkerAdmissionError> {
         let started = Instant::now();
         // The submit gate makes the forced transition wait for an ioctl that
-        // is already executing. Once it is acquired, no later ioctl can begin
-        // before the in-flight identity is detached and the worker is woken.
+        // is already executing or publishing ownership. Once it is acquired,
+        // no later ioctl can begin before the exact in-flight identity is
+        // detached and the worker is woken.
         let _submit_gate = self
             .submit_gate
             .lock()

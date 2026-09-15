@@ -167,6 +167,11 @@ impl KmsCommitWorkerHandle {
         self.shared.work_wakeup.notify_all();
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_after_submit_for_test(&self) -> Arc<DequeuePause> {
+        self.shared.pause_after_submit_for_test()
+    }
+
     pub(crate) fn start(
         executor: Arc<dyn KmsCommitExecutor>,
     ) -> Result<Self, KmsCommitWorkerStartError> {
@@ -953,17 +958,23 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         executor.submit(&job)
                     }));
-                    Some((submit_started_at, result))
+                    let submit_returned_at = monotonic_now_ns();
+                    if matches!(&result, Ok(Ok(_))) {
+                        #[cfg(test)]
+                        if let Some(pause) = shared.take_post_submit_pause_for_test() {
+                            pause.pause();
+                        }
+                        executing.transfer_to_inflight(&job, submit_returned_at);
+                    }
+                    Some((submit_started_at, result, submit_returned_at))
                 }
             };
-            let Some((submit_started_at, submission)) = submission else {
+            let Some((submit_started_at, submission, submit_returned_at)) = submission else {
                 quiesce_with_jobs(&shared, vec![job]);
                 return;
             };
             match submission {
                 Ok(Ok(submission)) => {
-                    let submit_returned_at = monotonic_now_ns();
-                    executing.transfer_to_inflight(&job, submit_returned_at);
                     if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
                         // The ioctl has consumed the input-fence contract. The
                         // fence must not remain owned while waiting for the pageflip.
