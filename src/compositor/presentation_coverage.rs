@@ -51,6 +51,7 @@ impl PresentationCoverageAnalysis {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn analyze_presentation_coverage(
     surfaces: &[RenderableSurface],
     decorations: &[DecorationRenderInstance],
@@ -119,15 +120,13 @@ pub(crate) fn analyze_presentation_coverage(
         } else {
             None
         };
-        if intersects_output {
-            if let Some(kind) = kind {
-                analysis
-                    .visible_content_above
-                    .push(PresentationCoverageContent {
-                        root_surface_id: group.root_surface_id(),
-                        kind,
-                    });
-            }
+        if intersects_output && let Some(kind) = kind {
+            analysis
+                .visible_content_above
+                .push(PresentationCoverageContent {
+                    root_surface_id: group.root_surface_id(),
+                    kind,
+                });
         }
         record_visible_decoration(
             &mut analysis.visible_content_above,
@@ -243,9 +242,11 @@ mod tests {
             |root| layers.contains(&root),
             |root| root == 10,
             |root| {
-                (root == 10)
-                    .then_some(PresentationCoverageOpacity::OpaqueXrgb8888)
-                    .unwrap_or(PresentationCoverageOpacity::Unknown)
+                if root == 10 {
+                    PresentationCoverageOpacity::OpaqueXrgb8888
+                } else {
+                    PresentationCoverageOpacity::Unknown
+                }
             },
         )
     }
@@ -293,9 +294,11 @@ mod tests {
             |root| root == 50,
             |root| root == 10,
             |root| {
-                (root == 10)
-                    .then_some(PresentationCoverageOpacity::OpaqueXrgb8888)
-                    .unwrap_or(PresentationCoverageOpacity::Unknown)
+                if root == 10 {
+                    PresentationCoverageOpacity::OpaqueXrgb8888
+                } else {
+                    PresentationCoverageOpacity::Unknown
+                }
             },
         );
 

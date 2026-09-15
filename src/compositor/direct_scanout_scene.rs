@@ -70,7 +70,7 @@ impl CompositorState {
         };
         let root_surface_id = covering_group.root_surface_id;
 
-        if self.toplevel_surfaces.get(&root_surface_id).is_none()
+        if !self.toplevel_surfaces.contains_key(&root_surface_id)
             && self.window_id_for_surface(root_surface_id).is_none()
         {
             blockers.push(DirectScanoutSceneRejection::OwnerMissing);
