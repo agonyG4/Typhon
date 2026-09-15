@@ -237,6 +237,50 @@ pub(in crate::compositor::tests) fn create_mapped_surface_then_move_outside_outp
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn create_surface_then_cross_output_with_retained_mapping(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let initial_enter_count = state.surface_enter_count;
+
+    surface.offset(-2_000, -2_000);
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    surface.offset(0, 0);
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    assert_eq!(initial_enter_count, 1);
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_mapped_surface_then_unmap_and_remap(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {

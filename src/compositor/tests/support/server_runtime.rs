@@ -178,6 +178,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
     SetPointerHitInstrumentationEnabled(bool),
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
+    CaptureCoreComplianceMetrics(Sender<CoreComplianceMetrics>),
+    CapturePointerHitGeneration(Sender<u64>),
+    CapturePointerSceneHit {
+        x: f64,
+        y: f64,
+        reply: Sender<(Option<u32>, Option<(f64, f64)>)>,
+    },
     CaptureResolvedEffectScene(Sender<ResolvedEffectScene>),
     CaptureLifecycleEffectPath(Sender<LifecycleEffectPathSnapshot>),
     ReplaceBlurPolicyConfig {
@@ -665,6 +672,25 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureSceneRenderGeneration(reply) => {
                         let _ = reply.send(server.scene_render_generation());
+                    }
+                    ServerCommand::CaptureCoreComplianceMetrics(reply) => {
+                        let _ = reply.send(server.core_compliance_metrics());
+                    }
+                    ServerCommand::CapturePointerHitGeneration(reply) => {
+                        let _ = reply.send(server.state.pointer_hit_generation);
+                    }
+                    ServerCommand::CapturePointerSceneHit { x, y, reply } => {
+                        let hit = server.state.pointer_scene_hit_at(x, y);
+                        let snapshot = match hit {
+                            PointerSceneHit::Client { target } => (
+                                Some(compositor_surface_id(&target.surface)),
+                                Some((target.surface_x, target.surface_y)),
+                            ),
+                            PointerSceneHit::Decoration { .. } | PointerSceneHit::None => {
+                                (None, None)
+                            }
+                        };
+                        let _ = reply.send(snapshot);
                     }
                     ServerCommand::CaptureResolvedEffectScene(reply) => {
                         let _ = reply.send(server.resolved_effect_scene());
@@ -1736,6 +1762,56 @@ pub(in crate::compositor::tests) fn capture_scene_render_generation(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report scene render generation")
+}
+
+pub(in crate::compositor::tests) fn capture_core_compliance_metrics(
+    commands: &Sender<ServerCommand>,
+) -> CoreComplianceMetrics {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureCoreComplianceMetrics(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report core compliance metrics")
+}
+
+pub(in crate::compositor::tests) fn capture_pointer_hit_generation(
+    commands: &Sender<ServerCommand>,
+) -> u64 {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerHitGeneration(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pointer hit generation")
+}
+
+pub(in crate::compositor::tests) fn capture_pointer_scene_hit(
+    commands: &Sender<ServerCommand>,
+    x: f64,
+    y: f64,
+) -> (Option<u32>, Option<(f64, f64)>) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerSceneHit { x, y, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pointer scene hit")
+}
+
+pub(in crate::compositor::tests) fn capture_last_pointer_position(
+    commands: &Sender<ServerCommand>,
+) -> (f64, f64) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureLastPointerPosition(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report last pointer position")
 }
 
 pub(in crate::compositor::tests) fn capture_focus_generation(

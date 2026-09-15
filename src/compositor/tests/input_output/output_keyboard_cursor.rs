@@ -463,6 +463,20 @@ fn output_membership_reconciles_move_outside_without_duplicate_enter() {
 }
 
 #[test]
+fn output_membership_reconciles_retained_mapping_boundary_and_reentry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let state = create_surface_then_cross_output_with_retained_mapping(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let state = state.unwrap();
+
+    assert_eq!(state.surface_enter_count, 2);
+    assert_eq!(state.surface_leave_count, 1);
+}
+
+#[test]
 fn wayland_surface_offset_request_updates_rendered_surface_offset() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

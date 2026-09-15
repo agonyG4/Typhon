@@ -1404,6 +1404,317 @@ fn wayland_bufferless_mapping_commit_publishes_viewport_resets_and_scale() {
 }
 
 #[test]
+fn wayland_bufferless_viewport_destroy_resets_retained_mapping() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 2).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    viewport.set_source(0.0, 0.0, 2.0, 2.0);
+    viewport.set_destination(2, 2);
+    buffer.attach(&surface, 4, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let surface_id = initial[0].surface_id;
+    let initial_ownership = capture_surface_buffer_ownership(&commands, surface_id);
+
+    viewport.destroy();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let reset = capture_renderable_surface_snapshot(&commands);
+    let reset_ownership = capture_surface_buffer_ownership(&commands, surface_id);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial.len(), 1);
+    assert_eq!(reset.len(), 1);
+    assert_eq!(reset[0].buffer_id, initial[0].buffer_id);
+    assert_eq!(reset[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(reset[0].viewport_source, None);
+    assert_eq!(reset[0].viewport_destination, None);
+    assert_eq!((reset[0].width, reset[0].height), (4, 2));
+    assert!(reset[0].generation > initial[0].generation);
+    assert!(initial_ownership.current_surface_buffer);
+    assert!(reset_ownership.current_surface_buffer);
+    assert_eq!(reset_ownership.pending_dmabuf_releases, 0);
+}
+
+#[test]
+fn wayland_bufferless_window_geometry_none_is_not_a_delta() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 4, 2).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    xdg_surface.set_window_geometry(1, 2, 3, 1);
+    buffer.attach(&surface, 4, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let initial_generation = initial[0].generation;
+    let initial_metrics = capture_core_compliance_metrics(&commands);
+    let initial_geometry = capture_committed_window_geometry(&commands);
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let no_op = capture_renderable_surface_snapshot(&commands);
+    let no_op_metrics = capture_core_compliance_metrics(&commands);
+    let no_op_geometry = capture_committed_window_geometry(&commands);
+
+    xdg_surface.set_window_geometry(2, 3, 2, 2);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let changed = capture_renderable_surface_snapshot(&commands);
+    let changed_metrics = capture_core_compliance_metrics(&commands);
+    let changed_geometry = capture_committed_window_geometry(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial.len(), 1);
+    assert_eq!(no_op.len(), 1);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(no_op[0].generation, initial_generation);
+    assert_eq!(no_op[0].buffer_id, initial[0].buffer_id);
+    assert_eq!(no_op[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(
+        no_op_metrics.surface_commit_mapping_full_promotions,
+        initial_metrics.surface_commit_mapping_full_promotions
+    );
+    assert_eq!(no_op_geometry, initial_geometry);
+    assert!(changed[0].generation > no_op[0].generation);
+    assert_eq!(changed[0].buffer_id, initial[0].buffer_id);
+    assert_eq!(changed[0].pixel_checksum, initial[0].pixel_checksum);
+    assert_eq!(changed_geometry, Some(XdgWindowGeometry::new(2, 3, 2, 2)));
+    assert_eq!(
+        changed_metrics.surface_commit_mapping_full_promotions,
+        no_op_metrics.surface_commit_mapping_full_promotions + 1
+    );
+}
+
+#[test]
+fn wayland_bufferless_mapping_refreshes_pointer_hit_cache_without_pointer_motion() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    let buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    viewport.set_destination(100, 80);
+    buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let point_x = f64::from(initial[0].origin_x) + 40.0;
+    let point_y = f64::from(initial[0].origin_y) + 30.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: point_x,
+            y: point_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let primed = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_before = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_before = capture_pointer_input_metrics(&commands);
+    let last_position_before = capture_last_pointer_position(&commands);
+
+    surface.offset(20, 10);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let updated = capture_renderable_surface_snapshot(&commands);
+    let hit_after_offset = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_after_offset = capture_pointer_hit_generation(&commands);
+    let pointer_metrics_after_offset = capture_pointer_input_metrics(&commands);
+    let last_position_after = capture_last_pointer_position(&commands);
+
+    viewport.set_source(10.0, 0.0, 80.0, 60.0);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let generation_after_source_crop = capture_pointer_hit_generation(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(primed.0, Some(initial[0].surface_id));
+    assert_eq!(primed.1, Some((40.0, 30.0)));
+    assert_eq!(hit_after_offset.0, Some(updated[0].surface_id));
+    assert_eq!(hit_after_offset.1, Some((20.0, 20.0)));
+    assert_ne!(generation_after_offset, generation_before);
+    assert!(
+        pointer_metrics_after_offset.pointer_hit_generation_invalidations
+            > pointer_metrics_before.pointer_hit_generation_invalidations
+    );
+    assert_eq!(last_position_after, last_position_before);
+    assert_eq!(generation_after_source_crop, generation_after_offset);
+}
+
+#[test]
+fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 64, 48).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 64, 48).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let surface_id = initial[0].surface_id;
+    let pointer_x = f64::from(initial[0].origin_x) + 20.0;
+    let pointer_y = f64::from(initial[0].origin_y) + 20.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: pointer_x,
+            y: pointer_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let initial_hit = capture_pointer_scene_hit(&commands, pointer_x, pointer_y);
+
+    commands
+        .send(ServerCommand::ResizeFocusedTo {
+            width: 120,
+            height: 90,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    surface.offset(5, 7);
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let intermediate = capture_renderable_surface_snapshot(&commands);
+    let intermediate_visual = capture_toplevel_visual_geometry(&commands);
+    let intermediate_root = capture_root_window_geometry(&commands, surface_id);
+    let intermediate_hit = capture_pointer_scene_hit(&commands, pointer_x, pointer_y);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, 120, 90).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let final_snapshot = capture_renderable_surface_snapshot(&commands);
+    let final_visual = capture_toplevel_visual_geometry(&commands);
+    let final_root = capture_root_window_geometry(&commands, surface_id);
+    let final_hit = capture_pointer_scene_hit(&commands, pointer_x, pointer_y);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial_hit.0, Some(surface_id));
+    assert_eq!(initial_hit.1, Some((20.0, 20.0)));
+    assert_eq!(intermediate.len(), 1);
+    assert_eq!((intermediate[0].width, intermediate[0].height), (64, 48));
+    assert_eq!(
+        (intermediate[0].content_x, intermediate[0].content_y),
+        (5, 7)
+    );
+    assert!(intermediate_visual.is_some_and(|visual| {
+        visual.active_resize && (visual.width, visual.height) == (120, 90)
+    }));
+    assert_eq!(
+        intermediate_root.map(|geometry| (geometry.width, geometry.height)),
+        Some((64, 48))
+    );
+    assert_eq!(intermediate_hit.0, Some(surface_id));
+    assert_eq!(intermediate_hit.1, Some((15.0, 13.0)));
+    assert_eq!(final_snapshot.len(), 1);
+    assert_eq!(
+        (final_snapshot[0].width, final_snapshot[0].height),
+        (120, 90)
+    );
+    assert_eq!(
+        final_visual.map(|visual| (visual.width, visual.height)),
+        Some((120, 90))
+    );
+    assert_eq!(
+        final_root.map(|geometry| (geometry.width, geometry.height)),
+        Some((120, 90))
+    );
+    assert_eq!(final_hit.0, Some(surface_id));
+    assert_eq!(final_hit.1, Some((15.0, 13.0)));
+    assert_eq!(state.surface_leave_count, 0);
+}
+
+#[test]
 fn wayland_bufferless_offset_commit_updates_retained_mapping_without_damage() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

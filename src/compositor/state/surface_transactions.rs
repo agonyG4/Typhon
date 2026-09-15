@@ -363,11 +363,11 @@ impl CompositorState {
         if input_region_changed {
             self.advance_pointer_hit_generation();
         }
-        let window_geometry_changed = window_geometry.is_some_and(|geometry| {
-            self.surface_window_geometries.get(&surface_id).copied() != Some(geometry)
-        });
+        let window_geometry_changed =
+            self.committed_window_geometry_changed(surface_id, window_geometry);
         let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
         let damage = damage.or(opaque_region_changed.then_some(RenderableSurfaceDamage::Full));
+        let pointer_hit_generation_before_publication = self.pointer_hit_generation;
         let inactive_subsurface = self.subsurface_content_is_inactive(surface_id);
         let mut parent_commit_applied = true;
         match attachment {
@@ -482,7 +482,9 @@ impl CompositorState {
             );
         }
         self.apply_captured_pointer_constraint_surface_state(surface_id, pointer_constraint_state);
-        if input_region_changed {
+        if input_region_changed
+            && self.pointer_hit_generation == pointer_hit_generation_before_publication
+        {
             self.refresh_pointer_focus_at_last_position();
         }
         if background_effect_changed {
