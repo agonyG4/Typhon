@@ -3860,6 +3860,7 @@ impl NativeFramePacing {
             .sequence
             .saturating_sub(new_target.physical_claim().sequence);
         self.ready_pull_in_successes = self.ready_pull_in_successes.saturating_add(1);
+        self.ready_waiting_for_target_count = self.ready_waiting_for_target_count.saturating_sub(1);
         self.ready_pull_in_advanced_intervals = self
             .ready_pull_in_advanced_intervals
             .saturating_add(advanced_intervals);
