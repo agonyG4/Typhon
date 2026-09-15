@@ -879,11 +879,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn note_direct_blocker(&mut self, reason: &str) {
-        let (name, bit) = direct_blocker(reason);
-        self.direct.counters.blocker_set |= bit;
-        if self.direct.counters.first_blocker.is_none() {
-            self.direct.counters.first_blocker = Some(name);
-        }
+        record_direct_blocker(&mut self.direct.counters, reason);
     }
 
     pub(crate) fn note_direct_duplicate_feedback(&mut self) {
@@ -914,5 +910,41 @@ impl AtomicEglGbmScanout {
         self.direct.suspend()?;
         self.scene.invalidate_presented_damage_history();
         Ok(())
+    }
+}
+
+fn record_direct_blocker(counters: &mut DirectScanoutCounters, reason: &str) {
+    let (name, bit) = direct_blocker(reason);
+    counters.blocker_set |= bit;
+    if counters.first_blocker.is_none() {
+        counters.first_blocker = Some(name);
+    }
+    counters.last_blocker = Some(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirectScanoutCounters, record_direct_blocker};
+
+    #[test]
+    fn note_direct_blocker_preserves_first_blocker() {
+        let mut counters = DirectScanoutCounters::default();
+
+        record_direct_blocker(&mut counters, "import_failed");
+        record_direct_blocker(&mut counters, "test_only_rejected");
+
+        assert_eq!(counters.first_blocker, Some("import_failed"));
+    }
+
+    #[test]
+    fn later_direct_blocker_updates_latest_without_replacing_first() {
+        let mut counters = DirectScanoutCounters::default();
+
+        record_direct_blocker(&mut counters, "import_failed");
+        record_direct_blocker(&mut counters, "test_only_rejected");
+
+        assert_eq!(counters.first_blocker, Some("import_failed"));
+        assert_eq!(counters.last_blocker, Some("test_only_rejected"));
+        assert_eq!(counters.blocker_set, (1 << 6) | (1 << 8));
     }
 }

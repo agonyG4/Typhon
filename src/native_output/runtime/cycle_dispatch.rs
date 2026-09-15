@@ -1,6 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::*;
 
+use oblivion_one::compositor::DirectScanoutSceneAnalysis;
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
 };
@@ -916,6 +917,42 @@ impl NativeRuntime {
                 let output_available = !self.scanout_destroyed;
                 let session_severity = self.session.doctor_severity();
                 let direct_state = self.direct_scanout_state();
+                // Scene analysis is intentionally a doctor-only snapshot, not frame-loop state.
+                let direct_scene_analysis = self.server.direct_scanout_scene_analysis();
+                let semantic_solitary_fullscreen = direct_scene_analysis
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|candidate| {
+                        self.server
+                            .direct_scanout_solitary_fullscreen(candidate.root_surface_id)
+                    });
+                let direct_scene = DirectScanoutDoctorScene::from_analysis(
+                    &direct_scene_analysis,
+                    semantic_solitary_fullscreen,
+                );
+                let direct_runtime = DirectScanoutDoctorRuntime {
+                    direct_pending: self.scanout.direct_scanout_pending(),
+                    direct_inhibited: self.scanout.direct_scanout_inhibited(),
+                    worker_transport: self.kms_commit_worker_transport.as_str(),
+                    worker_running: self
+                        .kms_commit_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.fatal_reason().is_none()),
+                    atomic_commit_pending: self.atomic_commit_arbiter.atomic_commit_pending(),
+                    ready_frame_queued: self.scanout.ready_frame_queued(),
+                    output_render_in_progress: self.scanout.output_render_in_progress(),
+                    pending_interactive_visual_work: self
+                        .server
+                        .has_pending_interactive_visual_work(),
+                    session_active: self.session.permits_output(),
+                };
+                let direct_counters = self.scanout.direct_scanout_counters();
+                let direct_detail = format_direct_scanout_doctor_detail(
+                    &direct_scene,
+                    direct_state,
+                    direct_runtime,
+                    direct_counters.as_ref(),
+                );
                 let dmem_snapshot = self.dmem_foreground.snapshot();
                 let app_scope_snapshot = oblivion_one::application_scope::snapshot();
                 let checks = vec![
@@ -1032,13 +1069,14 @@ impl NativeRuntime {
                             self.kms_commit_worker_startup.as_str()
                         ),
                     ),
-                    doctor_check(
+                    doctor_check_with_detail(
                         "direct_scanout.state",
                         direct_scanout_doctor_severity(
                             self.direct_scanout_preference.enabled(),
                             direct_state,
                         ),
                         direct_state.as_str(),
+                        direct_detail,
                     ),
                     doctor_check(
                         "triple_buffering.state",
@@ -2041,19 +2079,117 @@ impl NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
+        DirectScanoutCounters, DirectScanoutDoctorRuntime, DirectScanoutDoctorScene,
         EmptyKeyboardLayoutArgs, KeyboardConfigurationSetArgs, KeyboardLayoutSetArgs,
         NativePreReadInputDecision, decide_native_pre_read_input, dispatch_keyboard_layout_command,
-        input_requires_full_server_progression, keyboard_layout_failure,
-        promote_native_input_before_wayland_read,
+        format_direct_scanout_doctor_detail, input_requires_full_server_progression,
+        keyboard_layout_failure, promote_native_input_before_wayland_read,
     };
     use crate::native_output::input::NativeInputEpoch;
     use oblivion_one::{
         compositor::{KeyboardLayoutControlError, OwnCompositorServer},
         control::{ControlCommand, ControlRequest},
+        control_snapshots::FeatureState,
     };
     use std::sync::Mutex;
 
     static KEYBOARD_LAYOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn direct_doctor_runtime_for_test() -> DirectScanoutDoctorRuntime {
+        DirectScanoutDoctorRuntime {
+            direct_pending: false,
+            direct_inhibited: false,
+            worker_transport: "worker",
+            worker_running: true,
+            atomic_commit_pending: false,
+            ready_frame_queued: false,
+            output_render_in_progress: false,
+            pending_interactive_visual_work: false,
+            session_active: true,
+        }
+    }
+
+    #[test]
+    fn direct_scanout_doctor_detail_reports_scene_blockers_without_candidate() {
+        let scene = DirectScanoutDoctorScene {
+            scene_candidate: false,
+            scene_root: None,
+            opacity: "unknown",
+            scene_blockers: vec!["application_content_above", "popup_visible"],
+            semantic_solitary_fullscreen: false,
+        };
+        let counters = DirectScanoutCounters::default();
+
+        let detail = format_direct_scanout_doctor_detail(
+            &scene,
+            FeatureState::Configured,
+            direct_doctor_runtime_for_test(),
+            Some(&counters),
+        );
+
+        assert!(detail.contains("scene_candidate=false"));
+        assert!(detail.contains("scene_root=none"));
+        assert!(detail.contains("opacity=unknown"));
+        assert!(detail.contains("scene_blockers=application_content_above,popup_visible"));
+        assert!(detail.contains("feature_state=configured"));
+    }
+
+    #[test]
+    fn direct_scanout_doctor_detail_reports_candidate_and_downstream_counters() {
+        let scene = DirectScanoutDoctorScene {
+            scene_candidate: true,
+            scene_root: Some(42),
+            opacity: "opaque_xrgb8888",
+            scene_blockers: Vec::new(),
+            semantic_solitary_fullscreen: false,
+        };
+        let mut counters = DirectScanoutCounters::default();
+        counters.candidate_checks = 3;
+        counters.candidates_accepted = 2;
+        counters.import_attempts = 2;
+        counters.import_failures = 1;
+        counters.test_only_attempts = 2;
+        counters.test_only_rejections = 1;
+        counters.real_submit_attempts = 1;
+        counters.submit_rejections = 1;
+        counters.submissions = 1;
+        counters.presentations = 0;
+        counters.entries = 1;
+        counters.exits = 0;
+        counters.first_blocker = Some("import_failed");
+        counters.last_blocker = Some("test_only_rejected");
+
+        let detail = format_direct_scanout_doctor_detail(
+            &scene,
+            FeatureState::Available,
+            direct_doctor_runtime_for_test(),
+            Some(&counters),
+        );
+
+        assert!(detail.contains("scene_candidate=true scene_root=42"));
+        assert!(detail.contains("semantic_solitary_fullscreen=false"));
+        assert!(detail.contains("candidate_checks:3"));
+        assert!(detail.contains("import_failures:1"));
+        assert!(detail.contains("test_only_rejections:1"));
+        assert!(detail.contains("first_blocker:import_failed"));
+        assert!(detail.contains("last_blocker:test_only_rejected"));
+    }
+
+    #[test]
+    fn direct_scanout_scene_diagnostic_is_derived_only_in_doctor_dispatch() {
+        let source = include_str!("cycle_dispatch.rs");
+        let scene_analysis_call = ["self.server", "direct_scanout_scene_analysis()"].concat();
+
+        assert_eq!(source.matches(&scene_analysis_call).count(), 1);
+        assert!(
+            source
+                .find(&scene_analysis_call)
+                .expect("doctor scene analysis call")
+                > source
+                    .find("ControlCommand::Doctor")
+                    .expect("doctor dispatch arm")
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintMode {
@@ -2784,6 +2920,111 @@ fn doctor_check_with_detail(
         summary: summary.into(),
         detail: Some(detail.into()),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectScanoutDoctorScene {
+    scene_candidate: bool,
+    scene_root: Option<u32>,
+    opacity: &'static str,
+    scene_blockers: Vec<&'static str>,
+    semantic_solitary_fullscreen: bool,
+}
+
+impl DirectScanoutDoctorScene {
+    fn from_analysis(
+        analysis: &DirectScanoutSceneAnalysis,
+        semantic_solitary_fullscreen: bool,
+    ) -> Self {
+        Self {
+            scene_candidate: analysis.candidate.is_some(),
+            scene_root: analysis
+                .coverage
+                .covering_application_group
+                .as_ref()
+                .map(|group| group.root_surface_id),
+            opacity: analysis.coverage.opacity.as_str(),
+            scene_blockers: analysis
+                .blockers
+                .reasons()
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect(),
+            semantic_solitary_fullscreen,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectScanoutDoctorRuntime {
+    direct_pending: bool,
+    direct_inhibited: bool,
+    worker_transport: &'static str,
+    worker_running: bool,
+    atomic_commit_pending: bool,
+    ready_frame_queued: bool,
+    output_render_in_progress: bool,
+    pending_interactive_visual_work: bool,
+    session_active: bool,
+}
+
+fn format_direct_scanout_doctor_detail(
+    scene: &DirectScanoutDoctorScene,
+    feature_state: FeatureState,
+    runtime: DirectScanoutDoctorRuntime,
+    counters: Option<&DirectScanoutCounters>,
+) -> String {
+    let scene_root = scene
+        .scene_root
+        .map_or_else(|| "none".to_string(), |root| root.to_string());
+    let scene_blockers = if scene.scene_blockers.is_empty() {
+        "none".to_string()
+    } else {
+        scene.scene_blockers.join(",")
+    };
+    format!(
+        "scene_candidate={} scene_root={} opacity={} scene_blockers={} semantic_solitary_fullscreen={} feature_state={} runtime={{direct_pending:{} direct_inhibited:{} worker_transport:{} worker_running:{} atomic_commit_pending:{} ready_frame_queued:{} output_render_in_progress:{} pending_interactive_visual_work:{} session_active:{}}} counters={}",
+        scene.scene_candidate,
+        scene_root,
+        scene.opacity,
+        scene_blockers,
+        scene.semantic_solitary_fullscreen,
+        feature_state.as_str(),
+        runtime.direct_pending,
+        runtime.direct_inhibited,
+        runtime.worker_transport,
+        runtime.worker_running,
+        runtime.atomic_commit_pending,
+        runtime.ready_frame_queued,
+        runtime.output_render_in_progress,
+        runtime.pending_interactive_visual_work,
+        runtime.session_active,
+        format_direct_scanout_counters(counters),
+    )
+}
+
+fn format_direct_scanout_counters(counters: Option<&DirectScanoutCounters>) -> String {
+    let Some(counters) = counters else {
+        return "unavailable".to_string();
+    };
+    format!(
+        "{{candidate_checks:{} candidates_accepted:{} import_attempts:{} import_failures:{} test_only_attempts:{} test_only_rejections:{} real_submit_attempts:{} submit_rejections:{} submissions:{} presentations:{} entries:{} exits:{} first_blocker:{} last_blocker:{} blocker_set:{}}}",
+        counters.candidate_checks,
+        counters.candidates_accepted,
+        counters.import_attempts,
+        counters.import_failures,
+        counters.test_only_attempts,
+        counters.test_only_rejections,
+        counters.real_submit_attempts,
+        counters.submit_rejections,
+        counters.submissions,
+        counters.presentations,
+        counters.entries,
+        counters.exits,
+        counters.first_blocker.unwrap_or("none"),
+        counters.last_blocker.unwrap_or("none"),
+        counters.blocker_set,
+    )
 }
 
 impl NativeRuntime {

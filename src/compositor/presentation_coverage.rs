@@ -9,6 +9,13 @@ pub enum PresentationCoverageOpacity {
 }
 
 impl PresentationCoverageOpacity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpaqueXrgb8888 => "opaque_xrgb8888",
+            Self::Unknown => "unknown",
+        }
+    }
+
     pub const fn is_proven_opaque(self) -> bool {
         matches!(self, Self::OpaqueXrgb8888)
     }

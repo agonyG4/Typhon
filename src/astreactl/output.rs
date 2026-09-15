@@ -243,12 +243,17 @@ fn format_cursor(snapshot: &CursorSnapshot) -> String {
 }
 
 fn format_doctor_check(check: &DoctorCheck) -> String {
-    format!(
+    let mut output = format!(
         "[{}] {} - {}",
         check.severity.as_str().to_uppercase(),
         sanitize_terminal_text(&check.id),
         sanitize_terminal_text(&check.summary)
-    )
+    );
+    if let Some(detail) = check.detail.as_deref() {
+        output.push_str("\n  ");
+        output.push_str(&sanitize_terminal_text(detail));
+    }
+    output
 }
 
 fn window_table(windows: &[WindowSnapshot]) -> String {
@@ -298,8 +303,9 @@ pub fn sanitize_terminal_text(value: &str) -> String {
 mod tests {
     use super::human;
     use crate::control_snapshots::{
-        AstreactlResult, ControlWindowId, KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot,
-        VersionSnapshot, WindowKindSnapshot, WindowListSnapshot, WindowSnapshot,
+        AstreactlResult, ControlWindowId, DoctorCheck, DoctorSeverity, DoctorSnapshot,
+        KeyboardLayoutEntrySnapshot, KeyboardLayoutSnapshot, VersionSnapshot, WindowKindSnapshot,
+        WindowListSnapshot, WindowSnapshot,
     };
 
     #[test]
@@ -313,6 +319,24 @@ mod tests {
             rustc_version: None,
         });
         assert_eq!(human(&value), "Typhon 0.1.0\nProtocol: 1");
+    }
+
+    #[test]
+    fn doctor_detail_is_displayed_and_sanitized() {
+        let value = AstreactlResult::Doctor(DoctorSnapshot {
+            healthy: false,
+            checks: vec![DoctorCheck {
+                id: "direct_scanout.state".to_string(),
+                severity: DoctorSeverity::Warning,
+                summary: "configured".to_string(),
+                detail: Some("line1\n\u{1b}[31mline2\u{1b}[0m".to_string()),
+            }],
+        });
+
+        assert_eq!(
+            human(&value),
+            "[WARNING] direct_scanout.state - configured\n  line1 [31mline2[0m"
+        );
     }
 
     #[test]

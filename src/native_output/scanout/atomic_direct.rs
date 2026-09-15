@@ -247,6 +247,7 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) callback_owner_leak_events: u64,
     pub(crate) callback_owner_leaked_callbacks: u64,
     pub(crate) first_blocker: Option<&'static str>,
+    pub(crate) last_blocker: Option<&'static str>,
     pub(crate) blocker_set: u64,
 }
 
