@@ -27,14 +27,12 @@ pub(crate) struct DirectScanoutViewportCompatibility {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectScanoutSceneRejection {
-    NoFullscreenOwner,
     OwnerMissing,
     OwnerMinimized,
     OwnerDoesNotCoverOutput,
     OwnerRootBufferMissing,
     OwnerTreeHasAdditionalSurface,
     NoOutputCoveringApplication,
-    NoCoveringApplication,
     EffectRequiresComposition,
     OverlayVisible,
     ApplicationContentAbove,
@@ -58,14 +56,12 @@ pub enum DirectScanoutSceneRejection {
 impl DirectScanoutSceneRejection {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::NoFullscreenOwner => "no_fullscreen_owner",
             Self::OwnerMissing => "owner_missing",
             Self::OwnerMinimized => "owner_minimized",
             Self::OwnerDoesNotCoverOutput => "owner_does_not_cover_output",
             Self::OwnerRootBufferMissing => "owner_root_buffer_missing",
             Self::OwnerTreeHasAdditionalSurface => "owner_tree_has_additional_surface",
             Self::NoOutputCoveringApplication => "no_output_covering_application",
-            Self::NoCoveringApplication => "no_covering_application",
             Self::EffectRequiresComposition => "effect_requires_composition",
             Self::OverlayVisible => "overlay_visible",
             Self::ApplicationContentAbove => "application_content_above",
