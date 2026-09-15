@@ -274,7 +274,8 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn direct_scanout_scene_candidate(
+    #[allow(dead_code)]
+    fn legacy_direct_scanout_scene_candidate(
         &self,
     ) -> Result<DirectScanoutSceneCandidate, DirectScanoutSceneRejection> {
         let owner = self
@@ -423,7 +424,8 @@ impl CompositorState {
         })
     }
 
-    pub(in crate::compositor) fn direct_scanout_scene_blockers(
+    #[allow(dead_code)]
+    fn legacy_direct_scanout_scene_blockers(
         &self,
     ) -> DirectScanoutSceneBlockers {
         let mut blockers = DirectScanoutSceneBlockers::default();
