@@ -1,5 +1,5 @@
 use super::*;
-use crate::compositor::fullscreen::direct_scanout_viewport_compatibility;
+use crate::compositor::direct_scanout::direct_scanout_viewport_compatibility;
 use crate::compositor::{SurfaceContentType, SurfacePresentationMetadata};
 use std::borrow::Cow;
 

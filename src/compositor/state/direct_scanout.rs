@@ -1,14 +1,10 @@
-use super::fullscreen::{
+use super::*;
+use crate::compositor::direct_scanout::{
     DirectScanoutSceneBlockers, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     direct_scanout_viewport_compatibility,
 };
-use super::presentation_coverage::{
-    PresentationCoverageAnalysis, PresentationCoverageContentKind, PresentationCoverageOpacity,
-    analyze_presentation_coverage,
-};
-use super::{
-    CompositorState, SceneWorkOwner, SurfaceData, SurfacePlacement, SurfacePresentationMetadata,
-    WindowState,
+use crate::compositor::presentation_coverage::{
+    PresentationCoverageAnalysis, PresentationCoverageContentKind,
 };
 use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
@@ -28,29 +24,14 @@ impl CompositorState {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
         let active_surfaces = self.active_scene_surfaces();
-        let decorations = self.native_decoration_render_instances(active_surfaces);
-        let coverage = analyze_presentation_coverage(
-            active_surfaces,
-            &decorations,
-            self.active_scene_popup_surface_ids(),
-            output_size,
-            |root_surface_id| self.window_id_for_surface(root_surface_id).is_some(),
-            |root_surface_id| self.layer_surfaces.contains_key(&root_surface_id),
-            |root_surface_id| {
-                self.current_visual_root_window_geometry(root_surface_id)
-                    .is_some_and(|geometry| {
-                        geometry.width == self.output_size.width
-                            && geometry.height == self.output_size.height
-                            && geometry.placement == SurfacePlacement::absolute_root_at(0, 0)
-                    })
-            },
-            |root_surface_id| self.presentation_coverage_opacity(root_surface_id, output_size),
-        );
+        let coverage = self.presentation_coverage_analysis();
 
         let mut blockers = DirectScanoutSceneBlockers::default();
-        if let Some(rejection) = super::fullscreen::direct_scanout_scene_rejection_for_effects(
-            self.effect_scene_summary(),
-        ) {
+        if let Some(rejection) =
+            crate::compositor::direct_scanout::direct_scanout_scene_rejection_for_effects(
+                self.effect_scene_summary(),
+            )
+        {
             blockers.push(rejection);
         }
         if self.presentation_animation_has_pending_visible() {
@@ -266,37 +247,5 @@ impl CompositorState {
                     SceneWorkOwner::Location(WorkspaceLocation::Special(_))
                 )
             })
-    }
-
-    fn presentation_coverage_opacity(
-        &self,
-        root_surface_id: u32,
-        output_size: BufferSize,
-    ) -> PresentationCoverageOpacity {
-        let Some(root) = self
-            .active_scene_surfaces()
-            .iter()
-            .find(|surface| surface.surface_id == root_surface_id)
-        else {
-            return PresentationCoverageOpacity::Unknown;
-        };
-        let proven = root.buffer_source() == SurfaceBufferSource::Dmabuf
-            && root
-                .dmabuf_handle()
-                .is_some_and(|buffer| buffer.format() == DrmFormat::Xrgb8888)
-            && root
-                .dmabuf_handle()
-                .is_some_and(|buffer| buffer.size() == output_size)
-            && root.visual_clip.is_none()
-            && root
-                .render_placement
-                .is_none_or(|placement| placement == root.placement)
-            && root.render_target_size.is_none()
-            && root.placement == SurfacePlacement::absolute_root_at(0, 0);
-        if proven {
-            PresentationCoverageOpacity::OpaqueXrgb8888
-        } else {
-            PresentationCoverageOpacity::Unknown
-        }
     }
 }

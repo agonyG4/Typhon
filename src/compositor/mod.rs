@@ -77,7 +77,7 @@ mod color;
 mod commit_debug;
 mod decoration;
 mod desktop_window;
-mod direct_scanout_scene;
+mod direct_scanout;
 mod dmabuf;
 mod effects;
 mod explicit_sync;
@@ -207,20 +207,19 @@ pub use decoration::render_plan::DecorationRenderPrimitive;
 use decoration::theme::DecorationThemeSnapshot;
 use decoration::types::DecorationButtonKind;
 pub use decoration::types::DecorationRect;
-pub use direct_scanout_scene::DirectScanoutSceneAnalysis;
+pub use direct_scanout::DirectScanoutSceneBlockers;
+#[cfg(test)]
+pub(crate) use direct_scanout::direct_scanout_scene_rejection_for_effects;
+pub use direct_scanout::{DirectScanoutSceneCandidate, DirectScanoutSceneRejection};
 pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,
     EffectSceneSummary, ResolvedEffectInstance, ResolvedEffectScene,
 };
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
-pub use fullscreen::DirectScanoutSceneBlockers;
-#[cfg(test)]
-pub(crate) use fullscreen::direct_scanout_scene_rejection_for_effects;
 pub use fullscreen::{
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenAboveFullscreenReason,
-    FullscreenCompositionMode, FullscreenCompositionPlan, FullscreenCulledRootReason,
-    FullscreenPresentationEligibility, FullscreenPresentationRejection,
+    FullscreenAboveFullscreenReason, FullscreenCompositionMode, FullscreenCompositionPlan,
+    FullscreenCulledRootReason, FullscreenPresentationEligibility, FullscreenPresentationRejection,
     FullscreenPresentationState, FullscreenRenderPlanMetrics, FullscreenRootClassification,
 };
 pub use idle::{IdleManager, IdleState};
@@ -257,6 +256,7 @@ pub use presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
     PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
 };
+pub use state::DirectScanoutSceneAnalysis;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardLayoutControlError {

@@ -6,6 +6,7 @@ mod commit_timing_runtime;
 mod cursor;
 mod data_device;
 mod desktop_windows;
+mod direct_scanout;
 mod dmabuf_feedback;
 mod frame_callbacks;
 mod frames;
@@ -20,6 +21,7 @@ mod output_state;
 mod override_redirect_stack;
 mod pointer_constraint_region;
 mod pointer_constraints;
+mod presentation_coverage;
 mod resize;
 mod roles;
 mod scene_order;
@@ -81,6 +83,7 @@ pub(in crate::compositor) use cursor::*;
 pub(in crate::compositor) use data_device::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use desktop_windows::*;
+pub use direct_scanout::DirectScanoutSceneAnalysis;
 #[allow(unused_imports)]
 pub(in crate::compositor) use dmabuf_feedback::*;
 #[allow(unused_imports)]
