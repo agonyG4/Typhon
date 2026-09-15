@@ -172,6 +172,11 @@ impl KmsCommitWorkerHandle {
         self.shared.pause_after_submit_for_test()
     }
 
+    #[cfg(test)]
+    pub(crate) fn submit_gate_available_for_test(&self) -> bool {
+        self.shared.submit_gate_available_for_test()
+    }
+
     pub(crate) fn start(
         executor: Arc<dyn KmsCommitExecutor>,
     ) -> Result<Self, KmsCommitWorkerStartError> {

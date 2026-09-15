@@ -709,6 +709,21 @@ impl WorkerShared {
             .take()
     }
 
+    #[cfg(test)]
+    pub(crate) fn submit_gate_available_for_test(&self) -> bool {
+        match self.submit_gate.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                drop(poisoned.into_inner());
+                true
+            }
+            Err(TryLockError::WouldBlock) => false,
+        }
+    }
+
     pub(crate) fn offer_cursor_sidecar(
         &self,
         sidecar: CursorSidecar,

@@ -108,6 +108,10 @@ fn shutdown_admission_waits_for_inflight_publication_after_submit_returns() {
     let transaction_id = job.transaction_id;
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
     post_submit.wait_until_selected();
+    assert!(
+        !handle.submit_gate_available_for_test(),
+        "submit gate must remain held until the successful submission is published inflight"
+    );
 
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (done_sender, done_receiver) = std::sync::mpsc::channel();
@@ -120,23 +124,10 @@ fn shutdown_admission_waits_for_inflight_publication_after_submit_returns() {
                 .unwrap();
         });
         started_receiver.recv().unwrap();
-        let early_snapshot = match done_receiver.recv_timeout(Duration::from_millis(20)) {
-            Ok(snapshot) => Some(snapshot),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(error) => panic!("shutdown thread exited before returning: {error}"),
-        };
-        let shutdown_returned_while_paused = early_snapshot.is_some();
-
         post_submit.release();
-        let snapshot = early_snapshot.unwrap_or_else(|| {
-            done_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .expect("shutdown should complete after in-flight publication")
-        });
-        assert!(
-            !shutdown_returned_while_paused,
-            "shutdown must wait for exact in-flight publication"
-        );
+        let snapshot = done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown should complete after in-flight publication");
         assert!(snapshot.queued_job.is_none());
         assert_eq!(
             snapshot.inflight.map(|inflight| inflight.token.get()),

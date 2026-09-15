@@ -12,7 +12,9 @@ use crate::native_output::kms_worker::{
 };
 use crate::native_output::pacing::NativeFramePacing;
 use crate::native_output::runtime::AtomicCommitKind;
-use crate::native_output::scanout::DirectPrimaryLease;
+use crate::native_output::scanout::{
+    DirectPrimaryLease, OutputFrameIdentitySnapshot, OutputFrameKey, OutputSlotId,
+};
 use crate::native_output::{
     ContentEpochId, DirectScanoutCandidateKey, NativeResult, OutputContentKey, OutputTransactionId,
 };
@@ -73,6 +75,23 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
         output_generation: 1,
         cursor_content_key: None,
         color_epoch: 0,
+    }
+}
+
+fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
+    OutputFrameIdentitySnapshot {
+        frame_id,
+        protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(frame_id).expect("test protocol batch ID"),
+        ),
+        transaction_id: OutputTransactionId::new(
+            std::num::NonZeroU64::new(frame_id).expect("test transaction ID"),
+        ),
+        slot: OutputSlotId::new(1).expect("test output slot ID"),
+        framebuffer_id: FramebufferId::new(frame_id as u32).expect("test framebuffer ID"),
+        render_generation: frame_id,
+        pool_generation: 1,
+        target: None,
     }
 }
 
@@ -280,23 +299,44 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
 fn submitted_worker_integration_failure_abandons_exact_pending_token() {
     let mut pacing = NativeFramePacing::from_env();
     pacing.queue_visual(1, 1);
-    let predecessor = pacing
+    let logical_frame = pacing.active.expect("normal predecessor");
+    let predecessor_ticket = pacing
         .reserve_worker_submission(false)
         .unwrap()
         .expect("predecessor worker ticket");
+    assert_eq!(predecessor_ticket.frame_id(), logical_frame);
+
     pacing
         .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
         .unwrap();
-    let successor = pacing.active;
+    let successor_attempt = pacing
+        .active_predictive_attempt_id()
+        .expect("predictive successor attempt");
+    let successor_physical = pacing_test_physical_identity(5_002);
+    let successor_key = OutputFrameKey::from(&successor_physical);
+    pacing
+        .bind_predictive_o1(successor_physical)
+        .expect("bind predictive successor physical identity");
+    pacing.note_render_ready();
+    pacing.note_ready_frame(2, true);
+
+    assert_eq!(pacing.ready, Some(logical_frame));
+    assert_eq!(
+        pacing.ready_predictive_attempt_id(),
+        Some(successor_attempt)
+    );
+    assert_eq!(pacing.ready_physical_key(), Some(successor_key));
+    assert_eq!(pacing.predictive_o1_active_entries_for_test(), 1);
 
     pacing
         .note_worker_submit_exact(
-            Some(predecessor),
+            Some(predecessor_ticket),
             41,
             3,
             NativeOutputPacingMode::PredictiveTriple,
         )
         .unwrap();
+    assert_eq!(pacing.pending, Some(logical_frame));
     let result = super::NativeRuntime::finish_submitted_worker_pacing(
         &mut pacing,
         Some(SubmittedWorkerPacingState::new(
@@ -308,15 +348,41 @@ fn submitted_worker_integration_failure_abandons_exact_pending_token() {
     assert!(result.is_err());
     assert!(pacing.pending.is_none());
     assert!(!pacing.abandon_pending_submission(41));
-    assert_eq!(pacing.active, successor);
-    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.ready, Some(logical_frame));
     assert_eq!(
-        pacing
-            .reserve_worker_submission(false)
-            .unwrap()
-            .map(|ticket| ticket.frame_id()),
-        successor
+        pacing.ready_predictive_attempt_id(),
+        Some(successor_attempt)
     );
+    assert_eq!(pacing.ready_physical_key(), Some(successor_key));
+    assert_eq!(pacing.predictive_o1_active_entries_for_test(), 1);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.predictive_o1_presented, 0);
+
+    let successor_ticket = pacing
+        .reserve_worker_submission(true)
+        .unwrap()
+        .expect("successor worker ticket");
+    assert_eq!(successor_ticket.frame_id(), logical_frame);
+    assert_eq!(
+        successor_ticket.predictive_attempt_id(),
+        Some(successor_attempt)
+    );
+    assert_eq!(successor_ticket.physical_key(), Some(successor_key));
+    pacing
+        .note_worker_submit_exact(
+            Some(successor_ticket),
+            42,
+            4,
+            NativeOutputPacingMode::PredictiveTriple,
+        )
+        .expect("successor worker submission");
+    pacing.note_pageflip_exact(Some(successor_physical), 5, 4, 42, 6_060);
+
+    assert_eq!(pacing.predictive_o1_presented, 1);
+    assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    assert_eq!(pacing.predictive_o1_active_entries_for_test(), 0);
+    assert!(pacing.reserve_worker_submission(true).unwrap().is_none());
+    assert!(pacing.pending.is_none());
 }
 
 #[test]

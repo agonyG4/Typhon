@@ -2880,6 +2880,11 @@ impl NativeFramePacing {
         self.ready_physical_key
     }
 
+    #[cfg(test)]
+    pub(crate) fn predictive_o1_active_entries_for_test(&self) -> u64 {
+        self.predictive_o1_lifecycle.active_entries()
+    }
+
     pub(crate) fn note_render_decision(
         &mut self,
         pacing_mode: NativeOutputPacingMode,
