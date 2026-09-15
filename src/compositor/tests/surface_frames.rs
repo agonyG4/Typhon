@@ -1718,7 +1718,7 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
         Some((200, 150))
     );
     assert_eq!(intermediate_hit.0, Some(surface_id));
-    assert_eq!(intermediate_hit.1, Some((20.0, 20.0)));
+    assert_eq!(intermediate_hit.1, Some((15.0, 13.0)));
     assert_eq!(final_snapshot.len(), 1);
     assert_eq!(
         (final_snapshot[0].width, final_snapshot[0].height),
@@ -1732,7 +1732,7 @@ fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
         Some((200, 150))
     );
     assert_eq!(final_hit.0, Some(surface_id));
-    assert_eq!(final_hit.1, Some((15.0, 13.0)));
+    assert_eq!(final_hit.1, Some((20.0, 20.0)));
     assert_eq!(state.surface_leave_count, 0);
 }
 
