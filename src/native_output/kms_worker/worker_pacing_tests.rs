@@ -10,7 +10,7 @@ use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::{OutputFrameIdentitySnapshot, OutputFrameKey, OutputSlotId};
 use oblivion_one::native::kms::AtomicKmsErrorKind;
-use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTargetReason};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,12 @@ fn wait_until_monotonic_ns(deadline_ns: u64) {
 fn test_submit_window(target_presentation_ns: u64, dispatch_budget_ns: u64) -> KmsSubmitWindow {
     KmsSubmitWindow::try_new(target_presentation_ns, 0, dispatch_budget_ns, 0)
         .expect("test submit window should be reachable")
+}
+
+fn binding_test_job(token: u64) -> KmsCommitJob {
+    let mut job = test_job(token);
+    job.target.reason = PresentationTargetReason::Normal;
+    job
 }
 
 fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
@@ -89,7 +95,7 @@ fn predecessor_blocked_successor_overrun_does_not_train_dispatch_tail_guard() {
     let handle = KmsCommitWorkerHandle::start(executor).unwrap();
     let now_ns = monotonic_now_ns_for_test();
 
-    let mut predecessor = test_job(7_010);
+    let mut predecessor = binding_test_job(7_010);
     predecessor.submit_window =
         test_submit_window(now_ns.saturating_add(1_000_000_000), 1_000_000_000);
     let predecessor_identity = predecessor.identity();
@@ -97,7 +103,7 @@ fn predecessor_blocked_successor_overrun_does_not_train_dispatch_tail_guard() {
     let predecessor_transaction = predecessor.transaction_id;
 
     let planned_worker_wake_at = now_ns.saturating_add(50_000_000);
-    let mut successor = test_job(7_011);
+    let mut successor = binding_test_job(7_011);
     successor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
     successor.submit_window = test_submit_window(planned_worker_wake_at, 0);
     let successor_window = successor.submit_window;
@@ -160,7 +166,7 @@ fn post_dequeue_worker_delay_remains_dispatch_tail_evidence() {
     let handle = KmsCommitWorkerHandle::start(executor).unwrap();
     let now_ns = monotonic_now_ns_for_test();
     let planned_worker_wake_at = now_ns.saturating_add(50_000_000);
-    let mut job = test_job(7_012);
+    let mut job = binding_test_job(7_012);
     job.submit_window = test_submit_window(planned_worker_wake_at, 0);
     job.queued_at = MonotonicTimestampNs::new(now_ns);
 
@@ -183,6 +189,100 @@ fn post_dequeue_worker_delay_remains_dispatch_tail_evidence() {
     handle
         .ack_pageflip(test_job(7_012).token, test_job(7_012).transaction_id, 1)
         .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn reactive_double_overrun_does_not_train_or_decay_dispatch_tail_guard() {
+    let executor = Arc::new(WorkerPacingTestExecutor {
+        reject_test_only: false,
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let now_ns = monotonic_now_ns_for_test();
+    let binding_wake_at = now_ns.saturating_add(50_000_000);
+    let mut binding_miss = binding_test_job(7_013);
+    binding_miss.submit_window = test_submit_window(binding_wake_at, 0);
+    let binding_identity = binding_miss.identity();
+    let binding_pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, binding_miss.kind)
+        .enqueue(binding_miss)
+        .unwrap();
+    binding_pause.wait_until_selected();
+    wait_until_monotonic_ns(binding_wake_at);
+    binding_pause.release();
+    wait_for_fence_event(
+        &handle,
+        7_013,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 7_013),
+    );
+    let binding_timing = handle.metrics_snapshot().timing;
+    assert!(binding_timing.dispatch_tail_guard_ns > 0);
+    handle
+        .ack_pageflip(test_job(7_013).token, test_job(7_013).transaction_id, 1)
+        .unwrap();
+
+    let advisory_wake_at = monotonic_now_ns_for_test().saturating_add(50_000_000);
+    let mut advisory_miss = test_job(7_014);
+    advisory_miss.validation_base = KmsValidationBase::Predecessor(binding_identity);
+    advisory_miss.submit_window = test_submit_window(advisory_wake_at, 0);
+    let mut advisory_identity = advisory_miss.identity();
+    let advisory_pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, advisory_miss.kind)
+        .enqueue(advisory_miss)
+        .unwrap();
+    advisory_pause.wait_until_selected();
+    wait_until_monotonic_ns(advisory_wake_at);
+    advisory_pause.release();
+    wait_for_fence_event(
+        &handle,
+        7_014,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 7_014),
+    );
+    let advisory_overrun_timing = handle.metrics_snapshot().timing;
+    assert!(advisory_overrun_timing.dispatch_deadline_overrun_ns > 0);
+    assert_eq!(
+        advisory_overrun_timing.dispatch_tail_guard_ns,
+        binding_timing.dispatch_tail_guard_ns
+    );
+    assert_eq!(
+        advisory_overrun_timing.dispatch_tail_guard_increases,
+        binding_timing.dispatch_tail_guard_increases
+    );
+    handle
+        .ack_pageflip(test_job(7_014).token, test_job(7_014).transaction_id, 1)
+        .unwrap();
+
+    for token in 7_015..=7_046 {
+        let mut clean_advisory = test_job(token);
+        clean_advisory.validation_base = KmsValidationBase::Predecessor(advisory_identity);
+        clean_advisory.submit_window = test_submit_window(
+            monotonic_now_ns_for_test().saturating_add(1_000_000_000),
+            1_000_000_000,
+        );
+        advisory_identity = clean_advisory.identity();
+        reserve_for_test(&handle, clean_advisory.kind)
+            .enqueue(clean_advisory)
+            .unwrap();
+        wait_for_fence_event(
+            &handle,
+            token,
+            |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == token),
+        );
+        handle
+            .ack_pageflip(test_job(token).token, test_job(token).transaction_id, 1)
+            .unwrap();
+    }
+
+    let after_advisory_clean_timing = handle.metrics_snapshot().timing;
+    assert_eq!(
+        after_advisory_clean_timing.dispatch_tail_guard_ns,
+        binding_timing.dispatch_tail_guard_ns
+    );
+    assert_eq!(
+        after_advisory_clean_timing.dispatch_tail_guard_decays,
+        binding_timing.dispatch_tail_guard_decays
+    );
     handle.request_quiesce();
     handle.join().unwrap();
 }

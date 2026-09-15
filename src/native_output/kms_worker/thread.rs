@@ -1014,7 +1014,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // that acquired executable worker ownership by its planned wake gives
                     // the worker a fair chance to meet the dispatch deadline and may train
                     // the adaptive tail guard.
-                    let fair_dispatch_chance = dequeued_at.get() <= planned_worker_wake_at;
+                    let fair_dispatch_chance =
+                        job.target.is_binding() && dequeued_at.get() <= planned_worker_wake_at;
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
