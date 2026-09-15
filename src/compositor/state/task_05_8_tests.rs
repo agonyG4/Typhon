@@ -331,7 +331,12 @@ mod task_05_8_tests {
         let mut behind_surface = test_surface(911, 40, 40);
         behind_surface.placement = SurfacePlacement::absolute_root_at(10, 10);
         state.install_native_frame_test_scene(
-            vec![behind_surface, covering_surface, above_surface, outside_surface],
+            vec![
+                behind_surface,
+                covering_surface,
+                above_surface,
+                outside_surface,
+            ],
             &[(911, behind), (912, covering), (913, above), (914, outside)],
             None,
         );
