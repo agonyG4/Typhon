@@ -187,7 +187,8 @@ fn rect_intersects_output(
 mod tests {
     use super::*;
     use crate::compositor::{
-        RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement, SurfaceRenderBackend,
+        DecorationRenderInstance, RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement,
+        SurfaceRenderBackend, WindowId,
     };
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, CommittedSurfaceBuffer,
@@ -329,5 +330,37 @@ mod tests {
 
         assert!(analysis.geometrically_covers_output());
         assert!(!analysis.can_occlude_behind_content());
+    }
+
+    #[test]
+    fn visible_server_decoration_is_content_above_the_client_surface() {
+        let surfaces = [test_surface(10, 0, 0, 1280, 800)];
+        let decoration = DecorationRenderInstance::test_solid(
+            WindowId::from_raw(1).expect("test window id"),
+            10,
+            0,
+            0,
+            1280,
+            24,
+            [0xff, 0, 0, 0xff],
+        );
+        let analysis = analyze_presentation_coverage(
+            &surfaces,
+            &[decoration],
+            &[],
+            BufferSize::new(1280, 800).expect("test output size"),
+            |root| root == 10,
+            |_| false,
+            |root| root == 10,
+            |_| PresentationCoverageOpacity::OpaqueXrgb8888,
+        );
+
+        assert_eq!(
+            analysis.visible_content_above,
+            vec![PresentationCoverageContent {
+                root_surface_id: 10,
+                kind: PresentationCoverageContentKind::ServerSideDecoration,
+            }]
+        );
     }
 }
