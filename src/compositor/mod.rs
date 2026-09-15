@@ -225,9 +225,8 @@ pub use presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
     PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
 };
-pub(crate) use fullscreen::{
-    direct_scanout_scene_rejection_for_effects,
-};
+#[cfg(test)]
+pub(crate) use fullscreen::direct_scanout_scene_rejection_for_effects;
 pub use idle::{IdleManager, IdleState};
 pub use input::{
     CursorRevealAuthority, OutputPosition, OutputRect, OutputRegion, PointerAxisComponent,

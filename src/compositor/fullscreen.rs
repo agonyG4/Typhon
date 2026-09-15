@@ -236,6 +236,7 @@ pub(crate) fn direct_scanout_viewport_compatibility(
     })
 }
 
+#[cfg(test)]
 pub(crate) const fn direct_scanout_scene_rejection_for_flags(
     overlays_visible: bool,
     popup_visible: bool,
