@@ -92,6 +92,20 @@ pub(crate) fn settle_returned_worker_pacing(
     }
 }
 
+pub(super) fn settle_uncertain_worker_pacing(
+    frame_pacing: &mut NativeFramePacing,
+    ticket: Option<WorkerPacingTicket>,
+) -> NativeResult<()> {
+    if frame_pacing.abandon_worker_submission(ticket) {
+        Ok(())
+    } else {
+        Err(
+            io::Error::other("uncertain worker pacing reservation does not match queued state")
+                .into(),
+        )
+    }
+}
+
 pub(crate) fn settle_submitted_worker_pacing(
     frame_pacing: &mut NativeFramePacing,
     ticket: Option<WorkerPacingTicket>,

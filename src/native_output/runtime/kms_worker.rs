@@ -548,15 +548,12 @@ impl NativeRuntime {
         &mut self,
         job: KmsCommitJob,
     ) -> NativeResult<UncertainJobRetention> {
-        if !self
-            .frame_pacing
-            .abandon_worker_submission(job.pacing_ticket)
-        {
+        if let Err(error) = super::kms_worker_teardown::settle_uncertain_worker_pacing(
+            &mut self.frame_pacing,
+            job.pacing_ticket,
+        ) {
             self.emergency_quarantined_worker_jobs.push(job);
-            return Err(io::Error::other(
-                "uncertain worker pacing reservation does not match queued state",
-            )
-            .into());
+            return Err(error);
         }
         if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
             && let Some(duration_ns) = job.test_only_duration_ns
