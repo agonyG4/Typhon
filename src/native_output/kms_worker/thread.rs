@@ -597,6 +597,11 @@ impl ExecutingDirectCandidateGuard {
     }
 
     fn transfer_to_inflight(&mut self, job: &KmsCommitJob, submit_returned_at_ns: u64) {
+        #[cfg(test)]
+        if let Some(pause) = self.shared.take_post_submit_pause_for_test() {
+            pause.pause();
+        }
+
         let mut state = self
             .shared
             .state
@@ -966,10 +971,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     }));
                     let submit_returned_at = monotonic_now_ns();
                     if matches!(&result, Ok(Ok(_))) {
-                        #[cfg(test)]
-                        if let Some(pause) = shared.take_post_submit_pause_for_test() {
-                            pause.pause();
-                        }
                         executing.transfer_to_inflight(&job, submit_returned_at);
                     }
                     Some((submit_started_at, result, submit_returned_at))

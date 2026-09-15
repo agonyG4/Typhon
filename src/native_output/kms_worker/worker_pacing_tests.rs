@@ -243,8 +243,12 @@ fn shutdown_admission_waits_for_inflight_publication_after_submit_returns() {
     let transaction_id = job.transaction_id;
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
     post_submit.wait_until_selected();
+    let submit_gate_available = handle.submit_gate_available_for_test();
+    if submit_gate_available {
+        post_submit.release();
+    }
     assert!(
-        !handle.submit_gate_available_for_test(),
+        !submit_gate_available,
         "submit gate must remain held until the successful submission is published inflight"
     );
 

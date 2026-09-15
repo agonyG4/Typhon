@@ -304,6 +304,7 @@ fn submitted_worker_integration_failure_abandons_exact_pending_token() {
         .reserve_worker_submission(false)
         .unwrap()
         .expect("predecessor worker ticket");
+    let predecessor_reservation_id = predecessor_ticket.reservation_id();
     assert_eq!(predecessor_ticket.frame_id(), logical_frame);
 
     pacing
@@ -362,6 +363,10 @@ fn submitted_worker_integration_failure_abandons_exact_pending_token() {
         .reserve_worker_submission(true)
         .unwrap()
         .expect("successor worker ticket");
+    assert_ne!(
+        successor_ticket.reservation_id(),
+        predecessor_reservation_id
+    );
     assert_eq!(successor_ticket.frame_id(), logical_frame);
     assert_eq!(
         successor_ticket.predictive_attempt_id(),
