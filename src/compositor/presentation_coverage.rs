@@ -112,7 +112,7 @@ pub(crate) fn analyze_presentation_coverage(
                     )
                 })
         });
-        let kind = if group.is_popup() {
+        let kind = if popup_surface_ids.contains(&group.root_surface_id()) {
             Some(PresentationCoverageContentKind::Popup)
         } else if is_layer_group(group.root_surface_id()) {
             Some(PresentationCoverageContentKind::LayerShell)

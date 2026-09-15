@@ -49,6 +49,25 @@ fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
 }
 
 #[test]
+fn output_sized_normal_window_is_not_fullscreen_but_is_scene_candidate() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_normal_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    let eligibility = capture_fullscreen_presentation_eligibility(&commands);
+    assert_eq!(
+        eligibility.rejection,
+        Some(FullscreenPresentationRejection::NoFullscreenOwner)
+    );
+    assert!(capture_direct_scanout_candidate(&commands).is_ok());
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn fullscreen_cropped_viewport_is_rejected_before_direct_scanout_import() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

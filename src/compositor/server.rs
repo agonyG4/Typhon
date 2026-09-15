@@ -17,7 +17,8 @@ use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 use crate::compositor::frame_batch::FrameCallbackAdmission;
 use crate::compositor::state::ShutdownDmabufReleaseSet;
 use crate::compositor::{
-    AnimationTime, EffectFrameDemandSnapshot, NativeFramePresentationTargets,
+    AnimationTime, DirectScanoutSceneAnalysis, EffectFrameDemandSnapshot,
+    NativeFramePresentationTargets,
     PresentationAnimationMetrics, PresentationFrameSnapshot, PresentationGroupTransform,
     PresentationRect, PresentationSceneSample, PresentedWindowGeometry, ResolvedEffectScene,
     ShmBufferLifetimeMetrics, SurfaceCommitSequence, SurfaceLocalityMetrics,

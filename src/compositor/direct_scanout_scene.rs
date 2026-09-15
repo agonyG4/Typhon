@@ -12,6 +12,7 @@ use super::{
 };
 use crate::render_backend::buffer::{BufferSize, DrmFormat, SurfaceBufferSource};
 use crate::wm::WorkspaceLocation;
+use wayland_server::Resource;
 
 #[derive(Debug, Clone)]
 pub struct DirectScanoutSceneAnalysis {

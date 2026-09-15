@@ -921,11 +921,25 @@ pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dma
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
-    create_fullscreen_viewport_xrgb_dmabuf(
+    create_viewport_xrgb_dmabuf(
         socket_path,
         commands,
         Some((0.0, 0.0, 1280.0, 800.0)),
         Some((1280, 800)),
+        true,
+    )
+}
+
+pub(in crate::compositor::tests) fn create_normal_identity_viewport_xrgb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_viewport_xrgb_dmabuf(
+        socket_path,
+        commands,
+        Some((0.0, 0.0, 1280.0, 800.0)),
+        Some((1280, 800)),
+        false,
     )
 }
 
@@ -934,6 +948,16 @@ pub(in crate::compositor::tests) fn create_fullscreen_viewport_xrgb_dmabuf(
     commands: &Sender<ServerCommand>,
     source: Option<(f64, f64, f64, f64)>,
     destination: Option<(i32, i32)>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_viewport_xrgb_dmabuf(socket_path, commands, source, destination, true)
+}
+
+fn create_viewport_xrgb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    source: Option<(f64, f64, f64, f64)>,
+    destination: Option<(i32, i32)>,
+    fullscreen: bool,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
@@ -956,7 +980,9 @@ pub(in crate::compositor::tests) fn create_fullscreen_viewport_xrgb_dmabuf(
         viewport.set_destination(width, height);
     }
     toplevel.set_app_id("oblivion.identity-viewport-test".to_string());
-    toplevel.set_fullscreen(None);
+    if fullscreen {
+        toplevel.set_fullscreen(None);
+    }
     surface.commit();
     connection.flush()?;
     let mut state = RegistryTestState::default();
