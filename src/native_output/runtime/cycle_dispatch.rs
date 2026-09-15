@@ -2143,21 +2143,21 @@ mod tests {
             scene_blockers: Vec::new(),
             semantic_solitary_fullscreen: false,
         };
-        let mut counters = DirectScanoutCounters::default();
-        counters.candidate_checks = 3;
-        counters.candidates_accepted = 2;
-        counters.import_attempts = 2;
-        counters.import_failures = 1;
-        counters.test_only_attempts = 2;
-        counters.test_only_rejections = 1;
-        counters.real_submit_attempts = 1;
-        counters.submit_rejections = 1;
-        counters.submissions = 1;
-        counters.presentations = 0;
-        counters.entries = 1;
-        counters.exits = 0;
-        counters.first_blocker = Some("import_failed");
-        counters.last_blocker = Some("test_only_rejected");
+        let counters = DirectScanoutCounters {
+            candidate_checks: 3,
+            candidates_accepted: 2,
+            import_attempts: 2,
+            import_failures: 1,
+            test_only_attempts: 2,
+            test_only_rejections: 1,
+            real_submit_attempts: 1,
+            submit_rejections: 1,
+            submissions: 1,
+            entries: 1,
+            first_blocker: Some("import_failed"),
+            last_blocker: Some("test_only_rejected"),
+            ..DirectScanoutCounters::default()
+        };
 
         let detail = format_direct_scanout_doctor_detail(
             &scene,
