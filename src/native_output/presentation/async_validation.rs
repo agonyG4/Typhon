@@ -22,6 +22,7 @@ pub(crate) struct CompositedAsyncValidationKey {
 }
 
 impl CompositedAsyncValidationKey {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) const fn new(
         output_id: OutputId,
         output_generation: u64,
