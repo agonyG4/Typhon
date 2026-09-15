@@ -60,6 +60,7 @@ impl FatalWorkerJobHandler for RecordingFatalJobHandler {
 
 fn test_direct_key() -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
             std::num::NonZeroU64::new(42).expect("test buffer ID"),
@@ -80,6 +81,7 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
 
 fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
     OutputFrameIdentitySnapshot {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         frame_id,
         protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
             std::num::NonZeroU64::new(frame_id).expect("test protocol batch ID"),
@@ -103,6 +105,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         owners: KmsBundleOwners::legacy_unchecked(),
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id,
         token,
         output_generation: 1,
@@ -134,6 +137,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             selection_evidence: Default::default(),
         },
         validation_base: KmsValidationBase::Presented {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                 None,
             ),

@@ -97,6 +97,8 @@ impl CursorAtomicValidationKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DirectPlaneValidationKey {
+    /// The logical output prevents validation results from crossing outputs.
+    pub(crate) output_id: OutputId,
     /// The DRM generation identifies the currently bound KMS target.
     pub(crate) output_generation: u64,
     /// The CRTC is part of the atomic object assignment.
@@ -174,6 +176,7 @@ pub(crate) fn plane_layout_hash(buffer: &DmabufBufferHandle) -> u64 {
 #[cfg(test)]
 pub(crate) fn test_validation_key(seed: u64) -> DirectPlaneValidationKey {
     DirectPlaneValidationKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         output_generation: seed,
         crtc_id: 7,
         primary_plane_id: 11,
@@ -233,6 +236,7 @@ mod tests {
 
     fn key(seed: u64) -> DirectPlaneValidationKey {
         DirectPlaneValidationKey {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             output_generation: seed,
             crtc_id: 7,
             primary_plane_id: 11,
@@ -270,6 +274,15 @@ mod tests {
     #[test]
     fn validation_key_changes_with_output_generation() {
         assert_ne!(key(1), key(2));
+    }
+
+    #[test]
+    fn validation_key_changes_with_logical_output_id() {
+        let first = key(1);
+        let mut second = first;
+        second.output_id = OutputId::from_raw(2).expect("nonzero output id");
+
+        assert_ne!(first, second);
     }
 
     #[test]

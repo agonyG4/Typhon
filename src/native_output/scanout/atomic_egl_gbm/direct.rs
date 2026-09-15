@@ -62,8 +62,11 @@ fn settle_no_visual_change_transaction(
         direct_surface_id,
         release,
     )
-    .map(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
-    {
+    .map(|transaction| {
+        transaction
+            .with_output_id(scanout.direct.output_id)
+            .with_presentation_state(presentation_mode, content_type)
+    }) {
         Ok(transaction) => transaction,
         Err(error) => {
             server.restore_frame_batch_after_render_failure(frame_batch_id);
@@ -224,9 +227,12 @@ impl AtomicEglGbmScanout {
         let content_type =
             kms.resolved_content_type(effective_presentation.content_type.drm_value());
         self.direct.counters.candidates_accepted += 1;
-        let Some(candidate_key) =
-            direct_candidate_key(&candidate, self.direct.drm_generation, cursor)
-        else {
+        let Some(candidate_key) = direct_candidate_key(
+            &candidate,
+            self.direct.output_id,
+            self.direct.drm_generation,
+            cursor,
+        ) else {
             return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
         };
         let release = match &sync_readiness {
@@ -306,6 +312,7 @@ impl AtomicEglGbmScanout {
             DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
         };
         let validation_key = DirectPlaneValidationKey {
+            output_id: self.direct.output_id,
             output_generation: self.direct.drm_generation,
             crtc_id: atomic.discovery().pipeline.crtc.get(),
             primary_plane_id: atomic.discovery().pipeline.plane.get(),
@@ -443,7 +450,9 @@ impl AtomicEglGbmScanout {
             candidate.surface_id,
             release,
         ) {
-            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
+            Ok(transaction) => transaction
+                .with_output_id(self.direct.output_id)
+                .with_presentation_state(presentation_mode, content_type),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 drop(surface_damage);

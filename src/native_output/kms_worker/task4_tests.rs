@@ -318,6 +318,7 @@ fn stale_presented_validation_base_is_returned_before_test_or_submit() {
     );
     let mut job = test_cursor_job(3361);
     job.validation_base = KmsValidationBase::Presented {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
         output_generation: 1,
         crtc_id: 7,
@@ -352,6 +353,7 @@ fn rejected_predecessor_returns_dependent_cursor_before_test_or_submit() {
     let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
     let mut predecessor = required_direct_test_job(337);
     predecessor.validation_base = KmsValidationBase::Presented {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
         output_generation: 1,
         crtc_id: 7,
@@ -670,6 +672,7 @@ fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
         KmsValidationBase::Presented { .. }
     ));
     let predecessor = KmsCommitBundleIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         id: job.bundle_id,
         token: job.token,
         output_generation: job.output_generation,
@@ -679,6 +682,7 @@ fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
     };
     assert_ne!(
         KmsValidationBase::Presented {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                 None,
             ),
@@ -693,6 +697,7 @@ fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
 fn predecessor_validation_base_must_match_job_output_identity() {
     let mut job = test_job(3322);
     job.validation_base = KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         id: job.bundle_id,
         token: job.token,
         output_generation: job.output_generation,
@@ -715,6 +720,16 @@ fn predecessor_validation_base_must_match_job_output_identity() {
         job.validate_against(&transaction),
         Err(super::KmsCommitPayloadError::ValidationBaseMismatch)
     );
+}
+
+#[test]
+fn identical_backend_generations_do_not_alias_across_logical_outputs() {
+    let first = test_job(333).identity();
+    let mut second_job = test_job(333);
+    second_job.output_id = oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id");
+    let second = second_job.identity();
+
+    assert_ne!(first, second);
 }
 
 #[test]

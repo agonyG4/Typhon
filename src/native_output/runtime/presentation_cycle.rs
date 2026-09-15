@@ -79,6 +79,7 @@ impl NativeRuntime {
         let perf = self.perf;
         let Self {
             server,
+            output_id,
             cursor_image,
             cursor_manager,
             perf: _,
@@ -157,7 +158,13 @@ impl NativeRuntime {
             ..
         } = self;
         #[rustfmt::skip]
-        let validation_base_context = (kms_commit_worker.as_ref(), *presented_planes, *drm_file_generation, target.crtc_id);
+        let validation_base_context = (
+            kms_commit_worker.as_ref(),
+            *presented_planes,
+            *drm_file_generation,
+            target.crtc_id,
+            output_transactions.output_id(),
+        );
         let wakeup = &cycle.wakeup;
         let worker_mode = *kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
         let mut frame_completed = cycle.frame_completed;
@@ -519,6 +526,7 @@ impl NativeRuntime {
             });
         let direct_inspection = inspect_direct_presentation(DirectPresentationInputs {
             server,
+            output_id: *output_id,
             kms_kind: kms_backend.effective_kind(),
             atomic_cursor: atomic_cursor.as_ref(),
             cursor_render_mode: *cursor_render_mode,

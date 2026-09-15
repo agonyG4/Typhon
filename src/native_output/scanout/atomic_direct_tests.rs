@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 fn test_key() -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
             std::num::NonZeroU64::new(42).expect("test buffer ID"),
@@ -310,7 +311,11 @@ fn content_epoch_mismatch_does_not_retire_presented_lease() {
 
 fn direct_control_for_transition_test() -> DirectScanoutControl {
     let drm = std::fs::File::open("/dev/null").expect("test DRM file");
-    DirectScanoutControl::new(drm.as_fd(), 1)
+    DirectScanoutControl::new(
+        drm.as_fd(),
+        1,
+        OutputId::from_raw(1).expect("nonzero output id"),
+    )
 }
 
 #[test]
@@ -604,6 +609,7 @@ fn worker_queue_owns_direct_resource_before_submit() {
                 PageFlipToken::new(80).unwrap(),
             ),
         owners: KmsBundleOwners::legacy_unchecked(),
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),
         token: PageFlipToken::new(80).unwrap(),
         output_generation: 1,
@@ -619,6 +625,7 @@ fn worker_queue_owns_direct_resource_before_submit() {
         )
         .unwrap(),
         validation_base: KmsValidationBase::Presented {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                 None,
             ),

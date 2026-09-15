@@ -81,6 +81,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         lifecycle_snapshot: LifecycleFrameSnapshot::default(),
     };
     let snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
+        OutputId::from_raw(1).expect("nonzero output id"),
         1,
         &resolved_scene,
         NativeCursorDamageBounds::default(),
@@ -291,6 +292,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
 
     for age in 1..=3_u32 {
         let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id: 0,
             render_generation: 0,
             scene: normal.clone(),
@@ -301,6 +303,7 @@ fn fullscreen_restore_matches_full_reference_for_buffer_ages_one_two_three() {
         for frame_id in 1..=20_u64 {
             let scene = fullscreen_scene(frame_id);
             history.replace_ready(NativeFrameSceneSnapshot {
+                output_id: OutputId::from_raw(1).expect("nonzero output id"),
                 frame_id,
                 render_generation: frame_id,
                 scene,

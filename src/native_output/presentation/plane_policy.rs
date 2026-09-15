@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::native_output::OutputTransactionId;
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::AtomicCursorVisualState;
 
 use super::plane::CursorRevision;
@@ -16,6 +17,7 @@ pub(crate) enum CursorGeometryClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CursorCapabilityKey {
+    pub(crate) output_id: OutputId,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) plane_id: u32,

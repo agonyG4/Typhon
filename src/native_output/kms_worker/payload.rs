@@ -14,6 +14,7 @@ use crate::native_output::{
     PrimaryPlaneAssignment,
 };
 use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
+use oblivion_one::core::OutputId;
 use oblivion_one::native::{
     kms::{AtomicCursorVisualState, FramebufferId, PageFlipToken},
     presentation_deadline::{MonotonicTimestampNs, PresentationTarget},
@@ -24,6 +25,7 @@ use std::os::fd::OwnedFd;
 pub(crate) struct KmsCommitJob {
     pub(crate) bundle_id: KmsCommitBundleId,
     pub(crate) owners: KmsBundleOwners,
+    pub(crate) output_id: OutputId,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) output_generation: u64,
@@ -67,6 +69,7 @@ pub(crate) enum KmsPrimaryCursorPresentation {
 pub(crate) enum KmsValidationBase {
     Presented {
         snapshot: PresentedPlaneSnapshot,
+        output_id: oblivion_one::core::OutputId,
         output_generation: u64,
         crtc_id: u32,
     },
@@ -77,6 +80,7 @@ pub(crate) enum KmsValidationBase {
 pub(crate) enum EstablishedKmsBase {
     Presented {
         revision: crate::native_output::presentation::plane::PlaneStateRevision,
+        output_id: oblivion_one::core::OutputId,
         output_generation: u64,
         crtc_id: u32,
     },
@@ -99,15 +103,18 @@ pub(crate) fn validation_base_ready(
         (
             EstablishedKmsBase::Presented {
                 revision,
+                output_id,
                 output_generation,
                 crtc_id,
             },
             KmsValidationBase::Presented {
                 snapshot,
+                output_id: required_output_id,
                 output_generation: required_generation,
                 crtc_id: required_crtc,
             },
         ) if revision == snapshot.revision
+            && output_id == required_output_id
             && output_generation == required_generation
             && crtc_id == required_crtc =>
         {
@@ -200,6 +207,7 @@ impl KmsCommitTestPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsCommitPayloadError {
+    OutputMismatch,
     TransactionIdentityMismatch,
     GenerationMismatch,
     TargetMismatch,
@@ -258,6 +266,7 @@ impl KmsCommitJob {
         KmsCommitBundleIdentity {
             id: self.bundle_id,
             token: self.token,
+            output_id: self.output_id,
             output_generation: self.output_generation,
             crtc_id: self.crtc_id,
             primary_transaction_id: self.owners.primary_transaction_id(),
@@ -295,6 +304,9 @@ impl KmsCommitJob {
         submitted: bool,
     ) -> Result<(), KmsCommitPayloadError> {
         self.validate_pacing_ownership()?;
+        if self.output_id != transaction.output_id() {
+            return Err(KmsCommitPayloadError::OutputMismatch);
+        }
         if self.transaction_id != transaction.id()
             || kind_transaction_id(self.kind) != self.transaction_id
         {
@@ -308,15 +320,20 @@ impl KmsCommitJob {
         }
         match self.validation_base {
             KmsValidationBase::Presented {
+                output_id,
                 output_generation,
                 crtc_id,
                 ..
             }
             | KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+                output_id,
                 output_generation,
                 crtc_id,
                 ..
-            }) if output_generation != self.output_generation || crtc_id != self.crtc_id => {
+            }) if output_id != self.identity().output_id
+                || output_generation != self.output_generation
+                || crtc_id != self.crtc_id =>
+            {
                 return Err(KmsCommitPayloadError::ValidationBaseMismatch);
             }
             _ => {}
@@ -339,6 +356,9 @@ impl KmsCommitJob {
             .into_iter()
             .flatten()
             {
+                if owner.output_id() != self.output_id {
+                    return Err(KmsCommitPayloadError::OutputMismatch);
+                }
                 if owner.output_generation() != self.output_generation {
                     return Err(KmsCommitPayloadError::OwnerGenerationMismatch);
                 }
@@ -617,11 +637,15 @@ mod tests {
             validation_base_ready(
                 EstablishedKmsBase::Presented {
                     revision: before.revision,
+                    output_id: oblivion_one::core::OutputId::from_raw(1)
+                        .expect("single native output identity is nonzero"),
                     output_generation: 2,
                     crtc_id: 7,
                 },
                 KmsValidationBase::Presented {
                     snapshot: after,
+                    output_id: oblivion_one::core::OutputId::from_raw(1)
+                        .expect("single native output identity is nonzero"),
                     output_generation: 2,
                     crtc_id: 7,
                 },

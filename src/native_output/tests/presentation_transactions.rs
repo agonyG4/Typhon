@@ -135,6 +135,7 @@ fn candidate_key_ignores_protocol_only_work_but_tracks_visual_epochs() {
         0,
     );
     let base = DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content,
         output_generation: 1,
         cursor_content_key: Some(CursorContentKey {
@@ -174,6 +175,13 @@ fn candidate_key_ignores_protocol_only_work_but_tracks_visual_epochs() {
         base,
         DirectScanoutCandidateKey {
             output_generation: 2,
+            ..base
+        }
+    );
+    assert_ne!(
+        base,
+        DirectScanoutCandidateKey {
+            output_id: oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id"),
             ..base
         }
     );
@@ -393,6 +401,22 @@ fn test_composited_transaction(
         batch_id,
     )
     .expect("composited transaction")
+}
+
+#[test]
+fn transaction_from_one_logical_output_cannot_enter_another_ledger() {
+    let first = oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id");
+    let second = oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id");
+    let mut first_ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let mut second_ledger = super::OutputTransactionLedger::for_output(second, 8, 64);
+    let transaction =
+        test_composited_transaction(&mut second_ledger, test_batch(99), 1).with_output_id(second);
+
+    assert_eq!(first_ledger.output_id(), first);
+    assert_eq!(
+        first_ledger.insert(transaction),
+        Err(super::OutputTransactionError::OutputMismatch)
+    );
 }
 
 #[test]
@@ -1834,6 +1858,7 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
         0,
     );
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content,
         output_generation: 1,
         cursor_content_key: None,

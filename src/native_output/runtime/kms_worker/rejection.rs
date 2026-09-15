@@ -741,6 +741,7 @@ mod ownership_tests {
 
     fn key() -> CursorCapabilityKey {
         CursorCapabilityKey {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             output_generation: 1,
             crtc_id: 7,
             plane_id: 9,
@@ -846,6 +847,7 @@ mod ownership_tests {
                 NonZeroU64::new(token).unwrap(),
             ),
             owners,
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             transaction_id,
             token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
             output_generation: 1,
@@ -865,6 +867,7 @@ mod ownership_tests {
                 )
                 .unwrap(),
             validation_base: KmsValidationBase::Presented {
+                output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
                 snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
                     None,
                 ),

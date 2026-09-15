@@ -1,11 +1,13 @@
 use super::*;
 use oblivion_one::compositor::{DrmContentType, FrameBatchDiscardReason, OutputPresentationMode};
+use oblivion_one::core::OutputId;
 
 macro_rules! require_validation_base {
     ($context:expr, $redraw:ident) => {
         match $context {
-            (worker, presented, generation, crtc) => {
-                match validation_base_for_submission(worker, presented, generation, crtc) {
+            (worker, presented, generation, crtc, output_id) => {
+                match validation_base_for_submission(worker, output_id, presented, generation, crtc)
+                {
                     Some(base) => base,
                     None => {
                         *$redraw = true;
@@ -168,6 +170,7 @@ pub(super) use xwayland_reactor::{
 
 #[derive(Debug, Clone, Copy)]
 struct PendingSessionRecovery {
+    output_id: OutputId,
     scanout: NativeScanoutRecovery,
     generation: u64,
     cursor: crate::native_output::presentation::plane::PresentedCursorState,
@@ -481,6 +484,7 @@ impl KmsTeardownSafety {
 
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
+    output_id: OutputId,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     cursor_manager: oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,

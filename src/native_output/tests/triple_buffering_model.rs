@@ -426,6 +426,7 @@ fn pipeline_owner_cardinality_rejects_duplicate_positions() {
 
 fn test_direct_key() -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
             NonZeroU64::new(42).unwrap(),

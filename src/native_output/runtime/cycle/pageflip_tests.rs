@@ -78,6 +78,7 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
     let job = KmsCommitJob {
         bundle_id: KmsCommitBundleId::from_pageflip_token(token),
         owners,
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id,
         token,
         output_generation: 1,
@@ -92,6 +93,7 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
         )
         .unwrap(),
         validation_base: KmsValidationBase::Presented {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: PresentedPlaneSnapshot::legacy(None),
             output_generation: 1,
             crtc_id: 7,

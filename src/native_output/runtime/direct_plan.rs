@@ -168,6 +168,7 @@ mod tests {
             0,
         );
         DirectScanoutCandidateKey {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             content,
             output_generation: 1,
             cursor_content_key: None,

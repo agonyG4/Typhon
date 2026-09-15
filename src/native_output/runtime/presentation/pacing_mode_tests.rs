@@ -1242,6 +1242,7 @@ fn direct_combined_cursor_rejection_does_not_latch_software_cursor() {
 
 fn test_confirmed_direct_key() -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
             std::num::NonZeroU64::new(42).unwrap(),

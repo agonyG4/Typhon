@@ -1,9 +1,29 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in crate::compositor) struct PhysicalOutputId(u8);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::OutputId;
 
-const NATIVE_PHYSICAL_OUTPUT: PhysicalOutputId = PhysicalOutputId(0);
+    #[test]
+    fn membership_keeps_distinct_logical_output_ids_separate() {
+        let first = OutputId::from_raw(1).expect("nonzero output id");
+        let second = OutputId::from_raw(2).expect("nonzero output id");
+        let mut membership = SurfaceOutputMembership::default();
+
+        membership.physical_outputs.insert(first);
+
+        assert!(membership.physical_outputs.contains(&first));
+        assert!(!membership.physical_outputs.contains(&second));
+    }
+
+    #[test]
+    fn compositor_allocates_one_real_native_output_id() {
+        let state = CompositorState::new(None);
+
+        assert_eq!(state.native_output_id().map(OutputId::get), Some(1));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct SurfaceBufferPreference {
@@ -13,7 +33,7 @@ pub(in crate::compositor) struct SurfaceBufferPreference {
 
 #[derive(Debug, Default, Clone)]
 pub(in crate::compositor) struct SurfaceOutputMembership {
-    pub(in crate::compositor) physical_outputs: HashSet<PhysicalOutputId>,
+    pub(in crate::compositor) physical_outputs: HashSet<OutputId>,
     pub(in crate::compositor) entered_resources: HashSet<u32>,
     pub(in crate::compositor) last_preference: Option<SurfaceBufferPreference>,
 }
@@ -138,20 +158,21 @@ impl CompositorState {
             .membership_surfaces_inspected
             .saturating_add(1);
         let surface_id = compositor_surface_id(surface);
+        let Some(native_output_id) = self.ensure_native_output_id() else {
+            return;
+        };
         let overlaps = self.surface_overlaps_native_output(surface_id);
         let membership = self
             .surface_output_memberships
             .entry(surface_id)
             .or_default();
-        let was_overlapping = membership
-            .physical_outputs
-            .contains(&NATIVE_PHYSICAL_OUTPUT);
+        let was_overlapping = membership.physical_outputs.contains(&native_output_id);
         let mut membership_changed = was_overlapping != overlaps;
 
         if overlaps {
-            membership.physical_outputs.insert(NATIVE_PHYSICAL_OUTPUT);
+            membership.physical_outputs.insert(native_output_id);
         } else {
-            membership.physical_outputs.remove(&NATIVE_PHYSICAL_OUTPUT);
+            membership.physical_outputs.remove(&native_output_id);
         }
 
         let output_resources = self

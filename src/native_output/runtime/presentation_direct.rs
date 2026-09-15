@@ -24,6 +24,7 @@ pub(super) struct DirectPresentationInspection {
 
 pub(super) struct DirectPresentationInputs<'a> {
     pub(super) server: &'a OwnCompositorServer,
+    pub(super) output_id: OutputId,
     pub(super) kms_kind: KmsBackendKind,
     pub(super) atomic_cursor: Option<&'a NativeAtomicCursor>,
     pub(super) cursor_render_mode: NativeCursorRenderMode,
@@ -111,6 +112,7 @@ pub(super) fn inspect_direct_presentation(
             (!inputs.pending_interactive_visual_work).then(|| {
                 DirectScanoutCandidateKey::from_candidate(
                     candidate,
+                    inputs.output_id,
                     inputs.drm_file_generation,
                     super::scanout::direct_cursor_content_key(
                         inputs.effective_cursor,
@@ -246,6 +248,7 @@ mod tests {
 
     fn candidate_key() -> DirectScanoutCandidateKey {
         DirectScanoutCandidateKey {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             content: OutputContentKey::new(
                 7,
                 NonZeroU64::new(1).expect("buffer id"),

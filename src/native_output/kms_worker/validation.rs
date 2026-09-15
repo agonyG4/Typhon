@@ -74,6 +74,21 @@ impl KmsCommitWorkerHandle {
             .set_established_presented_base(revision, output_generation, crtc_id);
     }
 
+    pub(crate) fn set_established_presented_base_for_output(
+        &self,
+        output_id: oblivion_one::core::OutputId,
+        revision: crate::native_output::presentation::plane::PlaneStateRevision,
+        output_generation: u64,
+        crtc_id: u32,
+    ) {
+        self.shared.set_established_presented_base_for_output(
+            output_id,
+            revision,
+            output_generation,
+            crtc_id,
+        );
+    }
+
     pub(crate) fn invalidate_validation_base(
         &self,
         predecessor: KmsCommitBundleIdentity,

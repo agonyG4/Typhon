@@ -72,13 +72,14 @@ use super::{
     DirectScanoutSceneRejection, ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics,
     FrameCallbackTime, FrameCallbackTimingEvidence, FramePacingProtocolCapabilities,
     FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
-    InteractionUpdateOutcome, OutputPosition, OutputRect, PendingProcessLaunch, PointerAxisFrame,
-    PointerConstraintTransitionSnapshot, PresentationClock, PresentationProtocolCapabilities,
-    ProtocolOnlyCompletion, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
-    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, SurfacePacingMetrics, SurfacePipelineEvent,
-    SurfacePresentationMetadata, WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason,
-    WindowId, WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    InteractionUpdateOutcome, OutputId, OutputPosition, OutputRect, PendingProcessLaunch,
+    PointerAxisFrame, PointerConstraintTransitionSnapshot, PresentationClock,
+    PresentationProtocolCapabilities, ProtocolOnlyCompletion, RenderGenerationCause,
+    RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    SurfacePacingMetrics, SurfacePipelineEvent, SurfacePresentationMetadata,
+    WindowActivationOutcome, WindowFocusOutcome, WindowFocusReason, WindowId,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
     XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{
         PointerConstraintBackendId, PointerConstraintBackendRequest,
@@ -144,6 +145,10 @@ impl Drop for OwnCompositorServer {
     }
 }
 impl OwnCompositorServer {
+    pub fn native_output_id(&self) -> Option<OutputId> {
+        self.state.native_output_id()
+    }
+
     pub fn trusted_effect_registry(&self) -> &crate::effects::TrustedEffectRegistry {
         self.state.trusted_effect_registry()
     }

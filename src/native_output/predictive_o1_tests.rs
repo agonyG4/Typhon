@@ -10,6 +10,7 @@ use std::num::NonZeroU64;
 
 fn physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
     OutputFrameIdentitySnapshot {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         frame_id,
         protocol_batch_id: CompositorFrameBatchId::new(
             NonZeroU64::new(frame_id).expect("test frame batch ID"),

@@ -68,6 +68,7 @@ fn transaction_id(value: u64) -> OutputTransactionId {
 fn predecessor(value: u64) -> crate::native_output::kms_worker::KmsCommitBundleIdentity {
     let token = oblivion_one::native::kms::PageFlipToken::new(value).expect("non-zero token");
     crate::native_output::kms_worker::KmsCommitBundleIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         id: KmsCommitBundleId::from_pageflip_token(token),
         token,
         output_generation: 1,
@@ -141,6 +142,7 @@ fn independent_plane_delta_preparation_retains_frozen_reveal_without_sidecar() {
     let mut transactions = OutputTransactionLedger::new();
     let mut trace = PresentationTransactionTraceRing::disabled(8);
     let validation_base = KmsValidationBase::Presented {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         snapshot: PresentedPlaneSnapshot::legacy(None),
         output_generation: 1,
         crtc_id: 7,
@@ -178,6 +180,7 @@ fn independent_plane_delta_preparation_retains_frozen_reveal_without_sidecar() {
 fn promoted_independent_sidecar_uses_fresh_standalone_validation_base() {
     let worker = KmsCommitWorkerHandle::start(Arc::new(AcceptingExecutor)).unwrap();
     let old_base = KmsValidationBase::Presented {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         snapshot: PresentedPlaneSnapshot::legacy(None),
         output_generation: 1,
         crtc_id: 7,

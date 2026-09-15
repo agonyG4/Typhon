@@ -8,6 +8,7 @@ const INITIAL_CURSOR_EPOCH: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CursorOutputIdentity {
+    pub(crate) output_id: OutputId,
     pub(crate) crtc_id: u32,
     pub(crate) mode_width: u32,
     pub(crate) mode_height: u32,
@@ -16,8 +17,14 @@ pub(crate) struct CursorOutputIdentity {
 }
 
 impl CursorOutputIdentity {
-    pub(crate) const fn new(crtc_id: u32, mode_width: u32, mode_height: u32) -> Self {
+    pub(crate) const fn new(
+        output_id: OutputId,
+        crtc_id: u32,
+        mode_width: u32,
+        mode_height: u32,
+    ) -> Self {
         Self {
+            output_id,
             crtc_id,
             mode_width,
             mode_height,
@@ -28,6 +35,7 @@ impl CursorOutputIdentity {
 
     #[allow(dead_code)]
     pub(crate) const fn with_transform_scale(
+        output_id: OutputId,
         crtc_id: u32,
         mode_width: u32,
         mode_height: u32,
@@ -35,6 +43,7 @@ impl CursorOutputIdentity {
         output_scale_milli: u32,
     ) -> Self {
         Self {
+            output_id,
             crtc_id,
             mode_width,
             mode_height,
@@ -46,6 +55,7 @@ impl CursorOutputIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeCursorImageKey {
+    pub(crate) output_id: OutputId,
     pub(crate) surface_id: u32,
     pub(crate) buffer_id: u64,
     pub(crate) commit_sequence: u64,
@@ -69,7 +79,24 @@ impl NativeCursorImageKey {
         hotspot_y: i32,
         output_scale_milli: u32,
     ) -> Self {
+        Self::for_surface_at_output_scale_for_output(
+            OutputId::from_raw(1).expect("single native output identity is nonzero"),
+            surface,
+            hotspot_x,
+            hotspot_y,
+            output_scale_milli,
+        )
+    }
+
+    pub(crate) fn for_surface_at_output_scale_for_output(
+        output_id: OutputId,
+        surface: &RenderableSurface,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        output_scale_milli: u32,
+    ) -> Self {
         Self {
+            output_id,
             surface_id: surface.surface_id,
             buffer_id: surface.buffer_id().get(),
             commit_sequence: surface.commit_sequence.0,
@@ -95,6 +122,7 @@ pub(crate) struct NativeAtomicCursor {
     resources: AtomicCursorResources,
     pub(crate) plane: AtomicCursorPlaneProperties,
     pub(crate) generation: u64,
+    pub(crate) output_id: OutputId,
     /// Output-local identity for the desired KMS cursor state. This is
     /// intentionally independent of compositor scene/cursor generations.
     desired_epoch: u64,
@@ -156,6 +184,7 @@ impl NativeAtomicCursor {
             },
             plane,
             generation,
+            output_id: output.output_id,
             desired_epoch: INITIAL_CURSOR_EPOCH,
             submitted_epoch: INITIAL_CURSOR_EPOCH,
             revisions: CursorRevisionTracker::new(),
@@ -914,6 +943,7 @@ impl NativeAtomicCursor {
             output_height: self.mode_height,
         })?;
         Some(CursorCapabilityKey {
+            output_id: self.output_id,
             output_generation: self.generation,
             crtc_id: self.crtc_id,
             plane_id: self.plane.plane_id,

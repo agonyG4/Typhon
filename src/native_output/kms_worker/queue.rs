@@ -594,6 +594,22 @@ impl WorkerShared {
         output_generation: u64,
         crtc_id: u32,
     ) {
+        self.set_established_presented_base_for_output(
+            oblivion_one::core::OutputId::from_raw(1)
+                .expect("single native output identity is nonzero"),
+            revision,
+            output_generation,
+            crtc_id,
+        );
+    }
+
+    pub(crate) fn set_established_presented_base_for_output(
+        &self,
+        output_id: oblivion_one::core::OutputId,
+        revision: crate::native_output::presentation::plane::PlaneStateRevision,
+        output_generation: u64,
+        crtc_id: u32,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -602,6 +618,7 @@ impl WorkerShared {
         if state.queued.is_empty() {
             state.established_base = Some(EstablishedKmsBase::Presented {
                 revision,
+                output_id,
                 output_generation,
                 crtc_id,
             });
@@ -1076,12 +1093,14 @@ impl KmsCommitAdmissionPermit {
         if state.established_base.is_none()
             && let KmsValidationBase::Presented {
                 snapshot,
+                output_id,
                 output_generation,
                 crtc_id,
             } = job.validation_base
         {
             state.established_base = Some(EstablishedKmsBase::Presented {
                 revision: snapshot.revision,
+                output_id,
                 output_generation,
                 crtc_id,
             });

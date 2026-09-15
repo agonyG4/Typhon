@@ -222,9 +222,13 @@ pub(super) fn submit_ready_frame(
         server.prepared_frame_batch_id().zip(compatibility_target)
     };
     let callback_batch_id = guard.map(|(batch_id, _)| batch_id);
-    let Some(validation_base) =
-        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id)
-    else {
+    let Some(validation_base) = validation_base_for_submission(
+        worker,
+        output_transactions.output_id(),
+        presented_planes,
+        output_generation,
+        crtc_id,
+    ) else {
         if let Some(batch_id) = callback_batch_id {
             server.note_frame_callback_admission_failure(batch_id);
         }
@@ -697,6 +701,7 @@ mod tests {
         let frame_now = MonotonicTimestampNs::new(frame_id);
         swapchain
             .finish_render_owned(RenderedOutputFrame {
+                output_id: swapchain.output_id(),
                 id: frame_id,
                 transaction_id,
                 slot,

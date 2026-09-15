@@ -268,6 +268,7 @@ impl DirectScanoutCounters {
 }
 
 pub(crate) struct DirectScanoutControl {
+    pub(crate) output_id: OutputId,
     pub(crate) ownership: DirectPrimaryOwnership,
     pub(crate) framebuffer_cache: DirectFramebufferCache,
     pub(crate) inhibit_until_composited_present: bool,
@@ -281,11 +282,13 @@ pub(crate) struct DirectScanoutControl {
 
 pub(super) fn direct_candidate_key(
     candidate: &DirectScanoutSceneCandidate,
+    output_id: OutputId,
     drm_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
 ) -> Option<DirectScanoutCandidateKey> {
     DirectScanoutCandidateKey::from_candidate(
         candidate,
+        output_id,
         drm_generation,
         direct_cursor_content_key(cursor, true),
         0,
@@ -701,8 +704,13 @@ impl DirectScanoutControl {
         }
     }
 
-    pub(super) fn new(drm: std::os::fd::BorrowedFd<'_>, generation: u64) -> Self {
+    pub(super) fn new(
+        drm: std::os::fd::BorrowedFd<'_>,
+        generation: u64,
+        output_id: OutputId,
+    ) -> Self {
         Self {
+            output_id,
             ownership: DirectPrimaryOwnership::default(),
             framebuffer_cache: DirectFramebufferCache::new(drm, generation),
             inhibit_until_composited_present: true,

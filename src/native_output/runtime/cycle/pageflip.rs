@@ -17,11 +17,13 @@ use crate::native_output::presentation::plane::{
 };
 
 fn pageflip_identity(
+    output_id: OutputId,
     token: PageFlipToken,
     output_generation: u64,
     crtc_id: u32,
 ) -> crate::native_output::presentation::plane::PlanePageflipIdentity {
     crate::native_output::presentation::plane::PlanePageflipIdentity {
+        output_id,
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         token,
@@ -37,6 +39,7 @@ fn presented_primary_from_worker_job(
     let transaction = job.owners.primary()?.transaction.as_ref();
     let bundle_identity = job.identity();
     let pageflip = crate::native_output::presentation::plane::PlanePageflipIdentity {
+        output_id: bundle_identity.output_id,
         bundle_id: bundle_identity.id,
         token: bundle_identity.token,
         output_generation: bundle_identity.output_generation,
@@ -743,7 +746,12 @@ impl NativeRuntime {
                 {
                     let token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
-                    let identity = pageflip_identity(token, *drm_file_generation, target.crtc_id);
+                    let identity = pageflip_identity(
+                        self.output_id,
+                        token,
+                        *drm_file_generation,
+                        target.crtc_id,
+                    );
                     let previous_cursor = presented_planes.cursor;
                     let presented_cursor = cursor.presented_plane_state();
                     if !presented_planes.promote_bundle(
@@ -917,8 +925,12 @@ impl NativeRuntime {
                             );
                         }
                     }
-                    let direct_pageflip_identity =
-                        pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                    let direct_pageflip_identity = pageflip_identity(
+                        self.output_id,
+                        pageflip_token,
+                        *drm_file_generation,
+                        target.crtc_id,
+                    );
                     cycle_direct::settle_direct_pageflip(
                         scanout,
                         scene_history,
@@ -945,8 +957,12 @@ impl NativeRuntime {
                     if *kms_commit_worker_transport
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                     {
-                        let identity =
-                            pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        let identity = pageflip_identity(
+                            self.output_id,
+                            pageflip_token,
+                            *drm_file_generation,
+                            target.crtc_id,
+                        );
                         let previous_cursor = presented_planes.cursor;
                         let presented_cursor = atomic_cursor
                             .as_ref()
@@ -1284,8 +1300,12 @@ impl NativeRuntime {
                     let pool_generation = swapchain.pool_generation();
                     let presentation_serial = swapchain.presentation_serial();
                     let framebuffer_id = explicit.framebuffer(slot)?.get();
-                    let pageflip =
-                        pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                    let pageflip = pageflip_identity(
+                        self.output_id,
+                        pageflip_token,
+                        *drm_file_generation,
+                        target.crtc_id,
+                    );
                     let presented_primary = Some(PresentedPrimaryAssignment::Composed {
                         transaction_id,
                         token: pageflip_token,
@@ -1298,8 +1318,12 @@ impl NativeRuntime {
                     if *kms_commit_worker_transport
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                     {
-                        let identity =
-                            pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        let identity = pageflip_identity(
+                            self.output_id,
+                            pageflip_token,
+                            *drm_file_generation,
+                            target.crtc_id,
+                        );
                         let previous_cursor = presented_planes.cursor;
                         let presented_cursor = atomic_cursor
                             .as_ref()
@@ -1661,6 +1685,7 @@ impl NativeRuntime {
                     )) = worker_promotion
                     {
                         if bundle_identity.token != pageflip_token
+                            || bundle_identity.output_id != self.output_id
                             || bundle_identity.output_generation != *drm_file_generation
                             || bundle_identity.crtc_id != target.crtc_id
                         {
@@ -1671,6 +1696,7 @@ impl NativeRuntime {
                         }
                         let identity =
                             crate::native_output::presentation::plane::PlanePageflipIdentity {
+                                output_id: self.output_id,
                                 bundle_id: bundle_identity.id,
                                 token: bundle_identity.token,
                                 output_generation: bundle_identity.output_generation,
@@ -1726,7 +1752,8 @@ impl NativeRuntime {
                             );
                         }
                         if let Some(worker) = kms_commit_worker.as_ref() {
-                            worker.set_established_presented_base(
+                            worker.set_established_presented_base_for_output(
+                                self.output_id,
                                 presented_planes.revision,
                                 *drm_file_generation,
                                 target.crtc_id,

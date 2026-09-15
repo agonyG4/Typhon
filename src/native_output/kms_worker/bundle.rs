@@ -35,6 +35,7 @@ pub(crate) struct KmsBundleOwners {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsBundleOwnerError {
     Empty,
+    OutputMismatch,
     GenerationMismatch,
     TargetMismatch,
     CursorRevisionMismatch,
@@ -44,6 +45,7 @@ pub(crate) enum KmsBundleOwnerError {
 pub(crate) struct KmsCommitBundleIdentity {
     pub(crate) id: crate::native_output::presentation::plane::KmsCommitBundleId,
     pub(crate) token: PageFlipToken,
+    pub(crate) output_id: oblivion_one::core::OutputId,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) primary_transaction_id: Option<OutputTransactionId>,
@@ -69,6 +71,13 @@ impl KmsBundleOwners {
         else {
             return Err(KmsBundleOwnerError::Empty);
         };
+        if owners
+            .cursor
+            .as_ref()
+            .is_some_and(|owner| owner.transaction.output_id() != first.output_id())
+        {
+            return Err(KmsBundleOwnerError::OutputMismatch);
+        }
         if owners
             .cursor
             .as_ref()

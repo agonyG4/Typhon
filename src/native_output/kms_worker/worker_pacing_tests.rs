@@ -43,6 +43,7 @@ fn test_submit_window(target_presentation_ns: u64, dispatch_budget_ns: u64) -> K
 
 fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
     OutputFrameIdentitySnapshot {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         frame_id,
         protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
             std::num::NonZeroU64::new(frame_id).unwrap(),

@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, fmt::Write as _};
 
 use oblivion_one::compositor::{CursorRevealAuthority, PointerConstraintBackendId};
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::{
     AtomicCursorPlaneAssignment, AtomicCursorVisualState, AtomicPipelineProperties, PageFlipToken,
 };
@@ -18,6 +19,7 @@ pub(crate) const CURSOR_REVEAL_TRACE_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CursorRevealPhysicalIdentity {
+    pub(crate) output_id: OutputId,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) token: PageFlipToken,
@@ -26,6 +28,7 @@ pub(crate) struct CursorRevealPhysicalIdentity {
 impl CursorRevealPhysicalIdentity {
     pub(crate) const fn from_pageflip(identity: PlanePageflipIdentity) -> Self {
         Self {
+            output_id: identity.output_id,
             output_generation: identity.output_generation,
             crtc_id: identity.crtc_id,
             token: identity.token,
@@ -228,9 +231,10 @@ impl CursorRevealTraceLedger {
         });
         crate::pointer_debug::cursor_presentation_log_lazy(|| {
             format!(
-                "event=cursor_submission_bound constraint={}/{} output_generation={} crtc_id={} pageflip_token={} expected_epoch={:?} expected_revision={:?} expected_delivery={:?} expected_position={:?} expected_hotspot={:?} expected_framebuffer_id={:?} expected_image_generation={:?} expected_source={:?}",
+                "event=cursor_submission_bound constraint={}/{} output_id={} output_generation={} crtc_id={} pageflip_token={} expected_epoch={:?} expected_revision={:?} expected_delivery={:?} expected_position={:?} expected_hotspot={:?} expected_framebuffer_id={:?} expected_image_generation={:?} expected_source={:?}",
                 snapshot.authority.constraint.constraint_id,
                 snapshot.authority.constraint.generation,
+                identity.output_id.get(),
                 identity.output_generation,
                 identity.crtc_id,
                 identity.token.get(),
@@ -331,6 +335,7 @@ pub(crate) enum CursorKmsAssignment<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CursorKmsSubmitContext {
+    pub(crate) output_id: OutputId,
     pub(crate) output_generation: u64,
     pub(crate) transaction_id: Option<crate::native_output::OutputTransactionId>,
     pub(crate) token: PageFlipToken,
@@ -389,7 +394,8 @@ fn format_cursor_kms_submit_assignment(
         .cursor_revision
         .map_or_else(|| "unknown".to_string(), |revision| format!("{revision:?}"));
     let mut line = format!(
-        "event=cursor_kms_submit output_generation={} transaction_id={} pageflip_token={} crtc_id={} cursor_epoch={} cursor_revision={} submission_kind={} transport={} delivery={:?} assignment=",
+        "event=cursor_kms_submit output_id={} output_generation={} transaction_id={} pageflip_token={} crtc_id={} cursor_epoch={} cursor_revision={} submission_kind={} transport={} delivery={:?} assignment=",
+        context.output_id.get(),
         context.output_generation,
         transaction_id,
         context.token.get(),
@@ -506,6 +512,7 @@ mod tests {
 
     fn identity(token: u64) -> CursorRevealPhysicalIdentity {
         CursorRevealPhysicalIdentity {
+            output_id: OutputId::from_raw(1).expect("test output id"),
             output_generation: 7,
             crtc_id: 11,
             token: PageFlipToken::new(token).unwrap(),
@@ -520,6 +527,17 @@ mod tests {
 
         assert_eq!(ledger.take(identity(10)).unwrap().reveal.constraint_id, 1);
         assert_eq!(ledger.take(identity(20)).unwrap().reveal.constraint_id, 2);
+    }
+
+    #[test]
+    fn reveal_identity_is_qualified_by_logical_output() {
+        let first = identity(10);
+        let second = CursorRevealPhysicalIdentity {
+            output_id: OutputId::from_raw(2).expect("test output id"),
+            ..first
+        };
+
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -630,6 +648,7 @@ mod tests {
                 pixel_blend_mode: None,
             },
             CursorKmsSubmitContext {
+                output_id: OutputId::from_raw(1).expect("test output id"),
                 output_generation: 4,
                 transaction_id: Some(crate::native_output::OutputTransactionId::new(
                     NonZeroU64::new(12).unwrap(),
@@ -644,6 +663,7 @@ mod tests {
             },
             false,
         );
+        assert!(line.contains("output_id=1"));
         assert!(line.contains("transport=synchronous"));
         assert!(line.contains("submission_kind=primary_plus_cursor"));
         assert!(line.contains("FB_ID=99 CRTC_ID=11"));
@@ -657,6 +677,7 @@ mod tests {
     #[test]
     fn disabled_and_unchanged_kms_payloads_do_not_invent_geometry() {
         let context = CursorKmsSubmitContext {
+            output_id: OutputId::from_raw(1).expect("test output id"),
             output_generation: 4,
             transaction_id: None,
             token: PageFlipToken::new(55).unwrap(),

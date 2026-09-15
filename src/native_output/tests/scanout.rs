@@ -486,6 +486,7 @@ fn ready_frame_retains_and_transfers_frozen_hardware_client_source_key() {
     .unwrap();
     let slot = swapchain.acquire_render_slot().unwrap();
     let source_key = crate::native_output::output::NativeCursorImageKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         surface_id: 77,
         buffer_id: 11,
         commit_sequence: 100,
@@ -710,6 +711,7 @@ fn ready_frame_cursor_pin_drops_when_suspended_frame_is_abandoned() {
 
 fn test_cursor_capability_key() -> CursorCapabilityKey {
     CursorCapabilityKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         output_generation: 1,
         crtc_id: 7,
         plane_id: 9,

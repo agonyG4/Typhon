@@ -372,6 +372,7 @@ impl NativeSessionIo for NativeRuntime {
                 crate::native_output::presentation::plane::PresentedCursorState::hidden,
             );
         self.pending_session_recovery = Some(PendingSessionRecovery {
+            output_id: self.output_id,
             scanout: recovery,
             generation,
             cursor,
@@ -381,6 +382,7 @@ impl NativeSessionIo for NativeRuntime {
                 NativePerfField::str("completion", "synchronous_modeset"),
                 NativePerfField::str("kms_backend", self.kms_backend.effective_kind().as_str()),
                 NativePerfField::u64("framebuffer", u64::from(framebuffer.get())),
+                NativePerfField::u64("output_id", self.output_id.get()),
                 NativePerfField::u64("prepared_generation", generation),
             ]
         });
@@ -459,6 +461,9 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self
             .pending_session_recovery
             .expect("session recovery remains pending until generation rebind");
+        if recovery.output_id != self.output_id {
+            return Err(io::Error::other("session recovery output identity mismatch").into());
+        }
         let snapshot_revision_before = self.presented_planes.revision;
         let (had_presented_primary, primary_kind) =
             self.presented_planes
@@ -924,6 +929,20 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn session_recovery_keeps_logical_output_id_when_drm_generation_changes() {
+        let output_id = OutputId::from_raw(7).expect("nonzero output id");
+        let recovery = PendingSessionRecovery {
+            output_id,
+            scanout: NativeScanoutRecovery::Dumb(FramebufferId::new(1).unwrap()),
+            generation: 42,
+            cursor: crate::native_output::presentation::plane::PresentedCursorState::hidden(),
+        };
+
+        assert_eq!(recovery.output_id, output_id);
+        assert_ne!(41, recovery.generation);
     }
 
     #[test]

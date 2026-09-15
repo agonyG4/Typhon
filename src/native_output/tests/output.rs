@@ -86,6 +86,7 @@ fn native_damage_includes_old_and_new_effect_regions() {
 #[test]
 fn direct_plane_validation_key_changes_for_modifier_and_generation() {
     let first = DirectPlaneValidationKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         output_generation: 1,
         crtc_id: 7,
         primary_plane_id: 11,
@@ -834,6 +835,7 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         vec![decoration(RENDERED_B_WIDTH)],
     );
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 1,
         render_generation: 1,
         scene: presented_a_scene,
@@ -842,6 +844,7 @@ fn render_ahead_oversized_ssd_repair_matches_full_reference() {
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 2,
         render_generation: 2,
         scene: rendered_b_scene.clone(),
@@ -994,6 +997,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         vec![decoration(1400)],
     );
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
@@ -1002,6 +1006,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 2,
         render_generation: 44,
         scene: retry_scene.clone(),
@@ -1012,6 +1017,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference() {
     assert!(history.queue_submission(220));
     assert!(history.discard_submission(220));
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 3,
         render_generation: 44,
         scene: retry_scene.clone(),
@@ -1102,6 +1108,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
     let retry_scene =
         NativeSceneSnapshot::from_surfaces(std::slice::from_ref(&retry_surface), Vec::new());
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
@@ -1110,6 +1117,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 2,
         render_generation: 45,
         scene: retry_scene.clone(),
@@ -1120,6 +1128,7 @@ fn rejected_oversized_csd_retry_matches_full_reference() {
     assert!(history.queue_submission(230));
     assert!(history.discard_submission(230));
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 3,
         render_generation: 45,
         scene: retry_scene.clone(),
@@ -1249,6 +1258,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
 
     for age in 1..=3_u32 {
         let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id: 1,
             render_generation: 1,
             scene: scene(2200, 100),
@@ -1292,6 +1302,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
             planner.commit_presented_transition(plan.render_damage.clone());
             let frame_id = 2 + index as u64;
             history.replace_ready(NativeFrameSceneSnapshot {
+                output_id: OutputId::from_raw(1).expect("nonzero output id"),
                 frame_id,
                 render_generation: frame_id,
                 scene: current_scene,
@@ -1307,6 +1318,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
         let retry_scene = scene(1400, 110);
         let rejected_frame_id = 10 + age as u64;
         history.replace_ready(NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id: rejected_frame_id,
             render_generation: 900,
             scene: retry_scene.clone(),
@@ -1318,6 +1330,7 @@ fn rejected_oversized_ssd_retry_matches_full_reference_for_buffer_ages_one_two_t
         assert!(history.queue_submission(rejected_token));
         assert!(history.discard_submission(rejected_token));
         history.replace_ready(NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id: rejected_frame_id + 1,
             render_generation: 900,
             scene: retry_scene.clone(),
@@ -1447,6 +1460,7 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
     assert_eq!(widths.last(), Some(&800));
     let first_surface = surface(widths[0]);
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 0,
         render_generation: 0,
         scene: scene(&first_surface, widths[0]),
@@ -1508,6 +1522,7 @@ fn presented_scene_history_repairs_oversized_shrink_sequence() {
         assert_eq!(mismatches, 0, "shrink step {step} at width {width}");
 
         history.replace_ready(NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id: step as u64,
             render_generation: step as u64,
             scene: current_scene,

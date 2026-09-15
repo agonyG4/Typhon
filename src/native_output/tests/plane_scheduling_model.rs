@@ -444,6 +444,7 @@ fn presented_cursor_promotes_only_on_the_exact_bundle_pageflip() {
     visible.x = 100;
     visible.y = 200;
     let expected_identity = PlanePageflipIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(7),
         token: token(8),
         output_generation: 9,
@@ -479,6 +480,7 @@ fn presented_bundle_promotes_primary_and_cursor_atomically() {
     );
     let mut snapshot = PresentedPlaneSnapshot::initial(hidden);
     let identity = PlanePageflipIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(70),
         token: token(71),
         output_generation: 72,
@@ -524,6 +526,7 @@ fn presented_snapshot_preserves_the_other_plane_and_rejects_every_stale_identity
     );
     let mut snapshot = PresentedPlaneSnapshot::initial(hidden);
     let identity = PlanePageflipIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(82),
         token: token(81),
         output_generation: 83,
@@ -583,6 +586,7 @@ fn capability_key(class: CursorGeometryClass) -> CursorCapabilityKey {
     };
     let normalized = normalize_cursor_geometry(input).expect("test geometry is visible");
     CursorCapabilityKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         output_generation: 3,
         crtc_id: 4,
         plane_id: 5,
@@ -613,6 +617,30 @@ fn capability_key(class: CursorGeometryClass) -> CursorCapabilityKey {
         destination_width: normalized.destination.width,
         destination_height: normalized.destination.height,
     }
+}
+
+#[test]
+fn cursor_capability_identity_is_qualified_by_logical_output() {
+    let first = capability_key(CursorGeometryClass::FullyVisible);
+    let mut second = first;
+    second.output_id = oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id");
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn pageflip_identity_is_qualified_by_logical_output() {
+    let first = PlanePageflipIdentity {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
+        bundle_id: bundle_id(1),
+        token: token(1),
+        output_generation: 1,
+        crtc_id: 1,
+    };
+    let mut second = first;
+    second.output_id = oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id");
+
+    assert_ne!(first, second);
 }
 
 fn geometry(x: i32, y: i32) -> CursorGeometryInput {

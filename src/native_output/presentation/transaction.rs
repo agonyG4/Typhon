@@ -6,6 +6,7 @@ use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DrmContentType, OutputPresentationMode,
     SurfaceDamagePresentation,
 };
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::{
@@ -383,6 +384,7 @@ impl OutputProtocolObligations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputTransaction {
     id: OutputTransactionId,
+    output_id: OutputId,
     output_generation: u64,
     created_at: MonotonicTimestampNs,
     reservation: FramePresentationReservation,
@@ -749,6 +751,11 @@ impl OutputTransaction {
         }
         Ok(Self {
             id,
+            // The current product has one logical output, whose allocator
+            // assigns the first identity during compositor creation. Runtime
+            // callers qualify transactions with their owned identity through
+            // `with_output_id` when constructing output-scoped work.
+            output_id: OutputId::from_raw(1).expect("single native output identity is nonzero"),
             output_generation,
             created_at,
             reservation,
@@ -766,6 +773,15 @@ impl OutputTransaction {
 
     pub(crate) const fn id(&self) -> OutputTransactionId {
         self.id
+    }
+
+    pub(crate) const fn output_id(&self) -> OutputId {
+        self.output_id
+    }
+
+    pub(crate) const fn with_output_id(mut self, output_id: OutputId) -> Self {
+        self.output_id = output_id;
+        self
     }
 
     pub(crate) const fn output_generation(&self) -> u64 {
@@ -991,6 +1007,7 @@ impl OutputContentKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DirectScanoutCandidateKey {
+    pub(crate) output_id: OutputId,
     pub(crate) content: OutputContentKey,
     pub(crate) output_generation: u64,
     pub(crate) cursor_content_key: Option<CursorContentKey>,
@@ -1000,6 +1017,7 @@ pub(crate) struct DirectScanoutCandidateKey {
 impl DirectScanoutCandidateKey {
     pub(crate) fn from_candidate(
         candidate: &DirectScanoutSceneCandidate,
+        output_id: OutputId,
         output_generation: u64,
         cursor_content_key: Option<CursorContentKey>,
         color_epoch: u64,
@@ -1007,6 +1025,7 @@ impl DirectScanoutCandidateKey {
         let buffer_id = NonZeroU64::new(candidate.buffer_identity.id().get())?;
         let modifier = candidate.buffer.planes().first()?.descriptor().modifier.0;
         Some(Self {
+            output_id,
             content: OutputContentKey::new(
                 candidate.surface_id,
                 buffer_id,

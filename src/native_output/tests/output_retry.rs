@@ -21,6 +21,7 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
     let presented_scene = NativeSceneSnapshot::from_surfaces(&[presented], Vec::new());
     let retry_scene = NativeSceneSnapshot::from_surfaces(&[retry], Vec::new());
     let mut history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 1,
         render_generation: 1,
         scene: presented_scene,
@@ -29,6 +30,7 @@ fn rejected_same_generation_retry_repairs_from_presented_scene() {
         lifecycle: LifecycleFrameSnapshot::default(),
     });
     history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         frame_id: 2,
         render_generation: 7,
         scene: retry_scene.clone(),

@@ -97,6 +97,7 @@ fn test_cursor() -> NativeAtomicCursor {
             pixel_blend_mode_premultiplied: None,
         },
         generation: 1,
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         output_transform: 0,
         output_scale_milli: 1_000,
         desired_epoch: INITIAL_CURSOR_EPOCH,
@@ -860,6 +861,7 @@ fn client_cursor_hotspot_outside_source_is_rejected() {
 #[test]
 fn client_cursor_image_key_changes_for_commit_and_hotspot() {
     let first = NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         surface_id: 7,
         buffer_id: 11,
         commit_sequence: 3,
@@ -882,6 +884,7 @@ fn client_cursor_image_key_changes_for_commit_and_hotspot() {
 #[test]
 fn client_cursor_image_key_changes_for_output_scale() {
     let first = NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         surface_id: 7,
         buffer_id: 11,
         commit_sequence: 3,
@@ -900,9 +903,33 @@ fn client_cursor_image_key_changes_for_output_scale() {
 }
 
 #[test]
+fn client_cursor_image_key_is_qualified_by_logical_output() {
+    let first = NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        surface_id: 7,
+        buffer_id: 11,
+        commit_sequence: 3,
+        hotspot_x: 1,
+        hotspot_y: 2,
+        width: 32,
+        height: 32,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    };
+    let second = NativeCursorImageKey {
+        output_id: OutputId::from_raw(2).expect("nonzero output id"),
+        ..first
+    };
+
+    assert_ne!(first, second);
+}
+
+#[test]
 fn hardware_client_cursor_replacement_uses_new_commit_key_with_cached_buffer() {
     let mut cursor = test_cursor();
     let old_source_key = NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         surface_id: 7,
         buffer_id: 11,
         commit_sequence: 100,
@@ -915,6 +942,7 @@ fn hardware_client_cursor_replacement_uses_new_commit_key_with_cached_buffer() {
         output_scale_milli: 1_000,
     };
     let source_key = NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
         surface_id: 7,
         buffer_id: 11,
         commit_sequence: 101,

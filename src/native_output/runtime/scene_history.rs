@@ -4,6 +4,7 @@ use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, lamp_foot
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeFrameSceneSnapshot {
+    pub(crate) output_id: OutputId,
     pub(crate) frame_id: u64,
     pub(crate) render_generation: u64,
     pub(crate) scene: NativeSceneSnapshot,
@@ -14,11 +15,13 @@ pub(crate) struct NativeFrameSceneSnapshot {
 
 impl NativeFrameSceneSnapshot {
     pub(crate) fn from_resolved_frame_scene(
+        output_id: OutputId,
         frame_id: u64,
         resolved: &ResolvedNativeFrameScene<'_>,
         cursor_damage: NativeCursorDamageBounds,
     ) -> Self {
         Self {
+            output_id,
             frame_id,
             render_generation: resolved.render_generation,
             scene: resolved.snapshot_owned(),
@@ -29,8 +32,9 @@ impl NativeFrameSceneSnapshot {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct NativeSceneHistory {
+    output_id: OutputId,
     presented: Option<NativeFrameSceneSnapshot>,
     ready: Option<NativeFrameSceneSnapshot>,
     submitted: VecDeque<(u64, NativeFrameSceneSnapshot)>,
@@ -48,11 +52,17 @@ impl NativeSceneHistory {
     const MAX_SUBMITTED_SCENES: usize = 3;
 
     pub(crate) fn new(presented: NativeFrameSceneSnapshot) -> Self {
+        let output_id = presented.output_id;
         Self {
+            output_id,
             presented: Some(presented),
             ready: None,
             submitted: VecDeque::new(),
         }
+    }
+
+    pub(crate) const fn output_id(&self) -> OutputId {
+        self.output_id
     }
 
     #[cfg(test)]
@@ -121,8 +131,12 @@ impl NativeSceneHistory {
         self.submitted.clear();
     }
 
-    pub(crate) fn replace_ready(&mut self, snapshot: NativeFrameSceneSnapshot) {
+    pub(crate) fn replace_ready(&mut self, snapshot: NativeFrameSceneSnapshot) -> bool {
+        if snapshot.output_id != self.output_id {
+            return false;
+        }
         self.ready = Some(snapshot);
+        true
     }
 
     pub(crate) fn discard_ready(&mut self) {
@@ -131,6 +145,13 @@ impl NativeSceneHistory {
 
     pub(crate) fn queue_submission(&mut self, token: u64) -> bool {
         if self.submitted.len() >= Self::MAX_SUBMITTED_SCENES {
+            return false;
+        }
+        if self
+            .ready
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.output_id != self.output_id)
+        {
             return false;
         }
         let Some(snapshot) = self.ready.take() else {
@@ -156,6 +177,9 @@ impl NativeSceneHistory {
             .submitted
             .iter()
             .find(|(submitted_token, _)| *submitted_token == token)?;
+        if current.output_id != self.output_id {
+            return None;
+        }
         let previous_frame_id = self.presented.as_ref().map(|snapshot| snapshot.frame_id);
         if previous_frame_id.is_some_and(|frame_id| current.frame_id <= frame_id) {
             return None;
@@ -195,6 +219,14 @@ impl NativeSceneHistory {
     }
 
     pub(crate) fn promote_immediate(&mut self) -> bool {
+        if self
+            .ready
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.output_id != self.output_id)
+        {
+            self.ready = None;
+            return false;
+        }
         let Some(snapshot) = self.ready.take() else {
             return false;
         };
@@ -221,6 +253,9 @@ impl NativeSceneHistory {
             .submitted
             .remove(index)
             .expect("position was returned from submitted scene history");
+        if snapshot.output_id != self.output_id {
+            return false;
+        }
         if self
             .presented
             .as_ref()
@@ -284,6 +319,7 @@ mod tests {
 
     fn snapshot(frame_id: u64) -> NativeFrameSceneSnapshot {
         NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id,
             render_generation: frame_id,
             scene: NativeSceneSnapshot::default(),
@@ -306,6 +342,7 @@ mod tests {
             )],
         );
         NativeFrameSceneSnapshot {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
             frame_id,
             render_generation: frame_id,
             scene: NativeSceneSnapshot::default(),
@@ -430,6 +467,37 @@ mod tests {
         assert_eq!(
             history.presented.as_ref().map(|frame| frame.frame_id),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn scene_history_rejects_a_snapshot_from_another_logical_output() {
+        let first = OutputId::from_raw(1).expect("nonzero output id");
+        let second = OutputId::from_raw(2).expect("nonzero output id");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        let mut foreign = snapshot(2);
+        foreign.output_id = second;
+
+        assert_eq!(history.output_id(), first);
+        assert!(!history.replace_ready(foreign));
+        assert!(history.ready.is_none());
+    }
+
+    #[test]
+    fn pageflip_promotion_rejects_a_foreign_output_snapshot() {
+        let first = OutputId::from_raw(1).expect("nonzero output id");
+        let second = OutputId::from_raw(2).expect("nonzero output id");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        let mut foreign = snapshot(2);
+        foreign.output_id = second;
+        history.submitted.push_back((77, foreign));
+
+        assert!(!history.promote_pageflip(77));
+        assert_eq!(
+            history
+                .presented_snapshot()
+                .map(|snapshot| snapshot.output_id),
+            Some(first)
         );
     }
 

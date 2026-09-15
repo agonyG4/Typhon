@@ -43,6 +43,7 @@ use oblivion_one::compositor::{
     ResolvedPointerConstraintBackendRequest, TearingPolicy, WindowId,
     render_scene_elements_for_surfaces, resize_debug_log,
 };
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::{
     AtomicCommitState, AtomicCompletion, AtomicCursorPlaneProperties, AtomicCursorVisualState,
     AtomicKmsErrorKind, ConnectorId, CrtcId, DRM_FORMAT_ARGB8888, FramebufferId,

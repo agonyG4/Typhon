@@ -187,6 +187,7 @@ impl AtomicEglGbmScanout {
                             crate::native_output::CursorKmsAssignment::Set,
                         ),
                         crate::native_output::CursorKmsSubmitContext {
+                            output_id: output_transactions.output_id(),
                             output_generation: output_transactions
                                 .transaction(transaction_id)
                                 .map_or(0, |transaction| {

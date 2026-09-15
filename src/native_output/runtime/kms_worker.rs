@@ -221,6 +221,7 @@ pub(super) fn queue_explicit_composited_frame(
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         owners,
+        output_id: output_transactions.output_id(),
         transaction_id,
         token,
         output_generation,
@@ -457,6 +458,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         owners,
+        output_id: output_transactions.output_id(),
         transaction_id,
         token,
         output_generation,
@@ -914,6 +916,7 @@ impl NativeRuntime {
                 }
                 let trace_snapshot = ownership.job.owners.trace_reveal();
                 let trace_identity = crate::native_output::CursorRevealPhysicalIdentity {
+                    output_id: ownership.job.output_id,
                     output_generation: ownership.job.output_generation,
                     crtc_id: ownership.job.crtc_id,
                     token: ownership.job.token,

@@ -7,6 +7,7 @@ use std::{
 };
 
 use oblivion_one::compositor::CursorRevealAuthority;
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
 
 use super::pipeline::PresentedPrimaryState;
@@ -398,6 +399,7 @@ impl PresentedPlaneSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlanePageflipIdentity {
+    pub(crate) output_id: OutputId,
     pub(crate) bundle_id: KmsCommitBundleId,
     pub(crate) token: PageFlipToken,
     pub(crate) output_generation: u64,
@@ -411,6 +413,7 @@ impl PlanePageflipIdentity {
         crtc_id: u32,
     ) -> Self {
         Self {
+            output_id: OutputId::from_raw(1).expect("single native output identity is nonzero"),
             bundle_id: KmsCommitBundleId::from_pageflip_token(token),
             token,
             output_generation,

@@ -67,6 +67,7 @@ pub(super) fn replace_atomic_ready_scene(
 ) {
     let cursor_damage = scene_history.cursor_damage(cursor);
     scene_history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: scene_history.output_id(),
         frame_id,
         render_generation,
         scene: resolved_snapshot,
@@ -344,6 +345,7 @@ pub(super) fn replace_ready_scene(
     current_software_cursor_damage: Option<NativeDamageRect>,
 ) {
     let mut snapshot = NativeFrameSceneSnapshot::from_resolved_frame_scene(
+        scene_history.output_id(),
         frame_index,
         resolved_scene,
         scene_history.cursor_damage((current_client_cursor_damage, current_software_cursor_damage)),
@@ -432,16 +434,24 @@ pub(super) fn worker_cursor_pin(
 
 pub(super) fn validation_base_for_submission(
     worker: Option<&KmsCommitWorkerHandle>,
+    output_id: OutputId,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     output_generation: u64,
     crtc_id: u32,
 ) -> Option<KmsValidationBase> {
     worker
         .and_then(|worker| worker.pending_bundle_snapshot(output_generation, crtc_id))
+        .filter(|snapshot| match snapshot {
+            PendingBundleSnapshot::MutablePreFreeze { .. } => false,
+            PendingBundleSnapshot::Frozen(identity) | PendingBundleSnapshot::InFlight(identity) => {
+                identity.output_id == output_id
+            }
+        })
         .map_or_else(
             || {
                 Some(KmsValidationBase::Presented {
                     snapshot: presented_planes,
+                    output_id,
                     output_generation,
                     crtc_id,
                 })
@@ -989,6 +999,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
     {
         ledger.bind(
             CursorRevealPhysicalIdentity {
+                output_id: output_transactions.output_id(),
                 output_generation,
                 crtc_id,
                 token,
@@ -1180,6 +1191,7 @@ pub(super) fn finish_direct_worker_queued(
                 commit_token,
             ),
         owners,
+        output_id: output_transactions.output_id(),
         transaction_id,
         token: commit_token,
         output_generation,

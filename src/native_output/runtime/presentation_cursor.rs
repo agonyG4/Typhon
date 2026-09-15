@@ -193,7 +193,8 @@ pub(super) fn prepare_cursor_image(
     perf: NativePerfLogger,
 ) -> bool {
     if let Some(client) = client_cursor {
-        let source_key = NativeCursorImageKey::for_surface_at_output_scale(
+        let source_key = NativeCursorImageKey::for_surface_at_output_scale_for_output(
+            cursor.output_id,
             client.surface,
             client.hotspot_x,
             client.hotspot_y,
@@ -1139,6 +1140,7 @@ mod tests {
 
     fn key() -> CursorCapabilityKey {
         CursorCapabilityKey {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             output_generation: 1,
             crtc_id: 7,
             plane_id: 8,
@@ -1185,6 +1187,7 @@ mod tests {
             selection_evidence: Default::default(),
         };
         let identity = KmsCommitBundleIdentity {
+            output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
                 token,
             ),
@@ -1198,6 +1201,7 @@ mod tests {
             transaction_id,
             bundle_identity: identity,
             validation_base: KmsValidationBase::Presented {
+                output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
                 snapshot: PresentedPlaneSnapshot::initial(PresentedCursorState::hidden()),
                 output_generation: 1,
                 crtc_id: 7,

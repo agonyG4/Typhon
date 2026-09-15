@@ -843,6 +843,8 @@ impl CompositorState {
     }
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
         let mut state = Self {
+            native_output_id: None,
+            output_id_allocator: OutputIdAllocator::default(),
             frame_clock_start: Some(Instant::now()),
             next_window_id: 1,
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
@@ -857,6 +859,7 @@ impl CompositorState {
             pointer_hit_instrumentation_enabled: pointer_debug_enabled(),
             ..Self::default()
         };
+        state.native_output_id = state.output_id_allocator.allocate().ok();
         // PresentationAnimator has its own compatibility defaults for older
         // callers. The compositor-owned control plane is authoritative for
         // the real runtime configuration, including persisted disablement.
@@ -866,6 +869,17 @@ impl CompositorState {
         state.set_lifecycle_animation_enabled(state.animation_control.enabled());
         state.rebuild_active_scene_view();
         state
+    }
+
+    pub(in crate::compositor) fn native_output_id(&self) -> Option<OutputId> {
+        self.native_output_id
+    }
+
+    pub(in crate::compositor) fn ensure_native_output_id(&mut self) -> Option<OutputId> {
+        if self.native_output_id.is_none() {
+            self.native_output_id = self.output_id_allocator.allocate().ok();
+        }
+        self.native_output_id
     }
     pub(in crate::compositor) fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
         self.buffer_ids.allocate()

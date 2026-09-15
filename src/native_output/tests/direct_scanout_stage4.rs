@@ -50,6 +50,7 @@ fn test_direct_key(content_epoch: u64) -> DirectScanoutCandidateKey {
         0,
     );
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content,
         output_generation: 1,
         cursor_content_key: None,
@@ -168,6 +169,7 @@ fn new_content_epoch_can_reuse_validation_key_but_still_submits() {
     let first = test_direct_key(3);
     let second = test_direct_key(4);
     let validation_key = DirectPlaneValidationKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         output_generation: 1,
         crtc_id: 7,
         primary_plane_id: 8,

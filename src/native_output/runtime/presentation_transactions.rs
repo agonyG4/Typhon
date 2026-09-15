@@ -897,6 +897,7 @@ pub(super) fn submit_plane_delta(
                                 CursorKmsAssignment::Disable
                             },
                             CursorKmsSubmitContext {
+                                output_id: output_transactions.output_id(),
                                 output_generation,
                                 transaction_id: Some(transaction_id),
                                 token,
@@ -914,6 +915,7 @@ pub(super) fn submit_plane_delta(
                     {
                         ledger.bind(
                             CursorRevealPhysicalIdentity {
+                                output_id: output_transactions.output_id(),
                                 output_generation,
                                 crtc_id,
                                 token,

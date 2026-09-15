@@ -27,6 +27,7 @@ fn key() -> DirectScanoutCandidateKey {
 
 fn key_with_generation(output_generation: u64) -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             9,
             NonZeroU64::new(42).unwrap(),

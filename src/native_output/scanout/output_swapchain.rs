@@ -31,6 +31,7 @@ use crate::native_output::presentation::{
     plane::{CursorRevealTraceSnapshot, FrozenPrimaryCursorPlan},
     plane_policy::CursorCapabilityKey,
 };
+use oblivion_one::core::OutputId;
 use oblivion_one::native::buffering::PresentationOpportunityFrontier;
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
@@ -190,6 +191,7 @@ struct SuspendedOutputSlot {
 
 #[derive(Debug)]
 pub(crate) struct RenderedOutputFrame {
+    pub(crate) output_id: OutputId,
     pub(crate) id: u64,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) slot: OutputSlotId,
@@ -290,6 +292,7 @@ pub(crate) struct WorkerQueuedOutputFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputFrameIdentitySnapshot {
+    pub(crate) output_id: OutputId,
     pub(crate) frame_id: u64,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) transaction_id: OutputTransactionId,
@@ -307,6 +310,7 @@ pub(crate) struct OutputFrameIdentitySnapshot {
 /// the output pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OutputFrameKey {
+    pub(crate) output_id: OutputId,
     pub(crate) frame_id: u64,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) transaction_id: OutputTransactionId,
@@ -319,6 +323,7 @@ pub(crate) struct OutputFrameKey {
 impl From<&OutputFrameIdentitySnapshot> for OutputFrameKey {
     fn from(snapshot: &OutputFrameIdentitySnapshot) -> Self {
         Self {
+            output_id: snapshot.output_id,
             frame_id: snapshot.frame_id,
             protocol_batch_id: snapshot.protocol_batch_id,
             transaction_id: snapshot.transaction_id,
@@ -333,6 +338,7 @@ impl From<&OutputFrameIdentitySnapshot> for OutputFrameKey {
 impl From<&RenderedOutputFrame> for OutputFrameKey {
     fn from(frame: &RenderedOutputFrame) -> Self {
         Self {
+            output_id: frame.output_id,
             frame_id: frame.id,
             protocol_batch_id: frame.protocol_batch_id,
             transaction_id: frame.transaction_id,
@@ -347,6 +353,7 @@ impl From<&RenderedOutputFrame> for OutputFrameKey {
 impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
     fn from(frame: &RenderedOutputFrame) -> Self {
         Self {
+            output_id: frame.output_id,
             frame_id: frame.id,
             protocol_batch_id: frame.protocol_batch_id,
             transaction_id: frame.transaction_id,
@@ -412,6 +419,7 @@ pub(crate) struct CompletedOutputFrame {
 
 #[derive(Debug)]
 pub(crate) struct AtomicOutputSwapchain {
+    output_id: OutputId,
     slots: OutputSlotSet,
     pool_generation: u64,
     current: OutputSlotId,
@@ -430,13 +438,32 @@ pub(crate) struct AtomicOutputSwapchain {
 }
 
 impl AtomicOutputSwapchain {
+    fn default_output_id() -> OutputId {
+        OutputId::from_raw(1).expect("single native output identity is nonzero")
+    }
+
     pub(crate) fn from_presented_slots(
+        slots: OutputSlotSet,
+        current: OutputSlotId,
+        pool_generation: u64,
+    ) -> io::Result<Self> {
+        Self::from_presented_slots_for_output(
+            Self::default_output_id(),
+            slots,
+            current,
+            pool_generation,
+        )
+    }
+
+    pub(crate) fn from_presented_slots_for_output(
+        output_id: OutputId,
         slots: OutputSlotSet,
         current: OutputSlotId,
         pool_generation: u64,
     ) -> io::Result<Self> {
         OutputSlotOwnership::from_presented_slots(slots, Some(current))?;
         Ok(Self {
+            output_id,
             slots,
             pool_generation,
             current,
@@ -529,6 +556,10 @@ impl AtomicOutputSwapchain {
         self.pool_generation
     }
 
+    pub(crate) const fn output_id(&self) -> OutputId {
+        self.output_id
+    }
+
     pub(crate) const fn slot_capacity(&self) -> usize {
         self.slots.capacity()
     }
@@ -596,6 +627,7 @@ impl AtomicOutputSwapchain {
             .expect("test frame ownership server should bind");
         let protocol_batch_id = server.take_frame_batch_for_render(self.next_frame_id);
         self.finish_render_owned(RenderedOutputFrame {
+            output_id: self.output_id,
             id: self.next_frame_id,
             transaction_id: OutputTransactionId::new(
                 NonZeroU64::new(self.next_frame_id).expect("test transaction ID is nonzero"),
@@ -653,6 +685,11 @@ impl AtomicOutputSwapchain {
         if frame.id != self.next_frame_id || frame.pool_generation != self.pool_generation {
             return Err(io::Error::other(
                 "rendered output frame identity does not match the swapchain",
+            ));
+        }
+        if frame.output_id != self.output_id {
+            return Err(io::Error::other(
+                "rendered output frame belongs to another logical output",
             ));
         }
         if let Some(target) = frame.bound_target() {
@@ -719,6 +756,7 @@ impl AtomicOutputSwapchain {
             .ok_or_else(|| io::Error::other("test output frame ID overflow"))?;
         self.rendering = None;
         self.ready = Some(RenderedOutputFrame {
+            output_id: self.output_id,
             id: frame_id,
             transaction_id: OutputTransactionId::new(
                 std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),
@@ -2297,6 +2335,58 @@ mod tests {
     }
 
     #[test]
+    fn physical_frame_key_is_qualified_by_logical_output() {
+        let first = OutputFrameKey {
+            output_id: OutputId::from_raw(1).expect("nonzero output id"),
+            frame_id: 1,
+            protocol_batch_id: CompositorFrameBatchId::new(
+                NonZeroU64::new(1).expect("nonzero batch id"),
+            ),
+            transaction_id: OutputTransactionId::new(
+                NonZeroU64::new(1).expect("nonzero transaction id"),
+            ),
+            slot: OutputSlotId::new(0).expect("output slot"),
+            framebuffer_id: FramebufferId::new(1).expect("nonzero framebuffer id"),
+            render_generation: 1,
+            pool_generation: 1,
+        };
+        let second = OutputFrameKey {
+            output_id: OutputId::from_raw(2).expect("nonzero output id"),
+            ..first
+        };
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn swapchain_rejects_a_frame_from_another_logical_output() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let first = OutputId::from_raw(1).expect("nonzero output id");
+        let second = OutputId::from_raw(2).expect("nonzero output id");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots_for_output(
+            first,
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let mut frame = test_frame(
+            &swapchain,
+            slot,
+            test_target(1, 1, PresentationTargetReason::ReactiveDouble),
+        );
+        frame.output_id = second;
+
+        assert!(swapchain.finish_render_owned(frame).is_err());
+    }
+
+    #[test]
     fn suspend_worker_completion_proof_stays_owned_on_token_error() {
         let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
             OutputSlotSet::new([
@@ -2869,6 +2959,7 @@ mod tests {
                 .expect("test batch ID is nonzero"),
         );
         RenderedOutputFrame {
+            output_id: swapchain.output_id,
             id: frame_id,
             transaction_id: OutputTransactionId::new(
                 std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),

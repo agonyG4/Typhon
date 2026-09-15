@@ -6,6 +6,7 @@ use super::transaction::{
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::OutputPresentationMode;
 use oblivion_one::compositor::SurfaceDamagePresentation;
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::collections::{HashMap, VecDeque};
@@ -156,6 +157,7 @@ pub(crate) enum OutputTransactionTransitionKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputTransactionError {
+    OutputMismatch,
     ActiveCapacityExceeded,
     DuplicateId,
     UnknownTransaction,
@@ -290,6 +292,7 @@ pub(crate) struct OutputTransactionCounters {
 
 #[derive(Debug)]
 pub(crate) struct OutputTransactionLedger {
+    output_id: OutputId,
     allocator: super::transaction::OutputTransactionAllocator,
     active_capacity: usize,
     history_capacity: usize,
@@ -308,17 +311,38 @@ impl Default for OutputTransactionLedger {
 }
 
 impl OutputTransactionLedger {
+    fn default_output_id() -> OutputId {
+        OutputId::from_raw(1).expect("single native output identity is nonzero")
+    }
+
     pub(crate) fn new() -> Self {
+        Self::new_for_output(Self::default_output_id())
+    }
+
+    pub(crate) fn new_for_output(output_id: OutputId) -> Self {
         let history_capacity = std::env::var("OBLIVION_ONE_OUTPUT_TRANSACTION_HISTORY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(DEFAULT_OUTPUT_TRANSACTION_HISTORY_CAPACITY)
             .clamp(64, 65_536);
-        Self::with_capacities(DEFAULT_OUTPUT_TRANSACTION_ACTIVE_CAPACITY, history_capacity)
+        Self::for_output(
+            output_id,
+            DEFAULT_OUTPUT_TRANSACTION_ACTIVE_CAPACITY,
+            history_capacity,
+        )
     }
 
     pub(crate) fn with_capacities(active_capacity: usize, history_capacity: usize) -> Self {
+        Self::for_output(Self::default_output_id(), active_capacity, history_capacity)
+    }
+
+    pub(crate) fn for_output(
+        output_id: OutputId,
+        active_capacity: usize,
+        history_capacity: usize,
+    ) -> Self {
         Self {
+            output_id,
             allocator: super::transaction::OutputTransactionAllocator::default(),
             active_capacity,
             history_capacity: history_capacity.max(1),
@@ -329,6 +353,10 @@ impl OutputTransactionLedger {
             counters: OutputTransactionCounters::default(),
             last_created: None,
         }
+    }
+
+    pub(crate) const fn output_id(&self) -> OutputId {
+        self.output_id
     }
 
     pub(crate) fn allocate_id(
@@ -343,6 +371,9 @@ impl OutputTransactionLedger {
         &mut self,
         descriptor: OutputTransaction,
     ) -> Result<(), OutputTransactionError> {
+        if descriptor.output_id() != self.output_id {
+            return Err(OutputTransactionError::OutputMismatch);
+        }
         let id = descriptor.id();
         if self.active.contains_key(&id)
             || self

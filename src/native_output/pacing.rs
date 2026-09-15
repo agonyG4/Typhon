@@ -13,6 +13,7 @@ mod tests {
         render_generation: u64,
     ) -> OutputFrameIdentitySnapshot {
         OutputFrameIdentitySnapshot {
+            output_id: oblivion_one::core::OutputId::from_raw(1).unwrap(),
             frame_id,
             protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
                 std::num::NonZeroU64::new(frame_id).unwrap(),

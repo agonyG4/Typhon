@@ -23,6 +23,7 @@ fn candidate_key(content_epoch: u64) -> DirectScanoutCandidateKey {
         NonZeroU64::new(content_epoch).expect("test content epoch must be nonzero"),
     );
     DirectScanoutCandidateKey {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         content: OutputContentKey::new(
             7,
             buffer_id,

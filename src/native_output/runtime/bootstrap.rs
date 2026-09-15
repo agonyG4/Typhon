@@ -187,6 +187,7 @@ fn build_native_kms_startup_plan(
 }
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
+    output_id: OutputId,
     keyboard_store: KeyboardConfigurationStore,
     cursor_image: Arc<CompositorCursorImage>,
     cursor_manager: CursorThemeManager,
@@ -222,6 +223,7 @@ impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
             mut server,
+            output_id,
             keyboard_store,
             cursor_image,
             mut cursor_manager,
@@ -637,6 +639,7 @@ impl NativeRuntime {
         let xwayland_environment_materialized = xwayland_app_environment.is_some();
         let mut runtime = Self {
             server,
+            output_id,
             cursor_image,
             cursor_manager,
             perf,
@@ -710,7 +713,7 @@ impl NativeRuntime {
             forced_shutdown_pacing_settled: None,
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
-            output_transactions: OutputTransactionLedger::new(),
+            output_transactions: OutputTransactionLedger::new_for_output(output_id),
             confirmed_output_presentation: ConfirmedOutputPresentationState::default(),
             presentation_timing,
             presentation_deadline,
@@ -773,6 +776,9 @@ impl NativeRuntime {
             app,
             app_gpu_preference,
         } = config;
+        let output_id = server.native_output_id().ok_or_else(|| {
+            io::Error::other("native logical output identity allocation exhausted")
+        })?;
         let keyboard_store = KeyboardConfigurationStore::from_environment()
             .unwrap_or_else(KeyboardConfigurationStore::unavailable);
         let (persisted_keyboard_config, keyboard_persistence) =
@@ -935,6 +941,7 @@ impl NativeRuntime {
                         target.width,
                         target.height,
                         drm_file_generation,
+                        output_id,
                     )?;
                     let startup_plan = build_native_kms_startup_plan(
                         kms_policy,
@@ -1054,7 +1061,12 @@ impl NativeRuntime {
                         discovery.cursor_width,
                         discovery.cursor_height,
                         drm_file_generation,
-                        CursorOutputIdentity::new(target.crtc_id, target.width, target.height),
+                        CursorOutputIdentity::new(
+                            output_id,
+                            target.crtc_id,
+                            target.width,
+                            target.height,
+                        ),
                         cursor_image.clone(),
                     ) {
                         Ok(mut cursor) => {
@@ -1305,7 +1317,7 @@ impl NativeRuntime {
             }
         };
         let initial_paint_stats = initial_paint.require_rendered("initial native scanout")?;
-        #[rustfmt::skip] let mut initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(0, &initial_resolved_scene, NativeCursorDamageBounds::default());
+        #[rustfmt::skip] let mut initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(output_id, 0, &initial_resolved_scene, NativeCursorDamageBounds::default());
         initial_presented_scene.lifecycle = initial_lifecycle_snapshot;
         drop(initial_resolved_scene);
         println!("native scanout backend active: {}", scanout.kind().as_str());
@@ -1505,6 +1517,7 @@ impl NativeRuntime {
         });
         Self::finish_bootstrap(NativeRuntimeBootstrapTail {
             server,
+            output_id,
             keyboard_store,
             cursor_image,
             cursor_manager,

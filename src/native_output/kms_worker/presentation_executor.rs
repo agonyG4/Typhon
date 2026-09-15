@@ -86,6 +86,7 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     KmsCursorUpdate::Unchanged => CursorKmsAssignment::Unchanged,
                 },
                 CursorKmsSubmitContext {
+                    output_id: job.output_id,
                     output_generation: job.output_generation,
                     transaction_id: Some(job.transaction_id),
                     token: job.token,

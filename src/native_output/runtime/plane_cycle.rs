@@ -215,6 +215,7 @@ pub(super) fn queue_plane_delta(
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         owners,
+        output_id: output_transactions.output_id(),
         transaction_id,
         token,
         output_generation,
@@ -419,6 +420,7 @@ pub(super) fn prepare_plane_delta(
         desired.clone(),
         OutputReleasePlan::Pageflip,
     )
+    .map(|transaction| transaction.with_output_id(output_transactions.output_id()))
     .map_err(io::Error::other)?;
     let transaction = if let Some(surface_damage) = cursor_surface_damage {
         transaction.with_surface_damage(surface_damage)

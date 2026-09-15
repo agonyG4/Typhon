@@ -363,6 +363,7 @@ impl AtomicEglGbmScanout {
         width: u32,
         height: u32,
         pool_generation: u64,
+        output_id: OutputId,
     ) -> io::Result<Self> {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
@@ -579,7 +580,7 @@ impl AtomicEglGbmScanout {
                 native_fence_functions,
                 pool: Some(pool),
                 swapchain: None,
-                direct: DirectScanoutControl::new(kms.as_fd(), pool_generation),
+                direct: DirectScanoutControl::new(kms.as_fd(), pool_generation, output_id),
                 width,
                 height,
                 dmabuf_feedback,
@@ -958,6 +959,7 @@ impl AtomicEglGbmScanout {
         };
         let transaction = match transaction_result {
             Ok(transaction) => transaction
+                .with_output_id(self.direct.output_id)
                 .with_presentation_state(presentation_mode, content_type)
                 .with_async_validation_key(async_validation_key),
             Err(error) => {
@@ -1241,6 +1243,7 @@ impl AtomicEglGbmScanout {
             .identity_signature();
         let rendered_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let frame = RenderedOutputFrame {
+            output_id: self.direct.output_id,
             id: frame_id,
             transaction_id,
             slot,
@@ -1528,8 +1531,12 @@ impl AtomicEglGbmScanout {
             OutputSlotId::new(2).unwrap(),
         ])?;
         let framebuffer_id = pool.slots[usize::from(slot.get())].framebuffer;
-        let mut swapchain =
-            AtomicOutputSwapchain::from_presented_slots(slots, slot, pool.pool_generation)?;
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots_for_output(
+            self.direct.output_id,
+            slots,
+            slot,
+            pool.pool_generation,
+        )?;
         swapchain.set_current_framebuffer_id(framebuffer_id);
         self.swapchain = Some(swapchain);
         pool.slots[usize::from(slot.get())].record_presentation(0);

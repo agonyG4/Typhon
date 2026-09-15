@@ -125,6 +125,7 @@ mod window_backend;
 mod window_state;
 mod workspace_protocol;
 pub use crate::core::WindowId;
+pub(crate) use crate::core::{OutputId, OutputIdAllocator};
 use commit_debug::*;
 pub use desktop_window::{
     DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowMetadata, X11DesktopRole,
@@ -645,6 +646,8 @@ pub(in crate::compositor) struct SurfaceTeardownResult {
 }
 #[derive(Debug, Default)]
 pub struct CompositorState {
+    native_output_id: Option<OutputId>,
+    output_id_allocator: OutputIdAllocator,
     pub accepted_clients: usize,
     pub xdg_toplevels: usize,
     pub xdg_popups: usize,
