@@ -1,4 +1,5 @@
 use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
+use oblivion_one::core::OutputId;
 use oblivion_one::native::kms::DrmFormatModifierPair;
 
 /// Exact state that makes a composited Async TEST_ONLY result reusable.
@@ -9,6 +10,7 @@ use oblivion_one::native::kms::DrmFormatModifierPair;
 /// type that were tested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CompositedAsyncValidationKey {
+    pub(crate) output_id: OutputId,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) primary_plane_id: u32,
@@ -21,6 +23,7 @@ pub(crate) struct CompositedAsyncValidationKey {
 
 impl CompositedAsyncValidationKey {
     pub(crate) const fn new(
+        output_id: OutputId,
         output_generation: u64,
         crtc_id: u32,
         primary_plane_id: u32,
@@ -30,6 +33,7 @@ impl CompositedAsyncValidationKey {
         content_type: DrmContentType,
     ) -> Self {
         Self {
+            output_id,
             output_generation,
             crtc_id,
             primary_plane_id,
@@ -48,6 +52,7 @@ mod tests {
 
     fn key() -> CompositedAsyncValidationKey {
         CompositedAsyncValidationKey::new(
+            OutputId::from_raw(1).expect("test output id"),
             7,
             42,
             43,
@@ -64,14 +69,15 @@ mod tests {
     #[test]
     fn exact_key_changes_when_any_qualification_input_changes() {
         let base = key();
-        let mut variants = [base; 7];
-        variants[0].output_generation += 1;
-        variants[1].crtc_id += 1;
-        variants[2].primary_plane_id += 1;
-        variants[3].format_modifier.modifier = 1;
-        variants[4].acquire_strategy = 1;
-        variants[5].cursor_visible = true;
-        variants[6].content_type = DrmContentType::Game;
+        let mut variants = [base; 8];
+        variants[0].output_id = OutputId::from_raw(2).expect("test output id");
+        variants[1].output_generation += 1;
+        variants[2].crtc_id += 1;
+        variants[3].primary_plane_id += 1;
+        variants[4].format_modifier.modifier = 1;
+        variants[5].acquire_strategy = 1;
+        variants[6].cursor_visible = true;
+        variants[7].content_type = DrmContentType::Game;
         for variant in variants {
             assert_ne!(base, variant);
         }

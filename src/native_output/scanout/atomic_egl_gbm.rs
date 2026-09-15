@@ -313,6 +313,7 @@ impl AtomicEglGbmScanout {
             && self.async_format_capable
             && self.async_output_generation == output_generation)
             .then_some(CompositedAsyncValidationKey::new(
+                self.direct.output_id,
                 output_generation,
                 self.async_crtc_id,
                 self.async_primary_plane_id,
@@ -902,6 +903,7 @@ impl AtomicEglGbmScanout {
         };
         let async_validation_key = presentation_mode.is_async().then(|| {
             CompositedAsyncValidationKey::new(
+                self.direct.output_id,
                 output_generation,
                 self.async_crtc_id,
                 self.async_primary_plane_id,
