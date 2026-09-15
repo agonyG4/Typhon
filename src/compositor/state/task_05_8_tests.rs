@@ -315,6 +315,54 @@ mod task_05_8_tests {
     }
 
     #[test]
+    fn scene_coverage_ignores_behind_content_and_reports_intersecting_content_above() {
+        let mut state = CompositorState::default();
+        let behind = WindowId::from_raw(31).expect("behind window id");
+        let covering = WindowId::from_raw(32).expect("covering window id");
+        let above = WindowId::from_raw(33).expect("above window id");
+        let outside = WindowId::from_raw(34).expect("outside window id");
+        let mut covering_surface =
+            test_surface(912, state.output_size.width, state.output_size.height);
+        covering_surface.placement = SurfacePlacement::absolute_root_at(0, 0);
+        let mut above_surface = test_surface(913, 40, 40);
+        above_surface.placement = SurfacePlacement::absolute_root_at(40, 40);
+        let mut outside_surface = test_surface(914, 40, 40);
+        outside_surface.placement = SurfacePlacement::absolute_root_at(2000, 0);
+        let mut behind_surface = test_surface(911, 40, 40);
+        behind_surface.placement = SurfacePlacement::absolute_root_at(10, 10);
+        state.install_native_frame_test_scene(
+            vec![behind_surface, covering_surface, above_surface, outside_surface],
+            &[(911, behind), (912, covering), (913, above), (914, outside)],
+            None,
+        );
+
+        let analysis = state.direct_scanout_scene_analysis();
+        assert_eq!(
+            analysis
+                .coverage
+                .covering_application_group
+                .as_ref()
+                .map(|group| group.root_surface_id),
+            Some(912)
+        );
+        assert_eq!(
+            analysis.coverage.visible_content_above,
+            vec![PresentationCoverageContent {
+                root_surface_id: 913,
+                kind: PresentationCoverageContentKind::Application,
+            }]
+        );
+        assert!(
+            analysis
+                .blockers
+                .reasons()
+                .contains(&DirectScanoutSceneRejection::ApplicationContentAbove)
+        );
+        assert!(analysis.candidate.is_none());
+        assert!(!analysis.blockers.is_empty());
+    }
+
+    #[test]
     fn fullscreen_owner_transient_family_survives_unrelated_application_culling() {
         let mut state = CompositorState::default();
         let unrelated = WindowId::from_raw(21).expect("unrelated window id");
