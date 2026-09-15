@@ -707,6 +707,7 @@ impl NativeRuntime {
             deferred_worker_completion: None,
             worker_timeout_pending: None,
             forced_shutdown_inflight: None,
+            forced_shutdown_pacing_settled: None,
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),

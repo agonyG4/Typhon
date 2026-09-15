@@ -570,6 +570,12 @@ impl DirectWorkerAdmissionGuard {
     }
 }
 
+pub(crate) fn validate_direct_worker_pacing(job: &KmsCommitJob) -> NativeResult<()> {
+    job.validate_pacing_ownership().map_err(|error| {
+        io::Error::other(format!("invalid direct worker pacing payload: {error:?}")).into()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quarantine_direct_admission_failure(
     emergency_quarantined_worker_jobs: &mut Vec<KmsCommitJob>,
@@ -1226,6 +1232,40 @@ pub(super) fn finish_direct_worker_queued(
     job.pacing_ticket = pacing_ticket;
     let mut guard =
         DirectWorkerAdmissionGuard::new(transaction_id, commit_token, pacing_ticket, admission);
+    if let Err(error) = validate_direct_worker_pacing(&job) {
+        let rollback = guard.rollback(
+            context.frame_pacing,
+            atomic_commit_arbiter,
+            output_transactions,
+        );
+        if let Err(reason) = rollback {
+            return quarantine_direct_admission_failure(
+                emergency_quarantined_worker_jobs,
+                direct_fallback_tracker,
+                worker,
+                guard,
+                job,
+                frame_scheduler,
+                atomic_commit_arbiter,
+                scanout,
+                reason,
+            );
+        }
+        if let Err(settle_error) = settle_failed_direct_worker_transaction(
+            scanout,
+            server,
+            output_transactions,
+            transaction_id,
+            protocol_batch_id,
+            OutputTransactionFailureStage::BackendOwnershipTransfer,
+            MonotonicTimestampNs::new(queued_at_ns),
+        ) {
+            emergency_quarantined_worker_jobs.push(job);
+            return Err(settle_error);
+        }
+        drop(job);
+        return Err(error);
+    }
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,

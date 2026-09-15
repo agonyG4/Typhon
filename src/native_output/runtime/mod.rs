@@ -72,12 +72,18 @@ pub(crate) use dmabuf_release::{
     DmabufGpuReleaseRegistry, DmabufGpuReleaseSafety, DmabufReleaseRetryReason,
     dmabuf_gpu_release_safety, retire_settled_output_terminals,
 };
+#[cfg(test)]
+pub(crate) use kms_worker_teardown::{
+    settle_returned_worker_pacing, settle_submitted_worker_pacing,
+};
 use metrics::NativeRenderTelemetry;
 pub(crate) use pointer_timing::{
     NativePointerPreReadObservation, NativePointerTimingBatch, NativePointerTimingPhase,
     NativePointerTimingPoint, NativePointerTimingTrace, NativePointerTimingTransition,
     NativePointerTransitionContext, capture_timing_point,
 };
+#[cfg(test)]
+pub(crate) use presentation_worker::validate_direct_worker_pacing;
 pub(crate) use resource_efficiency::{
     NativeWorkClass, NativeWorkDecision, ResourceEfficiencyMetrics,
 };
@@ -545,6 +551,10 @@ pub(crate) struct NativeRuntime {
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
     forced_shutdown_inflight: Option<super::kms_worker::WorkerInFlight>,
+    forced_shutdown_pacing_settled: Option<(
+        PageFlipToken,
+        crate::native_output::pacing::WorkerPacingTicket,
+    )>,
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,

@@ -141,6 +141,7 @@ impl NativeRuntime {
         NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerJoin);
         NativeSessionIo::join_kms_worker(self)?;
         let forced_identity = self.forced_shutdown_inflight.take();
+        let forced_pacing_settled = self.forced_shutdown_pacing_settled.take();
         if let Some(identity) = forced_identity {
             let _ = self
                 .frame_pacing
@@ -183,6 +184,7 @@ impl NativeRuntime {
                 self.retire_settled_output_terminals();
             } else {
                 self.forced_shutdown_inflight = Some(identity);
+                self.forced_shutdown_pacing_settled = forced_pacing_settled;
             }
         }
         self.perf.log("native.kms_restore", || {

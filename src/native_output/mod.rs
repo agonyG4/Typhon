@@ -142,6 +142,10 @@ pub(crate) use runtime::{
 };
 #[cfg(test)]
 pub(crate) use runtime::{NativeFrameSceneSnapshot, NativeSceneHistory};
+#[cfg(test)]
+pub(crate) use runtime::{
+    settle_returned_worker_pacing, settle_submitted_worker_pacing, validate_direct_worker_pacing,
+};
 pub(crate) use scanout::*;
 
 #[cfg(test)]

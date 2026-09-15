@@ -59,6 +59,57 @@ pub(super) const fn proof_from_restoration(outcome: RestorationOutcome) -> Optio
     }
 }
 
+pub(super) fn record_forced_shutdown_inflight(
+    runtime: &mut NativeRuntime,
+    inflight: super::super::kms_worker::WorkerInFlight,
+) -> bool {
+    let pacing_cleared = if let Some(ticket) = inflight.pacing_ticket {
+        runtime.frame_pacing.cancel_worker_submission(Some(ticket))
+            || runtime
+                .frame_pacing
+                .abandon_pending_submission(inflight.token.get())
+    } else {
+        runtime
+            .frame_pacing
+            .abandon_pending_submission(inflight.token.get())
+    };
+    runtime.forced_shutdown_inflight = Some(inflight);
+    runtime.forced_shutdown_pacing_settled = pacing_cleared
+        .then_some(inflight.pacing_ticket)
+        .flatten()
+        .map(|ticket| (inflight.token, ticket));
+    pacing_cleared
+}
+
+pub(crate) fn settle_returned_worker_pacing(
+    frame_pacing: &mut NativeFramePacing,
+    ticket: Option<WorkerPacingTicket>,
+) -> NativeResult<()> {
+    if frame_pacing.cancel_worker_submission(ticket) {
+        Ok(())
+    } else {
+        Err(io::Error::other("worker pacing reservation does not match queued state").into())
+    }
+}
+
+pub(crate) fn settle_submitted_worker_pacing(
+    frame_pacing: &mut NativeFramePacing,
+    ticket: Option<WorkerPacingTicket>,
+    token: u64,
+    now_ns: u64,
+    pacing_mode: NativeOutputPacingMode,
+) -> NativeResult<()> {
+    frame_pacing
+        .note_worker_submit_exact(ticket, token, now_ns, pacing_mode)
+        .map_err(io::Error::other)?;
+    if ticket.is_some() && !frame_pacing.abandon_pending_submission(token) {
+        return Err(
+            io::Error::other("worker pacing submission does not match pending token").into(),
+        );
+    }
+    Ok(())
+}
+
 impl NativeRuntime {
     fn restore_pre_submit_worker_fence(&mut self, job: &mut KmsCommitJob) -> NativeResult<()> {
         if !matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
@@ -74,12 +125,53 @@ impl NativeRuntime {
     }
 
     fn retain_returned_worker_job(&mut self, mut job: KmsCommitJob) -> NativeResult<()> {
-        if let Err(error) = self.restore_pre_submit_worker_fence(&mut job) {
+        let pacing_result =
+            settle_returned_worker_pacing(&mut self.frame_pacing, job.pacing_ticket);
+        let fence_result = self.restore_pre_submit_worker_fence(&mut job);
+        if let Err(error) = pacing_result {
+            self.emergency_quarantined_worker_jobs.push(job);
+            return Err(error);
+        }
+        if let Err(error) = fence_result {
             self.emergency_quarantined_worker_jobs.push(job);
             return Err(error);
         }
         self.worker_quarantine.jobs.push(job);
         Ok(())
+    }
+
+    fn settle_submitted_worker_pacing_after_join(
+        &mut self,
+        ownership: &KmsSubmittedOwnership,
+    ) -> NativeResult<()> {
+        let Some(ticket) = ownership.job.pacing_ticket else {
+            return Ok(());
+        };
+        if self.forced_shutdown_pacing_settled == Some((ownership.job.token, ticket)) {
+            return Ok(());
+        }
+        let pacing_mode = ownership
+            .job
+            .owners
+            .primary()
+            .map(|owner| owner.transaction.pacing_mode())
+            .ok_or_else(|| io::Error::other("submitted worker job has no primary pacing owner"))?;
+        settle_submitted_worker_pacing(
+            &mut self.frame_pacing,
+            Some(ticket),
+            ownership.job.token.get(),
+            ownership.submit_returned_at.get(),
+            pacing_mode,
+        )
+    }
+
+    fn quarantine_submitted_worker_ownership_after_join(
+        &mut self,
+        ownership: KmsSubmittedOwnership,
+    ) -> NativeResult<()> {
+        let pacing_result = self.settle_submitted_worker_pacing_after_join(&ownership);
+        let quarantine_result = self.quarantine_submitted_ownership(ownership);
+        pacing_result.and(quarantine_result)
     }
 
     pub(super) fn process_kms_worker_event_after_join_safely(
@@ -88,7 +180,7 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
-                self.quarantine_submitted_ownership(ownership)
+                self.quarantine_submitted_worker_ownership_after_join(ownership)
             }
             KmsWorkerEvent::TestRejected { job, .. }
             | KmsWorkerEvent::SubmitRejected { job, .. }
@@ -100,13 +192,18 @@ impl NativeRuntime {
                 returned_jobs,
                 returned_sidecar,
             } => {
+                let mut first_error = None;
                 for job in returned_jobs {
-                    self.retain_returned_worker_job(job)?;
+                    if let Err(error) = self.retain_returned_worker_job(job)
+                        && first_error.is_none()
+                    {
+                        first_error = Some(error);
+                    }
                 }
                 self.worker_quarantine
                     .cursor_sidecars
                     .extend(returned_sidecar);
-                Ok(())
+                first_error.map_or(Ok(()), Err)
             }
             KmsWorkerEvent::Fatal { .. }
             | KmsWorkerEvent::BusyDeferred { .. }
@@ -266,7 +363,7 @@ impl NativeRuntime {
         for event in worker.drain_events() {
             let result = match event {
                 KmsWorkerEvent::Submitted { ownership } => {
-                    self.quarantine_submitted_ownership(ownership)
+                    self.quarantine_submitted_worker_ownership_after_join(ownership)
                 }
                 KmsWorkerEvent::TestRejected { job, .. }
                 | KmsWorkerEvent::SubmitRejected { job, .. }

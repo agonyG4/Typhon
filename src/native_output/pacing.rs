@@ -467,6 +467,107 @@ mod tests {
         assert!(pacing.abandon_pending_submission(41));
     }
 
+    fn post_join_pacing_overlap() -> (
+        NativeFramePacing,
+        WorkerPacingTicket,
+        PredictiveO1AttemptId,
+        OutputFrameKey,
+    ) {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let predecessor_ticket = pacing
+            .reserve_worker_submission(false)
+            .expect("predecessor worker reservation")
+            .expect("predecessor worker ticket");
+
+        pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("same-logical-ID predictive successor");
+        let successor_attempt = pacing
+            .active_predictive_attempt
+            .expect("successor predictive attempt");
+        let successor_physical = predictive_physical_identity(5_263, 2);
+        let successor_key = OutputFrameKey::from(&successor_physical);
+        pacing
+            .bind_predictive_o1(successor_physical)
+            .expect("bind successor physical frame");
+        pacing.note_render_ready();
+        pacing.note_ready_frame(2, true);
+
+        (pacing, predecessor_ticket, successor_attempt, successor_key)
+    }
+
+    #[test]
+    fn post_join_returned_job_settles_exact_worker_ticket_and_preserves_successor() {
+        let (mut pacing, predecessor_ticket, successor_attempt, successor_key) =
+            post_join_pacing_overlap();
+
+        crate::native_output::settle_returned_worker_pacing(&mut pacing, Some(predecessor_ticket))
+            .expect("returned worker job settles its exact ticket");
+
+        assert!(pacing.worker_reservation.is_none());
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(pacing.ready_physical_key, Some(successor_key));
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    }
+
+    #[test]
+    fn post_join_submitted_job_abandons_exact_pending_ticket_and_preserves_successor() {
+        let (mut pacing, predecessor_ticket, successor_attempt, successor_key) =
+            post_join_pacing_overlap();
+
+        crate::native_output::settle_submitted_worker_pacing(
+            &mut pacing,
+            Some(predecessor_ticket),
+            41,
+            3,
+            NativeOutputPacingMode::PredictiveTriple,
+        )
+        .expect("submitted worker job settles and abandons its exact token");
+
+        assert!(pacing.worker_reservation.is_none());
+        assert!(pacing.pending.is_none());
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(pacing.ready_physical_key, Some(successor_key));
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    }
+
+    #[test]
+    fn post_join_stale_worker_ticket_is_rejected_without_touching_collision_successor() {
+        let (mut pacing, predecessor_ticket, successor_attempt, successor_key) =
+            post_join_pacing_overlap();
+        assert!(pacing.cancel_worker_submission(Some(predecessor_ticket)));
+        let successor_ticket = pacing
+            .reserve_worker_submission(true)
+            .expect("successor worker reservation")
+            .expect("successor worker ticket");
+
+        assert!(
+            crate::native_output::settle_returned_worker_pacing(
+                &mut pacing,
+                Some(predecessor_ticket),
+            )
+            .is_err()
+        );
+        assert_eq!(pacing.worker_reservation, Some(successor_ticket));
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(pacing.ready_physical_key, Some(successor_key));
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    }
+
+    #[test]
+    fn uncertain_worker_submission_abandons_exact_ticket_and_preserves_successor() {
+        let (mut pacing, predecessor_ticket, successor_attempt, successor_key) =
+            post_join_pacing_overlap();
+
+        assert!(pacing.abandon_worker_submission(Some(predecessor_ticket)));
+        assert!(pacing.worker_reservation.is_none());
+        assert_eq!(pacing.ready_predictive_attempt, Some(successor_attempt));
+        assert_eq!(pacing.ready_physical_key, Some(successor_key));
+        assert_eq!(pacing.predictive_o1_lifecycle.active_entries(), 1);
+    }
+
     #[test]
     fn worker_reservation_settles_exactly_once() {
         let mut pacing = NativeFramePacing::from_env();
@@ -3424,6 +3525,33 @@ impl NativeFramePacing {
         }
         self.log(
             "worker_submit_cancelled",
+            Self::worker_ticket_fields(reservation),
+        );
+        true
+    }
+
+    pub(crate) fn abandon_worker_submission(&mut self, ticket: Option<WorkerPacingTicket>) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let Some(ticket) = ticket else {
+            return true;
+        };
+        let reservation = match self.take_worker_submission(ticket) {
+            Ok(reservation) => reservation,
+            Err(_) => return false,
+        };
+        if let Some(identity) = lifecycle_identity(
+            reservation.predictive_attempt_id(),
+            reservation.physical_key(),
+        ) {
+            self.terminalize_predictive_frame(
+                identity,
+                PredictiveReadyTerminal::OtherSafeAbandonment,
+            );
+        }
+        self.log(
+            "worker_submit_uncertain_abandoned",
             Self::worker_ticket_fields(reservation),
         );
         true
