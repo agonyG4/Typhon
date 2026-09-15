@@ -1,6 +1,7 @@
 use super::thread::worker_wait_is_armed;
 use super::timing::KmsWorkerDispatchModel;
 use super::*;
+use crate::native_output::presentation::kms_timing::{KmsPresentationOutcome, KmsSubmitWindow};
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 
 #[test]
@@ -47,6 +48,29 @@ fn worker_dispatch_budget_does_not_include_queue_residency() {
     model.record(0, 100_000, 200_000, 300_000);
 
     assert_eq!(model.budget().dispatch_budget_ns, 350_000);
+}
+
+#[test]
+fn dispatch_tail_deadline_hole_is_not_render_readiness_miss() {
+    let mut model = KmsWorkerDispatchModel::default();
+    model.record(0, 0, 100_000, 100_000);
+    let window = KmsSubmitWindow::try_new(10_000_000, 0, model.budget().dispatch_budget_ns, 0)
+        .expect("test window is reachable");
+    let payload_ready_at_ns = 1_000_000;
+    let submit_returned_at_ns = window.commit_complete_deadline_ns() + 12_230;
+
+    assert!(payload_ready_at_ns < window.commit_complete_deadline_ns());
+    assert!(window.is_dispatch_miss_at(submit_returned_at_ns));
+    assert_eq!(
+        KmsPresentationOutcome::classify(
+            &window,
+            Some(payload_ready_at_ns),
+            submit_returned_at_ns,
+            1,
+            2,
+        ),
+        KmsPresentationOutcome::KmsDispatchMiss
+    );
 }
 
 #[test]

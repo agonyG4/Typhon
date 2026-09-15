@@ -2,6 +2,8 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use super::timing::KmsWorkerDispatchTailObservation;
+
 const UNSIGNED_BUCKET_LIMITS_NS: [u64; 14] = [
     50_000,
     100_000,
@@ -256,6 +258,11 @@ pub(crate) struct WorkerTimingMetrics {
     pageflip_ack_delay: AtomicTimingSummary,
     test_only_duration: AtomicTimingSummary,
     dispatch_budget_ns: AtomicU64,
+    dispatch_tail_guard_ns: AtomicU64,
+    dispatch_deadline_overrun_ns: AtomicU64,
+    dispatch_tail_guard_increases: AtomicU64,
+    dispatch_tail_guard_decays: AtomicU64,
+    dispatch_tail_guard_cap_hits: AtomicU64,
     late_before_ioctl: AtomicU64,
     late_after_ioctl: AtomicU64,
     test_only_count: AtomicU64,
@@ -274,6 +281,11 @@ pub(crate) struct WorkerTimingSnapshot {
     pub(crate) pageflip_ack_delay: TimingSummarySnapshot,
     pub(crate) test_only_duration: TimingSummarySnapshot,
     pub(crate) dispatch_budget_ns: u64,
+    pub(crate) dispatch_tail_guard_ns: u64,
+    pub(crate) dispatch_deadline_overrun_ns: u64,
+    pub(crate) dispatch_tail_guard_increases: u64,
+    pub(crate) dispatch_tail_guard_decays: u64,
+    pub(crate) dispatch_tail_guard_cap_hits: u64,
     pub(crate) late_before_ioctl: u64,
     pub(crate) late_after_ioctl: u64,
     pub(crate) test_only_count: u64,
@@ -316,6 +328,25 @@ impl WorkerTimingMetrics {
         }
     }
 
+    pub(crate) fn record_dispatch_tail(&self, observation: KmsWorkerDispatchTailObservation) {
+        self.dispatch_tail_guard_ns
+            .store(observation.guard_ns, Ordering::Relaxed);
+        self.dispatch_deadline_overrun_ns
+            .store(observation.deadline_overrun_ns, Ordering::Relaxed);
+        if observation.increased {
+            self.dispatch_tail_guard_increases
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if observation.decayed {
+            self.dispatch_tail_guard_decays
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if observation.cap_hit {
+            self.dispatch_tail_guard_cap_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_pageflip_ack_delay(&self, delay_ns: u64) {
         self.pageflip_ack_delay.record(delay_ns);
     }
@@ -342,6 +373,17 @@ impl WorkerTimingMetrics {
             pageflip_ack_delay: self.pageflip_ack_delay.snapshot(),
             test_only_duration: self.test_only_duration.snapshot(),
             dispatch_budget_ns: self.dispatch_budget_ns.load(Ordering::Relaxed),
+            dispatch_tail_guard_ns: self.dispatch_tail_guard_ns.load(Ordering::Relaxed),
+            dispatch_deadline_overrun_ns: self
+                .dispatch_deadline_overrun_ns
+                .load(Ordering::Relaxed),
+            dispatch_tail_guard_increases: self
+                .dispatch_tail_guard_increases
+                .load(Ordering::Relaxed),
+            dispatch_tail_guard_decays: self.dispatch_tail_guard_decays.load(Ordering::Relaxed),
+            dispatch_tail_guard_cap_hits: self
+                .dispatch_tail_guard_cap_hits
+                .load(Ordering::Relaxed),
             late_before_ioctl: self.late_before_ioctl.load(Ordering::Relaxed),
             late_after_ioctl: self.late_after_ioctl.load(Ordering::Relaxed),
             test_only_count: self.test_only_count.load(Ordering::Relaxed),

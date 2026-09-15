@@ -998,6 +998,14 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         submit_duration_ns,
                         dispatch_duration_ns,
                     );
+                    let dispatch_tail = dispatch_model.observe_submission_deadline(
+                        job.submit_window.commit_complete_deadline_ns(),
+                        submit_returned_at,
+                    );
+                    shared
+                        .metrics
+                        .timing
+                        .record_dispatch_tail(dispatch_tail);
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let submission_budget_ns = dispatch_budget.dispatch_budget_ns;
                     shared.metrics.timing.record_submission(
