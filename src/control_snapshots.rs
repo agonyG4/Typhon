@@ -620,6 +620,18 @@ pub struct BufferingPerformanceSnapshot {
     pub triple_entries_submit_miss: u64,
     pub triple_entries_presentation_miss: u64,
     pub triple_exits: u64,
+    #[serde(default)]
+    pub ready_pull_in_attempts: u64,
+    #[serde(default)]
+    pub ready_pull_in_successes: u64,
+    #[serde(default)]
+    pub ready_pull_in_rejected_too_late: u64,
+    #[serde(default)]
+    pub ready_pull_in_rejected_owned: u64,
+    #[serde(default)]
+    pub ready_pull_in_rejected_identity: u64,
+    #[serde(default)]
+    pub ready_pull_in_advanced_intervals: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -637,10 +649,15 @@ pub struct WorkerTimingPerformanceSnapshot {
     pub pageflip_ack_delay: TimingSummarySnapshot,
     pub test_only_duration: TimingSummarySnapshot,
     pub dispatch_budget_us: u64,
+    #[serde(default)]
     pub dispatch_tail_guard_us: u64,
+    #[serde(default)]
     pub dispatch_deadline_overrun_us: u64,
+    #[serde(default)]
     pub dispatch_tail_guard_increases: u64,
+    #[serde(default)]
     pub dispatch_tail_guard_decays: u64,
+    #[serde(default)]
     pub dispatch_tail_guard_cap_hits: u64,
     pub late_before_ioctl: u64,
     pub late_after_ioctl: u64,
@@ -873,7 +890,7 @@ mod tests {
             "minUs": 0,
             "maxUs": 0,
         });
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "compositorCpuRender": timing,
             "repaint": {
                 "skipFrames": 0,
@@ -1000,6 +1017,26 @@ mod tests {
             },
             "timingScopes": {},
         });
+
+        for key in [
+            "readyPullInAttempts",
+            "readyPullInSuccesses",
+            "readyPullInRejectedTooLate",
+            "readyPullInRejectedOwned",
+            "readyPullInRejectedIdentity",
+            "readyPullInAdvancedIntervals",
+        ] {
+            value["buffering"][key] = serde_json::Value::from(0);
+        }
+        for key in [
+            "dispatchTailGuardUs",
+            "dispatchDeadlineOverrunUs",
+            "dispatchTailGuardIncreases",
+            "dispatchTailGuardDecays",
+            "dispatchTailGuardCapHits",
+        ] {
+            value["kms"]["workerTiming"][key] = serde_json::Value::from(0);
+        }
 
         let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
         assert_eq!(serde_json::to_value(snapshot).unwrap(), value);

@@ -12,6 +12,119 @@ use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 use oblivion_one::compositor::FrameCallbackAdmission;
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationDeadlinePlanner, ReadyPresentationServiceEstimate,
+};
+
+pub(super) enum ReadyPullInResult {
+    PulledIn,
+    RejectedTooLate,
+    RejectedOwned,
+    RejectedIdentity,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pull_ready_frame_into_reachable_opportunity(
+    explicit: &mut AtomicEglGbmScanout,
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_deadline: &PresentationDeadlinePlanner,
+    presentation_timing: &KmsPresentationTimingModel,
+    frame_pacing: &mut NativeFramePacing,
+    now: MonotonicTimestampNs,
+    output_generation: u64,
+    dispatch_budget_ns: u64,
+) -> NativeResult<ReadyPullInResult> {
+    frame_pacing.note_ready_pull_in_attempt();
+    if frame_pacing.ready_predictive_attempt_id().is_some()
+        || frame_pacing.ready_worker_submission_reserved()
+    {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    }
+
+    let swapchain = explicit.swapchain()?;
+    if swapchain.worker_queued_identity().is_some() {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    }
+    let Some(ready_identity) = swapchain.ready_identity() else {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    };
+    let Some(current_target) = ready_identity.target else {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    };
+    if !current_target.is_binding() {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    }
+    let Some(record) = output_transactions.transaction(ready_identity.transaction_id) else {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    };
+    if record.descriptor().output_generation() != output_generation {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    }
+
+    let Some(mut frontier) = swapchain.last_presented_primary_claim() else {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    };
+    if let Some(future) = swapchain.latest_future_primary_target() {
+        let future_claim = future.physical_claim();
+        if future_claim.sequence <= frontier.sequence
+            || future_claim.presentation_time <= frontier.presentation_time
+        {
+            return Ok(ReadyPullInResult::RejectedIdentity);
+        }
+        frontier = future_claim;
+    }
+
+    let remaining_service = ReadyPresentationServiceEstimate::new(
+        dispatch_budget_ns,
+        presentation_timing.apply_guard_ns(),
+    );
+    let Some(pull_in) = presentation_deadline.ready_target_pull_in(
+        now,
+        remaining_service,
+        frontier,
+        current_target,
+    ) else {
+        return Ok(ReadyPullInResult::RejectedTooLate);
+    };
+    let old_target = pull_in.abandoned_target();
+    let new_target = pull_in.replacement_target();
+    let submit_window = match presentation_timing.submit_window(
+        new_target.presentation_time.get(),
+        now.get(),
+        dispatch_budget_ns,
+    ) {
+        Ok(window) => window,
+        Err(_) => return Ok(ReadyPullInResult::RejectedTooLate),
+    };
+
+    if swapchain
+        .validate_ready_target_replacement(ready_identity.transaction_id, old_target, new_target)
+        .is_err()
+    {
+        return Ok(ReadyPullInResult::RejectedOwned);
+    }
+    if output_transactions
+        .replace_ready_target(ready_identity.transaction_id, old_target, new_target)
+        .is_err()
+    {
+        return Ok(ReadyPullInResult::RejectedIdentity);
+    }
+    if let Err(error) = explicit.swapchain_mut()?.replace_ready_target(
+        ready_identity.transaction_id,
+        old_target,
+        new_target,
+        submit_window,
+    ) {
+        let _ = output_transactions.replace_ready_target(
+            ready_identity.transaction_id,
+            new_target,
+            old_target,
+        );
+        return Err(error.into());
+    }
+    frame_pacing.note_ready_pull_in_success(old_target, new_target);
+    Ok(ReadyPullInResult::PulledIn)
+}
 
 pub(super) fn ensure_async_render_fence_ready(
     explicit: &AtomicEglGbmScanout,

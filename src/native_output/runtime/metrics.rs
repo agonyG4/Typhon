@@ -316,6 +316,12 @@ impl NativeRuntime {
                 triple_entries_submit_miss: buffering.triple_entries_submit_miss,
                 triple_entries_presentation_miss: buffering.triple_entries_presentation_miss,
                 triple_exits: buffering.triple_exits,
+                ready_pull_in_attempts: buffering.ready_pull_in_attempts,
+                ready_pull_in_successes: buffering.ready_pull_in_successes,
+                ready_pull_in_rejected_too_late: buffering.ready_pull_in_rejected_too_late,
+                ready_pull_in_rejected_owned: buffering.ready_pull_in_rejected_owned,
+                ready_pull_in_rejected_identity: buffering.ready_pull_in_rejected_identity,
+                ready_pull_in_advanced_intervals: buffering.ready_pull_in_advanced_intervals,
             },
             kms: KmsPerformanceSnapshot {
                 mode_refresh_interval_ns: presentation_timing.mode().refresh_interval_ns(),

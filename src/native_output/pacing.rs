@@ -1663,7 +1663,7 @@ use oblivion_one::native::adaptive_buffering::{
     AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss, RenderPrediction,
 };
 use oblivion_one::native::presentation_deadline::{
-    PresentationTargetReason, TargetSelectionEvidence,
+    PresentationTarget, PresentationTargetReason, TargetSelectionEvidence,
 };
 use oblivion_one::native::scheduler::{
     NativeOutputPacingMode, PipelineWaitReason, SchedulerDecision,
@@ -2431,6 +2431,12 @@ pub(crate) struct NativeFramePacing {
     pub(crate) predictive_ready_failed: u64,
     pub(crate) predictive_ready_current_at_shutdown: u64,
     pub(crate) normal_ready_wait_count: u64,
+    pub(crate) ready_pull_in_attempts: u64,
+    pub(crate) ready_pull_in_successes: u64,
+    pub(crate) ready_pull_in_rejected_too_late: u64,
+    pub(crate) ready_pull_in_rejected_owned: u64,
+    pub(crate) ready_pull_in_rejected_identity: u64,
+    pub(crate) ready_pull_in_advanced_intervals: u64,
     pub(crate) scheduled_normal_target_count: u64,
     pub(crate) expired_deadline_wait_count: u64,
     pub(crate) repeated_immediate_timer_wake_count: u64,
@@ -2560,6 +2566,12 @@ pub(crate) struct NativeBufferingMetrics {
     pub(crate) o1_credit2_granted_not_consumed: u64,
     pub(crate) o1_credit2_drain_events: u64,
     pub(crate) o1_credit2_refill_suppressed_while_draining: u64,
+    pub(crate) ready_pull_in_attempts: u64,
+    pub(crate) ready_pull_in_successes: u64,
+    pub(crate) ready_pull_in_rejected_too_late: u64,
+    pub(crate) ready_pull_in_rejected_owned: u64,
+    pub(crate) ready_pull_in_rejected_identity: u64,
+    pub(crate) ready_pull_in_advanced_intervals: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2650,6 +2662,12 @@ impl NativeFramePacing {
             predictive_ready_failed: 0,
             predictive_ready_current_at_shutdown: 0,
             normal_ready_wait_count: 0,
+            ready_pull_in_attempts: 0,
+            ready_pull_in_successes: 0,
+            ready_pull_in_rejected_too_late: 0,
+            ready_pull_in_rejected_owned: 0,
+            ready_pull_in_rejected_identity: 0,
+            ready_pull_in_advanced_intervals: 0,
             scheduled_normal_target_count: 0,
             expired_deadline_wait_count: 0,
             repeated_immediate_timer_wake_count: 0,
@@ -2849,9 +2867,12 @@ impl NativeFramePacing {
             .flatten()
     }
 
-    #[cfg(test)]
     pub(crate) const fn ready_predictive_attempt_id(&self) -> Option<PredictiveO1AttemptId> {
         self.ready_predictive_attempt
+    }
+
+    pub(crate) const fn ready_worker_submission_reserved(&self) -> bool {
+        self.ready_worker_reservation_id.is_some()
     }
 
     #[cfg(test)]
@@ -3800,6 +3821,66 @@ impl NativeFramePacing {
         );
     }
 
+    pub(crate) fn note_ready_pull_in_attempt(&mut self) {
+        if self.enabled {
+            self.ready_pull_in_attempts = self.ready_pull_in_attempts.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_ready_pull_in_rejected_too_late(&mut self) {
+        if self.enabled {
+            self.ready_pull_in_rejected_too_late =
+                self.ready_pull_in_rejected_too_late.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_ready_pull_in_rejected_owned(&mut self) {
+        if self.enabled {
+            self.ready_pull_in_rejected_owned = self.ready_pull_in_rejected_owned.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_ready_pull_in_rejected_identity(&mut self) {
+        if self.enabled {
+            self.ready_pull_in_rejected_identity =
+                self.ready_pull_in_rejected_identity.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_ready_pull_in_success(
+        &mut self,
+        old_target: PresentationTarget,
+        new_target: PresentationTarget,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let advanced_intervals = old_target
+            .physical_claim()
+            .sequence
+            .saturating_sub(new_target.physical_claim().sequence);
+        self.ready_pull_in_successes = self.ready_pull_in_successes.saturating_add(1);
+        self.ready_pull_in_advanced_intervals = self
+            .ready_pull_in_advanced_intervals
+            .saturating_add(advanced_intervals);
+        self.log(
+            "ready_target_pull_in",
+            vec![
+                PacingField::u64("old_target_sequence", old_target.sequence),
+                PacingField::u64("new_target_sequence", new_target.sequence),
+                PacingField::u64("advanced_intervals", advanced_intervals),
+                PacingField::u64(
+                    "old_target_presentation_ns",
+                    old_target.presentation_time.get(),
+                ),
+                PacingField::u64(
+                    "new_target_presentation_ns",
+                    new_target.presentation_time.get(),
+                ),
+            ],
+        );
+    }
+
     pub(crate) fn abandon_ready_frame(&mut self) -> bool {
         if !self.enabled {
             return true;
@@ -4388,6 +4469,12 @@ impl NativeFramePacing {
             o1_credit2_drain_events: self.o1_credit2_drain_events,
             o1_credit2_refill_suppressed_while_draining: self
                 .o1_credit2_refill_suppressed_while_draining,
+            ready_pull_in_attempts: self.ready_pull_in_attempts,
+            ready_pull_in_successes: self.ready_pull_in_successes,
+            ready_pull_in_rejected_too_late: self.ready_pull_in_rejected_too_late,
+            ready_pull_in_rejected_owned: self.ready_pull_in_rejected_owned,
+            ready_pull_in_rejected_identity: self.ready_pull_in_rejected_identity,
+            ready_pull_in_advanced_intervals: self.ready_pull_in_advanced_intervals,
         }
     }
 
@@ -4846,6 +4933,24 @@ impl NativeFramePacing {
                     self.predictive_ready_current_at_shutdown,
                 ),
                 PacingField::u64("normal_ready_wait_count", self.normal_ready_wait_count),
+                PacingField::u64("ready_pull_in_attempts", self.ready_pull_in_attempts),
+                PacingField::u64("ready_pull_in_successes", self.ready_pull_in_successes),
+                PacingField::u64(
+                    "ready_pull_in_rejected_too_late",
+                    self.ready_pull_in_rejected_too_late,
+                ),
+                PacingField::u64(
+                    "ready_pull_in_rejected_owned",
+                    self.ready_pull_in_rejected_owned,
+                ),
+                PacingField::u64(
+                    "ready_pull_in_rejected_identity",
+                    self.ready_pull_in_rejected_identity,
+                ),
+                PacingField::u64(
+                    "ready_pull_in_advanced_intervals",
+                    self.ready_pull_in_advanced_intervals,
+                ),
                 PacingField::u64(
                     "scheduled_normal_target_count",
                     self.scheduled_normal_target_count,

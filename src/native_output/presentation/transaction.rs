@@ -784,6 +784,18 @@ impl OutputTransaction {
         self.reservation.bound_target()
     }
 
+    pub(crate) fn replace_bound_target(
+        &mut self,
+        expected: PresentationTarget,
+        replacement: PresentationTarget,
+    ) -> bool {
+        if self.reservation != FramePresentationReservation::Bound(expected) {
+            return false;
+        }
+        self.reservation = FramePresentationReservation::Bound(replacement);
+        true
+    }
+
     pub(crate) fn bind_deferred_o1(
         &mut self,
         claim: PrimaryRefreshClaim,

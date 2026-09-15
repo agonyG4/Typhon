@@ -1540,6 +1540,58 @@ impl AtomicOutputSwapchain {
         self.ready.as_ref().map(Into::into)
     }
 
+    pub(crate) fn validate_ready_target_replacement(
+        &self,
+        transaction_id: OutputTransactionId,
+        expected: PresentationTarget,
+        replacement: PresentationTarget,
+    ) -> io::Result<()> {
+        let ready = self
+            .ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
+        if ready.transaction_id != transaction_id
+            || ready.bound_target() != Some(expected)
+            || !expected.is_binding()
+            || !replacement.is_binding()
+        {
+            return Err(io::Error::other(
+                "ready target replacement identity does not match the ready frame",
+            ));
+        }
+        if replacement.physical_claim().sequence >= expected.physical_claim().sequence
+            || replacement.physical_claim().presentation_time
+                >= expected.physical_claim().presentation_time
+        {
+            return Err(io::Error::other(
+                "ready target replacement is not an earlier physical opportunity",
+            ));
+        }
+        self.validate_later_primary_target(replacement)
+    }
+
+    pub(crate) fn replace_ready_target(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        expected: PresentationTarget,
+        replacement: PresentationTarget,
+        submit_window: KmsSubmitWindow,
+    ) -> io::Result<()> {
+        self.validate_ready_target_replacement(transaction_id, expected, replacement)?;
+        if submit_window.target_presentation_ns() != replacement.presentation_time.get() {
+            return Err(io::Error::other(
+                "ready target replacement submit window belongs to another target",
+            ));
+        }
+        let ready = self
+            .ready
+            .as_mut()
+            .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
+        ready.reservation = FramePresentationReservation::Bound(replacement);
+        ready.submit_window = submit_window;
+        Ok(())
+    }
+
     pub(crate) fn deferred_o1_binding_failure(
         &self,
         output_generation: u64,
@@ -2674,6 +2726,53 @@ mod tests {
         assert_eq!(swapchain.ready_identity(), None);
         assert_eq!(swapchain.free_slot_count(), 2);
         assert!(swapchain.acquire_render_slot_for_limit(2).is_ok());
+    }
+
+    #[test]
+    fn ready_target_replacement_updates_target_and_submit_window_together() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let frontier = test_target(1, 10, PresentationTargetReason::ReactiveDouble);
+        swapchain
+            .note_physical_primary_presentation(frontier.physical_claim())
+            .expect("frontier is the first physical presentation");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let old_target = test_target(3, 30, PresentationTargetReason::Normal);
+        let frame = test_frame(&swapchain, slot, old_target);
+        let transaction_id = frame.transaction_id;
+        swapchain
+            .finish_render_owned(frame)
+            .expect("frame becomes ready");
+
+        let mut new_target = test_target(2, 20, PresentationTargetReason::Normal);
+        new_target.submit_not_before = MonotonicTimestampNs::new(15);
+        new_target.render_start_deadline = new_target.submit_not_before;
+        let submit_window = KmsSubmitWindow::try_new(20, 15, 1, 1)
+            .expect("replacement target has a reachable KMS window");
+        swapchain
+            .replace_ready_target(transaction_id, old_target, new_target, submit_window)
+            .expect("ready target replacement succeeds");
+
+        let identity = swapchain.ready_identity().expect("ready identity");
+        assert_eq!(identity.target, Some(new_target));
+        let window = swapchain.ready_submit_window().expect("ready window");
+        assert_eq!(window.target_presentation_ns(), 20);
+        assert_eq!(window.earliest_submit_ns(), 15);
+        assert!(
+            swapchain
+                .validate_ready_target_replacement(transaction_id, old_target, new_target)
+                .is_err()
+        );
     }
 
     fn test_target(

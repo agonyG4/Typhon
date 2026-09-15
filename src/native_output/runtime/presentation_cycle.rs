@@ -1577,6 +1577,27 @@ impl NativeRuntime {
                                 } else if waits_for_target {
                                     server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                     frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                    match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
+                                        explicit,
+                                        output_transactions,
+                                        presentation_deadline,
+                                        presentation_timing,
+                                        frame_pacing,
+                                        MonotonicTimestampNs::new(ready_at_ns),
+                                        *drm_file_generation,
+                                        prediction.kms_dispatch_budget_ns,
+                                    )? {
+                                        super::presentation_ready::ReadyPullInResult::PulledIn => {}
+                                        super::presentation_ready::ReadyPullInResult::RejectedTooLate => {
+                                            frame_pacing.note_ready_pull_in_rejected_too_late();
+                                        }
+                                        super::presentation_ready::ReadyPullInResult::RejectedOwned => {
+                                            frame_pacing.note_ready_pull_in_rejected_owned();
+                                        }
+                                        super::presentation_ready::ReadyPullInResult::RejectedIdentity => {
+                                            frame_pacing.note_ready_pull_in_rejected_identity();
+                                        }
+                                    }
                                     if render_ahead {
                                         frame_pacing.note_predictive_unbound_ready();
                                     }

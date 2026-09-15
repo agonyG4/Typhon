@@ -177,6 +177,52 @@ impl PresentationTarget {
     }
 }
 
+/// Service which remains after a frame has completed rendering and before its
+/// primary KMS commit can become physically effective.
+///
+/// Render risk, the main-loop render-start guard, and queue residency are
+/// intentionally absent: they have already been paid or are an overlappable
+/// waiting dimension by the time the frame is READY.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyPresentationServiceEstimate {
+    pub kms_dispatch_budget_ns: u64,
+    pub kms_apply_guard_ns: u64,
+}
+
+impl ReadyPresentationServiceEstimate {
+    pub const fn new(kms_dispatch_budget_ns: u64, kms_apply_guard_ns: u64) -> Self {
+        Self {
+            kms_dispatch_budget_ns,
+            kms_apply_guard_ns,
+        }
+    }
+
+    pub const fn total_ns(self) -> u64 {
+        self.kms_dispatch_budget_ns
+            .saturating_add(self.kms_apply_guard_ns)
+    }
+}
+
+/// An explicit replacement of a still-unsubmitted READY frame's physical
+/// presentation target.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyTargetPullIn {
+    abandoned_target: PresentationTarget,
+    replacement_target: PresentationTarget,
+}
+
+impl ReadyTargetPullIn {
+    pub const fn abandoned_target(self) -> PresentationTarget {
+        self.abandoned_target
+    }
+
+    pub const fn replacement_target(self) -> PresentationTarget {
+        self.replacement_target
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct PresentationDeadlinePlanner {
@@ -511,6 +557,56 @@ impl PresentationDeadlinePlanner {
         updated
     }
 
+    /// Find an earlier physical opportunity for a frame which is already
+    /// READY. The caller must separately preflight and commit the ownership
+    /// transition in the output pipeline.
+    pub fn ready_target_pull_in(
+        &self,
+        now: MonotonicTimestampNs,
+        remaining_service: ReadyPresentationServiceEstimate,
+        physical_frontier: PrimaryRefreshClaim,
+        current_target: PresentationTarget,
+    ) -> Option<ReadyTargetPullIn> {
+        if !self.is_current(current_target)
+            || !current_target.is_binding()
+            || current_target.sequence != current_target.physical_claim.sequence
+            || current_target.presentation_time != current_target.physical_claim.presentation_time
+            || physical_frontier.clock_generation != self.clock_generation
+            || current_target.physical_claim().clock_generation != self.clock_generation
+            || !claim_is_strictly_later(current_target.physical_claim(), physical_frontier)
+        {
+            return None;
+        }
+        let ready_at = now.checked_add(Duration::from_nanos(remaining_service.total_ns()))?;
+        let candidate = self.earliest_reachable_after_claim(ready_at, physical_frontier)?;
+        if !claim_is_strictly_earlier(candidate, current_target.physical_claim()) {
+            return None;
+        }
+        let replacement_target = PresentationTarget {
+            sequence: candidate.sequence,
+            presentation_time: candidate.presentation_time,
+            // A READY frame has no render-start gate. Its submit window is
+            // rebuilt by the Atomic output owner from this immediate lower
+            // bound and the current KMS timing authorities.
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: self.refresh_interval,
+            reason: current_target.reason,
+            clock_generation: self.clock_generation,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: candidate,
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence: candidate.sequence,
+                binding: true,
+            },
+        };
+        Some(ReadyTargetPullIn {
+            abandoned_target: current_target,
+            replacement_target,
+        })
+    }
+
     pub fn invalidate(&mut self, refresh_interval: Duration) {
         self.clock_generation = self.clock_generation.checked_add(1).unwrap_or(1);
         self.last_presented_sequence = 0;
@@ -617,6 +713,32 @@ impl PresentationDeadlinePlanner {
         }
     }
 
+    fn earliest_reachable_after_claim(
+        &self,
+        ready_at: MonotonicTimestampNs,
+        frontier: PrimaryRefreshClaim,
+    ) -> Option<PrimaryRefreshClaim> {
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let mut sequence = frontier.sequence.checked_add(1)?;
+        let mut presentation_time = frontier
+            .presentation_time
+            .checked_add(self.refresh_interval)?;
+        if presentation_time < ready_at {
+            let intervals = (ready_at.get() - presentation_time.get()).div_ceil(refresh_ns);
+            sequence = sequence.checked_add(intervals)?;
+            presentation_time = MonotonicTimestampNs::new(
+                presentation_time
+                    .get()
+                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
+            );
+        }
+        Some(PrimaryRefreshClaim {
+            sequence,
+            presentation_time,
+            clock_generation: frontier.clock_generation,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_target(
         &mut self,
@@ -686,6 +808,21 @@ fn submit_not_before(
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn claim_is_strictly_later(candidate: PrimaryRefreshClaim, frontier: PrimaryRefreshClaim) -> bool {
+    candidate.sequence > frontier.sequence
+        && candidate.presentation_time > frontier.presentation_time
+        && candidate.clock_generation == frontier.clock_generation
+}
+
+fn claim_is_strictly_earlier(
+    candidate: PrimaryRefreshClaim,
+    upper_bound: PrimaryRefreshClaim,
+) -> bool {
+    candidate.sequence < upper_bound.sequence
+        && candidate.presentation_time < upper_bound.presentation_time
+        && candidate.clock_generation == upper_bound.clock_generation
 }
 
 fn nonzero_refresh(refresh_interval: Duration) -> Duration {
@@ -952,6 +1089,104 @@ mod tests {
         assert_eq!(later.sequence, 3);
         assert!(later.submit_not_before().get() > 71_000_000);
         assert_eq!(later.submit_not_before().get(), 80_100_000);
+    }
+
+    #[test]
+    fn ready_frame_can_pull_n_plus_two_into_a_reachable_n_plus_one() {
+        let refresh = Duration::from_nanos(6_060_606);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+        planner.note_presented(presented_at);
+        let old_target = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(1_001_000_000),
+                Duration::from_nanos(5_807_000),
+            )
+            .expect("conservative pre-render target");
+        assert_eq!(old_target.sequence, 3);
+        assert_eq!(old_target.submit_not_before().get(), 1_006_160_606);
+
+        let pull_in = planner
+            .ready_target_pull_in(
+                MonotonicTimestampNs::new(1_005_500_000),
+                ReadyPresentationServiceEstimate::new(300_000, 190_000),
+                PrimaryRefreshClaim {
+                    sequence: 1,
+                    presentation_time: presented_at,
+                    clock_generation: 1,
+                },
+                old_target,
+            )
+            .expect("N+1 remains reachable after render completion");
+
+        assert_eq!(pull_in.abandoned_target(), old_target);
+        assert_eq!(pull_in.replacement_target().sequence, 2);
+        assert_eq!(
+            pull_in.replacement_target().presentation_time.get(),
+            1_006_060_606
+        );
+        assert_eq!(
+            pull_in.replacement_target().submit_not_before().get(),
+            1_005_500_000
+        );
+    }
+
+    #[test]
+    fn ready_target_pull_in_rejects_late_or_owned_opportunities() {
+        let refresh = Duration::from_nanos(6_060_606);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        let presented_at = MonotonicTimestampNs::new(1_000_000_000);
+        planner.note_presented(presented_at);
+        let old_target = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(1_001_000_000),
+                Duration::from_nanos(5_807_000),
+            )
+            .expect("conservative pre-render target");
+        let service = ReadyPresentationServiceEstimate::new(300_000, 190_000);
+        let frontier = PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: presented_at,
+            clock_generation: 1,
+        };
+
+        assert!(
+            planner
+                .ready_target_pull_in(
+                    MonotonicTimestampNs::new(1_006_000_000),
+                    service,
+                    frontier,
+                    old_target,
+                )
+                .is_none()
+        );
+
+        let owned_frontier = frontier.successor(refresh).expect("N+1 claim");
+        assert!(
+            planner
+                .ready_target_pull_in(
+                    MonotonicTimestampNs::new(1_005_500_000),
+                    service,
+                    owned_frontier,
+                    old_target,
+                )
+                .is_none()
+        );
+
+        let advisory = PresentationTarget {
+            reason: PresentationTargetReason::ReactiveDouble,
+            ..old_target
+        };
+        assert!(
+            planner
+                .ready_target_pull_in(
+                    MonotonicTimestampNs::new(1_005_500_000),
+                    service,
+                    frontier,
+                    advisory,
+                )
+                .is_none()
+        );
     }
 
     #[test]

@@ -171,6 +171,7 @@ pub(crate) enum OutputTransactionError {
         state: OutputTransactionStateKind,
         stage: OutputTransactionFailureStage,
     },
+    PresentationTargetMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -905,6 +906,32 @@ impl OutputTransactionLedger {
 
     pub(crate) fn transaction(&self, id: OutputTransactionId) -> Option<&OutputTransactionRecord> {
         self.active.get(&id)
+    }
+
+    pub(crate) fn replace_ready_target(
+        &mut self,
+        id: OutputTransactionId,
+        expected: oblivion_one::native::presentation_deadline::PresentationTarget,
+        replacement: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(state, OutputTransactionState::Ready { .. }) {
+            return Err(OutputTransactionError::PresentationTargetMismatch);
+        }
+        let record = self
+            .active
+            .get_mut(&id)
+            .ok_or(OutputTransactionError::UnknownTransaction)?;
+        if !expected.is_binding()
+            || !replacement.is_binding()
+            || record.descriptor.bound_target() != Some(expected)
+            || !record
+                .descriptor
+                .replace_bound_target(expected, replacement)
+        {
+            return Err(OutputTransactionError::PresentationTargetMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn surface_damage(
