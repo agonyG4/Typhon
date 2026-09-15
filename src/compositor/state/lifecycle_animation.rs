@@ -369,6 +369,10 @@ mod tests {
         assert!(!state.settle_lifecycle_no_visual_change());
         assert_eq!(state.window_lifecycle_animator.active_count(), 1);
         assert!(state.lifecycle_animation_has_pending_visible());
+        assert_eq!(
+            state.direct_scanout_scene_candidate().unwrap_err(),
+            DirectScanoutSceneRejection::LifecycleAnimation
+        );
     }
 
     #[test]
