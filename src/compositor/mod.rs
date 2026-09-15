@@ -76,6 +76,7 @@ mod clipboard_bridge;
 mod color;
 mod commit_debug;
 mod decoration;
+mod direct_scanout_scene;
 mod desktop_window;
 mod dmabuf;
 mod effects;
@@ -93,6 +94,7 @@ mod pacing;
 mod plan;
 mod popup;
 mod presentation;
+mod presentation_coverage;
 mod presentation_modes;
 mod protocol_error_trace;
 mod protocols;
@@ -217,6 +219,11 @@ pub use fullscreen::{
     FullscreenCompositionMode, FullscreenCompositionPlan, FullscreenCulledRootReason,
     FullscreenPresentationEligibility, FullscreenPresentationRejection,
     FullscreenPresentationState, FullscreenRenderPlanMetrics, FullscreenRootClassification,
+};
+pub use direct_scanout_scene::DirectScanoutSceneAnalysis;
+pub use presentation_coverage::{
+    PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
+    PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
 };
 pub(crate) use fullscreen::{
     direct_scanout_scene_rejection_for_effects, direct_scanout_scene_rejection_for_flags,

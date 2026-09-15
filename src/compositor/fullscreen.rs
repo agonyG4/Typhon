@@ -119,8 +119,11 @@ pub enum DirectScanoutSceneRejection {
     OwnerDoesNotCoverOutput,
     OwnerRootBufferMissing,
     OwnerTreeHasAdditionalSurface,
+    NoCoveringApplication,
     EffectRequiresComposition,
     OverlayVisible,
+    ApplicationContentAbove,
+    ServerSideDecorationVisible,
     PopupVisible,
     NonDmabuf,
     FormatNotOpaqueXrgb8888,
@@ -146,8 +149,11 @@ impl DirectScanoutSceneRejection {
             Self::OwnerDoesNotCoverOutput => "owner_does_not_cover_output",
             Self::OwnerRootBufferMissing => "owner_root_buffer_missing",
             Self::OwnerTreeHasAdditionalSurface => "owner_tree_has_additional_surface",
+            Self::NoCoveringApplication => "no_covering_application",
             Self::EffectRequiresComposition => "effect_requires_composition",
             Self::OverlayVisible => "overlay_visible",
+            Self::ApplicationContentAbove => "application_content_above",
+            Self::ServerSideDecorationVisible => "server_side_decoration_visible",
             Self::PopupVisible => "popup_visible",
             Self::NonDmabuf => "non_dmabuf",
             Self::FormatNotOpaqueXrgb8888 => "format_not_opaque_xrgb8888",
@@ -172,6 +178,10 @@ pub struct DirectScanoutSceneBlockers {
 }
 
 impl DirectScanoutSceneBlockers {
+    pub const fn is_empty(&self) -> bool {
+        self.reasons.is_empty()
+    }
+
     pub fn reasons(&self) -> &[DirectScanoutSceneRejection] {
         &self.reasons
     }
