@@ -103,6 +103,7 @@ mod surface_pipeline_trace;
 pub(crate) use protocols::cursor_shape::ProtocolCursorShape;
 mod render;
 mod runtime_files;
+mod scene;
 mod screen_capture;
 mod selection;
 mod server;
@@ -137,6 +138,7 @@ pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
     classify_x11_role, x11_placement_policy,
 };
+pub(crate) use scene::*;
 pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
@@ -261,6 +263,7 @@ use keyboard::{KeyboardSerializedState, KeyboardStateHandle};
 pub use presentation_coverage::{
     PresentationCoverageAnalysis, PresentationCoverageApplicationGroup,
     PresentationCoverageContent, PresentationCoverageContentKind, PresentationCoverageOpacity,
+    PresentationCoverageSurface,
 };
 pub use state::DirectScanoutSceneAnalysis;
 
@@ -661,6 +664,7 @@ pub struct CompositorState {
     renderable_surface_indices: HashMap<u32, usize>,
     locality_metrics: Cell<SurfaceLocalityMetrics>,
     active_scene_view: ActiveSceneView,
+    scene_registry: CanonicalSceneRegistry,
     presentation_animator: PresentationAnimator,
     #[allow(dead_code)]
     presentation_animation_policy: PresentationAnimationPolicy,
