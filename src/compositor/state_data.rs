@@ -231,6 +231,17 @@ pub(in crate::compositor) struct SurfaceViewportCommit {
     pub(in crate::compositor) destination: Option<BufferSize>,
 }
 
+impl SurfaceViewportCommit {
+    pub(super) fn validate_viewport_state_without_buffer(self) -> Result<(), SurfaceMappingError> {
+        SurfaceBufferMapping::validate_viewport_state_without_buffer(
+            self.source.map(|source| {
+                SurfaceGeometryRect::new(source.x, source.y, source.width, source.height)
+            }),
+            self.destination,
+        )
+    }
+}
+
 /// The complete effective mapping of the pixels retained by a surface.
 ///
 /// This is deliberately a value rather than a collection of optional deltas:

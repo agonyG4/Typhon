@@ -89,6 +89,18 @@ pub enum SurfaceMappingError {
 
 #[allow(dead_code)]
 impl SurfaceBufferMapping {
+    pub fn validate_viewport_state_without_buffer(
+        source: Option<SurfaceGeometryRect>,
+        destination: Option<BufferSize>,
+    ) -> Result<(), SurfaceMappingError> {
+        if source.is_some_and(|source| {
+            destination.is_none() && (!is_integral(source.width) || !is_integral(source.height))
+        }) {
+            return Err(SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination);
+        }
+        Ok(())
+    }
+
     pub fn new(
         raw_size: BufferSize,
         buffer_scale: u32,
@@ -119,15 +131,9 @@ impl SurfaceBufferMapping {
             f64::from(logical_extent.width),
             f64::from(logical_extent.height),
         );
-        let explicit_source = source.is_some();
+        Self::validate_viewport_state_without_buffer(source, destination)?;
         let source = source.unwrap_or(full_source);
         valid_source(source, logical_extent)?;
-        if explicit_source
-            && destination.is_none()
-            && (!is_integral(source.width) || !is_integral(source.height))
-        {
-            return Err(SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination);
-        }
         if destination.is_some_and(|destination| destination.width == 0 || destination.height == 0)
         {
             return Err(SurfaceMappingError::InvalidBufferSize);

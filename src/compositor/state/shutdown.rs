@@ -60,6 +60,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         explicit_sync: None,
         offset: None,
         viewport_destination: PendingViewportChange::default(),
+        viewport_error_owner: None,
         buffer_scale: None,
         buffer_transform: None,
         opaque_region: None,

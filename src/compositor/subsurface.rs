@@ -3,6 +3,7 @@ use std::{
     time::Instant,
 };
 
+use wayland_protocols::wp::viewporter::server::wp_viewport;
 use wayland_server::backend::ClientId;
 use wayland_server::protocol::wl_callback;
 use wayland_server::protocol::wl_output;
@@ -387,6 +388,10 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) explicit_sync: Option<CapturedExplicitSyncState>,
     pub(super) offset: Option<(i32, i32)>,
     pub(super) viewport_destination: PendingViewportChange,
+    /// The resource that authored the effective source state represented by
+    /// this cached commit. This is an attribution token, not viewport state:
+    /// it may become dead before synchronized publication.
+    pub(super) viewport_error_owner: Option<wp_viewport::WpViewport>,
     pub(super) buffer_scale: Option<u32>,
     pub(super) buffer_transform: Option<wl_output::Transform>,
     pub(super) opaque_region: Option<SurfaceInputRegion>,
@@ -457,6 +462,7 @@ impl CachedSubsurfaceCommit {
             explicit_sync,
             offset,
             viewport_destination,
+            viewport_error_owner,
             buffer_scale,
             buffer_transform,
             opaque_region,
@@ -502,7 +508,15 @@ impl CachedSubsurfaceCommit {
         if offset.is_some() {
             self.offset = offset;
         }
+        // Source is the only viewport field that can produce a mapping
+        // protocol error. A destination-only delta therefore keeps the
+        // source author's identity; a source delta (including an explicit
+        // reset from viewport destruction) replaces it deterministically.
+        let source_changed = viewport_destination.source.is_some();
         self.viewport_destination.merge(viewport_destination);
+        if source_changed {
+            self.viewport_error_owner = viewport_error_owner;
+        }
         if buffer_scale.is_some() {
             self.buffer_scale = buffer_scale;
         }
@@ -1156,6 +1170,7 @@ mod window_geometry_tests {
             explicit_sync: None,
             offset: None,
             viewport_destination: PendingViewportChange::default(),
+            viewport_error_owner: None,
             buffer_scale: None,
             buffer_transform: None,
             opaque_region: None,

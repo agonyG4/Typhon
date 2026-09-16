@@ -237,6 +237,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     explicit_sync: explicit_sync.map(CapturedExplicitSyncState::capture),
                     offset,
                     viewport_destination: viewport_change,
+                    viewport_error_owner: data.viewport_resource(),
                     buffer_scale: buffer_scale_change,
                     buffer_transform: buffer_transform_change,
                     opaque_region: opaque_region_change,

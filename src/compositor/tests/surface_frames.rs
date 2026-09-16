@@ -2063,6 +2063,7 @@ fn wayland_bufferless_offset_commit_updates_retained_mapping_without_damage() {
 #[derive(Clone, Copy)]
 enum SynchronizedViewportUpdate {
     SetSource,
+    SetFractionalSource,
     SetDestination,
     ResetSource,
     ResetDestination,
@@ -2121,6 +2122,10 @@ fn run_synchronized_viewport_updates(
                 .as_ref()
                 .expect("viewport should be alive")
                 .set_source(1.0, 0.0, 2.0, 2.0),
+            SynchronizedViewportUpdate::SetFractionalSource => viewport
+                .as_ref()
+                .expect("viewport should be alive")
+                .set_source(0.0, 0.0, 2.5, 2.0),
             SynchronizedViewportUpdate::SetDestination => viewport
                 .as_ref()
                 .expect("viewport should be alive")
@@ -2184,6 +2189,20 @@ fn synchronized_viewport_destination_then_source_preserves_both_fields() {
     assert_eq!(final_snapshot.viewport_destination, Some((3, 4)));
     assert_eq!(final_snapshot.buffer_id, initial.buffer_id);
     assert_eq!(final_snapshot.pixel_checksum, initial.pixel_checksum);
+}
+
+#[test]
+fn synchronized_viewport_final_composed_state_is_valid_after_intermediate_reset() {
+    let (initial, final_snapshot) = run_synchronized_viewport_updates(&[
+        SynchronizedViewportUpdate::ResetDestination,
+        SynchronizedViewportUpdate::SetFractionalSource,
+        SynchronizedViewportUpdate::SetDestination,
+    ]);
+
+    assert_eq!(initial.viewport_source, Some((0, 0, 1024, 512)));
+    assert_eq!(initial.viewport_destination, Some((4, 2)));
+    assert_eq!(final_snapshot.viewport_source, Some((0, 0, 640, 512)));
+    assert_eq!(final_snapshot.viewport_destination, Some((3, 4)));
 }
 
 #[test]

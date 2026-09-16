@@ -291,6 +291,7 @@ impl CompositorState {
             explicit_sync,
             offset,
             viewport_destination,
+            viewport_error_owner: _,
             buffer_scale,
             buffer_transform,
             opaque_region,

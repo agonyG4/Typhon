@@ -1996,28 +1996,15 @@ impl CompositorState {
                 _ => {}
             }
         }
-        let mapping_error = if commit.attachment.is_none() {
-            self.surface_resource_by_id(surface_id).and_then(|surface| {
-                let data = surface.data::<SurfaceData>()?;
-                let current = self.current_surface_buffers.get(&surface_id)?;
-                current
-                    .content_mapping_for_state(
-                        data.viewport_for_change(commit.viewport_destination),
-                        data.buffer_scale_for_change(commit.buffer_scale),
-                        data.buffer_transform_for_change(commit.buffer_transform),
-                        commit.offset,
-                    )
-                    .err()
-            })
-        } else {
-            None
-        };
-        if let Some(error) = mapping_error {
-            self.post_surface_mapping_error(surface_id, error);
+        let synchronized = self.is_effectively_synchronized_subsurface(surface_id);
+        if !synchronized
+            && let Some(error) = self.surface_mapping_error_for_commit(surface_id, &commit)
+        {
+            self.post_surface_mapping_error(surface_id, error, commit.viewport_error_owner.clone());
             self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
             return;
         }
-        if self.is_effectively_synchronized_subsurface(surface_id) {
+        if synchronized {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
         }
@@ -2044,7 +2031,11 @@ impl CompositorState {
                     ))
                 });
                 if let Some(Err(error)) = mapping_error {
-                    self.post_surface_mapping_error(surface_id, error);
+                    self.post_surface_mapping_error(
+                        surface_id,
+                        error,
+                        commit.viewport_error_owner.clone(),
+                    );
                     self.release_pending_surface_buffer(pending.clone());
                     self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
                     return;
@@ -2076,6 +2067,40 @@ impl CompositorState {
         );
     }
 
+    fn surface_mapping_error_for_commit(
+        &self,
+        surface_id: u32,
+        commit: &CachedSubsurfaceCommit,
+    ) -> Option<SurfaceMappingError> {
+        let surface = self.surface_resource_by_id(surface_id)?;
+        let data = surface.data::<SurfaceData>()?;
+        let viewport = data.viewport_for_change(commit.viewport_destination);
+        let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
+        let buffer_transform = data.buffer_transform_for_change(commit.buffer_transform);
+        match commit.attachment.as_ref() {
+            Some(PendingSurfaceAttachment::Buffer(pending)) => pending
+                .surface_size_for_state(viewport, buffer_scale, buffer_transform)
+                .err(),
+            Some(PendingSurfaceAttachment::RemoveContent) => {
+                viewport.validate_viewport_state_without_buffer().err()
+            }
+            None => self
+                .current_surface_buffers
+                .get(&surface_id)
+                .map(|current| {
+                    current
+                        .content_mapping_for_state(
+                            viewport,
+                            buffer_scale,
+                            buffer_transform,
+                            commit.offset,
+                        )
+                        .err()
+                })
+                .unwrap_or_else(|| viewport.validate_viewport_state_without_buffer().err()),
+        }
+    }
+
     fn submit_surface_tree_nodes_with_kind(
         &mut self,
         surface_id: u32,
@@ -2083,14 +2108,15 @@ impl CompositorState {
         external_content_update_dependencies: Vec<ContentUpdateRef>,
         submission_kind: SurfaceTreeSubmissionKind,
     ) {
-        if let Err((error_surface_id, error)) = self.prepare_surface_tree_surface_state(&mut nodes)
+        if let Err((error_surface_id, error, viewport_error_owner)) =
+            self.prepare_surface_tree_surface_state(&mut nodes)
         {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: surface_commit validation failed surface={error_surface_id}"
                 );
             }
-            self.post_surface_mapping_error(error_surface_id, error);
+            self.post_surface_mapping_error(error_surface_id, error, viewport_error_owner);
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         }
@@ -2581,13 +2607,21 @@ impl CompositorState {
     pub(in crate::compositor) fn prepare_surface_tree_surface_state(
         &self,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
-    ) -> Result<(), (u32, SurfaceMappingError)> {
+    ) -> Result<(), (u32, SurfaceMappingError, Option<wp_viewport::WpViewport>)> {
         for (surface_id, commit) in nodes {
             let Some(surface) = self.surface_resource_by_id(*surface_id) else {
-                return Err((*surface_id, SurfaceMappingError::InvalidBufferSize));
+                return Err((
+                    *surface_id,
+                    SurfaceMappingError::InvalidBufferSize,
+                    commit.viewport_error_owner.clone(),
+                ));
             };
             let Some(data) = surface.data::<SurfaceData>() else {
-                return Err((*surface_id, SurfaceMappingError::InvalidBufferSize));
+                return Err((
+                    *surface_id,
+                    SurfaceMappingError::InvalidBufferSize,
+                    commit.viewport_error_owner.clone(),
+                ));
             };
             let viewport = data.viewport_for_change(commit.viewport_destination);
             let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
@@ -2596,7 +2630,9 @@ impl CompositorState {
                 Some(PendingSurfaceAttachment::Buffer(pending)) => {
                     pending.apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
                 }
-                Some(PendingSurfaceAttachment::RemoveContent) => Ok(()),
+                Some(PendingSurfaceAttachment::RemoveContent) => {
+                    viewport.validate_viewport_state_without_buffer()
+                }
                 None => {
                     if let Some(current) = self.current_surface_buffers.get(surface_id) {
                         current
@@ -2608,27 +2644,33 @@ impl CompositorState {
                             )
                             .map(|_| ())
                     } else {
-                        Ok(())
+                        viewport.validate_viewport_state_without_buffer()
                     }
                 }
             };
             if let Err(error) = result {
-                return Err((*surface_id, error));
+                return Err((*surface_id, error, commit.viewport_error_owner.clone()));
             }
         }
         Ok(())
     }
 
-    fn post_surface_mapping_error(&mut self, surface_id: u32, error: SurfaceMappingError) {
+    fn post_surface_mapping_error(
+        &mut self,
+        surface_id: u32,
+        error: SurfaceMappingError,
+        viewport_error_owner: Option<wp_viewport::WpViewport>,
+    ) {
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
             return;
         };
         let Some(client) = surface.client() else {
             return;
         };
-        let viewport = surface
-            .data::<SurfaceData>()
-            .and_then(SurfaceData::viewport_resource);
+        // A cached viewport error belongs to the resource that authored the
+        // cached source state. If that object has since been destroyed, its
+        // error cannot be reassigned to a newer viewport or to wl_surface.
+        let viewport = viewport_error_owner.filter(Resource::is_alive);
         match (viewport, error) {
             (Some(viewport), SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination) => {
                 self.post_protocol_error(
@@ -2647,8 +2689,8 @@ impl CompositorState {
                 );
             }
             (None, SurfaceMappingError::ViewportSourceNonIntegralWithoutDestination)
-            | (None, SurfaceMappingError::ViewportSourceOutOfBounds)
-            | (_, SurfaceMappingError::InvalidBufferSize)
+            | (None, SurfaceMappingError::ViewportSourceOutOfBounds) => {}
+            (_, SurfaceMappingError::InvalidBufferSize)
             | (_, SurfaceMappingError::BufferScaleNotIntegral) => self.post_protocol_error(
                 &client,
                 &surface,
