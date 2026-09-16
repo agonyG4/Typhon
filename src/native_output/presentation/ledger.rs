@@ -422,7 +422,6 @@ impl OutputTransactionLedger {
         self.counters.active_peak = self.counters.active_peak.max(self.active.len() as u64);
         Ok(())
     }
-
     pub(crate) fn mark_ready(
         &mut self,
         id: OutputTransactionId,
@@ -439,7 +438,6 @@ impl OutputTransactionLedger {
         self.counters.ready = self.counters.ready.saturating_add(1);
         Ok(())
     }
-
     pub(crate) fn mark_ready_unbound(
         &mut self,
         id: OutputTransactionId,
@@ -456,7 +454,6 @@ impl OutputTransactionLedger {
         self.counters.ready = self.counters.ready.saturating_add(1);
         Ok(())
     }
-
     pub(crate) fn bind_deferred_o1(
         &mut self,
         id: OutputTransactionId,
@@ -486,7 +483,6 @@ impl OutputTransactionLedger {
         };
         Ok(())
     }
-
     pub(crate) fn mark_queued(
         &mut self,
         id: OutputTransactionId,
@@ -524,7 +520,6 @@ impl OutputTransactionLedger {
         });
         Ok(())
     }
-
     pub(crate) fn rollback_queued(
         &mut self,
         id: OutputTransactionId,
@@ -562,7 +557,6 @@ impl OutputTransactionLedger {
         }
         Ok(())
     }
-
     pub(crate) fn mark_submitted(
         &mut self,
         id: OutputTransactionId,
@@ -615,7 +609,6 @@ impl OutputTransactionLedger {
         });
         Ok(())
     }
-
     pub(crate) fn accept_presented(
         &mut self,
         id: OutputTransactionId,
@@ -665,7 +658,6 @@ impl OutputTransactionLedger {
             },
         )
     }
-
     pub(crate) fn accept_immediate_presented(
         &mut self,
         id: OutputTransactionId,
@@ -698,7 +690,6 @@ impl OutputTransactionLedger {
             .saturating_add(1);
         Ok(accepted)
     }
-
     pub(crate) fn mark_presented(
         &mut self,
         id: OutputTransactionId,
@@ -711,7 +702,6 @@ impl OutputTransactionLedger {
             self.accept_presented(id, token, output_generation, presented_at, actual_sequence)?;
         self.finalize_terminal(accepted)
     }
-
     pub(crate) fn mark_dropped(
         &mut self,
         id: OutputTransactionId,
