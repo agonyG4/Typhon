@@ -64,9 +64,10 @@ pub struct PresentationCoverageAnalysis {
 
 impl PresentationCoverageAnalysis {
     pub const fn geometrically_covers_output(&self) -> bool {
-        self.covering_application_group
-            .as_ref()
-            .is_some_and(|group| group.covering_surface.is_some())
+        match self.covering_application_group.as_ref() {
+            Some(group) => group.covering_surface.is_some(),
+            None => false,
+        }
     }
 
     pub const fn can_occlude_behind_content(&self) -> bool {
@@ -403,7 +404,6 @@ mod tests {
             BufferSize::new(1280, 800).expect("test output size"),
             |root| root == 10,
             |_| false,
-            |root| root == 10,
             |surface, _target| {
                 if surface.surface_id == 11 {
                     PresentationCoverageOpacity::OpaqueXrgb8888
