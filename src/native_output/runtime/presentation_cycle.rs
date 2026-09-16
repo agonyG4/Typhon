@@ -280,6 +280,7 @@ impl NativeRuntime {
             *cursor_render_mode,
         );
         log_client_cursor_path_if_changed(
+            *output_id,
             last_client_cursor_path,
             client_surface_content_active,
             client_cursor_hardware_usable,
