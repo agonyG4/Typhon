@@ -743,6 +743,7 @@ mod tests {
             .unwrap();
 
         let transaction = OutputTransaction::composited(
+            oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
             transaction_id,
             1,
             frame_now,

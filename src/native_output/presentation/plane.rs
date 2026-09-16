@@ -407,6 +407,7 @@ pub(crate) struct PlanePageflipIdentity {
 }
 
 impl PlanePageflipIdentity {
+    #[cfg(test)]
     pub(crate) const fn from_pageflip(
         token: PageFlipToken,
         output_generation: u64,

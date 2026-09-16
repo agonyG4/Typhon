@@ -1029,6 +1029,7 @@ mod tests {
     ) -> crate::native_output::OutputTransaction {
         let id = ledger.allocate_id().expect("transaction ID");
         crate::native_output::OutputTransaction::composited(
+            ledger.output_id(),
             id,
             1,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(10),

@@ -81,6 +81,7 @@ fn predecessor(value: u64) -> crate::native_output::kms_worker::KmsCommitBundleI
 fn independent_hidden_sidecar(validation_base: KmsValidationBase) -> CursorSidecar {
     let target = target();
     let transaction = OutputTransaction::cursor_plane_delta(
+        oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         transaction_id(91),
         1,
         MonotonicTimestampNs::new(1),

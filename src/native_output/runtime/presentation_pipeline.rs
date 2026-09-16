@@ -779,6 +779,7 @@ mod tests {
         output_generation: u64,
     ) {
         let transaction = OutputTransaction::composited(
+            ledger.output_id(),
             identity.transaction_id,
             output_generation,
             MonotonicTimestampNs::new(0),
@@ -830,6 +831,7 @@ mod tests {
         ledger
             .insert(
                 OutputTransaction::cursor_plane_delta(
+                    ledger.output_id(),
                     id,
                     1,
                     MonotonicTimestampNs::new(0),
@@ -1239,6 +1241,7 @@ mod tests {
         ledger
             .insert(
                 OutputTransaction::direct(
+                    ledger.output_id(),
                     ready.transaction_id,
                     1,
                     MonotonicTimestampNs::new(0),

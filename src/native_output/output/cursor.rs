@@ -71,22 +71,14 @@ pub(crate) struct NativeCursorImageKey {
 }
 
 impl NativeCursorImageKey {
-    pub(crate) fn for_surface(surface: &RenderableSurface, hotspot_x: i32, hotspot_y: i32) -> Self {
-        Self::for_surface_at_output_scale(surface, hotspot_x, hotspot_y, 1_000)
-    }
-
-    pub(crate) fn for_surface_at_output_scale(
+    pub(crate) fn for_surface(
+        output_id: OutputId,
         surface: &RenderableSurface,
         hotspot_x: i32,
         hotspot_y: i32,
-        output_scale_milli: u32,
     ) -> Self {
         Self::for_surface_at_output_scale_for_output(
-            OutputId::from_raw(1).expect("single native output identity is nonzero"),
-            surface,
-            hotspot_x,
-            hotspot_y,
-            output_scale_milli,
+            output_id, surface, hotspot_x, hotspot_y, 1_000,
         )
     }
 

@@ -438,10 +438,12 @@ pub(crate) struct AtomicOutputSwapchain {
 }
 
 impl AtomicOutputSwapchain {
+    #[cfg(test)]
     fn default_output_id() -> OutputId {
         OutputId::from_raw(1).expect("single native output identity is nonzero")
     }
 
+    #[cfg(test)]
     pub(crate) fn from_presented_slots(
         slots: OutputSlotSet,
         current: OutputSlotId,

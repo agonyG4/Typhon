@@ -70,6 +70,7 @@ fn test_frame_batch_id(value: u64) -> CompositorFrameBatchId {
 fn direct_transaction_uses_client_primary_assignment() {
     let key = test_direct_key(3);
     let transaction = OutputTransaction::direct(
+        key.output_id,
         test_transaction_id(1),
         1,
         MonotonicTimestampNs::new(10),
@@ -200,6 +201,7 @@ fn direct_test_rejection_never_marks_transaction_presented() {
     let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
     let transaction_id = test_transaction_id(1);
     let transaction = OutputTransaction::direct(
+        test_direct_key(3).output_id,
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -249,6 +251,7 @@ fn terminal_direct_transaction_is_not_still_active() {
     ledger
         .insert(
             OutputTransaction::direct(
+                test_direct_key(3).output_id,
                 transaction_id,
                 1,
                 MonotonicTimestampNs::new(10),
@@ -288,6 +291,7 @@ fn direct_pageflip_is_the_only_presented_transition() {
     let generation = 1;
     let token = PageFlipToken::new(51).expect("pageflip token");
     let transaction = OutputTransaction::direct(
+        test_direct_key(3).output_id,
         transaction_id,
         generation,
         MonotonicTimestampNs::new(10),
@@ -360,6 +364,7 @@ fn direct_admission_rollback_restores_built_transaction_before_enqueue() {
     ledger
         .insert(
             OutputTransaction::direct(
+                test_direct_key(3).output_id,
                 transaction_id,
                 1,
                 MonotonicTimestampNs::new(10),
@@ -402,6 +407,7 @@ fn duplicate_transaction_settlement_is_counted_and_suppressed() {
     ledger
         .insert(
             OutputTransaction::direct(
+                test_direct_key(3).output_id,
                 transaction_id,
                 1,
                 MonotonicTimestampNs::new(10),

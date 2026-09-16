@@ -522,6 +522,7 @@ fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
     );
     let transaction = Arc::new(
         crate::native_output::OutputTransaction::cursor_plane_delta(
+            job.output_id,
             transaction_id,
             job.output_generation,
             MonotonicTimestampNs::new(id),

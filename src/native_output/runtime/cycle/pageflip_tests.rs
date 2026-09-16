@@ -54,6 +54,7 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
     let slot = OutputSlotId::new(0).unwrap();
     let transaction = Arc::new(
         OutputTransaction::composited(
+            oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
             transaction_id,
             1,
             MonotonicTimestampNs::new(0),

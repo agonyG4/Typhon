@@ -56,6 +56,7 @@ pub(crate) fn defer_cursor_after_busy(
 }
 
 pub(crate) fn log_client_cursor_path(
+    output_id: OutputId,
     perf: NativePerfLogger,
     path: NativeClientCursorPath,
     hardware_eligible: bool,
@@ -78,6 +79,7 @@ pub(crate) fn log_client_cursor_path(
         ];
         if let Some(client) = client_cursor {
             let key = NativeCursorImageKey::for_surface(
+                output_id,
                 client.surface,
                 client.hotspot_x,
                 client.hotspot_y,

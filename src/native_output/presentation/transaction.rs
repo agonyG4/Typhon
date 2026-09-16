@@ -402,6 +402,7 @@ pub(crate) struct OutputTransaction {
 impl OutputTransaction {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn composited(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -416,6 +417,7 @@ impl OutputTransaction {
         frame_batch_id: CompositorFrameBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::composited_with_direct_equivalence(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -434,6 +436,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn composited_with_direct_equivalence(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -449,6 +452,7 @@ impl OutputTransaction {
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -478,6 +482,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn direct(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -492,6 +497,7 @@ impl OutputTransaction {
         release: OutputReleasePlan,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -513,6 +519,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn composited_deferred_o1(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -527,6 +534,7 @@ impl OutputTransaction {
         frame_batch_id: CompositorFrameBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -556,6 +564,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compatibility_composited(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -568,6 +577,7 @@ impl OutputTransaction {
         frame_batch_id: CompositorFrameBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -591,6 +601,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compatibility_immediate(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -600,6 +611,7 @@ impl OutputTransaction {
         frame_batch_id: CompositorFrameBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -618,6 +630,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cursor_plane_delta(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -630,6 +643,7 @@ impl OutputTransaction {
         let sidecar_id =
             CursorSidecarId::new(NonZeroU64::new(cursor_epoch).expect("cursor epoch is nonzero"));
         Self::plane_delta(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -645,6 +659,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn plane_delta(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -657,6 +672,7 @@ impl OutputTransaction {
         release: OutputReleasePlan,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
+            output_id,
             id,
             output_generation,
             created_at,
@@ -681,6 +697,7 @@ impl OutputTransaction {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
+        output_id: OutputId,
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
@@ -751,11 +768,7 @@ impl OutputTransaction {
         }
         Ok(Self {
             id,
-            // The current product has one logical output, whose allocator
-            // assigns the first identity during compositor creation. Runtime
-            // callers qualify transactions with their owned identity through
-            // `with_output_id` when constructing output-scoped work.
-            output_id: OutputId::from_raw(1).expect("single native output identity is nonzero"),
+            output_id,
             output_generation,
             created_at,
             reservation,
@@ -777,11 +790,6 @@ impl OutputTransaction {
 
     pub(crate) const fn output_id(&self) -> OutputId {
         self.output_id
-    }
-
-    pub(crate) const fn with_output_id(mut self, output_id: OutputId) -> Self {
-        self.output_id = output_id;
-        self
     }
 
     pub(crate) const fn output_generation(&self) -> u64 {
@@ -1112,6 +1120,7 @@ mod tests {
         let frame_batch_id =
             CompositorFrameBatchId::new(NonZeroU64::new(15).expect("test frame batch ID"));
         let mut transaction = OutputTransaction::composited_deferred_o1(
+            OutputId::from_raw(1).expect("test output id"),
             id,
             7,
             MonotonicTimestampNs::new(1),

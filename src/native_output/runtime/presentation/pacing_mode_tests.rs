@@ -299,6 +299,7 @@ fn forced_shutdown_drops_submitted_transaction_once_without_presentation() {
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_composited(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -394,6 +395,7 @@ fn unproven_teardown_keeps_forced_transaction_and_protocol_batch_owned() -> Nati
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_composited(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -467,6 +469,7 @@ fn target_destruction_safely_settles_forced_transaction_once() -> NativeResult<(
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_composited(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -538,6 +541,7 @@ fn forced_shutdown_does_not_abandon_late_presented_transaction() {
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_composited(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -960,6 +964,7 @@ fn immediate_settlement_cannot_consume_another_prepared_batch() {
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_immediate(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1008,6 +1013,7 @@ fn immediate_settlement_rejects_missing_obligation_owner() {
         .allocate_id()
         .expect("transaction ID");
     let transaction = OutputTransaction::compatibility_immediate(
+        harness.output_transactions.output_id(),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),

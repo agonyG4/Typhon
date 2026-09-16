@@ -304,6 +304,7 @@ pub(crate) struct OutputTransactionLedger {
     last_created: Option<OutputTransactionId>,
 }
 
+#[cfg(test)]
 impl Default for OutputTransactionLedger {
     fn default() -> Self {
         Self::new()
@@ -311,12 +312,9 @@ impl Default for OutputTransactionLedger {
 }
 
 impl OutputTransactionLedger {
-    fn default_output_id() -> OutputId {
-        OutputId::from_raw(1).expect("single native output identity is nonzero")
-    }
-
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::new_for_output(Self::default_output_id())
+        Self::new_for_output(OutputId::from_raw(1).expect("test output id"))
     }
 
     pub(crate) fn new_for_output(output_id: OutputId) -> Self {
@@ -332,8 +330,10 @@ impl OutputTransactionLedger {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_capacities(active_capacity: usize, history_capacity: usize) -> Self {
-        Self::for_output(Self::default_output_id(), active_capacity, history_capacity)
+        let output_id = OutputId::from_raw(1).expect("test output id");
+        Self::for_output(output_id, active_capacity, history_capacity)
     }
 
     pub(crate) fn for_output(

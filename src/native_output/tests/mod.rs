@@ -54,6 +54,7 @@ mod input_protocol;
 mod input_xwayland_client;
 mod integrated_swapchain_oracle;
 mod output;
+mod output_identity;
 mod output_retry;
 mod plane_scheduling_model;
 mod presentation_transactions;

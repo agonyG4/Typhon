@@ -544,6 +544,7 @@ pub(super) fn build_compatibility_transaction(
         .map_err(io::Error::other)?;
     let transaction = match scanout.compatibility_framebuffer_id() {
         Some(framebuffer_id) => OutputTransaction::compatibility_composited(
+            output_transactions.output_id(),
             transaction_id,
             output_generation,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -560,6 +561,7 @@ pub(super) fn build_compatibility_transaction(
         ),
         None if scanout.kind() == NativeScanoutKind::DumbFramebuffer => {
             OutputTransaction::compatibility_immediate(
+                output_transactions.output_id(),
                 transaction_id,
                 output_generation,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -775,6 +777,7 @@ pub(super) fn build_cursor_transaction(
         .allocate_id()
         .map_err(io::Error::other)?;
     let transaction = OutputTransaction::cursor_plane_delta(
+        output_transactions.output_id(),
         transaction_id,
         output_generation,
         MonotonicTimestampNs::new(monotonic_now_ns()?),

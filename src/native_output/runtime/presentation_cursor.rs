@@ -862,6 +862,7 @@ pub(super) fn cursor_damage_states(
 }
 
 pub(super) fn log_client_cursor_path_if_changed(
+    output_id: OutputId,
     last_path: &mut Option<NativeClientCursorPath>,
     client_surface_content_active: bool,
     hardware_eligible: bool,
@@ -872,7 +873,14 @@ pub(super) fn log_client_cursor_path_if_changed(
     let path = resolve_client_cursor_path(client_surface_content_active, hardware_eligible);
     if *last_path != Some(path) {
         *last_path = Some(path);
-        log_client_cursor_path(perf, path, hardware_eligible, direct_active, client_cursor);
+        log_client_cursor_path(
+            output_id,
+            perf,
+            path,
+            hardware_eligible,
+            direct_active,
+            client_cursor,
+        );
     }
 }
 

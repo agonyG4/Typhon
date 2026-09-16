@@ -793,6 +793,7 @@ mod ownership_tests {
         };
         let transaction = Arc::new(
             crate::native_output::OutputTransaction::composited(
+                oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
                 transaction_id,
                 1,
                 MonotonicTimestampNs::new(1),

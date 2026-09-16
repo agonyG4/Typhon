@@ -81,6 +81,7 @@ fn test_direct_transaction_with_surface_id(
     direct_surface_id: u32,
 ) -> OutputTransaction {
     OutputTransaction::direct(
+        oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         OutputTransactionId::new(std::num::NonZeroU64::new(token).expect("transaction id")),
         1,
         MonotonicTimestampNs::new(10),
@@ -115,6 +116,7 @@ fn submitted_composited_job_accepts_consumed_input_fence() {
     let transaction_id =
         OutputTransactionId::new(std::num::NonZeroU64::new(token).expect("transaction id"));
     let transaction = OutputTransaction::composited(
+        oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -165,6 +167,7 @@ fn composited_job_rejects_cursor_geometry_newer_than_transaction_plan() {
         image_generation: 4,
     };
     let transaction = OutputTransaction::composited(
+        oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
         transaction_id,
         1,
         MonotonicTimestampNs::new(10),

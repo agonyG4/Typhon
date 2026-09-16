@@ -129,8 +129,10 @@ fn presented_direct_primary_survives_origin_history_eviction() {
     let (ownership, current) = presented_direct();
     let origin = OutputTransactionId::new(NonZeroU64::new(143).unwrap());
     let mut ledger = OutputTransactionLedger::with_capacities(8, 1);
+    let output_id = ledger.output_id();
     let insert_direct = |id, batch| {
         OutputTransaction::direct(
+            output_id,
             id,
             1,
             MonotonicTimestampNs::new(0),

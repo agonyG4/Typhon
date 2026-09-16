@@ -24,6 +24,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
     );
     let transaction = Arc::new(
         crate::native_output::OutputTransaction::cursor_plane_delta(
+            job.output_id,
             transaction_id,
             job.output_generation,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
@@ -84,6 +85,7 @@ fn embedded_primary_owner_preserves_exact_component_cursor_revision() {
     }
     let transaction = Arc::new(
         crate::native_output::OutputTransaction::composited(
+            oblivion_one::core::OutputId::from_raw(1).expect("test output id"),
             transaction_id,
             1,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(1),
@@ -172,6 +174,7 @@ fn two_owner_job(
     let transaction = |id, epoch| {
         Arc::new(
             crate::native_output::OutputTransaction::cursor_plane_delta(
+                job.output_id,
                 id,
                 1,
                 oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
@@ -706,6 +709,7 @@ fn predecessor_validation_base_must_match_job_output_identity() {
         cursor_transaction_id: None,
     });
     let transaction = crate::native_output::OutputTransaction::cursor_plane_delta(
+        job.output_id,
         job.transaction_id,
         job.output_generation,
         oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
@@ -1363,6 +1367,7 @@ fn sidecar_replacement_publishes_its_exact_test_policy() {
 fn impossible_cursor_delivery_payloads_are_rejected() {
     let cursor_transaction = |job: &KmsCommitJob, desired| {
         crate::native_output::OutputTransaction::cursor_plane_delta(
+            job.output_id,
             job.transaction_id,
             job.output_generation,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
@@ -1451,6 +1456,7 @@ fn software_primary_presentation_requires_a_matching_primary_payload() {
         },
     );
     let transaction = crate::native_output::OutputTransaction::compatibility_composited(
+        job.output_id,
         job.transaction_id,
         1,
         oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),

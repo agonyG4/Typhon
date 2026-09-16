@@ -313,8 +313,10 @@ fn output_transaction_descriptor_is_immutable_and_path_typed() {
         },
         selection_evidence: Default::default(),
     };
+    let output_id = oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id");
 
     let transaction = super::OutputTransaction::composited(
+        output_id,
         id,
         1,
         now,
@@ -387,6 +389,7 @@ fn test_composited_transaction(
 ) -> super::OutputTransaction {
     let id = ledger.allocate_id().expect("transaction ID");
     super::OutputTransaction::composited(
+        ledger.output_id(),
         id,
         output_generation,
         MonotonicTimestampNs::new(10),
@@ -401,22 +404,6 @@ fn test_composited_transaction(
         batch_id,
     )
     .expect("composited transaction")
-}
-
-#[test]
-fn transaction_from_one_logical_output_cannot_enter_another_ledger() {
-    let first = oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id");
-    let second = oblivion_one::core::OutputId::from_raw(2).expect("nonzero output id");
-    let mut first_ledger = super::OutputTransactionLedger::with_capacities(8, 64);
-    let mut second_ledger = super::OutputTransactionLedger::for_output(second, 8, 64);
-    let transaction =
-        test_composited_transaction(&mut second_ledger, test_batch(99), 1).with_output_id(second);
-
-    assert_eq!(first_ledger.output_id(), first);
-    assert_eq!(
-        first_ledger.insert(transaction),
-        Err(super::OutputTransactionError::OutputMismatch)
-    );
 }
 
 #[test]
@@ -1088,6 +1075,7 @@ fn immediate_compatibility_presentation_creates_transaction_and_transitions_buil
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let transaction = super::OutputTransaction::compatibility_immediate(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1117,6 +1105,7 @@ fn immediate_compatibility_path_never_waits_for_pageflip() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let transaction = super::OutputTransaction::compatibility_immediate(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1150,6 +1139,7 @@ fn stale_pageflip_cannot_recomplete_immediate_transaction() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let transaction = super::OutputTransaction::compatibility_immediate(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1187,6 +1177,7 @@ fn immediate_compatibility_failure_marks_typed_failure() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let transaction = super::OutputTransaction::compatibility_immediate(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1350,6 +1341,7 @@ fn compatibility_transaction_uses_shared_lifecycle_identity() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().expect("transaction ID");
     let transaction = super::OutputTransaction::compatibility_composited(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1454,6 +1446,7 @@ fn direct_pageflip_rejection_settles_nothing() {
     let id = ledger.allocate_id().unwrap();
     let batch_id = test_batch(114);
     let transaction = super::OutputTransaction::direct(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1496,6 +1489,7 @@ fn cursor_pageflip_rejection_terminalizes_nothing() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let transaction = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1535,6 +1529,7 @@ fn cursor_only_plane_delta_owns_its_exact_surface_damage_token() {
     let id = ledger.allocate_id().unwrap();
     let token = CompositorSurfaceDamagePresentation::default();
     let transaction = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1566,6 +1561,7 @@ fn superseded_cursor_only_plane_delta_does_not_retain_or_settle_old_token() {
     let first_id = ledger.allocate_id().unwrap();
     let first_token = CompositorSurfaceDamagePresentation::default();
     let first = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
         first_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1585,6 +1581,7 @@ fn superseded_cursor_only_plane_delta_does_not_retain_or_settle_old_token() {
     let second_id = ledger.allocate_id().unwrap();
     let second_token = CompositorSurfaceDamagePresentation::default();
     let second = super::OutputTransaction::cursor_plane_delta(
+        ledger.output_id(),
         second_id,
         1,
         MonotonicTimestampNs::new(30),
@@ -1872,6 +1869,7 @@ fn direct_transaction_submits_without_ready_state() {
     let id = ledger.allocate_id().unwrap();
     let token = super::PageFlipToken::new(51).expect("token");
     let transaction = super::OutputTransaction::direct(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1904,6 +1902,7 @@ fn plane_delta_transaction_has_no_protocol_obligations_or_primary_owner() {
     let id = ledger.allocate_id().unwrap();
     let token = super::PageFlipToken::new(52).expect("token");
     let transaction = super::OutputTransaction::plane_delta(
+        ledger.output_id(),
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1939,6 +1938,7 @@ fn direct_and_cursor_descriptors_have_expected_obligations() {
     let key = test_direct_key();
     let direct_id = ledger.allocate_id().unwrap();
     let direct = super::OutputTransaction::direct(
+        ledger.output_id(),
         direct_id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1964,6 +1964,7 @@ fn direct_and_cursor_descriptors_have_expected_obligations() {
 
     let cursor_id = ledger.allocate_id().unwrap();
     let cursor = super::OutputTransaction::plane_delta(
+        ledger.output_id(),
         cursor_id,
         1,
         MonotonicTimestampNs::new(10),

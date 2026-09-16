@@ -411,6 +411,7 @@ pub(super) fn prepare_plane_delta(
         .allocate_id()
         .map_err(io::Error::other)?;
     let transaction = OutputTransaction::cursor_plane_delta(
+        output_transactions.output_id(),
         transaction_id,
         output_generation,
         MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -420,7 +421,6 @@ pub(super) fn prepare_plane_delta(
         desired.clone(),
         OutputReleasePlan::Pageflip,
     )
-    .map(|transaction| transaction.with_output_id(output_transactions.output_id()))
     .map_err(io::Error::other)?;
     let transaction = if let Some(surface_damage) = cursor_surface_damage {
         transaction.with_surface_damage(surface_damage)

@@ -929,6 +929,7 @@ impl AtomicEglGbmScanout {
         };
         let transaction_result = if let Some(intent) = prepare_intent {
             OutputTransaction::composited_deferred_o1(
+                self.direct.output_id,
                 transaction_id,
                 output_generation,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -944,6 +945,7 @@ impl AtomicEglGbmScanout {
             )
         } else {
             OutputTransaction::composited_with_direct_equivalence(
+                self.direct.output_id,
                 transaction_id,
                 output_generation,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -961,7 +963,6 @@ impl AtomicEglGbmScanout {
         };
         let transaction = match transaction_result {
             Ok(transaction) => transaction
-                .with_output_id(self.direct.output_id)
                 .with_presentation_state(presentation_mode, content_type)
                 .with_async_validation_key(async_validation_key),
             Err(error) => {

@@ -46,6 +46,7 @@ fn settle_no_visual_change_transaction(
         }
     };
     let transaction = match OutputTransaction::direct(
+        scanout.direct.output_id,
         transaction_id,
         output_generation,
         created_at,
@@ -62,11 +63,8 @@ fn settle_no_visual_change_transaction(
         direct_surface_id,
         release,
     )
-    .map(|transaction| {
-        transaction
-            .with_output_id(scanout.direct.output_id)
-            .with_presentation_state(presentation_mode, content_type)
-    }) {
+    .map(|transaction| transaction.with_presentation_state(presentation_mode, content_type))
+    {
         Ok(transaction) => transaction,
         Err(error) => {
             server.restore_frame_batch_after_render_failure(frame_batch_id);
@@ -434,6 +432,7 @@ impl AtomicEglGbmScanout {
             }
         };
         let transaction = match OutputTransaction::direct(
+            self.direct.output_id,
             transaction_id,
             self.direct.drm_generation,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -450,9 +449,7 @@ impl AtomicEglGbmScanout {
             candidate.surface_id,
             release,
         ) {
-            Ok(transaction) => transaction
-                .with_output_id(self.direct.output_id)
-                .with_presentation_state(presentation_mode, content_type),
+            Ok(transaction) => transaction.with_presentation_state(presentation_mode, content_type),
             Err(error) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 drop(surface_damage);
