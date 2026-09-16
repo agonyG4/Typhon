@@ -42,6 +42,8 @@ pub(crate) use timing::{KmsWorkerDispatchBudget, KmsWorkerDispatchModel};
 #[cfg(test)]
 mod direct_lease_tests;
 #[cfg(test)]
+mod output_identity_tests;
+#[cfg(test)]
 mod signal_tests;
 #[cfg(test)]
 mod task4_tests;
