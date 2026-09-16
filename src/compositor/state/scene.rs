@@ -205,24 +205,6 @@ fn scene_domain_for_layer(layer: crate::compositor::layer_shell::Layer) -> Scene
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_semantic_domains_are_metadata_only_and_conservative() {
-        use crate::compositor::layer_shell::Layer;
-
-        assert_eq!(
-            scene_domain_for_layer(Layer::Background),
-            SceneDomain::Desktop
-        );
-        assert_eq!(scene_domain_for_layer(Layer::Bottom), SceneDomain::Chrome);
-        assert_eq!(scene_domain_for_layer(Layer::Top), SceneDomain::Chrome);
-        assert_eq!(scene_domain_for_layer(Layer::Overlay), SceneDomain::Chrome);
-    }
-}
-
 fn scene_parent_for_surface(
     state: &CompositorState,
     surface_id: u32,
@@ -248,5 +230,23 @@ fn scene_parent_for_surface(
         | Some(LiveRoleInstance::Cursor)
         | Some(LiveRoleInstance::DragIcon)
         | None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_semantic_domains_are_metadata_only_and_conservative() {
+        use crate::compositor::layer_shell::Layer;
+
+        assert_eq!(
+            scene_domain_for_layer(Layer::Background),
+            SceneDomain::Desktop
+        );
+        assert_eq!(scene_domain_for_layer(Layer::Bottom), SceneDomain::Chrome);
+        assert_eq!(scene_domain_for_layer(Layer::Top), SceneDomain::Chrome);
+        assert_eq!(scene_domain_for_layer(Layer::Overlay), SceneDomain::Chrome);
     }
 }
